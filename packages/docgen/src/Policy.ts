@@ -130,9 +130,7 @@ const fenceInfo = (
 ): string | undefined => {
   const source = snapshot.closure.sources.get(module.name)
   if (source === undefined || source.id !== block.source.sourceId) return block.language
-  const authored = decoder.decode(
-    Uint8Array.from(source.bytes.slice(block.source.start, block.source.end)),
-  )
+  const authored = decoder.decode(source.bytes.slice(block.source.start, block.source.end))
   const match = /(`{3,}|~{3,})([^\r\n]*)/.exec(authored)
   return match?.[2]?.trim() ?? block.language
 }

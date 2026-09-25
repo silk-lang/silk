@@ -106,11 +106,23 @@ export const witnessKey = (witness: DeclarationFacts.ConformanceWitness): string
 export const providedContractEntry = (requirement: Omit<ProvidedRequirement, 'local'>): string =>
   `provided:${Type.key(requirement.capability)}@${requirement.role}:${requirement.requirementAccess}:${requirement.access}:${Type.key(requirement.providerType)}:${requirement.witness._tag}`
 
-const effectRunnerSiteKey = (type: Extract<Mir.Type, { readonly _tag: 'EffectValue' }>): string =>
-  runnerSiteKey(
-    type.storage?.realization.runnerInstance ?? type.environment.instance,
-    type.storage?.realization.site ?? type.site,
-  )
+// Runner selection compares the requested site against every generated runner's site.
+const effectRunnerSiteKeys = new WeakMap<
+  Extract<Mir.Type, { readonly _tag: 'EffectValue' }>,
+  string
+>()
+
+const effectRunnerSiteKey = (type: Extract<Mir.Type, { readonly _tag: 'EffectValue' }>): string => {
+  let key = effectRunnerSiteKeys.get(type)
+  if (key === undefined) {
+    key = runnerSiteKey(
+      type.storage?.realization.runnerInstance ?? type.environment.instance,
+      type.storage?.realization.site ?? type.site,
+    )
+    effectRunnerSiteKeys.set(type, key)
+  }
+  return key
+}
 
 const effectRunnerKey = (type: Extract<Mir.Type, { readonly _tag: 'EffectValue' }>): string =>
   baseRunnerKey(
@@ -149,6 +161,54 @@ const providerRequirementSubtractionMatches = (
     ),
   )
 
+type ConcreteEffectEnvironment = Extract<
+  Layout.EffectEnvironment,
+  { readonly _tag: 'EffectEnvironment' }
+>
+
+interface EffectEnvironmentIndex {
+  readonly byInstance: ReadonlyMap<string, ReadonlyArray<ConcreteEffectEnvironment>>
+  readonly direct: ReadonlyMap<string, ReadonlyArray<ConcreteEffectEnvironment>>
+  readonly success: ReadonlyMap<string, ReadonlyArray<ConcreteEffectEnvironment>>
+  readonly representation: ReadonlyMap<string, ReadonlyArray<ConcreteEffectEnvironment>>
+}
+
+// Every Effect value lowered in the program is resolved against the whole plan's environments;
+// each plan list is grouped once, preserving plan order within every group.
+const effectEnvironmentIndexCache = new WeakMap<
+  ReadonlyArray<Layout.EffectEnvironment>,
+  EffectEnvironmentIndex
+>()
+
+const effectEnvironmentIndex = (layout: Layout.Plan): EffectEnvironmentIndex => {
+  const cached = effectEnvironmentIndexCache.get(layout.effectEnvironments)
+  if (cached !== undefined) return cached
+  const byInstance = new Map<string, Array<ConcreteEffectEnvironment>>()
+  const direct = new Map<string, Array<ConcreteEffectEnvironment>>()
+  const success = new Map<string, Array<ConcreteEffectEnvironment>>()
+  const representation = new Map<string, Array<ConcreteEffectEnvironment>>()
+  const add = (
+    groups: Map<string, Array<ConcreteEffectEnvironment>>,
+    key: string,
+    environment: ConcreteEffectEnvironment,
+  ): void => {
+    const group = groups.get(key)
+    if (group === undefined) groups.set(key, [environment])
+    else group.push(environment)
+  }
+  for (const environment of layout.effectEnvironments) {
+    if (environment._tag !== 'EffectEnvironment') continue
+    add(byInstance, Instances.keyText(environment.instance), environment)
+    add(direct, Instances.effectIdentity(environment.instance, environment.site), environment)
+    if (environment.successEffectIdentity !== undefined)
+      add(success, environment.successEffectIdentity, environment)
+    add(representation, Tir.effectRepresentationIdentity(environment.site), environment)
+  }
+  const built = { byInstance, direct, success, representation }
+  effectEnvironmentIndexCache.set(layout.effectEnvironments, built)
+  return built
+}
+
 export const effectValueType = (
   layout: Layout.Plan,
   instance: Instances.InstanceKey,
@@ -157,13 +217,13 @@ export const effectValueType = (
 ): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
   // Instance and site already identify exactly one block, so the contract check only has to
   // confirm that this environment is the one the requested type asks for.
-  const environment = layout.effectEnvironments.find(
-    (candidate) =>
-      candidate._tag === 'EffectEnvironment' &&
-      Instances.keyText(candidate.instance) === Instances.keyText(instance) &&
-      Tir.sameExecutableSite(candidate.site, block.site) &&
-      EffectExecutionContract.realizes(candidate.effect, requested),
-  )
+  const environment = effectEnvironmentIndex(layout)
+    .byInstance.get(Instances.keyText(instance))
+    ?.find(
+      (candidate) =>
+        Tir.sameExecutableSite(candidate.site, block.site) &&
+        EffectExecutionContract.realizes(candidate.effect, requested),
+    )
   if (environment?._tag !== 'EffectEnvironment') return undefined
   return {
     _tag: 'EffectValue',
@@ -179,13 +239,13 @@ export const effectValueAtSite = (
   site: Tir.EffectSiteId,
   requested: Type.Effect,
 ): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
-  const environment = layout.effectEnvironments.find(
-    (candidate) =>
-      candidate._tag === 'EffectEnvironment' &&
-      Instances.keyText(candidate.instance) === Instances.keyText(instance) &&
-      Tir.sameExecutableSite(candidate.site, site) &&
-      EffectExecutionContract.equals(candidate.effect, requested),
-  )
+  const environment = effectEnvironmentIndex(layout)
+    .byInstance.get(Instances.keyText(instance))
+    ?.find(
+      (candidate) =>
+        Tir.sameExecutableSite(candidate.site, site) &&
+        EffectExecutionContract.equals(candidate.effect, requested),
+    )
   return environment?._tag !== 'EffectEnvironment'
     ? undefined
     : { _tag: 'EffectValue', type: environment.effect, site, environment }
@@ -196,19 +256,11 @@ const effectEnvironmentsByIdentity = (
   identity: string,
   owner?: Type.ExecutableSpecializationOwner,
 ): ReadonlyArray<Extract<Layout.EffectEnvironment, { readonly _tag: 'EffectEnvironment' }>> => {
-  const available = layout.effectEnvironments.filter(
-    (
-      candidate,
-    ): candidate is Extract<Layout.EffectEnvironment, { readonly _tag: 'EffectEnvironment' }> =>
-      candidate._tag === 'EffectEnvironment',
-  )
-  const direct = available.filter(
-    (candidate) => Instances.effectIdentity(candidate.instance, candidate.site) === identity,
-  )
-  const success = available.filter((candidate) => candidate.successEffectIdentity === identity)
-  const recovered = available.filter(
+  const index = effectEnvironmentIndex(layout)
+  const direct = index.direct.get(identity) ?? []
+  const success = index.success.get(identity) ?? []
+  const recovered = (index.representation.get(identity) ?? []).filter(
     (candidate) =>
-      Tir.effectRepresentationIdentity(candidate.site) === identity &&
       owner !== undefined &&
       candidate.instance.declaration.module === owner.declaration.module &&
       candidate.instance.declaration.name === owner.declaration.name &&
@@ -611,10 +663,11 @@ export const ensureEffectRunner = (
   // physical owner and site. Match that identity and the exact execution channels;
   // concreteSpecialization re-solves provider witnesses from these complete runtime
   // arguments; object identity would reject equivalent contextual specializations.
+  const site = effectRunnerSiteKey(type)
   const physical = fn.generatedRunners.filter(
     (candidate) =>
       candidate.providedRequirements.length === 0 &&
-      effectRunnerSiteKey(candidate.type) === effectRunnerSiteKey(type) &&
+      effectRunnerSiteKey(candidate.type) === site &&
       EffectExecutionContract.matches(candidate.type.type, type.type, requirements),
   )
   const base = physical.length === 1 ? physical.at(0) : undefined

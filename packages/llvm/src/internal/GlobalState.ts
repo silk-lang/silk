@@ -95,15 +95,9 @@ export const resolveIndex = (
   index: number,
   operation: string,
 ): Result.Result<number, LlvmError> => {
-  const visited = new globalThis.Set<number>()
+  let visited: globalThis.Set<number> | undefined
   let current = index
   while (true) {
-    if (visited.has(current)) {
-      return Result.fail(
-        invalidInput({ operation, message: 'Global replacement cycle detected', input: index }),
-      )
-    }
-    visited.add(current)
     const description = state.globals.entries.descriptions[current]
     if (description === undefined) {
       return Result.fail(
@@ -111,6 +105,13 @@ export const resolveIndex = (
       )
     }
     if (description.replacement === undefined) return Result.succeed(current)
+    visited ??= new globalThis.Set<number>()
+    if (visited.has(current)) {
+      return Result.fail(
+        invalidInput({ operation, message: 'Global replacement cycle detected', input: index }),
+      )
+    }
+    visited.add(current)
     current = description.replacement
   }
 }
@@ -125,18 +126,17 @@ export const resolve = (
 ): Result.Result<
   { readonly index: number; readonly description: GlobalDescription.GlobalDescription },
   LlvmError
-> =>
-  Result.gen(function* () {
-    const original = yield* Handle.resolve(builder, owner, self, 'Global', operation)
-    const index = yield* resolveIndex(state, original, operation)
-    const description = state.globals.entries.descriptions[index]
-    if (description === undefined || description.deleted) {
-      return yield* Result.fail(
-        invalidInput({ operation, message: 'Global has been deleted', input: self }),
-      )
-    }
-    return { index, description }
-  })
+> => {
+  const original = Handle.resolve(builder, owner, self, 'Global', operation)
+  if (Result.isFailure(original)) return Result.fail(original.failure)
+  const index = resolveIndex(state, original.success, operation)
+  if (Result.isFailure(index)) return Result.fail(index.failure)
+  const description = state.globals.entries.descriptions[index.success]
+  if (description === undefined || description.deleted) {
+    return Result.fail(invalidInput({ operation, message: 'Global has been deleted', input: self }))
+  }
+  return Result.succeed({ index: index.success, description })
+}
 
 /** @internal */
 export const handleAt = (

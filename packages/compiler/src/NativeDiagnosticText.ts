@@ -1,7 +1,4 @@
-import * as Constant from '@silklang/llvm/Constant'
-import * as LlvmType from '@silklang/llvm/Type'
-import * as Variable from '@silklang/llvm/Variable'
-import * as Effect from 'effect/Effect'
+import * as Emitter from '@silklang/llvm/Emitter'
 import { type LineTable, lineTable, positionOf } from './Backend.js'
 import type * as Mir from './Mir.js'
 import type * as NativeDiagnosticContext from './NativeDiagnosticContext.js'
@@ -30,28 +27,28 @@ export const origin = (
 }
 
 /** Emits a static UTF-8 pointer/length pair whose lifetime exceeds every observer reference. */
-export const literal = Effect.fnUntraced(function* (
+export const literal = (
   context: Pick<
     NativeDiagnosticContext.NativeDiagnosticContext,
     'builder' | 'byte' | 'word' | 'literals'
   >,
   value: string,
   name: string,
-) {
+) => {
   const existing = context.literals.get(value)
   if (existing !== undefined) return existing
   const bytes = new TextEncoder().encode(value)
-  const type = yield* LlvmType.array(context.builder, context.byte, bytes.length)
-  const variable = yield* Variable.make(context.builder, `${name}.${context.literals.size}`, type, {
-    initializer: yield* Constant.string(context.builder, bytes),
+  const type = Emitter.arrayType(context.builder, context.byte, bytes.length)
+  const variable = Emitter.variable(context.builder, `${name}.${context.literals.size}`, type, {
+    initializer: Emitter.constantString(context.builder, bytes),
     constant: true,
     linkage: 'internal',
     unnamedAddress: 'unnamed_addr',
   })
   const result = [
-    yield* Constant.fromGlobal(context.builder, yield* Variable.global(context.builder, variable)),
-    yield* Constant.integerUnsigned(context.builder, context.word, BigInt(bytes.length)),
+    Emitter.fromGlobal(context.builder, Emitter.variableGlobal(context.builder, variable)),
+    Emitter.integerUnsigned(context.builder, context.word, BigInt(bytes.length)),
   ] as const
   context.literals.set(value, result)
   return result
-})
+}

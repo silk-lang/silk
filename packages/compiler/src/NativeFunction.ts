@@ -1,14 +1,12 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativeDiagnosticOutcome from './NativeDiagnosticOutcome.js'
 import * as NativeExecutionStorage from './NativeExecutionStorage.js'
 import * as NativeAssemblyOperation from './NativeAssemblyOperation.js'
-import * as Alignment from '@silklang/llvm/Alignment'
 import * as LlvmBlock from '@silklang/llvm/Block'
 import type * as Builder from '@silklang/llvm/Builder'
 import * as Constant from '@silklang/llvm/Constant'
 import * as DISPFlags from '@silklang/llvm/DISPFlags'
 import * as FunctionActor from '@silklang/llvm/Function'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import * as Intrinsic from '@silklang/llvm/Intrinsic'
 import * as LlvmMetadata from '@silklang/llvm/Metadata'
 import type * as LlvmType from '@silklang/llvm/Type'
 import * as Value from '@silklang/llvm/Value'
@@ -283,6 +281,14 @@ const blockLocalReferences = (block: LinearBlock) => {
   return { initial, starting, ending }
 }
 
+export interface ResumeThunk {
+  readonly handle: FunctionActor.Function
+  readonly region: Mir.RunSuspendableEffectRegion
+  readonly owner: NativeLoweringContext.DeclaredFunction
+  readonly frame: Mir.CoroutineFrameTargetLayout
+  readonly layout: Mir.CoroutineFrameTargetStateLayout
+}
+
 export interface EmissionContext {
   readonly runtimeFeatures: Set<Backend.RuntimeFeature>
   readonly builder: Builder.Builder
@@ -331,16 +337,7 @@ export interface EmissionContext {
       readonly owner: NativeLoweringContext.DeclaredFunction
     }
   >
-  readonly resumeThunks: ReadonlyMap<
-    string,
-    {
-      readonly handle: FunctionActor.Function
-      readonly region: Mir.RunSuspendableEffectRegion
-      readonly owner: NativeLoweringContext.DeclaredFunction
-      readonly frame: Mir.CoroutineFrameTargetLayout
-      readonly layout: Mir.CoroutineFrameTargetStateLayout
-    }
-  >
+  readonly resumeThunks: ReadonlyMap<string, ResumeThunk>
   readonly debug: boolean
   readonly compileUnit: LlvmMetadata.Optional
   readonly file: LlvmMetadata.Optional
@@ -396,6 +393,19 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
     debugContext,
     termination,
   } = context
+  // The per-function prologue used to rescan every resume thunk and coroutine frame, which grew
+  // quadratically with the number of emitted functions; group both collections once.
+  const resumesByOwner = new Map<NativeLoweringContext.DeclaredFunction, Array<ResumeThunk>>()
+  for (const resume of resumeThunks.values()) {
+    const owned = resumesByOwner.get(resume.owner)
+    if (owned === undefined) resumesByOwner.set(resume.owner, [resume])
+    else owned.push(resume)
+  }
+  const coroutineFrames = new Map<string, Mir.CoroutineFrameTargetLayout>()
+  for (const frame of program.coroutineFrames?.entries ?? []) {
+    const key = Instances.keyText(frame.function)
+    if (!coroutineFrames.has(key)) coroutineFrames.set(key, frame)
+  }
   for (const entry of declared) {
     yield* Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({
@@ -425,92 +435,85 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
       }
       const scope = subprogram
 
-      yield* FunctionActor.buildBody(
-        builder,
-        entry.handle,
-        Effect.fnUntraced(function* (body) {
+      // Each body is emitted as synchronous Emitter code: one Effect per LLVM operation made the
+      // fiber run loop and generator allocation the largest emission cost (self-hosted build).
+      yield* Emitter.module(builder, (builder) =>
+        Emitter.buildBody(builder, entry.handle, (body) => {
           if (entry.fn.machine !== undefined)
-            return yield* NativeAssemblyOperation.emitNaked(
-              builder,
-              body,
-              entry.fn,
-              program.layout.target,
-            )
+            return NativeAssemblyOperation.emitNaked(builder, body, entry.fn, program.layout.target)
           const suspensionRegions = new Map(
             (entry.fn.suspension?.regions ?? []).map(
               (region) => [region.operation, region] as const,
             ),
           )
-          const resumeControls = [...resumeThunks.values()]
-            .filter((resume) => resume.owner === entry)
+          const resumeControls = (resumesByOwner.get(entry) ?? [])
             .sort((left, right) =>
               suspensionPointKey(left.region.point).localeCompare(
                 suspensionPointKey(right.region.point),
               ),
             )
             .map((resume, ordinal) => ({ ...resume, ordinal: ordinal + 1 }))
-          const coroutineFrame = program.coroutineFrames?.entries.find(
-            (candidate) =>
-              Instances.keyText(candidate.function) === Instances.keyText(entry.fn.instance),
-          )
-          yield* LlvmBlock.make(body, 'entry')
+          const coroutineFrame = coroutineFrames.get(Instances.keyText(entry.fn.instance))
+          Emitter.block(body, 'entry')
           const dispatchBlock = entry.suspendable
-            ? yield* LlvmBlock.make(body, 'suspend_dispatch')
+            ? Emitter.block(body, 'suspend_dispatch')
             : undefined
           const frameReuseBlock =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* LlvmBlock.make(body, 'suspend_invocation_frame_reuse')
+              ? Emitter.block(body, 'suspend_invocation_frame_reuse')
               : undefined
           const frameAllocateBlock =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* LlvmBlock.make(body, 'suspend_invocation_frame_push')
+              ? Emitter.block(body, 'suspend_invocation_frame_push')
               : undefined
           const frameAcquiredBlock =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* LlvmBlock.make(body, 'suspend_invocation_frame_acquired')
+              ? Emitter.block(body, 'suspend_invocation_frame_acquired')
               : undefined
           const frameTrapBlock =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* LlvmBlock.make(body, 'suspend_invocation_frame_trap')
+              ? Emitter.block(body, 'suspend_invocation_frame_trap')
               : undefined
           const framePushedBlock =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* LlvmBlock.make(body, 'suspend_invocation_frame_pushed')
+              ? Emitter.block(body, 'suspend_invocation_frame_pushed')
               : undefined
           const blocks = new Map<number, LlvmBlock.Block>()
           for (const block of entry.linear) {
             blocks.set(
               block.id.ordinal,
-              yield* LlvmBlock.make(
+              Emitter.block(
                 body,
                 `bb${block.id.ordinal}${block.kind === 'Cleanup' ? '_cleanup' : ''}`,
               ),
             )
           }
           const resumeBlocks = new Map(
-            yield* Effect.forEach(resumeControls, (resume) =>
-              Effect.map(
-                LlvmBlock.make(body, `suspend_resume_${resume.ordinal}`),
-                (block) => [suspensionPointKey(resume.region.point), block] as const,
-              ),
+            Array.from(
+              resumeControls,
+              (resume) =>
+                [
+                  suspensionPointKey(resume.region.point),
+                  Emitter.block(body, `suspend_resume_${resume.ordinal}`),
+                ] as const,
             ),
           )
           const invocationFrameStorage =
             entry.suspendable && coroutineFrame !== undefined
-              ? yield* FunctionBody.alloca(body, pointer, 'suspend_invocation_frame_slot')
+              ? Emitter.alloca(body, pointer, 'suspend_invocation_frame_slot')
               : undefined
           const operationState: NativeOperation.State = { trapBlocks: [], checkOrdinal: 0 }
           const diagnostic =
             entry.diagnosticParameter === undefined
               ? undefined
-              : yield* NativeDiagnosticContext.make(
+              : NativeDiagnosticContext.make(
                   builder,
                   body,
                   pointer,
                   i8,
                   integerTypes.get(program.layout.target.pointerSize * 8) ?? i32,
-                  yield* Value.argument(body, entry.diagnosticParameter),
-                  yield* Value.argument(body, entry.diagnosticParameter + 1),
+                  Emitter.argument(body, entry.diagnosticParameter),
+                  Emitter.argument(body, entry.diagnosticParameter + 1),
                 )
           // A transfer-only runner can use the suspension ABI without retaining a
           // resumable frame. Its outcome slots belong to this native invocation;
@@ -518,13 +521,13 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
           if (diagnostic !== undefined && invocationFrameStorage === undefined) {
             for (const outcome of Mir.diagnosticOutcomeLocals(program, entry.fn)) {
               const slot = {
-                storage: yield* FunctionBody.alloca(
+                storage: Emitter.alloca(
                   body,
                   diagnostic.causeType,
                   `diagnostic_outcome${outcome.ordinal}`,
                 ),
               }
-              yield* NativeDiagnosticOutcome.initialize(slot, diagnostic)
+              NativeDiagnosticOutcome.initialize(slot, diagnostic)
               diagnostic.outcomes.set(outcome.ordinal, slot)
             }
           }
@@ -548,9 +551,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             if (NativeValue.classify(program.layout, logicalType) !== 'Direct') continue
             const storage: Array<Value.Input> = []
             for (const [lane, callingLane] of valueLanesFor(logicalType).entries()) {
-              storage.push(
-                yield* FunctionBody.alloca(body, laneType(callingLane), `mut${root}_${lane}`),
-              )
+              storage.push(Emitter.alloca(body, laneType(callingLane), `mut${root}_${lane}`))
             }
             mutableStorage.set(root, storage)
           }
@@ -592,17 +593,14 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
           )) {
             const logicalType = entry.fn.localTypes.at(root)
             if (logicalType?._tag === 'EnvironmentBorrow') {
-              addressStorage.set(
-                root,
-                yield* FunctionBody.alloca(body, pointer, `borrow${root}_slot`),
-              )
+              addressStorage.set(root, Emitter.alloca(body, pointer, `borrow${root}_slot`))
               continue
             }
             if (
               logicalType !== undefined &&
               NativeValue.classify(program.layout, logicalType) === 'Place'
             ) {
-              const place = yield* NativePlace.allocate(
+              const place = NativePlace.allocate(
                 { body, types: nativeTypes, lanePointers },
                 logicalType,
                 `addr${root}`,
@@ -617,12 +615,12 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             if (logicalType === undefined || layout === undefined) {
               throw new RangeError(`Backend lost address-taken value %${root}`)
             }
-            const count = yield* Constant.integerUnsigned(builder, i32, BigInt(layout.size))
+            const count = Emitter.integerUnsigned(builder, i32, BigInt(layout.size))
             addressStorage.set(
               root,
-              yield* FunctionBody.alloca(body, i8, `addr${root}`, {
+              Emitter.alloca(body, i8, `addr${root}`, {
                 count,
-                alignment: yield* Alignment.fromByteUnits(layout.alignment),
+                alignment: Emitter.alignment(body, layout.alignment),
               }),
             )
           }
@@ -665,12 +663,12 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             if (logicalType === undefined)
               throw new RangeError(`Backend lost address root %${root}`)
             if (NativeValue.classify(program.layout, logicalType) !== 'Direct') continue
-            mutableStorage.set(root, yield* NativeStorage.addressLanes(storageContext, root))
-            yield* NativeStorage.storeAddressValues(
+            mutableStorage.set(root, NativeStorage.addressLanes(storageContext, root))
+            NativeStorage.storeAddressValues(
               storageContext,
               root,
-              yield* Effect.forEach(valueLanesFor(logicalType), (lane) =>
-                Constant.nullValue(builder, laneType(lane)),
+              Array.from(valueLanesFor(logicalType), (lane) =>
+                Emitter.nullValue(builder, laneType(lane)),
               ),
               `addr${root}_zero`,
             )
@@ -678,7 +676,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
           const diagnosticScopes =
             diagnostic === undefined
               ? new Map<number, NativeDiagnosticScope.NativeDiagnosticScope>()
-              : yield* NativeDiagnosticScope.prepare({
+              : NativeDiagnosticScope.prepare({
                   builder,
                   body,
                   entry,
@@ -697,14 +695,14 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               throw new RangeError(`Backend lost parameter type %${ordinal}`)
             }
             if (entry.argumentParameters.at(ordinal)?.indirect) {
-              const incoming = yield* Value.argument(body, physicalParameter++)
+              const incoming = Emitter.argument(body, physicalParameter++)
               const destination = NativeStorage.readLocal(storageContext, {
                 _tag: 'Local',
                 ordinal,
               })
               if (destination._tag !== 'NativePlace')
                 throw new RangeError('Canonical parameter lost its local storage')
-              yield* NativePlace.copy(
+              NativePlace.copy(
                 destination,
                 storageContext,
                 NativePlace.make(program.layout, logicalType, incoming),
@@ -713,7 +711,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             }
             const values: Array<Value.Input> = []
             for (let lane = 0, count = lanesFor(logicalType).length; lane < count; lane += 1) {
-              values.push(yield* Value.argument(body, physicalParameter))
+              values.push(Emitter.argument(body, physicalParameter))
               physicalParameter += 1
             }
             if (logicalType._tag === 'EnvironmentBorrow') {
@@ -722,23 +720,23 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
                 throw new RangeError(`Backend lost environment borrow %${ordinal}`)
               const slot = addressStorage.get(ordinal)
               if (slot === undefined) throw new RangeError('Environment borrow lost its entry slot')
-              yield* FunctionBody.store(body, base, slot)
+              Emitter.store(body, base, slot)
               addressStorage.set(ordinal, slot)
               continue
             }
-            yield* NativeStorage.writeLocal(storageContext, ordinal, values)
+            NativeStorage.writeLocal(storageContext, ordinal, values)
             const storage = mutableStorage.get(ordinal)
             if (storage !== undefined) {
               for (const [lane, pointer] of storage.entries()) {
                 const stored = values.at(lane)
-                if (stored !== undefined) yield* FunctionBody.store(body, stored, pointer)
+                if (stored !== undefined) Emitter.store(body, stored, pointer)
               }
             }
             if (
               addressRoots.has(ordinal) &&
               NativeValue.classify(program.layout, logicalType) === 'Direct'
             ) {
-              yield* NativeStorage.storeAddressValues(
+              NativeStorage.storeAddressValues(
                 storageContext,
                 ordinal,
                 values,
@@ -749,22 +747,22 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
           if (entry.diagnosticParameter !== undefined) physicalParameter += 2
           if (entry.resultStorage !== undefined) physicalParameter += 1
           const transferPointer = entry.suspendable
-            ? yield* Value.argument(body, physicalParameter)
+            ? Emitter.argument(body, physicalParameter)
             : undefined
           const resumeFrame = entry.suspendable
-            ? yield* Value.argument(body, physicalParameter + 1)
+            ? Emitter.argument(body, physicalParameter + 1)
             : undefined
           const resumePath = entry.suspendable
-            ? yield* Value.argument(body, physicalParameter + 2)
+            ? Emitter.argument(body, physicalParameter + 2)
             : undefined
           const initialBlock = blocks.get(entry.fn.entry.ordinal)
           if (initialBlock === undefined) throw new RangeError('Native function has no entry block')
-          const completion = yield* NativeReturn.makeCompletion(
+          const completion = NativeReturn.makeCompletion(
             storageContext,
             entry,
             diagnostic !== undefined && diagnostic.outcomes.size > 0,
           )
-          yield* FunctionBody.branch(body, dispatchBlock ?? initialBlock)
+          Emitter.branch(body, dispatchBlock ?? initialBlock)
           if (entry.suspendable) {
             const entryBlock = blocks.get(entry.fn.entry.ordinal)
             if (
@@ -774,7 +772,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               entryBlock === undefined
             )
               throw new RangeError('LLVM suspension dispatch lost its entry state')
-            yield* LlvmBlock.setInsertionPoint(body, dispatchBlock)
+            Emitter.setInsertionPoint(body, dispatchBlock)
             if (coroutineFrame !== undefined) {
               if (
                 invocationFrameStorage === undefined ||
@@ -788,32 +786,32 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
                 framePushedBlock === undefined
               )
                 throw new RangeError('LLVM coroutine-frame stack lost private storage support')
-              const resumeAddress = yield* FunctionBody.cast(
+              const resumeAddress = Emitter.cast(
                 body,
                 'ptrtoint',
                 resumeFrame,
                 usizeType,
                 'suspend_resume_frame_address',
               )
-              yield* FunctionBody.conditionalBranch(
+              Emitter.conditionalBranch(
                 body,
-                yield* FunctionBody.integerCompare(
+                Emitter.integerCompare(
                   body,
                   'ne',
                   resumeAddress,
-                  yield* Constant.integerUnsigned(builder, usizeType, 0n),
+                  Emitter.integerUnsigned(builder, usizeType, 0n),
                   'suspend_has_reusable_frame',
                 ),
                 frameReuseBlock,
                 frameAllocateBlock,
               )
-              yield* LlvmBlock.setInsertionPoint(body, frameReuseBlock)
-              yield* FunctionBody.store(body, resumeFrame, invocationFrameStorage)
-              yield* FunctionBody.branch(body, frameAcquiredBlock)
-              yield* LlvmBlock.setInsertionPoint(body, frameAllocateBlock)
-              const state = yield* NativeExecutionStorage.ensure(
+              Emitter.setInsertionPoint(body, frameReuseBlock)
+              Emitter.store(body, resumeFrame, invocationFrameStorage)
+              Emitter.branch(body, frameAcquiredBlock)
+              Emitter.setInsertionPoint(body, frameAllocateBlock)
+              const state = NativeExecutionStorage.ensure(
                 { builder, body, pointer, usizeType, storage: executionStorage },
-                yield* NativeLanePointer.lanePointer(
+                NativeLanePointer.lanePointer(
                   lanePointers,
                   body,
                   transferPointer,
@@ -822,17 +820,17 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
                 ),
                 'suspend_storage',
               )
-              const allocatedFrame = yield* NativeExecutionStorage.invoke(
+              const allocatedFrame = NativeExecutionStorage.invoke(
                 { builder, body, pointer, storage: executionStorage },
                 'acquire',
                 [
                   state,
-                  yield* Constant.integerUnsigned(
+                  Emitter.integerUnsigned(
                     builder,
                     usizeType,
                     BigInt(Math.max(coroutineFrame.size, 1)),
                   ),
-                  yield* Constant.integerUnsigned(
+                  Emitter.integerUnsigned(
                     builder,
                     usizeType,
                     BigInt(Math.max(coroutineFrame.alignment, 1)),
@@ -842,31 +840,26 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               )
               if (allocatedFrame === undefined)
                 throw new RangeError('LLVM private frame allocation returned no pointer')
-              const exhausted = yield* FunctionBody.integerCompare(
+              const exhausted = Emitter.integerCompare(
                 body,
                 'eq',
-                yield* FunctionBody.cast(
+                Emitter.cast(
                   body,
                   'ptrtoint',
                   allocatedFrame,
                   usizeType,
                   'suspend_invocation_frame_address',
                 ),
-                yield* Constant.integerUnsigned(builder, usizeType, 0n),
+                Emitter.integerUnsigned(builder, usizeType, 0n),
                 'suspend_invocation_frame_exhausted',
               )
-              yield* FunctionBody.store(body, allocatedFrame, invocationFrameStorage)
-              yield* FunctionBody.conditionalBranch(
-                body,
-                exhausted,
-                frameTrapBlock,
-                framePushedBlock,
-              )
-              yield* LlvmBlock.setInsertionPoint(body, frameTrapBlock)
-              yield* Intrinsic.call(body, 'trap', [], [])
-              yield* FunctionBody.unreachable(body)
-              yield* LlvmBlock.setInsertionPoint(body, framePushedBlock)
-              const pushedFrame = yield* FunctionBody.load(
+              Emitter.store(body, allocatedFrame, invocationFrameStorage)
+              Emitter.conditionalBranch(body, exhausted, frameTrapBlock, framePushedBlock)
+              Emitter.setInsertionPoint(body, frameTrapBlock)
+              Emitter.intrinsicCall(body, 'trap', [], [])
+              Emitter.unreachable(body)
+              Emitter.setInsertionPoint(body, framePushedBlock)
+              const pushedFrame = Emitter.load(
                 body,
                 pointer,
                 invocationFrameStorage,
@@ -874,9 +867,9 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               )
               if (diagnostic !== undefined) {
                 for (const field of coroutineFrame.diagnosticOutcomes) {
-                  yield* NativeDiagnosticOutcome.initialize(
+                  NativeDiagnosticOutcome.initialize(
                     {
-                      storage: yield* NativeLanePointer.lanePointer(
+                      storage: NativeLanePointer.lanePointer(
                         lanePointers,
                         body,
                         pushedFrame,
@@ -890,16 +883,16 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               }
               for (const [root, field] of stableAddressFields) {
                 if (root >= entry.fn.parameterCount) continue
-                yield* NativeFrame.retain(
+                NativeFrame.retain(
                   storageContext,
                   pushedFrame,
                   field,
                   `suspend_parameter_root${root}`,
                 )
               }
-              yield* FunctionBody.branch(body, frameAcquiredBlock)
-              yield* LlvmBlock.setInsertionPoint(body, frameAcquiredBlock)
-              const invocationFrame = yield* FunctionBody.load(
+              Emitter.branch(body, frameAcquiredBlock)
+              Emitter.setInsertionPoint(body, frameAcquiredBlock)
+              const invocationFrame = Emitter.load(
                 body,
                 pointer,
                 invocationFrameStorage,
@@ -908,7 +901,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               if (diagnostic !== undefined) {
                 for (const field of coroutineFrame.diagnosticOutcomes) {
                   diagnostic.outcomes.set(field.outcome.ordinal, {
-                    storage: yield* NativeLanePointer.lanePointer(
+                    storage: NativeLanePointer.lanePointer(
                       lanePointers,
                       body,
                       invocationFrame,
@@ -924,7 +917,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
                   throw new RangeError('Persistent diagnostic descriptor lost its scope')
                 diagnosticScopes.set(field.scope.ordinal, {
                   ...scope,
-                  record: yield* NativeLanePointer.lanePointer(
+                  record: NativeLanePointer.lanePointer(
                     lanePointers,
                     body,
                     invocationFrame,
@@ -936,11 +929,11 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               for (const [root, field] of stableAddressFields) {
                 addressStorage.set(
                   root,
-                  yield* FunctionBody.getElementPtr(
+                  Emitter.getElementPtr(
                     body,
                     i8,
                     invocationFrame,
-                    [yield* Constant.integerUnsigned(builder, i32, BigInt(field.offset))],
+                    [Emitter.integerUnsigned(builder, i32, BigInt(field.offset))],
                     `suspend_stable_root${root}`,
                   ),
                 )
@@ -949,21 +942,21 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
                   rootType !== undefined &&
                   NativeValue.classify(program.layout, rootType) === 'Direct'
                 )
-                  mutableStorage.set(root, yield* NativeStorage.addressLanes(storageContext, root))
+                  mutableStorage.set(root, NativeStorage.addressLanes(storageContext, root))
               }
             }
-            const dispatch = yield* FunctionBody.switchTerminator(body, resumePath, entryBlock)
+            const dispatch = Emitter.switchTerminator(body, resumePath, entryBlock)
             for (const resume of resumeControls) {
               const target = resumeBlocks.get(suspensionPointKey(resume.region.point))
               if (target === undefined) throw new RangeError('LLVM suspension lost resume block')
-              yield* FunctionBody.addSwitchCase(
+              Emitter.addSwitchCase(
                 body,
                 dispatch,
-                yield* Constant.integerUnsigned(builder, i32, BigInt(resume.ordinal)),
+                Emitter.integerUnsigned(builder, i32, BigInt(resume.ordinal)),
                 target,
               )
             }
-            yield* FunctionBody.sealSwitch(body, dispatch)
+            Emitter.sealSwitch(body, dispatch)
           }
           const debugLocation: NativeDebug.LocationContext = {
             builder,
@@ -1155,7 +1148,7 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               if (mutableRoots.has(root)) storageContext.blockRoots.add(root)
             }
             for (const root of frameRoots) storageContext.blockRoots.add(root)
-            yield* LlvmBlock.setInsertionPoint(body, blockHandle)
+            Emitter.setInsertionPoint(body, blockHandle)
             if (diagnostic !== undefined) {
               const recovered = block.recoveryOutcomes?.at(-1)
               const slot =
@@ -1165,24 +1158,22 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
               let cause =
                 block.recoveryBoundary === undefined
                   ? diagnostic.incomingCause
-                  : yield* Constant.nullValue(builder, diagnostic.causeType)
-              if (slot !== undefined)
-                cause = yield* NativeDiagnosticOutcome.borrow(slot, diagnostic)
-              yield* FunctionBody.store(body, cause, diagnostic.cause)
+                  : Emitter.nullValue(builder, diagnostic.causeType)
+              if (slot !== undefined) cause = NativeDiagnosticOutcome.borrow(slot, diagnostic)
+              Emitter.store(body, cause, diagnostic.cause)
             }
-            if (blockOrdinal > 0)
-              yield* NativeStorage.reloadRoots(storageContext, `b${block.id.ordinal}`)
+            if (blockOrdinal > 0) NativeStorage.reloadRoots(storageContext, `b${block.id.ordinal}`)
             for (const [operationOrdinal, operation] of block.operations.entries()) {
               for (const root of references.starting.get(operationOrdinal) ?? []) {
                 if (mutableRoots.has(root)) storageContext.blockRoots.add(root)
               }
-              yield* NativeOperation.emit(operationContext, operation)
+              NativeOperation.emit(operationContext, operation)
               const destination = destinationOf(operation)
               if (destination !== undefined && mutableRoots.has(destination.ordinal)) {
-                yield* NativeStorage.commitLocal(storageContext, destination)
+                NativeStorage.commitLocal(storageContext, destination)
               }
               if (diagnostic?.sourceState.dirty === true) {
-                yield* NativeStorage.reloadAddressRoots(storageContext)
+                NativeStorage.reloadAddressRoots(storageContext)
                 diagnostic.sourceState.dirty = false
               }
               for (const root of references.ending.get(operationOrdinal) ?? []) {
@@ -1191,10 +1182,10 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             }
             const terminalAssembly = block.operations.at(-1)
             if (terminalAssembly?._tag === 'NativeAssembly' && terminalAssembly.assembly.noReturn) {
-              yield* FunctionBody.unreachable(body)
+              Emitter.unreachable(body)
               continue
             }
-            yield* NativeControl.emit(
+            NativeControl.emit(
               {
                 builder,
                 body,
@@ -1215,8 +1206,8 @@ export const emitBodies = Effect.fn('NativeFunction.emitBodies')(function* (
             )
           }
 
-          yield* NativeTermination.emitTrapBlocks(terminationContext)
-          yield* NativeReturn.emitCompletion(suspensionReturnContext)
+          NativeTermination.emitTrapBlocks(terminationContext)
+          NativeReturn.emitCompletion(suspensionReturnContext)
         }),
       )
     }).pipe(Effect.withSpan('NativeFunction.emitBodies_entry'))

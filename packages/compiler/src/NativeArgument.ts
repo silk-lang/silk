@@ -1,5 +1,4 @@
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import type * as Layout from './Layout.js'
 import type * as Mir from './Mir.js'
 import * as NativePlace from './NativePlace.js'
@@ -52,28 +51,24 @@ export const fromLocals = (
   values: locals.map((local) => NativeStorage.readLocal(storage, local)),
 })
 
-export const materialize = Effect.fnUntraced(function* (
-  context: NativePlace.Context,
-  args: NativeArgument,
-  tag: string,
-) {
+export const materialize = (context: NativePlace.Context, args: NativeArgument, tag: string) => {
   if (args._tag === 'Materialized') return args.values
   const values: Array<Value.Input> = []
   for (const [ordinal, value] of args.values.entries()) {
     if (value._tag === 'Direct') values.push(...value.values)
     else if (value._tag === 'NativePlace')
-      values.push(...(yield* NativePlace.loadLanes(value, context, `${tag}_${ordinal}`)))
+      values.push(...NativePlace.loadLanes(value, context, `${tag}_${ordinal}`))
   }
   return values
-})
+}
 
 /** Lowers one complete logical argument list into the declared physical ABI. */
-export const lower = Effect.fnUntraced(function* (
+export const lower = (
   context: NativePlace.Context,
   parameters: ReadonlyArray<Parameter>,
   args: NativeArgument,
   tag: string,
-) {
+) => {
   const values: Array<NativeValue.NativeValue> = []
   if (args._tag === 'Values') values.push(...args.values)
   else {
@@ -98,19 +93,19 @@ export const lower = Effect.fnUntraced(function* (
       if (value._tag === 'NativePlace') {
         const expected = NativePlace.make(context.types.program.layout, parameter.type, value.base)
         if (value.view === expected.view && value.representation === expected.representation) {
-          output.push(yield* NativePlace.base(value, context, `${tag}_${ordinal}_base`))
+          output.push(NativePlace.base(value, context, `${tag}_${ordinal}_base`))
           continue
         }
       }
-      const temporary = yield* NativePlace.allocate(
+      const temporary = NativePlace.allocate(
         context,
         parameter.type,
         `${tag}_${ordinal}_argument`,
         'entry',
       )
-      if (value._tag === 'NativePlace') yield* NativePlace.transfer(temporary, context, value)
+      if (value._tag === 'NativePlace') NativePlace.transfer(temporary, context, value)
       else
-        yield* NativePlace.storeLanes(
+        NativePlace.storeLanes(
           temporary,
           context,
           value._tag === 'Empty' ? [] : value.values,
@@ -118,7 +113,7 @@ export const lower = Effect.fnUntraced(function* (
         )
       output.push(temporary.base)
     } else if (value._tag === 'NativePlace') {
-      output.push(...(yield* NativePlace.loadLanes(value, context, `${tag}_${ordinal}_load`)))
+      output.push(...NativePlace.loadLanes(value, context, `${tag}_${ordinal}_load`))
     } else {
       const lanes = value._tag === 'Empty' ? [] : value.values
       if (lanes.length !== parameter.lanes.length)
@@ -127,15 +122,15 @@ export const lower = Effect.fnUntraced(function* (
     }
   }
   return output
-})
+}
 
 /** Projects capture-time snapshots, never the original locals from which they were constructed. */
-export const captures = Effect.fnUntraced(function* (
+export const captures = (
   storage: NativeStorage.Context,
   parameters: ReadonlyArray<Parameter>,
   effect: Mir.LocalId,
   arguments_: ReadonlyArray<Mir.LocalId>,
-) {
+) => {
   const type = storage.fn.localTypes.at(effect.ordinal)
   if (type?._tag !== 'EffectValue')
     throw new RangeError('Native Effect arguments lost their capture identity')
@@ -147,8 +142,8 @@ export const captures = Effect.fnUntraced(function* (
     type.environment.fields.some((field) => field.representation === 'Borrow')
   ) {
     return fromValues([
-      ...(yield* NativeStorage.materialize(storage, effect)),
-      ...(yield* NativeStorage.materializeArguments(storage, arguments_)).flat(),
+      ...NativeStorage.materialize(storage, effect),
+      ...NativeStorage.materializeArguments(storage, arguments_).flat(),
     ])
   }
   const values: Array<NativeValue.NativeValue> = []
@@ -156,7 +151,7 @@ export const captures = Effect.fnUntraced(function* (
     const parameter = parameters.at(ordinal)
     if (parameter === undefined) throw new RangeError('Native capture lost its parameter')
     values.push(
-      yield* NativePlace.project(
+      NativePlace.project(
         captured,
         storage,
         parameter.type,
@@ -167,4 +162,4 @@ export const captures = Effect.fnUntraced(function* (
   }
   values.push(...arguments_.map((local) => NativeStorage.readLocal(storage, local)))
   return { _tag: 'Values', values } satisfies NativeArgument
-})
+}

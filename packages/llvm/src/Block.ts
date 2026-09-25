@@ -59,14 +59,13 @@ export interface Block extends Handle.Handle<'Block'> {}
  * @category blocks
  * @since 0.0.0
  */
-export const make = Effect.fnUntraced(function* (
+export const make = (
   body: FunctionBody.FunctionBody,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Block, LlvmError> {
-  return yield* FunctionBodyState.mutate(body, 'Block.make', (draft) =>
+): Effect.Effect<Block, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Block.make', (draft) =>
     Result.succeed(FunctionBodyState.makeBlock(draft, name)),
   )
-})
 
 /**
  * Directs subsequent instructions to this non-terminated block.
@@ -74,14 +73,13 @@ export const make = Effect.fnUntraced(function* (
  * @category blocks
  * @since 0.0.0
  */
-export const setInsertionPoint = Effect.fnUntraced(function* (
+export const setInsertionPoint = (
   body: FunctionBody.FunctionBody,
   self: Block,
-): Effect.fn.Return<void, LlvmError> {
-  yield* FunctionBodyState.mutate(body, 'Block.setInsertionPoint', (draft) =>
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Block.setInsertionPoint', (draft) =>
     FunctionBodyState.setCursor(draft, self),
   )
-})
 
 /**
  * Returns the block's zero-based function-local index.

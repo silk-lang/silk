@@ -1,8 +1,5 @@
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import * as LlvmType from '@silklang/llvm/Type'
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as FloatingPoint from './FloatingPoint.js'
 import * as Layout from './Layout.js'
 import * as Mir from './Mir.js'
@@ -34,7 +31,7 @@ type Operation = Extract<
   }
 >
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const {
     arith,
     body,
@@ -86,7 +83,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             ),
           )
         }
-        const { address, type } = yield* NativePlaceAddress.resolve(
+        const { address, type } = NativePlaceAddress.resolve(
           context,
           operation.scrutinee,
           selectors,
@@ -95,11 +92,11 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         if (operation.type._tag === 'EnvironmentBorrow') {
           const slot = nativeStorage.addressStorage.get(operation.destination.ordinal)
           if (slot === undefined) throw new RangeError('Borrowed match lost its entry slot')
-          yield* FunctionBody.store(body, address, slot)
+          Emitter.store(body, address, slot)
         } else {
           // The successful match proves the variant. Project its canonical field directly;
           // converting the whole union would redispatch every variant for every binding.
-          yield* NativeStorage.receivePlace(
+          NativeStorage.receivePlace(
             nativeStorage,
             operation.destination,
             NativePlace.stored(context.program.layout, type, address),
@@ -120,14 +117,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const targetLanes = NativeType.lanesFor(types, operation.type)
       const selected: Array<Value.Input> = []
       for (const [targetOrdinal, ordinal] of physical.entries()) {
-        const value = yield* NativeStorage.readLane(nativeStorage, operation.scrutinee, ordinal)
+        const value = NativeStorage.readLane(nativeStorage, operation.scrutinee, ordinal)
         const sourceLane = sourceLanes.at(ordinal)
         const targetLane = targetLanes.at(targetOrdinal)
         if (value === undefined || sourceLane === undefined || targetLane === undefined) {
           continue
         }
         selected.push(
-          yield* NativeArith.coerceLane(
+          NativeArith.coerceLane(
             arith.lane,
             value,
             sourceLane,
@@ -141,48 +138,42 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `LLVM match binding %${operation.destination.ordinal} disagrees with its payload lanes (${physical.length} selected, ${targetLanes.length} required)`,
         )
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, selected)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, selected)
       break
     }
     case 'EnumConstant': {
       const lane = NativeType.lanesFor(types, operation.type).at(0)
       if (lane === undefined) throw new RangeError('LLVM enum constant lost its lane')
       const physicalType = NativeType.laneType(types, lane)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
         operation.representation.signedness === 'Signed'
-          ? yield* Constant.integerSigned(builder, physicalType, operation.discriminant)
-          : yield* Constant.integerUnsigned(builder, physicalType, operation.discriminant),
+          ? Emitter.integerSigned(builder, physicalType, operation.discriminant)
+          : Emitter.integerUnsigned(builder, physicalType, operation.discriminant),
       ])
       break
     }
     case 'EnumValue': {
-      yield* NativeStorage.writeLocal(
+      NativeStorage.writeLocal(
         nativeStorage,
         operation.destination.ordinal,
-        yield* NativeStorage.materialize(nativeStorage, operation.source),
+        NativeStorage.materialize(nativeStorage, operation.source),
       )
       break
     }
     case 'EnumEquality': {
-      const left = (yield* NativeStorage.materialize(nativeStorage, operation.left)).at(0)
-      const right = (yield* NativeStorage.materialize(nativeStorage, operation.right)).at(0)
+      const left = NativeStorage.materialize(nativeStorage, operation.left).at(0)
+      const right = NativeStorage.materialize(nativeStorage, operation.right).at(0)
       if (left === undefined || right === undefined)
         throw new RangeError('LLVM enum equality lost an operand lane')
-      const compared = yield* FunctionBody.integerCompare(
+      const compared = Emitter.integerCompare(
         body,
         operation.negated ? 'ne' : 'eq',
         left,
         right,
         `enum${operation.destination.ordinal}_${operation.negated ? 'not_equal' : 'equal'}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
-        yield* FunctionBody.cast(
-          body,
-          'zext',
-          compared,
-          i32,
-          `enum${operation.destination.ordinal}_result`,
-        ),
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+        Emitter.cast(body, 'zext', compared, i32, `enum${operation.destination.ordinal}_result`),
       ])
       break
     }
@@ -193,8 +184,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const semantic = Mir.semanticType(operation.type)
       const floating = typeof semantic === 'string' ? Scalar.find(semantic) : undefined
       if (floating?.category === 'Floating') {
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
-          yield* Constant.floatingRaw(
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+          Emitter.floatingRaw(
             builder,
             physicalType,
             floating.spelling === 'f32' ? 'float' : 'double',
@@ -208,10 +199,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       }
       const unsigned =
         typeof semantic === 'string' && Scalar.find(semantic)?.signedness === 'Unsigned'
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
         unsigned
-          ? yield* Constant.integerUnsigned(builder, physicalType, BigInt(operation.value))
-          : yield* Constant.integerSigned(builder, physicalType, BigInt(operation.value)),
+          ? Emitter.integerUnsigned(builder, physicalType, BigInt(operation.value))
+          : Emitter.integerSigned(builder, physicalType, BigInt(operation.value)),
       ])
       break
     }
@@ -220,9 +211,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (address === undefined || usizeType === undefined) {
         throw new RangeError('LLVM static view lost its data placement or usize type')
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
         address,
-        yield* Constant.integerUnsigned(builder, usizeType, operation.length),
+        Emitter.integerUnsigned(builder, usizeType, operation.length),
       ])
       break
     }
@@ -231,45 +222,39 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (address === undefined || usizeType === undefined) {
         throw new RangeError('LLVM static string lost its data placement or usize type')
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
         address,
-        yield* Constant.integerUnsigned(builder, usizeType, operation.byteLength),
+        Emitter.integerUnsigned(builder, usizeType, operation.byteLength),
       ])
       break
     }
     case 'StringFromUtf8Unchecked': {
-      yield* NativeStorage.writeLocal(
+      NativeStorage.writeLocal(
         nativeStorage,
         operation.destination.ordinal,
-        yield* NativeStorage.materialize(nativeStorage, operation.bytes),
+        NativeStorage.materialize(nativeStorage, operation.bytes),
       )
       break
     }
     case 'StringUtf8Bytes': {
-      yield* NativeStorage.writeLocal(
+      NativeStorage.writeLocal(
         nativeStorage,
         operation.destination.ordinal,
-        yield* NativeStorage.materialize(nativeStorage, operation.string),
+        NativeStorage.materialize(nativeStorage, operation.string),
       )
       break
     }
     case 'StringByteLength': {
-      const length = (yield* NativeStorage.materialize(nativeStorage, operation.string)).at(1)
+      const length = NativeStorage.materialize(nativeStorage, operation.string).at(1)
       if (length === undefined) {
         throw new RangeError('LLVM string lost its byte-length lane')
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [length])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [length])
       break
     }
     case 'StringEqualsExact': {
-      const [leftAddress, leftLength] = yield* NativeStorage.materialize(
-        nativeStorage,
-        operation.left,
-      )
-      const [rightAddress, rightLength] = yield* NativeStorage.materialize(
-        nativeStorage,
-        operation.right,
-      )
+      const [leftAddress, leftLength] = NativeStorage.materialize(nativeStorage, operation.left)
+      const [rightAddress, rightLength] = NativeStorage.materialize(nativeStorage, operation.right)
       if (
         leftAddress === undefined ||
         leftLength === undefined ||
@@ -280,22 +265,22 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       ) {
         throw new RangeError('LLVM string equality lost its lanes or runtime helper')
       }
-      const lengthsEqual = yield* FunctionBody.integerCompare(
+      const lengthsEqual = Emitter.integerCompare(
         body,
         'eq',
         leftLength,
         rightLength,
         `string${operation.destination.ordinal}_lengths_equal`,
       )
-      const zeroLength = yield* Constant.integerUnsigned(builder, usizeType, 0n)
-      const comparedLength = yield* FunctionBody.select(
+      const zeroLength = Emitter.integerUnsigned(builder, usizeType, 0n)
+      const comparedLength = Emitter.select(
         body,
         lengthsEqual,
         leftLength,
         zeroLength,
         `string${operation.destination.ordinal}_compared_length`,
       )
-      const compared = yield* FunctionBody.callDirect(
+      const compared = Emitter.callDirect(
         body,
         memcmp,
         [leftAddress, rightAddress, comparedLength],
@@ -304,15 +289,15 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (compared === undefined) {
         throw new RangeError('LLVM string equality produced no comparison result')
       }
-      const zero = yield* Constant.integerSigned(builder, i32, 0n)
-      const bytesEqual = yield* FunctionBody.integerCompare(
+      const zero = Emitter.integerSigned(builder, i32, 0n)
+      const bytesEqual = Emitter.integerCompare(
         body,
         'eq',
         compared,
         zero,
         `string${operation.destination.ordinal}_bytes_equal`,
       )
-      const exact = yield* FunctionBody.binary(
+      const exact = Emitter.binary(
         body,
         'and',
         lengthsEqual,
@@ -320,25 +305,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `string${operation.destination.ordinal}_exact`,
       )
       const selected = operation.negated
-        ? yield* FunctionBody.integerCompare(
+        ? Emitter.integerCompare(
             body,
             'eq',
             exact,
-            yield* Constant.integerUnsigned(builder, yield* LlvmType.integer(builder, 1), 0n),
+            Emitter.integerUnsigned(builder, Emitter.integerType(builder, 1), 0n),
             `string${operation.destination.ordinal}_negated`,
           )
         : exact
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
-        yield* FunctionBody.cast(
-          body,
-          'zext',
-          selected,
-          i32,
-          `string${operation.destination.ordinal}_result`,
-        ),
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+        Emitter.cast(body, 'zext', selected, i32, `string${operation.destination.ordinal}_result`),
       ])
       break
     }
   }
   context.state.checkOrdinal = checkOrdinal
-})
+}

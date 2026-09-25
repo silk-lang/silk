@@ -5,13 +5,7 @@ import type { LlvmError } from '../../LlvmError.js'
 import type * as ValueActor from '../../Value.js'
 import * as FunctionBodyDescription from '../FunctionBodyDescription.js'
 import * as Handle from '../Handle.js'
-import {
-  type Draft,
-  fail,
-  instructionEntries,
-  type MutableBlock,
-  valueEntries,
-} from './primitives.js'
+import { type Draft, fail, localName, type MutableBlock, noAttachments } from './primitives.js'
 
 /**
  * Construction's measured per-instruction append/validation loop. Direct Result transitions
@@ -47,15 +41,19 @@ export const appendInstruction = (
   const index = draft.instructions.length
   const handle = Handle.make('Instruction', draft.owner, index)
   draft.instructions.push(instruction)
-  draft.metadata.push([])
+  draft.metadata.push(noAttachments)
   draft.debugLocations.push(undefined)
   draft.instructionHandles.push(handle)
   cursor.success.block.instructions.push(index)
-  instructionEntries.set(handle, { owner: draft.owner, index })
   return Result.succeed(handle)
 }
 
-/** @internal */
+/**
+ * Appends a result-producing instruction and returns its value. Most results are only used as
+ * values, so the instruction handle is minted lazily by `instructionHandleAt`.
+ *
+ * @internal
+ */
 export const appendResult = (
   draft: Draft,
   type: number,
@@ -64,31 +62,42 @@ export const appendResult = (
     result: number,
     name: ByteString.ByteString,
   ) => FunctionBodyDescription.Instruction,
-): Result.Result<
-  { readonly value: ValueActor.Value; readonly instruction: FunctionBodyActor.Instruction },
-  LlvmError
-> => {
+): Result.Result<ValueActor.Value, LlvmError> => {
   const cursor = currentBlock(draft, 'FunctionBody.appendResult')
   if (Result.isFailure(cursor)) return Result.fail(cursor.failure)
   const result = draft.values.length
   const instructionIndex = draft.instructions.length
-  const finalName = ByteString.coerceOrEmpty(name)
+  const finalName = localName(draft, name)
   const value = Handle.make('Value', draft.owner, result)
-  const instruction = Handle.make('Instruction', draft.owner, instructionIndex)
   draft.values.push({
     type,
     name: finalName,
     source: { _tag: 'Instruction', instruction: instructionIndex },
   })
   draft.valueHandles.push(value)
-  valueEntries.set(value, { owner: draft.owner, index: result })
   draft.instructions.push(makeInstruction(result, finalName))
-  draft.metadata.push([])
+  draft.metadata.push(noAttachments)
   draft.debugLocations.push(undefined)
-  draft.instructionHandles.push(instruction)
+  draft.instructionHandles.push(undefined)
   cursor.success.block.instructions.push(instructionIndex)
-  instructionEntries.set(instruction, { owner: draft.owner, index: instructionIndex })
-  return Result.succeed({ value, instruction })
+  return Result.succeed(value)
+}
+
+/** @internal */
+export const instructionHandleAt = (
+  draft: Draft,
+  index: number,
+  operation: string,
+): Result.Result<FunctionBodyActor.Instruction, LlvmError> => {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= draft.instructions.length) {
+    return fail(operation, 'Instruction table handle is missing', index)
+  }
+  let handle = draft.instructionHandles[index]
+  if (handle === undefined) {
+    handle = Handle.make('Instruction', draft.owner, index)
+    draft.instructionHandles[index] = handle
+  }
+  return Result.succeed(handle)
 }
 
 /** @internal */
@@ -118,8 +127,9 @@ const validateOperand = (
 const validateInstructionOperands = (
   draft: Draft,
   instruction: FunctionBodyDescription.Instruction,
+  operands: Array<FunctionBodyDescription.Operand>,
 ): Result.Result<void, LlvmError> => {
-  const operands: Array<FunctionBodyDescription.Operand> = []
+  operands.length = 0
   switch (instruction._tag) {
     case 'Unary':
     case 'Cast':
@@ -182,15 +192,12 @@ const validateInstructionOperands = (
       operands.push(instruction.value)
       break
     case 'Phi':
-      operands.push(...instruction.incoming.map((entry) => entry.value))
+      for (const entry of instruction.incoming) operands.push(entry.value)
       break
     case 'Invoke':
     case 'Call':
-      operands.push(
-        instruction.callee,
-        ...instruction.arguments,
-        ...instruction.operandBundles.flatMap((bundle) => bundle.operands),
-      )
+      operands.push(instruction.callee, ...instruction.arguments)
+      for (const bundle of instruction.operandBundles) operands.push(...bundle.operands)
       break
     case 'LandingPad':
     case 'Branch':
@@ -208,8 +215,10 @@ const validateInstructionOperands = (
 
 /** @internal */
 export const validateInstructions = (draft: Draft): Result.Result<void, LlvmError> => {
+  // One scratch list for every instruction: commit validation visits each emitted instruction.
+  const operands: Array<FunctionBodyDescription.Operand> = []
   for (const instruction of draft.instructions) {
-    const validated = validateInstructionOperands(draft, instruction)
+    const validated = validateInstructionOperands(draft, instruction, operands)
     if (Result.isFailure(validated)) return Result.fail(validated.failure)
   }
   for (let valueIndex = 0; valueIndex < draft.values.length; valueIndex += 1) {

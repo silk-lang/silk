@@ -5,44 +5,38 @@ import type * as Builder from '../../Builder.js'
 import * as ByteString from '../../ByteString.js'
 import type * as FunctionBodyActor from '../../FunctionBody.js'
 import { invalidInput, invalidState, type LlvmError } from '../../LlvmError.js'
+import * as Type from '../../Type.js'
 import type * as ValueActor from '../../Value.js'
 import * as BuilderState from '../BuilderState.js'
-import * as CanonicalKey from '../CanonicalKey.js'
 import * as FunctionBodyDescription from '../FunctionBodyDescription.js'
 import * as Handle from '../Handle.js'
 import type * as OwnedHandle from '../OwnedHandle.js'
 import type * as TypeDescription from '../TypeDescription.js'
-import { validateInstructions } from './InstructionEncoder.js'
+import { instructionHandleAt, validateInstructions } from './InstructionEncoder.js'
 import {
   assertActive,
-  blockEntries,
   type Draft,
   drafts,
   fail,
-  instructionEntries,
-  localEntry,
-  lookup,
+  localIndex,
+  localName,
   type OperandInput,
-  phiEntries,
-  switchEntries,
-  type SwitchEntry,
-  valueEntries,
 } from './primitives.js'
 
-/** @internal */
-export const create = (
-  builder: Builder.Builder,
-  moduleOwner: OwnedHandle.Owner,
+/** Creates an active draft for one function body transaction. @internal */
+export const makeDraft = (
+  context: BuilderState.Context,
   functionIndex: number,
   functionType: number,
   signature: Extract<TypeDescription.Description, { readonly _tag: 'Function' }>,
   creatorFiber: number,
-): FunctionBodyActor.FunctionBody => {
+): Draft => {
   const owner: OwnedHandle.Owner = { token: Symbol('llvm-function-body-owner') }
-  const self = Handle.make('FunctionBody', owner, 0)
   const draft: Draft = {
-    builder,
-    moduleOwner,
+    builder: context.builder,
+    moduleOwner: context.owner,
+    module: context.state,
+    context,
     owner,
     functionIndex,
     functionType,
@@ -56,6 +50,8 @@ export const create = (
     instructions: [],
     openPhis: new Map(),
     instructionHandles: [],
+    switchBlocks: new Map(),
+    localOperands: [],
     values: [],
     valueHandles: [],
     metadata: [],
@@ -73,8 +69,20 @@ export const create = (
     })
     draft.valueHandles.push(handle)
     draft.arguments.push(valueIndex)
-    valueEntries.set(handle, { owner, index: valueIndex })
   }
+  return draft
+}
+
+/** Creates a draft reachable through an effectful body handle. @internal */
+export const create = (
+  context: BuilderState.Context,
+  functionIndex: number,
+  functionType: number,
+  signature: Extract<TypeDescription.Description, { readonly _tag: 'Function' }>,
+  creatorFiber: number,
+): FunctionBodyActor.FunctionBody => {
+  const draft = makeDraft(context, functionIndex, functionType, signature, creatorFiber)
+  const self = Handle.make('FunctionBody', draft.owner, 0)
   drafts.set(self, draft)
   return self
 }
@@ -94,12 +102,10 @@ export const builder = (
   self: FunctionBodyActor.FunctionBody,
 ): Effect.Effect<Builder.Builder, LlvmError> =>
   Effect.withFiber((fiber) => {
-    const found = lookup(self, 'FunctionBody.builder')
-    if (Result.isFailure(found)) return Effect.fail(found.failure)
-    const active = assertActive(found.success, fiber.id, 'FunctionBody.builder')
-    return Result.isFailure(active)
-      ? Effect.fail(active.failure)
-      : Effect.succeed(found.success.builder)
+    const draft = drafts.get(self)
+    if (draft === undefined) return unknownDraft(self, 'FunctionBody.builder')
+    const active = assertActive(draft, fiber.id, 'FunctionBody.builder')
+    return Result.isFailure(active) ? Effect.fail(active.failure) : Effect.succeed(draft.builder)
   })
 
 /** @internal */
@@ -109,12 +115,12 @@ export const mutate = <A>(
   transition: (draft: Draft) => Result.Result<A, LlvmError>,
 ): Effect.Effect<A, LlvmError> =>
   Effect.withFiber((fiber) => {
-    const found = lookup(self, operation)
-    if (Result.isFailure(found)) return Effect.fail(found.failure)
-    const active = assertActive(found.success, fiber.id, operation)
+    const draft = drafts.get(self)
+    if (draft === undefined) return unknownDraft(self, operation)
+    const active = assertActive(draft, fiber.id, operation)
     return Result.isFailure(active)
       ? Effect.fail(active.failure)
-      : Effect.fromResult(transition(found.success))
+      : Effect.fromResult(transition(draft))
   })
 
 /** @internal */
@@ -124,16 +130,19 @@ export const mutateModule = <A>(
   transition: (draft: Draft, module: BuilderState.MutableState) => Result.Result<A, LlvmError>,
 ): Effect.Effect<A, LlvmError> =>
   Effect.withFiber((fiber) => {
-    const found = lookup(self, operation)
-    if (Result.isFailure(found)) return Effect.fail(found.failure)
-    const draft = found.success
-    return Effect.fromResult(
-      BuilderState.transitionResult(draft.builder, operation, (module) => {
-        const active = assertActive(draft, fiber.id, operation)
-        return Result.isFailure(active) ? Result.fail(active.failure) : transition(draft, module)
-      }),
-    )
+    const draft = drafts.get(self)
+    if (draft === undefined) return unknownDraft(self, operation)
+    const active = assertActive(draft, fiber.id, operation)
+    return Result.isFailure(active)
+      ? Effect.fail(active.failure)
+      : Effect.fromResult(transition(draft, draft.module))
   })
+
+const unknownDraft = (
+  self: FunctionBodyActor.FunctionBody,
+  operation: string,
+): Effect.Effect<never, LlvmError> =>
+  Effect.fail(invalidInput({ operation, message: 'Unknown function-body draft', input: self }))
 
 /** @internal */
 export const close = (
@@ -149,8 +158,7 @@ export const resolveBlock = (
   draft: Draft,
   block: BlockActor.Block,
   operation: string,
-): Result.Result<number, LlvmError> =>
-  Result.map(localEntry(blockEntries, draft, block, operation, 'block'), (entry) => entry.index)
+): Result.Result<number, LlvmError> => localIndex(draft, block, 'Block', operation, 'block')
 
 /** @internal */
 export const resolveInstruction = (
@@ -158,26 +166,27 @@ export const resolveInstruction = (
   instruction: FunctionBodyActor.Instruction,
   operation: string,
 ): Result.Result<number, LlvmError> =>
-  Result.map(
-    localEntry(instructionEntries, draft, instruction, operation, 'instruction'),
-    (entry) => entry.index,
-  )
+  localIndex(draft, instruction, 'Instruction', operation, 'instruction')
 
 /** @internal */
 export const resolvePhi = (
   draft: Draft,
   phi: FunctionBodyActor.Phi,
   operation: string,
-): Result.Result<number, LlvmError> =>
-  Result.map(localEntry(phiEntries, draft, phi, operation, 'phi'), (entry) => entry.index)
+): Result.Result<number, LlvmError> => localIndex(draft, phi, 'Phi', operation, 'phi')
 
 /** @internal */
 export const resolveSwitch = (
   draft: Draft,
   value: FunctionBodyActor.Switch,
   operation: string,
-): Result.Result<SwitchEntry, LlvmError> =>
-  localEntry(switchEntries, draft, value, operation, 'switch')
+): Result.Result<{ readonly index: number; readonly block: number }, LlvmError> => {
+  const index = localIndex(draft, value, 'Switch', operation, 'switch')
+  if (Result.isFailure(index)) return Result.fail(index.failure)
+  const block = draft.switchBlocks.get(index.success)
+  if (block === undefined) return fail(operation, 'Switch block is missing', value)
+  return Result.succeed({ index: index.success, block })
+}
 
 /** @internal */
 const resolveLocalValue = (
@@ -188,14 +197,16 @@ const resolveLocalValue = (
   { readonly operand: FunctionBodyDescription.Operand; readonly type: number },
   LlvmError
 > => {
-  const entry = localEntry(valueEntries, draft, value, operation, 'value')
-  if (Result.isFailure(entry)) return Result.fail(entry.failure)
-  const description = draft.values[entry.success.index]
+  const index = localIndex(draft, value, 'Value', operation, 'value')
+  if (Result.isFailure(index)) return Result.fail(index.failure)
+  const description = draft.values[index.success]
   if (description === undefined) return fail(operation, 'Local value table entry is missing', value)
-  return Result.succeed({
-    operand: { _tag: 'Local', value: entry.success.index },
-    type: description.type,
-  })
+  let operand = draft.localOperands[index.success]
+  if (operand === undefined) {
+    operand = { _tag: 'Local', value: index.success }
+    draft.localOperands[index.success] = operand
+  }
+  return Result.succeed({ operand, type: description.type })
 }
 
 /** @internal */
@@ -213,10 +224,12 @@ export const resolveOperand = (
   if (Result.isFailure(index)) return Result.fail(index.failure)
   const constant = module.constants.descriptions[index.success]
   if (constant === undefined) return fail(operation, 'Constant table entry is missing', value)
-  return Result.succeed({
-    operand: { _tag: 'Constant', constant: index.success },
-    type: constant.type,
-  })
+  let operand = module.constantOperands[index.success]
+  if (operand === undefined) {
+    operand = { _tag: 'Constant', constant: index.success }
+    module.constantOperands[index.success] = operand
+  }
+  return Result.succeed({ operand, type: constant.type })
 }
 
 /** @internal */
@@ -236,105 +249,77 @@ const scalarType = (
   module: BuilderState.MutableState,
   index: number,
   operation: string,
-): Result.Result<TypeDescription.Description, LlvmError> =>
-  Result.gen(function* () {
-    const description = yield* typeAt(module, index, operation)
-    return description._tag === 'Vector'
-      ? yield* typeAt(module, description.child, operation)
-      : description
-  })
+): Result.Result<TypeDescription.Description, LlvmError> => {
+  const description = typeAt(module, index, operation)
+  if (Result.isFailure(description) || description.success._tag !== 'Vector') return description
+  return typeAt(module, description.success.child, operation)
+}
+
+const floatingTags: ReadonlySet<string> = new Set([
+  'Half',
+  'BFloat',
+  'Float',
+  'Double',
+  'X86Fp80',
+  'Fp128',
+  'PpcFp128',
+])
 
 /** @internal */
 export const isIntegerType = (
   module: BuilderState.MutableState,
   index: number,
   operation: string,
-): Result.Result<boolean, LlvmError> =>
-  Result.map(scalarType(module, index, operation), (description) => description._tag === 'Integer')
+): Result.Result<boolean, LlvmError> => {
+  const description = scalarType(module, index, operation)
+  if (Result.isFailure(description)) return Result.fail(description.failure)
+  return Result.succeed(description.success._tag === 'Integer')
+}
 
 /** @internal */
 export const isFloatingType = (
   module: BuilderState.MutableState,
   index: number,
   operation: string,
-): Result.Result<boolean, LlvmError> =>
-  Result.gen(function* () {
-    const description = yield* scalarType(module, index, operation)
-    return (
-      description._tag === 'Simple' &&
-      (description.tag === 'Half' ||
-        description.tag === 'BFloat' ||
-        description.tag === 'Float' ||
-        description.tag === 'Double' ||
-        description.tag === 'X86Fp80' ||
-        description.tag === 'Fp128' ||
-        description.tag === 'PpcFp128')
-    )
-  })
+): Result.Result<boolean, LlvmError> => {
+  const description = scalarType(module, index, operation)
+  if (Result.isFailure(description)) return Result.fail(description.failure)
+  return Result.succeed(
+    description.success._tag === 'Simple' && floatingTags.has(description.success.tag),
+  )
+}
 
 /** @internal */
 export const isPointerType = (
   module: BuilderState.MutableState,
   index: number,
   operation: string,
-): Result.Result<boolean, LlvmError> =>
-  Result.map(scalarType(module, index, operation), (description) => description._tag === 'Pointer')
-
-/** @internal */
-const typeKey = (description: TypeDescription.Description): Result.Result<string, LlvmError> => {
-  if (description._tag === 'Integer') {
-    return Result.succeed(
-      CanonicalKey.tagged('integer', [CanonicalKey.integer(description.bitWidth)]),
-    )
-  }
-  if (description._tag === 'Vector') {
-    return Result.succeed(
-      CanonicalKey.tagged('vector', [
-        CanonicalKey.integer(description.child),
-        CanonicalKey.integer(description.length),
-        description.scalable ? '1' : '0',
-      ]),
-    )
-  }
-  return fail('FunctionBody.typeKey', 'Unsupported comparison result type', description)
+): Result.Result<boolean, LlvmError> => {
+  const description = scalarType(module, index, operation)
+  if (Result.isFailure(description)) return Result.fail(description.failure)
+  return Result.succeed(description.success._tag === 'Pointer')
 }
-
-/** @internal */
-const internType = (
-  draft: Draft,
-  module: BuilderState.MutableState,
-  description: TypeDescription.Description,
-): Result.Result<number, LlvmError> =>
-  Result.gen(function* () {
-    const key = yield* typeKey(description)
-    const found = module.types.keys.get(key)
-    if (found !== undefined) return found
-    const index = module.types.descriptions.length
-    const handle = Handle.make('Type', draft.moduleOwner, index)
-    module.types.descriptions.push(description)
-    module.types.handles.push(handle)
-    module.types.keys.set(key, index)
-    return index
-  })
 
 /** @internal */
 export const comparisonType = (
   draft: Draft,
   module: BuilderState.MutableState,
   operandType: number,
-): Result.Result<number, LlvmError> =>
-  Result.gen(function* () {
-    const i1 = yield* internType(draft, module, { _tag: 'Integer', bitWidth: 1 })
-    const description = yield* typeAt(module, operandType, 'FunctionBody.compare')
-    return description._tag === 'Vector'
-      ? yield* internType(draft, module, {
+): Result.Result<number, LlvmError> => {
+  const i1 = Type.internIndex(module, draft.moduleOwner, { _tag: 'Integer', bitWidth: 1 })
+  const description = typeAt(module, operandType, 'FunctionBody.compare')
+  if (Result.isFailure(description)) return Result.fail(description.failure)
+  return Result.succeed(
+    description.success._tag === 'Vector'
+      ? Type.internIndex(module, draft.moduleOwner, {
           _tag: 'Vector',
           child: i1,
-          length: description.length,
-          scalable: description.scalable,
+          length: description.success.length,
+          scalable: description.success.scalable,
         })
-      : i1
-  })
+      : i1,
+  )
+}
 
 /** @internal */
 const valueHandle = (
@@ -349,18 +334,6 @@ const valueHandle = (
 }
 
 /** @internal */
-const instructionHandle = (
-  draft: Draft,
-  index: number,
-  operation: string,
-): Result.Result<FunctionBodyActor.Instruction, LlvmError> => {
-  const handle = draft.instructionHandles[index]
-  return handle === undefined
-    ? fail(operation, 'Instruction table handle is missing', index)
-    : Result.succeed(handle)
-}
-
-/** @internal */
 export const makeBlock = (
   draft: Draft,
   name: ByteString.ByteString | Uint8Array | string | undefined,
@@ -368,12 +341,11 @@ export const makeBlock = (
   const index = draft.blocks.length
   const handle = Handle.make('Block', draft.owner, index)
   draft.blocks.push({
-    name: ByteString.coerceOrEmpty(name),
+    name: localName(draft, name),
     instructions: [],
     predecessors: new Set(),
   })
   draft.blockHandles.push(handle)
-  blockEntries.set(handle, { owner: draft.owner, index })
   if (draft.cursor === undefined) draft.cursor = index
   return handle
 }
@@ -399,27 +371,30 @@ export const addPredecessor = (
 }
 
 /** @internal */
-export const setCursor = (draft: Draft, block: BlockActor.Block): Result.Result<void, LlvmError> =>
-  Result.gen(function* () {
-    draft.cursor = yield* resolveBlock(draft, block, 'Block.setInsertionPoint')
-  })
+export const setCursor = (
+  draft: Draft,
+  block: BlockActor.Block,
+): Result.Result<void, LlvmError> => {
+  const index = resolveBlock(draft, block, 'Block.setInsertionPoint')
+  if (Result.isFailure(index)) return Result.fail(index.failure)
+  draft.cursor = index.success
+  return Result.void
+}
 
 /** @internal */
-export const argument = (draft: Draft, index: number): Result.Result<ValueActor.Value, LlvmError> =>
-  Result.gen(function* () {
-    if (!Number.isSafeInteger(index) || index < 0) {
-      return yield* fail('Value.argument', 'Argument index must be a non-negative integer', index)
-    }
-    const value = draft.arguments[index]
-    if (value === undefined) {
-      return yield* fail(
-        'Value.argument',
-        'Argument index is outside the function signature',
-        index,
-      )
-    }
-    return yield* valueHandle(draft, value, 'Value.argument')
-  })
+export const argument = (
+  draft: Draft,
+  index: number,
+): Result.Result<ValueActor.Value, LlvmError> => {
+  if (!Number.isSafeInteger(index) || index < 0) {
+    return fail('Value.argument', 'Argument index must be a non-negative integer', index)
+  }
+  const value = draft.arguments[index]
+  if (value === undefined) {
+    return fail('Value.argument', 'Argument index is outside the function signature', index)
+  }
+  return valueHandle(draft, value, 'Value.argument')
+}
 
 /** @internal */
 export const forward = (
@@ -431,11 +406,10 @@ export const forward = (
   const handle = Handle.make('Value', draft.owner, index)
   draft.values.push({
     type,
-    name: ByteString.coerceOrEmpty(name),
+    name: localName(draft, name),
     source: { _tag: 'Forward', resolved: undefined },
   })
   draft.valueHandles.push(handle)
-  valueEntries.set(handle, { owner: draft.owner, index })
   return handle
 }
 
@@ -447,14 +421,8 @@ export const resolveForward = (
   resolved: OperandInput,
 ): Result.Result<void, LlvmError> =>
   Result.gen(function* () {
-    const entry = yield* localEntry(
-      valueEntries,
-      draft,
-      forwardValue,
-      'Value.resolveForward',
-      'value',
-    )
-    const value = draft.values[entry.index]
+    const index = yield* localIndex(draft, forwardValue, 'Value', 'Value.resolveForward', 'value')
+    const value = draft.values[index]
     if (value === undefined || value.source._tag !== 'Forward') {
       return yield* Result.fail(
         invalidInput({
@@ -489,8 +457,8 @@ export const valueType = (
   value: ValueActor.Value,
 ): Result.Result<number, LlvmError> =>
   Result.gen(function* () {
-    const entry = yield* localEntry(valueEntries, draft, value, 'Value.typeOf', 'value')
-    const description = draft.values[entry.index]
+    const index = yield* localIndex(draft, value, 'Value', 'Value.typeOf', 'value')
+    const description = draft.values[index]
     if (description === undefined) {
       return yield* fail('Value.typeOf', 'Value table entry is missing', value)
     }
@@ -504,8 +472,8 @@ export const setValueName = (
   name: ByteString.ByteString | Uint8Array | string,
 ): Result.Result<void, LlvmError> =>
   Result.gen(function* () {
-    const entry = yield* localEntry(valueEntries, draft, value, 'Value.setName', 'value')
-    const description = draft.values[entry.index]
+    const index = yield* localIndex(draft, value, 'Value', 'Value.setName', 'value')
+    const description = draft.values[index]
     if (description === undefined) {
       return yield* Result.fail(
         invalidState({
@@ -515,7 +483,7 @@ export const setValueName = (
         }),
       )
     }
-    description.name = ByteString.coerceOrEmpty(name)
+    description.name = localName(draft, name)
     if (description.source._tag === 'Instruction') {
       const instruction = draft.instructions[description.source.instruction]
       if (instruction !== undefined) {
@@ -533,8 +501,8 @@ export const valueName = (
   value: ValueActor.Value,
 ): Result.Result<ByteString.ByteString, LlvmError> =>
   Result.gen(function* () {
-    const entry = yield* localEntry(valueEntries, draft, value, 'Value.name', 'value')
-    const description = draft.values[entry.index]
+    const index = yield* localIndex(draft, value, 'Value', 'Value.name', 'value')
+    const description = draft.values[index]
     if (description === undefined) {
       return yield* fail('Value.name', 'Value table entry is missing', value)
     }
@@ -547,10 +515,10 @@ export const valueInstruction = (
   value: ValueActor.Value,
 ): Result.Result<FunctionBodyActor.Instruction | undefined, LlvmError> =>
   Result.gen(function* () {
-    const entry = yield* localEntry(valueEntries, draft, value, 'Value.instruction', 'value')
-    const source = draft.values[entry.index]?.source
+    const index = yield* localIndex(draft, value, 'Value', 'Value.instruction', 'value')
+    const source = draft.values[index]?.source
     return source?._tag === 'Instruction'
-      ? yield* instructionHandle(draft, source.instruction, 'Value.instruction')
+      ? yield* instructionHandleAt(draft, source.instruction, 'Value.instruction')
       : undefined
   })
 
@@ -570,15 +538,11 @@ export const instructionResult = (
 /** @internal */
 export const makePhiHandle = (
   draft: Draft,
-  instruction: FunctionBodyActor.Instruction,
-): Result.Result<FunctionBodyActor.Phi, LlvmError> =>
-  Result.gen(function* () {
-    const index = yield* resolveInstruction(draft, instruction, 'FunctionBody.phi')
-    const handle = Handle.make('Phi', draft.owner, index)
-    phiEntries.set(handle, { owner: draft.owner, index })
-    draft.openPhis.set(index, { incoming: [], blocks: new Set() })
-    return handle
-  })
+  index: number,
+): Result.Result<FunctionBodyActor.Phi, LlvmError> => {
+  draft.openPhis.set(index, { incoming: [], blocks: new Set() })
+  return Result.succeed(Handle.make('Phi', draft.owner, index))
+}
 
 /** @internal */
 export const makeSwitchHandle = (
@@ -589,7 +553,7 @@ export const makeSwitchHandle = (
   Result.gen(function* () {
     const index = yield* resolveInstruction(draft, instruction, 'FunctionBody.switchTerminator')
     const handle = Handle.make('Switch', draft.owner, index)
-    switchEntries.set(handle, { owner: draft.owner, index, block })
+    draft.switchBlocks.set(index, block)
     return handle
   })
 
@@ -597,93 +561,91 @@ export const makeSwitchHandle = (
 export const validate = Effect.fn('FunctionBody.validate')(function* (
   self: FunctionBodyActor.FunctionBody,
 ): Effect.fn.Return<FunctionBodyDescription.Snapshot, LlvmError> {
-  return yield* mutate(self, 'FunctionBody.validate', (draft) => {
-    if (draft.blocks.length === 0) {
-      return fail('FunctionBody.validate', 'A function body requires at least one block', self)
+  return yield* mutate(self, 'FunctionBody.validate', (draft) => validateDraft(draft, self))
+})
+
+/** Validates a finished draft and hands its tables to the committed snapshot. @internal */
+export const validateDraft = (
+  draft: Draft,
+  self: unknown,
+): Result.Result<FunctionBodyDescription.Snapshot, LlvmError> => {
+  if (draft.blocks.length === 0) {
+    return fail('FunctionBody.validate', 'A function body requires at least one block', self)
+  }
+  for (let blockIndex = 0; blockIndex < draft.blocks.length; blockIndex += 1) {
+    const block = draft.blocks[blockIndex]
+    if (block === undefined || block.instructions.length === 0) {
+      return fail('FunctionBody.validate', 'Every block must contain a terminator', blockIndex)
     }
-    for (let blockIndex = 0; blockIndex < draft.blocks.length; blockIndex += 1) {
-      const block = draft.blocks[blockIndex]
-      if (block === undefined || block.instructions.length === 0) {
-        return fail('FunctionBody.validate', 'Every block must contain a terminator', blockIndex)
-      }
-      const terminatorIndex = block.instructions.at(-1)
-      const terminator =
-        terminatorIndex === undefined ? undefined : draft.instructions[terminatorIndex]
-      if (terminator === undefined || !FunctionBodyDescription.isTerminator(terminator)) {
+    const terminatorIndex = block.instructions.at(-1)
+    const terminator =
+      terminatorIndex === undefined ? undefined : draft.instructions[terminatorIndex]
+    if (terminator === undefined || !FunctionBodyDescription.isTerminator(terminator)) {
+      return fail(
+        'FunctionBody.validate',
+        'Every block must end in exactly one terminator',
+        blockIndex,
+      )
+    }
+    for (const instructionIndex of block.instructions) {
+      const instruction = draft.instructions[instructionIndex]
+      if (instruction === undefined) {
         return fail(
           'FunctionBody.validate',
-          'Every block must end in exactly one terminator',
-          blockIndex,
+          'Block references a missing instruction',
+          instructionIndex,
         )
       }
-      for (const instructionIndex of block.instructions) {
-        const instruction = draft.instructions[instructionIndex]
-        if (instruction === undefined) {
+      if (instruction._tag === 'Switch' && !instruction.sealed) {
+        return fail(
+          'FunctionBody.validate',
+          'Switch construction was not finalized',
+          instructionIndex,
+        )
+      }
+      if (instruction._tag === 'Phi') {
+        if (!instruction.sealed) {
           return fail(
             'FunctionBody.validate',
-            'Block references a missing instruction',
+            'Phi construction was not finalized',
             instructionIndex,
           )
         }
-        if (instruction._tag === 'Switch' && !instruction.sealed) {
+        const incoming = new Set(instruction.incoming.map((entry) => entry.block))
+        if (
+          incoming.size !== block.predecessors.size ||
+          [...block.predecessors].some((predecessor) => !incoming.has(predecessor))
+        ) {
           return fail(
             'FunctionBody.validate',
-            'Switch construction was not finalized',
-            instructionIndex,
+            'Phi incoming blocks must cover every predecessor once',
+            {
+              block: blockIndex,
+              predecessors: [...block.predecessors],
+              incoming: [...incoming],
+            },
           )
-        }
-        if (instruction._tag === 'Phi') {
-          if (!instruction.sealed) {
-            return fail(
-              'FunctionBody.validate',
-              'Phi construction was not finalized',
-              instructionIndex,
-            )
-          }
-          const incoming = new Set(instruction.incoming.map((entry) => entry.block))
-          if (
-            incoming.size !== block.predecessors.size ||
-            [...block.predecessors].some((predecessor) => !incoming.has(predecessor))
-          ) {
-            return fail(
-              'FunctionBody.validate',
-              'Phi incoming blocks must cover every predecessor once',
-              {
-                block: blockIndex,
-                predecessors: [...block.predecessors],
-                incoming: [...incoming],
-              },
-            )
-          }
         }
       }
     }
-    const validated = validateInstructions(draft)
-    if (Result.isFailure(validated)) return Result.fail(validated.failure)
-    return Result.succeed({
-      arguments: [...draft.arguments],
-      blocks: draft.blocks.map((block) => ({
-        name: block.name,
-        instructions: [...block.instructions],
-        predecessors: [...block.predecessors].sort((left, right) => left - right),
-      })),
-      instructions: [...draft.instructions],
-      values: draft.values.map((value) => ({
-        type: value.type,
-        name: value.name,
-        source:
-          value.source._tag === 'Forward'
-            ? {
-                _tag: 'Forward' as const,
-                resolved: value.source.resolved,
-              }
-            : value.source,
-      })),
-      metadata: draft.metadata.map((attachments) => [...attachments]),
-      debugLocations: [...draft.debugLocations],
-    })
+  }
+  const validated = validateInstructions(draft)
+  if (Result.isFailure(validated)) return Result.fail(validated.failure)
+  // The body commits right after validation and the draft is closed, so the snapshot takes
+  // ownership of the draft's tables instead of copying them.
+  return Result.succeed({
+    arguments: draft.arguments,
+    blocks: draft.blocks.map((block) => ({
+      name: block.name,
+      instructions: block.instructions,
+      predecessors: [...block.predecessors].sort((left, right) => left - right),
+    })),
+    instructions: draft.instructions,
+    values: draft.values,
+    metadata: draft.metadata,
+    debugLocations: draft.debugLocations,
   })
-})
+}
 
 /** @internal */
 export const snapshotDraft = (self: FunctionBodyActor.FunctionBody): Draft | undefined =>

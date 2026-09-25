@@ -1724,16 +1724,17 @@ const callableIdentityKey = (self: CallableIdentityArgument): string =>
     self.environment === undefined ? '' : callableEnvironmentKey(self.environment),
   ].join('')
 
-const genericArgumentKeyCache = new WeakMap<Exclude<GenericArgument, string>, string>()
+/** Memoized on the argument object itself, like `key`. */
+const cachedGenericArgumentKey: unique symbol = Symbol('Type.genericArgumentKey')
 
 export const genericArgumentKey = (self: GenericArgument): string => {
   if (typeof self === 'string') return computeGenericArgumentKey(self)
-  let cached = genericArgumentKeyCache.get(self)
-  if (cached === undefined) {
-    cached = computeGenericArgumentKey(self)
-    genericArgumentKeyCache.set(self, cached)
-  }
-  return cached
+  const cached: unknown = Reflect.get(self, cachedGenericArgumentKey)
+  if (typeof cached === 'string') return cached
+  const computed = computeGenericArgumentKey(self)
+  if (Object.isExtensible(self))
+    Object.defineProperty(self, cachedGenericArgumentKey, { value: computed })
+  return computed
 }
 
 const computeGenericArgumentKey = (self: GenericArgument): string => {
@@ -1962,17 +1963,22 @@ const hasTypeDiscriminant = (self: unknown): self is Type =>
     typeof self._tag === 'string' &&
     semanticTypeTags.has(self._tag))
 
-const keyCache = new WeakMap<Exclude<Type, string>, string>()
+/**
+ * Each immutable type object carries its canonical key once computed, in a non-enumerable
+ * property that spreads, clones and structural comparisons never see. Most keyed types are
+ * fresh substitution results keyed once: a weak map paid an ephemeron insertion per type and
+ * made every major collection trace the table.
+ */
+const cachedKey: unique symbol = Symbol('Type.key')
 
 /** Returns the canonical deterministic key used for equality and ordering. */
 export const key = (self: Type): string => {
   if (typeof self === 'string') return computeKey(self)
-  let cached = keyCache.get(self)
-  if (cached === undefined) {
-    cached = computeKey(self)
-    keyCache.set(self, cached)
-  }
-  return cached
+  const cached: unknown = Reflect.get(self, cachedKey)
+  if (typeof cached === 'string') return cached
+  const computed = computeKey(self)
+  if (Object.isExtensible(self)) Object.defineProperty(self, cachedKey, { value: computed })
+  return computed
 }
 
 /**
@@ -4131,23 +4137,22 @@ export const runtimeGenericArgumentKey = (self: GenericArgument): string => {
   return runtimeKey(self)
 }
 
-const runtimeKeyCache = new WeakMap<Exclude<Type, string>, string>()
+/** Memoized on the type object itself, like `key`. */
+const cachedRuntimeKey: unique symbol = Symbol('Type.runtimeKey')
 
 /**
  * Encodes a layout/instance type identity with all lifetime proof arguments erased.
- * Like semantic keys, runtime keys are memoized by immutable type identity. Layout and
- * native lowering repeatedly query the same nested types during a cold build; retaining
- * only weak keys avoids repeating their canonical string construction without keeping
- * completed analysis snapshots alive or introducing a persistent compilation cache.
+ * Like semantic keys, runtime keys are memoized on the immutable type object in a
+ * non-enumerable property: instance keys and layouts key many fresh substitution results
+ * exactly once, where a weak map paid an ephemeron insertion each and grew every major GC.
  */
 export const runtimeKey = (self: Type): string => {
   if (typeof self === 'string') return key(self)
-  let cached = runtimeKeyCache.get(self)
-  if (cached === undefined) {
-    cached = computeRuntimeKey(self)
-    runtimeKeyCache.set(self, cached)
-  }
-  return cached
+  const cached: unknown = Reflect.get(self, cachedRuntimeKey)
+  if (typeof cached === 'string') return cached
+  const computed = computeRuntimeKey(self)
+  if (Object.isExtensible(self)) Object.defineProperty(self, cachedRuntimeKey, { value: computed })
+  return computed
 }
 
 const computeRuntimeKey = (self: Exclude<Type, string>): string => {

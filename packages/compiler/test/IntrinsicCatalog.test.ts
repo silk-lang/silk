@@ -4,11 +4,8 @@ import * as NativeDiagnosticOutcome from '../src/NativeDiagnosticOutcome.js'
 import * as NativeResult from '../src/NativeResult.js'
 import * as NativeDiagnosticTransfer from '../src/NativeDiagnosticTransfer.js'
 import * as ContinuationTransfer from '../src/ContinuationTransfer.js'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as LlvmFunction from '@silklang/llvm/Function'
-import * as LlvmFunctionBody from '@silklang/llvm/FunctionBody'
-import * as LlvmBlock from '@silklang/llvm/Block'
-import * as LlvmValue from '@silklang/llvm/Value'
-import * as LlvmConstant from '@silklang/llvm/Constant'
 import * as NativeDiagnosticContext from '../src/NativeDiagnosticContext.js'
 import * as NativeDiagnosticFailure from '../src/NativeDiagnosticFailure.js'
 import * as NativeCall from '../src/NativeCall.js'
@@ -947,7 +944,7 @@ pub fn main() -> i32 {
     const declarations = yield* NativeDeclare.functions({
       builder,
       types,
-      lanePointers: { builder, byteType: yield* LlvmType.integer(builder, 8), offsetType: i32 },
+      lanePointers: { byteType: yield* LlvmType.integer(builder, 8), offsetType: i32 },
       program: types.program,
       i32,
       pointer,
@@ -1535,50 +1532,38 @@ it.effect('keeps failure metadata attached to its originating observer', () =>
         'failure_metadata',
         yield* LlvmType.functionType(builder, resultType, [pointer, pointer, pointer, pointer]),
       )
-      yield* LlvmFunction.buildBody(
-        builder,
-        fn,
-        Effect.fnUntraced(function* (body) {
-          yield* LlvmBlock.make(body, 'entry')
-          const first = yield* LlvmValue.argument(body, 0)
-          const second = yield* LlvmValue.argument(body, 1)
+      yield* Emitter.module(builder, (builder) =>
+        Emitter.buildBody(builder, fn, (body) => {
+          Emitter.block(body, 'entry')
+          const first = Emitter.argument(body, 0)
+          const second = Emitter.argument(body, 1)
           const identity = Object.freeze([
-            yield* LlvmValue.argument(body, 2),
-            yield* LlvmConstant.integerUnsigned(builder, word, 7n),
+            Emitter.argument(body, 2),
+            Emitter.integerUnsigned(builder, word, 7n),
           ] as const)
           const origin = Object.freeze([
-            yield* LlvmValue.argument(body, 3),
-            yield* LlvmConstant.integerUnsigned(builder, word, 9n),
+            Emitter.argument(body, 3),
+            Emitter.integerUnsigned(builder, word, 9n),
           ] as const)
-          const context = yield* NativeDiagnosticContext.make(
-            builder,
-            body,
-            pointer,
-            byte,
-            word,
-            first,
-          )
-          const failure = yield* NativeDiagnosticFailure.produce(context, identity, origin)
+          const context = NativeDiagnosticContext.make(builder, body, pointer, byte, word, first)
+          const failure = NativeDiagnosticFailure.produce(context, identity, origin)
           // A later lexical observer must not receive the original pool's handles.
-          yield* LlvmFunctionBody.store(body, second, context.current)
-          const retained = yield* NativeDiagnosticFailure.retain(failure, context)
-          const propagated = yield* NativeDiagnosticFailure.propagate(retained, context, identity)
-          const combined = yield* NativeDiagnosticFailure.withCause(propagated, context, failure)
-          yield* NativeDiagnosticFailure.release(retained, context)
-          yield* NativeDiagnosticFailure.release(propagated, context)
-          yield* NativeDiagnosticFailure.release(failure, context)
+          Emitter.store(body, second, context.current)
+          const retained = NativeDiagnosticFailure.retain(failure, context)
+          const propagated = NativeDiagnosticFailure.propagate(retained, context, identity)
+          const combined = NativeDiagnosticFailure.withCause(propagated, context, failure)
+          NativeDiagnosticFailure.release(retained, context)
+          NativeDiagnosticFailure.release(propagated, context)
+          NativeDiagnosticFailure.release(failure, context)
           assert.strictEqual(combined.observer, failure.observer)
           assert.strictEqual(combined.identity, identity)
           assert.strictEqual(combined.origin, origin)
-          yield* NativeDiagnosticFailure.unhandled(combined, context)
-          const restored = yield* NativeDiagnosticFailure.unpack(
+          NativeDiagnosticFailure.unhandled(combined, context)
+          const restored = NativeDiagnosticFailure.unpack(
             context,
-            yield* NativeDiagnosticFailure.pack(combined, context),
+            NativeDiagnosticFailure.pack(combined, context),
           )
-          yield* LlvmFunctionBody.returnValue(
-            body,
-            yield* NativeDiagnosticFailure.pack(restored, context),
-          )
+          Emitter.returnValue(body, NativeDiagnosticFailure.pack(restored, context))
         }),
       )
       const ir = yield* LlvmIrText.render(builder)
@@ -1598,43 +1583,40 @@ it.effect('forwards borrowed invocation causes and clears independent execution 
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
-        const causeType = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
+        const causeType = yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticFailure.type({ builder, pointer, word }),
+        )
         const signature = yield* LlvmType.functionType(builder, causeType, [pointer, causeType])
         const callee = yield* LlvmFunction.declare(builder, 'cause_receiver', signature)
         const caller = yield* LlvmFunction.declare(builder, 'cause_caller', signature)
-        yield* LlvmFunction.buildBody(
-          builder,
-          caller,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const incoming = yield* LlvmValue.argument(body, 1)
-            const diagnostic = yield* NativeDiagnosticContext.make(
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, caller, (body) => {
+            Emitter.block(body, 'entry')
+            const incoming = Emitter.argument(body, 1)
+            const diagnostic = NativeDiagnosticContext.make(
               builder,
               body,
               pointer,
               byte,
               word,
-              yield* LlvmValue.argument(body, 0),
+              Emitter.argument(body, 0),
               incoming,
             )
             assert.strictEqual(diagnostic.incomingCause, incoming)
-            const inherited = yield* NativeCall.argumentsFor(
+            const inherited = NativeCall.argumentsFor(
               { diagnostic },
               { diagnosticParameter: 0 },
               [],
             )
-            const independent = yield* NativeCall.argumentsFor(
+            const independent = NativeCall.argumentsFor(
               { diagnostic },
               { diagnosticParameter: 0 },
               [],
               'Independent',
             )
-            const result = yield* LlvmFunctionBody.callDirect(body, callee, inherited, 'inherited')
-            yield* LlvmFunctionBody.callDirect(body, callee, independent, 'independent')
-            yield* LlvmFunctionBody.returnValue(
-              body,
-              result ?? unreachable('expected borrowed cause result'),
-            )
+            const result = Emitter.callDirect(body, callee, inherited, 'inherited')
+            Emitter.callDirect(body, callee, independent, 'independent')
+            Emitter.returnValue(body, result ?? unreachable('expected borrowed cause result'))
           }),
         )
         const ir = yield* LlvmIrText.render(builder)
@@ -1659,30 +1641,27 @@ it.effect('disables terminal dispatch for absent or foreign observer contexts', 
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
-        const causeType = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
+        const causeType = yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticFailure.type({ builder, pointer, word }),
+        )
         const caller = yield* LlvmFunction.declare(
           builder,
           'terminal_context',
           yield* LlvmType.functionType(builder, word, [pointer, causeType]),
         )
-        yield* LlvmFunction.buildBody(
-          builder,
-          caller,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const context = yield* NativeDiagnosticContext.make(
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, caller, (body) => {
+            Emitter.block(body, 'entry')
+            const context = NativeDiagnosticContext.make(
               builder,
               body,
               pointer,
               byte,
               word,
-              yield* LlvmValue.argument(body, 0),
-              yield* LlvmValue.argument(body, 1),
+              Emitter.argument(body, 0),
+              Emitter.argument(body, 1),
             )
-            yield* LlvmFunctionBody.returnValue(
-              body,
-              yield* NativeDiagnosticContext.unhandled(context),
-            )
+            Emitter.returnValue(body, NativeDiagnosticContext.unhandled(context))
           }),
         )
         const ir = yield* LlvmIrText.render(builder)
@@ -1712,31 +1691,28 @@ it.effect('guards fatal cause handles by their originating observer', () =>
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
-        const causeType = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
+        const causeType = yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticFailure.type({ builder, pointer, word }),
+        )
         const signature = yield* LlvmType.functionType(builder, word, [pointer, causeType, pointer])
         const caller = yield* LlvmFunction.declare(builder, 'fatal_cause', signature)
-        yield* LlvmFunction.buildBody(
-          builder,
-          caller,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const diagnostic = yield* NativeDiagnosticContext.make(
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, caller, (body) => {
+            Emitter.block(body, 'entry')
+            const diagnostic = NativeDiagnosticContext.make(
               builder,
               body,
               pointer,
               byte,
               word,
-              yield* LlvmValue.argument(body, 0),
-              yield* LlvmValue.argument(body, 1),
+              Emitter.argument(body, 0),
+              Emitter.argument(body, 1),
             )
             const text = Object.freeze([
-              yield* LlvmValue.argument(body, 2),
-              yield* LlvmConstant.integerUnsigned(builder, word, 7n),
+              Emitter.argument(body, 2),
+              Emitter.integerUnsigned(builder, word, 7n),
             ] as const)
-            yield* LlvmFunctionBody.returnValue(
-              body,
-              yield* NativeDiagnosticContext.fatal(diagnostic, text, text),
-            )
+            Emitter.returnValue(body, NativeDiagnosticContext.fatal(diagnostic, text, text))
           }),
         )
         const ir = yield* LlvmIrText.render(builder)
@@ -1764,7 +1740,9 @@ it.effect('keeps private return metadata separate from source result lanes', () 
         const pointer = yield* LlvmType.pointer(builder)
         const word = yield* LlvmType.integer(builder, bits)
         const payloadType = yield* LlvmType.integer(builder, 32)
-        const diagnosticType = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
+        const diagnosticType = yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticFailure.type({ builder, pointer, word }),
+        )
         const resultType = yield* LlvmType.structure(builder, [payloadType, diagnosticType])
         const signature = yield* LlvmType.functionType(builder, resultType, [
           payloadType,
@@ -1782,13 +1760,11 @@ it.effect('keeps private return metadata separate from source result lanes', () 
           ),
         )
         const shape = { resultLaneCount: 1, diagnosticResult: true }
-        yield* LlvmFunction.buildBody(
-          builder,
-          producer,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const values = [yield* LlvmValue.argument(body, 0)]
-            const diagnostic = yield* LlvmValue.argument(body, 1)
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, producer, (body) => {
+            Emitter.block(body, 'entry')
+            const values = [Emitter.argument(body, 0)]
+            const diagnostic = Emitter.argument(body, 1)
             assert.throws(() => NativeResult.sourceValues({ values, diagnostic }), /cannot discard/)
             assert.throws(
               () => NativeResult.fields({ values }, shape),
@@ -1803,61 +1779,47 @@ it.effect('keeps private return metadata separate from source result lanes', () 
               () => NativeResult.fields({ values: [], diagnostic }, shape),
               /source lane count/,
             )
-            const called = yield* LlvmFunctionBody.callDirect(
+            const called = Emitter.callDirect(
               body,
               receiver,
               NativeResult.fields({ values, diagnostic }, shape),
               'returned',
             )
-            const unpacked = yield* NativeResult.unpack(body, shape, called, 'returned')
-            const stepped = yield* LlvmFunctionBody.callDirect(
+            const unpacked = NativeResult.unpack(body, shape, called, 'returned')
+            const stepped = Emitter.callDirect(
               body,
               stepReceiver,
               NativeResult.fields(unpacked, shape),
               'stepped',
             )
-            const resumed = yield* NativeResult.unpack(
-              body,
-              shape,
-              stepped,
-              'resumed',
-              'SuspensionStep',
-            )
+            const resumed = NativeResult.unpack(body, shape, stepped, 'resumed', 'SuspensionStep')
             const transfer = {
               builder,
               body,
               wordSize: bits / 8,
-              transfer: yield* LlvmFunctionBody.alloca(
-                body,
-                yield* LlvmType.integer(builder, 8),
-                'transfer',
-                {
-                  count: yield* LlvmConstant.integerUnsigned(
-                    builder,
-                    payloadType,
-                    BigInt((ContinuationTransfer.headerWords * bits) / 8),
-                  ),
-                },
-              ),
+              transfer: Emitter.alloca(body, Emitter.integerType(builder, 8), 'transfer', {
+                count: Emitter.integerUnsigned(
+                  builder,
+                  payloadType,
+                  BigInt((ContinuationTransfer.headerWords * bits) / 8),
+                ),
+              }),
             }
-            yield* NativeDiagnosticTransfer.publish(
+            NativeDiagnosticTransfer.publish(
               transfer,
               resumed.diagnostic ?? unreachable('expected resumed metadata'),
             )
-            const packed = yield* NativeResult.pack(
+            const packed = NativeResult.pack(
               {
                 ...resumed,
-                diagnostic: yield* NativeDiagnosticTransfer.take(transfer, diagnosticType),
+                diagnostic: NativeDiagnosticTransfer.take(transfer, diagnosticType),
               },
               { body },
               shape,
               resultType,
               'forwarded',
             )
-            yield* LlvmFunctionBody.returnValue(
-              body,
-              packed ?? unreachable('expected private return aggregate'),
-            )
+            Emitter.returnValue(body, packed ?? unreachable('expected private return aggregate'))
           }),
         )
         const ir = yield* LlvmIrText.render(builder)
@@ -1887,26 +1849,26 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
-        const metadata = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
+        const metadata = yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticFailure.type({ builder, pointer, word }),
+        )
         const signature = yield* LlvmType.functionType(builder, metadata, [pointer, metadata])
         const fn = yield* LlvmFunction.declare(builder, 'replace_outcome', signature)
-        yield* LlvmFunction.buildBody(
-          builder,
-          fn,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const context = yield* NativeDiagnosticContext.make(
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, fn, (body) => {
+            Emitter.block(body, 'entry')
+            const context = NativeDiagnosticContext.make(
               builder,
               body,
               pointer,
               byte,
               word,
-              yield* LlvmConstant.nullValue(builder, pointer),
+              Emitter.nullValue(builder, pointer),
             )
-            const slot = { storage: yield* LlvmValue.argument(body, 0) }
-            const incoming = yield* LlvmValue.argument(body, 1)
+            const slot = { storage: Emitter.argument(body, 0) }
+            const incoming = Emitter.argument(body, 1)
             context.outcomes.set(0, slot)
-            yield* NativeDiagnosticOutcome.accept(
+            NativeDiagnosticOutcome.accept(
               context,
               { _tag: 'Local', ordinal: 0 },
               {
@@ -1914,10 +1876,7 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
                 diagnostic: incoming,
               },
             )
-            yield* LlvmFunctionBody.returnValue(
-              body,
-              yield* NativeDiagnosticOutcome.take(slot, context),
-            )
+            Emitter.returnValue(body, NativeDiagnosticOutcome.take(slot, context))
           }),
         )
         const releaseOwner = yield* LlvmFunction.declare(
@@ -1928,25 +1887,23 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
             pointer,
           ]),
         )
-        yield* LlvmFunction.buildBody(
-          builder,
-          releaseOwner,
-          Effect.fnUntraced(function* (body) {
-            yield* LlvmBlock.make(body, 'entry')
-            const context = yield* NativeDiagnosticContext.make(
+        yield* Emitter.module(builder, (builder) =>
+          Emitter.buildBody(builder, releaseOwner, (body) => {
+            Emitter.block(body, 'entry')
+            const context = NativeDiagnosticContext.make(
               builder,
               body,
               pointer,
               byte,
               word,
-              yield* LlvmConstant.nullValue(builder, pointer),
+              Emitter.nullValue(builder, pointer),
             )
-            yield* NativeDiagnosticOutcome.releaseForObserver(
-              { storage: yield* LlvmValue.argument(body, 0) },
+            NativeDiagnosticOutcome.releaseForObserver(
+              { storage: Emitter.argument(body, 0) },
               context,
-              yield* LlvmValue.argument(body, 1),
+              Emitter.argument(body, 1),
             )
-            yield* LlvmFunctionBody.returnVoid(body)
+            Emitter.returnVoid(body)
           }),
         )
         const ir = yield* LlvmIrText.render(builder)

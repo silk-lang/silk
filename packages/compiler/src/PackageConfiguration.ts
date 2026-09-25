@@ -17,7 +17,7 @@ export interface Module {
   readonly canonical: string
   readonly package: string
   readonly module: string
-  readonly bytes: ReadonlyArray<number>
+  readonly bytes: Uint8Array
 }
 
 /** Project/workspace bindings share a tier; artifact/profile bindings share the higher tier. */

@@ -255,11 +255,13 @@ const sameStoredExecutableViolationKey = (
   SourceSpan.equals(left.span, right.span) &&
   SourceSpan.equals(left.constructionSpan, right.constructionSpan)
 
-/** Collects every reachable aggregate construction that retains executable storage. */
-const storedExecutableViolations = (
+/**
+ * Rejects reachable constructions that retain bare or represented callable values, then those
+ * that retain represented Effect values.
+ */
+export const storedExecutableViolations = (
   self: Instances.Discovery,
   index: DeclarationIndex.Index,
-  kind: 'Callable' | 'Effect',
 ): ReadonlyArray<Diagnostic.Diagnostic> => {
   const fieldRealizations = callableFieldRealizations(self, index)
   const specializingCalls = new Map<string, Instances.CallInstance>()
@@ -269,77 +271,106 @@ const storedExecutableViolations = (
     if (current === undefined || compareCallSites(call, current) < 0)
       specializingCalls.set(target, call)
   }
-  const reported: Array<StoredExecutableViolationKey> = []
-  return self.instances.flatMap((instance) =>
-    instance.function.statements
+  const found = {
+    Callable: [] as Array<Diagnostic.Diagnostic>,
+    Effect: [] as Array<Diagnostic.Diagnostic>,
+  }
+  const reported = {
+    Callable: [] as Array<StoredExecutableViolationKey>,
+    Effect: [] as Array<StoredExecutableViolationKey>,
+  }
+  // Most constructions retain no executable storage, and one aggregate type recurs across many
+  // constructions; remember which types were proved free of it.
+  const executableFree = { Callable: new Set<string>(), Effect: new Set<string>() }
+  const storedExecutableOf = (
+    type: Type.Type,
+    kind: 'Callable' | 'Effect',
+  ): StoredExecutable | undefined => {
+    const typeKey = Type.key(type)
+    if (executableFree[kind].has(typeKey)) return undefined
+    const stored = storedExecutable(index, type, kind)
+    if (stored === undefined) executableFree[kind].add(typeKey)
+    return stored
+  }
+  const violation = (
+    instance: Instances.Instance,
+    expression: Extract<
+      Tir.Expression,
+      { readonly _tag: 'Construct' | 'ConstructUnionVariant' | 'ArrayConstruct' }
+    >,
+    aggregate: Type.Type,
+    kind: 'Callable' | 'Effect',
+  ): Diagnostic.Diagnostic | undefined => {
+    const stored = storedExecutableOf(aggregate, kind)
+    if (stored === undefined) return undefined
+    if (
+      stored.represented &&
+      Type.isNominal(aggregate) &&
+      FieldRealization.supportsInstance(fieldRealizations, aggregate)
+    )
+      return undefined
+    const declared = storedExecutableOf(expression.type, kind)
+    const specializing =
+      declared === undefined || declared.open
+        ? specializingCalls.get(Instances.keyText(instance.key))
+        : undefined
+    const span = specializing?.span ?? expression.span
+    const key: StoredExecutableViolationKey = {
+      aggregate,
+      path: stored.path,
+      contract: stored.contract,
+      represented: stored.represented,
+      span,
+      constructionSpan: expression.span,
+    }
+    if (reported[kind].some((candidate) => sameStoredExecutableViolationKey(candidate, key)))
+      return undefined
+    reported[kind].push(key)
+    const path = stored.path.length === 0 ? undefined : stored.path.join('.')
+    const related = specializing === undefined ? undefined : expression.span
+    if (
+      (kind === 'Callable' && Type.isCallable(stored.contract)) ||
+      (kind === 'Effect' && !stored.represented && Type.isEffect(stored.contract))
+    )
+      return Diagnostic.storedCallableConstruction(
+        Type.encode(aggregate),
+        path,
+        Type.encode(stored.contract),
+        span,
+        related,
+        stored.represented,
+        kind === 'Callable' ? 'callable' : 'Effect',
+      )
+    if (kind === 'Effect' && Type.isEffect(stored.contract))
+      return Diagnostic.storedRepresentedEffectConstruction(
+        Type.encode(aggregate),
+        path,
+        Type.encode(stored.contract),
+        span,
+        related,
+      )
+    return undefined
+  }
+  // One walk serves both kinds: specializing each construction's type dominates the check.
+  for (const instance of self.instances)
+    for (const expression of instance.function.statements
       .flatMap(Tir.statementExpressions)
-      .flatMap(Tir.expressionTree)
-      .flatMap((expression) => {
-        if (
-          expression._tag !== 'Construct' &&
-          expression._tag !== 'ConstructUnionVariant' &&
-          expression._tag !== 'ArrayConstruct'
-        )
-          return []
-        const aggregate = Specialization.specializeType(instance.key, expression.type, [
-          instance.substitution,
-        ])
-        const found = storedExecutable(index, aggregate, kind)
-        if (found === undefined) return []
-        if (
-          found.represented &&
-          Type.isNominal(aggregate) &&
-          FieldRealization.supportsInstance(fieldRealizations, aggregate)
-        )
-          return []
-        const declared = storedExecutable(index, expression.type, kind)
-        const specializing =
-          declared === undefined || declared.open
-            ? specializingCalls.get(Instances.keyText(instance.key))
-            : undefined
-        const span = specializing?.span ?? expression.span
-        const constructionSpan = expression.span
-        const key: StoredExecutableViolationKey = {
-          aggregate,
-          path: found.path,
-          contract: found.contract,
-          represented: found.represented,
-          span,
-          constructionSpan,
-        }
-        if (reported.some((candidate) => sameStoredExecutableViolationKey(candidate, key)))
-          return []
-        reported.push(key)
-        const path = found.path.length === 0 ? undefined : found.path.join('.')
-        const related = specializing === undefined ? undefined : expression.span
-        if (
-          (kind === 'Callable' && Type.isCallable(found.contract)) ||
-          (kind === 'Effect' && !found.represented && Type.isEffect(found.contract))
-        )
-          return [
-            Diagnostic.storedCallableConstruction(
-              Type.encode(aggregate),
-              path,
-              Type.encode(found.contract),
-              span,
-              related,
-              found.represented,
-              kind === 'Callable' ? 'callable' : 'Effect',
-            ),
-          ]
-        if (kind === 'Effect' && Type.isEffect(found.contract))
-          return [
-            Diagnostic.storedRepresentedEffectConstruction(
-              Type.encode(aggregate),
-              path,
-              Type.encode(found.contract),
-              span,
-              related,
-            ),
-          ]
-        return []
-      }),
-  )
+      .flatMap(Tir.expressionTree)) {
+      if (
+        expression._tag !== 'Construct' &&
+        expression._tag !== 'ConstructUnionVariant' &&
+        expression._tag !== 'ArrayConstruct'
+      )
+        continue
+      const aggregate = Specialization.specializeType(instance.key, expression.type, [
+        instance.substitution,
+      ])
+      for (const kind of ['Callable', 'Effect'] as const) {
+        const diagnostic = violation(instance, expression, aggregate, kind)
+        if (diagnostic !== undefined) found[kind].push(diagnostic)
+      }
+    }
+  return [...found.Callable, ...found.Effect]
 }
 
 /** Rejects reachable Drop-hook instances whose concrete provider is Copy. */
@@ -444,18 +475,6 @@ export const unlowerableWitnessViolations = (
         ]
       }),
   )
-
-/** Rejects reachable constructions that retain bare or represented callable values. */
-export const storedCallableViolations = (
-  self: Instances.Discovery,
-  index: DeclarationIndex.Index,
-): ReadonlyArray<Diagnostic.Diagnostic> => storedExecutableViolations(self, index, 'Callable')
-
-/** Rejects reachable constructions that retain represented Effect values. */
-export const storedEffectViolations = (
-  self: Instances.Discovery,
-  index: DeclarationIndex.Index,
-): ReadonlyArray<Diagnostic.Diagnostic> => storedExecutableViolations(self, index, 'Effect')
 
 /** Produces semantic diagnostics for every finite-discovery violation. */
 export const violationDiagnostics = (

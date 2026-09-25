@@ -52,7 +52,7 @@ const TRIVIA = new Set(['Whitespace', 'Newline', 'Comment'])
 export const isTrivia = (kind: string): boolean => TRIVIA.has(kind)
 
 const sliceOf = (source: SyntaxFile.SyntaxFile['source'], span: Span): string =>
-  decoder.decode(Uint8Array.from(source.bytes.slice(span.start, span.end)))
+  decoder.decode(source.bytes.slice(span.start, span.end))
 
 export const tokenRows = (
   syntax: SyntaxFile.SyntaxFile,

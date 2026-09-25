@@ -82,7 +82,7 @@ export const normalize = (
       offsets[markdown.length] = start
     }
     const normalizedStart = markdown.length
-    const value = decoder.decode(Uint8Array.from(source.bytes.slice(start, comment.span.end)))
+    const value = decoder.decode(source.bytes.slice(start, comment.span.end))
     let byteOffset = start
     for (const character of value) {
       for (let unit = 0; unit < character.length; unit += 1)

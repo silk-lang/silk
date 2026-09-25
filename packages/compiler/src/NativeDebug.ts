@@ -1,3 +1,4 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as Builder from '@silklang/llvm/Builder'
 import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import type * as LlvmError from '@silklang/llvm/LlvmError'
@@ -20,29 +21,24 @@ export interface LoweringContext {
 
 /** Source-location state for instructions in one native function body. */
 export interface LocationContext {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly enabled: boolean
   readonly scope: LlvmMetadata.Optional
   readonly table: LineTable
 }
 
 /** Attaches one source location when debug metadata is enabled. */
-export const locate = Effect.fnUntraced(function* (
+export const locate = (
   context: LocationContext,
   span: SourceSpan.SourceSpan,
   instruction: FunctionBody.Instruction | undefined,
-) {
+) => {
   if (!context.enabled || context.scope === undefined || instruction === undefined) return
   const position = positionOf(context.table, span.start)
-  const location = yield* LlvmMetadata.location(
-    context.builder,
-    position.line,
-    position.column,
-    context.scope,
-  )
-  yield* FunctionBody.setDebugLocation(context.body, instruction, location)
-})
+  const location = Emitter.location(context.builder, position.line, position.column, context.scope)
+  Emitter.setDebugLocation(context.body, instruction, location)
+}
 
 /** Emits and memoizes the source-level debug type for one MIR value. */
 export const typeOf = Effect.fn('NativeDebug.typeOf')(function* (

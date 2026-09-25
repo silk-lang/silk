@@ -68,7 +68,7 @@ export const segments = (self: SyntaxTree.Node): ReadonlyArray<Token.Token> =>
 const decoder = new TextDecoder()
 
 const tokenText = (source: SourceFile.SourceFile, token: Token.Token): string =>
-  decoder.decode(Uint8Array.from(source.bytes.slice(token.span.start, token.span.end)))
+  decoder.decode(source.bytes.slice(token.span.start, token.span.end))
 
 /** Renders a syntax import path as source spells it; source-edit tooling only. */
 export const spelling = (

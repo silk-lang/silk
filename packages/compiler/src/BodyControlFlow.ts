@@ -13,6 +13,16 @@ export interface Boundary {
   readonly after: number
 }
 
+/**
+ * Points reachable from one start: bit `point & 31` of word `point >>> 5`. Answers stay cached for
+ * the life of the graph, and a bitset is a small fraction of a `Set<number>` of the same points.
+ */
+export type Reachable = Uint32Array
+
+/** Whether a reachability answer contains one point. */
+export const includes = (self: Reachable, point: number): boolean =>
+  (((self[point >>> 5] ?? 0) >>> (point & 31)) & 1) === 1
+
 /** Finite semantic control flow, independent of source offsets and backend lowering. */
 export interface BodyControlFlow {
   readonly boundaries: ReadonlyMap<string, Boundary>
@@ -23,12 +33,21 @@ export interface BodyControlFlow {
   readonly spans: ReadonlyMap<string, Boundary>
   readonly writes: ReadonlyMap<string, number>
   readonly edges: ReadonlyArray<ReadonlyArray<number>>
-  readonly queries: Map<string, ReadonlySet<number>>
+  /** Answered reachability by start point, then by barrier (-1 for none, or a sorted list). */
+  readonly queries: Map<number, Map<number | string, Reachable>>
   readonly work: { queries: number; cacheHits: number; visitedEdges: number }
 }
 
-const spanKey = (span: SourceSpan.SourceSpan): string =>
-  `${span.sourceId}:${span.start}:${span.end}`
+// Spans are immutable and ownership probes the same span objects repeatedly.
+const spanKeys = new WeakMap<SourceSpan.SourceSpan, string>()
+const spanKey = (span: SourceSpan.SourceSpan): string => {
+  let key = spanKeys.get(span)
+  if (key === undefined) {
+    key = `${span.sourceId}:${span.start}:${span.end}`
+    spanKeys.set(span, key)
+  }
+  return key
+}
 const loopKey = (loop: Tir.LoopId): string =>
   `${loop.function.sourceId}:${loop.function.ordinal}:${loop.ordinal}`
 
@@ -192,7 +211,9 @@ export const make = (
     writeAnchors,
     spans,
     writes,
-    edges,
+    // Exact-size copies: each successor list was grown by push (17 slots for one edge), and the
+    // graph lives with its function's lifetime flow.
+    edges: edges.map((successors) => successors.slice()),
     queries: new Map(),
     work: { queries: 0, cacheHits: 0, visitedEdges: 0 },
   }
@@ -222,7 +243,7 @@ export const present = (
     ...self,
     spans,
     writes,
-    queries: new Map(self.queries),
+    queries: new Map([...self.queries].map(([from, answers]) => [from, new Map(answers)])),
     work: { queries: 0, cacheHits: 0, visitedEdges: 0 },
   }
 }
@@ -244,32 +265,52 @@ export const at = (self: BodyControlFlow, span: SourceSpan.SourceSpan): Boundary
 export const writeAt = (self: BodyControlFlow, span: SourceSpan.SourceSpan): number | undefined =>
   self.writes.get(spanKey(span))
 
+/**
+ * Every point reachable from one start without passing a barrier, computed lazily and reused for
+ * every later query from the same start and barriers.
+ */
+export const reachable = (
+  self: BodyControlFlow,
+  from: number,
+  barrier?: number | ReadonlyArray<number>,
+): Reachable => {
+  self.work.queries += 1
+  // Ownership asks the same few (start, barrier) pairs many thousand times: key the cache by
+  // numbers, allocating a key only for a list of barriers.
+  let key: number | string = -1
+  if (typeof barrier === 'number') key = barrier
+  else if (barrier !== undefined)
+    key = [...new Set(barrier)].sort((left, right) => left - right).join(',')
+  let answers = self.queries.get(from)
+  if (answers === undefined) {
+    answers = new Map()
+    self.queries.set(from, answers)
+  }
+  const cached = answers.get(key)
+  if (cached !== undefined) {
+    self.work.cacheHits += 1
+    return cached
+  }
+  const barriers = new Set(typeof barrier === 'number' ? [barrier] : (barrier ?? []))
+  const pending = [from]
+  const visited: Reachable = new Uint32Array((self.edges.length + 31) >>> 5)
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === undefined || barriers.has(current) || includes(visited, current)) continue
+    visited[current >>> 5] = (visited[current >>> 5] ?? 0) | (1 << (current & 31))
+    for (const next of self.edges.at(current) ?? []) {
+      self.work.visitedEdges += 1
+      pending.push(next)
+    }
+  }
+  answers.set(key, visited)
+  return visited
+}
+
 /** Lazily reuses reachability from requested starts; barriers stop re-creation of a loan. */
 export const reaches = (
   self: BodyControlFlow,
   from: number,
   to: number,
   barrier?: number | ReadonlyArray<number>,
-): boolean => {
-  self.work.queries += 1
-  const barriers = new Set(typeof barrier === 'number' ? [barrier] : (barrier ?? []))
-  const key = `${from}:${[...barriers].sort((left, right) => left - right).join(',')}`
-  const cached = self.queries.get(key)
-  if (cached !== undefined) {
-    self.work.cacheHits += 1
-    return cached.has(to)
-  }
-  const pending = [from]
-  const visited = new Set<number>()
-  while (pending.length > 0) {
-    const current = pending.pop()
-    if (current === undefined || barriers.has(current) || visited.has(current)) continue
-    visited.add(current)
-    for (const next of self.edges.at(current) ?? []) {
-      self.work.visitedEdges += 1
-      pending.push(next)
-    }
-  }
-  self.queries.set(key, visited)
-  return visited.has(to)
-}
+): boolean => includes(reachable(self, from, barrier), to)

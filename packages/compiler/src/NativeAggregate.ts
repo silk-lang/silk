@@ -1,15 +1,10 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativeExecutionStorage from './NativeExecutionStorage.js'
+import * as FunctionIndex from './internal/FunctionIndex.js'
 import * as NativeArgument from './NativeArgument.js'
-import * as Alignment from '@silklang/llvm/Alignment'
-import * as LlvmBlock from '@silklang/llvm/Block'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
 import type * as FunctionActor from '@silklang/llvm/Function'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import * as Layout from './Layout.js'
@@ -44,8 +39,8 @@ export const fieldOffset = (layout: Layout.Plan, type: SilkType.Type, name: stri
 }
 
 export interface FailureContext {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly i32: LlvmType.Type
   readonly types: NativeType.LoweringContext
@@ -53,7 +48,7 @@ export interface FailureContext {
 }
 
 /** Repacks one semantic failure payload into the target Effect outcome layout. */
-export const failurePayload = Effect.fnUntraced(function* (
+export const failurePayload = (
   context: FailureContext,
   source: ReadonlyArray<Value.Input>,
   sourceType: DeclarationFacts.SemanticType,
@@ -61,7 +56,7 @@ export const failurePayload = Effect.fnUntraced(function* (
   targetType: SilkType.Effect,
   mappings: ReadonlyArray<{ readonly source: number; readonly target: number }>,
   label: string,
-): Effect.fn.Return<ReadonlyArray<Value.Input>, LlvmError.LlvmError> {
+): ReadonlyArray<Value.Input> => {
   const targetShape = Layout.callingShape(context.program.layout, targetType)
   if (targetShape?.tree._tag !== 'OutcomeShape')
     throw new RangeError('LLVM failure propagation lost its target calling shape')
@@ -83,7 +78,7 @@ export const failurePayload = Effect.fnUntraced(function* (
   })
   const payload: Array<Value.Input> = []
   for (const [targetOrdinal, targetLane] of targetShape.lanes.slice(1).entries()) {
-    let selected: Value.Input = yield* Constant.nullValue(
+    let selected: Value.Input = Emitter.nullValue(
       context.builder,
       NativeType.laneType(context.types, targetLane),
     )
@@ -97,19 +92,19 @@ export const failurePayload = Effect.fnUntraced(function* (
     for (const [mappingOrdinal, { mapping, lanes }] of prepared.entries()) {
       const lane = lanes.get(targetOrdinal)
       const sourceValue = lane === undefined ? undefined : source.at(lane.sourceOrdinal)
-      let candidate: Value.Input = yield* Constant.nullValue(
+      let candidate: Value.Input = Emitter.nullValue(
         context.builder,
         NativeType.laneType(context.types, targetLane),
       )
       if (lane !== undefined && sourceValue !== undefined) {
-        const member = yield* NativeArith.coerceLane(
+        const member = NativeArith.coerceLane(
           context.arith,
           sourceValue,
           lane.source,
           lane.member,
           `${label}_${targetOrdinal}_${mappingOrdinal}_member`,
         )
-        candidate = yield* NativeArith.coerceLane(
+        candidate = NativeArith.coerceLane(
           context.arith,
           member,
           lane.member,
@@ -121,14 +116,14 @@ export const failurePayload = Effect.fnUntraced(function* (
         selected = candidate
         continue
       }
-      const matches = yield* FunctionBody.integerCompare(
+      const matches = Emitter.integerCompare(
         context.body,
         'eq',
         sourceTag,
-        yield* Constant.integerSigned(context.builder, context.i32, BigInt(mapping.source)),
+        Emitter.integerSigned(context.builder, context.i32, BigInt(mapping.source)),
         `${label}_${targetOrdinal}_${mappingOrdinal}_matches`,
       )
-      selected = yield* FunctionBody.select(
+      selected = Emitter.select(
         context.body,
         matches,
         candidate,
@@ -139,7 +134,7 @@ export const failurePayload = Effect.fnUntraced(function* (
     payload.push(selected)
   }
   return payload
-})
+}
 
 /** Field paths to reclaim contexts, or undefined when guarded structural cleanup is required. */
 export const reclaimContextPaths = (
@@ -276,8 +271,8 @@ const unionPayloadOffset = (layout: Layout.Plan, type: SilkType.Type): number =>
 }
 
 export interface Context {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly i8: LlvmType.Type
   readonly i32: LlvmType.Type
@@ -330,14 +325,14 @@ const childInitialization = (
   }
 }
 
-export const dropThroughPlan = Effect.fnUntraced(function* (
+export const dropThroughPlan = (
   context: Context,
   plan: CleanupPlan.CleanupPlan,
   values: NativePayload.NativePayload,
   tag: string,
   localSharedBlock?: LocalSharedControlBlock.Plan,
   initialization?: Initialization,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   const {
     builder,
     body,
@@ -366,28 +361,28 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
     if (flag === undefined) throw new RangeError('Conditional cleanup lost its initialization flag')
     const initialized =
       context.initializationValues === undefined
-        ? yield* NativeStorage.readScalar(storage, flag.local)
+        ? NativeStorage.readScalar(storage, flag.local)
         : context.initializationValues.get(flag.local.ordinal)
     if (initialized === undefined)
       throw new RangeError('Conditional frame cleanup lost its retained initialization flag')
-    const condition = yield* FunctionBody.integerCompare(
+    const condition = Emitter.integerCompare(
       body,
       'ne',
       initialized,
-      yield* Constant.integerSigned(builder, i32, 0n),
+      Emitter.integerSigned(builder, i32, 0n),
       `${tag}_is_initialized`,
     )
-    const selected = yield* LlvmBlock.make(body, `${tag}_initialized`)
-    const following = yield* LlvmBlock.make(body, `${tag}_initialization_next`)
-    yield* FunctionBody.conditionalBranch(body, condition, selected, following)
-    yield* LlvmBlock.setInsertionPoint(body, selected)
-    yield* dropThroughPlan(context, plan, values, tag, localSharedBlock, {
+    const selected = Emitter.block(body, `${tag}_initialized`)
+    const following = Emitter.block(body, `${tag}_initialization_next`)
+    Emitter.conditionalBranch(body, condition, selected, following)
+    Emitter.setInsertionPoint(body, selected)
+    dropThroughPlan(context, plan, values, tag, localSharedBlock, {
       ...initialization,
       state: { ...initialization.state, initialization: 'Initialized' },
     })
-    yield* FunctionBody.branch(body, following)
-    yield* LlvmBlock.setInsertionPoint(body, following)
-    yield* NativeStorage.reloadRoots(storage, `${tag}_initialization_next`)
+    Emitter.branch(body, following)
+    Emitter.setInsertionPoint(body, following)
+    NativeStorage.reloadRoots(storage, `${tag}_initialization_next`)
     return
   }
   const semanticLanesOf = (type: SilkType.Type): ReadonlyArray<Layout.CallingLane> => {
@@ -401,15 +396,15 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
     case 'ParameterCleanup':
       return
     case 'ExecutionCleanup': {
-      const base = yield* NativePayload.at(values, context, 0, `${tag}_base`)
+      const base = NativePayload.at(values, context, 0, `${tag}_base`)
       if (base === undefined || context.executionRelease === undefined)
         throw new RangeError('LLVM Execution cleanup lost its release helper')
       // A synchronous call, not a bare `callDirect`: the helper may run user drop hooks, so the
       // caller's address-taken roots reload exactly as they did for the former inline expansion.
       NativeResult.sourceValues(
-        yield* NativeResult.materialize(
+        NativeResult.materialize(
           context.storage,
-          yield* NativeCall.callSynchronous(
+          NativeCall.callSynchronous(
             call.synchronous,
             {
               handle: context.executionRelease,
@@ -426,9 +421,9 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       return
     }
     case 'WakeCleanup':
-      return yield* NativeExecutionOperation.dropWake(
+      return NativeExecutionOperation.dropWake(
         context,
-        yield* NativePayload.materialize(values, context, tag),
+        NativePayload.materialize(values, context, tag),
         tag,
       )
     case 'CallableCleanup': {
@@ -447,10 +442,10 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
         )
         if (range === undefined || field === undefined)
           throw new RangeError('LLVM callable cleanup lost an owned capture lane')
-        yield* dropThroughPlan(
+        dropThroughPlan(
           context,
           slot.cleanup,
-          yield* NativePayload.projectStored(
+          NativePayload.projectStored(
             values,
             context,
             field.type,
@@ -473,22 +468,22 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       )
         return
       const shape = Layout.callingShape(program.layout, plan.type)
-      const tagValue = yield* NativePayload.at(values, context, 0, `${tag}_tag`)
+      const tagValue = NativePayload.at(values, context, 0, `${tag}_tag`)
       if (shape?.tree._tag !== 'NominalUnionShape' || tagValue === undefined)
         throw new RangeError('LLVM nominal union cleanup lost its shape')
       for (const variant of plan.variants) {
         if (!variant.fields.some((field) => CleanupPlan.hasEffect(field.cleanup))) continue
-        const matches = yield* FunctionBody.integerCompare(
+        const matches = Emitter.integerCompare(
           body,
           'eq',
           tagValue,
-          yield* Constant.integerSigned(builder, i32, BigInt(variant.ordinal)),
+          Emitter.integerSigned(builder, i32, BigInt(variant.ordinal)),
           `${tag}_v${variant.ordinal}_is`,
         )
-        const selectedBlock = yield* LlvmBlock.make(body, `${tag}_v${variant.ordinal}_drop`)
-        const followingBlock = yield* LlvmBlock.make(body, `${tag}_v${variant.ordinal}_next`)
-        yield* FunctionBody.conditionalBranch(body, matches, selectedBlock, followingBlock)
-        yield* LlvmBlock.setInsertionPoint(body, selectedBlock)
+        const selectedBlock = Emitter.block(body, `${tag}_v${variant.ordinal}_drop`)
+        const followingBlock = Emitter.block(body, `${tag}_v${variant.ordinal}_next`)
+        Emitter.conditionalBranch(body, matches, selectedBlock, followingBlock)
+        Emitter.setInsertionPoint(body, selectedBlock)
         const identity = Match.nominalUnionVariant(
           plan.type,
           plan.type,
@@ -501,10 +496,10 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
           const targetLanes = semanticLanesOf(field.cleanup.type)
           if (physical === undefined || physical.length !== targetLanes.length)
             throw new RangeError('LLVM nominal union cleanup lost a field payload lane')
-          yield* dropThroughPlan(
+          dropThroughPlan(
             context,
             field.cleanup,
-            yield* NativePayload.projectStored(
+            NativePayload.projectStored(
               values,
               context,
               field.cleanup.type,
@@ -521,9 +516,9 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
             ),
           )
         }
-        yield* FunctionBody.branch(body, followingBlock)
-        yield* LlvmBlock.setInsertionPoint(body, followingBlock)
-        yield* NativeStorage.reloadRoots(storage, `${tag}_v${variant.ordinal}_next`)
+        Emitter.branch(body, followingBlock)
+        Emitter.setInsertionPoint(body, followingBlock)
+        NativeStorage.reloadRoots(storage, `${tag}_v${variant.ordinal}_next`)
       }
       return
     }
@@ -538,7 +533,7 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
         const selected =
           field === undefined
             ? NativePayload.slice(values, slot.laneOffset, slot.laneOffset + slot.laneCount)
-            : yield* NativePayload.projectStored(
+            : NativePayload.projectStored(
                 values,
                 context,
                 field.type,
@@ -552,7 +547,7 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
           throw new RangeError(
             `LLVM Effect cleanup ${tag} lost slot ${slot.ordinal} lanes ${slot.laneOffset}+${slot.laneCount} from ${values.length} value(s)`,
           )
-        yield* dropThroughPlan(context, slot.cleanup, selected, `${tag}_effect${slot.ordinal}`)
+        dropThroughPlan(context, slot.cleanup, selected, `${tag}_effect${slot.ordinal}`)
       }
       return
     case 'EffectCompositeCleanup': {
@@ -560,32 +555,29 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       const shape = Layout.callingShape(program.layout, plan.type)
       if (view === undefined || shape === undefined)
         throw new RangeError('Composite cleanup lost its value-storage plan')
-      const choice = yield* NativePayload.at(values, context, 0, `${tag}_choice`)
+      const choice = NativePayload.at(values, context, 0, `${tag}_choice`)
       if (choice === undefined) throw new RangeError('LLVM Effect composite cleanup lost its tag')
-      const following = yield* LlvmBlock.make(body, `${tag}_effect_composite_following`)
+      const following = Emitter.block(body, `${tag}_effect_composite_following`)
       for (const [ordinal, alternative] of plan.alternatives.entries()) {
-        const selected = yield* LlvmBlock.make(body, `${tag}_effect_composite_${ordinal}`)
-        const otherwise = yield* LlvmBlock.make(
+        const selected = Emitter.block(body, `${tag}_effect_composite_${ordinal}`)
+        const otherwise = Emitter.block(body, `${tag}_effect_composite_${ordinal}_otherwise`)
+        Emitter.conditionalBranch(
           body,
-          `${tag}_effect_composite_${ordinal}_otherwise`,
-        )
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             choice,
-            yield* Constant.integerSigned(builder, i32, BigInt(ordinal)),
+            Emitter.integerSigned(builder, i32, BigInt(ordinal)),
             `${tag}_effect_composite_is_${ordinal}`,
           ),
           selected,
           otherwise,
         )
-        yield* LlvmBlock.setInsertionPoint(body, selected)
+        Emitter.setInsertionPoint(body, selected)
         const member = view.members.find((member) => member.tag === ordinal)
         if (member === undefined)
           throw new RangeError('Composite cleanup lost its selected alternative')
-        yield* dropThroughPlan(
+        dropThroughPlan(
           context,
           alternative,
           NativePayload.project(
@@ -595,16 +587,16 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
           ),
           `${tag}_${ordinal}`,
         )
-        yield* FunctionBody.branch(body, following)
-        yield* LlvmBlock.setInsertionPoint(body, otherwise)
+        Emitter.branch(body, following)
+        Emitter.setInsertionPoint(body, otherwise)
       }
-      yield* FunctionBody.branch(body, following)
-      yield* LlvmBlock.setInsertionPoint(body, following)
-      yield* NativeStorage.reloadRoots(storage, `${tag}_effect_composite_following`)
+      Emitter.branch(body, following)
+      Emitter.setInsertionPoint(body, following)
+      NativeStorage.reloadRoots(storage, `${tag}_effect_composite_following`)
       return
     }
     case 'LocalSharedCoreCleanup': {
-      const baseAddress = yield* NativePayload.at(values, context, 0, `${tag}_base`)
+      const baseAddress = NativePayload.at(values, context, 0, `${tag}_base`)
       const elementLayout = Layout.entry(program.layout, plan.element)
       const block =
         localSharedBlock ??
@@ -618,69 +610,66 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       )
         throw new RangeError('LLVM local-shared cleanup lost its control-block plan')
       const wordType = usizeType
-      const base = yield* FunctionBody.cast(body, 'inttoptr', baseAddress, pointer, `${tag}_base`)
-      const countPointer = yield* NativeLanePointer.lanePointer(
+      const base = Emitter.cast(body, 'inttoptr', baseAddress, pointer, `${tag}_base`)
+      const countPointer = NativeLanePointer.lanePointer(
         lanePointers,
         body,
         base,
         block.strongOffset,
         `${tag}_strong_ptr`,
       )
-      const count = yield* FunctionBody.load(body, wordType, countPointer, `${tag}_strong`)
-      const nonLast = yield* FunctionBody.integerCompare(
+      const count = Emitter.load(body, wordType, countPointer, `${tag}_strong`)
+      const nonLast = Emitter.integerCompare(
         body,
         'ugt',
         count,
-        yield* Constant.integerUnsigned(builder, wordType, 1n),
+        Emitter.integerUnsigned(builder, wordType, 1n),
         `${tag}_non_last`,
       )
-      const decrement = yield* LlvmBlock.make(body, `${tag}_decrement`)
-      const last = yield* LlvmBlock.make(body, `${tag}_last`)
-      const following = yield* LlvmBlock.make(body, `${tag}_following`)
-      yield* FunctionBody.conditionalBranch(body, nonLast, decrement, last)
-      yield* LlvmBlock.setInsertionPoint(body, decrement)
-      yield* FunctionBody.store(
+      const decrement = Emitter.block(body, `${tag}_decrement`)
+      const last = Emitter.block(body, `${tag}_last`)
+      const following = Emitter.block(body, `${tag}_following`)
+      Emitter.conditionalBranch(body, nonLast, decrement, last)
+      Emitter.setInsertionPoint(body, decrement)
+      Emitter.store(
         body,
-        yield* FunctionBody.binary(
+        Emitter.binary(
           body,
           'sub',
           count,
-          yield* Constant.integerUnsigned(builder, wordType, 1n),
+          Emitter.integerUnsigned(builder, wordType, 1n),
           `${tag}_decremented`,
         ),
         countPointer,
       )
-      yield* FunctionBody.branch(body, following)
-      yield* LlvmBlock.setInsertionPoint(body, last)
-      const loadLanes = Effect.fnUntraced(function* (
-        type: SilkType.Type,
-        byteOffset: number,
-        laneTag: string,
-      ) {
-        return yield* NativePlace.loadLanes(
+      Emitter.branch(body, following)
+      Emitter.setInsertionPoint(body, last)
+      const loadLanes = (type: SilkType.Type, byteOffset: number, laneTag: string) => {
+        return NativePlace.loadLanes(
           NativePlace.stored(
             program.layout,
             type,
-            yield* NativeLanePointer.lanePointer(lanePointers, body, base, byteOffset, laneTag),
+            NativeLanePointer.lanePointer(lanePointers, body, base, byteOffset, laneTag),
           ),
           context.storage,
           laneTag,
         )
-      })
-      const helper = declared.find((candidate) =>
+      }
+      const helper = FunctionIndex.nativeCandidates(
+        declared,
+        LocalSharedPayloadCleanup.declaration,
+      ).find((candidate) =>
         Mir.matchesInstance(candidate.fn, LocalSharedPayloadCleanup.declaration, [plan.element]),
       )
       if (helper === undefined)
         throw new RangeError('LLVM local-shared cleanup lost its payload helper')
-      yield* NativeCall.callValues(
+      NativeCall.callValues(
         call,
         helper,
-        NativeArgument.fromValues(
-          yield* loadLanes(plan.element, block.valueOffset, `${tag}_value`),
-        ),
+        NativeArgument.fromValues(loadLanes(plan.element, block.valueOffset, `${tag}_value`)),
         `${tag}_value_cleanup`,
       )
-      yield* dropThroughPlan(
+      dropThroughPlan(
         context,
         plan.allocation,
         NativePayload.place(
@@ -688,7 +677,7 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
           NativePlace.stored(
             program.layout,
             SilkType.allocation,
-            yield* NativeLanePointer.lanePointer(
+            NativeLanePointer.lanePointer(
               lanePointers,
               body,
               base,
@@ -699,23 +688,23 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
         ),
         `${tag}_allocation`,
       )
-      yield* FunctionBody.branch(body, following)
-      yield* LlvmBlock.setInsertionPoint(body, following)
-      yield* NativeStorage.reloadRoots(storage, `${tag}_following`)
+      Emitter.branch(body, following)
+      Emitter.setInsertionPoint(body, following)
+      NativeStorage.reloadRoots(storage, `${tag}_following`)
       return
     }
     case 'AllocationCleanup':
     case 'RawBufferCleanup': {
-      const reclaim = yield* NativePayload.at(values, context, 4, `${tag}_reclaim`)
+      const reclaim = NativePayload.at(values, context, 4, `${tag}_reclaim`)
       if (free === undefined)
         throw new RangeError('LLVM allocation cleanup lost its reclaim context')
-      yield* FunctionBody.callDirect(body, free, [
-        yield* FunctionBody.cast(body, 'inttoptr', reclaim, pointer, `${tag}_context`),
+      Emitter.callDirect(body, free, [
+        Emitter.cast(body, 'inttoptr', reclaim, pointer, `${tag}_context`),
       ])
       return
     }
     case 'HookCleanup': {
-      const target = declared.find((candidate) =>
+      const target = FunctionIndex.nativeCandidates(declared, plan.hook).find((candidate) =>
         Mir.matchesInstance(candidate.fn, plan.hook, plan.typeArguments),
       )
       if (target === undefined)
@@ -726,32 +715,27 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       let receiver = NativePayload.storage(values, context)
       if (receiver === undefined) {
         // A transport-only payload has no owning address until it enters this cleanup.
-        const base = yield* FunctionBody.alloca(body, i8, `${tag}_hook_storage`, {
-          count: yield* Constant.integerUnsigned(builder, i32, BigInt(layoutEntry.size)),
-          alignment: yield* Alignment.fromByteUnits(layoutEntry.alignment),
+        const base = Emitter.alloca(body, i8, `${tag}_hook_storage`, {
+          count: Emitter.integerUnsigned(builder, i32, BigInt(layoutEntry.size)),
+          alignment: Emitter.alignment(body, layoutEntry.alignment),
         })
         receiver = NativePlace.stored(program.layout, plan.type, base)
-        yield* NativePlace.storeLanes(
+        NativePlace.storeLanes(
           receiver,
           context.storage,
-          yield* NativePayload.materialize(values, context, `${tag}_source`),
+          NativePayload.materialize(values, context, `${tag}_source`),
           `${tag}_store`,
         )
       }
-      const base = yield* NativePlace.base(receiver, context.storage, `${tag}_receiver`)
+      const base = NativePlace.base(receiver, context.storage, `${tag}_receiver`)
       NativeResult.sourceValues(
-        yield* NativeResult.materialize(
+        NativeResult.materialize(
           context.storage,
-          yield* NativeCall.callValues(
-            call,
-            target,
-            NativeArgument.fromValues([base]),
-            `${tag}_hook`,
-          ),
+          NativeCall.callValues(call, target, NativeArgument.fromValues([base]), `${tag}_hook`),
           `${tag}_source_result`,
         ),
       )
-      yield* dropThroughPlan(
+      dropThroughPlan(
         context,
         plan.inner,
         NativePayload.place(
@@ -774,10 +758,10 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
             ? [index]
             : []
         })
-        yield* dropThroughPlan(
+        dropThroughPlan(
           context,
           field.cleanup,
-          yield* NativePayload.projectStored(
+          NativePayload.projectStored(
             values,
             context,
             field.cleanup.type,
@@ -804,10 +788,10 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
             ? [ordinal]
             : []
         })
-        yield* dropThroughPlan(
+        dropThroughPlan(
           context,
           plan.element,
-          yield* NativePayload.projectStored(
+          NativePayload.projectStored(
             values,
             context,
             plan.element.type,
@@ -828,7 +812,7 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       // the complete plan. Plain reclaim paths select a null context for inactive cases,
       // which libc free ignores.
       const shape = Layout.callingShape(program.layout, plan.type)
-      const tagValue = yield* NativePayload.at(values, context, 0, `${tag}_tag`)
+      const tagValue = NativePayload.at(values, context, 0, `${tag}_tag`)
       if (shape === undefined || tagValue === undefined) {
         throw new RangeError('LLVM union cleanup lost its shape')
       }
@@ -836,26 +820,26 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
         const paths =
           initialization === undefined ? reclaimContextPaths(caseEntry.cleanup) : undefined
         if (paths === undefined) {
-          const matches = yield* FunctionBody.integerCompare(
+          const matches = Emitter.integerCompare(
             body,
             'eq',
             tagValue,
-            yield* Constant.integerSigned(builder, i32, BigInt(caseEntry.ordinal)),
+            Emitter.integerSigned(builder, i32, BigInt(caseEntry.ordinal)),
             `${tag}_u${caseEntry.ordinal}_is`,
           )
-          const selectedBlock = yield* LlvmBlock.make(body, `${tag}_u${caseEntry.ordinal}_drop`)
-          const followingBlock = yield* LlvmBlock.make(body, `${tag}_u${caseEntry.ordinal}_next`)
-          yield* FunctionBody.conditionalBranch(body, matches, selectedBlock, followingBlock)
-          yield* LlvmBlock.setInsertionPoint(body, selectedBlock)
+          const selectedBlock = Emitter.block(body, `${tag}_u${caseEntry.ordinal}_drop`)
+          const followingBlock = Emitter.block(body, `${tag}_u${caseEntry.ordinal}_next`)
+          Emitter.conditionalBranch(body, matches, selectedBlock, followingBlock)
+          Emitter.setInsertionPoint(body, selectedBlock)
           const physical = Layout.memberFieldSlots(shape, caseEntry.member, [])
           const targetLanes = semanticLanesOf(caseEntry.member)
           if (physical === undefined || physical.length !== targetLanes.length) {
             throw new RangeError('LLVM union cleanup lost a member payload lane')
           }
-          yield* dropThroughPlan(
+          dropThroughPlan(
             context,
             caseEntry.cleanup,
-            yield* NativePayload.projectStored(
+            NativePayload.projectStored(
               values,
               context,
               caseEntry.member,
@@ -868,49 +852,44 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
             undefined,
             childInitialization(initialization, { _tag: 'Variant', ordinal: caseEntry.ordinal }),
           )
-          yield* FunctionBody.branch(body, followingBlock)
-          yield* LlvmBlock.setInsertionPoint(body, followingBlock)
+          Emitter.branch(body, followingBlock)
+          Emitter.setInsertionPoint(body, followingBlock)
           // Only bounded direct locals need fresh SSA values at the join. Aggregate
           // reads resolve the current place after a hook's possible alias writes.
-          yield* NativeStorage.reloadRoots(storage, `${tag}_u${caseEntry.ordinal}_next`)
+          NativeStorage.reloadRoots(storage, `${tag}_u${caseEntry.ordinal}_next`)
           continue
         }
         if (paths.length === 0) continue
         if (free === undefined || usizeType === undefined) {
           throw new RangeError('LLVM union reclaim cleanup lost its release helper')
         }
-        const zero = yield* Constant.integerUnsigned(builder, usizeType, 0n)
+        const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
         for (const [pathOrdinal, path] of paths.entries()) {
           const slots = Layout.memberFieldSlots(shape, caseEntry.member, path)
           const contextSlot = slots?.at(4)
           const reclaim =
             contextSlot === undefined
               ? undefined
-              : yield* NativePayload.at(
-                  values,
-                  context,
-                  contextSlot,
-                  `${tag}_reclaim${pathOrdinal}`,
-                )
+              : NativePayload.at(values, context, contextSlot, `${tag}_reclaim${pathOrdinal}`)
           if (reclaim === undefined) {
             throw new RangeError('LLVM union cleanup lost a reclaim lane')
           }
-          const matches = yield* FunctionBody.integerCompare(
+          const matches = Emitter.integerCompare(
             body,
             'eq',
             tagValue,
-            yield* Constant.integerSigned(builder, i32, BigInt(caseEntry.ordinal)),
+            Emitter.integerSigned(builder, i32, BigInt(caseEntry.ordinal)),
             `${tag}_u${caseEntry.ordinal}_${pathOrdinal}_is`,
           )
-          const guarded = yield* FunctionBody.select(
+          const guarded = Emitter.select(
             body,
             matches,
             reclaim,
             zero,
             `${tag}_u${caseEntry.ordinal}_${pathOrdinal}_context`,
           )
-          yield* FunctionBody.callDirect(body, free, [
-            yield* FunctionBody.cast(
+          Emitter.callDirect(body, free, [
+            Emitter.cast(
               body,
               'inttoptr',
               guarded,
@@ -923,4 +902,4 @@ export const dropThroughPlan = Effect.fnUntraced(function* (
       return
     }
   }
-})
+}

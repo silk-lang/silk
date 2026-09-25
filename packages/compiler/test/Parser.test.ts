@@ -486,7 +486,7 @@ fn main() -> i32 { let pending = work(Problem { code: 1 }) return run pending }`
     'RunExpression',
   )
   assert.deepEqual(result.parserDiagnostics, [])
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('parses source service contracts with complete operation rows losslessly', () => {
@@ -623,7 +623,7 @@ it('parses an effect block as a primary lazy expression and retains Copy fail sy
     undefined,
   )
   assert.deepEqual(result.parserDiagnostics, [])
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('parses ordinary and effectful anonymous callables distinctly and losslessly', () => {
@@ -841,7 +841,7 @@ fn main() -> i32 { unsafe { let allocation = Allocator.allocate(Layout.make(4, 4
   assert.strictEqual(kinds.filter((kind) => kind === 'ImplDeclaration').length, 2)
   assert.include(kinds, 'ImplOperation')
   assert.strictEqual(kinds.filter((kind) => kind === 'UnsafeStatement').length, 2)
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('parses a parametric conformance losslessly', () => {
@@ -861,7 +861,7 @@ fn main() -> i32 { return 42 }`
     .map((node) => node.kind)
   assert.include(implKinds, 'TypeParameterList')
   assert.include(implKinds, 'TypeParameter')
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('retains qualified enum-member and signed integer patterns losslessly', () => {
@@ -933,7 +933,7 @@ fn take(state: Empty | Full) -> i32 {
     .filter(SyntaxTree.isNode)
     .map((node) => node.kind)
   assert.strictEqual(kinds.filter((kind) => kind === 'BindingPattern').length, 2)
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('recovers from a malformed impl type-parameter list inside the declaration', () => {
@@ -4459,7 +4459,7 @@ fn main() -> i32 { return 42 }`
     'FunctionDeclaration',
     'FunctionDeclaration',
   ])
-  assert.deepEqual(Array.from(reconstructedBytes(result)), result.source.bytes)
+  assert.deepEqual(reconstructedBytes(result), result.source.bytes)
 })
 
 it('recovers inside a malformed inherent impl and keeps parsing the next declaration', () => {
@@ -4469,7 +4469,7 @@ it('recovers inside a malformed inherent impl and keeps parsing the next declara
 fn main() -> i32 { return 42 }`
   const unclosedResult = parseText('memory://inherent-unclosed.silk', unclosed)
   assert.notDeepEqual(unclosedResult.parserDiagnostics, [])
-  assert.deepEqual(Array.from(reconstructedBytes(unclosedResult)), unclosedResult.source.bytes)
+  assert.deepEqual(reconstructedBytes(unclosedResult), unclosedResult.source.bytes)
   const binders = `impl<T, Option<T> { fn none() -> Self { return Option<T>.None } }
 fn main() -> i32 { return 42 }`
   const bindersResult = parseText('memory://inherent-binders.silk', binders)
@@ -4483,7 +4483,7 @@ fn main() -> i32 { return 42 }`
       SyntaxTree.isNode(element) && element.kind === 'FunctionDeclaration',
   )
   assert.strictEqual(mainDeclarations.length, 1)
-  assert.deepEqual(Array.from(reconstructedBytes(bindersResult)), bindersResult.source.bytes)
+  assert.deepEqual(reconstructedBytes(bindersResult), bindersResult.source.bytes)
 })
 
 it('parses package schemas with optional defaults and ordinary validation expressions', () => {

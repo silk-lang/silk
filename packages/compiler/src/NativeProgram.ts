@@ -1,3 +1,4 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as ContinuationTransfer from './ContinuationTransfer.js'
 import * as ByteString from '@silklang/llvm/ByteString'
 import * as NativeForeignGuard from './NativeForeignGuard.js'
@@ -152,11 +153,8 @@ export const emit = Effect.fn('NativeProgram.emit')(function* (
   yield* retainRoots(builder, program, declared)
 
   const voidType = functionDeclarations.voidType
-  const executionRelease = yield* NativeExecutionOperation.declareReleaseHelper(
-    builder,
-    program,
-    pointer,
-    voidType,
+  const executionRelease = yield* Emitter.module(builder, (builder) =>
+    NativeExecutionOperation.declareReleaseHelper(builder, program, pointer, voidType),
   )
   const foreignCallbacks = yield* declareExports(
     builder,
@@ -219,41 +217,45 @@ export const emit = Effect.fn('NativeProgram.emit')(function* (
   })
 
   if (executionRelease !== undefined)
-    yield* NativeExecutionOperation.emitReleaseHelper({
+    yield* Emitter.module(builder, (builder) =>
+      NativeExecutionOperation.emitReleaseHelper({
+        builder,
+        program,
+        i8,
+        i32,
+        pointer,
+        ...(usizeType === undefined ? {} : { usizeType }),
+        ...(free === undefined ? {} : { free }),
+        ...(executionStorage === undefined ? {} : { executionStorage }),
+        resumeThunks,
+        declared,
+        types: typeContext,
+        lanePointers,
+        helper: executionRelease,
+      }),
+    )
+
+  yield* Emitter.module(builder, (builder) =>
+    NativeSuspension.emitThunks({
       builder,
       program,
       i8,
       i32,
       pointer,
       ...(usizeType === undefined ? {} : { usizeType }),
-      ...(free === undefined ? {} : { free }),
-      ...(executionStorage === undefined ? {} : { executionStorage }),
-      resumeThunks,
-      declared,
-      types: typeContext,
       lanePointers,
-      helper: executionRelease,
-    })
-
-  yield* NativeSuspension.emitThunks({
-    builder,
-    program,
-    i8,
-    i32,
-    pointer,
-    ...(usizeType === undefined ? {} : { usizeType }),
-    lanePointers,
-    declared,
-    originThunks,
-    resumeThunks,
-    types: typeContext,
-    ...(executionStorage === undefined ? {} : { executionStorage }),
-    transferHeaderSize,
-    transferResultOffset,
-    transferStorageSize,
-    ...(childThunkType === undefined ? {} : { childThunkType }),
-    ...(resumeThunkType === undefined ? {} : { resumeThunkType }),
-  })
+      declared,
+      originThunks,
+      resumeThunks,
+      types: typeContext,
+      ...(executionStorage === undefined ? {} : { executionStorage }),
+      transferHeaderSize,
+      transferResultOffset,
+      transferStorageSize,
+      ...(childThunkType === undefined ? {} : { childThunkType }),
+      ...(resumeThunkType === undefined ? {} : { resumeThunkType }),
+    }),
+  )
   if (needsFrameCleanup || originThunks.size > 0 || resumeThunks.size > 0)
     runtimeFeatures.add('NestedSuspensionRuntime')
 
@@ -306,7 +308,6 @@ const initializeTypes = Effect.fn('NativeProgram.initializeTypes')(function* (
   const i8 = yield* LlvmType.integer(builder, 8)
   const pointer = yield* LlvmType.pointer(builder)
   const lanePointers: NativeLanePointer.Context = {
-    builder,
     byteType: i8,
     offsetType: i32,
   }
@@ -433,15 +434,19 @@ const declareForeignIndirects = Effect.fn('NativeProgram.declareForeignIndirects
     const admitted = parameters.flatMap((type) => (type === undefined ? [] : [type]))
     const result = cType(operation.signature.result) ?? (yield* LlvmType.voidType(builder))
     const calleeType = yield* LlvmType.functionType(builder, result, admitted)
-    const attributes = yield* NativeCAbi.attributes(builder, operation.signature)
-    const handle = yield* NativeForeignGuard.indirect(
-      foreignGuard,
-      builder,
-      calleeType,
-      result,
-      admitted,
-      attributes,
-      foreignIndirects.size,
+    const attributes = yield* Emitter.module(builder, (builder) =>
+      NativeCAbi.attributes(builder, operation.signature),
+    )
+    const handle = yield* Emitter.module(builder, (builder) =>
+      NativeForeignGuard.indirect(
+        foreignGuard,
+        builder,
+        calleeType,
+        result,
+        admitted,
+        attributes,
+        foreignIndirects.size,
+      ),
     )
     foreignIndirects.set(key, { handle, signature: operation.signature })
   }
@@ -463,7 +468,9 @@ const declareForeignFunctions = Effect.fn('NativeProgram.declareForeignFunctions
     const parameters = call.signature.parameters.map(cType)
     if (parameters.some((type) => type === undefined))
       throw new RangeError(`LLVM foreign function ${call.symbol} has a void parameter`)
-    const attributes = yield* NativeCAbi.attributes(builder, call.signature)
+    const attributes = yield* Emitter.module(builder, (builder) =>
+      NativeCAbi.attributes(builder, call.signature),
+    )
     const handle = yield* FunctionActor.declare(
       builder,
       NativeSymbol.foreign(program.layout.target, call.symbol),
@@ -496,13 +503,16 @@ const declareForeignFunctions = Effect.fn('NativeProgram.declareForeignFunctions
       ]
       if (arguments_.some((type) => type === undefined))
         throw new RangeError('Invalid variadic guard parameter')
-      const guarded = yield* NativeForeignGuard.wrap(
-        foreignGuard,
-        builder,
-        handle,
-        foreignFunctions.size,
-        arguments_.flatMap((type) => (type === undefined ? [] : [type])),
-        cType(call.signature.result) ?? (yield* LlvmType.voidType(builder)),
+      const guardResult = cType(call.signature.result) ?? (yield* LlvmType.voidType(builder))
+      const guarded = yield* Emitter.module(builder, (builder) =>
+        NativeForeignGuard.wrap(
+          foreignGuard,
+          builder,
+          handle,
+          foreignFunctions.size,
+          arguments_.flatMap((type) => (type === undefined ? [] : [type])),
+          guardResult,
+        ),
       )
       foreignFunctions.set(key, { handle: guarded, signature: call.signature })
     }
@@ -618,7 +628,7 @@ const declareForeignSymbols = Effect.fn('NativeProgram.declareForeignSymbols')(f
       program.foreignExports.length === 0 &&
       indirectCalls.length === 0)
       ? undefined
-      : yield* NativeForeignGuard.make(builder)
+      : yield* Emitter.module(builder, (builder) => NativeForeignGuard.make(builder))
   const foreignIndirects = yield* declareForeignIndirects(
     builder,
     indirectCalls,

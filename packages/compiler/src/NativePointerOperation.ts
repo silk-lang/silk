@@ -1,10 +1,6 @@
-import * as Alignment from '@silklang/llvm/Alignment'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as Type from './Type.js'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import { alignUp } from './internal/Align.js'
 import * as Layout from './Layout.js'
 import * as LayoutVerify from './LayoutVerify.js'
@@ -48,46 +44,44 @@ const accessAlignment = (context: Context, local: Mir.LocalId, offset: number): 
  * Lowers raw pointers as one LLVM pointer lane: the lane a borrow already carries, so formation
  * copies it, offset is a byte `getelementptr`, and read/write move the pointee's lanes through it.
  */
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const { builder, body, program, pointer, i32, lanePointers, types, storage } = context
   const destination = operation.destination.ordinal
   switch (operation._tag) {
     case 'PointerNull': {
-      yield* NativeStorage.writeLocal(storage, destination, [
-        yield* Constant.nullValue(builder, pointer),
-      ])
+      NativeStorage.writeLocal(storage, destination, [Emitter.nullValue(builder, pointer)])
       return
     }
     case 'PointerAddress': {
-      const addressType = yield* LlvmType.integer(builder, program.layout.target.pointerSize * 8)
-      const address = yield* FunctionBody.cast(
+      const addressType = Emitter.integerType(builder, program.layout.target.pointerSize * 8)
+      const address = Emitter.cast(
         body,
         'ptrtoint',
-        yield* NativeStorage.readScalar(storage, operation.pointer),
+        NativeStorage.readScalar(storage, operation.pointer),
         addressType,
         `ptr_address${destination}`,
       )
-      yield* NativeStorage.writeLocal(storage, destination, [address])
+      NativeStorage.writeLocal(storage, destination, [address])
       return
     }
     case 'PointerIsNull': {
       // icmp takes integers only, so the lane is compared as its pointer-width address.
-      const addressType = yield* LlvmType.integer(builder, program.layout.target.pointerSize * 8)
-      const flag = yield* FunctionBody.integerCompare(
+      const addressType = Emitter.integerType(builder, program.layout.target.pointerSize * 8)
+      const flag = Emitter.integerCompare(
         body,
         'eq',
-        yield* FunctionBody.cast(
+        Emitter.cast(
           body,
           'ptrtoint',
-          yield* NativeStorage.readScalar(storage, operation.pointer),
+          NativeStorage.readScalar(storage, operation.pointer),
           addressType,
           `ptr_is_null${destination}_address`,
         ),
-        yield* Constant.integerUnsigned(builder, addressType, 0n),
+        Emitter.integerUnsigned(builder, addressType, 0n),
         `ptr_is_null${destination}_flag`,
       )
-      yield* NativeStorage.writeLocal(storage, destination, [
-        yield* FunctionBody.cast(body, 'zext', flag, i32, `ptr_is_null${destination}`),
+      NativeStorage.writeLocal(storage, destination, [
+        Emitter.cast(body, 'zext', flag, i32, `ptr_is_null${destination}`),
       ])
       return
     }
@@ -96,21 +90,15 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
     case 'PointerRequalify':
     case 'PointerFromStorage': {
       // A reference is its address lane; a slice is address then length.
-      const address = (yield* NativeStorage.materialize(storage, operation.source)).at(0)
+      const address = NativeStorage.materialize(storage, operation.source).at(0)
       if (address === undefined)
         throw new RangeError('LLVM pointer formation lost its address lane')
       const sourceType = storage.fn.localTypes.at(operation.source.ordinal)
       const pointerAddress =
         sourceType !== undefined && Type.isSlot(Mir.semanticType(sourceType))
-          ? yield* FunctionBody.cast(
-              body,
-              'inttoptr',
-              address,
-              pointer,
-              `slot_address${destination}`,
-            )
+          ? Emitter.cast(body, 'inttoptr', address, pointer, `slot_address${destination}`)
           : address
-      yield* NativeStorage.writeLocal(storage, destination, [pointerAddress])
+      NativeStorage.writeLocal(storage, destination, [pointerAddress])
       return
     }
     case 'PointerAt': {
@@ -121,22 +109,18 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const countLane = NativeType.lanesFor(types, countType).at(0)
       if (countLane === undefined) throw new RangeError('LLVM pointer offset lost its count lane')
       const stride = alignUp(pointee.size, pointee.alignment)
-      const bytes = yield* FunctionBody.binary(
+      const bytes = Emitter.binary(
         body,
         'mul',
-        yield* NativeStorage.readScalar(storage, operation.count),
-        yield* Constant.integerUnsigned(
-          builder,
-          NativeType.laneType(types, countLane),
-          BigInt(stride),
-        ),
+        NativeStorage.readScalar(storage, operation.count),
+        Emitter.integerUnsigned(builder, NativeType.laneType(types, countLane), BigInt(stride)),
         `ptr_offset${destination}_bytes`,
       )
-      yield* NativeStorage.writeLocal(storage, destination, [
-        yield* NativeLanePointer.lanePointer(
+      NativeStorage.writeLocal(storage, destination, [
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
-          yield* NativeStorage.readScalar(storage, operation.pointer),
+          NativeStorage.readScalar(storage, operation.pointer),
           bytes,
           `ptr_offset${destination}`,
         ),
@@ -144,12 +128,12 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       return
     }
     case 'PointerRead': {
-      const base = yield* NativeStorage.readScalar(storage, operation.pointer)
+      const base = NativeStorage.readScalar(storage, operation.pointer)
       if (NativeValue.classify(program.layout, operation.type) === 'Place') {
         const destination = NativeStorage.readLocal(storage, operation.destination)
         if (destination._tag !== 'NativePlace')
           throw new RangeError('Pointer read lost its aggregate destination')
-        yield* NativePlace.transfer(destination, storage, {
+        NativePlace.transfer(destination, storage, {
           ...NativePlace.make(
             program.layout,
             operation.type,
@@ -166,10 +150,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const offset = LayoutVerify.laneOffset(program.layout, semantic, lane.path)
         if (offset === undefined) throw new RangeError('LLVM pointer read lost a pointee lane')
         values.push(
-          yield* FunctionBody.load(
+          Emitter.load(
             body,
             NativeType.laneType(types, lane),
-            yield* NativeLanePointer.lanePointer(
+            NativeLanePointer.lanePointer(
               lanePointers,
               body,
               base,
@@ -178,23 +162,24 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             ),
             `ptr_read${destination}_${ordinal}`,
             {
-              alignment: yield* Alignment.fromByteUnits(
+              alignment: Emitter.alignment(
+                body,
                 accessAlignment(context, operation.pointer, offset),
               ),
             },
           ),
         )
       }
-      yield* NativeStorage.writeLocal(storage, destination, values)
+      NativeStorage.writeLocal(storage, destination, values)
       return
     }
     case 'PointerWrite': {
-      const base = yield* NativeStorage.readScalar(storage, operation.pointer)
+      const base = NativeStorage.readScalar(storage, operation.pointer)
       const valueType = storage.fn.localTypes.at(operation.value.ordinal)
       if (valueType === undefined) throw new RangeError('LLVM pointer write lost its value type')
       const source = NativeStorage.readLocal(storage, operation.value)
       if (source._tag === 'NativePlace') {
-        yield* NativePlace.transfer(
+        NativePlace.transfer(
           {
             ...NativePlace.make(
               program.layout,
@@ -207,21 +192,21 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           storage,
           source,
         )
-        yield* NativeStorage.writeLocal(storage, destination, [])
-        yield* NativeStorage.reloadAddressRoots(storage)
+        NativeStorage.writeLocal(storage, destination, [])
+        NativeStorage.reloadAddressRoots(storage)
         return
       }
       const semantic = Mir.semanticType(valueType)
-      const values = yield* NativeStorage.materialize(storage, operation.value)
+      const values = NativeStorage.materialize(storage, operation.value)
       for (const [ordinal, lane] of NativeType.lanesFor(types, valueType).entries()) {
         const offset = LayoutVerify.laneOffset(program.layout, semantic, lane.path)
         const value = values.at(ordinal)
         if (offset === undefined || value === undefined)
           throw new RangeError('LLVM pointer write lost a pointee lane')
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
           value,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -229,15 +214,13 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `ptr_write${destination}_${ordinal}_ptr`,
           ),
           {
-            alignment: yield* Alignment.fromByteUnits(
-              accessAlignment(context, operation.pointer, offset),
-            ),
+            alignment: Emitter.alignment(body, accessAlignment(context, operation.pointer, offset)),
           },
         )
       }
-      yield* NativeStorage.writeLocal(storage, destination, [])
-      yield* NativeStorage.reloadAddressRoots(storage)
+      NativeStorage.writeLocal(storage, destination, [])
+      NativeStorage.reloadAddressRoots(storage)
       return
     }
   }
-})
+}

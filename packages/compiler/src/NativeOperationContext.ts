@@ -1,7 +1,6 @@
-import type * as Builder from '@silklang/llvm/Builder'
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as Constant from '@silklang/llvm/Constant'
 import type * as FunctionActor from '@silklang/llvm/Function'
-import type * as FunctionBody from '@silklang/llvm/FunctionBody'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Backend from './Backend.js'
 import type * as Mir from './Mir.js'
@@ -29,8 +28,8 @@ interface OverflowSignature {
 export interface Context {
   readonly diagnosticScopes: ReadonlyMap<number, NativeDiagnosticScope.NativeDiagnosticScope>
   readonly runtimeFeatures: Set<Backend.RuntimeFeature>
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly entry: NativeLoweringContext.DeclaredFunction
   readonly declared: ReadonlyArray<NativeLoweringContext.DeclaredFunction>

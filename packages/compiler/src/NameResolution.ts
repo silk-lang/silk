@@ -381,7 +381,7 @@ const associatedMembersOf = (
   index: DeclarationIndex.Index,
   owner: DeclarationFacts.CanonicalId,
 ): ReadonlyArray<DeclarationFacts.DeclarationFact> => {
-  const members = index.modules.find((headers) => headers.module === owner.module)?.members
+  const members = DeclarationFacts.moduleHeaders(index, owner.module)?.members
   if (members === undefined) return []
   let byOwner = associatedCache.get(members)
   if (byOwner === undefined) {
@@ -801,7 +801,7 @@ export const resolveItem = (
     return { _tag: 'Missing' }
   if (second === undefined) {
     const local = DeclarationFacts.lookupDeclaration(
-      index.modules.find((candidate) => candidate.module === module)?.declarations ?? [],
+      DeclarationFacts.moduleHeaders(index, module)?.declarations ?? [],
       first.spelling,
     )
     if (local._tag === 'Ambiguous') return { _tag: 'Ambiguous', count: local.declarations.length }

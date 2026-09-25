@@ -8,10 +8,12 @@ import * as Attribute from '../src/Attribute.js'
 import * as Block from '../src/Block.js'
 import * as Builder from '../src/Builder.js'
 import * as Constant from '../src/Constant.js'
+import * as Emitter from '../src/Emitter.js'
 import * as FunctionActor from '../src/Function.js'
 import * as FunctionBody from '../src/FunctionBody.js'
 import * as IrText from '../src/IrText.js'
 import * as BodyState from '../src/internal/FunctionBodyState/primitives.js'
+import * as Handle from '../src/internal/Handle.js'
 import { invalidInput, LlvmError } from '../src/LlvmError.js'
 import * as Type from '../src/Type.js'
 import * as Value from '../src/Value.js'
@@ -100,21 +102,83 @@ it.effect('local handles retain an owner identity, not the function construction
         const instruction =
           (yield* Value.instruction(body, sum)) ?? raise('expected an instruction')
         const draft = BodyState.drafts.get(body) ?? raise('expected an active draft')
-        // Structural lifetime contract: an escaped local must not retain sibling handles,
-        // the mutable draft, or its builder through a process-wide weak registry.
-        assert.deepStrictEqual(BodyState.blockEntries.get(block), { owner: draft.owner, index: 0 })
-        assert.deepStrictEqual(BodyState.valueEntries.get(argument), {
-          owner: draft.owner,
-          index: 0,
-        })
-        assert.deepStrictEqual(BodyState.valueEntries.get(sum), { owner: draft.owner, index: 1 })
-        assert.deepStrictEqual(BodyState.instructionEntries.get(instruction), {
-          owner: draft.owner,
-          index: 0,
-        })
+        // Structural lifetime contract: an escaped local retains only its owner identity and
+        // index, never sibling handles, the mutable draft, or its builder.
+        for (const [handle, index] of [
+          [block, 0],
+          [argument, 0],
+          [sum, 1],
+          [instruction, 0],
+        ] as const) {
+          assert.strictEqual(Handle.ownerOf(handle), draft.owner)
+          assert.strictEqual(Handle.indexOf(handle), index)
+        }
         yield* FunctionBody.returnValue(body, sum)
       }),
     )
+  }),
+)
+
+it.effect('emits the same body synchronously and rolls back an aborted session', () =>
+  Effect.gen(function* () {
+    const emit = (session: Emitter.Module, fn: FunctionActor.Function, i32: Type.Type) =>
+      Emitter.buildBody(session, fn, (body) => {
+        Emitter.block(body, 'entry')
+        const sum = Emitter.binary(
+          body,
+          'add',
+          Emitter.argument(body, 0),
+          Emitter.integerUnsigned(body, i32, 1),
+          'sum',
+        )
+        Emitter.returnValue(body, sum)
+      })
+    const renders: Array<string> = []
+    for (const synchronous of [false, true]) {
+      const builder = yield* Builder.make()
+      const i32 = yield* Type.integer(builder, 32)
+      const fn = yield* FunctionActor.declare(
+        builder,
+        'increment',
+        yield* Type.functionType(builder, i32, [i32]),
+      )
+      if (synchronous) yield* Emitter.module(builder, (session) => emit(session, fn, i32))
+      else
+        yield* FunctionActor.buildBody(
+          builder,
+          fn,
+          Effect.fnUntraced(function* (body) {
+            yield* Block.make(body, 'entry')
+            const argument = yield* Value.argument(body, 0)
+            const one = yield* Constant.integerUnsigned(builder, i32, 1)
+            yield* FunctionBody.returnValue(
+              body,
+              yield* FunctionBody.binary(body, 'add', argument, one, 'sum'),
+            )
+          }),
+        )
+      renders.push(yield* IrText.render(builder))
+    }
+    assert.strictEqual(renders[0], renders[1])
+
+    const builder = yield* Builder.make()
+    const i32 = yield* Type.integer(builder, 32)
+    const fn = yield* FunctionActor.declare(
+      builder,
+      'retry',
+      yield* Type.functionType(builder, i32, [i32]),
+    )
+    const aborted = yield* Effect.flip(
+      Emitter.module(builder, (session) =>
+        Emitter.buildBody(session, fn, (body) => {
+          Emitter.block(body, 'entry')
+          Emitter.returnValue(body, Emitter.integerSigned(body, i32, 1n << 40n))
+        }),
+      ),
+    )
+    assert.include(aborted.message, 'does not fit')
+    yield* Emitter.module(builder, (session) => emit(session, fn, i32))
+    assert.include(yield* IrText.render(builder), 'define i32 @retry(i32 %v0)')
   }),
 )
 

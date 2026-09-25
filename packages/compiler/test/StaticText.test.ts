@@ -2484,7 +2484,12 @@ pub fn main() -> i32 { return 0 }`
           ...graph,
           modules: [
             ...graph.modules,
-            { canonical: 'alias', package: 'demo@1.0.0', module: 'config', bytes: [1] },
+            {
+              canonical: 'alias',
+              package: 'demo@1.0.0',
+              module: 'config',
+              bytes: Uint8Array.of(1),
+            },
           ],
         }),
       )).code,

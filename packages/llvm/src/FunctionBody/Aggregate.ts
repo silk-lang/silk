@@ -16,57 +16,57 @@ const aggregatePath = (
   root: number,
   indices: ReadonlyArray<number>,
   operation: string,
-): Result.Result<number, LlvmError> =>
-  Result.gen(function* () {
-    if (indices.length === 0) {
-      return yield* Result.fail(
-        invalidInput({ operation, message: 'Aggregate paths cannot be empty', input: indices }),
+): Result.Result<number, LlvmError> => {
+  if (indices.length === 0) {
+    return Result.fail(
+      invalidInput({ operation, message: 'Aggregate paths cannot be empty', input: indices }),
+    )
+  }
+  let current = root
+  for (const index of indices) {
+    if (!Number.isSafeInteger(index) || index < 0) {
+      return Result.fail(
+        invalidInput({
+          operation,
+          message: 'Aggregate indices must be non-negative integers',
+          input: index,
+        }),
       )
     }
-    let current = root
-    for (const index of indices) {
-      if (!Number.isSafeInteger(index) || index < 0) {
-        return yield* Result.fail(
+    const found = FunctionBodyState.typeAt(module, current, operation)
+    if (Result.isFailure(found)) return Result.fail(found.failure)
+    const description = found.success
+    if (description._tag === 'Array' || description._tag === 'Vector') {
+      const length = description._tag === 'Array' ? description.length : BigInt(description.length)
+      if (BigInt(index) >= length) {
+        return Result.fail(
           invalidInput({
             operation,
-            message: 'Aggregate indices must be non-negative integers',
+            message: 'Aggregate index is outside the aggregate',
             input: index,
           }),
         )
       }
-      const description = yield* FunctionBodyState.typeAt(module, current, operation)
-      if (description._tag === 'Array' || description._tag === 'Vector') {
-        const length =
-          description._tag === 'Array' ? description.length : BigInt(description.length)
-        if (BigInt(index) >= length) {
-          return yield* Result.fail(
-            invalidInput({
-              operation,
-              message: 'Aggregate index is outside the aggregate',
-              input: index,
-            }),
-          )
-        }
-        current = description.child
-        continue
-      }
-      let fields: ReadonlyArray<number> | undefined
-      if (description._tag === 'Structure') fields = description.fields
-      else if (description._tag === 'NamedStructure') fields = description.body?.fields
-      const field = fields?.[index]
-      if (field === undefined) {
-        return yield* Result.fail(
-          invalidInput({
-            operation,
-            message: 'Aggregate path does not select a field',
-            input: indices,
-          }),
-        )
-      }
-      current = field
+      current = description.child
+      continue
     }
-    return current
-  })
+    let fields: ReadonlyArray<number> | undefined
+    if (description._tag === 'Structure') fields = description.fields
+    else if (description._tag === 'NamedStructure') fields = description.body?.fields
+    const field = fields?.[index]
+    if (field === undefined) {
+      return Result.fail(
+        invalidInput({
+          operation,
+          message: 'Aggregate path does not select a field',
+          input: indices,
+        }),
+      )
+    }
+    current = field
+  }
+  return Result.succeed(current)
+}
 
 /**
  * Extracts a value along a non-empty, statically indexed structure path.
@@ -74,41 +74,44 @@ const aggregatePath = (
  * @category instructions
  * @since 0.0.0
  */
-export const extractValue = Effect.fnUntraced(function* (
+export const extractValue = (
   self: FunctionBody,
   aggregate: Value.Input,
   indices: ReadonlyArray<number>,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.extractValue', (draft, module) =>
-    Result.gen(function* () {
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        aggregate,
-        'FunctionBody.extractValue',
-      )
-      const resultType = yield* aggregatePath(
-        module,
-        resolved.type,
-        indices,
-        'FunctionBody.extractValue',
-      )
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        resultType,
-        name,
-        (result, finalName) => ({
-          _tag: 'ExtractValue',
-          aggregate: resolved.operand,
-          indices: [...indices],
-          result,
-          name: finalName,
-        }),
-      )).value
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.extractValue', (draft) =>
+    extractValueIn(draft, aggregate, indices, name),
+  )
+
+/** @internal */
+export const extractValueIn = (
+  draft: FunctionBodyState.Draft,
+  aggregate: Value.Input,
+  indices: ReadonlyArray<number>,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.extractValue'
+  const resolved = FunctionBodyState.resolveOperand(draft, module, aggregate, operation)
+  if (Result.isFailure(resolved)) return Result.fail(resolved.failure)
+  const resultType = aggregatePath(module, resolved.success.type, indices, operation)
+  if (Result.isFailure(resultType)) return Result.fail(resultType.failure)
+  const aggregateOperand = resolved.success.operand
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    resultType.success,
+    name,
+    (result, finalName) => ({
+      _tag: 'ExtractValue',
+      aggregate: aggregateOperand,
+      indices,
+      result,
+      name: finalName,
     }),
   )
-})
+  return appended
+}
 
 /**
  * Inserts a same-typed value along a validated aggregate path.
@@ -116,58 +119,59 @@ export const extractValue = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const insertValue = Effect.fnUntraced(function* (
+export const insertValue = (
   self: FunctionBody,
   aggregate: Value.Input,
   element: Value.Input,
   indices: ReadonlyArray<number>,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.insertValue', (draft, module) =>
-    Result.gen(function* () {
-      const aggregateValue = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        aggregate,
-        'FunctionBody.insertValue',
-      )
-      const elementValue = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        element,
-        'FunctionBody.insertValue',
-      )
-      const selected = yield* aggregatePath(
-        module,
-        aggregateValue.type,
-        indices,
-        'FunctionBody.insertValue',
-      )
-      if (elementValue.type !== selected) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.insertValue',
-            message: 'Inserted value does not match the aggregate path type',
-            input: { aggregate, element, indices },
-          }),
-        )
-      }
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        aggregateValue.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'InsertValue',
-          aggregate: aggregateValue.operand,
-          element: elementValue.operand,
-          indices: [...indices],
-          result,
-          name: finalName,
-        }),
-      )).value
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.insertValue', (draft) =>
+    insertValueIn(draft, aggregate, element, indices, name),
+  )
+
+/** @internal */
+export const insertValueIn = (
+  draft: FunctionBodyState.Draft,
+  aggregate: Value.Input,
+  element: Value.Input,
+  indices: ReadonlyArray<number>,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.insertValue'
+  const aggregateValue = FunctionBodyState.resolveOperand(draft, module, aggregate, operation)
+  if (Result.isFailure(aggregateValue)) return Result.fail(aggregateValue.failure)
+  const elementValue = FunctionBodyState.resolveOperand(draft, module, element, operation)
+  if (Result.isFailure(elementValue)) return Result.fail(elementValue.failure)
+  const selected = aggregatePath(module, aggregateValue.success.type, indices, operation)
+  if (Result.isFailure(selected)) return Result.fail(selected.failure)
+  if (elementValue.success.type !== selected.success) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'Inserted value does not match the aggregate path type',
+        input: { aggregate, element, indices },
+      }),
+    )
+  }
+  const aggregateOperand = aggregateValue.success.operand
+  const elementOperand = elementValue.success.operand
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    aggregateValue.success.type,
+    name,
+    (result, finalName) => ({
+      _tag: 'InsertValue',
+      aggregate: aggregateOperand,
+      element: elementOperand,
+      indices,
+      result,
+      name: finalName,
     }),
   )
-})
+  return appended
+}
 
 /**
  * Builds an aggregate from a poison seed and a complete, exact sequence of element values.
@@ -175,36 +179,54 @@ export const insertValue = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const buildAggregate = Effect.fnUntraced(function* (
+export const buildAggregate = (
   self: FunctionBody,
   type: Type.Type,
   elements: ReadonlyArray<Value.Input>,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Input, LlvmError> {
-  const builder = yield* FunctionBodyState.builder(self)
-  const shape = yield* Type.aggregateShape(builder, type)
-  const expectedLength = shape.length === undefined ? shape.fields.length : Number(shape.length)
+): Effect.Effect<Value.Input, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.buildAggregate', (draft) =>
+    buildAggregateIn(draft, type, elements, name),
+  )
+
+/** @internal */
+export const buildAggregateIn = (
+  draft: FunctionBodyState.Draft,
+  type: Type.Type,
+  elements: ReadonlyArray<Value.Input>,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Input, LlvmError> => {
+  const shape = Type.aggregateShapeIn(draft.context, type)
+  if (Result.isFailure(shape)) return Result.fail(shape.failure)
+  const expectedLength =
+    shape.success.length === undefined ? shape.success.fields.length : Number(shape.success.length)
   if (elements.length !== expectedLength) {
-    return yield* invalidInput({
-      operation: 'FunctionBody.buildAggregate',
-      message: 'Aggregate element count does not match its type',
-      input: elements,
-    })
+    return Result.fail(
+      invalidInput({
+        operation: 'FunctionBody.buildAggregate',
+        message: 'Aggregate element count does not match its type',
+        input: elements,
+      }),
+    )
   }
-  let aggregate: Value.Input = yield* Constant.poison(builder, type)
+  const poison = Constant.specialIn(draft.context, type, 'poison')
+  if (Result.isFailure(poison)) return Result.fail(poison.failure)
+  let aggregate: Value.Input = poison.success
   for (let index = 0; index < elements.length; index += 1) {
     const element = elements[index]
     if (element === undefined) continue
-    aggregate = yield* insertValue(
-      self,
+    const inserted = insertValueIn(
+      draft,
       aggregate,
       element,
       [index],
       index === elements.length - 1 ? name : undefined,
     )
+    if (Result.isFailure(inserted)) return Result.fail(inserted.failure)
+    aggregate = inserted.success
   }
-  return aggregate
-})
+  return Result.succeed(aggregate)
+}
 
 /**
  * Extracts one vector lane using a scalar integer index.
@@ -254,7 +276,7 @@ export const extractElement = Effect.fnUntraced(function* (
             }),
           )
         }
-        return (yield* FunctionBodyState.appendResult(
+        return yield* FunctionBodyState.appendResult(
           draft,
           sourceType.child,
           name,
@@ -265,7 +287,7 @@ export const extractElement = Effect.fnUntraced(function* (
             result,
             name: finalName,
           }),
-        )).value
+        )
       }),
   )
 })
@@ -329,7 +351,7 @@ export const insertElement = Effect.fnUntraced(function* (
             }),
           )
         }
-        return (yield* FunctionBodyState.appendResult(
+        return yield* FunctionBodyState.appendResult(
           draft,
           source.type,
           name,
@@ -341,7 +363,7 @@ export const insertElement = Effect.fnUntraced(function* (
             result,
             name: finalName,
           }),
-        )).value
+        )
       }),
   )
 })
@@ -432,7 +454,7 @@ export const shuffleVector = Effect.fnUntraced(function* (
         'Type',
         'FunctionBody.shuffleVector',
       )
-      return (yield* FunctionBodyState.appendResult(
+      return yield* FunctionBodyState.appendResult(
         draft,
         resultTypeIndex,
         name,
@@ -444,7 +466,7 @@ export const shuffleVector = Effect.fnUntraced(function* (
           result,
           name: finalName,
         }),
-      )).value
+      )
     }),
   )
 })

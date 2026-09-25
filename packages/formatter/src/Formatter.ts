@@ -151,14 +151,14 @@ const join = (parts: ReadonlyArray<Uint8Array>): Uint8Array => {
   return output
 }
 
-const applyEdits = (original: ReadonlyArray<number>, edits: ReadonlyArray<Edit>): Uint8Array => {
+const applyEdits = (original: Uint8Array, edits: ReadonlyArray<Edit>): Uint8Array => {
   let output: Uint8Array = Uint8Array.from(original)
   for (const edit of [...edits].sort((left, right) => right.start - left.start))
     output = join([output.slice(0, edit.start), edit.bytes, output.slice(edit.end)])
   return output
 }
 
-const changed = (source: ReadonlyArray<number>, formatted: Uint8Array): boolean =>
+const changed = (source: Uint8Array, formatted: Uint8Array): boolean =>
   source.length !== formatted.length || source.some((byte, index) => byte !== formatted[index])
 
 const formatInternal: (

@@ -1,6 +1,7 @@
 import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
 import * as AuthoredEncoding from './AuthoredEncoding.js'
+import type * as AuthoredHir from './AuthoredHir.js'
 import type * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as AuthoredLowering from './AuthoredLowering.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
@@ -60,17 +61,38 @@ export interface Environment {
   readonly complete: boolean
 }
 
-export interface Input {
-  readonly catalog: TestDiscovery.Catalog
-  readonly discovery: Instances.Discovery
-  readonly results: ReadonlyMap<string, Elaboration.Result>
-  readonly environment: Environment
+const digest = (value: string): string => ToolchainIntegrity.contentDigest(value)
+
+// Test closures share most of their items, and the platform-neutral digest is slow; hash each
+// item once per discovery and build closure identities from item digests.
+const closureItemCaches = new WeakMap<Instances.Discovery, Map<string, string>>()
+
+const closureItemCache = (discovery: Instances.Discovery): Map<string, string> => {
+  let cache = closureItemCaches.get(discovery)
+  if (cache === undefined) {
+    cache = new Map()
+    closureItemCaches.set(discovery, cache)
+  }
+  return cache
 }
 
-const digest = (value: string): string => ToolchainIntegrity.contentDigest(value)
+const itemDigests = (cache: Map<string, string>, items: ReadonlyArray<string>): string =>
+  Canonical.array(
+    items.map((item) => {
+      let itemDigest = cache.get(item)
+      if (itemDigest === undefined) {
+        itemDigest = digest(item)
+        cache.set(item, itemDigest)
+      }
+      return itemDigest
+    }),
+  )
 
 const declarationIdentity = (declaration: DeclarationFacts.CanonicalId): string =>
   Canonical.record('Declaration', [declaration.module, declaration.name])
+
+// Every test closure re-reaches the same shared declarations; digest each declaration once.
+const authoredDigests = new WeakMap<AuthoredHir.Declaration, string | undefined>()
 
 const authoredDigest = Effect.fnUntraced(function* (
   results: ReadonlyMap<string, Elaboration.Result>,
@@ -81,6 +103,16 @@ const authoredDigest = Effect.fnUntraced(function* (
   if (result === undefined) return undefined
   const authored = AuthoredLowering.declarationOf(result.authored, owner)
   if (authored === undefined) return undefined
+  if (authoredDigests.has(authored)) return authoredDigests.get(authored)
+  const digest = yield* encodeAuthoredDigest(result, authored)
+  authoredDigests.set(authored, digest)
+  return digest
+})
+
+const encodeAuthoredDigest = Effect.fnUntraced(function* (
+  result: Elaboration.Result,
+  authored: AuthoredHir.Declaration,
+): Effect.fn.Return<string | undefined> {
   const encoded = yield* Effect.result(
     Effect.gen(function* () {
       const header = yield* AuthoredEncoding.header(result.authored.module.pool, authored)
@@ -277,6 +309,31 @@ const typeFactEncoding = (fact: DeclarationFacts.MemberFact): string => {
   return Canonical.record('NominalDeclaration', [fact._tag])
 }
 
+interface ExpressionFacts {
+  readonly types: ReadonlyArray<Type.Type>
+  readonly constants: ReadonlyArray<DeclarationFacts.CanonicalId>
+}
+
+// Every test closure revisits the same shared instances; walk each body's expressions once.
+const expressionFacts = new WeakMap<Instances.Instance, ExpressionFacts>()
+
+const instanceExpressionFacts = (instance: Instances.Instance): ExpressionFacts => {
+  let facts = expressionFacts.get(instance)
+  if (facts === undefined) {
+    const types: Array<Type.Type> = []
+    const constants: Array<DeclarationFacts.CanonicalId> = []
+    for (const statement of instance.function.statements)
+      for (const expression of Tir.statementExpressions(statement).flatMap(Tir.expressionTree)) {
+        if ('type' in expression) types.push(expression.type)
+        if (expression.constant !== undefined) constants.push(expression.constant)
+        if (expression._tag === 'ConstantReference') constants.push(expression.declaration)
+      }
+    facts = { types, constants }
+    expressionFacts.set(instance, facts)
+  }
+  return facts
+}
+
 const executionEncoding = Effect.fnUntraced(function* (
   discovery: Instances.Discovery,
   results: ReadonlyMap<string, Elaboration.Result>,
@@ -321,14 +378,9 @@ const executionEncoding = Effect.fnUntraced(function* (
       addType(instance.function.contract.result)
     }
     for (const local of instance.function.locals ?? []) addType(local.type)
-    for (const statement of instance.function.statements)
-      for (const expression of Tir.statementExpressions(statement).flatMap(Tir.expressionTree)) {
-        if ('type' in expression) addType(expression.type)
-        if (expression.constant !== undefined)
-          constants.set(declarationKey(expression.constant), expression.constant)
-        if (expression._tag === 'ConstantReference')
-          constants.set(declarationKey(expression.declaration), expression.declaration)
-      }
+    const expressions = instanceExpressionFacts(instance)
+    for (const type of expressions.types) addType(type)
+    for (const constant of expressions.constants) constants.set(declarationKey(constant), constant)
   }
   for (const callable of closure.callables) {
     addType(callable.type)
@@ -424,23 +476,27 @@ const executionEncoding = Effect.fnUntraced(function* (
     }
   }
 
+  const itemCache = closureItemCache(discovery)
   return {
     _tag: 'Complete',
-    encoding: Canonical.record('ExecutionClosure.v3', [
-      Canonical.array(
+    encoding: Canonical.record('ExecutionClosure.v4', [
+      itemDigests(
+        itemCache,
         closure.instances.map((instance) =>
           instanceEncoding(instance, authored.get(Instances.keyText(instance.key)) ?? ''),
         ),
       ),
-      Canonical.array(closure.edges.map(edgeEncoding)),
-      Canonical.array(closure.callables.map(callableEncoding)),
-      Canonical.array(closure.effects.map(effectEncoding)),
-      Canonical.array(
+      itemDigests(itemCache, closure.edges.map(edgeEncoding)),
+      itemDigests(itemCache, closure.callables.map(callableEncoding)),
+      itemDigests(itemCache, closure.effects.map(effectEncoding)),
+      itemDigests(
+        itemCache,
         closure.intrinsics.map((call) =>
           Canonical.record('Intrinsic', [Intrinsic.operationText(call.operation)]),
         ),
       ),
-      Canonical.array(
+      itemDigests(
+        itemCache,
         closure.foreignCalls.map((call) =>
           Canonical.record('Foreign', [
             call.symbol,
@@ -449,10 +505,10 @@ const executionEncoding = Effect.fnUntraced(function* (
           ]),
         ),
       ),
-      Canonical.array(closure.residualBodies.map(residualEncoding)),
-      Canonical.array(constantEncodings),
-      Canonical.array([...semanticTypeEncodings.values()].sort(Canonical.compare)),
-      Canonical.array([...nominalTypeEncodings.values()].sort(Canonical.compare)),
+      itemDigests(itemCache, closure.residualBodies.map(residualEncoding)),
+      itemDigests(itemCache, constantEncodings),
+      itemDigests(itemCache, [...semanticTypeEncodings.values()].sort(Canonical.compare)),
+      itemDigests(itemCache, [...nominalTypeEncodings.values()].sort(Canonical.compare)),
     ]),
   }
 })
@@ -578,31 +634,37 @@ export const runtimeIdentity = (distribution: ToolchainIntegrity.Graph): string 
     ]),
   )
 
-const eligible = Effect.fnUntraced(function* (
-  input: Input,
+/** One test's link-independent execution closure, or why its results can never be reused. */
+export type Closure =
+  | { readonly _tag: 'Closure'; readonly encoding: string }
+  | { readonly _tag: 'Ineligible'; readonly reason: IneligibilityReason }
+
+/** Link-independent closure encodings of a test catalog, in catalog order. */
+export interface Closures {
+  readonly catalog: TestDiscovery.Catalog
+  readonly entries: ReadonlyArray<Closure>
+}
+
+const closureOf = Effect.fnUntraced(function* (
+  discovery: Instances.Discovery,
+  results: ReadonlyMap<string, Elaboration.Result>,
   entry: TestDiscovery.Entry,
-  environment: string,
-): Effect.fn.Return<Eligibility> {
-  if (!input.environment.complete)
-    return {
-      _tag: 'Ineligible',
-      reason: { _tag: 'IncompleteEnvironment', component: 'Runner' },
-    }
+): Effect.fn.Return<Closure> {
   const declaration = entry.declaration.canonical
   if (declaration._tag !== 'Canonical')
     return { _tag: 'Ineligible', reason: { _tag: 'MissingTestRoot' } }
-  const roots = rootOf(input.discovery, declaration.id)
+  const roots = rootOf(discovery, declaration.id)
   if (roots.length === 0) return { _tag: 'Ineligible', reason: { _tag: 'MissingTestRoot' } }
   if (roots.length !== 1) return { _tag: 'Ineligible', reason: { _tag: 'AmbiguousTestRoot' } }
   const root = roots.at(0)
   if (root === undefined) return { _tag: 'Ineligible', reason: { _tag: 'MissingTestRoot' } }
-  const closure = Instances.executionClosure(input.discovery, root.key)
+  const closure = Instances.executionClosure(discovery, root.key)
   if (closure.gaps.length > 0)
     return {
       _tag: 'Ineligible',
       reason: { _tag: 'IncompleteExecutionClosure', gaps: closure.gaps },
     }
-  const closureEncoding = yield* executionEncoding(input.discovery, input.results, closure)
+  const closureEncoding = yield* executionEncoding(discovery, results, closure)
   if (closureEncoding._tag === 'Incomplete')
     return closureEncoding.declaration === undefined
       ? {
@@ -619,35 +681,58 @@ const eligible = Effect.fnUntraced(function* (
             declaration: closureEncoding.declaration,
           },
         }
-  const encoded = Canonical.record('TestExecution.v1', [
-    entry.info.identity,
-    environment,
-    closureEncoding.encoding,
-  ])
-  return { _tag: 'Eligible', identity: digest(encoded) }
+  return { _tag: 'Closure', encoding: closureEncoding.encoding }
+})
+
+/**
+ * Encodes every test's execution closure. Closures do not depend on native code generation or
+ * linking, so the driver computes them while the object compiler runs.
+ */
+export const closures = Effect.fn('TestExecution.closures')(function* (
+  catalog: TestDiscovery.Catalog,
+  discovery: Instances.Discovery,
+  results: ReadonlyMap<string, Elaboration.Result>,
+): Effect.fn.Return<Closures> {
+  const entries: Array<Closure> = []
+  for (const entry of catalog.entries) entries.push(yield* closureOf(discovery, results, entry))
+  return { catalog, entries }
 })
 
 /** Derives canonical-order per-test execution identities, failing closed per entry. */
-export const make = Effect.fn('TestExecution.make')(function* (
-  input: Input,
-): Effect.fn.Return<Manifest> {
-  const environment = environmentIdentity(input.environment)
-  const entries: Array<Entry> = []
-  for (const entry of input.catalog.entries) {
-    entries.push({ test: entry.info, eligibility: yield* eligible(input, entry, environment) })
-  }
+export const make = (self: Closures, environment: Environment): Manifest => {
+  const identity = environmentIdentity(environment)
   return {
     _tag: 'TestExecutionManifest',
     catalogIdentity: digest(
       Canonical.record('TestExecutionCatalog.v1', [
         Canonical.array(
-          input.catalog.entries.map((entry, ordinal) =>
+          self.catalog.entries.map((entry, ordinal) =>
             Canonical.record('Test', [String(ordinal), entry.info.identity]),
           ),
         ),
       ]),
     ),
-    environmentIdentity: environment,
-    entries,
+    environmentIdentity: identity,
+    entries: self.catalog.entries.map((entry, ordinal): Entry => {
+      const closure = self.entries[ordinal]
+      if (!environment.complete || closure === undefined)
+        return {
+          test: entry.info,
+          eligibility: {
+            _tag: 'Ineligible',
+            reason: { _tag: 'IncompleteEnvironment', component: 'Runner' },
+          },
+        }
+      if (closure._tag === 'Ineligible') return { test: entry.info, eligibility: closure }
+      return {
+        test: entry.info,
+        eligibility: {
+          _tag: 'Eligible',
+          identity: digest(
+            Canonical.record('TestExecution.v1', [entry.info.identity, identity, closure.encoding]),
+          ),
+        },
+      }
+    }),
   }
-})
+}

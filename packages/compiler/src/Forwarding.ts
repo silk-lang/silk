@@ -71,33 +71,19 @@ export const forwardedRequirementBinding = (
   const run = completed?._tag === 'Return' ? completed.expression : undefined
   const nested = run?._tag === 'Run' ? run.subject : undefined
   if (nested?._tag !== 'EffectConstruct' && nested?._tag !== 'Call') return undefined
-  const call = calls.find(
-    (candidate) =>
-      Instances.keyText(candidate.owner) === key_ &&
-      candidate.span.sourceId === nested.span.sourceId &&
-      candidate.span.start === nested.span.start &&
-      candidate.span.end === nested.span.end,
-  )
-  const candidates = instances
+  const call = Instances.callsAtSite(calls, instance.key, nested.span).at(0)
+  const declared = Instances.instancesOf(instances, nested.target)
+  const candidates = declared
     .filter(
       (candidate) =>
-        candidate.key.declaration.module === nested.target.module &&
-        candidate.key.declaration.name === nested.target.name &&
-        (call === undefined || Instances.keyText(candidate.key) === Instances.keyText(call.target)),
+        call === undefined || Instances.keyText(candidate.key) === Instances.keyText(call.target),
     )
     .sort(
       (left, right) =>
         right.key.typeArguments.filter(Type.isHiddenExecutableArgument).length -
         left.key.typeArguments.filter(Type.isHiddenExecutableArgument).length,
     )
-  const searchable =
-    candidates.length === 0 && call !== undefined
-      ? instances.filter(
-          (candidate) =>
-            candidate.key.declaration.module === nested.target.module &&
-            candidate.key.declaration.name === nested.target.name,
-        )
-      : candidates
+  const searchable = candidates.length === 0 && call !== undefined ? declared : candidates
   return searchable
     .map((candidate) =>
       forwardedRequirementBinding(candidate, instances, calls, new Set(resolving).add(key_)),
@@ -140,11 +126,7 @@ export const forwardedCallableParameter = (
       return expression(binding.initializer, new Set(resolvingBindings).add(ordinal))
     }
     if (current._tag !== 'Call') return undefined
-    const target = fn.instances.find(
-      (candidate) =>
-        candidate.key.declaration.module === current.target.module &&
-        candidate.key.declaration.name === current.target.name,
-    )
+    const target = Instances.instancesOf(fn.instances, current.target).at(0)
     const forwarded =
       target === undefined ? undefined : forwardedCallableParameter(fn, target, next)
     const argument = forwarded === undefined ? undefined : current.arguments.at(forwarded)
@@ -220,11 +202,7 @@ export const staticallyForwardedCallableRecipe = (
   if (current._tag !== 'Call') return undefined
   const identity = `${current.target.module}\u0000${current.target.name}`
   if (resolving.has(identity)) return undefined
-  const target = fn.instances.find(
-    (instance) =>
-      instance.key.declaration.module === current.target.module &&
-      instance.key.declaration.name === current.target.name,
-  )
+  const target = Instances.instancesOf(fn.instances, current.target).at(0)
   const forwarded =
     target === undefined ? undefined : forwardedCallableParameter(fn, target, resolving)
   const argument = forwarded === undefined ? undefined : current.arguments.at(forwarded)
@@ -268,17 +246,9 @@ export const callableRecipe = (
         )
       : fn.call(expression)
   const target =
-    (call === undefined
-      ? undefined
-      : fn.instances.find(
-          (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
-        )) ??
+    (call === undefined ? undefined : Instances.instanceByKey(fn.instances, call.target)) ??
     (expression._tag === 'Call'
-      ? fn.instances.find(
-          (instance) =>
-            instance.key.declaration.module === expression.target.module &&
-            instance.key.declaration.name === expression.target.name,
-        )
+      ? Instances.instancesOf(fn.instances, expression.target).at(0)
       : undefined)
   const forwarded = target === undefined ? undefined : forwardedCallableParameter(fn, target)
   const argument = forwarded === undefined ? undefined : expression.arguments.at(forwarded)
@@ -373,13 +343,7 @@ export const inlineForwardedRequirement = (
     declaration = undefined
   }
   const candidates =
-    declaration === undefined
-      ? []
-      : fn.instances.filter(
-          (instance) =>
-            instance.key.declaration.module === declaration.module &&
-            instance.key.declaration.name === declaration.name,
-        )
+    declaration === undefined ? [] : Instances.instancesOf(fn.instances, declaration)
   const inferredArguments = (() => {
     if (expression._tag === 'EffectConstruct')
       return expression.typeArguments.map((argument) => fn.semanticArgument(argument))
@@ -397,9 +361,7 @@ export const inlineForwardedRequirement = (
   })()
   let target: Instances.Instance | undefined
   if (call !== undefined) {
-    target = fn.instances.find(
-      (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
-    )
+    target = Instances.instanceByKey(fn.instances, call.target)
   } else if (inferredArguments === undefined) {
     target = undefined
   } else {

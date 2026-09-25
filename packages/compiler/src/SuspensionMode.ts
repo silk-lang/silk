@@ -51,31 +51,59 @@ const comparePath = (left: ReadonlyArray<string>, right: ReadonlyArray<string>):
   return compareText(left.join('\0'), right.join('\0'))
 }
 
-const pathTo = (
+/**
+ * The first causal path from every node to `roots`: shortest, then lexicographic by node.
+ *
+ * A breadth-first distance to the nearest root, computed once over reversed edges, fixes each
+ * node's successor on that path: the least-named dependency one step closer to a root. The path
+ * of a node is therefore its successor's path with the node prepended, so the whole map costs one
+ * graph traversal rather than one traversal per node.
+ */
+const pathsTo = (
   graph: Graph,
-  origin: string,
   roots: ReadonlySet<string>,
-): ReadonlyArray<string> | undefined => {
-  if (roots.has(origin)) return [origin]
-  // FIFO traversal with sorted neighbor expansion dequeues paths in exactly
-  // (length, lexicographic) order: equal-length paths inherit their parents' order, and a parent
-  // ordered before another parent orders every child before the other's children.
-  const pending: Array<ReadonlyArray<string>> = [[origin]]
-  const visited = new Set([origin])
-  for (let cursor = 0; cursor < pending.length; cursor += 1) {
-    const path = pending[cursor]
-    const tail = path?.at(-1)
-    if (path === undefined || tail === undefined) continue
-    const targets = [...(graph.dependencies.get(tail) ?? [])].sort(compareText)
+): ReadonlyMap<string, ReadonlyArray<string>> => {
+  const reverse = new Map<string, Array<string>>()
+  for (const [source, targets] of graph.dependencies)
     for (const target of targets) {
-      if (visited.has(target)) continue
-      visited.add(target)
-      const next = [...path, target]
-      if (roots.has(target)) return next
-      pending.push(next)
+      const sources = reverse.get(target)
+      if (sources === undefined) reverse.set(target, [source])
+      else sources.push(source)
+    }
+  const distance = new Map<string, number>()
+  const ordered: Array<string> = []
+  for (const root of roots) {
+    distance.set(root, 0)
+    ordered.push(root)
+  }
+  for (let cursor = 0; cursor < ordered.length; cursor += 1) {
+    const node = ordered[cursor]
+    if (node === undefined) continue
+    const next = (distance.get(node) ?? 0) + 1
+    for (const source of reverse.get(node) ?? []) {
+      if (distance.has(source)) continue
+      distance.set(source, next)
+      ordered.push(source)
     }
   }
-  return undefined
+  const paths = new Map<string, ReadonlyArray<string>>()
+  for (const node of ordered) {
+    const steps = distance.get(node) ?? 0
+    if (steps === 0) {
+      paths.set(node, [node])
+      continue
+    }
+    let successor: string | undefined
+    for (const target of graph.dependencies.get(node) ?? [])
+      if (
+        distance.get(target) === steps - 1 &&
+        (successor === undefined || compareText(target, successor) < 0)
+      )
+        successor = target
+    const rest = successor === undefined ? undefined : paths.get(successor)
+    if (rest !== undefined) paths.set(node, [node, ...rest])
+  }
+  return paths
 }
 
 /** Computes one deterministic summary for every graph node. */
@@ -88,11 +116,13 @@ export const summarize = (graph: Graph): ReadonlyMap<string, Summary> => {
     ...graph.unavailable,
   ])
   const summaries = new Map<string, Summary>()
+  const paths = order.map(
+    (mode) => [mode, pathsTo(graph, graph.roots.get(mode) ?? new Set<string>())] as const,
+  )
   for (const node of [...nodes].sort(compareText)) {
     const causes: Array<Cause> = []
-    for (const mode of order) {
-      const roots = graph.roots.get(mode) ?? new Set<string>()
-      const path = pathTo(graph, node, roots)
+    for (const [mode, byNode] of paths) {
+      const path = byNode.get(node)
       if (path !== undefined) causes.push({ mode, path })
     }
     const permitted = graph.permitted.get(node) ?? new Set<Mode>()

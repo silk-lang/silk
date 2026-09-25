@@ -1,4 +1,5 @@
 import * as Effect from 'effect/Effect'
+import * as Result from 'effect/Result'
 import * as IntegerInput from './internal/IntegerInput.js'
 import { invalidInput, type LlvmError } from './LlvmError.js'
 
@@ -51,25 +52,30 @@ const isPowerOfTwo = (value: bigint): boolean => value > 0n && (value & (value -
  * @category alignment
  * @since 0.0.0
  */
-export const fromByteUnits = Effect.fnUntraced(function* (
+export const fromByteUnits = (byteUnits: number | bigint): Effect.Effect<Alignment, LlvmError> =>
+  Effect.fromResult(fromByteUnitsResult(byteUnits))
+
+/** @internal */
+export const fromByteUnitsResult = (
   byteUnits: number | bigint,
-): Effect.fn.Return<Alignment, LlvmError> {
-  const value = yield* Effect.fromResult(
-    IntegerInput.normalize(byteUnits, {
-      operation: 'Alignment.fromByteUnits',
-      message: 'LLVM alignment must be a positive power of two',
-      minimum: 1n,
-    }),
-  )
-  if (!isPowerOfTwo(value)) {
-    return yield* invalidInput({
-      operation: 'Alignment.fromByteUnits',
-      message: 'LLVM alignment must be a positive power of two',
-      input: byteUnits,
-    })
+): Result.Result<Alignment, LlvmError> => {
+  const value = IntegerInput.normalize(byteUnits, {
+    operation: 'Alignment.fromByteUnits',
+    message: 'LLVM alignment must be a positive power of two',
+    minimum: 1n,
+  })
+  if (Result.isFailure(value)) return Result.fail(value.failure)
+  if (!isPowerOfTwo(value.success)) {
+    return Result.fail(
+      invalidInput({
+        operation: 'Alignment.fromByteUnits',
+        message: 'LLVM alignment must be a positive power of two',
+        input: byteUnits,
+      }),
+    )
   }
-  return { _tag: 'Alignment', byteUnits: value }
-})
+  return Result.succeed({ _tag: 'Alignment', byteUnits: value.success })
+}
 
 /**
  * Converts a positive, byte-sized bit alignment into an {@link Alignment}.

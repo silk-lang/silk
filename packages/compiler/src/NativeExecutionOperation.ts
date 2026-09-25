@@ -1,4 +1,6 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativePlace from './NativePlace.js'
+import * as FunctionIndex from './internal/FunctionIndex.js'
 import * as NativeArgument from './NativeArgument.js'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as NativePayload from './NativePayload.js'
@@ -9,16 +11,10 @@ import * as NativeDiagnosticFailure from './NativeDiagnosticFailure.js'
 import * as NativeDiagnosticContext from './NativeDiagnosticContext.js'
 import * as ContinuationTransfer from './ContinuationTransfer.js'
 import * as NativeExecutionStorage from './NativeExecutionStorage.js'
-import * as Alignment from '@silklang/llvm/Alignment'
 import * as LlvmBlock from '@silklang/llvm/Block'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
 import * as FunctionActor from '@silklang/llvm/Function'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import * as LlvmType from '@silklang/llvm/Type'
 import * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import { suspensionPointKey } from './Backend.js'
 import * as CoroutineFrame from './CoroutineFrame.js'
 import * as ExecutionPackage from './ExecutionPackage.js'
@@ -93,15 +89,15 @@ const targetForCallable = (
   return { type, target }
 }
 
-const applyCallable = Effect.fnUntraced(function* (
+const applyCallable = (
   context: Context,
   local: { readonly _tag: 'Local'; readonly ordinal: number },
   typeArguments: ReadonlyArray<SilkType.GenericArgument>,
   arguments_: ReadonlyArray<ReadonlyArray<Value.Input>>,
   tag: string,
-) {
+) => {
   const { type, target } = targetForCallable(context, local, typeArguments)
-  const values = yield* NativeStorage.materialize(context.storage, local)
+  const values = NativeStorage.materialize(context.storage, local)
   let cursor = 0
   const captures = (type.environment?.fields ?? []).map((field) => {
     const lanes = Layout.callableFieldLanes(context.program.layout, field)
@@ -110,9 +106,9 @@ const applyCallable = Effect.fnUntraced(function* (
     return { parameterOrdinal: field.parameterOrdinal, items: selected }
   })
   return NativeResult.sourceValues(
-    yield* NativeResult.materialize(
+    NativeResult.materialize(
       context.storage,
-      yield* NativeCall.callValues(
+      NativeCall.callValues(
         context.call,
         target,
         NativeArgument.fromValues(Mir.applyOperands(captures, arguments_)),
@@ -121,30 +117,30 @@ const applyCallable = Effect.fnUntraced(function* (
       `${tag}_source_result`,
     ),
   )
-})
+}
 
-const storePackageValue = Effect.fnUntraced(function* (
+const storePackageValue = (
   context: Context,
   base: Value.Input,
   local: { readonly _tag: 'Local'; readonly ordinal: number },
   type: SilkType.Type,
   byteOffset: number,
   tag: string,
-) {
+) => {
   if (NativeStorage.readLocal(context.storage, local)._tag === 'Empty') return
-  const selected = yield* NativeLanePointer.lanePointer(
+  const selected = NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,
     base,
     byteOffset,
     tag,
   )
-  yield* NativeStorage.sendPlace(
+  NativeStorage.sendPlace(
     context.storage,
     NativePlace.stored(context.program.layout, type, selected),
     local,
   )
-})
+}
 
 interface PackageReadContext {
   readonly body: Context['body']
@@ -154,14 +150,14 @@ interface PackageReadContext {
 }
 
 /** Keeps package cleanup lazy until the owning lifecycle selects this component. */
-const packagePayload = Effect.fnUntraced(function* (
+const packagePayload = (
   context: PackageReadContext,
   base: Value.Input,
   type: SilkType.Type,
   byteOffset: number,
   tag: string,
-) {
-  const selected = yield* NativeLanePointer.lanePointer(
+) => {
+  const selected = NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,
     base,
@@ -172,7 +168,7 @@ const packagePayload = Effect.fnUntraced(function* (
     context.types,
     NativePlace.stored(context.program.layout, type, selected),
   )
-})
+}
 
 const exactEffect = (context: Context, package_: ExecutionPackage.Plan) => {
   const represented = package_.specialization.body
@@ -197,7 +193,10 @@ const exactEffect = (context: Context, package_: ExecutionPackage.Plan) => {
   const target =
     environment === undefined
       ? undefined
-      : context.declared.find((candidate) =>
+      : FunctionIndex.nativeCandidates(
+          context.declared,
+          Tir.effectRunnerId(environment.instance.declaration, environment.site),
+        ).find((candidate) =>
           Mir.matchesEffectInstance(
             candidate.fn,
             Tir.effectRunnerId(environment.instance.declaration, environment.site),
@@ -211,20 +210,20 @@ const exactEffect = (context: Context, package_: ExecutionPackage.Plan) => {
   return { environment, target }
 }
 
-const bodyOperands = Effect.fnUntraced(function* (
+const bodyOperands = (
   context: Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   const { environment, target } = exactEffect(context, package_)
   const bodyOffset = componentOffset(package_, 'BodyEnvironment')
   if (bodyOffset === undefined) throw new RangeError('LLVM execution drive lost body storage')
-  const values = yield* NativePlace.loadLanes(
+  const values = NativePlace.loadLanes(
     NativePlace.stored(
       context.program.layout,
       package_.specialization.body,
-      yield* NativeLanePointer.lanePointer(
+      NativeLanePointer.lanePointer(
         context.lanePointers,
         context.body,
         base,
@@ -236,14 +235,14 @@ const bodyOperands = Effect.fnUntraced(function* (
     tag,
   )
   return { environment, target, values: values }
-})
+}
 
-const notifyReady = Effect.fnUntraced(function* (
+const notifyReady = (
   context: Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   context.runtimeFeatures.add('ReadinessNotification')
   const callbackOffset = componentOffset(package_, 'EndpointCallback')
   const endpointOffset = componentOffset(package_, 'EndpointState')
@@ -297,11 +296,11 @@ const notifyReady = Effect.fnUntraced(function* (
   const callbackValues =
     environment === undefined
       ? []
-      : yield* NativePlace.loadLanes(
+      : NativePlace.loadLanes(
           NativePlace.stored(
             context.program.layout,
             callback,
-            yield* NativeLanePointer.lanePointer(
+            NativeLanePointer.lanePointer(
               context.lanePointers,
               context.body,
               base,
@@ -321,7 +320,7 @@ const notifyReady = Effect.fnUntraced(function* (
     })
     captureOrdinal += count
   }
-  const endpoint = yield* NativeLanePointer.lanePointer(
+  const endpoint = NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,
     base,
@@ -329,9 +328,9 @@ const notifyReady = Effect.fnUntraced(function* (
     `${tag}_endpoint`,
   )
   NativeResult.sourceValues(
-    yield* NativeResult.materialize(
+    NativeResult.materialize(
       context.storage,
-      yield* NativeCall.callValues(
+      NativeCall.callValues(
         context.call,
         target,
         NativeArgument.fromValues(Mir.applyOperands(captures, [[endpoint]])),
@@ -340,24 +339,24 @@ const notifyReady = Effect.fnUntraced(function* (
       `${tag}_source_result`,
     ),
   )
-})
+}
 
-const releasePackage = Effect.fnUntraced(function* (
+const releasePackage = (
   context: Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   const cleanup = package_.cleanup
   const allocationOffset = componentOffset(package_, 'AllocationAuthority')
   if (cleanup === undefined || allocationOffset === undefined)
     throw new RangeError('LLVM execution cleanup lost package metadata')
   const callbackOffset = componentOffset(package_, 'EndpointCallback')
   if (callbackOffset !== undefined && CleanupPlan.hasEffect(cleanup.callback))
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context.cleanup,
       cleanup.callback,
-      yield* packagePayload(
+      packagePayload(
         context,
         base,
         package_.specialization.callback,
@@ -368,10 +367,10 @@ const releasePackage = Effect.fnUntraced(function* (
     )
   const endpointOffset = componentOffset(package_, 'EndpointState')
   if (endpointOffset !== undefined && CleanupPlan.hasEffect(cleanup.endpoint))
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context.cleanup,
       cleanup.endpoint,
-      yield* packagePayload(
+      packagePayload(
         context,
         base,
         package_.specialization.endpoint,
@@ -380,56 +379,50 @@ const releasePackage = Effect.fnUntraced(function* (
       ),
       `${tag}_endpoint`,
     )
-  yield* NativeAggregate.dropThroughPlan(
+  NativeAggregate.dropThroughPlan(
     context.cleanup,
     {
       _tag: 'AllocationCleanup' as const,
       type: SilkType.allocation,
       ticket: 'ActiveReclaimTicket' as const,
     },
-    yield* packagePayload(
-      context,
-      base,
-      SilkType.allocation,
-      allocationOffset,
-      `${tag}_allocation_load`,
-    ),
+    packagePayload(context, base, SilkType.allocation, allocationOffset, `${tag}_allocation_load`),
     `${tag}_allocation`,
   )
-})
+}
 
-const releaseAllocation = Effect.fnUntraced(function* (
+const releaseAllocation = (
   context: Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   const allocationOffset = componentOffset(package_, 'AllocationAuthority')
   if (allocationOffset === undefined)
     throw new RangeError('LLVM execution lost allocation authority')
-  yield* NativeAggregate.dropThroughPlan(
+  NativeAggregate.dropThroughPlan(
     context.cleanup,
     {
       _tag: 'AllocationCleanup' as const,
       type: SilkType.allocation,
       ticket: 'ActiveReclaimTicket' as const,
     },
-    yield* packagePayload(context, base, SilkType.allocation, allocationOffset, `${tag}_load`),
+    packagePayload(context, base, SilkType.allocation, allocationOffset, `${tag}_load`),
     tag,
   )
-})
+}
 
 interface StoredEndpoints {
   readonly callback?: NativePayload.NativePayload
   readonly endpoint?: NativePayload.NativePayload
 }
 
-const loadStoredEndpoints = Effect.fnUntraced(function* (
+const loadStoredEndpoints = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-): Effect.fn.Return<StoredEndpoints, LlvmError.LlvmError> {
+): StoredEndpoints => {
   const callbackOffset = componentOffset(package_, 'EndpointCallback')
   const endpointOffset = componentOffset(package_, 'EndpointState')
   return {
@@ -438,7 +431,7 @@ const loadStoredEndpoints = Effect.fnUntraced(function* (
     !CleanupPlan.hasEffect(package_.cleanup.callback)
       ? {}
       : {
-          callback: yield* packagePayload(
+          callback: packagePayload(
             context,
             base,
             package_.specialization.callback,
@@ -451,7 +444,7 @@ const loadStoredEndpoints = Effect.fnUntraced(function* (
     !CleanupPlan.hasEffect(package_.cleanup.endpoint)
       ? {}
       : {
-          endpoint: yield* packagePayload(
+          endpoint: packagePayload(
             context,
             base,
             package_.specialization.endpoint,
@@ -460,33 +453,33 @@ const loadStoredEndpoints = Effect.fnUntraced(function* (
           ),
         }),
   }
-})
+}
 
-const dropStoredEndpoints = Effect.fnUntraced(function* (
+const dropStoredEndpoints = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   endpoints: StoredEndpoints,
   tag: string,
-) {
+) => {
   const cleanup = package_.cleanup
   if (cleanup === undefined) throw new RangeError('LLVM execution drop lost package metadata')
   if (endpoints.callback !== undefined)
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context,
       cleanup.callback,
       endpoints.callback,
       `${tag}_callback`,
     )
   if (endpoints.endpoint !== undefined)
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context,
       cleanup.endpoint,
       endpoints.endpoint,
       `${tag}_endpoint`,
     )
-})
+}
 
-const dropStoredPackage = Effect.fnUntraced(function* (
+const dropStoredPackage = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
@@ -496,29 +489,18 @@ const dropStoredPackage = Effect.fnUntraced(function* (
     readonly allocation: boolean
   },
   tag: string,
-) {
+) => {
   const cleanup = package_.cleanup
   if (cleanup === undefined) throw new RangeError('LLVM execution drop lost package metadata')
   if (options.endpoints)
-    yield* dropStoredEndpoints(
-      context,
-      package_,
-      yield* loadStoredEndpoints(context, package_, base, tag),
-      tag,
-    )
+    dropStoredEndpoints(context, package_, loadStoredEndpoints(context, package_, base, tag), tag)
   if (options.body && CleanupPlan.hasEffect(cleanup.body)) {
     const offset = componentOffset(package_, 'BodyEnvironment')
     if (offset === undefined) throw new RangeError('LLVM execution drop lost body storage')
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context,
       cleanup.body,
-      yield* packagePayload(
-        context,
-        base,
-        package_.specialization.body,
-        offset,
-        `${tag}_body_load`,
-      ),
+      packagePayload(context, base, package_.specialization.body, offset, `${tag}_body_load`),
       `${tag}_body`,
     )
   }
@@ -526,14 +508,14 @@ const dropStoredPackage = Effect.fnUntraced(function* (
     const allocationOffset = componentOffset(package_, 'AllocationAuthority')
     if (allocationOffset === undefined)
       throw new RangeError('LLVM execution drop lost allocation storage')
-    yield* NativeAggregate.dropThroughPlan(
+    NativeAggregate.dropThroughPlan(
       context,
       {
         _tag: 'AllocationCleanup' as const,
         type: SilkType.allocation,
         ticket: 'ActiveReclaimTicket' as const,
       },
-      yield* packagePayload(
+      packagePayload(
         context,
         base,
         SilkType.allocation,
@@ -543,20 +525,20 @@ const dropStoredPackage = Effect.fnUntraced(function* (
       `${tag}_allocation`,
     )
   }
-})
+}
 
 /** Runs one armed nonparking finalizer from its retained frame before consuming those fields. */
-const runCancellationFinalizer = Effect.fnUntraced(function* (
+const runCancellationFinalizer = (
   context: NativeAggregate.Context,
   owner: Mir.MirFunction,
   layout: Mir.CoroutineFrameTargetStateLayout,
   frame: Value.Input,
   finalizer: Mir.CancellationFinalizer | undefined,
   tag: string,
-) {
+) => {
   if (finalizer === undefined) return new Set<number>()
   const { body, declared } = context
-  const target = declared.find((candidate) =>
+  const target = FunctionIndex.nativeCandidates(declared, finalizer.runner).find((candidate) =>
     Mir.matchesEffectInstance(
       candidate.fn,
       finalizer.runner,
@@ -567,7 +549,7 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
   )
   if (target === undefined)
     throw new RangeError('LLVM cancellation finalizer lost its exact Effect runner')
-  const materialize = Effect.fnUntraced(function* (local: Mir.LocalId) {
+  const materialize = (local: Mir.LocalId) => {
     const type = owner.localTypes.at(local.ordinal)
     if (type === undefined) throw new RangeError('LLVM cancellation finalizer lost a local type')
     const field = layout.payload.find((candidate) => candidate.local.ordinal === local.ordinal)
@@ -575,32 +557,28 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
       if (NativeType.valueLanesFor(context.types, type).length === 0) return []
       throw new RangeError('LLVM cancellation finalizer lost a retained frame field')
     }
-    const place = yield* NativeFrame.place(
-      context.storage,
-      frame,
-      field,
-      `${tag}_local${local.ordinal}`,
-    )
-    return yield* NativePayload.materialize(
+    const place = NativeFrame.place(context.storage, frame, field, `${tag}_local${local.ordinal}`)
+    return NativePayload.materialize(
       NativePayload.place(context.types, place),
       context,
       `${tag}_local${local.ordinal}_value`,
     )
-  })
+  }
   let effectValues: ReadonlyArray<Value.Input>
   if (finalizer._tag === 'EffectCancellationFinalizer') {
-    effectValues = yield* materialize(finalizer.effect)
+    effectValues = materialize(finalizer.effect)
   } else {
     const releaseType = owner.localTypes.at(finalizer.release.ordinal)
     if (releaseType?._tag !== 'CallableValue')
       throw new RangeError('LLVM resource finalizer lost its release callable')
-    const releaseTarget = declared.find((candidate) =>
-      Mir.matchesInstance(candidate.fn, finalizer.releaseTarget, finalizer.releaseTypeArguments),
+    const releaseTarget = FunctionIndex.nativeCandidates(declared, finalizer.releaseTarget).find(
+      (candidate) =>
+        Mir.matchesInstance(candidate.fn, finalizer.releaseTarget, finalizer.releaseTypeArguments),
     )
     if (releaseTarget === undefined)
       throw new RangeError('LLVM resource finalizer lost its release builder target')
-    const releaseValues = yield* materialize(finalizer.release)
-    const captures = yield* NativeCallable.capturedArguments(
+    const releaseValues = materialize(finalizer.release)
+    const captures = NativeCallable.capturedArguments(
       context,
       releaseType,
       releaseValues,
@@ -611,18 +589,18 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
     )
     if (resourceField === undefined)
       throw new RangeError('LLVM resource finalizer lost its retained resource')
-    const resourcePlace = yield* NativeFrame.place(
+    const resourcePlace = NativeFrame.place(
       context.storage,
       frame,
       resourceField,
       `${tag}_resource`,
     )
-    const resourceReference = yield* NativePlace.base(
+    const resourceReference = NativePlace.base(
       resourcePlace,
       context.storage,
       `${tag}_resource_ref`,
     )
-    const releaseResult = yield* NativeCall.callValues(
+    const releaseResult = NativeCall.callValues(
       context.call,
       releaseTarget,
       NativeArgument.fromValues(
@@ -637,14 +615,11 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
       `${tag}_build`,
     )
     effectValues = NativeResult.sourceValues(
-      yield* NativeResult.materialize(context.storage, releaseResult, `${tag}_source_result`),
+      NativeResult.materialize(context.storage, releaseResult, `${tag}_source_result`),
     )
   }
-  const inputs = [
-    ...effectValues,
-    ...(yield* Effect.forEach(finalizer.arguments, materialize)).flat(),
-  ]
-  const lowered = yield* NativeArgument.lower(
+  const inputs = [...effectValues, ...Array.from(finalizer.arguments, materialize).flat()]
+  const lowered = NativeArgument.lower(
     context.storage,
     target.argumentParameters,
     NativeArgument.fromValues(inputs),
@@ -653,13 +628,13 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
   const callable = target.suspendable ? target.driver : target.handle
   if (callable === undefined)
     throw new RangeError('LLVM nonparking cancellation finalizer lost its machine driver')
-  const resultAddress = yield* NativeResult.allocate(body, target, `${tag}_result`)
-  yield* FunctionBody.callDirect(
+  const resultAddress = NativeResult.allocate(body, target, `${tag}_result`)
+  Emitter.callDirect(
     body,
     callable,
     NativeResult.argumentsFor(
       target,
-      yield* NativeCall.argumentsFor(context.call.synchronous, target, lowered),
+      NativeCall.argumentsFor(context.call.synchronous, target, lowered),
       resultAddress,
     ),
     `${tag}_run`,
@@ -670,14 +645,14 @@ const runCancellationFinalizer = Effect.fnUntraced(function* (
       : [finalizer.release.ordinal]),
     ...finalizer.arguments.map((local) => local.ordinal),
   ])
-})
+}
 
-const dropFrames = Effect.fnUntraced(function* (
+const dropFrames = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   const continuationOffset = componentOffset(package_, 'InitialContinuationSegment')
   if (continuationOffset === undefined) return
   const { body, builder, executionStorage, lanePointers, pointer, program, usizeType } = context
@@ -685,24 +660,24 @@ const dropFrames = Effect.fnUntraced(function* (
     throw new RangeError('LLVM execution frame cleanup lost runtime support')
   const diagnostic = context.call.synchronous.diagnostic
   const previousObserver =
-    diagnostic === undefined ? undefined : yield* NativeDiagnosticContext.current(diagnostic)
+    diagnostic === undefined ? undefined : NativeDiagnosticContext.current(diagnostic)
   const previousCause =
-    diagnostic === undefined ? undefined : yield* NativeDiagnosticContext.currentCause(diagnostic)
-  const stateSlot = yield* NativeLanePointer.lanePointer(
+    diagnostic === undefined ? undefined : NativeDiagnosticContext.currentCause(diagnostic)
+  const stateSlot = NativeLanePointer.lanePointer(
     lanePointers,
     body,
     base,
     continuationOffset + NativeExecutionStorage.stateOffset(program.layout.target.pointerSize),
     `${tag}_storage_slot`,
   )
-  const storageState = yield* FunctionBody.load(body, pointer, stateSlot, `${tag}_storage_state`)
-  const headStorage = yield* FunctionBody.alloca(body, pointer, `${tag}_head_slot`)
-  yield* FunctionBody.store(
+  const storageState = Emitter.load(body, pointer, stateSlot, `${tag}_storage_state`)
+  const headStorage = Emitter.alloca(body, pointer, `${tag}_head_slot`)
+  Emitter.store(
     body,
-    yield* FunctionBody.load(
+    Emitter.load(
       body,
       pointer,
-      yield* NativeLanePointer.lanePointer(
+      NativeLanePointer.lanePointer(
         lanePointers,
         body,
         base,
@@ -713,34 +688,34 @@ const dropFrames = Effect.fnUntraced(function* (
     ),
     headStorage,
   )
-  const loop = yield* LlvmBlock.make(body, `${tag}_frame_loop`)
-  const finish = yield* LlvmBlock.make(body, `${tag}_frame_finish`)
-  yield* FunctionBody.branch(body, loop)
-  yield* LlvmBlock.setInsertionPoint(body, loop)
-  const head = yield* FunctionBody.load(body, pointer, headStorage, `${tag}_head`)
-  const address = yield* FunctionBody.cast(body, 'ptrtoint', head, usizeType, `${tag}_head_address`)
-  const present = yield* LlvmBlock.make(body, `${tag}_frame_present`)
-  yield* FunctionBody.conditionalBranch(
+  const loop = Emitter.block(body, `${tag}_frame_loop`)
+  const finish = Emitter.block(body, `${tag}_frame_finish`)
+  Emitter.branch(body, loop)
+  Emitter.setInsertionPoint(body, loop)
+  const head = Emitter.load(body, pointer, headStorage, `${tag}_head`)
+  const address = Emitter.cast(body, 'ptrtoint', head, usizeType, `${tag}_head_address`)
+  const present = Emitter.block(body, `${tag}_frame_present`)
+  Emitter.conditionalBranch(
     body,
-    yield* FunctionBody.integerCompare(
+    Emitter.integerCompare(
       body,
       'eq',
       address,
-      yield* Constant.integerUnsigned(builder, usizeType, 0n),
+      Emitter.integerUnsigned(builder, usizeType, 0n),
       `${tag}_frames_done`,
     ),
     finish,
     present,
   )
-  yield* LlvmBlock.setInsertionPoint(body, present)
-  const next = yield* FunctionBody.load(body, pointer, head, `${tag}_next`)
+  Emitter.setInsertionPoint(body, present)
+  const next = Emitter.load(body, pointer, head, `${tag}_next`)
   if (diagnostic !== undefined)
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
-      yield* FunctionBody.load(
+      Emitter.load(
         body,
         pointer,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           head,
@@ -753,12 +728,12 @@ const dropFrames = Effect.fnUntraced(function* (
     )
 
   if (diagnostic !== undefined)
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
-      yield* FunctionBody.load(
+      Emitter.load(
         body,
         diagnostic.causeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           head,
@@ -770,10 +745,10 @@ const dropFrames = Effect.fnUntraced(function* (
       diagnostic.cause,
     )
 
-  const resume = yield* FunctionBody.load(
+  const resume = Emitter.load(
     body,
     pointer,
-    yield* NativeLanePointer.lanePointer(
+    NativeLanePointer.lanePointer(
       lanePointers,
       body,
       head,
@@ -782,47 +757,32 @@ const dropFrames = Effect.fnUntraced(function* (
     ),
     `${tag}_resume`,
   )
-  const resumeAddress = yield* FunctionBody.cast(
-    body,
-    'ptrtoint',
-    resume,
-    usizeType,
-    `${tag}_resume_address`,
-  )
-  const released = yield* LlvmBlock.make(body, `${tag}_frame_released`)
+  const resumeAddress = Emitter.cast(body, 'ptrtoint', resume, usizeType, `${tag}_resume_address`)
+  const released = Emitter.block(body, `${tag}_frame_released`)
   let otherwise = present
   for (const [ordinal, generated] of [...context.resumeThunks.values()].entries()) {
-    const selected = yield* LlvmBlock.make(body, `${tag}_frame_${ordinal}`)
-    const following = yield* LlvmBlock.make(body, `${tag}_frame_${ordinal}_otherwise`)
-    if (otherwise !== present) yield* LlvmBlock.setInsertionPoint(body, otherwise)
-    const target = yield* Constant.fromGlobal(
-      builder,
-      yield* FunctionActor.global(builder, generated.handle),
-    )
-    yield* FunctionBody.conditionalBranch(
+    const selected = Emitter.block(body, `${tag}_frame_${ordinal}`)
+    const following = Emitter.block(body, `${tag}_frame_${ordinal}_otherwise`)
+    if (otherwise !== present) Emitter.setInsertionPoint(body, otherwise)
+    const target = Emitter.fromGlobal(builder, Emitter.functionGlobal(builder, generated.handle))
+    Emitter.conditionalBranch(
       body,
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         'eq',
         resumeAddress,
-        yield* FunctionBody.cast(
-          body,
-          'ptrtoint',
-          target,
-          usizeType,
-          `${tag}_target_${ordinal}_address`,
-        ),
+        Emitter.cast(body, 'ptrtoint', target, usizeType, `${tag}_target_${ordinal}_address`),
         `${tag}_frame_${ordinal}_matches`,
       ),
       selected,
       following,
     )
-    yield* LlvmBlock.setInsertionPoint(body, selected)
+    Emitter.setInsertionPoint(body, selected)
     const owner = program.functions.find((fn) =>
       Mir.matchesInstanceKey(fn, generated.layout.point.owner),
     )
     if (owner === undefined) throw new RangeError('LLVM execution frame cleanup lost its owner')
-    const consumed = yield* runCancellationFinalizer(
+    const consumed = runCancellationFinalizer(
       context,
       owner,
       generated.layout,
@@ -848,23 +808,20 @@ const dropFrames = Effect.fnUntraced(function* (
         NativeType.lanesFor(context.types, field.type),
         field.offset,
       )
-      const values = yield* Effect.forEach(
-        lanes.entries,
-        Effect.fnUntraced(function* (lane) {
-          return yield* FunctionBody.load(
+      const values = Array.from(lanes.entries, (lane) => {
+        return Emitter.load(
+          body,
+          NativeType.laneType(context.types, lane.lane),
+          NativeLanePointer.lanePointer(
+            lanePointers,
             body,
-            NativeType.laneType(context.types, lane.lane),
-            yield* NativeLanePointer.lanePointer(
-              lanePointers,
-              body,
-              head,
-              lane.offset,
-              `${tag}_flag${ordinal}_ptr`,
-            ),
-            `${tag}_flag${ordinal}`,
-          )
-        }),
-      )
+            head,
+            lane.offset,
+            `${tag}_flag${ordinal}_ptr`,
+          ),
+          `${tag}_flag${ordinal}`,
+        )
+      })
       const value = values.at(0)
       if (value === undefined || values.length !== 1)
         throw new RangeError('LLVM cancellation initialization flag is not scalar')
@@ -892,9 +849,9 @@ const dropFrames = Effect.fnUntraced(function* (
           if (descriptor === undefined)
             throw new RangeError('Cancellation lost its diagnostic descriptor')
           for (const field of frame?.diagnosticOutcomes ?? []) {
-            yield* NativeDiagnosticOutcome.releaseForObserver(
+            NativeDiagnosticOutcome.releaseForObserver(
               {
-                storage: yield* NativeLanePointer.lanePointer(
+                storage: NativeLanePointer.lanePointer(
                   lanePointers,
                   body,
                   head,
@@ -903,7 +860,7 @@ const dropFrames = Effect.fnUntraced(function* (
                 ),
               },
               diagnostic,
-              yield* NativeLanePointer.lanePointer(
+              NativeLanePointer.lanePointer(
                 lanePointers,
                 body,
                 head,
@@ -912,12 +869,12 @@ const dropFrames = Effect.fnUntraced(function* (
               ),
             )
           }
-          yield* FunctionBody.store(
+          Emitter.store(
             body,
-            yield* FunctionBody.load(
+            Emitter.load(
               body,
               pointer,
-              yield* NativeLanePointer.lanePointer(
+              NativeLanePointer.lanePointer(
                 lanePointers,
                 body,
                 head,
@@ -928,12 +885,12 @@ const dropFrames = Effect.fnUntraced(function* (
             ),
             diagnostic.current,
           )
-          yield* FunctionBody.store(
+          Emitter.store(
             body,
-            yield* FunctionBody.load(
+            Emitter.load(
               body,
               diagnostic.causeType,
-              yield* NativeLanePointer.lanePointer(
+              NativeLanePointer.lanePointer(
                 lanePointers,
                 body,
                 head,
@@ -948,12 +905,12 @@ const dropFrames = Effect.fnUntraced(function* (
         }
       }
 
-      yield* NativeAggregate.dropThroughPlan(
+      NativeAggregate.dropThroughPlan(
         { ...context, initializationValues },
         field.access.cleanup,
         NativePayload.place(
           context.types,
-          yield* NativeFrame.place(context.storage, head, field, `${tag}_frame_${ordinal}`),
+          NativeFrame.place(context.storage, head, field, `${tag}_frame_${ordinal}`),
         ),
         `${tag}_frame_${ordinal}_slot${field.slot}`,
         undefined,
@@ -966,9 +923,9 @@ const dropFrames = Effect.fnUntraced(function* (
       )
       if (frame === undefined) throw new RangeError('Cancellation lost its outcome storage layout')
       for (const field of frame.diagnosticOutcomes)
-        yield* NativeDiagnosticOutcome.release(
+        NativeDiagnosticOutcome.release(
           {
-            storage: yield* NativeLanePointer.lanePointer(
+            storage: NativeLanePointer.lanePointer(
               lanePointers,
               body,
               head,
@@ -979,51 +936,51 @@ const dropFrames = Effect.fnUntraced(function* (
           diagnostic,
         )
     }
-    yield* FunctionBody.branch(body, released)
+    Emitter.branch(body, released)
     otherwise = following
   }
-  yield* LlvmBlock.setInsertionPoint(body, otherwise)
-  yield* FunctionBody.unreachable(body)
-  yield* LlvmBlock.setInsertionPoint(body, released)
-  yield* NativeExecutionStorage.invoke(
+  Emitter.setInsertionPoint(body, otherwise)
+  Emitter.unreachable(body)
+  Emitter.setInsertionPoint(body, released)
+  NativeExecutionStorage.invoke(
     { builder, body, pointer, storage: executionStorage },
     'release',
     [storageState, head],
     `${tag}_frame_release`,
   )
-  yield* FunctionBody.store(body, next, headStorage)
-  yield* FunctionBody.branch(body, loop)
-  yield* LlvmBlock.setInsertionPoint(body, finish)
+  Emitter.store(body, next, headStorage)
+  Emitter.branch(body, loop)
+  Emitter.setInsertionPoint(body, finish)
   if (diagnostic !== undefined && previousObserver !== undefined)
-    yield* FunctionBody.store(body, previousObserver, diagnostic.current)
+    Emitter.store(body, previousObserver, diagnostic.current)
   if (diagnostic !== undefined && previousCause !== undefined)
-    yield* FunctionBody.store(body, previousCause, diagnostic.cause)
-  yield* NativeExecutionStorage.destroy(
+    Emitter.store(body, previousCause, diagnostic.cause)
+  NativeExecutionStorage.destroy(
     { builder, body, pointer, usizeType, storage: executionStorage },
     stateSlot,
     `${tag}_storage`,
   )
-})
+}
 
 // These physical phases hold allocation authority throughout emitted source cleanup.
 // A Wake consumed reentrantly records consumption without releasing the package.
 const cleanupWithWake = 7n
 const cleanupWithoutWake = 8n
 
-const dropActivatedPackage = Effect.fnUntraced(function* (
+const dropActivatedPackage = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
-) {
+) => {
   const { body, builder, usizeType, lanePointers } = context
   if (usizeType === undefined) throw new RangeError('Execution cleanup lost its word type')
-  const endpoints = yield* loadStoredEndpoints(context, package_, base, tag)
+  const endpoints = loadStoredEndpoints(context, package_, base, tag)
   const controlOffset = componentOffset(package_, 'WakeControl')
   const phasePointer =
     controlOffset === undefined
       ? undefined
-      : yield* NativeLanePointer.lanePointer(
+      : NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
@@ -1031,95 +988,84 @@ const dropActivatedPackage = Effect.fnUntraced(function* (
           `${tag}_cleanup_phase_ptr`,
         )
   if (phasePointer !== undefined) {
-    const phase = yield* FunctionBody.load(body, usizeType, phasePointer, `${tag}_cleanup_phase`)
-    const registering = yield* FunctionBody.integerCompare(
+    const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_cleanup_phase`)
+    const registering = Emitter.integerCompare(
       body,
       'eq',
       phase,
-      yield* Constant.integerUnsigned(builder, usizeType, 1n),
+      Emitter.integerUnsigned(builder, usizeType, 1n),
       `${tag}_registering_wake`,
     )
-    const dormant = yield* FunctionBody.integerCompare(
+    const dormant = Emitter.integerCompare(
       body,
       'eq',
       phase,
-      yield* Constant.integerUnsigned(builder, usizeType, 3n),
+      Emitter.integerUnsigned(builder, usizeType, 3n),
       `${tag}_dormant_wake`,
     )
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
-      yield* FunctionBody.select(
+      Emitter.select(
         body,
-        yield* FunctionBody.binary(body, 'or', registering, dormant, `${tag}_owns_wake`),
-        yield* Constant.integerUnsigned(builder, usizeType, cleanupWithWake),
-        yield* Constant.integerUnsigned(builder, usizeType, cleanupWithoutWake),
+        Emitter.binary(body, 'or', registering, dormant, `${tag}_owns_wake`),
+        Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
+        Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
         `${tag}_held_phase`,
       ),
       phasePointer,
     )
   }
-  yield* FunctionBody.store(
+  Emitter.store(
     body,
-    yield* Constant.integerUnsigned(
-      builder,
-      usizeType,
-      BigInt(ExecutionTransition.tagOf('Destroyed')),
-    ),
-    yield* NativeLanePointer.lanePointer(lanePointers, body, base, 0, `${tag}_cleanup_state_ptr`),
+    Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Destroyed'))),
+    NativeLanePointer.lanePointer(lanePointers, body, base, 0, `${tag}_cleanup_state_ptr`),
   )
-  yield* dropFrames(context, package_, base, tag)
-  yield* dropStoredEndpoints(context, package_, endpoints, tag)
-  const release = yield* LlvmBlock.make(body, `${tag}_release_package`)
-  const done = yield* LlvmBlock.make(body, `${tag}_cleanup_done`)
+  dropFrames(context, package_, base, tag)
+  dropStoredEndpoints(context, package_, endpoints, tag)
+  const release = Emitter.block(body, `${tag}_release_package`)
+  const done = Emitter.block(body, `${tag}_cleanup_done`)
   if (phasePointer === undefined) {
-    yield* FunctionBody.branch(body, release)
+    Emitter.branch(body, release)
   } else {
-    const phase = yield* FunctionBody.load(body, usizeType, phasePointer, `${tag}_cleaned_phase`)
-    yield* FunctionBody.store(
+    const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_cleaned_phase`)
+    Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 6n), phasePointer)
+    Emitter.conditionalBranch(
       body,
-      yield* Constant.integerUnsigned(builder, usizeType, 6n),
-      phasePointer,
-    )
-    yield* FunctionBody.conditionalBranch(
-      body,
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         'eq',
         phase,
-        yield* Constant.integerUnsigned(builder, usizeType, cleanupWithoutWake),
+        Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
         `${tag}_wake_consumed`,
       ),
       release,
       done,
     )
   }
-  yield* LlvmBlock.setInsertionPoint(body, release)
-  yield* dropStoredPackage(
+  Emitter.setInsertionPoint(body, release)
+  dropStoredPackage(
     context,
     package_,
     base,
     { body: false, endpoints: false, allocation: true },
     `${tag}_allocation`,
   )
-  yield* FunctionBody.branch(body, done)
-  yield* LlvmBlock.setInsertionPoint(body, done)
-})
+  Emitter.branch(body, done)
+  Emitter.setInsertionPoint(body, done)
+}
 
-const selectPackage = Effect.fnUntraced(function* (
+const selectPackage = (
   context: NativeAggregate.Context,
   base: Value.Input,
   tag: string,
-  emitPlan: (
-    package_: ExecutionPackage.Plan,
-    ordinal: number,
-  ) => Effect.Effect<void, LlvmError.LlvmError>,
-) {
+  emitPlan: (package_: ExecutionPackage.Plan, ordinal: number) => void,
+) => {
   const { body, builder, program, usizeType } = context
   if (usizeType === undefined) throw new RangeError('LLVM execution cleanup lost usize')
-  const packageOrdinal = yield* FunctionBody.load(
+  const packageOrdinal = Emitter.load(
     body,
     usizeType,
-    yield* NativeLanePointer.lanePointer(
+    NativeLanePointer.lanePointer(
       context.lanePointers,
       body,
       base,
@@ -1128,48 +1074,48 @@ const selectPackage = Effect.fnUntraced(function* (
     ),
     `${tag}_package`,
   )
-  const following = yield* LlvmBlock.make(body, `${tag}_following`)
+  const following = Emitter.block(body, `${tag}_following`)
   let otherwise: LlvmBlock.Block | undefined
   for (const [ordinal, package_] of program.layout.executionPackages.plans.entries()) {
-    if (otherwise !== undefined) yield* LlvmBlock.setInsertionPoint(body, otherwise)
-    const selected = yield* LlvmBlock.make(body, `${tag}_package_${ordinal}`)
-    const next = yield* LlvmBlock.make(body, `${tag}_package_${ordinal}_otherwise`)
-    yield* FunctionBody.conditionalBranch(
+    if (otherwise !== undefined) Emitter.setInsertionPoint(body, otherwise)
+    const selected = Emitter.block(body, `${tag}_package_${ordinal}`)
+    const next = Emitter.block(body, `${tag}_package_${ordinal}_otherwise`)
+    Emitter.conditionalBranch(
       body,
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         'eq',
         packageOrdinal,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(ordinal)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ordinal)),
         `${tag}_package_${ordinal}_matches`,
       ),
       selected,
       next,
     )
-    yield* LlvmBlock.setInsertionPoint(body, selected)
-    yield* emitPlan(package_, ordinal)
-    yield* FunctionBody.branch(body, following)
+    Emitter.setInsertionPoint(body, selected)
+    emitPlan(package_, ordinal)
+    Emitter.branch(body, following)
     otherwise = next
   }
   if (otherwise === undefined) throw new RangeError('LLVM execution cleanup has no package plans')
-  yield* LlvmBlock.setInsertionPoint(body, otherwise)
-  yield* FunctionBody.unreachable(body)
-  yield* LlvmBlock.setInsertionPoint(body, following)
-})
+  Emitter.setInsertionPoint(body, otherwise)
+  Emitter.unreachable(body)
+  Emitter.setInsertionPoint(body, following)
+}
 
-const selectPackageFrom = Effect.fnUntraced(function* (
+const selectPackageFrom = (
   context: NativeAggregate.Context,
   base: Value.Input,
   matching: ReadonlyArray<ExecutionPackage.Plan>,
   tag: string,
-  emitPlan: (package_: ExecutionPackage.Plan) => Effect.Effect<void, LlvmError.LlvmError>,
-) {
+  emitPlan: (package_: ExecutionPackage.Plan) => void,
+) => {
   const { body, builder, program, usizeType } = context
   if (usizeType === undefined) throw new RangeError('LLVM package selection lost usize')
-  const packageOrdinal = yield* FunctionBody.load(
+  const packageOrdinal = Emitter.load(
     body,
     usizeType,
-    yield* NativeLanePointer.lanePointer(
+    NativeLanePointer.lanePointer(
       context.lanePointers,
       body,
       base,
@@ -1178,195 +1124,171 @@ const selectPackageFrom = Effect.fnUntraced(function* (
     ),
     `${tag}_selected_package`,
   )
-  const following = yield* LlvmBlock.make(body, `${tag}_selected_following`)
+  const following = Emitter.block(body, `${tag}_selected_following`)
   let otherwise: LlvmBlock.Block | undefined
   for (const package_ of matching) {
     const ordinal = program.layout.executionPackages.plans.findIndex((candidate) =>
       ExecutionPackage.equals(candidate, package_),
     )
     if (ordinal < 0) throw new RangeError('LLVM package selection lost a matching package ordinal')
-    if (otherwise !== undefined) yield* LlvmBlock.setInsertionPoint(body, otherwise)
-    const selected = yield* LlvmBlock.make(body, `${tag}_selected_package_${ordinal}`)
-    const next = yield* LlvmBlock.make(body, `${tag}_selected_package_${ordinal}_otherwise`)
-    yield* FunctionBody.conditionalBranch(
+    if (otherwise !== undefined) Emitter.setInsertionPoint(body, otherwise)
+    const selected = Emitter.block(body, `${tag}_selected_package_${ordinal}`)
+    const next = Emitter.block(body, `${tag}_selected_package_${ordinal}_otherwise`)
+    Emitter.conditionalBranch(
       body,
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         'eq',
         packageOrdinal,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(ordinal)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ordinal)),
         `${tag}_selected_package_${ordinal}_matches`,
       ),
       selected,
       next,
     )
-    yield* LlvmBlock.setInsertionPoint(body, selected)
-    yield* emitPlan(package_)
-    yield* FunctionBody.branch(body, following)
+    Emitter.setInsertionPoint(body, selected)
+    emitPlan(package_)
+    Emitter.branch(body, following)
     otherwise = next
   }
   if (otherwise === undefined) throw new RangeError('LLVM package selection has no matching plans')
-  yield* LlvmBlock.setInsertionPoint(body, otherwise)
-  yield* FunctionBody.unreachable(body)
-  yield* LlvmBlock.setInsertionPoint(body, following)
-})
+  Emitter.setInsertionPoint(body, otherwise)
+  Emitter.unreachable(body)
+  Emitter.setInsertionPoint(body, following)
+}
 
 /**
  * Drops one opaque Execution through its package state and retained continuation authority.
  * Only the release helper expands this inline; every other cleanup site calls the helper.
  */
-const dropExecution = Effect.fnUntraced(function* (
+const dropExecution = (
   context: NativeAggregate.Context,
   values: ReadonlyArray<Value.Input>,
   tag: string,
-) {
+) => {
   const base = values.at(0)
   const { body, builder, usizeType } = context
   if (base === undefined || usizeType === undefined)
     throw new RangeError('LLVM Execution cleanup lost its package reference')
-  yield* selectPackage(context, base, tag, (package_) =>
-    Effect.gen(function* () {
-      const statePointer = yield* NativeLanePointer.lanePointer(
+  selectPackage(context, base, tag, (package_) =>
+    (() => {
+      const statePointer = NativeLanePointer.lanePointer(
         context.lanePointers,
         body,
         base,
         0,
         `${tag}_state_ptr`,
       )
-      const state = yield* FunctionBody.load(body, usizeType, statePointer, `${tag}_state`)
-      const initial = yield* LlvmBlock.make(body, `${tag}_initial`)
-      const notInitial = yield* LlvmBlock.make(body, `${tag}_not_initial`)
-      const done = yield* LlvmBlock.make(body, `${tag}_state_done`)
-      const unpublished = yield* FunctionBody.integerCompare(
+      const state = Emitter.load(body, usizeType, statePointer, `${tag}_state`)
+      const initial = Emitter.block(body, `${tag}_initial`)
+      const notInitial = Emitter.block(body, `${tag}_not_initial`)
+      const done = Emitter.block(body, `${tag}_state_done`)
+      const unpublished = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Initial')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Initial'))),
         `${tag}_is_initial`,
       )
-      const initialReady = yield* FunctionBody.integerCompare(
+      const initialReady = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
+        Emitter.integerUnsigned(
           builder,
           usizeType,
           BigInt(ExecutionTransition.tagOf('InitialReady')),
         ),
         `${tag}_is_initial_ready`,
       )
-      yield* FunctionBody.conditionalBranch(
+      Emitter.conditionalBranch(
         body,
-        yield* FunctionBody.binary(body, 'or', unpublished, initialReady, `${tag}_is_initial_any`),
+        Emitter.binary(body, 'or', unpublished, initialReady, `${tag}_is_initial_any`),
         initial,
         notInitial,
       )
-      yield* LlvmBlock.setInsertionPoint(body, initial)
-      yield* FunctionBody.store(
+      Emitter.setInsertionPoint(body, initial)
+      Emitter.store(
         body,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Destroyed')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Destroyed'))),
         statePointer,
       )
-      yield* dropStoredPackage(
+      dropStoredPackage(
         context,
         package_,
         base,
         { body: true, endpoints: true, allocation: true },
         `${tag}_initial`,
       )
-      yield* FunctionBody.branch(body, done)
+      Emitter.branch(body, done)
 
-      yield* LlvmBlock.setInsertionPoint(body, notInitial)
-      const pending = yield* LlvmBlock.make(body, `${tag}_pending`)
-      const inactive = yield* LlvmBlock.make(body, `${tag}_inactive`)
-      const running = yield* FunctionBody.integerCompare(
+      Emitter.setInsertionPoint(body, notInitial)
+      const pending = Emitter.block(body, `${tag}_pending`)
+      const inactive = Emitter.block(body, `${tag}_inactive`)
+      const running = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Running')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Running'))),
         `${tag}_is_running`,
       )
-      const notifying = yield* FunctionBody.integerCompare(
+      const notifying = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Notifying')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Notifying'))),
         `${tag}_is_notifying`,
       )
-      yield* FunctionBody.conditionalBranch(
+      Emitter.conditionalBranch(
         body,
-        yield* FunctionBody.binary(body, 'or', running, notifying, `${tag}_is_pending`),
+        Emitter.binary(body, 'or', running, notifying, `${tag}_is_pending`),
         pending,
         inactive,
       )
-      yield* LlvmBlock.setInsertionPoint(body, pending)
-      yield* FunctionBody.store(
+      Emitter.setInsertionPoint(body, pending)
+      Emitter.store(
         body,
-        yield* Constant.integerUnsigned(
+        Emitter.integerUnsigned(
           builder,
           usizeType,
           BigInt(ExecutionTransition.tagOf('DestroyPending')),
         ),
         statePointer,
       )
-      yield* FunctionBody.branch(body, done)
+      Emitter.branch(body, done)
 
-      yield* LlvmBlock.setInsertionPoint(body, inactive)
-      const dormant = yield* FunctionBody.integerCompare(
+      Emitter.setInsertionPoint(body, inactive)
+      const dormant = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Dormant')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Dormant'))),
         `${tag}_is_dormant`,
       )
-      const eligible = yield* FunctionBody.integerCompare(
+      const eligible = Emitter.integerCompare(
         body,
         'eq',
         state,
-        yield* Constant.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('Eligible')),
-        ),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Eligible'))),
         `${tag}_is_eligible`,
       )
-      const release = yield* LlvmBlock.make(body, `${tag}_release`)
-      const invalid = yield* LlvmBlock.make(body, `${tag}_invalid_state`)
-      yield* FunctionBody.conditionalBranch(
+      const release = Emitter.block(body, `${tag}_release`)
+      const invalid = Emitter.block(body, `${tag}_invalid_state`)
+      Emitter.conditionalBranch(
         body,
-        yield* FunctionBody.binary(body, 'or', dormant, eligible, `${tag}_is_inactive`),
+        Emitter.binary(body, 'or', dormant, eligible, `${tag}_is_inactive`),
         release,
         invalid,
       )
-      yield* LlvmBlock.setInsertionPoint(body, invalid)
-      yield* FunctionBody.unreachable(body)
-      yield* LlvmBlock.setInsertionPoint(body, release)
-      yield* dropActivatedPackage(context, package_, base, `${tag}_inactive`)
-      yield* FunctionBody.branch(body, done)
-      yield* LlvmBlock.setInsertionPoint(body, done)
-    }),
+      Emitter.setInsertionPoint(body, invalid)
+      Emitter.unreachable(body)
+      Emitter.setInsertionPoint(body, release)
+      dropActivatedPackage(context, package_, base, `${tag}_inactive`)
+      Emitter.branch(body, done)
+      Emitter.setInsertionPoint(body, done)
+    })(),
   )
-})
+}
 
 const releaseHelperSymbol = 'silk_execution_release'
 
@@ -1376,74 +1298,72 @@ const releaseHelperSymbol = 'silk_execution_release'
  * `DeclaredFunction` only feeds the cleanup contexts: its MIR has one Execution parameter and no
  * roots, and its identity is distinct from every real function so no instance lookup can alias it.
  */
-export const declareReleaseHelper = Effect.fn('NativeExecutionOperation.declareReleaseHelper')(
-  function* (
-    builder: Builder.Builder,
-    program: Mir.Module,
-    pointer: LlvmType.Type,
-    declaredVoidType: LlvmType.Type | undefined,
-  ): Effect.fn.Return<NativeLoweringContext.DeclaredFunction | undefined, LlvmError.LlvmError> {
-    const source = program.functions
-      .flatMap((fn) =>
-        MirVerification.operations(fn).flatMap((operation) =>
-          operation._tag === 'ExecutionFromAllocation' ? [{ fn, operation }] : [],
-        ),
-      )
-      .at(0)
-    if (source === undefined) return undefined
-    // Resolved only here: an unneeded void type would perturb every other module's type table.
-    const voidType = declaredVoidType ?? (yield* LlvmType.voidType(builder))
-    const diagnostics = Mir.hasDiagnosticObservation(program)
-    const parameters = diagnostics
-      ? [
-          pointer,
-          pointer,
-          yield* NativeDiagnosticFailure.type({
-            builder,
-            pointer,
-            word: yield* LlvmType.integer(builder, program.layout.target.pointerSize * 8),
-          }),
-        ]
-      : [pointer]
-    const executionType = SilkType.execution(source.operation.plan.specialization.result)
-    const id = { ...source.fn.id, name: releaseHelperSymbol }
-    const { suspension: _suspension, ...base } = source.fn
-    const fn: Mir.MirFunction = {
-      ...base,
-      id,
-      instance: { ...source.fn.instance, declaration: id },
-      parameterCount: 1,
-      localTypes: [{ _tag: 'Nominal' as const, type: executionType }],
-    }
-    return {
-      fn,
-      symbol: releaseHelperSymbol,
-      publicSymbol: releaseHelperSymbol,
-      handle: yield* FunctionActor.declare(
-        builder,
-        releaseHelperSymbol,
-        yield* LlvmType.functionType(builder, voidType, parameters),
-        { visibility: 'hidden' },
+export const declareReleaseHelper = (
+  builder: Emitter.Module,
+  program: Mir.Module,
+  pointer: LlvmType.Type,
+  declaredVoidType: LlvmType.Type | undefined,
+): NativeLoweringContext.DeclaredFunction | undefined => {
+  const source = program.functions
+    .flatMap((fn) =>
+      MirVerification.operations(fn).flatMap((operation) =>
+        operation._tag === 'ExecutionFromAllocation' ? [{ fn, operation }] : [],
       ),
-      resultType: voidType,
-      emittedResultType: voidType,
-      resultLaneCount: 0,
-      suspendable: false,
-      parameterTypes: parameters,
-      argumentParameters: NativeArgument.parameters(program.layout, fn, (type) => {
-        const shape = Layout.callingShape(program.layout, Mir.semanticType(type))
-        if (shape === undefined)
-          throw new RangeError('Release helper lost its source parameter shape')
-        return shape.lanes
-      }),
-      ...(diagnostics ? { diagnosticParameter: 1 } : {}),
-      linear: [],
-    }
-  },
-)
+    )
+    .at(0)
+  if (source === undefined) return undefined
+  // Resolved only here: an unneeded void type would perturb every other module's type table.
+  const voidType = declaredVoidType ?? Emitter.voidType(builder)
+  const diagnostics = Mir.hasDiagnosticObservation(program)
+  const parameters = diagnostics
+    ? [
+        pointer,
+        pointer,
+        NativeDiagnosticFailure.type({
+          builder,
+          pointer,
+          word: Emitter.integerType(builder, program.layout.target.pointerSize * 8),
+        }),
+      ]
+    : [pointer]
+  const executionType = SilkType.execution(source.operation.plan.specialization.result)
+  const id = { ...source.fn.id, name: releaseHelperSymbol }
+  const { suspension: _suspension, ...base } = source.fn
+  const fn: Mir.MirFunction = {
+    ...base,
+    id,
+    instance: { ...source.fn.instance, declaration: id },
+    parameterCount: 1,
+    localTypes: [{ _tag: 'Nominal' as const, type: executionType }],
+  }
+  return {
+    fn,
+    symbol: releaseHelperSymbol,
+    publicSymbol: releaseHelperSymbol,
+    handle: Emitter.declareFunction(
+      builder,
+      releaseHelperSymbol,
+      Emitter.functionType(builder, voidType, parameters),
+      { visibility: 'hidden' },
+    ),
+    resultType: voidType,
+    emittedResultType: voidType,
+    resultLaneCount: 0,
+    suspendable: false,
+    parameterTypes: parameters,
+    argumentParameters: NativeArgument.parameters(program.layout, fn, (type) => {
+      const shape = Layout.callingShape(program.layout, Mir.semanticType(type))
+      if (shape === undefined)
+        throw new RangeError('Release helper lost its source parameter shape')
+      return shape.lanes
+    }),
+    ...(diagnostics ? { diagnosticParameter: 1 } : {}),
+    linear: [],
+  }
+}
 
 export interface ReleaseHelperContext {
-  readonly builder: Builder.Builder
+  readonly builder: Emitter.Module
   readonly program: Mir.Module
   readonly i8: LlvmType.Type
   readonly i32: LlvmType.Type
@@ -1464,9 +1384,7 @@ export interface ReleaseHelperContext {
  * retains another Execution releases it through a runtime call instead of re-expanding the
  * module's whole resume-frame inventory during IR construction.
  */
-export const emitReleaseHelper = Effect.fn('NativeExecutionOperation.emitReleaseHelper')(function* (
-  context: ReleaseHelperContext,
-) {
+export const emitReleaseHelper = (context: ReleaseHelperContext) => {
   const {
     builder,
     program,
@@ -1482,99 +1400,94 @@ export const emitReleaseHelper = Effect.fn('NativeExecutionOperation.emitRelease
     lanePointers,
     helper,
   } = context
-  yield* FunctionActor.buildBody(
-    builder,
-    helper.handle,
-    Effect.fnUntraced(function* (body) {
-      yield* LlvmBlock.make(body, 'entry')
-      const base = yield* Value.argument(body, 0)
-      const diagnostic =
-        helper.diagnosticParameter === undefined
-          ? undefined
-          : yield* NativeDiagnosticContext.make(
-              builder,
-              body,
-              pointer,
-              i8,
-              usizeType ??
-                (yield* LlvmType.integer(builder, program.layout.target.pointerSize * 8)),
-              yield* Value.argument(body, helper.diagnosticParameter),
-              yield* Value.argument(body, helper.diagnosticParameter + 1),
-            )
-      const storage: NativeStorage.Context = {
-        builder,
+  Emitter.buildBody(builder, helper.handle, (body) => {
+    Emitter.block(body, 'entry')
+    const base = Emitter.argument(body, 0)
+    const diagnostic =
+      helper.diagnosticParameter === undefined
+        ? undefined
+        : NativeDiagnosticContext.make(
+            builder,
+            body,
+            pointer,
+            i8,
+            usizeType ?? Emitter.integerType(builder, program.layout.target.pointerSize * 8),
+            Emitter.argument(body, helper.diagnosticParameter),
+            Emitter.argument(body, helper.diagnosticParameter + 1),
+          )
+    const storage: NativeStorage.Context = {
+      builder,
+      body,
+      byteType: i8,
+      offsetType: i32,
+      fn: helper.fn,
+      layout: program.layout,
+      mutableRoots: new Set<number>(),
+      blockRoots: new Set<number>(),
+      mutableStorage: new Map<number, ReadonlyArray<Value.Input>>(),
+      addressRoots: new Set<number>(),
+      addressStorage: new Map<number, Value.Input>(),
+      transientOutcomes: new Set<number>(),
+      locals: new Map<number, NativeValue.NativeValue>(),
+      types,
+      lanePointers,
+      sequences: { materialize: 0, reload: 0 },
+    }
+    const call: NativeCall.Context = {
+      builder,
+      body,
+      program,
+      i8,
+      i32,
+      pointer,
+      entry: helper,
+      resumeThunks,
+      lanePointers,
+      types,
+      storage,
+      synchronous: {
         body,
-        byteType: i8,
-        offsetType: i32,
-        fn: helper.fn,
-        layout: program.layout,
-        mutableRoots: new Set<number>(),
-        blockRoots: new Set<number>(),
-        mutableStorage: new Map<number, ReadonlyArray<Value.Input>>(),
-        addressRoots: new Set<number>(),
-        addressStorage: new Map<number, Value.Input>(),
-        transientOutcomes: new Set<number>(),
-        locals: new Map<number, NativeValue.NativeValue>(),
-        types,
-        lanePointers,
-        sequences: { materialize: 0, reload: 0 },
-      }
-      const call: NativeCall.Context = {
-        builder,
-        body,
-        program,
-        i8,
-        i32,
-        pointer,
-        entry: helper,
-        resumeThunks,
-        lanePointers,
-        types,
         storage,
-        synchronous: {
-          body,
-          storage,
-          ...(diagnostic === undefined ? {} : { diagnostic }),
-        },
-        returns: { builder, body, i32, pointer, entry: helper, types, lanePointers },
-      }
-      const cleanup: NativeAggregate.Context = {
-        builder,
+        ...(diagnostic === undefined ? {} : { diagnostic }),
+      },
+      returns: { builder, body, i32, pointer, entry: helper, types, lanePointers },
+    }
+    const cleanup: NativeAggregate.Context = {
+      builder,
+      body,
+      program,
+      i8,
+      i32,
+      pointer,
+      ...(usizeType === undefined ? {} : { usizeType }),
+      ...(free === undefined ? {} : { free }),
+      ...(executionStorage === undefined ? {} : { executionStorage }),
+      resumeThunks,
+      declared,
+      types,
+      lanePointers,
+      call,
+      arith: {
         body,
-        program,
-        i8,
+        pointerBits: program.layout.target.pointerSize === 4 ? 32 : 64,
         i32,
-        pointer,
-        ...(usizeType === undefined ? {} : { usizeType }),
-        ...(free === undefined ? {} : { free }),
-        ...(executionStorage === undefined ? {} : { executionStorage }),
-        resumeThunks,
-        declared,
+        integerTypes: types.integerTypes,
         types,
-        lanePointers,
-        call,
-        arith: {
-          body,
-          pointerBits: program.layout.target.pointerSize === 4 ? 32 : 64,
-          i32,
-          integerTypes: types.integerTypes,
-          types,
-        },
-        storage,
-        executionRelease: helper.handle,
-      }
-      yield* dropExecution(cleanup, [base], 'execution_release')
-      yield* FunctionBody.returnVoid(body)
-    }),
-  )
-})
+      },
+      storage,
+      executionRelease: helper.handle,
+    }
+    dropExecution(cleanup, [base], 'execution_release')
+    Emitter.returnVoid(body)
+  })
+}
 
 /** Drops one affine Wake, cancelling or finally discharging its generation authority. */
-export const dropWake = Effect.fnUntraced(function* (
+export const dropWake = (
   context: NativeAggregate.Context,
   values: ReadonlyArray<Value.Input>,
   tag: string,
-) {
+) => {
   const base = values.at(0)
   const { body, builder, usizeType } = context
   if (base === undefined || usizeType === undefined)
@@ -1582,122 +1495,119 @@ export const dropWake = Effect.fnUntraced(function* (
   const packages = context.program.layout.executionPackages.plans.filter(
     (candidate) => candidate.readinessStorage,
   )
-  yield* selectPackageFrom(context, base, packages, tag, (package_) =>
-    Effect.gen(function* () {
+  selectPackageFrom(context, base, packages, tag, (package_) =>
+    (() => {
       const controlOffset = componentOffset(package_, 'WakeControl')
-      if (controlOffset === undefined) return yield* Effect.die('Wake package lacks control state')
-      const phasePointer = yield* NativeLanePointer.lanePointer(
+      if (controlOffset === undefined) throw new RangeError('Wake package lacks control state')
+      const phasePointer = NativeLanePointer.lanePointer(
         context.lanePointers,
         body,
         base,
         controlOffset,
         `${tag}_phase_ptr`,
       )
-      const phase = yield* FunctionBody.load(body, usizeType, phasePointer, `${tag}_phase`)
-      const late = yield* LlvmBlock.make(body, `${tag}_late`)
-      const cancel = yield* LlvmBlock.make(body, `${tag}_cancel`)
-      const done = yield* LlvmBlock.make(body, `${tag}_done`)
-      yield* FunctionBody.conditionalBranch(
+      const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_phase`)
+      const late = Emitter.block(body, `${tag}_late`)
+      const cancel = Emitter.block(body, `${tag}_cancel`)
+      const done = Emitter.block(body, `${tag}_done`)
+      Emitter.conditionalBranch(
         body,
-        yield* FunctionBody.integerCompare(
+        Emitter.integerCompare(
           body,
           'eq',
           phase,
-          yield* Constant.integerUnsigned(builder, usizeType, 6n),
+          Emitter.integerUnsigned(builder, usizeType, 6n),
           `${tag}_is_late`,
         ),
         late,
         cancel,
       )
-      yield* LlvmBlock.setInsertionPoint(body, late)
-      yield* dropStoredPackage(
+      Emitter.setInsertionPoint(body, late)
+      dropStoredPackage(
         context,
         package_,
         base,
         { body: false, endpoints: false, allocation: true },
         `${tag}_late`,
       )
-      yield* FunctionBody.branch(body, done)
-      yield* LlvmBlock.setInsertionPoint(body, cancel)
-      const held = yield* FunctionBody.integerCompare(
+      Emitter.branch(body, done)
+      Emitter.setInsertionPoint(body, cancel)
+      const held = Emitter.integerCompare(
         body,
         'eq',
         phase,
-        yield* Constant.integerUnsigned(builder, usizeType, cleanupWithWake),
+        Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
         `${tag}_cleanup_active`,
       )
-      yield* FunctionBody.store(
+      Emitter.store(
         body,
-        yield* FunctionBody.select(
+        Emitter.select(
           body,
           held,
-          yield* Constant.integerUnsigned(builder, usizeType, cleanupWithoutWake),
-          yield* Constant.integerUnsigned(builder, usizeType, 6n),
+          Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
+          Emitter.integerUnsigned(builder, usizeType, 6n),
           `${tag}_consumed_phase`,
         ),
         phasePointer,
       )
-      yield* FunctionBody.branch(body, done)
-      yield* LlvmBlock.setInsertionPoint(body, done)
-    }),
+      Emitter.branch(body, done)
+      Emitter.setInsertionPoint(body, done)
+    })(),
   )
-})
+}
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const { body, builder, i32, lanePointers, pointer, program, storage, usizeType } = context
   if (usizeType === undefined) throw new RangeError('LLVM execution lowering requires usize')
   switch (operation._tag) {
     case 'ExecutionFromAllocation': {
       context.runtimeFeatures.add('ExecutionPackage')
       if (operation.plan.readinessStorage) context.runtimeFeatures.add('ExternalWakeCell')
-      const allocation = yield* NativeStorage.materialize(storage, operation.allocation)
+      const allocation = NativeStorage.materialize(storage, operation.allocation)
       const baseAddress = allocation.at(0)
       const bytes = allocation.at(1)
       const alignment = allocation.at(2)
       if (baseAddress === undefined || bytes === undefined || alignment === undefined)
         throw new RangeError('LLVM execution initialization lost allocation authority')
-      const bytesMismatch = yield* FunctionBody.integerCompare(
+      const bytesMismatch = Emitter.integerCompare(
         body,
         'ne',
         bytes,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.plan.size)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.plan.size)),
         `execution${operation.destination.ordinal}_bytes_mismatch`,
       )
-      const alignmentMismatch = yield* FunctionBody.integerCompare(
+      const alignmentMismatch = Emitter.integerCompare(
         body,
         'ne',
         alignment,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.plan.alignment)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.plan.alignment)),
         `execution${operation.destination.ordinal}_alignment_mismatch`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         bytesMismatch,
         alignmentMismatch,
         `execution${operation.destination.ordinal}_invalid`,
       )
-      const rejected = yield* LlvmBlock.make(body, `execution${operation.destination.ordinal}_trap`)
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `execution${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, rejected, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, rejected)
-      yield* FunctionBody.unreachable(body)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
-      const base = yield* FunctionBody.cast(
+      const rejected = Emitter.block(body, `execution${operation.destination.ordinal}_trap`)
+      const accepted = Emitter.block(body, `execution${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, rejected, accepted)
+      Emitter.setInsertionPoint(body, rejected)
+      Emitter.unreachable(body)
+      Emitter.setInsertionPoint(body, accepted)
+      const base = Emitter.cast(
         body,
         'inttoptr',
         baseAddress,
         pointer,
         `execution${operation.destination.ordinal}_base`,
       )
-      const storeWord = Effect.fnUntraced(function* (offset: number, value: Value.Input) {
-        yield* FunctionBody.store(
+      const storeWord = (offset: number, value: Value.Input) => {
+        Emitter.store(
           body,
           value,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -1705,17 +1615,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `execution${operation.destination.ordinal}_${offset}_ptr`,
           ),
         )
-      })
+      }
       const packageOrdinal = program.layout.executionPackages.plans.findIndex((candidate) =>
         ExecutionPackage.equals(candidate, operation.plan),
       )
       if (packageOrdinal < 0)
         throw new RangeError('LLVM execution initialization lost its package ordinal')
-      const zero = yield* Constant.integerUnsigned(builder, usizeType, 0n)
-      yield* storeWord(0, zero)
-      yield* storeWord(
+      const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
+      storeWord(0, zero)
+      storeWord(
         program.layout.target.pointerSize,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
       )
       for (const role of ['WakeControl', 'InitialContinuationSegment'] as const) {
         const offset = componentOffset(operation.plan, role)
@@ -1725,7 +1635,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           word < (role === 'InitialContinuationSegment' ? ContinuationTransfer.headerWords : 4);
           word += 1
         )
-          yield* storeWord(offset + word * program.layout.target.pointerSize, zero)
+          storeWord(offset + word * program.layout.target.pointerSize, zero)
       }
       const allocationOffset = componentOffset(operation.plan, 'AllocationAuthority')
       const bodyOffset = componentOffset(operation.plan, 'BodyEnvironment')
@@ -1737,9 +1647,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const offset = LayoutVerify.laneOffset(program.layout, SilkType.allocation, lane.path)
         if (value === undefined || offset === undefined)
           throw new RangeError('LLVM execution initialization lost allocation lane')
-        yield* storeWord(allocationOffset + offset, value)
+        storeWord(allocationOffset + offset, value)
       }
-      yield* storePackageValue(
+      storePackageValue(
         context,
         base,
         operation.body,
@@ -1749,7 +1659,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
       const endpointOffset = componentOffset(operation.plan, 'EndpointState')
       if (endpointOffset !== undefined)
-        yield* storePackageValue(
+        storePackageValue(
           context,
           base,
           operation.endpoint,
@@ -1759,7 +1669,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
       const callbackOffset = componentOffset(operation.plan, 'EndpointCallback')
       if (callbackOffset !== undefined)
-        yield* storePackageValue(
+        storePackageValue(
           context,
           base,
           operation.callback,
@@ -1767,7 +1677,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           callbackOffset,
           `execution${operation.destination.ordinal}_callback`,
         )
-      yield* NativeStorage.writeLocal(storage, operation.destination.ordinal, [base])
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [base])
       return
     }
     case 'ExecutionPark': {
@@ -1784,10 +1694,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         packages.length === 0
       )
         throw new RangeError('LLVM park lost external transfer authority')
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           transfer,
@@ -1796,22 +1706,22 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `park${operation.destination.ordinal}_active`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         baseAddress,
         pointer,
         `park${operation.destination.ordinal}_base`,
       )
-      const controlStorage = yield* FunctionBody.alloca(
+      const controlStorage = Emitter.alloca(
         body,
         pointer,
         `park${operation.destination.ordinal}_control_slot`,
       )
-      const storedPackage = yield* FunctionBody.load(
+      const storedPackage = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
@@ -1820,7 +1730,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `park${operation.destination.ordinal}_package`,
       )
-      const packageSelected = yield* LlvmBlock.make(
+      const packageSelected = Emitter.block(
         body,
         `park${operation.destination.ordinal}_package_selected`,
       )
@@ -1832,32 +1742,31 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const control = componentOffset(package_, 'WakeControl')
         if (ordinal < 0 || control === undefined)
           throw new RangeError('LLVM park lost a wake-control package ordinal')
-        if (packageOtherwise !== undefined)
-          yield* LlvmBlock.setInsertionPoint(body, packageOtherwise)
-        const selected = yield* LlvmBlock.make(
+        if (packageOtherwise !== undefined) Emitter.setInsertionPoint(body, packageOtherwise)
+        const selected = Emitter.block(
           body,
           `park${operation.destination.ordinal}_package_${ordinal}`,
         )
-        const otherwise = yield* LlvmBlock.make(
+        const otherwise = Emitter.block(
           body,
           `park${operation.destination.ordinal}_package_${ordinal}_otherwise`,
         )
-        yield* FunctionBody.conditionalBranch(
+        Emitter.conditionalBranch(
           body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             storedPackage,
-            yield* Constant.integerUnsigned(builder, usizeType, BigInt(ordinal)),
+            Emitter.integerUnsigned(builder, usizeType, BigInt(ordinal)),
             `park${operation.destination.ordinal}_package_${ordinal}_matches`,
           ),
           selected,
           otherwise,
         )
-        yield* LlvmBlock.setInsertionPoint(body, selected)
-        yield* FunctionBody.store(
+        Emitter.setInsertionPoint(body, selected)
+        Emitter.store(
           body,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -1866,92 +1775,78 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           controlStorage,
         )
-        yield* FunctionBody.branch(body, packageSelected)
+        Emitter.branch(body, packageSelected)
         packageOtherwise = otherwise
       }
       if (packageOtherwise === undefined)
         throw new RangeError('LLVM park lost every wake-control package')
-      yield* LlvmBlock.setInsertionPoint(body, packageOtherwise)
-      yield* FunctionBody.unreachable(body)
-      yield* LlvmBlock.setInsertionPoint(body, packageSelected)
-      const phasePointer = yield* FunctionBody.load(
+      Emitter.setInsertionPoint(body, packageOtherwise)
+      Emitter.unreachable(body)
+      Emitter.setInsertionPoint(body, packageSelected)
+      const phasePointer = Emitter.load(
         body,
         pointer,
         controlStorage,
         `park${operation.destination.ordinal}_phase_ptr`,
       )
-      const generationPointer = yield* NativeLanePointer.lanePointer(
+      const generationPointer = NativeLanePointer.lanePointer(
         lanePointers,
         body,
         phasePointer,
         program.layout.target.pointerSize,
         `park${operation.destination.ordinal}_generation_ptr`,
       )
-      const generation = yield* FunctionBody.load(
+      const generation = Emitter.load(
         body,
         usizeType,
         generationPointer,
         `park${operation.destination.ordinal}_generation`,
       )
-      yield* FunctionBody.store(
+      Emitter.store(
         body,
-        yield* FunctionBody.binary(
+        Emitter.binary(
           body,
           'add',
           generation,
-          yield* Constant.integerUnsigned(builder, usizeType, 1n),
+          Emitter.integerUnsigned(builder, usizeType, 1n),
           `park${operation.destination.ordinal}_next_generation`,
         ),
         generationPointer,
       )
-      yield* FunctionBody.store(
-        body,
-        yield* Constant.integerUnsigned(builder, usizeType, 1n),
-        phasePointer,
-      )
-      const guard = yield* applyCallable(
+      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 1n), phasePointer)
+      const guard = applyCallable(
         context,
         operation.register,
         operation.registrationTypeArguments,
         [[base]],
         `park${operation.destination.ordinal}_register`,
       )
-      yield* NativeStorage.writeLocal(storage, operation.guard.ordinal, guard)
-      const phase = yield* FunctionBody.load(
+      NativeStorage.writeLocal(storage, operation.guard.ordinal, guard)
+      const phase = Emitter.load(
         body,
         usizeType,
         phasePointer,
         `park${operation.destination.ordinal}_phase`,
       )
-      const latched = yield* FunctionBody.integerCompare(
+      const latched = Emitter.integerCompare(
         body,
         'eq',
         phase,
-        yield* Constant.integerUnsigned(builder, usizeType, 2n),
+        Emitter.integerUnsigned(builder, usizeType, 2n),
         `park${operation.destination.ordinal}_latched`,
       )
-      const keepLatched = yield* LlvmBlock.make(
-        body,
-        `park${operation.destination.ordinal}_keep_latched`,
-      )
-      const dormant = yield* LlvmBlock.make(body, `park${operation.destination.ordinal}_dormant`)
-      const relinquish = yield* LlvmBlock.make(
-        body,
-        `park${operation.destination.ordinal}_relinquish`,
-      )
-      yield* FunctionBody.conditionalBranch(body, latched, keepLatched, dormant)
-      yield* LlvmBlock.setInsertionPoint(body, keepLatched)
-      yield* FunctionBody.branch(body, relinquish)
-      yield* LlvmBlock.setInsertionPoint(body, dormant)
-      yield* FunctionBody.store(
-        body,
-        yield* Constant.integerUnsigned(builder, usizeType, 3n),
-        phasePointer,
-      )
-      yield* FunctionBody.branch(body, relinquish)
-      yield* LlvmBlock.setInsertionPoint(body, relinquish)
-      yield* NativeCall.retainRelay(context.call, region, `park${operation.destination.ordinal}`)
-      yield* NativeSuspension.returnStep(
+      const keepLatched = Emitter.block(body, `park${operation.destination.ordinal}_keep_latched`)
+      const dormant = Emitter.block(body, `park${operation.destination.ordinal}_dormant`)
+      const relinquish = Emitter.block(body, `park${operation.destination.ordinal}_relinquish`)
+      Emitter.conditionalBranch(body, latched, keepLatched, dormant)
+      Emitter.setInsertionPoint(body, keepLatched)
+      Emitter.branch(body, relinquish)
+      Emitter.setInsertionPoint(body, dormant)
+      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), phasePointer)
+      Emitter.branch(body, relinquish)
+      Emitter.setInsertionPoint(body, relinquish)
+      NativeCall.retainRelay(context.call, region, `park${operation.destination.ordinal}`)
+      NativeSuspension.returnStep(
         context.call.returns,
         2n,
         [],
@@ -1960,19 +1855,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const resumeBlock = context.suspension.resumeBlocks.get(suspensionPointKey(region.point))
       if (resumeBlock === undefined)
         throw new RangeError('LLVM park lost its verified resume label')
-      yield* LlvmBlock.setInsertionPoint(body, resumeBlock)
-      yield* NativeSuspension.restoreRelayPayload(
+      Emitter.setInsertionPoint(body, resumeBlock)
+      NativeSuspension.restoreRelayPayload(
         context.suspension,
         region,
         `park${operation.destination.ordinal}`,
       )
-      yield* NativeAggregate.dropThroughPlan(
+      NativeAggregate.dropThroughPlan(
         context.cleanup,
         operation.guardCleanup,
         NativePayload.local(storage, operation.guard),
         `park${operation.destination.ordinal}_guard`,
       )
-      yield* NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }
     case 'ExecutionDrive': {
@@ -1989,20 +1884,20 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
       if (matchingPackages.length === 0)
         throw new RangeError('LLVM execution drive lost every result package specialization')
-      const base = (yield* NativeStorage.materialize(storage, operation.execution)).at(0)
+      const base = NativeStorage.materialize(storage, operation.execution).at(0)
       if (base === undefined)
         throw new RangeError('LLVM execution drive lost its package reference')
-      const emitDirectPackage = Effect.fnUntraced(function* (package_: ExecutionPackage.Plan) {
+      const emitDirectPackage = (package_: ExecutionPackage.Plan) => {
         if (package_.specialization.suspension.modes.length !== 0)
           throw new RangeError('LLVM direct execution selected a suspendable package')
-        const statePointer = yield* NativeLanePointer.lanePointer(
+        const statePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
           0,
           `drive${operation.destination.ordinal}_direct_state_ptr`,
         )
-        const packagePointer = yield* NativeLanePointer.lanePointer(
+        const packagePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
@@ -2014,86 +1909,78 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         if (packageOrdinal < 0)
           throw new RangeError('LLVM direct execution lost its package ordinal')
-        const state = yield* FunctionBody.load(
+        const state = Emitter.load(
           body,
           usizeType,
           statePointer,
           `drive${operation.destination.ordinal}_direct_state`,
         )
-        const storedPackage = yield* FunctionBody.load(
+        const storedPackage = Emitter.load(
           body,
           usizeType,
           packagePointer,
           `drive${operation.destination.ordinal}_direct_package`,
         )
-        const unpublished = yield* FunctionBody.integerCompare(
+        const unpublished = Emitter.integerCompare(
           body,
           'eq',
           state,
-          yield* Constant.integerUnsigned(
-            builder,
-            usizeType,
-            BigInt(ExecutionTransition.tagOf('Initial')),
-          ),
+          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Initial'))),
           `drive${operation.destination.ordinal}_direct_initial`,
         )
-        const initialReady = yield* FunctionBody.integerCompare(
+        const initialReady = Emitter.integerCompare(
           body,
           'eq',
           state,
-          yield* Constant.integerUnsigned(
+          Emitter.integerUnsigned(
             builder,
             usizeType,
             BigInt(ExecutionTransition.tagOf('InitialReady')),
           ),
           `drive${operation.destination.ordinal}_direct_initial_ready`,
         )
-        const validState = yield* FunctionBody.binary(
+        const validState = Emitter.binary(
           body,
           'or',
           unpublished,
           initialReady,
           `drive${operation.destination.ordinal}_direct_ready`,
         )
-        const validPackage = yield* FunctionBody.integerCompare(
+        const validPackage = Emitter.integerCompare(
           body,
           'eq',
           storedPackage,
-          yield* Constant.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
+          Emitter.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
           `drive${operation.destination.ordinal}_direct_valid_package`,
         )
-        const valid = yield* FunctionBody.binary(
+        const valid = Emitter.binary(
           body,
           'and',
           validState,
           validPackage,
           `drive${operation.destination.ordinal}_direct_valid`,
         )
-        const accepted = yield* LlvmBlock.make(
+        const accepted = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_direct_accepted`,
         )
-        yield* FunctionBody.conditionalBranch(
+        Emitter.conditionalBranch(
           body,
           valid,
           accepted,
-          yield* NativeTermination.trapBlock(
+          NativeTermination.trapBlock(
             context.termination,
             'invalid execution drive',
             operation.provenance.span,
           ),
         )
-        yield* LlvmBlock.setInsertionPoint(body, accepted)
-        yield* FunctionBody.store(
+        Emitter.setInsertionPoint(body, accepted)
+        Emitter.store(
           body,
-          yield* Constant.integerUnsigned(
-            builder,
-            usizeType,
-            BigInt(ExecutionTransition.tagOf('Running')),
-          ),
+          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Running'))),
           statePointer,
         )
-        const executable = yield* bodyOperands(
+        const executable = bodyOperands(
           context,
           package_,
           base,
@@ -2101,17 +1988,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         if (executable.target.suspendable)
           throw new RangeError('LLVM direct execution selected a suspendable body')
-        const resultAddress = yield* NativeResult.allocate(
+        const resultAddress = NativeResult.allocate(
           body,
           executable.target,
           `drive${operation.destination.ordinal}_direct_result`,
         )
-        const started = yield* FunctionBody.callDirect(
+        const started = Emitter.callDirect(
           body,
           executable.target.handle,
           NativeResult.argumentsFor(
             executable.target,
-            yield* NativeCall.lowerArguments(
+            NativeCall.lowerArguments(
               context.call.synchronous,
               executable.target,
               NativeArgument.fromValues(executable.values),
@@ -2121,81 +2008,78 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           `drive${operation.destination.ordinal}_direct_started`,
         )
-        const completedResult = yield* NativeResult.read(
+        const completedResult = NativeResult.read(
           body,
           executable.target,
           started,
           resultAddress,
           `drive${operation.destination.ordinal}_direct_result`,
         )
-        const outcome = yield* NativeDiagnosticOutcome.consume(
+        const outcome = NativeDiagnosticOutcome.consume(
           context.call.synchronous.diagnostic,
           completedResult,
         )
         const outcomeTag = outcome.at(0)
         if (outcomeTag === undefined)
           throw new RangeError('LLVM direct execution body lost its outcome tag')
-        const succeeded = yield* LlvmBlock.make(
+        const succeeded = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_direct_succeeded`,
         )
-        const failed = yield* LlvmBlock.make(
+        const failed = Emitter.block(body, `drive${operation.destination.ordinal}_direct_failed`)
+        Emitter.conditionalBranch(
           body,
-          `drive${operation.destination.ordinal}_direct_failed`,
-        )
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             outcomeTag,
-            yield* Constant.integerSigned(builder, i32, 0n),
+            Emitter.integerSigned(builder, i32, 0n),
             `drive${operation.destination.ordinal}_direct_success`,
           ),
           succeeded,
           failed,
         )
-        yield* LlvmBlock.setInsertionPoint(body, failed)
-        yield* FunctionBody.unreachable(body)
-        yield* LlvmBlock.setInsertionPoint(body, succeeded)
+        Emitter.setInsertionPoint(body, failed)
+        Emitter.unreachable(body)
+        Emitter.setInsertionPoint(body, succeeded)
         const resultValues = outcome.slice(1)
-        yield* NativeStorage.writeLocal(storage, operation.result.ordinal, resultValues)
-        yield* NativeAggregate.dropThroughPlan(
+        NativeStorage.writeLocal(storage, operation.result.ordinal, resultValues)
+        NativeAggregate.dropThroughPlan(
           context.cleanup,
           operation.suspensionCleanup,
           NativePayload.local(storage, operation.onSuspend),
           `drive${operation.destination.ordinal}_direct_unused_suspend`,
         )
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
-          yield* Constant.integerUnsigned(
+          Emitter.integerUnsigned(
             builder,
             usizeType,
             BigInt(ExecutionTransition.tagOf('Completed')),
           ),
           statePointer,
         )
-        yield* releasePackage(
+        releasePackage(
           context,
           package_,
           base,
           `drive${operation.destination.ordinal}_direct_complete`,
         )
-        yield* NativeStorage.writeLocal(
+        NativeStorage.writeLocal(
           storage,
           operation.destination.ordinal,
-          yield* applyCallable(
+          applyCallable(
             context,
             operation.onComplete,
             operation.completionTypeArguments,
-            [yield* NativeStorage.materialize(storage, operation.branch), resultValues],
+            [NativeStorage.materialize(storage, operation.branch), resultValues],
             `drive${operation.destination.ordinal}_direct_on_complete`,
           ),
         )
-      })
-      const emitPackage = Effect.fnUntraced(function* (package_: ExecutionPackage.Plan) {
+      }
+      const emitPackage = (package_: ExecutionPackage.Plan) => {
         if (!package_.initialContinuationSegment) {
-          yield* emitDirectPackage(package_)
+          emitDirectPackage(package_)
           return
         }
         const continuationOffset = componentOffset(package_, 'InitialContinuationSegment')
@@ -2208,34 +2092,34 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           resumeThunkType === undefined
         )
           throw new RangeError('LLVM execution drive lost independent suspension storage')
-        const baseAddress = yield* FunctionBody.cast(
+        const baseAddress = Emitter.cast(
           body,
           'ptrtoint',
           base,
           usizeType,
           `drive${operation.destination.ordinal}_base_address`,
         )
-        const transfer = yield* FunctionBody.alloca(
+        const transfer = Emitter.alloca(
           body,
           context.suspension.i8,
           `drive${operation.destination.ordinal}_transfer`,
           {
-            count: yield* Constant.integerUnsigned(
+            count: Emitter.integerUnsigned(
               builder,
               i32,
               BigInt(Math.max(context.transferStorageSize, 1)),
             ),
-            alignment: yield* Alignment.fromByteUnits(program.layout.target.pointerAlignment),
+            alignment: Emitter.alignment(body, program.layout.target.pointerAlignment),
           },
         )
-        const statePointer = yield* NativeLanePointer.lanePointer(
+        const statePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
           0,
           `drive${operation.destination.ordinal}_state_ptr`,
         )
-        const packagePointer = yield* NativeLanePointer.lanePointer(
+        const packagePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
@@ -2246,90 +2130,87 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ExecutionPackage.equals(candidate, package_),
         )
         if (packageOrdinal < 0) throw new RangeError('LLVM execution drive lost package ordinal')
-        const storedPackage = yield* FunctionBody.load(
+        const storedPackage = Emitter.load(
           body,
           usizeType,
           packagePointer,
           `drive${operation.destination.ordinal}_package`,
         )
-        const state = yield* FunctionBody.load(
+        const state = Emitter.load(
           body,
           usizeType,
           statePointer,
           `drive${operation.destination.ordinal}_state`,
         )
-        const unpublished = yield* FunctionBody.integerCompare(
+        const unpublished = Emitter.integerCompare(
           body,
           'eq',
           state,
-          yield* Constant.integerUnsigned(builder, usizeType, 0n),
+          Emitter.integerUnsigned(builder, usizeType, 0n),
           `drive${operation.destination.ordinal}_initial`,
         )
-        const initialReady = yield* FunctionBody.integerCompare(
+        const initialReady = Emitter.integerCompare(
           body,
           'eq',
           state,
-          yield* Constant.integerUnsigned(
+          Emitter.integerUnsigned(
             builder,
             usizeType,
             BigInt(ExecutionTransition.tagOf('InitialReady')),
           ),
           `drive${operation.destination.ordinal}_initial_ready`,
         )
-        const initial = yield* FunctionBody.binary(
+        const initial = Emitter.binary(
           body,
           'or',
           unpublished,
           initialReady,
           `drive${operation.destination.ordinal}_initial_any`,
         )
-        const eligible = yield* FunctionBody.integerCompare(
+        const eligible = Emitter.integerCompare(
           body,
           'eq',
           state,
-          yield* Constant.integerUnsigned(builder, usizeType, 4n),
+          Emitter.integerUnsigned(builder, usizeType, 4n),
           `drive${operation.destination.ordinal}_eligible`,
         )
-        const validState = yield* FunctionBody.binary(
+        const validState = Emitter.binary(
           body,
           'or',
           initial,
           eligible,
           `drive${operation.destination.ordinal}_valid_state`,
         )
-        const validPackage = yield* FunctionBody.integerCompare(
+        const validPackage = Emitter.integerCompare(
           body,
           'eq',
           storedPackage,
-          yield* Constant.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
+          Emitter.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
           `drive${operation.destination.ordinal}_valid_package`,
         )
-        const valid = yield* FunctionBody.binary(
+        const valid = Emitter.binary(
           body,
           'and',
           validState,
           validPackage,
           `drive${operation.destination.ordinal}_valid`,
         )
-        const accepted = yield* LlvmBlock.make(
-          body,
-          `drive${operation.destination.ordinal}_accepted`,
-        )
-        yield* FunctionBody.conditionalBranch(
+        const accepted = Emitter.block(body, `drive${operation.destination.ordinal}_accepted`)
+        Emitter.conditionalBranch(
           body,
           valid,
           accepted,
-          yield* NativeTermination.trapBlock(
+          NativeTermination.trapBlock(
             context.termination,
             'invalid execution drive',
             operation.provenance.span,
           ),
         )
-        yield* LlvmBlock.setInsertionPoint(body, accepted)
+        Emitter.setInsertionPoint(body, accepted)
         const storageComponent = context.cleanup.executionStorage
         if (storageComponent === undefined)
           throw new RangeError('Execution drive lost storage component')
-        const storedStateSlot = yield* NativeLanePointer.lanePointer(
+        const storedStateSlot = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
@@ -2337,16 +2218,16 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             NativeExecutionStorage.stateOffset(program.layout.target.pointerSize),
           `drive${operation.destination.ordinal}_stored_storage_slot`,
         )
-        const transferStateSlot = yield* NativeLanePointer.lanePointer(
+        const transferStateSlot = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           transfer,
           NativeExecutionStorage.stateOffset(program.layout.target.pointerSize),
           `drive${operation.destination.ordinal}_transfer_storage_slot`,
         )
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
-          yield* FunctionBody.load(
+          Emitter.load(
             body,
             pointer,
             storedStateSlot,
@@ -2354,10 +2235,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           transferStateSlot,
         )
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
           baseAddress,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             transfer,
@@ -2365,63 +2246,53 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `drive${operation.destination.ordinal}_active`,
           ),
         )
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 1n),
-          statePointer,
-        )
-        const statusStorage = yield* FunctionBody.alloca(
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 1n), statePointer)
+        const statusStorage = Emitter.alloca(
           body,
           i32,
           `drive${operation.destination.ordinal}_status_slot`,
         )
-        const initialBlock = yield* LlvmBlock.make(
-          body,
-          `drive${operation.destination.ordinal}_start`,
-        )
-        const resumeBlock = yield* LlvmBlock.make(
-          body,
-          `drive${operation.destination.ordinal}_resume`,
-        )
-        const loop = yield* LlvmBlock.make(body, `drive${operation.destination.ordinal}_loop`)
-        const operationFollowing = yield* LlvmBlock.make(
+        const initialBlock = Emitter.block(body, `drive${operation.destination.ordinal}_start`)
+        const resumeBlock = Emitter.block(body, `drive${operation.destination.ordinal}_resume`)
+        const loop = Emitter.block(body, `drive${operation.destination.ordinal}_loop`)
+        const operationFollowing = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_following`,
         )
-        const headPointer = yield* NativeLanePointer.lanePointer(
+        const headPointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           transfer,
           program.layout.target.pointerSize,
           `drive${operation.destination.ordinal}_head_ptr`,
         )
-        const appendPointerPointer = yield* NativeLanePointer.lanePointer(
+        const appendPointerPointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           transfer,
           program.layout.target.pointerSize * 2,
           `drive${operation.destination.ordinal}_append_ptr_ptr`,
         )
-        yield* FunctionBody.conditionalBranch(body, initial, initialBlock, resumeBlock)
+        Emitter.conditionalBranch(body, initial, initialBlock, resumeBlock)
 
-        yield* LlvmBlock.setInsertionPoint(body, initialBlock)
-        const nullPointer = yield* Constant.nullValue(builder, pointer)
-        yield* FunctionBody.store(body, nullPointer, headPointer)
-        yield* FunctionBody.store(body, headPointer, appendPointerPointer)
-        const executable = yield* bodyOperands(
+        Emitter.setInsertionPoint(body, initialBlock)
+        const nullPointer = Emitter.nullValue(builder, pointer)
+        Emitter.store(body, nullPointer, headPointer)
+        Emitter.store(body, headPointer, appendPointerPointer)
+        const executable = bodyOperands(
           context,
           package_,
           base,
           `drive${operation.destination.ordinal}_body`,
         )
-        const resultAddress = yield* NativeResult.allocate(
+        const resultAddress = NativeResult.allocate(
           body,
           executable.target,
           `drive${operation.destination.ordinal}_result`,
         )
         const callArguments = NativeResult.argumentsFor(
           executable.target,
-          yield* NativeCall.lowerArguments(
+          NativeCall.lowerArguments(
             context.call.synchronous,
             executable.target,
             NativeArgument.fromValues(executable.values),
@@ -2429,21 +2300,16 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           resultAddress,
         )
-        const started = yield* FunctionBody.callDirect(
+        const started = Emitter.callDirect(
           body,
           executable.target.handle,
           executable.target.suspendable
-            ? [
-                ...callArguments,
-                transfer,
-                nullPointer,
-                yield* Constant.integerUnsigned(builder, i32, 0n),
-              ]
+            ? [...callArguments, transfer, nullPointer, Emitter.integerUnsigned(builder, i32, 0n)]
             : callArguments,
           `drive${operation.destination.ordinal}_started`,
         )
         const outcomeLanes = NativeType.lanesFor(context.types, executable.target.fn.result)
-        const initialResult = yield* NativeResult.read(
+        const initialResult = NativeResult.read(
           body,
           executable.target,
           started,
@@ -2453,7 +2319,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         const startedValues = initialResult.values
         if (initialResult.diagnostic !== undefined)
-          yield* NativeDiagnosticTransfer.publish(
+          NativeDiagnosticTransfer.publish(
             { builder, body, wordSize: program.layout.target.pointerSize, transfer },
             initialResult.diagnostic,
           )
@@ -2465,10 +2331,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         for (const [ordinal, lane] of packedOutcome.entries.entries()) {
           const value = startedValues.at(ordinal)
           if (value === undefined) throw new RangeError('LLVM execution body lost an outcome lane')
-          yield* FunctionBody.store(
+          Emitter.store(
             body,
             value,
-            yield* NativeLanePointer.lanePointer(
+            NativeLanePointer.lanePointer(
               lanePointers,
               body,
               transfer,
@@ -2479,21 +2345,21 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         }
         const startedStatus =
           executable.target.suspendable && started !== undefined
-            ? yield* NativeResult.status(
+            ? NativeResult.status(
                 body,
                 executable.target,
                 started,
                 `drive${operation.destination.ordinal}_initial_status`,
               )
-            : yield* Constant.integerUnsigned(builder, i32, 0n)
-        yield* FunctionBody.store(body, startedStatus, statusStorage)
-        yield* FunctionBody.branch(body, loop)
+            : Emitter.integerUnsigned(builder, i32, 0n)
+        Emitter.store(body, startedStatus, statusStorage)
+        Emitter.branch(body, loop)
 
-        yield* LlvmBlock.setInsertionPoint(body, resumeBlock)
-        const savedHead = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, resumeBlock)
+        const savedHead = Emitter.load(
           body,
           pointer,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -2502,18 +2368,18 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           `drive${operation.destination.ordinal}_saved_head`,
         )
-        const savedNext = yield* FunctionBody.load(
+        const savedNext = Emitter.load(
           body,
           pointer,
           savedHead,
           `drive${operation.destination.ordinal}_saved_next`,
         )
-        yield* FunctionBody.store(body, savedNext, headPointer)
-        yield* FunctionBody.store(body, headPointer, appendPointerPointer)
-        const resumeFunction = yield* FunctionBody.load(
+        Emitter.store(body, savedNext, headPointer)
+        Emitter.store(body, headPointer, appendPointerPointer)
+        const resumeFunction = Emitter.load(
           body,
           pointer,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             savedHead,
@@ -2522,7 +2388,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           `drive${operation.destination.ordinal}_resume_fn`,
         )
-        const resumed = yield* FunctionBody.call(
+        const resumed = Emitter.call(
           body,
           resumeThunkType,
           resumeFunction,
@@ -2530,60 +2396,57 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `drive${operation.destination.ordinal}_resumed`,
         )
         if (resumed === undefined) throw new RangeError('LLVM execution resume returned no status')
-        yield* FunctionBody.store(body, resumed, statusStorage)
-        yield* FunctionBody.branch(body, loop)
+        Emitter.store(body, resumed, statusStorage)
+        Emitter.branch(body, loop)
 
-        yield* LlvmBlock.setInsertionPoint(body, loop)
-        const status = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, loop)
+        const status = Emitter.load(
           body,
           i32,
           statusStorage,
           `drive${operation.destination.ordinal}_status`,
         )
-        const external = yield* LlvmBlock.make(
-          body,
-          `drive${operation.destination.ordinal}_external`,
-        )
-        const notExternal = yield* LlvmBlock.make(
+        const external = Emitter.block(body, `drive${operation.destination.ordinal}_external`)
+        const notExternal = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_not_external`,
         )
-        yield* FunctionBody.conditionalBranch(
+        Emitter.conditionalBranch(
           body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             status,
-            yield* Constant.integerUnsigned(builder, i32, 2n),
+            Emitter.integerUnsigned(builder, i32, 2n),
             `drive${operation.destination.ordinal}_is_external`,
           ),
           external,
           notExternal,
         )
 
-        yield* LlvmBlock.setInsertionPoint(body, notExternal)
-        const child = yield* LlvmBlock.make(body, `drive${operation.destination.ordinal}_child`)
-        const completed = yield* LlvmBlock.make(
+        Emitter.setInsertionPoint(body, notExternal)
+        const child = Emitter.block(body, `drive${operation.destination.ordinal}_child`)
+        const completed = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_completed_step`,
         )
-        yield* FunctionBody.conditionalBranch(
+        Emitter.conditionalBranch(
           body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             status,
-            yield* Constant.integerUnsigned(builder, i32, 1n),
+            Emitter.integerUnsigned(builder, i32, 1n),
             `drive${operation.destination.ordinal}_is_child`,
           ),
           child,
           completed,
         )
-        yield* LlvmBlock.setInsertionPoint(body, child)
-        const childFunction = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, child)
+        const childFunction = Emitter.load(
           body,
           pointer,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             transfer,
@@ -2592,7 +2455,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           `drive${operation.destination.ordinal}_child_fn`,
         )
-        const childStatus = yield* FunctionBody.call(
+        const childStatus = Emitter.call(
           body,
           childThunkType,
           childFunction,
@@ -2601,52 +2464,52 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         if (childStatus === undefined)
           throw new RangeError('LLVM execution child returned no status')
-        yield* FunctionBody.store(body, childStatus, statusStorage)
-        yield* FunctionBody.branch(body, loop)
+        Emitter.store(body, childStatus, statusStorage)
+        Emitter.branch(body, loop)
 
-        yield* LlvmBlock.setInsertionPoint(body, completed)
-        const head = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, completed)
+        const head = Emitter.load(
           body,
           pointer,
           headPointer,
           `drive${operation.destination.ordinal}_head`,
         )
-        const finish = yield* LlvmBlock.make(body, `drive${operation.destination.ordinal}_finish`)
-        const resumeParent = yield* LlvmBlock.make(
+        const finish = Emitter.block(body, `drive${operation.destination.ordinal}_finish`)
+        const resumeParent = Emitter.block(
           body,
           `drive${operation.destination.ordinal}_resume_parent`,
         )
-        yield* FunctionBody.conditionalBranch(
+        Emitter.conditionalBranch(
           body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
-            yield* FunctionBody.cast(
+            Emitter.cast(
               body,
               'ptrtoint',
               head,
               usizeType,
               `drive${operation.destination.ordinal}_head_address`,
             ),
-            yield* Constant.integerUnsigned(builder, usizeType, 0n),
+            Emitter.integerUnsigned(builder, usizeType, 0n),
             `drive${operation.destination.ordinal}_at_root`,
           ),
           finish,
           resumeParent,
         )
-        yield* LlvmBlock.setInsertionPoint(body, resumeParent)
-        const next = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, resumeParent)
+        const next = Emitter.load(
           body,
           pointer,
           head,
           `drive${operation.destination.ordinal}_next_head`,
         )
-        yield* FunctionBody.store(body, next, headPointer)
-        yield* FunctionBody.store(body, headPointer, appendPointerPointer)
-        const parentResume = yield* FunctionBody.load(
+        Emitter.store(body, next, headPointer)
+        Emitter.store(body, headPointer, appendPointerPointer)
+        const parentResume = Emitter.load(
           body,
           pointer,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             head,
@@ -2655,7 +2518,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           `drive${operation.destination.ordinal}_parent_resume`,
         )
-        const parentStatus = yield* FunctionBody.call(
+        const parentStatus = Emitter.call(
           body,
           resumeThunkType,
           parentResume,
@@ -2664,35 +2527,31 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         if (parentStatus === undefined)
           throw new RangeError('LLVM execution parent returned no status')
-        yield* FunctionBody.store(body, parentStatus, statusStorage)
-        yield* FunctionBody.branch(body, loop)
+        Emitter.store(body, parentStatus, statusStorage)
+        Emitter.branch(body, loop)
 
-        yield* LlvmBlock.setInsertionPoint(body, finish)
+        Emitter.setInsertionPoint(body, finish)
         if (executable.target.diagnosticResult !== undefined)
-          yield* NativeDiagnosticOutcome.consume(context.call.synchronous.diagnostic, {
+          NativeDiagnosticOutcome.consume(context.call.synchronous.diagnostic, {
             values: [],
-            diagnostic: yield* NativeDiagnosticTransfer.take(
+            diagnostic: NativeDiagnosticTransfer.take(
               { builder, body, wordSize: program.layout.target.pointerSize, transfer },
               executable.target.diagnosticResult,
             ),
           })
-        yield* NativeExecutionStorage.destroy(
+        NativeExecutionStorage.destroy(
           { builder, body, pointer, usizeType, storage: storageComponent },
           transferStateSlot,
           `drive${operation.destination.ordinal}_storage`,
         )
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.nullValue(builder, pointer),
-          storedStateSlot,
-        )
+        Emitter.store(body, Emitter.nullValue(builder, pointer), storedStateSlot)
         const outcome: Array<Value.Input> = []
         for (const [ordinal, lane] of packedOutcome.entries.entries())
           outcome.push(
-            yield* FunctionBody.load(
+            Emitter.load(
               body,
               NativeType.laneType(context.types, lane.lane),
-              yield* NativeLanePointer.lanePointer(
+              NativeLanePointer.lanePointer(
                 lanePointers,
                 body,
                 transfer,
@@ -2705,62 +2564,50 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const outcomeTag = outcome.at(0)
         if (outcomeTag === undefined)
           throw new RangeError('LLVM execution body lost its outcome tag')
-        const succeeded = yield* LlvmBlock.make(
+        const succeeded = Emitter.block(body, `drive${operation.destination.ordinal}_succeeded`)
+        const failed = Emitter.block(body, `drive${operation.destination.ordinal}_failed`)
+        Emitter.conditionalBranch(
           body,
-          `drive${operation.destination.ordinal}_succeeded`,
-        )
-        const failed = yield* LlvmBlock.make(body, `drive${operation.destination.ordinal}_failed`)
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             outcomeTag,
-            yield* Constant.integerSigned(builder, i32, 0n),
+            Emitter.integerSigned(builder, i32, 0n),
             `drive${operation.destination.ordinal}_success`,
           ),
           succeeded,
           failed,
         )
-        yield* LlvmBlock.setInsertionPoint(body, failed)
-        yield* FunctionBody.unreachable(body)
-        yield* LlvmBlock.setInsertionPoint(body, succeeded)
+        Emitter.setInsertionPoint(body, failed)
+        Emitter.unreachable(body)
+        Emitter.setInsertionPoint(body, succeeded)
         const resultValues = outcome.slice(1)
-        yield* NativeStorage.writeLocal(storage, operation.result.ordinal, resultValues)
-        yield* NativeAggregate.dropThroughPlan(
+        NativeStorage.writeLocal(storage, operation.result.ordinal, resultValues)
+        NativeAggregate.dropThroughPlan(
           context.cleanup,
           operation.suspensionCleanup,
           NativePayload.local(storage, operation.onSuspend),
           `drive${operation.destination.ordinal}_unused_suspend`,
         )
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 5n),
-          statePointer,
-        )
-        yield* releasePackage(
-          context,
-          package_,
-          base,
-          `drive${operation.destination.ordinal}_complete`,
-        )
-        yield* NativeStorage.writeLocal(
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), statePointer)
+        releasePackage(context, package_, base, `drive${operation.destination.ordinal}_complete`)
+        NativeStorage.writeLocal(
           storage,
           operation.destination.ordinal,
-          yield* applyCallable(
+          applyCallable(
             context,
             operation.onComplete,
             operation.completionTypeArguments,
-            [yield* NativeStorage.materialize(storage, operation.branch), resultValues],
+            [NativeStorage.materialize(storage, operation.branch), resultValues],
             `drive${operation.destination.ordinal}_on_complete`,
           ),
         )
-        yield* FunctionBody.branch(body, operationFollowing)
+        Emitter.branch(body, operationFollowing)
 
-        yield* LlvmBlock.setInsertionPoint(body, external)
-        yield* FunctionBody.store(
+        Emitter.setInsertionPoint(body, external)
+        Emitter.store(
           body,
-          yield* FunctionBody.load(
+          Emitter.load(
             body,
             pointer,
             transferStateSlot,
@@ -2768,22 +2615,22 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
           storedStateSlot,
         )
-        const transferredHead = yield* FunctionBody.load(
+        const transferredHead = Emitter.load(
           body,
           pointer,
           headPointer,
           `drive${operation.destination.ordinal}_transferred_head`,
         )
-        const transferredAppend = yield* FunctionBody.load(
+        const transferredAppend = Emitter.load(
           body,
           pointer,
           appendPointerPointer,
           `drive${operation.destination.ordinal}_transferred_append`,
         )
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
           transferredHead,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -2791,10 +2638,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `drive${operation.destination.ordinal}_store_head`,
           ),
         )
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
           transferredAppend,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -2802,181 +2649,147 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `drive${operation.destination.ordinal}_store_append`,
           ),
         )
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           context.cleanup,
           operation.completionCleanup,
           NativePayload.local(storage, operation.onComplete),
           `drive${operation.destination.ordinal}_unused_complete`,
         )
-        const suspendedResult = yield* applyCallable(
+        const suspendedResult = applyCallable(
           context,
           operation.onSuspend,
           operation.suspensionTypeArguments,
-          [yield* NativeStorage.materialize(storage, operation.branch), [base]],
+          [NativeStorage.materialize(storage, operation.branch), [base]],
           `drive${operation.destination.ordinal}_on_suspend`,
         )
         const controlOffset = componentOffset(package_, 'WakeControl')
         if (controlOffset === undefined) {
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 2n),
-            statePointer,
-          )
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), statePointer)
         } else {
-          const phasePointer = yield* NativeLanePointer.lanePointer(
+          const phasePointer = NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
             controlOffset,
             `drive${operation.destination.ordinal}_phase_ptr`,
           )
-          const phase = yield* FunctionBody.load(
+          const phase = Emitter.load(
             body,
             usizeType,
             phasePointer,
             `drive${operation.destination.ordinal}_phase`,
           )
-          const following = yield* LlvmBlock.make(
-            body,
-            `drive${operation.destination.ordinal}_suspended`,
-          )
-          const destroyedAfterSuspend = yield* LlvmBlock.make(
+          const following = Emitter.block(body, `drive${operation.destination.ordinal}_suspended`)
+          const destroyedAfterSuspend = Emitter.block(
             body,
             `drive${operation.destination.ordinal}_destroyed_after_suspend`,
           )
-          const retainedAfterSuspend = yield* LlvmBlock.make(
+          const retainedAfterSuspend = Emitter.block(
             body,
             `drive${operation.destination.ordinal}_retained_after_suspend`,
           )
-          const stateAfterSuspend = yield* FunctionBody.load(
+          const stateAfterSuspend = Emitter.load(
             body,
             usizeType,
             statePointer,
             `drive${operation.destination.ordinal}_state_after_suspend`,
           )
-          yield* FunctionBody.conditionalBranch(
+          Emitter.conditionalBranch(
             body,
-            yield* FunctionBody.integerCompare(
+            Emitter.integerCompare(
               body,
               'eq',
               stateAfterSuspend,
-              yield* Constant.integerUnsigned(builder, usizeType, 7n),
+              Emitter.integerUnsigned(builder, usizeType, 7n),
               `drive${operation.destination.ordinal}_destroy_pending_after_suspend`,
             ),
             destroyedAfterSuspend,
             retainedAfterSuspend,
           )
-          yield* LlvmBlock.setInsertionPoint(body, destroyedAfterSuspend)
-          yield* dropActivatedPackage(
+          Emitter.setInsertionPoint(body, destroyedAfterSuspend)
+          dropActivatedPackage(
             context.cleanup,
             package_,
             base,
             `drive${operation.destination.ordinal}_destroyed_after_suspend`,
           )
-          yield* FunctionBody.branch(body, following)
+          Emitter.branch(body, following)
 
-          yield* LlvmBlock.setInsertionPoint(body, retainedAfterSuspend)
-          const notify = yield* LlvmBlock.make(body, `drive${operation.destination.ordinal}_notify`)
-          const dormant = yield* LlvmBlock.make(
+          Emitter.setInsertionPoint(body, retainedAfterSuspend)
+          const notify = Emitter.block(body, `drive${operation.destination.ordinal}_notify`)
+          const dormant = Emitter.block(body, `drive${operation.destination.ordinal}_dormant`)
+          Emitter.conditionalBranch(
             body,
-            `drive${operation.destination.ordinal}_dormant`,
-          )
-          yield* FunctionBody.conditionalBranch(
-            body,
-            yield* FunctionBody.integerCompare(
+            Emitter.integerCompare(
               body,
               'eq',
               phase,
-              yield* Constant.integerUnsigned(builder, usizeType, 2n),
+              Emitter.integerUnsigned(builder, usizeType, 2n),
               `drive${operation.destination.ordinal}_latched`,
             ),
             notify,
             dormant,
           )
-          yield* LlvmBlock.setInsertionPoint(body, dormant)
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 3n),
-            phasePointer,
-          )
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 2n),
-            statePointer,
-          )
-          yield* FunctionBody.branch(body, following)
-          yield* LlvmBlock.setInsertionPoint(body, notify)
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 3n),
-            statePointer,
-          )
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 4n),
-            phasePointer,
-          )
-          yield* notifyReady(context, package_, base, `drive${operation.destination.ordinal}_ready`)
-          const stateAfterNotify = yield* FunctionBody.load(
+          Emitter.setInsertionPoint(body, dormant)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), phasePointer)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), statePointer)
+          Emitter.branch(body, following)
+          Emitter.setInsertionPoint(body, notify)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), statePointer)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), phasePointer)
+          notifyReady(context, package_, base, `drive${operation.destination.ordinal}_ready`)
+          const stateAfterNotify = Emitter.load(
             body,
             usizeType,
             statePointer,
             `drive${operation.destination.ordinal}_state_after_notify`,
           )
-          const destroyedAfterNotify = yield* LlvmBlock.make(
+          const destroyedAfterNotify = Emitter.block(
             body,
             `drive${operation.destination.ordinal}_destroyed_after_notify`,
           )
-          const eligibleAfterNotify = yield* LlvmBlock.make(
+          const eligibleAfterNotify = Emitter.block(
             body,
             `drive${operation.destination.ordinal}_eligible_after_notify`,
           )
-          yield* FunctionBody.conditionalBranch(
+          Emitter.conditionalBranch(
             body,
-            yield* FunctionBody.integerCompare(
+            Emitter.integerCompare(
               body,
               'eq',
               stateAfterNotify,
-              yield* Constant.integerUnsigned(builder, usizeType, 7n),
+              Emitter.integerUnsigned(builder, usizeType, 7n),
               `drive${operation.destination.ordinal}_destroy_pending_after_notify`,
             ),
             destroyedAfterNotify,
             eligibleAfterNotify,
           )
-          yield* LlvmBlock.setInsertionPoint(body, destroyedAfterNotify)
-          yield* dropActivatedPackage(
+          Emitter.setInsertionPoint(body, destroyedAfterNotify)
+          dropActivatedPackage(
             context.cleanup,
             package_,
             base,
             `drive${operation.destination.ordinal}_destroyed_after_notify`,
           )
 
-          yield* FunctionBody.branch(body, following)
-          yield* LlvmBlock.setInsertionPoint(body, eligibleAfterNotify)
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 5n),
-            phasePointer,
-          )
-          yield* FunctionBody.store(
-            body,
-            yield* Constant.integerUnsigned(builder, usizeType, 4n),
-            statePointer,
-          )
-          yield* FunctionBody.branch(body, following)
-          yield* LlvmBlock.setInsertionPoint(body, following)
+          Emitter.branch(body, following)
+          Emitter.setInsertionPoint(body, eligibleAfterNotify)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), phasePointer)
+          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), statePointer)
+          Emitter.branch(body, following)
+          Emitter.setInsertionPoint(body, following)
         }
-        yield* NativeStorage.writeLocal(storage, operation.destination.ordinal, suspendedResult)
-        yield* FunctionBody.branch(body, operationFollowing)
-        yield* LlvmBlock.setInsertionPoint(body, operationFollowing)
-      })
+        NativeStorage.writeLocal(storage, operation.destination.ordinal, suspendedResult)
+        Emitter.branch(body, operationFollowing)
+        Emitter.setInsertionPoint(body, operationFollowing)
+      }
       if (matchingPackages.length === 1) {
         const selected = matchingPackages.at(0)
         if (selected === undefined) throw new RangeError('LLVM execution drive lost its package')
-        yield* emitPackage(selected)
+        emitPackage(selected)
         return
       }
-      yield* selectPackageFrom(
+      selectPackageFrom(
         context.cleanup,
         base,
         matchingPackages,
@@ -2987,56 +2800,56 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
     }
     case 'ExecutionNotifyInitial': {
       context.runtimeFeatures.add('ReadinessNotification')
-      const reference = (yield* NativeStorage.materialize(storage, operation.execution)).at(0)
+      const reference = NativeStorage.materialize(storage, operation.execution).at(0)
       if (reference === undefined)
         throw new RangeError('LLVM initial readiness lost its Execution reference')
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
         reference,
         `notify_initial${operation.destination.ordinal}_base_address`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         baseAddress,
         context.pointer,
         `notify_initial${operation.destination.ordinal}_base`,
       )
-      yield* selectPackage(
+      selectPackage(
         context.cleanup,
         base,
         `notify_initial${operation.destination.ordinal}`,
         (package_) =>
-          Effect.gen(function* () {
-            const statePointer = yield* NativeLanePointer.lanePointer(
+          (() => {
+            const statePointer = NativeLanePointer.lanePointer(
               lanePointers,
               body,
               base,
               0,
               `notify_initial${operation.destination.ordinal}_state_ptr`,
             )
-            const current = yield* FunctionBody.load(
+            const current = Emitter.load(
               body,
               usizeType,
               statePointer,
               `notify_initial${operation.destination.ordinal}_state`,
             )
-            const accepted = yield* LlvmBlock.make(
+            const accepted = Emitter.block(
               body,
               `notify_initial${operation.destination.ordinal}_accepted`,
             )
-            const rejected = yield* LlvmBlock.make(
+            const rejected = Emitter.block(
               body,
               `notify_initial${operation.destination.ordinal}_rejected`,
             )
-            yield* FunctionBody.conditionalBranch(
+            Emitter.conditionalBranch(
               body,
-              yield* FunctionBody.integerCompare(
+              Emitter.integerCompare(
                 body,
                 'eq',
                 current,
-                yield* Constant.integerUnsigned(
+                Emitter.integerUnsigned(
                   builder,
                   usizeType,
                   BigInt(ExecutionTransition.tagOf('Initial')),
@@ -3046,27 +2859,27 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               accepted,
               rejected,
             )
-            yield* LlvmBlock.setInsertionPoint(body, rejected)
-            yield* FunctionBody.unreachable(body)
-            yield* LlvmBlock.setInsertionPoint(body, accepted)
-            yield* FunctionBody.store(
+            Emitter.setInsertionPoint(body, rejected)
+            Emitter.unreachable(body)
+            Emitter.setInsertionPoint(body, accepted)
+            Emitter.store(
               body,
-              yield* Constant.integerUnsigned(
+              Emitter.integerUnsigned(
                 builder,
                 usizeType,
                 BigInt(ExecutionTransition.tagOf('InitialReady')),
               ),
               statePointer,
             )
-            yield* notifyReady(
+            notifyReady(
               context,
               package_,
               base,
               `notify_initial${operation.destination.ordinal}_ready`,
             )
-          }),
+          })(),
       )
-      yield* NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }
     case 'ExecutionWake': {
@@ -3074,204 +2887,163 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const packages = program.layout.executionPackages.plans.filter(
         (candidate) => candidate.readinessStorage,
       )
-      const base = (yield* NativeStorage.materialize(storage, operation.wake)).at(0)
+      const base = NativeStorage.materialize(storage, operation.wake).at(0)
       if (packages.length === 0 || base === undefined)
         throw new RangeError('LLVM Wake lost its exact package authority')
-      const emitPackage = Effect.fnUntraced(function* (package_: ExecutionPackage.Plan) {
+      const emitPackage = (package_: ExecutionPackage.Plan) => {
         const controlOffset = componentOffset(package_, 'WakeControl')
         if (controlOffset === undefined)
           throw new RangeError('LLVM Wake package lost its control authority')
-        const phasePointer = yield* NativeLanePointer.lanePointer(
+        const phasePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
           controlOffset,
           `wake${operation.destination.ordinal}_phase_ptr`,
         )
-        const statePointer = yield* NativeLanePointer.lanePointer(
+        const statePointer = NativeLanePointer.lanePointer(
           lanePointers,
           body,
           base,
           0,
           `wake${operation.destination.ordinal}_state_ptr`,
         )
-        const phase = yield* FunctionBody.load(
+        const phase = Emitter.load(
           body,
           usizeType,
           phasePointer,
           `wake${operation.destination.ordinal}_phase`,
         )
-        const registering = yield* LlvmBlock.make(
-          body,
-          `wake${operation.destination.ordinal}_registering`,
-        )
-        const notRegistering = yield* LlvmBlock.make(
+        const registering = Emitter.block(body, `wake${operation.destination.ordinal}_registering`)
+        const notRegistering = Emitter.block(
           body,
           `wake${operation.destination.ordinal}_not_registering`,
         )
-        const following = yield* LlvmBlock.make(
+        const following = Emitter.block(body, `wake${operation.destination.ordinal}_following`)
+        Emitter.conditionalBranch(
           body,
-          `wake${operation.destination.ordinal}_following`,
-        )
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             phase,
-            yield* Constant.integerUnsigned(builder, usizeType, 1n),
+            Emitter.integerUnsigned(builder, usizeType, 1n),
             `wake${operation.destination.ordinal}_is_registering`,
           ),
           registering,
           notRegistering,
         )
-        yield* LlvmBlock.setInsertionPoint(body, registering)
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 2n),
-          phasePointer,
-        )
-        yield* FunctionBody.branch(body, following)
+        Emitter.setInsertionPoint(body, registering)
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), phasePointer)
+        Emitter.branch(body, following)
 
-        yield* LlvmBlock.setInsertionPoint(body, notRegistering)
-        const dormant = yield* LlvmBlock.make(body, `wake${operation.destination.ordinal}_dormant`)
-        const notDormant = yield* LlvmBlock.make(
+        Emitter.setInsertionPoint(body, notRegistering)
+        const dormant = Emitter.block(body, `wake${operation.destination.ordinal}_dormant`)
+        const notDormant = Emitter.block(body, `wake${operation.destination.ordinal}_not_dormant`)
+        Emitter.conditionalBranch(
           body,
-          `wake${operation.destination.ordinal}_not_dormant`,
-        )
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             phase,
-            yield* Constant.integerUnsigned(builder, usizeType, 3n),
+            Emitter.integerUnsigned(builder, usizeType, 3n),
             `wake${operation.destination.ordinal}_is_dormant`,
           ),
           dormant,
           notDormant,
         )
-        yield* LlvmBlock.setInsertionPoint(body, dormant)
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 3n),
-          statePointer,
-        )
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 4n),
-          phasePointer,
-        )
-        yield* notifyReady(context, package_, base, `wake${operation.destination.ordinal}_ready`)
-        const stateAfterNotify = yield* FunctionBody.load(
+        Emitter.setInsertionPoint(body, dormant)
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), statePointer)
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), phasePointer)
+        notifyReady(context, package_, base, `wake${operation.destination.ordinal}_ready`)
+        const stateAfterNotify = Emitter.load(
           body,
           usizeType,
           statePointer,
           `wake${operation.destination.ordinal}_state_after_notify`,
         )
-        const destroyed = yield* LlvmBlock.make(
+        const destroyed = Emitter.block(body, `wake${operation.destination.ordinal}_destroyed`)
+        const eligibleBlock = Emitter.block(body, `wake${operation.destination.ordinal}_eligible`)
+        Emitter.conditionalBranch(
           body,
-          `wake${operation.destination.ordinal}_destroyed`,
-        )
-        const eligibleBlock = yield* LlvmBlock.make(
-          body,
-          `wake${operation.destination.ordinal}_eligible`,
-        )
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             stateAfterNotify,
-            yield* Constant.integerUnsigned(builder, usizeType, 7n),
+            Emitter.integerUnsigned(builder, usizeType, 7n),
             `wake${operation.destination.ordinal}_destroy_pending`,
           ),
           destroyed,
           eligibleBlock,
         )
-        yield* LlvmBlock.setInsertionPoint(body, destroyed)
-        yield* dropActivatedPackage(
+        Emitter.setInsertionPoint(body, destroyed)
+        dropActivatedPackage(
           context.cleanup,
           package_,
           base,
           `wake${operation.destination.ordinal}_destroy`,
         )
 
-        yield* FunctionBody.branch(body, following)
-        yield* LlvmBlock.setInsertionPoint(body, eligibleBlock)
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 5n),
-          phasePointer,
-        )
-        yield* FunctionBody.store(
-          body,
-          yield* Constant.integerUnsigned(builder, usizeType, 4n),
-          statePointer,
-        )
-        yield* FunctionBody.branch(body, following)
+        Emitter.branch(body, following)
+        Emitter.setInsertionPoint(body, eligibleBlock)
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), phasePointer)
+        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), statePointer)
+        Emitter.branch(body, following)
 
-        yield* LlvmBlock.setInsertionPoint(body, notDormant)
-        const cleanup = yield* LlvmBlock.make(
+        Emitter.setInsertionPoint(body, notDormant)
+        const cleanup = Emitter.block(body, `wake${operation.destination.ordinal}_during_cleanup`)
+        const settled = Emitter.block(body, `wake${operation.destination.ordinal}_settled`)
+        Emitter.conditionalBranch(
           body,
-          `wake${operation.destination.ordinal}_during_cleanup`,
-        )
-        const settled = yield* LlvmBlock.make(body, `wake${operation.destination.ordinal}_settled`)
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             phase,
-            yield* Constant.integerUnsigned(builder, usizeType, cleanupWithWake),
+            Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
             `wake${operation.destination.ordinal}_cleanup_active`,
           ),
           cleanup,
           settled,
         )
-        yield* LlvmBlock.setInsertionPoint(body, cleanup)
-        yield* FunctionBody.store(
+        Emitter.setInsertionPoint(body, cleanup)
+        Emitter.store(
           body,
-          yield* Constant.integerUnsigned(builder, usizeType, cleanupWithoutWake),
+          Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
           phasePointer,
         )
-        yield* FunctionBody.branch(body, following)
-        yield* LlvmBlock.setInsertionPoint(body, settled)
-        const cancelled = yield* LlvmBlock.make(
+        Emitter.branch(body, following)
+        Emitter.setInsertionPoint(body, settled)
+        const cancelled = Emitter.block(body, `wake${operation.destination.ordinal}_cancelled`)
+        const invalid = Emitter.block(body, `wake${operation.destination.ordinal}_invalid`)
+        Emitter.conditionalBranch(
           body,
-          `wake${operation.destination.ordinal}_cancelled`,
-        )
-        const invalid = yield* LlvmBlock.make(body, `wake${operation.destination.ordinal}_invalid`)
-        yield* FunctionBody.conditionalBranch(
-          body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             phase,
-            yield* Constant.integerUnsigned(builder, usizeType, 6n),
+            Emitter.integerUnsigned(builder, usizeType, 6n),
             `wake${operation.destination.ordinal}_is_cancelled`,
           ),
           cancelled,
           invalid,
         )
-        yield* LlvmBlock.setInsertionPoint(body, cancelled)
-        yield* releaseAllocation(
+        Emitter.setInsertionPoint(body, cancelled)
+        releaseAllocation(
           context,
           package_,
           base,
           `wake${operation.destination.ordinal}_late_release`,
         )
-        yield* FunctionBody.branch(body, following)
-        yield* LlvmBlock.setInsertionPoint(body, invalid)
-        yield* FunctionBody.unreachable(body)
-        yield* LlvmBlock.setInsertionPoint(body, following)
-      })
+        Emitter.branch(body, following)
+        Emitter.setInsertionPoint(body, invalid)
+        Emitter.unreachable(body)
+        Emitter.setInsertionPoint(body, following)
+      }
       if (packages.length === 1) {
         const selected = packages.at(0)
         if (selected === undefined) throw new RangeError('LLVM Wake lost its package')
-        yield* emitPackage(selected)
+        emitPackage(selected)
       } else {
-        yield* selectPackageFrom(
+        selectPackageFrom(
           context.cleanup,
           base,
           packages,
@@ -3279,8 +3051,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           emitPackage,
         )
       }
-      yield* NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }
   }
-})
+}

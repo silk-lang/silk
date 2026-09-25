@@ -1,6 +1,4 @@
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import * as Layout from './Layout.js'
 import * as Match from './Match.js'
@@ -138,50 +136,42 @@ export const make = (
 }
 
 /** Loads only the selected flattened lanes; a partial owner is never rebuilt as a complete value. */
-export const read = Effect.fnUntraced(function* (
+export const read = (
   self: NativeOwnedPlace,
   context: NativeArith.LaneContext,
-  read: (ordinal: number) => Effect.Effect<Value.Input, LlvmError.LlvmError>,
+  read: (ordinal: number) => Value.Input,
   tag: string,
   ordinals: ReadonlyArray<number> = self.slots.map((_, ordinal) => ordinal),
-): Effect.fn.Return<ReadonlyArray<Value.Input>, LlvmError.LlvmError> {
+): ReadonlyArray<Value.Input> => {
   const selected: Array<Value.Input> = []
   for (const ordinal of ordinals) {
     const slot = self.slots.at(ordinal)
     if (slot === undefined) throw new RangeError('Owned place lost a selected lane')
-    const value = yield* read(slot)
+    const value = read(slot)
     const source = self.source.lanes.at(slot)
     const target = self.target.lanes.at(ordinal)
     if (value === undefined || source === undefined || target === undefined)
       throw new RangeError('Owned place lost a verified physical lane')
-    selected.push(
-      yield* NativeArith.coerceLane(context, value, source, target, `${tag}_${ordinal}`),
-    )
+    selected.push(NativeArith.coerceLane(context, value, source, target, `${tag}_${ordinal}`))
   }
   return selected
-})
+}
 
 /** Commits selected lanes into original storage, preserving every initialized sibling and tag. */
-export const write = Effect.fnUntraced(function* (
+export const write = (
   self: NativeOwnedPlace,
   context: NativeArith.LaneContext,
-  read: (ordinal: number) => Effect.Effect<Value.Input, LlvmError.LlvmError>,
-  write: (ordinal: number, value: Value.Input) => Effect.Effect<void, LlvmError.LlvmError>,
+  read: (ordinal: number) => Value.Input,
+  write: (ordinal: number, value: Value.Input) => void,
   tag: string,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   for (const [ordinal, slot] of self.slots.entries()) {
-    const value = yield* read(ordinal)
+    const value = read(ordinal)
     const target = self.source.lanes.at(slot)
     const source = self.target.lanes.at(ordinal)
     if (value === undefined || source === undefined || target === undefined)
       throw new RangeError('Owned place write lost a verified physical lane')
-    const stored = yield* NativeArith.coerceLane(
-      context,
-      value,
-      source,
-      target,
-      `${tag}_${ordinal}`,
-    )
-    yield* write(slot, stored)
+    const stored = NativeArith.coerceLane(context, value, source, target, `${tag}_${ordinal}`)
+    write(slot, stored)
   }
-})
+}

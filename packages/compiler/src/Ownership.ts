@@ -2654,14 +2654,14 @@ const analyzeLoans = (
         loan.startSpan.end <= span.start &&
         span.end <= loan.endSpan.end &&
         loan.endSpan.end > loan.startSpan.end
-      const live =
-        fn.lifetimeFlow === undefined
-          ? undefined
-          : LifetimeFlow.liveAt(fn.lifetimeFlow, loan.startSpan, span, loan.endSpan, write)
       // Executable environments retain their captured storage until their computed use/drop end.
       // That ownership fact is stronger than a value-lifetime graph which can stop at an invalid
       // invocation and would otherwise make the capture disappear before the authored use.
       if (retainedExecutableCapture && retainedThroughAuthoredUse) return true
+      const live =
+        fn.lifetimeFlow === undefined
+          ? undefined
+          : LifetimeFlow.liveAt(fn.lifetimeFlow, loan.startSpan, span, loan.endSpan, write)
       return live ?? retainedThroughAuthoredUse
     })
 

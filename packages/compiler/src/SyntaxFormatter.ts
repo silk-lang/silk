@@ -2157,7 +2157,7 @@ const printNode = (
   }
 }
 
-const changed = (source: ReadonlyArray<number>, formatted: Uint8Array): boolean =>
+const changed = (source: Uint8Array, formatted: Uint8Array): boolean =>
   source.length !== formatted.length || source.some((byte, index) => byte !== formatted[index])
 
 const validateFor = Effect.fnUntraced(function* (

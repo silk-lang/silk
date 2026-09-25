@@ -9,6 +9,7 @@ import * as ForeignContract from './ForeignContract.js'
 import * as Data from 'effect/Data'
 import * as Context from 'effect/Context'
 import * as Effect from 'effect/Effect'
+import * as Fiber from 'effect/Fiber'
 import * as Option from 'effect/Option'
 import * as ArtifactKind from './ArtifactKind.js'
 import * as AbiManifest from './AbiManifest.js'
@@ -25,11 +26,14 @@ import * as Linker from './Linker.js'
 import type * as NativeLinkPlan from './NativeLinkPlan.js'
 import * as PhaseReport from './PhaseReport.js'
 import * as Preparation from './Preparation.js'
+import type * as Realization from './Realization.js'
 import * as SemanticPersistence from './SemanticPersistence.js'
 import * as SourceFile from './SourceFile.js'
 import * as SourceResolver from './SourceResolver.js'
+import type * as SourceSpan from './SourceSpan.js'
 import * as Target from './Target.js'
 import * as TestExecution from './TestExecution.js'
+import type * as TestDiscovery from './TestDiscovery.js'
 import * as ToolchainIntegrity from './ToolchainIntegrity.js'
 import * as ToolchainPlan from './ToolchainPlan.js'
 
@@ -308,6 +312,232 @@ const commitLibraryInterface = Effect.fnUntraced(function* (
   )
 })
 
+/**
+ * What backend emission and linking need from a prepared program. The frontend and realization
+ * results stay local to {@link prepareEmission}, so they are released before the backend runs.
+ */
+interface Staged {
+  readonly _tag: 'Staged'
+  readonly sources: ReadonlyMap<string, SourceFile.SourceFile>
+  readonly rootSpan: SourceSpan.SourceSpan | undefined
+  readonly profile: Prepared['profile']
+  readonly target: Target.Target
+  readonly program: Prepared['program']
+  readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
+  readonly artifactPlan: ArtifactPlan.ArtifactPlan
+  /** Retained only when the build discovered tests, whose manifest is built after linking. */
+  readonly tests:
+    | {
+        readonly catalog: TestDiscovery.Catalog
+        readonly discovery: Prepared['instances']
+        readonly results: Prepared['frontend']['results']
+        readonly bootstrapIdentity: string | undefined
+      }
+    | undefined
+}
+
+type Prepared = Extract<Realization.Preparation, { readonly _tag: 'Prepared' }>
+
+/** Steps 4-8 of {@link compile}: prepare MIR and run every gate that precedes backend emission. */
+const prepareEmission = Effect.fnUntraced(function* (
+  request: CompileRequest,
+  compilation: ModuleClosure.CompilationRequest,
+  targetId: string | undefined,
+  stage: ArtifactPlan.Stage,
+  report: Array<DriverPhaseReport>,
+  heapBytes: () => number,
+  distribution: ToolchainIntegrity.Graph,
+): Effect.fn.Return<
+  Outcome | Staged,
+  ModuleClosure.ModuleClosureError | SourceResolutionFailed | NativeToolchain.ToolchainError,
+  SourceResolver.SourceResolver
+> {
+  // 4. Load and parse the transitive module closure, resolve declarations and names, elaborate
+  // bodies, and analyze semantics and ownership. Retain its diagnostics and per-phase observations.
+  const bundle = yield* Preparation.prepare(compilation, 'executable', {
+    heapBytes,
+    artifactKind: request.artifactKind,
+    ...(request.compilation.configuration === undefined || request.optimization === undefined
+      ? {}
+      : { optimization: request.optimization }),
+    emission: true,
+  })
+  const frontend = bundle.frontend
+
+  report.push(...frontend.report.map(phaseWithHeap))
+  const closure = frontend.closure
+  // Imported-source storage failures use the typed Effect error channel and retain all available
+  // source facts. Ordinary source diagnostics are handled by the preparation gate below.
+  if (closure.resolutionFailures.length > 0) {
+    return yield* new SourceResolutionFailed({
+      operation: 'Driver.compile',
+      message: `Source resolution failed for ${closure.resolutionFailures.length} imported module${closure.resolutionFailures.length === 1 ? '' : 's'}`,
+      failures: closure.resolutionFailures,
+      sources: closure.sources,
+      diagnostics: frontend.diagnostics,
+      report: [...report],
+    })
+  }
+  // 5. Reject artifact kinds that cannot be produced for this target. Unresolved targets pass
+  // to preparation, which returns the corresponding target failure.
+  const artifactTarget = Target.select(targetId)
+  if (
+    artifactTarget._tag === 'Resolved' &&
+    !ArtifactKind.supports(request.artifactKind, artifactTarget.target)
+  )
+    return {
+      _tag: 'TargetFailed',
+      error: Target.unavailableArtifact(artifactTarget.target, request.artifactKind),
+      diagnostics: frontend.diagnostics,
+      report: [...report],
+    }
+  // The sealed bundle already completed target configuration, instance discovery, MIR lowering
+  // and demanded storage components; nothing downstream reopens source discovery.
+  const preparation = Preparation.preparation(bundle)
+  // Preparation carries the frontend report forward. Replace the earlier frontend entries to
+  // avoid counting them twice, while retaining the driver's initial distribution-integrity check.
+  const integrityReport = report.at(0)
+  report.splice(
+    0,
+    report.length,
+    ...(integrityReport === undefined ? [] : [integrityReport]),
+    ...preparation.report.map(phaseWithHeap),
+  )
+  // Stop before emission when source/configuration diagnostics or target selection reject MIR.
+  if (preparation._tag === 'Rejected')
+    return {
+      _tag: 'Rejected',
+      sources: closure.sources,
+      diagnostics: preparation.diagnostics,
+      report: [...report],
+    }
+  if (preparation._tag === 'TargetFailed')
+    return {
+      _tag: 'TargetFailed',
+      error: preparation.error,
+      diagnostics: preparation.diagnostics,
+      report: [...report],
+    }
+  // 6. Build the logical artifact plan from the prepared program, profile, and composition.
+  // It records roots, exports, native requirements, and identity for the requested output stage.
+  const { diagnostics, program, target } = preparation
+  const plannedArtifact = yield* Effect.result(
+    ArtifactPlan.make(
+      preparation.frontend,
+      preparation.profile,
+      preparation.composition,
+      program,
+      stage,
+      distribution.digest,
+    ),
+  )
+  // Attach an invalid artifact configuration to the root source span as a user diagnostic.
+  // A missing root span is an internal invariant violation rather than a compilation outcome.
+  if (Result.isFailure(plannedArtifact)) {
+    const span = closure.modules.find((module) => module.name === closure.rootModule)?.syntax.root
+      .span
+    if (span === undefined) throw new RangeError('Artifact plan lost application source')
+    return {
+      _tag: 'Rejected',
+      sources: closure.sources,
+      diagnostics: Diagnostic.merge(diagnostics, [
+        Diagnostic.invalidConfiguration(plannedArtifact.failure, span),
+      ]),
+      report: [...report],
+    }
+  }
+  const artifactPlan = plannedArtifact.success
+
+  // 7. Decode supplied foreign ABI manifests and compare their contracts with the MIR program.
+  // Run this before cache lookup so cached code cannot bypass foreign-interface validation.
+  const importedInterfaces: Array<AbiManifest.Imported> = []
+  const interfaceDiagnostics: Array<Diagnostic.Diagnostic> = []
+  for (const source of request.foreignInterfaces ?? []) {
+    const decoded = yield* AbiManifest.decode(source).pipe(Effect.result)
+    if (Result.isFailure(decoded)) interfaceDiagnostics.push(decoded.failure)
+    else importedInterfaces.push(decoded.success)
+  }
+  // Combine malformed-manifest and contract-mismatch diagnostics, including manifest sources
+  // in the rejected outcome so callers can render their diagnostic spans.
+  interfaceDiagnostics.push(...AbiManifest.check(importedInterfaces, program))
+  if (interfaceDiagnostics.length > 0)
+    return {
+      _tag: 'Rejected',
+      sources: new Map([
+        ...closure.sources,
+        ...(request.foreignInterfaces ?? []).map((source) => [source.id, source] as const),
+      ]),
+      diagnostics: [...diagnostics, ...interfaceDiagnostics],
+      report: [...report],
+    }
+  // 8. Verify that the distribution supports the target's demanded intrinsics and runtime.
+  // Missing target operations become TargetFailed; inconsistent distribution data becomes
+  // ToolchainFailed. Both stop the pipeline before backend code generation.
+  const targetIntegrity = PhaseReport.measureInto(
+    report,
+    'toolchain-target',
+    program.intrinsics.length,
+    () => ToolchainIntegrity.validateTarget(distribution, target, program.intrinsics),
+    (result) => (result._tag === 'Matched' ? result.runtimeSupport.length : 0),
+    (result) => (result._tag === 'Invalid' ? result.failures.length : 0),
+    { heapBytes },
+  )
+  if (targetIntegrity._tag === 'UnsupportedTarget')
+    return {
+      _tag: 'TargetFailed',
+      error: Target.unavailableInventory(target, targetIntegrity.operations),
+      diagnostics,
+      report: [...report],
+    }
+  if (targetIntegrity._tag === 'Invalid')
+    return {
+      _tag: 'ToolchainFailed',
+      expectedIdentity: ToolchainIntegrity.installed().digest,
+      observedIdentity: distribution.digest,
+      failures: targetIntegrity.failures,
+      report: [...report],
+    }
+  // Explicit audits run even when a later emission-cache lookup can reuse the artifact.
+  if (request.verifyMir === true) {
+    const verified = yield* PhaseReport.measureEffectInto(
+      report,
+      'mir-verification',
+      program.functions.length,
+      Effect.result(MirVerification.check(program)),
+      (result) => (Result.isSuccess(result) ? program.functions.length : 0),
+      (result) => (Result.isFailure(result) ? result.failure.violations.length : 0),
+      { heapBytes },
+    )
+    if (Result.isFailure(verified))
+      return {
+        _tag: 'VerificationFailed',
+        error: verified.failure,
+        diagnostics,
+        report: [...report],
+      }
+  }
+  return {
+    _tag: 'Staged',
+    sources: closure.sources,
+    rootSpan: closure.modules.find((module) => module.name === closure.rootModule)?.syntax.root
+      .span,
+    profile: preparation.profile,
+    target,
+    program,
+    diagnostics,
+    artifactPlan,
+    tests:
+      frontend.testCatalog === undefined
+        ? undefined
+        : {
+            catalog: frontend.testCatalog,
+            discovery: preparation.instances,
+            results: frontend.results,
+            bootstrapIdentity: bundle.completion?.bootstrapIdentity,
+          },
+  }
+})
+
 /** Compiles one request end to end, writing its final artifact to the durable destination. */
 export const compile = Effect.fn('Driver.compile')(
   function* (
@@ -396,175 +626,22 @@ export const compile = Effect.fn('Driver.compile')(
             },
           }
 
-    // 4. Load and parse the transitive module closure, resolve declarations and names, elaborate
-    // bodies, and analyze semantics and ownership. Retain its diagnostics and per-phase observations.
-    const bundle = yield* Preparation.prepare(compilation, 'executable', {
-      heapBytes,
-      artifactKind: request.artifactKind,
-      ...(request.compilation.configuration === undefined || request.optimization === undefined
-        ? {}
-        : { optimization: request.optimization }),
-      emission: true,
-    })
-    const frontend = bundle.frontend
-
-    report.push(...frontend.report.map(phaseWithHeap))
-    const closure = frontend.closure
-    // Imported-source storage failures use the typed Effect error channel and retain all available
-    // source facts. Ordinary source diagnostics are handled by the preparation gate below.
-    if (closure.resolutionFailures.length > 0) {
-      return yield* new SourceResolutionFailed({
-        operation: 'Driver.compile',
-        message: `Source resolution failed for ${closure.resolutionFailures.length} imported module${closure.resolutionFailures.length === 1 ? '' : 's'}`,
-        failures: closure.resolutionFailures,
-        sources: closure.sources,
-        diagnostics: frontend.diagnostics,
-        report: [...report],
-      })
-    }
-    // 5. Select LLVM emission and reject artifact kinds that cannot be produced for this target.
-    // Unresolved targets pass to preparation, which returns the corresponding target failure.
-    const backend = LlvmBackend.LlvmBackend
-    const artifactTarget = Target.select(targetId)
-    if (
-      artifactTarget._tag === 'Resolved' &&
-      !ArtifactKind.supports(request.artifactKind, artifactTarget.target)
-    )
-      return {
-        _tag: 'TargetFailed',
-        error: Target.unavailableArtifact(artifactTarget.target, request.artifactKind),
-        diagnostics: frontend.diagnostics,
-        report: [...report],
-      }
-    // The sealed bundle already completed target configuration, instance discovery, MIR lowering
-    // and demanded storage components; nothing downstream reopens source discovery.
-    const preparation = Preparation.preparation(bundle)
-    // Preparation carries the frontend report forward. Replace the earlier frontend entries to
-    // avoid counting them twice, while retaining the driver's initial distribution-integrity check.
-    const integrityReport = report.at(0)
-    report.splice(
-      0,
-      report.length,
-      ...(integrityReport === undefined ? [] : [integrityReport]),
-      ...preparation.report.map(phaseWithHeap),
-    )
-    // Stop before emission when source/configuration diagnostics or target selection reject MIR.
-    if (preparation._tag === 'Rejected')
-      return {
-        _tag: 'Rejected',
-        sources: closure.sources,
-        diagnostics: preparation.diagnostics,
-        report: [...report],
-      }
-    if (preparation._tag === 'TargetFailed')
-      return {
-        _tag: 'TargetFailed',
-        error: preparation.error,
-        diagnostics: preparation.diagnostics,
-        report: [...report],
-      }
-    // 6. Build the logical artifact plan from the prepared program, profile, and composition.
-    // It records roots, exports, native requirements, and identity for the requested output stage.
-    const { diagnostics, program, target } = preparation
     const stage = request.stage ?? 'final'
-    const plannedArtifact = yield* Effect.result(
-      ArtifactPlan.make(
-        preparation.frontend,
-        preparation.profile,
-        preparation.composition,
-        program,
-        stage,
-        distribution.digest,
-      ),
-    )
-    // Attach an invalid artifact configuration to the root source span as a user diagnostic.
-    // A missing root span is an internal invariant violation rather than a compilation outcome.
-    if (Result.isFailure(plannedArtifact)) {
-      const span = closure.modules.find((module) => module.name === closure.rootModule)?.syntax.root
-        .span
-      if (span === undefined) throw new RangeError('Artifact plan lost application source')
-      return {
-        _tag: 'Rejected',
-        sources: closure.sources,
-        diagnostics: Diagnostic.merge(diagnostics, [
-          Diagnostic.invalidConfiguration(plannedArtifact.failure, span),
-        ]),
-        report: [...report],
-      }
-    }
-    const artifactPlan = plannedArtifact.success
-
-    // 7. Decode supplied foreign ABI manifests and compare their contracts with the MIR program.
-    // Run this before cache lookup so cached code cannot bypass foreign-interface validation.
-    const importedInterfaces: Array<AbiManifest.Imported> = []
-    const interfaceDiagnostics: Array<Diagnostic.Diagnostic> = []
-    for (const source of request.foreignInterfaces ?? []) {
-      const decoded = yield* AbiManifest.decode(source).pipe(Effect.result)
-      if (Result.isFailure(decoded)) interfaceDiagnostics.push(decoded.failure)
-      else importedInterfaces.push(decoded.success)
-    }
-    // Combine malformed-manifest and contract-mismatch diagnostics, including manifest sources
-    // in the rejected outcome so callers can render their diagnostic spans.
-    interfaceDiagnostics.push(...AbiManifest.check(importedInterfaces, program))
-    if (interfaceDiagnostics.length > 0)
-      return {
-        _tag: 'Rejected',
-        sources: new Map([
-          ...closure.sources,
-          ...(request.foreignInterfaces ?? []).map((source) => [source.id, source] as const),
-        ]),
-        diagnostics: [...diagnostics, ...interfaceDiagnostics],
-        report: [...report],
-      }
-    // 8. Verify that the distribution supports the target's demanded intrinsics and runtime.
-    // Missing target operations become TargetFailed; inconsistent distribution data becomes
-    // ToolchainFailed. Both stop the pipeline before backend code generation.
-    const targetIntegrity = PhaseReport.measureInto(
+    const staged = yield* prepareEmission(
+      request,
+      compilation,
+      targetId,
+      stage,
       report,
-      'toolchain-target',
-      program.intrinsics.length,
-      () => ToolchainIntegrity.validateTarget(distribution, target, program.intrinsics),
-      (result) => (result._tag === 'Matched' ? result.runtimeSupport.length : 0),
-      (result) => (result._tag === 'Invalid' ? result.failures.length : 0),
-      { heapBytes },
+      heapBytes,
+      distribution,
     )
-    if (targetIntegrity._tag === 'UnsupportedTarget')
-      return {
-        _tag: 'TargetFailed',
-        error: Target.unavailableInventory(target, targetIntegrity.operations),
-        diagnostics,
-        report: [...report],
-      }
-    if (targetIntegrity._tag === 'Invalid')
-      return {
-        _tag: 'ToolchainFailed',
-        expectedIdentity: ToolchainIntegrity.installed().digest,
-        observedIdentity: distribution.digest,
-        failures: targetIntegrity.failures,
-        report: [...report],
-      }
-    // Explicit audits run even when a later emission-cache lookup can reuse the artifact.
-    if (request.verifyMir === true) {
-      const verified = yield* PhaseReport.measureEffectInto(
-        report,
-        'mir-verification',
-        program.functions.length,
-        Effect.result(MirVerification.check(program)),
-        (result) => (Result.isSuccess(result) ? program.functions.length : 0),
-        (result) => (Result.isFailure(result) ? result.failure.violations.length : 0),
-        { heapBytes },
-      )
-      if (Result.isFailure(verified))
-        return {
-          _tag: 'VerificationFailed',
-          error: verified.failure,
-          diagnostics,
-          report: [...report],
-        }
-    }
+    if (staged._tag !== 'Staged') return staged
+    const { program, target, diagnostics, artifactPlan } = staged
+    const backend = LlvmBackend.LlvmBackend
     // 9. Look up LLVM emission independently of the final-artifact cache. The key covers the
     // distribution, backend, profile, artifact plan/kind, mode, source closure, and ABI manifests.
-    const mode = preparation.profile.debug ? 'debug' : 'release'
+    const mode = staged.profile.debug ? 'debug' : 'release'
     const emissionCache = artifactStorage
     const emissionCacheKey =
       emissionCache === undefined
@@ -572,11 +649,11 @@ export const compile = Effect.fn('Driver.compile')(
         : backendEmissionCacheKey(
             distribution.digest,
             backend.id,
-            preparation.profile.identity,
+            staged.profile.identity,
             artifactPlan.identity,
             request.artifactKind,
             mode,
-            closure.sources,
+            staged.sources,
             request.foreignInterfaces ?? [],
           )
     // Missing or undecodable entries are cache misses; a usable entry restores bitcode and metadata.
@@ -590,6 +667,13 @@ export const compile = Effect.fn('Driver.compile')(
         : undefined
     // Reuse cached emission or ask LLVM to emit the prepared MIR, recording which path ran.
     // Pass source bytes for backend source information and convert BackendError to an outcome.
+    // Native toolchain resolution only queries installed tools, so it runs during emission.
+    const pendingToolchain =
+      stage === 'final' && target.kind === 'Native' && request.artifactKind !== 'WebAssemblyModule'
+        ? yield* Effect.forkChild(
+            Effect.result(NativeToolchain.resolveToolchain(request.toolchain, staged.profile)),
+          )
+        : undefined
     const emitted =
       cachedEmission !== undefined
         ? PhaseReport.measureInto(
@@ -608,7 +692,7 @@ export const compile = Effect.fn('Driver.compile')(
             Backend.emit(backend, program, {
               mode,
               sources: new Map(
-                [...closure.sources].map(([module, source]) => [
+                [...staged.sources].map(([module, source]) => [
                   module,
                   SourceFile.toUint8Array(source),
                 ]),
@@ -655,7 +739,7 @@ export const compile = Effect.fn('Driver.compile')(
             request.toolchain,
             scope,
             artifact,
-            preparation.profile,
+            staged.profile,
             stage,
             request.destination,
           )
@@ -689,13 +773,12 @@ export const compile = Effect.fn('Driver.compile')(
       ),
     )
     if (Result.isFailure(bound)) {
-      const span = closure.modules.find((module) => module.name === closure.rootModule)?.syntax.root
-        .span
+      const span = staged.rootSpan
       if (span === undefined)
         throw new RangeError('Native requirement binding lost application source')
       return {
         _tag: 'Rejected',
-        sources: closure.sources,
+        sources: staged.sources,
         diagnostics: Diagnostic.merge(diagnostics, [
           Diagnostic.invalidConfiguration(bound.failure, span),
         ]),
@@ -734,7 +817,7 @@ export const compile = Effect.fn('Driver.compile')(
       finalArtifactStorage !== undefined && artifact._tag === 'LlvmBitcodeArtifact'
         ? yield* NativeToolchain.wasmArtifactCacheKey(
             request.toolchain,
-            preparation.profile,
+            staged.profile,
             artifact.bitcode,
             runtimeSource,
           )
@@ -810,7 +893,7 @@ export const compile = Effect.fn('Driver.compile')(
                 request.toolchain,
                 scope,
                 artifact,
-                preparation.profile,
+                staged.profile,
                 request.destination,
               ),
               () => 1,
@@ -853,12 +936,29 @@ export const compile = Effect.fn('Driver.compile')(
               report: [...report],
             }
 
+          // Test identities depend only on the analysis, so compute them while the native object
+          // compiler runs in its own process.
+          const tests = staged.tests
+          const testIdentities =
+            tests === undefined
+              ? undefined
+              : yield* Effect.forkChild(
+                  Effect.all([
+                    TestExecution.runnerIdentity(tests.discovery, tests.results, tests.catalog),
+                    cacheKind === 'NativeExecutable' && tests.bootstrapIdentity !== undefined
+                      ? Effect.asSome(
+                          TestExecution.closures(tests.catalog, tests.discovery, tests.results),
+                        )
+                      : Effect.succeedNone,
+                  ]),
+                )
+
           // 14. Resolve the native toolchain for the profile and turn LLVM bitcode into an object.
           // Track both generated object files and any helper capabilities reported by emission.
-          const toolchain = yield* NativeToolchain.resolveToolchain(
-            request.toolchain,
-            preparation.profile,
-          )
+          const toolchain =
+            pendingToolchain === undefined
+              ? yield* NativeToolchain.resolveToolchain(request.toolchain, staged.profile)
+              : yield* Effect.fromResult(yield* Fiber.join(pendingToolchain))
           const object = yield* PhaseReport.measureEffectInto(
             report,
             'object',
@@ -867,7 +967,7 @@ export const compile = Effect.fn('Driver.compile')(
               toolchain,
               scope,
               artifact,
-              profile: preparation.profile,
+              profile: staged.profile,
             }),
             () => 1,
             () => 0,
@@ -882,7 +982,7 @@ export const compile = Effect.fn('Driver.compile')(
             const support = yield* NativeToolchain.compileHelpers(
               toolchain,
               scope,
-              preparation.profile,
+              staged.profile,
               object.helpers,
             )
             generatedObjects.push(...support.map((entry) => entry.artifact))
@@ -945,7 +1045,7 @@ export const compile = Effect.fn('Driver.compile')(
             toolchain,
             scope,
             cacheKind,
-            preparation.profile,
+            staged.profile,
             generatedObjects,
             selectedNativeInputs,
             request.destination,
@@ -1005,42 +1105,25 @@ export const compile = Effect.fn('Driver.compile')(
                   { heapBytes },
                 )
               : undefined
-          const testRunnerIdentity =
-            frontend.testCatalog === undefined
-              ? undefined
-              : yield* TestExecution.runnerIdentity(
-                  preparation.instances,
-                  frontend.results,
-                  frontend.testCatalog,
-                )
-          const helperPolicyIdentity =
-            frontend.testCatalog === undefined
-              ? undefined
-              : HelperCapability.policyIdentity(preparation.profile)
+          const identities =
+            testIdentities === undefined ? undefined : yield* Fiber.join(testIdentities)
           const testManifest =
-            cacheKind === 'NativeExecutable' &&
-            frontend.testCatalog !== undefined &&
-            bundle.completion !== undefined &&
-            testRunnerIdentity !== undefined &&
-            helperPolicyIdentity !== undefined
-              ? yield* TestExecution.make({
-                  catalog: frontend.testCatalog,
-                  discovery: preparation.instances,
-                  results: frontend.results,
-                  environment: {
-                    profileIdentity: preparation.profile.identity,
-                    bootstrapIdentity: bundle.completion.bootstrapIdentity,
-                    runnerIdentity: testRunnerIdentity.identity,
-                    compilerIdentity: distribution.digest,
-                    runtimeIdentity: TestExecution.runtimeIdentity(distribution),
-                    nativeIdentity: TestExecution.nativeIdentity(
-                      linkPlan,
-                      generatedObjects.map((entry) => entry.path),
-                      bound.success.identity,
-                      helperPolicyIdentity,
-                    ),
-                    complete: testRunnerIdentity.complete,
-                  },
+            identities !== undefined &&
+            Option.isSome(identities[1]) &&
+            tests?.bootstrapIdentity !== undefined
+              ? TestExecution.make(identities[1].value, {
+                  profileIdentity: staged.profile.identity,
+                  bootstrapIdentity: tests.bootstrapIdentity,
+                  runnerIdentity: identities[0].identity,
+                  compilerIdentity: distribution.digest,
+                  runtimeIdentity: TestExecution.runtimeIdentity(distribution),
+                  nativeIdentity: TestExecution.nativeIdentity(
+                    linkPlan,
+                    generatedObjects.map((entry) => entry.path),
+                    bound.success.identity,
+                    HelperCapability.policyIdentity(staged.profile),
+                  ),
+                  complete: identities[0].complete,
                 })
               : undefined
           // Return the durable artifact together with linkage provenance, foreign symbols,

@@ -173,7 +173,42 @@ const executionIndex = (executions: ReadonlyArray<Execution>): Map<string, Execu
   return index
 }
 
+// Finalization asks several questions of each lowered function; both lookups below scan every
+// provisional execution, so their answers are retained per published execution list.
+const resolvedExecutions = new WeakMap<
+  ReadonlyArray<Execution>,
+  Map<string, Execution | undefined>
+>()
+const resolvedProvidedClassifications = new WeakMap<
+  ReadonlyArray<Execution>,
+  Map<string, Classification | undefined>
+>()
+
+const memoizedPerInstance = <A>(
+  cache: WeakMap<ReadonlyArray<Execution>, Map<string, A | undefined>>,
+  self: Module,
+  instance: Instances.InstanceKey,
+  compute: (self: Module, instance: Instances.InstanceKey) => A | undefined,
+): A | undefined => {
+  let answers = cache.get(self.executions)
+  if (answers === undefined) {
+    answers = new Map()
+    cache.set(self.executions, answers)
+  }
+  const text = Instances.keyText(instance)
+  if (answers.has(text)) return answers.get(text)
+  const answer = compute(self, instance)
+  answers.set(text, answer)
+  return answer
+}
+
 const executionForInstance = (
+  self: Module,
+  instance: Instances.InstanceKey,
+): Execution | undefined =>
+  memoizedPerInstance(resolvedExecutions, self, instance, resolveExecutionForInstance)
+
+const resolveExecutionForInstance = (
   self: Module,
   instance: Instances.InstanceKey,
 ): Execution | undefined => {
@@ -231,6 +266,17 @@ const mergeClassifications = (classifications: ReadonlyArray<Classification>): C
 }
 
 const providedClassification = (
+  self: Module,
+  instance: Instances.InstanceKey,
+): Classification | undefined =>
+  memoizedPerInstance(
+    resolvedProvidedClassifications,
+    self,
+    instance,
+    resolveProvidedClassification,
+  )
+
+const resolveProvidedClassification = (
   self: Module,
   instance: Instances.InstanceKey,
 ): Classification | undefined => {
