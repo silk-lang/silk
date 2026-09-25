@@ -5,6 +5,31 @@ The current executable reads one Silk file and prints its flat AST and syntax di
 lowered module and declaration fingerprints in `hir` mode. It does not yet perform name resolution,
 type checking, or code generation on that input. The TypeScript bootstrap compiler still builds it.
 
+## Development branches and bootstrap
+
+`selfhost` is the integration branch for the source-written compiler. Start native compiler work on
+`selfhost-*` branches from the current `selfhost` tip, and target their pull requests at `selfhost`.
+Use a hyphen after `selfhost`: Git cannot hold both the `selfhost` branch and a `selfhost/...`
+branch. Keep the merged M1 history and later `main` work in this branch's ancestry.
+
+Repairs to the TypeScript compiler, CLI, or standard library that the native compiler needs start
+from a freshly fetched `main`. Review and merge each repair through a pull request targeting
+`main`, with that branch's normal checks. Then fetch the merged `main` and merge it into a new
+`selfhost-sync-*` branch based on the current `selfhost` tip. Review the merge and any conflict
+resolution, run the focused native checks below, and target the synchronization pull request at
+`selfhost`. Use a merge that retains both parents; do not copy repair commits into a private
+bootstrap patch stream or reset `selfhost` onto another history. Update native feature branches
+from the synchronized `selfhost` tip as needed.
+
+For each bootstrap build, record the `selfhost` commit, the merged `main` repair commit it contains,
+the host platform and LLVM target. The checkout supplies the bootstrap compiler and CLI sources in
+`packages/compiler` and `packages/cli`, standard library sources in `packages/compiler/stdlib`,
+and the native sources and manifest in `compiler`. Root `package.json` pins the pnpm version and
+minimum Node version; `pnpm-lock.yaml` and `pnpm-workspace.yaml` determine the resolved workspace
+dependencies. Install from that lockfile with `pnpm install --frozen-lockfile`, then build this
+checkout's CLI with the command below. A built `dist` CLI or native executable is an output of
+those recorded inputs, not an independent bootstrap source.
+
 ## In-memory semantic queries
 
 `semantic.Semantic` resolves demanded facts from a held, immutable, in-memory
