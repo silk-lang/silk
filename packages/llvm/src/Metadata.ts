@@ -624,26 +624,42 @@ export const lexicalBlock = Effect.fnUntraced(function* (
  * @category metadata
  * @since 0.0.0
  */
-export const location = Effect.fnUntraced(function* (
+export const location = (
   builder: Builder.Builder,
   line: number,
   column: number,
   scope: Metadata,
   inlinedAt?: Metadata,
-): Effect.fn.Return<Optional, LlvmError> {
-  return yield* debugNode(builder, 'Metadata.location', (state, owner) =>
-    Result.gen(function* () {
-      return {
-        _tag: 'Location',
-        distinct: false,
-        line,
-        column,
-        scope: (yield* resolve(builder, state, owner, scope, 'Metadata.location')).index,
-        inlinedAt: yield* resolveIndex(builder, state, owner, inlinedAt, 'Metadata.location'),
-      }
+): Effect.Effect<Optional, LlvmError> =>
+  BuilderState.transition(builder, 'Metadata.location', (context) =>
+    locationIn(context, line, column, scope, inlinedAt),
+  )
+
+/** @internal */
+export const locationIn = (
+  context: BuilderState.Context,
+  line: number,
+  column: number,
+  scope: Metadata,
+  inlinedAt?: Metadata,
+): Result.Result<Optional, LlvmError> => {
+  const { builder, state, owner } = context
+  if (state.strip) return Result.succeed(undefined)
+  const scopeIndex = resolve(builder, state, owner, scope, 'Metadata.location')
+  if (Result.isFailure(scopeIndex)) return Result.fail(scopeIndex.failure)
+  const inlinedIndex = resolveIndex(builder, state, owner, inlinedAt, 'Metadata.location')
+  if (Result.isFailure(inlinedIndex)) return Result.fail(inlinedIndex.failure)
+  return Result.succeed(
+    node(state, owner, {
+      _tag: 'Location',
+      distinct: false,
+      line,
+      column,
+      scope: scopeIndex.success.index,
+      inlinedAt: inlinedIndex.success,
     }),
   )
-})
+}
 
 /**
  * Creates a basic debug type from DWARF encoding, optional metadata-string name, and bit size.

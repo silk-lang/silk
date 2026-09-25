@@ -429,11 +429,39 @@ export const hasCopyDeclaration = (self: Index, provider: Type.Type): boolean =>
  * `Copy` bound. Cycles and damaged executable representations remain unavailable instead of being
  * guessed affine or Copy.
  */
+const copyProofMemos = new WeakMap<Index, Map<string, CopyProof>>()
+
 export const copyProof = (
   self: Index,
   type: Type.Type,
   assumptions: ReadonlySet<string> = new Set(),
   active: ReadonlySet<string> = new Set(),
+): CopyProof => {
+  // A root proof is a pure function of the immutable index, the type and its Copy assumptions;
+  // ownership and body checking ask it for the same few types many thousand times.
+  if (active.size !== 0) return proveCopy(self, type, assumptions, active)
+  let memo = copyProofMemos.get(self)
+  if (memo === undefined) {
+    memo = new Map()
+    copyProofMemos.set(self, memo)
+  }
+  const key =
+    assumptions.size === 0
+      ? Type.key(type)
+      : `${Type.key(type)}\u0000${[...assumptions].sort().join('\u0000')}`
+  let proof = memo.get(key)
+  if (proof === undefined) {
+    proof = proveCopy(self, type, assumptions, active)
+    memo.set(key, proof)
+  }
+  return proof
+}
+
+const proveCopy = (
+  self: Index,
+  type: Type.Type,
+  assumptions: ReadonlySet<string>,
+  active: ReadonlySet<string>,
 ): CopyProof => {
   if (
     Type.isBuiltin(type) ||

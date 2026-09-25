@@ -595,9 +595,7 @@ const moduleInput = (
   | undefined => {
   const result = self[stateSymbol].results.get(declaration.id.sourceId)
   const scope = NameResolution.scopeOf(self[stateSymbol].resolution, declaration.id.sourceId)
-  const headers = self[stateSymbol].index.modules.find(
-    (module) => module.module === declaration.id.sourceId,
-  )
+  const headers = DeclarationFacts.moduleHeaders(self[stateSymbol].index, declaration.id.sourceId)
   return result === undefined || scope === undefined || headers === undefined
     ? undefined
     : { result, scope, declarations: headers.declarations }

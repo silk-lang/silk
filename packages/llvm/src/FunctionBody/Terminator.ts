@@ -1,5 +1,6 @@
 import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
+import * as AddrSpace from '../AddrSpace.js'
 import type * as Block from '../Block.js'
 import * as ByteString from '../ByteString.js'
 import type * as Constant from '../Constant.js'
@@ -112,34 +113,39 @@ export const indirectBranch = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const branch = Effect.fnUntraced(function* (
+export const branch = (
   self: FunctionBody,
   destination: Block.Block,
-): Effect.fn.Return<Instruction, LlvmError> {
-  return yield* FunctionBodyState.mutate(self, 'FunctionBody.branch', (draft) =>
-    Result.gen(function* () {
-      const block = yield* FunctionBodyState.resolveBlock(draft, destination, 'FunctionBody.branch')
-      const predecessor = draft.cursor
-      if (predecessor === undefined) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.branch',
-            message: 'Set an insertion block before branching',
-            input: destination,
-          }),
-        )
-      }
-      const instruction = yield* FunctionBodyState.appendInstruction(draft, {
-        _tag: 'Branch',
-        destination: block,
-        result: undefined,
-        name: ByteString.empty,
-      })
-      yield* FunctionBodyState.addPredecessor(draft, block, predecessor)
-      return instruction
-    }),
-  )
-})
+): Effect.Effect<Instruction, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.branch', (draft) => branchIn(draft, destination))
+
+/** @internal */
+export const branchIn = (
+  draft: FunctionBodyState.Draft,
+  destination: Block.Block,
+): Result.Result<Instruction, LlvmError> => {
+  const block = FunctionBodyState.resolveBlock(draft, destination, 'FunctionBody.branch')
+  if (Result.isFailure(block)) return Result.fail(block.failure)
+  const predecessor = draft.cursor
+  if (predecessor === undefined) {
+    return Result.fail(
+      invalidInput({
+        operation: 'FunctionBody.branch',
+        message: 'Set an insertion block before branching',
+        input: destination,
+      }),
+    )
+  }
+  const instruction = FunctionBodyState.appendInstruction(draft, {
+    _tag: 'Branch',
+    destination: block.success,
+    result: undefined,
+    name: ByteString.empty,
+  })
+  if (Result.isFailure(instruction)) return instruction
+  const added = FunctionBodyState.addPredecessor(draft, block.success, predecessor)
+  return Result.isFailure(added) ? Result.fail(added.failure) : instruction
+}
 
 /**
  * Terminates the insertion block with an `i1` conditional branch and records both edges.
@@ -147,79 +153,79 @@ export const branch = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const conditionalBranch = Effect.fnUntraced(function* (
+export const conditionalBranch = (
   self: FunctionBody,
   condition: Value.Input,
   onTrue: Block.Block,
   onFalse: Block.Block,
   weights: 'none' | 'unpredictable' | 'true-likely' | 'false-likely' = 'none',
-): Effect.fn.Return<Instruction, LlvmError> {
-  const instruction = yield* FunctionBodyState.mutateModule(
-    self,
-    'FunctionBody.conditionalBranch',
-    (draft, module) =>
-      Result.gen(function* () {
-        const resolved = yield* FunctionBodyState.resolveOperand(
-          draft,
-          module,
-          condition,
-          'FunctionBody.conditionalBranch',
-        )
-        const type = yield* FunctionBodyState.typeAt(
-          module,
-          resolved.type,
-          'FunctionBody.conditionalBranch',
-        )
-        if (type._tag !== 'Integer' || type.bitWidth !== 1) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.conditionalBranch',
-              message: 'Conditional branches require an i1 condition',
-              input: condition,
-            }),
-          )
-        }
-        const trueBlock = yield* FunctionBodyState.resolveBlock(
-          draft,
-          onTrue,
-          'FunctionBody.conditionalBranch',
-        )
-        const falseBlock = yield* FunctionBodyState.resolveBlock(
-          draft,
-          onFalse,
-          'FunctionBody.conditionalBranch',
-        )
-        const predecessor = draft.cursor
-        if (predecessor === undefined) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.conditionalBranch',
-              message: 'Set an insertion block before branching',
-              input: condition,
-            }),
-          )
-        }
-        const instruction = yield* FunctionBodyState.appendInstruction(draft, {
-          _tag: 'ConditionalBranch',
-          condition: resolved.operand,
-          onTrue: trueBlock,
-          onFalse: falseBlock,
-          weights,
-          result: undefined,
-          name: ByteString.empty,
-        })
-        yield* FunctionBodyState.addPredecessor(draft, trueBlock, predecessor)
-        yield* FunctionBodyState.addPredecessor(draft, falseBlock, predecessor)
-        return instruction
-      }),
+): Effect.Effect<Instruction, LlvmError> => {
+  const appended = FunctionBodyState.mutate(self, 'FunctionBody.conditionalBranch', (draft) =>
+    conditionalBranchIn(draft, condition, onTrue, onFalse, weights),
   )
-  if (weights === 'unpredictable') {
-    yield* setUnpredictable(self, instruction)
-  } else if (weights === 'true-likely' || weights === 'false-likely') {
-    yield* setBranchWeights(self, instruction, weights === 'true-likely' ? [2000, 1] : [1, 2000])
+  if (weights === 'none') return appended
+  return Effect.flatMap(appended, (instruction) =>
+    Effect.as(
+      weights === 'unpredictable'
+        ? setUnpredictable(self, instruction)
+        : setBranchWeights(self, instruction, weights === 'true-likely' ? [2000, 1] : [1, 2000]),
+      instruction,
+    ),
+  )
+}
+
+/** Appends the conditional branch; branch-weight metadata is attached separately. @internal */
+export const conditionalBranchIn = (
+  draft: FunctionBodyState.Draft,
+  condition: Value.Input,
+  onTrue: Block.Block,
+  onFalse: Block.Block,
+  weights: 'none' | 'unpredictable' | 'true-likely' | 'false-likely' = 'none',
+): Result.Result<Instruction, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.conditionalBranch'
+  const resolved = FunctionBodyState.resolveOperand(draft, module, condition, operation)
+  if (Result.isFailure(resolved)) return Result.fail(resolved.failure)
+  const type = FunctionBodyState.typeAt(module, resolved.success.type, operation)
+  if (Result.isFailure(type)) return Result.fail(type.failure)
+  if (type.success._tag !== 'Integer' || type.success.bitWidth !== 1) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'Conditional branches require an i1 condition',
+        input: condition,
+      }),
+    )
   }
-  return instruction
-})
+  const trueBlock = FunctionBodyState.resolveBlock(draft, onTrue, operation)
+  if (Result.isFailure(trueBlock)) return Result.fail(trueBlock.failure)
+  const falseBlock = FunctionBodyState.resolveBlock(draft, onFalse, operation)
+  if (Result.isFailure(falseBlock)) return Result.fail(falseBlock.failure)
+  const predecessor = draft.cursor
+  if (predecessor === undefined) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'Set an insertion block before branching',
+        input: condition,
+      }),
+    )
+  }
+  const instruction = FunctionBodyState.appendInstruction(draft, {
+    _tag: 'ConditionalBranch',
+    condition: resolved.success.operand,
+    onTrue: trueBlock.success,
+    onFalse: falseBlock.success,
+    weights,
+    result: undefined,
+    name: ByteString.empty,
+  })
+  if (Result.isFailure(instruction)) return instruction
+  const addedTrue = FunctionBodyState.addPredecessor(draft, trueBlock.success, predecessor)
+  if (Result.isFailure(addedTrue)) return Result.fail(addedTrue.failure)
+  const addedFalse = FunctionBodyState.addPredecessor(draft, falseBlock.success, predecessor)
+  return Result.isFailure(addedFalse) ? Result.fail(addedFalse.failure) : instruction
+}
 
 /**
  * Starts a switch terminator whose cases must be added and then finalized with {@link sealSwitch}.
@@ -235,68 +241,75 @@ export const conditionalBranch = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const switchTerminator = Effect.fnUntraced(function* (
+export const switchTerminator = (
   self: FunctionBody,
   value: Value.Input,
   defaultBlock: Block.Block,
   weights: ReadonlyArray<number> = [],
-): Effect.fn.Return<Switch, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(
-    self,
-    'FunctionBody.switchTerminator',
-    (draft, module) =>
-      Result.gen(function* () {
-        const resolved = yield* FunctionBodyState.resolveOperand(
-          draft,
-          module,
-          value,
-          'FunctionBody.switchTerminator',
-        )
-        if (
-          !(yield* FunctionBodyState.isIntegerType(
-            module,
-            resolved.type,
-            'FunctionBody.switchTerminator',
-          ))
-        ) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.switchTerminator',
-              message: 'switch requires an integer value',
-              input: value,
-            }),
-          )
-        }
-        const destination = yield* FunctionBodyState.resolveBlock(
-          draft,
-          defaultBlock,
-          'FunctionBody.switchTerminator',
-        )
-        const predecessor = draft.cursor
-        if (predecessor === undefined) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.switchTerminator',
-              message: 'Set an insertion block before adding a switch',
-              input: value,
-            }),
-          )
-        }
-        const instruction = yield* FunctionBodyState.appendInstruction(draft, {
-          _tag: 'Switch',
-          value: resolved.operand,
-          defaultBlock: destination,
-          cases: [],
-          weights: [...weights],
-          sealed: false,
-          result: undefined,
-          name: ByteString.empty,
-        })
-        yield* FunctionBodyState.addPredecessor(draft, destination, predecessor)
-        return yield* FunctionBodyState.makeSwitchHandle(draft, instruction, predecessor)
-      }),
+): Effect.Effect<Switch, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.switchTerminator', (draft) =>
+    switchTerminatorIn(draft, value, defaultBlock, weights),
   )
-})
+
+/** @internal */
+export const switchTerminatorIn = (
+  draft: FunctionBodyState.Draft,
+  value: Value.Input,
+  defaultBlock: Block.Block,
+  weights: ReadonlyArray<number> = [],
+): Result.Result<Switch, LlvmError> => {
+  const module = draft.module
+  return Result.gen(function* () {
+    const resolved = yield* FunctionBodyState.resolveOperand(
+      draft,
+      module,
+      value,
+      'FunctionBody.switchTerminator',
+    )
+    if (
+      !(yield* FunctionBodyState.isIntegerType(
+        module,
+        resolved.type,
+        'FunctionBody.switchTerminator',
+      ))
+    ) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.switchTerminator',
+          message: 'switch requires an integer value',
+          input: value,
+        }),
+      )
+    }
+    const destination = yield* FunctionBodyState.resolveBlock(
+      draft,
+      defaultBlock,
+      'FunctionBody.switchTerminator',
+    )
+    const predecessor = draft.cursor
+    if (predecessor === undefined) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.switchTerminator',
+          message: 'Set an insertion block before adding a switch',
+          input: value,
+        }),
+      )
+    }
+    const instruction = yield* FunctionBodyState.appendInstruction(draft, {
+      _tag: 'Switch',
+      value: resolved.operand,
+      defaultBlock: destination,
+      cases: [],
+      weights: [...weights],
+      sealed: false,
+      result: undefined,
+      name: ByteString.empty,
+    })
+    yield* FunctionBodyState.addPredecessor(draft, destination, predecessor)
+    return yield* FunctionBodyState.makeSwitchHandle(draft, instruction, predecessor)
+  })
+}
 
 /**
  * Adds one unique, same-typed integer constant case to an open switch.
@@ -304,81 +317,91 @@ export const switchTerminator = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const addSwitchCase = Effect.fnUntraced(function* (
+export const addSwitchCase = (
   self: FunctionBody,
   switchHandle: Switch,
   value: Constant.Constant,
   destination: Block.Block,
-): Effect.fn.Return<void, LlvmError> {
-  yield* FunctionBodyState.mutateModule(self, 'FunctionBody.addSwitchCase', (draft, module) =>
-    Result.gen(function* () {
-      const { index, block: predecessor } = yield* FunctionBodyState.resolveSwitch(
-        draft,
-        switchHandle,
-        'FunctionBody.addSwitchCase',
-      )
-      const instruction = draft.instructions[index]
-      if (instruction?._tag !== 'Switch' || instruction.sealed) {
-        return yield* Result.fail(
-          invalidState({
-            operation: 'FunctionBody.addSwitchCase',
-            message: 'Switch is missing or already finalized',
-            state: switchHandle,
-          }),
-        )
-      }
-      const switchValue =
-        instruction.value._tag === 'Constant'
-          ? module.constants.descriptions[instruction.value.constant]
-          : draft.values[instruction.value.value]
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        value,
-        'FunctionBody.addSwitchCase',
-      )
-      if (switchValue === undefined || switchValue.type !== resolved.type) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.addSwitchCase',
-            message: 'Switch case value must match the switch condition type',
-            input: value,
-          }),
-        )
-      }
-      const constantIndex =
-        resolved.operand._tag === 'Constant' ? resolved.operand.constant : undefined
-      if (constantIndex === undefined) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.addSwitchCase',
-            message: 'Switch cases must be module constants',
-            input: value,
-          }),
-        )
-      }
-      if (instruction.cases.some((entry) => entry.value === constantIndex)) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.addSwitchCase',
-            message: 'Switch case values must be unique',
-            input: value,
-          }),
-        )
-      }
-      const block = yield* FunctionBodyState.resolveBlock(
-        draft,
-        destination,
-        'FunctionBody.addSwitchCase',
-      )
-      draft.instructions[index] = {
-        ...instruction,
-        cases: [...instruction.cases, { value: constantIndex, block }],
-      }
-      yield* FunctionBodyState.addPredecessor(draft, block, predecessor)
-    }),
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.addSwitchCase', (draft) =>
+    addSwitchCaseIn(draft, switchHandle, value, destination),
   )
-})
+
+/** @internal */
+export const addSwitchCaseIn = (
+  draft: FunctionBodyState.Draft,
+  switchHandle: Switch,
+  value: Constant.Constant,
+  destination: Block.Block,
+): Result.Result<void, LlvmError> => {
+  const module = draft.module
+  return Result.gen(function* () {
+    const { index, block: predecessor } = yield* FunctionBodyState.resolveSwitch(
+      draft,
+      switchHandle,
+      'FunctionBody.addSwitchCase',
+    )
+    const instruction = draft.instructions[index]
+    if (instruction?._tag !== 'Switch' || instruction.sealed) {
+      return yield* Result.fail(
+        invalidState({
+          operation: 'FunctionBody.addSwitchCase',
+          message: 'Switch is missing or already finalized',
+          state: switchHandle,
+        }),
+      )
+    }
+    const switchValue =
+      instruction.value._tag === 'Constant'
+        ? module.constants.descriptions[instruction.value.constant]
+        : draft.values[instruction.value.value]
+    const resolved = yield* FunctionBodyState.resolveOperand(
+      draft,
+      module,
+      value,
+      'FunctionBody.addSwitchCase',
+    )
+    if (switchValue === undefined || switchValue.type !== resolved.type) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.addSwitchCase',
+          message: 'Switch case value must match the switch condition type',
+          input: value,
+        }),
+      )
+    }
+    const constantIndex =
+      resolved.operand._tag === 'Constant' ? resolved.operand.constant : undefined
+    if (constantIndex === undefined) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.addSwitchCase',
+          message: 'Switch cases must be module constants',
+          input: value,
+        }),
+      )
+    }
+    if (instruction.cases.some((entry) => entry.value === constantIndex)) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.addSwitchCase',
+          message: 'Switch case values must be unique',
+          input: value,
+        }),
+      )
+    }
+    const block = yield* FunctionBodyState.resolveBlock(
+      draft,
+      destination,
+      'FunctionBody.addSwitchCase',
+    )
+    draft.instructions[index] = {
+      ...instruction,
+      cases: [...instruction.cases, { value: constantIndex, block }],
+    }
+    yield* FunctionBodyState.addPredecessor(draft, block, predecessor)
+  })
+}
 
 /**
  * Finalizes a switch exactly once and records predecessor edges for every destination.
@@ -386,54 +409,51 @@ export const addSwitchCase = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const sealSwitch = Effect.fnUntraced(function* (
+export const sealSwitch = (
   self: FunctionBody,
   switchHandle: Switch,
-): Effect.fn.Return<Instruction, LlvmError> {
-  return yield* FunctionBodyState.mutate(self, 'FunctionBody.sealSwitch', (draft) =>
-    Result.gen(function* () {
-      const { index } = yield* FunctionBodyState.resolveSwitch(
-        draft,
-        switchHandle,
-        'FunctionBody.sealSwitch',
-      )
-      const instruction = draft.instructions[index]
-      if (instruction?._tag !== 'Switch' || instruction.sealed) {
-        return yield* Result.fail(
-          invalidState({
-            operation: 'FunctionBody.sealSwitch',
-            message: 'Switch is missing or already finalized',
-            state: switchHandle,
-          }),
-        )
-      }
-      if (
-        instruction.weights.length > 0 &&
-        instruction.weights.length !== instruction.cases.length + 1
-      ) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.sealSwitch',
-            message: 'Switch weights must include the default and every case',
-            input: instruction.weights,
-          }),
-        )
-      }
-      draft.instructions[index] = { ...instruction, sealed: true }
-      const handle = draft.instructionHandles[index]
-      if (handle === undefined) {
-        return yield* Result.fail(
-          invalidState({
-            operation: 'FunctionBody.sealSwitch',
-            message: 'Switch instruction handle is missing',
-            state: switchHandle,
-          }),
-        )
-      }
-      return handle
-    }),
+): Effect.Effect<Instruction, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.sealSwitch', (draft) =>
+    sealSwitchIn(draft, switchHandle),
   )
-})
+
+/** @internal */
+export const sealSwitchIn = (
+  draft: FunctionBodyState.Draft,
+  switchHandle: Switch,
+): Result.Result<Instruction, LlvmError> => {
+  return Result.gen(function* () {
+    const { index } = yield* FunctionBodyState.resolveSwitch(
+      draft,
+      switchHandle,
+      'FunctionBody.sealSwitch',
+    )
+    const instruction = draft.instructions[index]
+    if (instruction?._tag !== 'Switch' || instruction.sealed) {
+      return yield* Result.fail(
+        invalidState({
+          operation: 'FunctionBody.sealSwitch',
+          message: 'Switch is missing or already finalized',
+          state: switchHandle,
+        }),
+      )
+    }
+    if (
+      instruction.weights.length > 0 &&
+      instruction.weights.length !== instruction.cases.length + 1
+    ) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.sealSwitch',
+          message: 'Switch weights must include the default and every case',
+          input: instruction.weights,
+        }),
+      )
+    }
+    draft.instructions[index] = { ...instruction, sealed: true }
+    return yield* FunctionBodyState.instructionHandleAt(draft, index, 'FunctionBody.sealSwitch')
+  })
+}
 
 /**
  * Terminates the insertion block by returning a value matching the function return type.
@@ -441,36 +461,41 @@ export const sealSwitch = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const returnValue = Effect.fnUntraced(function* (
+export const returnValue = (
   self: FunctionBody,
   value: Value.Input,
-): Effect.fn.Return<Instruction, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.returnValue', (draft, module) =>
-    Result.gen(function* () {
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        value,
-        'FunctionBody.returnValue',
-      )
-      if (resolved.type !== draft.returnType) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.returnValue',
-            message: 'Return value does not match the function return type',
-            input: value,
-          }),
-        )
-      }
-      return yield* FunctionBodyState.appendInstruction(draft, {
-        _tag: 'Return',
-        value: resolved.operand,
-        result: undefined,
-        name: ByteString.empty,
-      })
-    }),
+): Effect.Effect<Instruction, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.returnValue', (draft) => returnValueIn(draft, value))
+
+/** @internal */
+export const returnValueIn = (
+  draft: FunctionBodyState.Draft,
+  value: Value.Input,
+): Result.Result<Instruction, LlvmError> => {
+  const module = draft.module
+  const resolved = FunctionBodyState.resolveOperand(
+    draft,
+    module,
+    value,
+    'FunctionBody.returnValue',
   )
-})
+  if (Result.isFailure(resolved)) return Result.fail(resolved.failure)
+  if (resolved.success.type !== draft.returnType) {
+    return Result.fail(
+      invalidInput({
+        operation: 'FunctionBody.returnValue',
+        message: 'Return value does not match the function return type',
+        input: value,
+      }),
+    )
+  }
+  return FunctionBodyState.appendInstruction(draft, {
+    _tag: 'Return',
+    value: resolved.success.operand,
+    result: undefined,
+    name: ByteString.empty,
+  })
+}
 
 /**
  * Terminates the insertion block with `ret void` after checking the signature.
@@ -478,33 +503,31 @@ export const returnValue = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const returnVoid = Effect.fnUntraced(function* (
-  self: FunctionBody,
-): Effect.fn.Return<Instruction, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.returnVoid', (draft, module) =>
-    Result.gen(function* () {
-      const returnType = yield* FunctionBodyState.typeAt(
-        module,
-        draft.returnType,
-        'FunctionBody.returnVoid',
-      )
-      if (returnType._tag !== 'Simple' || returnType.tag !== 'Void') {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.returnVoid',
-            message: 'returnVoid requires a void function return type',
-            input: draft.returnType,
-          }),
-        )
-      }
-      return yield* FunctionBodyState.appendInstruction(draft, {
-        _tag: 'ReturnVoid',
-        result: undefined,
-        name: ByteString.empty,
-      })
-    }),
-  )
-})
+export const returnVoid = (self: FunctionBody): Effect.Effect<Instruction, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.returnVoid', (draft) => returnVoidIn(draft))
+
+/** @internal */
+export const returnVoidIn = (
+  draft: FunctionBodyState.Draft,
+): Result.Result<Instruction, LlvmError> => {
+  const module = draft.module
+  const returnType = FunctionBodyState.typeAt(module, draft.returnType, 'FunctionBody.returnVoid')
+  if (Result.isFailure(returnType)) return Result.fail(returnType.failure)
+  if (returnType.success._tag !== 'Simple' || returnType.success.tag !== 'Void') {
+    return Result.fail(
+      invalidInput({
+        operation: 'FunctionBody.returnVoid',
+        message: 'returnVoid requires a void function return type',
+        input: draft.returnType,
+      }),
+    )
+  }
+  return FunctionBodyState.appendInstruction(draft, {
+    _tag: 'ReturnVoid',
+    result: undefined,
+    name: ByteString.empty,
+  })
+}
 
 /**
  * Terminates the insertion block with LLVM's `unreachable` instruction.
@@ -512,17 +535,18 @@ export const returnVoid = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const unreachable = Effect.fnUntraced(function* (
-  self: FunctionBody,
-): Effect.fn.Return<Instruction, LlvmError> {
-  return yield* FunctionBodyState.mutate(self, 'FunctionBody.unreachable', (draft) =>
-    FunctionBodyState.appendInstruction(draft, {
-      _tag: 'Unreachable',
-      result: undefined,
-      name: ByteString.empty,
-    }),
-  )
-})
+export const unreachable = (self: FunctionBody): Effect.Effect<Instruction, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.unreachable', (draft) => unreachableIn(draft))
+
+/** @internal */
+export const unreachableIn = (
+  draft: FunctionBodyState.Draft,
+): Result.Result<Instruction, LlvmError> =>
+  FunctionBodyState.appendInstruction(draft, {
+    _tag: 'Unreachable',
+    result: undefined,
+    name: ByteString.empty,
+  })
 
 /**
  * Begins a cleanup-only Itanium exception handler with the canonical `{ ptr, i32 }` result.
@@ -534,30 +558,40 @@ export const unreachable = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const cleanupLandingPad = Effect.fn('FunctionBody.cleanupLandingPad')(function* (
+export const cleanupLandingPad = (
   self: FunctionBody,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Value, LlvmError> {
-  const builder = yield* FunctionBodyState.builder(self)
-  const type = yield* Type.structure(builder, [
-    yield* Type.pointer(builder),
-    yield* Type.integer(builder, 32),
-  ])
-  return yield* FunctionBodyState.mutate(self, 'FunctionBody.cleanupLandingPad', (draft) =>
-    Result.gen(function* () {
-      const typeIndex = yield* HandleActor.resolve(
-        draft.builder,
-        draft.moduleOwner,
-        type,
-        'Type',
-        'FunctionBody.cleanupLandingPad',
-      )
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        typeIndex,
-        name,
-        (result, finalName) => ({ _tag: 'LandingPad', result, name: finalName, type: typeIndex }),
-      )).value
-    }),
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.cleanupLandingPad', (draft) =>
+    cleanupLandingPadIn(draft, name),
   )
-})
+
+/** @internal */
+export const cleanupLandingPadIn = (
+  draft: FunctionBodyState.Draft,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Value, LlvmError> => {
+  const pointer = Type.internIn(draft.context, {
+    _tag: 'Pointer',
+    addressSpace: AddrSpace.defaultAddrSpace,
+  })
+  if (Result.isFailure(pointer)) return Result.fail(pointer.failure)
+  const i32 = Type.internIn(draft.context, { _tag: 'Integer', bitWidth: 32 })
+  if (Result.isFailure(i32)) return Result.fail(i32.failure)
+  const type = Type.structureIn(draft.context, [pointer.success, i32.success])
+  if (Result.isFailure(type)) return Result.fail(type.failure)
+  const typeIndex = HandleActor.resolve(
+    draft.builder,
+    draft.moduleOwner,
+    type.success,
+    'Type',
+    'FunctionBody.cleanupLandingPad',
+  )
+  if (Result.isFailure(typeIndex)) return Result.fail(typeIndex.failure)
+  return FunctionBodyState.appendResult(draft, typeIndex.success, name, (result, finalName) => ({
+    _tag: 'LandingPad',
+    result,
+    name: finalName,
+    type: typeIndex.success,
+  }))
+}

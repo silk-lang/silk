@@ -166,9 +166,23 @@ const ofTypeInner = (
   return join(fields)
 }
 
+const ofTypeCache = new WeakMap<DeclarationIndex.Index, Map<string, ExecutionAffinity>>()
+
 /** Derives affinity from one canonical semantic type. */
-export const ofType = (index: DeclarationIndex.Index, type: Type.Type): ExecutionAffinity =>
-  ofTypeInner(index, type, new Set())
+export const ofType = (index: DeclarationIndex.Index, type: Type.Type): ExecutionAffinity => {
+  let cache = ofTypeCache.get(index)
+  if (cache === undefined) {
+    cache = new Map()
+    ofTypeCache.set(index, cache)
+  }
+  const key = Type.key(type)
+  let affinity = cache.get(key)
+  if (affinity === undefined) {
+    affinity = ofTypeInner(index, type, new Set())
+    cache.set(key, affinity)
+  }
+  return affinity
+}
 
 /** Derives affinity while preserving causal evidence for a damaged declared type. */
 export const ofDeclaredType = (

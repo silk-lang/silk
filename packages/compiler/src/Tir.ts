@@ -154,12 +154,21 @@ export interface Local {
 }
 
 /** The canonical text of an artifact identity: the key a body is requested and stored under. */
-export const artifactKey = (self: ArtifactId): string =>
-  JSON.stringify([
-    AuthoredIdentity.key(self.owner),
-    self.request._tag === 'Check' ? null : self.request.application,
-    self.parent === undefined ? null : artifactKey(self.parent),
-  ])
+// Artifact identities are immutable and keyed on every node, borrow, and site lookup.
+const artifactKeys = new WeakMap<ArtifactId, string>()
+
+export const artifactKey = (self: ArtifactId): string => {
+  let key = artifactKeys.get(self)
+  if (key === undefined) {
+    key = JSON.stringify([
+      AuthoredIdentity.key(self.owner),
+      self.request._tag === 'Check' ? null : self.request.application,
+      self.parent === undefined ? null : artifactKey(self.parent),
+    ])
+    artifactKeys.set(self, key)
+  }
+  return key
+}
 
 /** Canonical identity of one executable node across checked artifacts. */
 export const nodeRefKey = (self: NodeRef): string =>
@@ -1570,17 +1579,29 @@ export const expressionChildren = (expression: Expression): ReadonlyArray<Expres
 
 /** One expression and all of its semantic children in deterministic preorder. */
 export const expressionTree = (expression: Expression): ReadonlyArray<Expression> => {
-  const children = expressionChildren(expression)
-  return [expression, ...children.flatMap(expressionTree)]
+  // One output array: nested flatMap/spread copied every subtree once per ancestor.
+  const tree: Array<Expression> = []
+  const collect = (node: Expression): void => {
+    tree.push(node)
+    for (const child of expressionChildren(node)) collect(child)
+  }
+  collect(expression)
+  return tree
 }
 
 /** Runtime-bearing expression children; sealed assembly metadata never acquires data storage. */
 export const runtimeExpressionTree = (expression: Expression): ReadonlyArray<Expression> => {
-  const children =
-    expression._tag === 'BuiltinCall' && expression.operation === 'NativeAssembly'
-      ? expression.arguments.slice(6)
-      : expressionChildren(expression)
-  return [expression, ...children.flatMap(runtimeExpressionTree)]
+  const tree: Array<Expression> = []
+  const collect = (node: Expression): void => {
+    tree.push(node)
+    const children =
+      node._tag === 'BuiltinCall' && node.operation === 'NativeAssembly'
+        ? node.arguments.slice(6)
+        : expressionChildren(node)
+    for (const child of children) collect(child)
+  }
+  collect(expression)
+  return tree
 }
 
 /** Reachable return operands in this execution boundary, including eager ordinary arms. */

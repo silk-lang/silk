@@ -1308,8 +1308,14 @@ export interface CodegenRequest extends Backend.CodegenRequest {
 }
 
 /** Emits the snapshot's lowered program through LLVM. */
+/** What backend emission reads from a realized program; editor indexes are not part of it. */
+export type CodegenInput = Pick<
+  Snapshot,
+  'closure' | 'diagnostics' | 'instances' | 'mir' | 'profile' | 'target'
+>
+
 export const codegen = Effect.fn('Analysis.codegen')(function* (
-  self: Snapshot,
+  self: CodegenInput,
   request: CodegenRequest,
 ): Effect.fn.Return<
   Backend.LlvmBitcodeArtifact,
@@ -1393,10 +1399,7 @@ export const codegen = Effect.fn('Analysis.codegen')(function* (
     sources:
       request.sources ??
       new Map(
-        self.closure.modules.map((module) => [
-          module.name,
-          Uint8Array.from(module.syntax.source.bytes),
-        ]),
+        self.closure.modules.map((module) => [module.name, module.syntax.source.bytes.slice()]),
       ),
   })
 })

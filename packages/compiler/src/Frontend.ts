@@ -645,6 +645,7 @@ const selectModules = Effect.fn('Frontend.selectModules')(function* (
   closure: ModuleClosure.Closure,
   roots: AdditionalRoots,
   completion: ProfileBootstrap.Completion,
+  bootstrap: ModuleSelection.Headers,
 ) {
   const selected = yield* ModuleSelection.select(
     {
@@ -662,6 +663,7 @@ const selectModules = Effect.fn('Frontend.selectModules')(function* (
       ],
     },
     completion,
+    bootstrap,
   )
   const selectedClosure = ModuleClosure.view(selected.closure, closure.rootModule)
   if (selectedClosure === undefined) throw new RangeError('Module selection lost its root')
@@ -750,7 +752,7 @@ export const frontend = Effect.fn('Frontend.frontend')(function* (
   const configured = yield* Realization.configure(unselected, request.target)
   if (configured.completion === undefined)
     return yield* diagnoseIncompleteProfile(configured.frontend, closure, request.target)
-  const selected = yield* selectModules(request, closure, roots, configured.completion)
+  const selected = yield* selectModules(request, closure, roots, configured.completion, facts)
   const selectedFacts = yield* analyzeFrontend(
     selected.closure,
     report,
@@ -862,7 +864,7 @@ const configureProjectSelection = Effect.fn('Frontend.configureProjectSelection'
     )
     profile = configured.completion?.profile
     if (configured.completion !== undefined && ModuleSelection.required(closure)) {
-      const selected = yield* ModuleSelection.select(request, closure, configured.completion)
+      const selected = yield* ModuleSelection.select(request, closure, configured.completion, base)
       closure = selected.closure
       selection = selected.selection
     } else if (configured.completion === undefined) {

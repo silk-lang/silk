@@ -19,13 +19,22 @@ const sameRequirement = (left: Type.Requirement, right: Type.Requirement): boole
   left.access === right.access &&
   Type.equals(left.capability, right.capability)
 
+// Runner keys are rebuilt for every lowered Effect site over the same immutable contract types;
+// the key is memoized on the contract object itself, like `Type.key`.
+const cachedKey: unique symbol = Symbol('EffectExecutionContract.key')
+
 /** Semantic machine identity after erasing only outer access and executable lifetime proofs. */
-export const key = (self: Type.Effect): string =>
-  JSON.stringify([
+export const key = (self: Type.Effect): string => {
+  const cached: unknown = Reflect.get(self, cachedKey)
+  if (typeof cached === 'string') return cached
+  const computed = JSON.stringify([
     Type.key(self.success),
     RowAlgebra.key(Type.failureRowPolicy(), self.failureRow),
     RowAlgebra.key(Type.requirementRowPolicy(), self.requirementRow),
   ])
+  if (Object.isExtensible(self)) Object.defineProperty(self, cachedKey, { value: computed })
+  return computed
+}
 
 /** Exact executable channels; outer access and executable lifetime proofs are non-runtime facts. */
 export const equals = (left: Type.Effect, right: Type.Effect): boolean =>

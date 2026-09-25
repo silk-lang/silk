@@ -21,16 +21,13 @@ export interface LexicalResult {
 const isWhitespace = (byte: number | undefined): boolean =>
   byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d
 
-const isLineCommentStart = (bytes: ReadonlyArray<number>, index: number): boolean =>
+const isLineCommentStart = (bytes: Uint8Array, index: number): boolean =>
   bytes[index] === 0x2f && bytes[index + 1] === 0x2f
 
-const isLiteralStart = (bytes: ReadonlyArray<number>, index: number): boolean =>
+const isLiteralStart = (bytes: Uint8Array, index: number): boolean =>
   LiteralForm.recognize(bytes, index) !== undefined
 
-const compoundPunctuationKind = (
-  bytes: ReadonlyArray<number>,
-  index: number,
-): Token.TokenKind | undefined => {
+const compoundPunctuationKind = (bytes: Uint8Array, index: number): Token.TokenKind | undefined => {
   const first = bytes[index]
   const second = bytes[index + 1]
   if (first === 0x2d && second === 0x3e) return 'Arrow'
@@ -46,7 +43,7 @@ const compoundPunctuationKind = (
   return undefined
 }
 
-const isSupportedTokenStart = (bytes: ReadonlyArray<number>, index: number): boolean => {
+const isSupportedTokenStart = (bytes: Uint8Array, index: number): boolean => {
   const byte = bytes[index]
   return (
     isWhitespace(byte) ||
@@ -99,7 +96,7 @@ const keywordSpellings: ReadonlyArray<readonly [string, Token.TokenKind]> = [
 ]
 
 const matchesSpelling = (
-  bytes: ReadonlyArray<number>,
+  bytes: Uint8Array,
   start: number,
   end: number,
   spelling: string,
@@ -114,7 +111,7 @@ const matchesSpelling = (
 // Length buckets avoid comparing an identifier against keywords it cannot possibly match.
 const keywordsByLength = Array.groupBy(keywordSpellings, ([spelling]) => String(spelling.length))
 
-const keywordKind = (bytes: ReadonlyArray<number>, start: number, end: number): Token.TokenKind =>
+const keywordKind = (bytes: Uint8Array, start: number, end: number): Token.TokenKind =>
   Array.findFirst(keywordsByLength[end - start] ?? [], ([spelling]) =>
     matchesSpelling(bytes, start, end, spelling),
   ).pipe(
@@ -195,11 +192,7 @@ interface DigitRun {
  * rather than starting an identifier, which is what lets one diagnostic carry the literal's span.
  * A separator is well placed only with a digit of the same run on each side.
  */
-const scanDigitRun = (
-  bytes: ReadonlyArray<number>,
-  base: IntegerLiteral.Base,
-  from: number,
-): DigitRun => {
+const scanDigitRun = (bytes: Uint8Array, base: IntegerLiteral.Base, from: number): DigitRun => {
   let at = from
   let digits = false
   let separated = true

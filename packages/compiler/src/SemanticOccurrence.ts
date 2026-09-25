@@ -218,7 +218,7 @@ const locationOfField = (
   field: DeclarationFacts.FieldFact,
 ): LocatedDeclaration | undefined => {
   const declarationId = DeclarationFacts.fieldDeclaration(field.id)
-  const module = index.modules.find((candidate) => candidate.module === declarationId.sourceId)
+  const module = DeclarationFacts.moduleHeaders(index, declarationId.sourceId)
   const owner = field.id.owner
   const current =
     (owner._tag === 'StructFieldOwnerId'
@@ -1758,7 +1758,7 @@ export const makeModule = (
 ): ModuleIndex => {
   const pending: Array<Pending> = []
   const scope = NameResolution.scopeOf(resolution, module)
-  const headers = index.modules.find((candidate) => candidate.module === module)
+  const headers = DeclarationFacts.moduleHeaders(index, module)
   for (const member of headers?.members ?? []) collectMember(member, index, spans, scope, pending)
   for (const head of headers?.inherentImpls ?? []) collectInherentImpl(head, index, scope, pending)
   for (const conformance of headers?.conformances ?? [])

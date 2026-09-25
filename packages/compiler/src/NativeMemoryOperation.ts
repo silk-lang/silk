@@ -1,13 +1,8 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativePayload from './NativePayload.js'
 import * as NativePlace from './NativePlace.js'
-import * as Alignment from '@silklang/llvm/Alignment'
 import * as LlvmBlock from '@silklang/llvm/Block'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import * as Intrinsic from '@silklang/llvm/Intrinsic'
-import * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as Layout from './Layout.js'
 import * as LayoutVerify from './LayoutVerify.js'
 import type { LinearOperation } from './MirLinearization.js'
@@ -44,7 +39,7 @@ type Operation = Extract<
   }
 >
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const {
     body,
     builder,
@@ -66,7 +61,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
   const checkOrdinal = context.state.checkOrdinal
   switch (operation._tag) {
     case 'Allocate': {
-      const [bytes, alignment] = yield* NativeStorage.materialize(nativeStorage, operation.layout)
+      const [bytes, alignment] = NativeStorage.materialize(nativeStorage, operation.layout)
       if (
         bytes === undefined ||
         alignment === undefined ||
@@ -75,9 +70,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       ) {
         throw new RangeError('LLVM allocation lost its platform boundary')
       }
-      const one = yield* Constant.integerUnsigned(builder, usizeType, 1n)
-      const zero = yield* Constant.integerUnsigned(builder, usizeType, 0n)
-      const padding = yield* FunctionBody.binary(
+      const one = Emitter.integerUnsigned(builder, usizeType, 1n)
+      const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
+      const padding = Emitter.binary(
         body,
         'sub',
         alignment,
@@ -87,14 +82,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const usizeBits = program.layout.target.pointerSize * 8
       let unsignedOverflowSignature = unsignedOverflowSignatures.get(usizeBits)
       if (unsignedOverflowSignature === undefined) {
-        const i1 = yield* LlvmType.integer(builder, 1)
+        const i1 = Emitter.integerType(builder, 1)
         unsignedOverflowSignature = {
-          returnType: yield* LlvmType.structure(builder, [usizeType, i1]),
+          returnType: Emitter.structureType(builder, [usizeType, i1]),
           parameters: [usizeType, usizeType],
         }
         unsignedOverflowSignatures.set(usizeBits, unsignedOverflowSignature)
       }
-      const requestPair = yield* Intrinsic.call(
+      const requestPair = Emitter.intrinsicCall(
         body,
         'uadd.with.overflow',
         [usizeType],
@@ -105,96 +100,90 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (requestPair === undefined) {
         throw new RangeError('LLVM allocation size calculation produced no value')
       }
-      const requested = yield* FunctionBody.extractValue(
+      const requested = Emitter.extractValue(
         body,
         requestPair,
         [0],
         `allocation${operation.destination.ordinal}_requested`,
       )
-      const overflowed = yield* FunctionBody.extractValue(
+      const overflowed = Emitter.extractValue(
         body,
         requestPair,
         [1],
         `allocation${operation.destination.ordinal}_overflowed`,
       )
-      const empty = yield* FunctionBody.integerCompare(
+      const empty = Emitter.integerCompare(
         body,
         'eq',
         requested,
         zero,
         `allocation${operation.destination.ordinal}_empty`,
       )
-      const physicalSize = yield* FunctionBody.select(
+      const physicalSize = Emitter.select(
         body,
         empty,
         one,
         requested,
         `allocation${operation.destination.ordinal}_physical_size`,
       )
-      const raw = yield* FunctionBody.callDirect(
+      const raw = Emitter.callDirect(
         body,
         malloc,
         [physicalSize],
         `allocation${operation.destination.ordinal}_raw`,
       )
       if (raw === undefined) throw new RangeError('LLVM malloc returned no value')
-      const rawAddress = yield* FunctionBody.cast(
+      const rawAddress = Emitter.cast(
         body,
         'ptrtoint',
         raw,
         usizeType,
         `allocation${operation.destination.ordinal}_context`,
       )
-      const missing = yield* FunctionBody.integerCompare(
+      const missing = Emitter.integerCompare(
         body,
         'eq',
         rawAddress,
         zero,
         `allocation${operation.destination.ordinal}_missing`,
       )
-      const rejected = yield* FunctionBody.binary(
+      const rejected = Emitter.binary(
         body,
         'or',
         overflowed,
         missing,
         `allocation${operation.destination.ordinal}_rejected`,
       )
-      const failed = yield* LlvmBlock.make(
-        body,
-        `allocation${operation.destination.ordinal}_failure`,
-      )
-      const acquired = yield* LlvmBlock.make(
-        body,
-        `allocation${operation.destination.ordinal}_success`,
-      )
-      yield* FunctionBody.conditionalBranch(body, rejected, failed, acquired)
-      yield* LlvmBlock.setInsertionPoint(body, failed)
+      const failed = Emitter.block(body, `allocation${operation.destination.ordinal}_failure`)
+      const acquired = Emitter.block(body, `allocation${operation.destination.ordinal}_success`)
+      Emitter.conditionalBranch(body, rejected, failed, acquired)
+      Emitter.setInsertionPoint(body, failed)
       if (free === undefined) throw new RangeError('LLVM allocation lost release shim')
-      yield* FunctionBody.callDirect(body, free, [raw])
-      yield* NativeHostFailure.emit(hostFailure, operation)
-      yield* LlvmBlock.setInsertionPoint(body, acquired)
-      const advanced = yield* FunctionBody.binary(
+      Emitter.callDirect(body, free, [raw])
+      NativeHostFailure.emit(hostFailure, operation)
+      Emitter.setInsertionPoint(body, acquired)
+      const advanced = Emitter.binary(
         body,
         'add',
         rawAddress,
         padding,
         `allocation${operation.destination.ordinal}_advanced`,
       )
-      const mask = yield* FunctionBody.binary(
+      const mask = Emitter.binary(
         body,
         'sub',
         zero,
         alignment,
         `allocation${operation.destination.ordinal}_mask`,
       )
-      const base = yield* FunctionBody.binary(
+      const base = Emitter.binary(
         body,
         'and',
         advanced,
         mask,
         `allocation${operation.destination.ordinal}_base`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
         base,
         bytes,
         alignment,
@@ -205,8 +194,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'RawBufferFrom': {
-      const allocation = yield* NativeStorage.materialize(nativeStorage, operation.allocation)
-      const count = (yield* NativeStorage.materialize(nativeStorage, operation.count)).at(0)
+      const allocation = NativeStorage.materialize(nativeStorage, operation.allocation)
+      const count = NativeStorage.materialize(nativeStorage, operation.count).at(0)
       const bytes = allocation.at(1)
       const alignment = allocation.at(2)
       if (
@@ -217,53 +206,47 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       ) {
         throw new RangeError('LLVM RawBuffer construction lost its lanes')
       }
-      const expected = yield* FunctionBody.binary(
+      const expected = Emitter.binary(
         body,
         'mul',
         count,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
         `raw_buffer${operation.destination.ordinal}_bytes`,
       )
-      const bytesMismatch = yield* FunctionBody.integerCompare(
+      const bytesMismatch = Emitter.integerCompare(
         body,
         'ne',
         expected,
         bytes,
         `raw_buffer${operation.destination.ordinal}_bytes_mismatch`,
       )
-      const alignmentMismatch = yield* FunctionBody.integerCompare(
+      const alignmentMismatch = Emitter.integerCompare(
         body,
         'ne',
         alignment,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.elementAlignment)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.elementAlignment)),
         `raw_buffer${operation.destination.ordinal}_alignment_mismatch`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         bytesMismatch,
         alignmentMismatch,
         `raw_buffer${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'invalid raw buffer layout',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_buffer${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
-        ...allocation,
-        count,
-      ])
+      const accepted = Emitter.block(body, `raw_buffer${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [...allocation, count])
       break
     }
     case 'SharedFromAllocation': {
-      const allocation = yield* NativeStorage.materialize(nativeStorage, operation.allocation)
+      const allocation = NativeStorage.materialize(nativeStorage, operation.allocation)
       const baseAddress = allocation.at(0)
       const bytes = allocation.at(1)
       const alignment = allocation.at(2)
@@ -274,50 +257,47 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         usizeType === undefined
       )
         throw new RangeError('LLVM local-shared initialization lost its allocation lanes')
-      const bytesMismatch = yield* FunctionBody.integerCompare(
+      const bytesMismatch = Emitter.integerCompare(
         body,
         'ne',
         bytes,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.block.size)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.block.size)),
         `shared${operation.destination.ordinal}_bytes_mismatch`,
       )
-      const alignmentMismatch = yield* FunctionBody.integerCompare(
+      const alignmentMismatch = Emitter.integerCompare(
         body,
         'ne',
         alignment,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.block.alignment)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.block.alignment)),
         `shared${operation.destination.ordinal}_alignment_mismatch`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         bytesMismatch,
         alignmentMismatch,
         `shared${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'invalid shared allocation layout',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `shared${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
-      const base = yield* FunctionBody.cast(
+      const accepted = Emitter.block(body, `shared${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
+      const base = Emitter.cast(
         body,
         'inttoptr',
         baseAddress,
         pointer,
         `shared${operation.destination.ordinal}_base`,
       )
-      const storeWord = Effect.fnUntraced(function* (offset: number, value: Value.Input) {
-        yield* FunctionBody.store(
+      const storeWord = (offset: number, value: Value.Input) => {
+        Emitter.store(
           body,
           value,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -325,15 +305,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `shared${operation.destination.ordinal}_${offset}_ptr`,
           ),
         )
-      })
-      yield* storeWord(
-        operation.block.strongOffset,
-        yield* Constant.integerUnsigned(builder, usizeType, 1n),
-      )
-      yield* storeWord(
-        operation.block.accessOffset,
-        yield* Constant.integerUnsigned(builder, usizeType, 0n),
-      )
+      }
+      storeWord(operation.block.strongOffset, Emitter.integerUnsigned(builder, usizeType, 1n))
+      storeWord(operation.block.accessOffset, Emitter.integerUnsigned(builder, usizeType, 0n))
       const allocationLanes = Layout.callingShape(program.layout, SilkType.allocation)?.lanes
       if (allocationLanes === undefined)
         throw new RangeError('LLVM local-shared initialization lost its calling shapes')
@@ -342,14 +316,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const offset = LayoutVerify.laneOffset(program.layout, SilkType.allocation, lane.path)
         if (value === undefined || offset === undefined)
           throw new RangeError('LLVM local-shared initialization lost reclaim provenance')
-        yield* storeWord(operation.block.allocationOffset + offset, value)
+        storeWord(operation.block.allocationOffset + offset, value)
       }
-      yield* NativeStorage.sendPlace(
+      NativeStorage.sendPlace(
         nativeStorage,
         NativePlace.stored(
           program.layout,
           operation.element,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             lanePointers,
             body,
             base,
@@ -359,70 +333,67 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         operation.value,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [baseAddress])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [baseAddress])
       break
     }
     case 'SharedClone': {
-      const self = (yield* NativeStorage.materialize(nativeStorage, operation.self)).at(0)
+      const self = NativeStorage.materialize(nativeStorage, operation.self).at(0)
       if (self === undefined || usizeType === undefined)
         throw new RangeError('LLVM local-shared clone lost its borrowed handle')
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
         self,
         `shared${operation.destination.ordinal}_base_address`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         baseAddress,
         pointer,
         `shared${operation.destination.ordinal}_base`,
       )
-      const countPointer = yield* NativeLanePointer.lanePointer(
+      const countPointer = NativeLanePointer.lanePointer(
         lanePointers,
         body,
         base,
         operation.block.strongOffset,
         `shared${operation.destination.ordinal}_strong_ptr`,
       )
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
         countPointer,
         `shared${operation.destination.ordinal}_strong`,
       )
-      const overflow = yield* FunctionBody.integerCompare(
+      const overflow = Emitter.integerCompare(
         body,
         'eq',
         count,
-        yield* Constant.integerUnsigned(builder, usizeType, operation.block.strongMaximum),
+        Emitter.integerUnsigned(builder, usizeType, operation.block.strongMaximum),
         `shared${operation.destination.ordinal}_overflow`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'shared count overflow',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `shared${operation.destination.ordinal}_clone_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, overflow, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
-      const incremented = yield* FunctionBody.binary(
+      const accepted = Emitter.block(body, `shared${operation.destination.ordinal}_clone_accepted`)
+      Emitter.conditionalBranch(body, overflow, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
+      const incremented = Emitter.binary(
         body,
         'add',
         count,
-        yield* Constant.integerUnsigned(builder, usizeType, 1n),
+        Emitter.integerUnsigned(builder, usizeType, 1n),
         `shared${operation.destination.ordinal}_incremented`,
       )
-      yield* FunctionBody.store(body, incremented, countPointer)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [baseAddress])
+      Emitter.store(body, incremented, countPointer)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [baseAddress])
       break
     }
     case 'RawBufferCount': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
       const referenceType = entry.fn.localTypes.at(operation.buffer.ordinal)
       if (
         address === undefined ||
@@ -432,10 +403,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       ) {
         throw new RangeError('LLVM RawBuffer.count lost its referenced buffer')
       }
-      const value = yield* FunctionBody.load(
+      const value = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -444,12 +415,12 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_buffer_count${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [value])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [value])
       break
     }
     case 'RawBufferSlot': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
-      const index = (yield* NativeStorage.materialize(nativeStorage, operation.index)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
+      const index = NativeStorage.materialize(nativeStorage, operation.index).at(0)
       const element = Layout.entry(program.layout, operation.element)
       if (
         address === undefined ||
@@ -460,10 +431,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM RawBuffer.slot lost its storage provenance')
       }
       const bufferType = SilkType.rawBuffer(operation.element)
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -472,33 +443,30 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_slot${operation.destination.ordinal}_count`,
       )
-      const outOfBounds = yield* FunctionBody.integerCompare(
+      const outOfBounds = Emitter.integerCompare(
         body,
         'uge',
         index,
         count,
         `raw_slot${operation.destination.ordinal}_bounds`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'index out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_slot${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, outOfBounds, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
+      const accepted = Emitter.block(body, `raw_slot${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, outOfBounds, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
       const allocationOffset = NativeAggregate.fieldOffset(
         program.layout,
         bufferType,
         '$allocation',
       )
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -509,26 +477,26 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `raw_slot${operation.destination.ordinal}_base`,
       )
       const stride = Math.ceil(element.size / element.alignment) * element.alignment
-      const offset = yield* FunctionBody.binary(
+      const offset = Emitter.binary(
         body,
         'mul',
         index,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(stride)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(stride)),
         `raw_slot${operation.destination.ordinal}_offset`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         offset,
         `raw_slot${operation.destination.ordinal}_address`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [selected])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [selected])
       break
     }
     case 'RawBufferRead': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
-      const index = (yield* NativeStorage.materialize(nativeStorage, operation.index)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
+      const index = NativeStorage.materialize(nativeStorage, operation.index).at(0)
       const element = Layout.entry(program.layout, operation.element)
       if (
         address === undefined ||
@@ -539,10 +507,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM RawBuffer.read lost its storage provenance')
       }
       const bufferType = SilkType.rawBuffer(operation.element)
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -551,33 +519,30 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_read${operation.destination.ordinal}_count`,
       )
-      const outOfBounds = yield* FunctionBody.integerCompare(
+      const outOfBounds = Emitter.integerCompare(
         body,
         'uge',
         index,
         count,
         `raw_read${operation.destination.ordinal}_bounds`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'index out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_read${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, outOfBounds, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
+      const accepted = Emitter.block(body, `raw_read${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, outOfBounds, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
       const allocationOffset = NativeAggregate.fieldOffset(
         program.layout,
         bufferType,
         '$allocation',
       )
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -588,28 +553,28 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `raw_read${operation.destination.ordinal}_base`,
       )
       const stride = Math.ceil(element.size / element.alignment) * element.alignment
-      const offset = yield* FunctionBody.binary(
+      const offset = Emitter.binary(
         body,
         'mul',
         index,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(stride)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(stride)),
         `raw_read${operation.destination.ordinal}_offset`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         offset,
         `raw_read${operation.destination.ordinal}_address`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         selected,
         pointer,
         `raw_read${operation.destination.ordinal}_element_ptr`,
       )
-      yield* NativeStorage.receivePlace(
+      NativeStorage.receivePlace(
         nativeStorage,
         operation.destination,
         NativePlace.stored(program.layout, operation.element, base),
@@ -617,11 +582,11 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'SliceView': {
-      const lanes = yield* NativeStorage.materialize(nativeStorage, operation.slice)
+      const lanes = NativeStorage.materialize(nativeStorage, operation.slice)
       const source = lanes.at(0)
       const count = lanes.at(1)
-      const offset = (yield* NativeStorage.materialize(nativeStorage, operation.offset)).at(0)
-      const length = (yield* NativeStorage.materialize(nativeStorage, operation.length)).at(0)
+      const offset = NativeStorage.materialize(nativeStorage, operation.offset).at(0)
+      const length = NativeStorage.materialize(nativeStorage, operation.length).at(0)
       if (
         source === undefined ||
         count === undefined ||
@@ -631,80 +596,77 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       ) {
         throw new RangeError('LLVM Slice.view lost its view lanes or bounds')
       }
-      const offsetOutOfBounds = yield* FunctionBody.integerCompare(
+      const offsetOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         offset,
         count,
         `slice_view${operation.destination.ordinal}_offset_bounds`,
       )
-      const remaining = yield* FunctionBody.binary(
+      const remaining = Emitter.binary(
         body,
         'sub',
         count,
         offset,
         `slice_view${operation.destination.ordinal}_remaining`,
       )
-      const lengthOutOfBounds = yield* FunctionBody.integerCompare(
+      const lengthOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         length,
         remaining,
         `slice_view${operation.destination.ordinal}_length_bounds`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         offsetOutOfBounds,
         lengthOutOfBounds,
         `slice_view${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'slice range out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `slice_view${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
-      const baseAddress = yield* FunctionBody.cast(
+      const accepted = Emitter.block(body, `slice_view${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
+      const baseAddress = Emitter.cast(
         body,
         'ptrtoint',
         source,
         usizeType,
         `slice_view${operation.destination.ordinal}_base`,
       )
-      const byteOffset = yield* FunctionBody.binary(
+      const byteOffset = Emitter.binary(
         body,
         'mul',
         offset,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
         `slice_view${operation.destination.ordinal}_byte_offset`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         byteOffset,
         `slice_view${operation.destination.ordinal}_address`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         selected,
         pointer,
         `slice_view${operation.destination.ordinal}_ptr`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [base, length])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [base, length])
       break
     }
     case 'RawBufferView': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
-      const offset = (yield* NativeStorage.materialize(nativeStorage, operation.offset)).at(0)
-      const length = (yield* NativeStorage.materialize(nativeStorage, operation.length)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
+      const offset = NativeStorage.materialize(nativeStorage, operation.offset).at(0)
+      const length = NativeStorage.materialize(nativeStorage, operation.length).at(0)
       if (
         address === undefined ||
         offset === undefined ||
@@ -714,10 +676,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM RawBuffer.view lost its storage provenance')
       }
       const bufferType = SilkType.rawBuffer(operation.element)
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -726,54 +688,51 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_view${operation.destination.ordinal}_count`,
       )
-      const offsetOutOfBounds = yield* FunctionBody.integerCompare(
+      const offsetOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         offset,
         count,
         `raw_view${operation.destination.ordinal}_offset_bounds`,
       )
-      const remaining = yield* FunctionBody.binary(
+      const remaining = Emitter.binary(
         body,
         'sub',
         count,
         offset,
         `raw_view${operation.destination.ordinal}_remaining`,
       )
-      const lengthOutOfBounds = yield* FunctionBody.integerCompare(
+      const lengthOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         length,
         remaining,
         `raw_view${operation.destination.ordinal}_length_bounds`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         offsetOutOfBounds,
         lengthOutOfBounds,
         `raw_view${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'raw buffer range out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_view${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
+      const accepted = Emitter.block(body, `raw_view${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
       const allocationOffset = NativeAggregate.fieldOffset(
         program.layout,
         bufferType,
         '$allocation',
       )
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -783,37 +742,37 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_view${operation.destination.ordinal}_base`,
       )
-      const byteOffset = yield* FunctionBody.binary(
+      const byteOffset = Emitter.binary(
         body,
         'mul',
         offset,
-        yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
+        Emitter.integerUnsigned(builder, usizeType, BigInt(operation.stride)),
         `raw_view${operation.destination.ordinal}_byte_offset`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         byteOffset,
         `raw_view${operation.destination.ordinal}_address`,
       )
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         selected,
         pointer,
         `raw_view${operation.destination.ordinal}_ptr`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [base, length])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [base, length])
       break
     }
     case 'RawBufferCopy': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
-      const offset = (yield* NativeStorage.materialize(nativeStorage, operation.offset)).at(0)
-      const sourceLanes = yield* NativeStorage.materialize(nativeStorage, operation.source)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
+      const offset = NativeStorage.materialize(nativeStorage, operation.offset).at(0)
+      const sourceLanes = NativeStorage.materialize(nativeStorage, operation.source)
       const sourceAddress = sourceLanes.at(0)
       const sourceLength = sourceLanes.at(1)
-      const length = (yield* NativeStorage.materialize(nativeStorage, operation.length)).at(0)
+      const length = NativeStorage.materialize(nativeStorage, operation.length).at(0)
       const element = Layout.entry(program.layout, operation.element)
       if (
         address === undefined ||
@@ -827,10 +786,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM RawBuffer.copy lost its storage provenance')
       }
       const bufferType = SilkType.rawBuffer(operation.element)
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -839,68 +798,65 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_copy${operation.destination.ordinal}_count`,
       )
-      const offsetOutOfBounds = yield* FunctionBody.integerCompare(
+      const offsetOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         offset,
         count,
         `raw_copy${operation.destination.ordinal}_offset_bounds`,
       )
-      const remaining = yield* FunctionBody.binary(
+      const remaining = Emitter.binary(
         body,
         'sub',
         count,
         offset,
         `raw_copy${operation.destination.ordinal}_remaining`,
       )
-      const lengthOutOfBounds = yield* FunctionBody.integerCompare(
+      const lengthOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         length,
         remaining,
         `raw_copy${operation.destination.ordinal}_length_bounds`,
       )
-      const sourceOutOfBounds = yield* FunctionBody.integerCompare(
+      const sourceOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         length,
         sourceLength,
         `raw_copy${operation.destination.ordinal}_source_bounds`,
       )
-      const invalidRange = yield* FunctionBody.binary(
+      const invalidRange = Emitter.binary(
         body,
         'or',
         offsetOutOfBounds,
         lengthOutOfBounds,
         `raw_copy${operation.destination.ordinal}_range`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         invalidRange,
         sourceOutOfBounds,
         `raw_copy${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'raw buffer range out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_copy${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
+      const accepted = Emitter.block(body, `raw_copy${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
       const allocationOffset = NativeAggregate.fieldOffset(
         program.layout,
         bufferType,
         '$allocation',
       )
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -910,29 +866,29 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_copy${operation.destination.ordinal}_base`,
       )
-      const stride = yield* Constant.integerUnsigned(builder, usizeType, BigInt(operation.stride))
-      const byteOffset = yield* FunctionBody.binary(
+      const stride = Emitter.integerUnsigned(builder, usizeType, BigInt(operation.stride))
+      const byteOffset = Emitter.binary(
         body,
         'mul',
         offset,
         stride,
         `raw_copy${operation.destination.ordinal}_byte_offset`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         byteOffset,
         `raw_copy${operation.destination.ordinal}_address`,
       )
-      const target = yield* FunctionBody.cast(
+      const target = Emitter.cast(
         body,
         'inttoptr',
         selected,
         pointer,
         `raw_copy${operation.destination.ordinal}_ptr`,
       )
-      const byteLength = yield* FunctionBody.binary(
+      const byteLength = Emitter.binary(
         body,
         'mul',
         length,
@@ -940,18 +896,18 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `raw_copy${operation.destination.ordinal}_bytes`,
       )
       // memmove, not memcpy: an overlapping source and destination is a defined move.
-      yield* Intrinsic.memmove(body, target, sourceAddress, byteLength, {
-        destinationAlignment: yield* Alignment.fromByteUnits(element.alignment),
-        sourceAlignment: yield* Alignment.fromByteUnits(element.alignment),
+      Emitter.memmove(body, target, sourceAddress, byteLength, {
+        destinationAlignment: Emitter.alignment(body, element.alignment),
+        sourceAlignment: Emitter.alignment(body, element.alignment),
       })
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
       break
     }
     case 'RawBufferFill': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.buffer)).at(0)
-      const offset = (yield* NativeStorage.materialize(nativeStorage, operation.offset)).at(0)
-      const length = (yield* NativeStorage.materialize(nativeStorage, operation.length)).at(0)
-      const value = (yield* NativeStorage.materialize(nativeStorage, operation.value)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.buffer).at(0)
+      const offset = NativeStorage.materialize(nativeStorage, operation.offset).at(0)
+      const length = NativeStorage.materialize(nativeStorage, operation.length).at(0)
+      const value = NativeStorage.materialize(nativeStorage, operation.value).at(0)
       if (
         address === undefined ||
         offset === undefined ||
@@ -962,10 +918,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM RawBuffer.fill lost its storage provenance')
       }
       const bufferType = SilkType.rawBuffer('u8')
-      const count = yield* FunctionBody.load(
+      const count = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -974,54 +930,51 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_fill${operation.destination.ordinal}_count`,
       )
-      const offsetOutOfBounds = yield* FunctionBody.integerCompare(
+      const offsetOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         offset,
         count,
         `raw_fill${operation.destination.ordinal}_offset_bounds`,
       )
-      const remaining = yield* FunctionBody.binary(
+      const remaining = Emitter.binary(
         body,
         'sub',
         count,
         offset,
         `raw_fill${operation.destination.ordinal}_remaining`,
       )
-      const lengthOutOfBounds = yield* FunctionBody.integerCompare(
+      const lengthOutOfBounds = Emitter.integerCompare(
         body,
         'ugt',
         length,
         remaining,
         `raw_fill${operation.destination.ordinal}_length_bounds`,
       )
-      const invalid = yield* FunctionBody.binary(
+      const invalid = Emitter.binary(
         body,
         'or',
         offsetOutOfBounds,
         lengthOutOfBounds,
         `raw_fill${operation.destination.ordinal}_invalid`,
       )
-      trapBlock = yield* NativeTermination.trapBlock(
+      trapBlock = NativeTermination.trapBlock(
         context.termination,
         'raw buffer range out of bounds',
         operation.provenance.span,
       )
-      const accepted = yield* LlvmBlock.make(
-        body,
-        `raw_fill${operation.destination.ordinal}_accepted`,
-      )
-      yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, accepted)
-      yield* LlvmBlock.setInsertionPoint(body, accepted)
+      const accepted = Emitter.block(body, `raw_fill${operation.destination.ordinal}_accepted`)
+      Emitter.conditionalBranch(body, invalid, trapBlock, accepted)
+      Emitter.setInsertionPoint(body, accepted)
       const allocationOffset = NativeAggregate.fieldOffset(
         program.layout,
         bufferType,
         '$allocation',
       )
-      const baseAddress = yield* FunctionBody.load(
+      const baseAddress = Emitter.load(
         body,
         usizeType,
-        yield* NativeLanePointer.lanePointer(
+        NativeLanePointer.lanePointer(
           lanePointers,
           body,
           address,
@@ -1031,76 +984,58 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `raw_fill${operation.destination.ordinal}_base`,
       )
-      const selected = yield* FunctionBody.binary(
+      const selected = Emitter.binary(
         body,
         'add',
         baseAddress,
         offset,
         `raw_fill${operation.destination.ordinal}_address`,
       )
-      const target = yield* FunctionBody.cast(
+      const target = Emitter.cast(
         body,
         'inttoptr',
         selected,
         pointer,
         `raw_fill${operation.destination.ordinal}_ptr`,
       )
-      yield* Intrinsic.memset(body, target, value, length)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
+      Emitter.memset(body, target, value, length)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
       break
     }
     case 'SlotWrite': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.slot)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.slot).at(0)
       if (address === undefined || usizeType === undefined) {
         throw new RangeError('LLVM Slot.write lost its address')
       }
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         address,
         pointer,
         `slot_write${operation.destination.ordinal}_base`,
       )
-      yield* NativeStorage.sendPlace(
+      NativeStorage.sendPlace(
         nativeStorage,
         NativePlace.stored(program.layout, operation.element, base),
         operation.value,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
       break
     }
     case 'ValidateLayout': {
-      const bytes = (yield* NativeStorage.materialize(nativeStorage, operation.bytes)).at(0)
-      const alignment = (yield* NativeStorage.materialize(nativeStorage, operation.alignment)).at(0)
+      const bytes = NativeStorage.materialize(nativeStorage, operation.bytes).at(0)
+      const alignment = NativeStorage.materialize(nativeStorage, operation.alignment).at(0)
       if (bytes === undefined || alignment === undefined || usizeType === undefined) {
         throw new RangeError('LLVM layout validation lost its operands')
       }
       const name = `validate${operation.destination.ordinal}`
-      const zero = yield* Constant.integerUnsigned(builder, usizeType, 0n)
-      const one = yield* Constant.integerUnsigned(builder, usizeType, 1n)
-      const nonZero = yield* FunctionBody.integerCompare(
-        body,
-        'ne',
-        alignment,
-        zero,
-        `${name}_nonzero`,
-      )
-      const decremented = yield* FunctionBody.binary(
-        body,
-        'sub',
-        alignment,
-        one,
-        `${name}_decrement`,
-      )
-      const masked = yield* FunctionBody.binary(body, 'and', alignment, decremented, `${name}_mask`)
-      const powerOfTwo = yield* FunctionBody.integerCompare(
-        body,
-        'eq',
-        masked,
-        zero,
-        `${name}_pow2`,
-      )
-      const valid = yield* FunctionBody.binary(body, 'and', nonZero, powerOfTwo, `${name}_valid`)
+      const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
+      const one = Emitter.integerUnsigned(builder, usizeType, 1n)
+      const nonZero = Emitter.integerCompare(body, 'ne', alignment, zero, `${name}_nonzero`)
+      const decremented = Emitter.binary(body, 'sub', alignment, one, `${name}_decrement`)
+      const masked = Emitter.binary(body, 'and', alignment, decremented, `${name}_mask`)
+      const powerOfTwo = Emitter.integerCompare(body, 'eq', masked, zero, `${name}_pow2`)
+      const valid = Emitter.binary(body, 'and', nonZero, powerOfTwo, `${name}_valid`)
       const members = operation.type.type.members
       const layoutOrdinal = members.findIndex((member) => SilkType.equals(member, SilkType.layout))
       const invalidOrdinal = members.findIndex((member) =>
@@ -1109,31 +1044,31 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (layoutOrdinal < 0 || invalidOrdinal < 0) {
         throw new RangeError('LLVM layout validation lost its union members')
       }
-      const tag = yield* FunctionBody.select(
+      const tag = Emitter.select(
         body,
         valid,
-        yield* Constant.integerSigned(builder, i32, BigInt(layoutOrdinal)),
-        yield* Constant.integerSigned(builder, i32, BigInt(invalidOrdinal)),
+        Emitter.integerSigned(builder, i32, BigInt(layoutOrdinal)),
+        Emitter.integerSigned(builder, i32, BigInt(invalidOrdinal)),
         `${name}_tag`,
       )
       // Layout packs {bytes, alignment}; InvalidAlignment packs {alignment} at slot 0.
-      const first = yield* FunctionBody.select(body, valid, bytes, alignment, `${name}_slot0`)
-      const second = yield* FunctionBody.select(body, valid, alignment, zero, `${name}_slot1`)
+      const first = Emitter.select(body, valid, bytes, alignment, `${name}_slot0`)
+      const second = Emitter.select(body, valid, alignment, zero, `${name}_slot1`)
       const lanes = NativeType.lanesFor(types, operation.type)
       const values: Array<Value.Input> = [tag, first, second]
       while (values.length < lanes.length) {
         const lane = lanes.at(values.length)
         if (lane === undefined) break
-        values.push(yield* Constant.nullValue(builder, NativeType.laneType(types, lane)))
+        values.push(Emitter.nullValue(builder, NativeType.laneType(types, lane)))
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
       break
     }
     case 'RepeatLayout': {
-      const layoutValues = yield* NativeStorage.materialize(nativeStorage, operation.layout)
+      const layoutValues = NativeStorage.materialize(nativeStorage, operation.layout)
       const bytes = layoutValues.at(0)
       const alignment = layoutValues.at(1)
-      const count = (yield* NativeStorage.materialize(nativeStorage, operation.count)).at(0)
+      const count = NativeStorage.materialize(nativeStorage, operation.count).at(0)
       if (
         bytes === undefined ||
         alignment === undefined ||
@@ -1143,78 +1078,42 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('LLVM repeated layout lost its operands')
       }
       const name = `repeat${operation.destination.ordinal}`
-      const zero = yield* Constant.integerUnsigned(builder, usizeType, 0n)
-      const one = yield* Constant.integerUnsigned(builder, usizeType, 1n)
-      const maximum = yield* Constant.integerUnsigned(
+      const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
+      const one = Emitter.integerUnsigned(builder, usizeType, 1n)
+      const maximum = Emitter.integerUnsigned(
         builder,
         usizeType,
         program.layout.target.pointerSize === 4 ? 4294967295n : 18446744073709551615n,
       )
-      const alignmentZero = yield* FunctionBody.integerCompare(
+      const alignmentZero = Emitter.integerCompare(
         body,
         'eq',
         alignment,
         zero,
         `${name}_alignment_zero`,
       )
-      const safeAlignment = yield* FunctionBody.select(
+      const safeAlignment = Emitter.select(
         body,
         alignmentZero,
         one,
         alignment,
         `${name}_safe_alignment`,
       )
-      const summed = yield* FunctionBody.binary(
+      const summed = Emitter.binary(
         body,
         'add',
         bytes,
-        yield* FunctionBody.binary(body, 'sub', safeAlignment, one, `${name}_pad`),
+        Emitter.binary(body, 'sub', safeAlignment, one, `${name}_pad`),
         `${name}_summed`,
       )
-      const quotient = yield* FunctionBody.binary(
-        body,
-        'udiv',
-        summed,
-        safeAlignment,
-        `${name}_quotient`,
-      )
-      const rounded = yield* FunctionBody.binary(
-        body,
-        'mul',
-        quotient,
-        safeAlignment,
-        `${name}_rounded`,
-      )
-      const stride = yield* FunctionBody.select(
-        body,
-        alignmentZero,
-        zero,
-        rounded,
-        `${name}_stride`,
-      )
-      const countZero = yield* FunctionBody.integerCompare(
-        body,
-        'eq',
-        count,
-        zero,
-        `${name}_count_zero`,
-      )
-      const safeCount = yield* FunctionBody.select(
-        body,
-        countZero,
-        one,
-        count,
-        `${name}_safe_count`,
-      )
-      const budget = yield* FunctionBody.binary(body, 'udiv', maximum, safeCount, `${name}_budget`)
-      const exceeds = yield* FunctionBody.integerCompare(
-        body,
-        'ugt',
-        stride,
-        budget,
-        `${name}_exceeds`,
-      )
-      const countPositive = yield* FunctionBody.integerCompare(
+      const quotient = Emitter.binary(body, 'udiv', summed, safeAlignment, `${name}_quotient`)
+      const rounded = Emitter.binary(body, 'mul', quotient, safeAlignment, `${name}_rounded`)
+      const stride = Emitter.select(body, alignmentZero, zero, rounded, `${name}_stride`)
+      const countZero = Emitter.integerCompare(body, 'eq', count, zero, `${name}_count_zero`)
+      const safeCount = Emitter.select(body, countZero, one, count, `${name}_safe_count`)
+      const budget = Emitter.binary(body, 'udiv', maximum, safeCount, `${name}_budget`)
+      const exceeds = Emitter.integerCompare(body, 'ugt', stride, budget, `${name}_exceeds`)
+      const countPositive = Emitter.integerCompare(
         body,
         'ne',
         count,
@@ -1222,29 +1121,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `${name}_count_positive`,
       )
       // Rounding up can wrap the integer itself; classify that as overflow directly.
-      const headroom = yield* FunctionBody.binary(
+      const headroom = Emitter.binary(
         body,
         'sub',
         maximum,
-        yield* FunctionBody.binary(body, 'sub', safeAlignment, one, `${name}_pad2`),
+        Emitter.binary(body, 'sub', safeAlignment, one, `${name}_pad2`),
         `${name}_headroom`,
       )
-      const huge = yield* FunctionBody.integerCompare(body, 'ugt', bytes, headroom, `${name}_huge`)
-      const exceedsOrHuge = yield* FunctionBody.binary(
-        body,
-        'or',
-        exceeds,
-        huge,
-        `${name}_exceeds_or_huge`,
-      )
-      const overflow = yield* FunctionBody.binary(
-        body,
-        'and',
-        countPositive,
-        exceedsOrHuge,
-        `${name}_overflow`,
-      )
-      const total = yield* FunctionBody.binary(body, 'mul', stride, count, `${name}_total`)
+      const huge = Emitter.integerCompare(body, 'ugt', bytes, headroom, `${name}_huge`)
+      const exceedsOrHuge = Emitter.binary(body, 'or', exceeds, huge, `${name}_exceeds_or_huge`)
+      const overflow = Emitter.binary(body, 'and', countPositive, exceedsOrHuge, `${name}_overflow`)
+      const total = Emitter.binary(body, 'mul', stride, count, `${name}_total`)
       const members = operation.type.type.members
       const layoutOrdinal = members.findIndex((member) => SilkType.equals(member, SilkType.layout))
       const overflowOrdinal = members.findIndex((member) =>
@@ -1253,38 +1140,38 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       if (layoutOrdinal < 0 || overflowOrdinal < 0) {
         throw new RangeError('LLVM repeated layout lost its union members')
       }
-      const tag = yield* FunctionBody.select(
+      const tag = Emitter.select(
         body,
         overflow,
-        yield* Constant.integerSigned(builder, i32, BigInt(overflowOrdinal)),
-        yield* Constant.integerSigned(builder, i32, BigInt(layoutOrdinal)),
+        Emitter.integerSigned(builder, i32, BigInt(overflowOrdinal)),
+        Emitter.integerSigned(builder, i32, BigInt(layoutOrdinal)),
         `${name}_tag`,
       )
-      const totalOut = yield* FunctionBody.select(body, overflow, zero, total, `${name}_bytes`)
+      const totalOut = Emitter.select(body, overflow, zero, total, `${name}_bytes`)
       const lanes = NativeType.lanesFor(types, operation.type)
       const values: Array<Value.Input> = [tag, totalOut, alignment]
       while (values.length < lanes.length) {
         const lane = lanes.at(values.length)
         if (lane === undefined) break
-        values.push(yield* Constant.nullValue(builder, NativeType.laneType(types, lane)))
+        values.push(Emitter.nullValue(builder, NativeType.laneType(types, lane)))
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
       break
     }
     case 'SlotTake':
     case 'SlotCopy': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.slot)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.slot).at(0)
       if (address === undefined || usizeType === undefined) {
         throw new RangeError('LLVM Slot.take lost its address')
       }
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         address,
         pointer,
         `slot_take${operation.destination.ordinal}_base`,
       )
-      yield* NativeStorage.receivePlace(
+      NativeStorage.receivePlace(
         nativeStorage,
         operation.destination,
         NativePlace.stored(program.layout, operation.element, base),
@@ -1292,26 +1179,26 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'SlotDrop': {
-      const address = (yield* NativeStorage.materialize(nativeStorage, operation.slot)).at(0)
+      const address = NativeStorage.materialize(nativeStorage, operation.slot).at(0)
       if (address === undefined || usizeType === undefined) {
         throw new RangeError('LLVM Slot.drop lost its address')
       }
-      const base = yield* FunctionBody.cast(
+      const base = Emitter.cast(
         body,
         'inttoptr',
         address,
         pointer,
         `slot_drop${operation.destination.ordinal}_base`,
       )
-      yield* NativeAggregate.dropThroughPlan(
+      NativeAggregate.dropThroughPlan(
         cleanup,
         operation.cleanup,
         NativePayload.place(types, NativePlace.stored(program.layout, operation.element, base)),
         `slot_drop${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
       break
     }
   }
   context.state.checkOrdinal = checkOrdinal
-})
+}

@@ -30,160 +30,154 @@ export interface CastOptions {
 }
 
 /** @internal */
-const scalarWidth = (
+interface ScalarClass {
+  readonly integer: boolean
+  readonly floating: boolean
+  readonly pointer: boolean
+  readonly width: number | undefined
+}
+
+const floatingWidth = (tag: string): number | undefined => {
+  switch (tag) {
+    case 'Half':
+    case 'BFloat':
+      return 16
+    case 'Float':
+      return 32
+    case 'Double':
+      return 64
+    case 'X86Fp80':
+      return 80
+    case 'Fp128':
+    case 'PpcFp128':
+      return 128
+    default:
+      return undefined
+  }
+}
+
+/** Classifies a scalar or vector element type once for every cast legality check. */
+const classify = (
   module: BuilderState.MutableState,
   type: number,
-): Result.Result<number | undefined, LlvmError> =>
-  Result.gen(function* () {
-    const description = yield* FunctionBodyState.typeAt(module, type, 'FunctionBody.cast')
-    const scalar =
-      description._tag === 'Vector'
-        ? yield* FunctionBodyState.typeAt(module, description.child, 'FunctionBody.cast')
-        : description
-    if (scalar._tag === 'Integer') return scalar.bitWidth
-    if (scalar._tag !== 'Simple') return undefined
-    switch (scalar.tag) {
-      case 'Half':
-      case 'BFloat':
-        return 16
-      case 'Float':
-        return 32
-      case 'Double':
-        return 64
-      case 'X86Fp80':
-        return 80
-      case 'Fp128':
-      case 'PpcFp128':
-        return 128
-      default:
-        return undefined
-    }
+): Result.Result<ScalarClass, LlvmError> => {
+  const description = FunctionBodyState.typeAt(module, type, 'FunctionBody.cast')
+  if (Result.isFailure(description)) return Result.fail(description.failure)
+  const scalar =
+    description.success._tag === 'Vector'
+      ? FunctionBodyState.typeAt(module, description.success.child, 'FunctionBody.cast')
+      : description
+  if (Result.isFailure(scalar)) return Result.fail(scalar.failure)
+  const value = scalar.success
+  if (value._tag === 'Integer') {
+    return Result.succeed({ integer: true, floating: false, pointer: false, width: value.bitWidth })
+  }
+  const width = value._tag === 'Simple' ? floatingWidth(value.tag) : undefined
+  return Result.succeed({
+    integer: false,
+    floating: width !== undefined,
+    pointer: value._tag === 'Pointer',
+    width,
   })
+}
 
-/**
- * Appends a legal scalar or vector cast, returning the original operand when its type is unchanged.
- *
- * **Details**
- *
- * Vector conversions preserve lane count and scalability. Width and source/destination
- * families are validated for the selected cast rather than delegated to LLVM diagnostics.
- *
- * @category instructions
- * @since 0.0.0
- */
-export const cast = Effect.fnUntraced(function* (
+export const cast = (
   self: FunctionBody,
   kind: CastKind,
   operand: Value.Input,
   destinationType: Type.Type,
   name?: ByteString.ByteString | Uint8Array | string,
   options: CastOptions = {},
-): Effect.fn.Return<Value.Input, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.cast', (draft, module) =>
-    Result.gen(function* () {
-      const source = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        operand,
-        'FunctionBody.cast',
-      )
-      const destination = yield* Handle.resolve(
-        draft.builder,
-        draft.moduleOwner,
-        destinationType,
-        'Type',
-        'FunctionBody.cast',
-      )
-      if (source.type === destination) return operand
-      const sourceInteger = yield* FunctionBodyState.isIntegerType(
-        module,
-        source.type,
-        'FunctionBody.cast',
-      )
-      const destinationInteger = yield* FunctionBodyState.isIntegerType(
-        module,
-        destination,
-        'FunctionBody.cast',
-      )
-      const sourceFloating = yield* FunctionBodyState.isFloatingType(
-        module,
-        source.type,
-        'FunctionBody.cast',
-      )
-      const destinationFloating = yield* FunctionBodyState.isFloatingType(
-        module,
-        destination,
-        'FunctionBody.cast',
-      )
-      const sourcePointer = yield* FunctionBodyState.isPointerType(
-        module,
-        source.type,
-        'FunctionBody.cast',
-      )
-      const destinationPointer = yield* FunctionBodyState.isPointerType(
-        module,
-        destination,
-        'FunctionBody.cast',
-      )
-      const sourceWidth = yield* scalarWidth(module, source.type)
-      const destinationWidth = yield* scalarWidth(module, destination)
-      const valid =
-        (kind === 'trunc' &&
-          sourceInteger &&
-          destinationInteger &&
-          (sourceWidth ?? 0) > (destinationWidth ?? 0)) ||
-        ((kind === 'zext' || kind === 'sext') &&
-          sourceInteger &&
-          destinationInteger &&
-          (sourceWidth ?? 0) < (destinationWidth ?? 0)) ||
-        ((kind === 'fptoui' || kind === 'fptosi') && sourceFloating && destinationInteger) ||
-        ((kind === 'uitofp' || kind === 'sitofp') && sourceInteger && destinationFloating) ||
-        (kind === 'fptrunc' &&
-          sourceFloating &&
-          destinationFloating &&
-          (sourceWidth ?? 0) > (destinationWidth ?? 0)) ||
-        (kind === 'fpext' &&
-          sourceFloating &&
-          destinationFloating &&
-          (sourceWidth ?? 0) < (destinationWidth ?? 0)) ||
-        (kind === 'ptrtoint' && sourcePointer && destinationInteger) ||
-        (kind === 'inttoptr' && sourceInteger && destinationPointer) ||
-        (kind === 'bitcast' &&
-          (sourceWidth === destinationWidth || (sourcePointer && destinationPointer))) ||
-        (kind === 'addrspacecast' && sourcePointer && destinationPointer)
-      if (!valid) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.cast',
-            message: `${kind} is invalid for the source and destination types`,
-            input: { operand, destinationType },
-          }),
-        )
-      }
-      if ((options.noSignedWrap || options.noUnsignedWrap) && kind !== 'trunc') {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.cast',
-            message: 'No-wrap cast flags are only valid on trunc',
-            input: kind,
-          }),
-        )
-      }
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        destination,
-        name,
-        (result, finalName) => ({
-          _tag: 'Cast',
-          kind,
-          operand: source.operand,
-          destinationType: destination,
-          noSignedWrap: options.noSignedWrap ?? false,
-          noUnsignedWrap: options.noUnsignedWrap ?? false,
-          result,
-          name: finalName,
-        }),
-      )).value
+): Effect.Effect<Value.Input, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.cast', (draft) =>
+    castIn(draft, kind, operand, destinationType, name, options),
+  )
+
+/** @internal */
+export const castIn = (
+  draft: FunctionBodyState.Draft,
+  kind: CastKind,
+  operand: Value.Input,
+  destinationType: Type.Type,
+  name?: ByteString.ByteString | Uint8Array | string,
+  options: CastOptions = {},
+): Result.Result<Value.Input, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.cast'
+  const source = FunctionBodyState.resolveOperand(draft, module, operand, operation)
+  if (Result.isFailure(source)) return Result.fail(source.failure)
+  const destination = Handle.resolve(
+    draft.builder,
+    draft.moduleOwner,
+    destinationType,
+    'Type',
+    operation,
+  )
+  if (Result.isFailure(destination)) return Result.fail(destination.failure)
+  if (source.success.type === destination.success) return Result.succeed(operand)
+  const from = classify(module, source.success.type)
+  if (Result.isFailure(from)) return Result.fail(from.failure)
+  const to = classify(module, destination.success)
+  if (Result.isFailure(to)) return Result.fail(to.failure)
+  const sourceWidth = from.success.width ?? 0
+  const destinationWidth = to.success.width ?? 0
+  const valid =
+    (kind === 'trunc' &&
+      from.success.integer &&
+      to.success.integer &&
+      sourceWidth > destinationWidth) ||
+    ((kind === 'zext' || kind === 'sext') &&
+      from.success.integer &&
+      to.success.integer &&
+      sourceWidth < destinationWidth) ||
+    ((kind === 'fptoui' || kind === 'fptosi') && from.success.floating && to.success.integer) ||
+    ((kind === 'uitofp' || kind === 'sitofp') && from.success.integer && to.success.floating) ||
+    (kind === 'fptrunc' &&
+      from.success.floating &&
+      to.success.floating &&
+      sourceWidth > destinationWidth) ||
+    (kind === 'fpext' &&
+      from.success.floating &&
+      to.success.floating &&
+      sourceWidth < destinationWidth) ||
+    (kind === 'ptrtoint' && from.success.pointer && to.success.integer) ||
+    (kind === 'inttoptr' && from.success.integer && to.success.pointer) ||
+    (kind === 'bitcast' &&
+      (from.success.width === to.success.width || (from.success.pointer && to.success.pointer))) ||
+    (kind === 'addrspacecast' && from.success.pointer && to.success.pointer)
+  if (!valid) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: `${kind} is invalid for the source and destination types`,
+        input: { operand, destinationType },
+      }),
+    )
+  }
+  if ((options.noSignedWrap || options.noUnsignedWrap) && kind !== 'trunc') {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'No-wrap cast flags are only valid on trunc',
+        input: kind,
+      }),
+    )
+  }
+  const sourceOperand = source.success.operand
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    destination.success,
+    name,
+    (result, finalName) => ({
+      _tag: 'Cast',
+      kind,
+      operand: sourceOperand,
+      destinationType: destination.success,
+      noSignedWrap: options.noSignedWrap ?? false,
+      noUnsignedWrap: options.noUnsignedWrap ?? false,
+      result,
+      name: finalName,
     }),
   )
-})
+  return appended
+}

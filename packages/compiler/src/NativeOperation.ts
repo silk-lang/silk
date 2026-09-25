@@ -1,7 +1,6 @@
 import * as NativeAssemblyOperation from './NativeAssemblyOperation.js'
 import * as NativeDiagnosticScope from './NativeDiagnosticScope.js'
 import * as NativeDiagnosticOutcome from './NativeDiagnosticOutcome.js'
-import * as Effect from 'effect/Effect'
 import * as CleanupPlan from './CleanupPlan.js'
 import type * as Mir from './Mir.js'
 import type { LinearOperation } from './MirLinearization.js'
@@ -52,21 +51,18 @@ export interface State extends NativeTermination.TrapState {
   checkOrdinal: number
 }
 
-export const emit = Effect.fnUntraced(function* (
-  context: LoweringContext,
-  operation: LinearOperation,
-) {
+export const emit = (context: LoweringContext, operation: LinearOperation) => {
   switch (operation._tag) {
     case 'ReleaseDiagnosticOutcome':
-      return yield* NativeDiagnosticOutcome.releaseLocal(
+      return NativeDiagnosticOutcome.releaseLocal(
         context.call.termination.diagnostic,
         operation.outcome,
       )
     case 'EnterDiagnosticScope':
     case 'LeaveDiagnosticScope':
-      return yield* NativeDiagnosticScope.emit(context.call, operation)
+      return NativeDiagnosticScope.emit(context.call, operation)
     case 'NativeAssembly':
-      return yield* NativeAssemblyOperation.emit(context.call, operation)
+      return NativeAssemblyOperation.emit(context.call, operation)
     case 'BindMatch':
     case 'Literal':
     case 'EnumConstant':
@@ -78,7 +74,7 @@ export const emit = Effect.fnUntraced(function* (
     case 'StringUtf8Bytes':
     case 'StringByteLength':
     case 'StringEqualsExact':
-      return yield* NativeValueOperation.emit(context.value, operation)
+      return NativeValueOperation.emit(context.value, operation)
     case 'Allocate':
     case 'RawBufferFrom':
     case 'SharedFromAllocation':
@@ -96,15 +92,15 @@ export const emit = Effect.fnUntraced(function* (
     case 'SlotTake':
     case 'SlotCopy':
     case 'SlotDrop':
-      return yield* NativeMemoryOperation.emit(context.memory, operation)
+      return NativeMemoryOperation.emit(context.memory, operation)
     case 'SharedWithMut':
-      return yield* NativeLocalSharedOperation.emit(context.call, operation)
+      return NativeLocalSharedOperation.emit(context.call, operation)
     case 'ExecutionFromAllocation':
     case 'ExecutionDrive':
     case 'ExecutionNotifyInitial':
     case 'ExecutionWake':
     case 'ExecutionPark':
-      return yield* NativeExecutionOperation.emit(context.execution, operation)
+      return NativeExecutionOperation.emit(context.execution, operation)
     case 'Move':
     case 'SetInitialized':
     case 'BeginLoan':
@@ -118,7 +114,7 @@ export const emit = Effect.fnUntraced(function* (
     case 'ReadPlace':
     case 'CheckPlace':
     case 'WritePlace':
-      return yield* NativePlaceOperation.emit(context.place, operation)
+      return NativePlaceOperation.emit(context.place, operation)
     case 'ConvertInteger':
     case 'ConvertScalar':
     case 'ReinterpretScalar':
@@ -126,7 +122,7 @@ export const emit = Effect.fnUntraced(function* (
     case 'FloatTranscendental':
     case 'CheckedScalarOutcome':
     case 'Binary':
-      return yield* NativeScalarOperation.emit(context.scalar, operation)
+      return NativeScalarOperation.emit(context.scalar, operation)
     case 'Drop':
     case 'MakeEffect':
     case 'MakeCallable':
@@ -141,15 +137,15 @@ export const emit = Effect.fnUntraced(function* (
     case 'RunStaticEffect':
     case 'CatchEffect':
     case 'DiagnosticUnhandled':
-      return yield* NativeEffectOperation.emit(context.effect, operation)
+      return NativeEffectOperation.emit(context.effect, operation)
     case 'ApplyCallable':
     case 'Call':
-      return yield* NativeCallOperation.emit(context.call, operation)
+      return NativeCallOperation.emit(context.call, operation)
     case 'ForeignIndirectCall':
     case 'ForeignCall':
     case 'ForeignStaticLoad':
     case 'ForeignFunctionAddress':
-      return yield* NativeForeignOperation.emit(context.call, operation)
+      return NativeForeignOperation.emit(context.call, operation)
     case 'PointerNull':
     case 'PointerAddress':
     case 'PointerIsNull':
@@ -160,6 +156,6 @@ export const emit = Effect.fnUntraced(function* (
     case 'PointerAt':
     case 'PointerRead':
     case 'PointerWrite':
-      return yield* NativePointerOperation.emit(context.memory, operation)
+      return NativePointerOperation.emit(context.memory, operation)
   }
-})
+}

@@ -313,6 +313,8 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
     if (expression._tag === 'CallableApply') {
       return undefined
     }
+    // A match shares the target's declaration; most unrecorded calls name one with no instance.
+    if (Instances.instancesOf(discovery.instances, expression.target).length === 0) return undefined
     const typeArguments = expression.typeArguments.map((argument) =>
       Type.substituteGenericArgument(
         argument,
@@ -362,26 +364,31 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
     }
   }
 
+  const effectsByIdentity = new Map<string, Instances.EffectInstance>()
+  for (const effect of discovery.effects)
+    if (!effectsByIdentity.has(effect.identity)) effectsByIdentity.set(effect.identity, effect)
+
   // Directly forwarded Effects need no materialized environment in discovery.effects. Their
   // concrete construction still reaches this parameter through the ordinary call graph.
-  const executionSources = (
+  const executionSourcesFrom = (
     instance: Instances.Instance,
     expression: Tir.Expression,
-    visited: Set<string> = new Set(),
+    visited: Set<string>,
   ): ReadonlyArray<Instances.Instance> => {
     const key = `${ownerKey(instance)}:${expression._tag}:${expression.span.start}:${expression.span.end}`
     if (visited.has(key)) return []
     visited.add(key)
-    if (expression._tag === 'Move') return executionSources(instance, expression.subject, visited)
+    if (expression._tag === 'Move')
+      return executionSourcesFrom(instance, expression.subject, visited)
     if (expression._tag === 'UnionConvert')
-      return executionSources(instance, expression.source, visited)
+      return executionSourcesFrom(instance, expression.source, visited)
     if (expression._tag === 'EffectBindRequirement')
-      return executionSources(instance, expression.protected, visited)
+      return executionSourcesFrom(instance, expression.protected, visited)
     if (expression._tag === 'BindingReference') {
       const context = contexts.get(ownerKey(instance))
       if (context?.writtenBindings.has(expression.binding.ordinal)) return []
       const initializer = context?.bindings.get(expression.binding.ordinal)
-      return initializer === undefined ? [] : executionSources(instance, initializer, visited)
+      return initializer === undefined ? [] : executionSourcesFrom(instance, initializer, visited)
     }
     if (expression._tag === 'ParameterReference') {
       const identity = Instances.parameterEffectIdentity(
@@ -389,12 +396,12 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         instance.key,
         expression.parameter.ordinal,
       )
-      const effect = discovery.effects.find((candidate) => candidate.identity === identity)
+      const effect = identity === undefined ? undefined : effectsByIdentity.get(identity)
       const owner =
         effect === undefined ? undefined : instances.get(Instances.keyText(effect.owner))
       return owner === undefined
         ? (incoming.get(ownerKey(instance))?.get(expression.parameter.ordinal) ?? []).flatMap(
-            (source) => executionSources(source.owner, source.expression, visited),
+            (source) => executionSourcesFrom(source.owner, source.expression, visited),
           )
         : [owner]
     }
@@ -407,6 +414,30 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
       return target === undefined ? [] : [target]
     }
     return expression._tag === 'EffectBlock' ? [instance] : []
+  }
+
+  // A walk from a fresh visited set depends only on the settled call graph; provider
+  // reachability repeats it for every service owner it tests.
+  const executionSourceWalks = new Map<
+    Tir.Expression,
+    Map<string, ReadonlyArray<Instances.Instance>>
+  >()
+  const executionSources = (
+    instance: Instances.Instance,
+    expression: Tir.Expression,
+  ): ReadonlyArray<Instances.Instance> => {
+    let byOwner = executionSourceWalks.get(expression)
+    if (byOwner === undefined) {
+      byOwner = new Map()
+      executionSourceWalks.set(expression, byOwner)
+    }
+    const owner = ownerKey(instance)
+    let sources = byOwner.get(owner)
+    if (sources === undefined) {
+      sources = executionSourcesFrom(instance, expression, new Set())
+      byOwner.set(owner, sources)
+    }
+    return sources
   }
 
   const summaries = new Map<string, Origin>()
@@ -718,6 +749,157 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         }
   }
 
+  // Every provider binding in the program, and the providers each service owner is reached
+  // through: both depend only on the settled discovery graph, so service origins sharing an owner
+  // share one program scan.
+  let bindRequirementSitesCache:
+    | ReadonlyArray<{
+        readonly caller: Instances.Instance
+        readonly binding: Extract<Tir.Expression, { readonly _tag: 'EffectBindRequirement' }>
+      }>
+    | undefined
+  const bindRequirementSites = () =>
+    (bindRequirementSitesCache ??= discovery.instances.flatMap((caller) =>
+      caller.function.statements
+        .flatMap(Tir.statementExpressions)
+        .flatMap(Tir.expressionTree)
+        .flatMap((binding) =>
+          binding._tag === 'EffectBindRequirement' ? [{ caller, binding }] : [],
+        ),
+    ))
+  const forwardedProviders = new Map<string, ReadonlyArray<Provider>>()
+
+  const sameProvidedOwner = (
+    candidate: Instances.InstanceKey['declaration'],
+    expected: Instances.InstanceKey['declaration'],
+  ): boolean =>
+    candidate.module === expected.module &&
+    (candidate.name === expected.name || candidate.name.startsWith(`${expected.name}$provided$`))
+  // The parameter and binding references each body runs as an Effect, in body order.
+  const runSources = new Map<string, ReadonlyArray<Tir.Expression>>()
+  const runSourcesOf = (candidate: Instances.Instance): ReadonlyArray<Tir.Expression> => {
+    const identity = ownerKey(candidate)
+    let sources = runSources.get(identity)
+    if (sources === undefined) {
+      sources = candidate.function.statements
+        .flatMap(Tir.statementExpressions)
+        .flatMap(Tir.expressionTree)
+        .flatMap((expression) =>
+          expression._tag === 'Run'
+            ? Tir.expressionTree(expression.subject).filter(
+                (nested) =>
+                  nested._tag === 'ParameterReference' || nested._tag === 'BindingReference',
+              )
+            : [],
+        )
+      runSources.set(identity, sources)
+    }
+    return sources
+  }
+  // Per expected owner: nodes whose complete exploration never reached it, and roots proved to
+  // reach it. A failed search explores every node it visits, so each is proved unreachable; a
+  // successful one proves only its root. Either fact answers later searches exactly.
+  const reachability = new Map<
+    string,
+    { readonly unreachable: Set<string>; readonly reaching: Set<string> }
+  >()
+  const searchExecutionOwner = (
+    candidate: Instances.Instance,
+    expected: Instances.Instance,
+    seen: Set<string>,
+    unreachable: ReadonlySet<string>,
+    reaching: ReadonlySet<string>,
+  ): boolean => {
+    const identity = ownerKey(candidate)
+    if (seen.has(identity) || unreachable.has(identity)) return false
+    if (
+      reaching.has(identity) ||
+      identity === ownerKey(expected) ||
+      sameProvidedOwner(candidate.key.declaration, expected.key.declaration)
+    )
+      return true
+    // Execution edges include bracket callbacks that ordinary call records omit.
+    // The set is shared across sibling branches, not copied per path: a caller fully explored
+    // without reaching the owner cannot reach it through another path either, so reachability is
+    // unchanged while the walk stays linear in the call graph.
+    seen.add(identity)
+    if (
+      (executionTargetsByOwner.get(identity) ?? []).some((targetKey) => {
+        const target = instances.get(Instances.keyText(targetKey))
+        return (
+          target !== undefined &&
+          searchExecutionOwner(target, expected, seen, unreachable, reaching)
+        )
+      })
+    )
+      return true
+    // Running a captured Effect is an execution edge even when no ordinary call targets its
+    // owner. Recovery combinators, for example, execute a protected Effect parameter. Follow
+    // its specialized identity rather than recognizing the combinator's declaration spelling.
+    // A source wrapper may first store the bound recipe in an immutable local; resolve that
+    // binding through the same execution-source graph before following its protected parameter.
+    return runSourcesOf(candidate).some((nested) =>
+      executionSources(candidate, nested).some((owner) =>
+        searchExecutionOwner(owner, expected, seen, unreachable, reaching),
+      ),
+    )
+  }
+  const reachesExecutionOwner = (
+    candidate: Instances.Instance,
+    expected: Instances.Instance,
+  ): boolean => {
+    const target = ownerKey(expected)
+    let known = reachability.get(target)
+    if (known === undefined) {
+      known = { unreachable: new Set(), reaching: new Set() }
+      reachability.set(target, known)
+    }
+    const seen = new Set<string>()
+    const reached = searchExecutionOwner(
+      candidate,
+      expected,
+      seen,
+      known.unreachable,
+      known.reaching,
+    )
+    if (reached) known.reaching.add(ownerKey(candidate))
+    else for (const identity of seen) known.unreachable.add(identity)
+    return reached
+  }
+  const forwardedTo = (owner: Instances.Instance): ReadonlyArray<Provider> => {
+    const identity = ownerKey(owner)
+    const cached = forwardedProviders.get(identity)
+    if (cached !== undefined) return cached
+    const found = bindRequirementSites().flatMap(
+      ({ caller, binding: candidate }): ReadonlyArray<Provider> => {
+        const reachesOwner = Tir.expressionTree(candidate.protected).some((nested) => {
+          if (nested._tag === 'ParameterReference' || nested._tag === 'BindingReference') {
+            return executionSources(caller, nested).some((source) =>
+              reachesExecutionOwner(source, owner),
+            )
+          }
+          if (
+            nested._tag !== 'Call' &&
+            nested._tag !== 'EffectConstruct' &&
+            nested._tag !== 'CallableApply'
+          )
+            return false
+          const resultEffect = callAt(caller, nested)?.resultEffect
+          const effect =
+            resultEffect === undefined ? undefined : effectsByIdentity.get(resultEffect)
+          if (effect !== undefined && sameProvidedOwner(effect.runner, owner.key.declaration))
+            return true
+          const target = targetAt(caller, nested)
+          return target !== undefined && reachesExecutionOwner(target, owner)
+        })
+        if (!reachesOwner) return []
+        const selected = selectedProvider(caller, candidate.provider)
+        return selected === undefined ? [] : [selected]
+      },
+    )
+    forwardedProviders.set(identity, found)
+    return found
+  }
   const resolve = (origin: Origin, providers: ReadonlyArray<Provider> = []): Origin => {
     if (origin._tag === 'ProviderBoundOrigin') {
       const selected = selectedProvider(origin.owner, origin.provider)
@@ -733,99 +915,11 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         (candidate) =>
           candidate.role === origin.role && Type.equals(candidate.capability, origin.service),
       )
-    const sameProvidedOwner = (
-      candidate: Instances.InstanceKey['declaration'],
-      expected: Instances.InstanceKey['declaration'],
-    ): boolean =>
-      candidate.module === expected.module &&
-      (candidate.name === expected.name || candidate.name.startsWith(`${expected.name}$provided$`))
-    const reachesExecutionOwner = (
-      candidate: Instances.Instance,
-      expected: Instances.Instance,
-      seen = new Set<string>(),
-    ): boolean => {
-      const identity = ownerKey(candidate)
-      if (seen.has(identity)) return false
-      if (
-        identity === ownerKey(expected) ||
-        sameProvidedOwner(candidate.key.declaration, expected.key.declaration)
-      )
-        return true
-      // Execution edges include bracket callbacks that ordinary call records omit.
-      // The set is shared across sibling branches, not copied per path: a caller fully explored
-      // without reaching the owner cannot reach it through another path either, so reachability is
-      // unchanged while the walk stays linear in the call graph.
-      seen.add(identity)
-      if (
-        (executionTargetsByOwner.get(identity) ?? []).some((targetKey) => {
-          const target = instances.get(Instances.keyText(targetKey))
-          return target !== undefined && reachesExecutionOwner(target, expected, seen)
-        })
-      )
-        return true
-      // Running a captured Effect is an execution edge even when no ordinary call targets its
-      // owner. Recovery combinators, for example, execute a protected Effect parameter. Follow
-      // its specialized identity rather than recognizing the combinator's declaration spelling.
-      // A source wrapper may first store the bound recipe in an immutable local; resolve that
-      // binding through the same execution-source graph before following its protected parameter.
-      return candidate.function.statements
-        .flatMap(Tir.statementExpressions)
-        .flatMap(Tir.expressionTree)
-        .some(
-          (expression) =>
-            expression._tag === 'Run' &&
-            Tir.expressionTree(expression.subject).some((nested) => {
-              if (nested._tag !== 'ParameterReference' && nested._tag !== 'BindingReference')
-                return false
-              return executionSources(candidate, nested).some((owner) =>
-                reachesExecutionOwner(owner, expected, seen),
-              )
-            }),
-        )
-    }
     // An ordinary effect helper executes with the provider bound around the helper construction at
     // its caller. The provider node therefore lives in the caller TIR, while the service operation
     // whose allocation provenance we must prove lives in the callee TIR. Follow that structural
     // call edge instead of requiring the helper to inline or recognizing it by declaration name.
-    const forwarded =
-      explicitlyBound === undefined
-        ? discovery.instances.flatMap((caller): ReadonlyArray<Provider> =>
-            caller.function.statements
-              .flatMap(Tir.statementExpressions)
-              .flatMap(Tir.expressionTree)
-              .flatMap((candidate): ReadonlyArray<Provider> => {
-                if (candidate._tag !== 'EffectBindRequirement') return []
-                const reachesOwner = Tir.expressionTree(candidate.protected).some((nested) => {
-                  if (nested._tag === 'ParameterReference' || nested._tag === 'BindingReference') {
-                    return executionSources(caller, nested).some((owner) =>
-                      reachesExecutionOwner(owner, origin.owner),
-                    )
-                  }
-                  if (
-                    nested._tag !== 'Call' &&
-                    nested._tag !== 'EffectConstruct' &&
-                    nested._tag !== 'CallableApply'
-                  )
-                    return false
-                  const resultEffect = callAt(caller, nested)?.resultEffect
-                  const effect =
-                    resultEffect === undefined
-                      ? undefined
-                      : discovery.effects.find((candidate) => candidate.identity === resultEffect)
-                  if (
-                    effect !== undefined &&
-                    sameProvidedOwner(effect.runner, origin.owner.key.declaration)
-                  )
-                    return true
-                  const target = targetAt(caller, nested)
-                  return target !== undefined && reachesExecutionOwner(target, origin.owner)
-                })
-                if (!reachesOwner) return []
-                const selected = selectedProvider(caller, candidate.provider)
-                return selected === undefined ? [] : [selected]
-              }),
-          )
-        : []
+    const forwarded = explicitlyBound === undefined ? forwardedTo(origin.owner) : []
     const candidates =
       explicitlyBound === undefined
         ? forwarded.filter(

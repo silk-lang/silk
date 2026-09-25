@@ -188,57 +188,67 @@ const setGlobalDebugExpressions = (
  * @category variables
  * @since 0.0.0
  */
-export const make = Effect.fnUntraced(function* (
+export const make = (
   builder: Builder.Builder,
   name: ByteString.ByteString | Uint8Array | string,
   valueType: Type.Type,
   options: Options = {},
-): Effect.fn.Return<Variable, LlvmError> {
-  return yield* BuilderState.mutate(builder, 'Variable.make', (state, owner) =>
-    Result.gen(function* () {
-      const typeIndex = yield* Handle.resolve(builder, owner, valueType, 'Type', 'Variable.make')
-      const init = yield* initializerIndex(
-        builder,
-        state,
-        owner,
-        typeIndex,
-        options.initializer,
-        'Variable.make',
-      )
-      const debugExpressions = yield* debugExpressionIndices(
-        builder,
-        state,
-        owner,
-        options.debugExpressions,
-        'Variable.make',
-      )
-      const index = state.globals.variables.descriptions.length
-      const allocated = yield* GlobalState.allocate(
-        state,
-        owner,
-        ByteString.coerce(name),
-        'Variable',
-        index,
-        options,
-        'Variable.make',
-      )
-      const handle = Handle.make('Variable', owner, index)
-      state.globals.variables.descriptions.push({
-        _tag: 'Variable',
-        global: allocated.index,
-        valueType: typeIndex,
-        initializer: init,
-        constant: options.constant ?? false,
-        threadLocal: options.threadLocal ?? 'none',
-        externallyInitialized: options.externallyInitialized ?? false,
-        debugExpressions,
-      })
-      setGlobalDebugExpressions(state, allocated.index, debugExpressions)
-      state.globals.variables.handles.push(handle)
-      return handle
-    }),
+): Effect.Effect<Variable, LlvmError> =>
+  BuilderState.transition(builder, 'Variable.make', (context) =>
+    makeIn(context, name, valueType, options),
   )
-})
+
+/** @internal */
+export const makeIn = (
+  context: BuilderState.Context,
+  name: ByteString.ByteString | Uint8Array | string,
+  valueType: Type.Type,
+  options: Options = {},
+): Result.Result<Variable, LlvmError> => {
+  const { builder, state, owner } = context
+  return Result.gen(function* () {
+    const typeIndex = yield* Handle.resolve(builder, owner, valueType, 'Type', 'Variable.make')
+    const init = yield* initializerIndex(
+      builder,
+      state,
+      owner,
+      typeIndex,
+      options.initializer,
+      'Variable.make',
+    )
+    const debugExpressions = yield* debugExpressionIndices(
+      builder,
+      state,
+      owner,
+      options.debugExpressions,
+      'Variable.make',
+    )
+    const index = state.globals.variables.descriptions.length
+    const allocated = yield* GlobalState.allocate(
+      state,
+      owner,
+      ByteString.coerce(name),
+      'Variable',
+      index,
+      options,
+      'Variable.make',
+    )
+    const handle = Handle.make('Variable', owner, index)
+    state.globals.variables.descriptions.push({
+      _tag: 'Variable',
+      global: allocated.index,
+      valueType: typeIndex,
+      initializer: init,
+      constant: options.constant ?? false,
+      threadLocal: options.threadLocal ?? 'none',
+      externallyInitialized: options.externallyInitialized ?? false,
+      debugExpressions,
+    })
+    setGlobalDebugExpressions(state, allocated.index, debugExpressions)
+    state.globals.variables.handles.push(handle)
+    return handle
+  })
+}
 
 /**
  * Adopts an existing generic global as a variable, or returns its existing variable identity.
@@ -315,17 +325,23 @@ export const fromGlobal = Effect.fnUntraced(function* (
  * @category variables
  * @since 0.0.0
  */
-export const global = Effect.fnUntraced(function* (
+export const global = (
   builder: Builder.Builder,
   self: Variable,
-): Effect.fn.Return<Global.Global, LlvmError> {
-  return yield* BuilderState.mutate(builder, 'Variable.global', (state, owner) =>
-    Result.gen(function* () {
-      const value = (yield* resolve(builder, state, owner, self, 'Variable.global')).description
-      return yield* GlobalState.handleAt(state, value.global, 'Variable.global')
-    }),
-  )
-})
+): Effect.Effect<Global.Global, LlvmError> =>
+  BuilderState.transition(builder, 'Variable.global', (context) => globalIn(context, self))
+
+/** @internal */
+export const globalIn = (
+  context: BuilderState.Context,
+  self: Variable,
+): Result.Result<Global.Global, LlvmError> => {
+  const { builder, state, owner } = context
+  return Result.gen(function* () {
+    const value = (yield* resolve(builder, state, owner, self, 'Variable.global')).description
+    return yield* GlobalState.handleAt(state, value.global, 'Variable.global')
+  })
+}
 
 /**
  * Replaces or removes a variable initializer after exact type and ownership validation.

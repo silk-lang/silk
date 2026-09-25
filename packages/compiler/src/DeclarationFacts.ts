@@ -953,8 +953,26 @@ const contractParameterMode = (type: Type.Type): CallableContract.ParameterMode 
   return 'Value'
 }
 
+// Declaration facts are never edited after collection; body checking asks for the same
+// declaration's environment at every call site.
+const executableLifetimesCache = new WeakMap<
+  DeclarationFact | ServiceOperationFact,
+  Type.ExecutableLifetimes
+>()
+
 /** Computes the retained environment from a declaration's input contracts and written bounds. */
 export const executableLifetimes = (
+  declaration: DeclarationFact | ServiceOperationFact,
+): Type.ExecutableLifetimes => {
+  let cached = executableLifetimesCache.get(declaration)
+  if (cached === undefined) {
+    cached = computeExecutableLifetimes(declaration)
+    executableLifetimesCache.set(declaration, cached)
+  }
+  return cached
+}
+
+const computeExecutableLifetimes = (
   declaration: DeclarationFact | ServiceOperationFact,
 ): Type.ExecutableLifetimes => {
   const inputs = declaration.parameters.flatMap((parameter) =>
@@ -2139,14 +2157,28 @@ export const lookupAggregateMember = (
     : { _tag: 'Ambiguous', spelling, fields: matches }
 }
 
+// Declaration lookups resolve a module by name on every query; index the immutable module list
+// once instead of scanning it.
+const modulesByName = new WeakMap<Index['modules'], ReadonlyMap<string, ModuleHeaders>>()
+
+/** The first headers of one module by canonical name. */
+export const moduleHeaders = (self: Index, module: string): ModuleHeaders | undefined => {
+  let byName = modulesByName.get(self.modules)
+  if (byName === undefined) {
+    const built = new Map<string, ModuleHeaders>()
+    for (const headers of self.modules)
+      if (!built.has(headers.module)) built.set(headers.module, headers)
+    byName = built
+    modulesByName.set(self.modules, byName)
+  }
+  return byName.get(module)
+}
+
 export const lookup = (self: Index, module: string, name: string): DeclarationLookup =>
-  lookupDeclaration(
-    self.modules.find((candidate) => candidate.module === module)?.declarations ?? [],
-    name,
-  )
+  lookupDeclaration(moduleHeaders(self, module)?.declarations ?? [], name)
 
 export const member = (self: Index, module: string, name: string): MemberLookup =>
-  lookupMember(self.modules.find((candidate) => candidate.module === module)?.members ?? [], name)
+  lookupMember(moduleHeaders(self, module)?.members ?? [], name)
 
 /** Looks through explicit selective publication while preserving the original declaration identity. */
 export const publishedMember = (
@@ -2162,8 +2194,7 @@ export const publishedMember = (
   const candidates: Array<MemberFact> = []
   if (local._tag === 'Resolved') candidates.push(local.declaration)
   if (local._tag === 'Ambiguous') candidates.push(...local.declarations)
-  for (const publication of self.modules.find((headers) => headers.module === module)
-    ?.publications ?? []) {
+  for (const publication of moduleHeaders(self, module)?.publications ?? []) {
     if (publication.spelling !== name) continue
     const original = publishedMember(self, publication.module, publication.original, next)
     if (original._tag === 'Resolved') candidates.push(original.declaration)
@@ -2197,7 +2228,7 @@ export const enumByName = (self: Index, module: string, name: string): EnumLooku
 }
 
 export const struct = (self: Index, module: string, name: string): StructLookup =>
-  lookupStruct(self.modules.find((candidate) => candidate.module === module)?.structs ?? [], name)
+  lookupStruct(moduleHeaders(self, module)?.structs ?? [], name)
 
 export const unionByName = (self: Index, module: string, name: string): UnionLookup => {
   const result = member(self, module, name)
@@ -2241,8 +2272,10 @@ export const providerOperation = (
 
 /** Looks up one completed declaration by canonical identity. */
 export const byCanonical = (self: Index, id: CanonicalId): MemberFact | undefined => {
-  const generated = self.generatedAggregates.get(`${id.module}:${id.name}`)
-  if (generated !== undefined) return generated
+  if (self.generatedAggregates.size !== 0) {
+    const generated = self.generatedAggregates.get(`${id.module}:${id.name}`)
+    if (generated !== undefined) return generated
+  }
   const result = member(self, id.module, id.name)
   return result._tag === 'Resolved' && result.declaration.canonical._tag === 'Canonical'
     ? result.declaration

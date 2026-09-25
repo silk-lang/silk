@@ -86,6 +86,8 @@ export interface Session {
 interface Active {
   readonly key: string
   readonly observations: Array<Observation>
+  /** Encoded observation keys, so recording a dependency stays constant-time. */
+  readonly observed: Set<string>
 }
 
 interface State {
@@ -143,7 +145,8 @@ const observationKey = (observation: Observation): string =>
 
 const observeInto = (active: Active, observation: Observation): void => {
   const encoded = observationKey(observation)
-  if (active.observations.some((candidate) => observationKey(candidate) === encoded)) return
+  if (active.observed.has(encoded)) return
+  active.observed.add(encoded)
   active.observations.push(observation)
 }
 
@@ -178,7 +181,7 @@ const validateObservation = (self: Session, observation: Observation): boolean =
     if (current !== undefined) return current.fingerprint === observation.fingerprint
     const previous = state.previous.get(key)
     if (previous === undefined || state.active.some((active) => active.key === key)) return false
-    const reservation: Active = { key, observations: [] }
+    const reservation: Active = { key, observations: [], observed: new Set() }
     state.active.push(reservation)
     let valid = false
     let removed: Active | undefined
@@ -209,7 +212,7 @@ const validate = (self: Session, completed: Completed<unknown>): boolean => {
 const executeProvider = <A>(self: Session, descriptor: Descriptor, publish: boolean): Result<A> => {
   const state = stateOf(self)
   const key = keyOf(descriptor)
-  const active: Active = { key, observations: [] }
+  const active: Active = { key, observations: [], observed: new Set() }
   state.active.push(active)
   try {
     state.counters.executions += 1
@@ -221,7 +224,7 @@ const executeProvider = <A>(self: Session, descriptor: Descriptor, publish: bool
         fingerprint: readFingerprint(state, input),
       }),
     ) as A
-    const observations = [...active.observations]
+    const observations = active.observations
     // Result identity walks the whole answer; only a dependent read or persistence needs it, so a
     // root query with neither never pays. The answer and observations are frozen: same value later.
     let fingerprint: string | undefined
@@ -260,7 +263,7 @@ const execute = <A>(self: Session, descriptor: Descriptor, allowReuse: boolean):
     }
     const previous = descriptor.reuse === 'Revision' ? state.previous.get(key) : undefined
     if (previous !== undefined) {
-      const reservation: Active = { key, observations: [] }
+      const reservation: Active = { key, observations: [], observed: new Set() }
       state.active.push(reservation)
       let valid = false
       let removed: Active | undefined

@@ -49,7 +49,7 @@ export interface LifetimeFlow {
 
 interface Region {
   readonly lifetime: Lifetime.Lifetime
-  readonly available: Set<number>
+  readonly unavailable: Set<number>
   readonly required: Set<number>
 }
 
@@ -413,7 +413,7 @@ export const analyze = (
     const key = Lifetime.key(lifetime)
     const previous = regions.get(key)
     if (previous !== undefined) return previous
-    const region: Region = { lifetime, available: new Set(allPoints), required: new Set() }
+    const region: Region = { lifetime, unavailable: new Set(), required: new Set() }
     regions.set(key, region)
     if (lifetime._tag === 'IntersectionLifetime')
       for (const member of lifetime.members) {
@@ -439,7 +439,7 @@ export const analyze = (
   ): void => {
     const region = ensure(lifetime)
     const allowed = new Set(available)
-    for (const point of region.available) if (!allowed.has(point)) region.available.delete(point)
+    for (const point of allPoints) if (!allowed.has(point)) region.unavailable.add(point)
     origins.set(Lifetime.key(lifetime), origin)
   }
   const anchor = (
@@ -985,7 +985,7 @@ export const analyze = (
           use !== undefined &&
           BodyControlFlow.reaches(controlFlow, invalidated.after, use.after, created.before)
         )
-          region.available.delete(point)
+          region.unavailable.add(point)
       }
     }
   }
@@ -1161,7 +1161,7 @@ export const analyze = (
           paths.every((entry) => retiredPath([...carrier.path, ...entry.path], entry.type))
         if (retiredEveryPath) {
           retired.add(point)
-          ensure(origin.lifetime).available.add(point)
+          ensure(origin.lifetime).unavailable.delete(point)
         }
       }
       retiredUses.set(identity, retired)
@@ -1356,6 +1356,64 @@ export const content = (self: LifetimeFlow): LifetimeFlow => ({
   spans: new Map(),
 })
 
+const originSpanKey = (span: SourceSpan.SourceSpan): string =>
+  `${span.sourceId}\u0000${span.start}\u0000${span.end}`
+
+const originsBySpanCache = new WeakMap<LifetimeFlow, Map<string, Array<string>>>()
+
+interface RequiredUse {
+  /** Source start of the requiring point, when it has a span. */
+  readonly start: number | undefined
+  readonly retired: boolean
+  /** Control-flow point after the requiring use, when the use is an executed boundary. */
+  readonly after: number | undefined
+}
+
+const requiredUsesCache = new WeakMap<LifetimeFlow, Map<string, ReadonlyArray<RequiredUse>>>()
+
+/** One origin's required points resolved to spans and boundaries once per flow. */
+const requiredUses = (
+  self: LifetimeFlow,
+  solution: Extract<Lifetime.Solution, { readonly _tag: 'Solved' }>,
+  key: string,
+): ReadonlyArray<RequiredUse> => {
+  let byOrigin = requiredUsesCache.get(self)
+  if (byOrigin === undefined) {
+    byOrigin = new Map()
+    requiredUsesCache.set(self, byOrigin)
+  }
+  let uses = byOrigin.get(key)
+  if (uses === undefined) {
+    const retired = self.retiredUses.get(key)
+    uses = [...(solution.required.get(key) ?? [])].map((point): RequiredUse => {
+      const span = self.spans.get(point)
+      return {
+        start: span?.start,
+        retired: retired?.has(point) === true,
+        after: span === undefined ? undefined : BodyControlFlow.at(self.controlFlow, span)?.after,
+      }
+    })
+    byOrigin.set(key, uses)
+  }
+  return uses
+}
+
+/** Origin keys grouped by their exact creation span, built once per flow for liveness queries. */
+const originsBySpan = (self: LifetimeFlow): ReadonlyMap<string, ReadonlyArray<string>> => {
+  let index = originsBySpanCache.get(self)
+  if (index === undefined) {
+    index = new Map()
+    for (const [key, origin] of self.origins) {
+      const spanKey = originSpanKey(origin.span)
+      const keys = index.get(spanKey)
+      if (keys === undefined) index.set(spanKey, [key])
+      else keys.push(key)
+    }
+    originsBySpanCache.set(self, index)
+  }
+  return index
+}
+
 /** Tests concrete loan liveness at an access using the solved holder uses and source CFG. */
 export const liveAt = (
   self: LifetimeFlow,
@@ -1365,13 +1423,8 @@ export const liveAt = (
   write = false,
 ): boolean | undefined => {
   if (self.solution._tag !== 'Solved') return undefined
-  const origins = [...self.origins.entries()].filter(
-    ([, origin]) =>
-      origin.span.sourceId === start.sourceId &&
-      origin.span.start === start.start &&
-      origin.span.end === start.end,
-  )
-  if (origins.length === 0) return undefined
+  const origins = originsBySpan(self).get(originSpanKey(start))
+  if (origins === undefined) return undefined
   const created = BodyControlFlow.at(self.controlFlow, start)
   const accessed = BodyControlFlow.at(self.controlFlow, access)
   if (created === undefined || accessed === undefined) return undefined
@@ -1380,23 +1433,18 @@ export const liveAt = (
     : accessed.before
   if (!BodyControlFlow.reaches(self.controlFlow, created.after, at, created.before)) return false
   let observedHolderUse = false
-  for (const [key] of origins)
-    for (const point of self.solution.required.get(key) ?? []) {
-      const span = self.spans.get(point)
-      if (span !== undefined && span.start >= start.end) observedHolderUse = true
-      if (self.retiredUses.get(key)?.has(point)) continue
-      const use = span === undefined ? undefined : BodyControlFlow.at(self.controlFlow, span)
-      if (
-        use !== undefined &&
-        BodyControlFlow.reaches(self.controlFlow, at, use.after, created.before)
-      )
-        return true
+  const reachable = BodyControlFlow.reachable(self.controlFlow, at, created.before)
+  for (const key of origins)
+    for (const use of requiredUses(self, self.solution, key)) {
+      if (use.start !== undefined && use.start >= start.end) observedHolderUse = true
+      if (use.retired) continue
+      if (use.after !== undefined && BodyControlFlow.includes(reachable, use.after)) return true
     }
   const retainedEnd = BodyControlFlow.at(self.controlFlow, end)
   if (
     !observedHolderUse &&
     retainedEnd !== undefined &&
-    BodyControlFlow.reaches(self.controlFlow, at, retainedEnd.after, created.before)
+    BodyControlFlow.includes(reachable, retainedEnd.after)
   )
     return true
 
@@ -1573,10 +1621,15 @@ export const validateCleanup = (
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
   readonly work?: Lifetime.Work
 } => {
+  // Fresh destructor points are outside the analyzed domain, so the solver treats every region as
+  // available there. A region is actually available at one exactly when it is available at its
+  // exit's source point and its root is not released earlier in that exit; violations at fresh
+  // points are derived from the solved requirements by that rule instead of inserting each
+  // release point into each region's availability.
   const regions = new Map(
     self.input.regions.map((region) => [
       Lifetime.key(region.lifetime),
-      { ...region, available: new Set(region.available), required: new Set(region.required) },
+      { ...region, required: new Set(region.required) },
     ]),
   )
   const activatedConstraints = (self.input.activatedConstraints ?? []).map((bound) => ({
@@ -1584,38 +1637,78 @@ export const validateCleanup = (
     points: new Set(bound.points),
   }))
   const spans = new Map(self.spans)
-  let pointCount = self.input.pointCount
+  const roots = new Map<string, string | undefined>()
+  for (const key of regions.keys()) {
+    const root = self.origins.get(key)?.root
+    roots.set(key, root === undefined ? undefined : Ownership.siteKey(root))
+  }
+  const firstPoint = self.input.pointCount
+  const fresh: Array<{
+    readonly sourcePoint: number | undefined
+    readonly releases: ReadonlyMap<string, number>
+    readonly release: number
+  }> = []
+  let pointCount = firstPoint
   for (const exit of ownership.exits) {
     const sourcePoint = cleanupSourcePoint(self, exit.span)
-    const released = new Set<string>()
-    for (const release of exit.releases) {
+    // Fresh destructor points never equal the source point, so membership tests against it
+    // are fixed for the whole exit.
+    const activeBounds =
+      sourcePoint === undefined
+        ? []
+        : activatedConstraints.filter((bound) => bound.points.has(sourcePoint))
+    // The first release ordinal of each root within this exit.
+    const releases = new Map<string, number>()
+    for (const [ordinal, release] of exit.releases.entries()) {
       const point = pointCount++
       spans.set(point, exit.span)
+      fresh.push({ sourcePoint, releases, release: ordinal })
       // Ordered destructor points inherit the bounds active at this exit, including
       // dependencies installed after the holder's original acquisition.
-      for (const bound of activatedConstraints)
-        if (sourcePoint !== undefined && bound.points.has(sourcePoint)) bound.points.add(point)
-      for (const region of regions.values()) {
-        const origin = self.origins.get(Lifetime.key(region.lifetime))
-        if (origin?.root === undefined || !released.has(Ownership.siteKey(origin.root))) {
-          if (
-            region.lifetime._tag === 'StaticLifetime' ||
-            (sourcePoint !== undefined && region.available.has(sourcePoint))
-          )
-            region.available.add(point)
-        }
-      }
+      for (const bound of activeBounds) bound.points.add(point)
       for (const lifetime of cleanupLifetimes(release.cleanup, release.initialization))
         regions.get(Lifetime.key(lifetime))?.required.add(point)
-      released.add(Ownership.siteKey(release.binding.site))
+      const root = Ownership.siteKey(release.binding.site)
+      if (!releases.has(root)) releases.set(root, ordinal)
     }
   }
-  const solution = Lifetime.solve({
+  const availableAtFresh = (key: string, region: Lifetime.Region, point: number): boolean => {
+    const at = fresh[point - firstPoint]
+    if (at === undefined || at.sourcePoint === undefined) return false
+    if (region.unavailable.has(at.sourcePoint)) return false
+    const root = roots.get(key)
+    const released = root === undefined ? undefined : at.releases.get(root)
+    return released === undefined || released >= at.release
+  }
+  const solved = Lifetime.solve({
     ...self.input,
     pointCount,
     regions: [...regions.values()],
     activatedConstraints,
   })
+  let solution: Lifetime.Solution = solved
+  if (solved._tag === 'Solved') {
+    // Keep the solver's order: regions in input order, each region's points ascending.
+    const analyzed = new Map<string, Array<(typeof solved.violations)[number]>>()
+    for (const violation of solved.violations) {
+      const key = Lifetime.key(violation.lifetime)
+      const entries = analyzed.get(key)
+      if (entries === undefined) analyzed.set(key, [violation])
+      else entries.push(violation)
+    }
+    const violations: Array<(typeof solved.violations)[number]> = []
+    for (const [key, region] of regions) {
+      violations.push(...(analyzed.get(key) ?? []))
+      if (region.lifetime._tag === 'StaticLifetime') continue
+      const late = [...(solved.required.get(key) ?? [])]
+        .filter((point) => point >= firstPoint)
+        .sort((left, right) => left - right)
+      for (const point of late)
+        if (!availableAtFresh(key, region, point))
+          violations.push({ lifetime: region.lifetime, point })
+    }
+    solution = { ...solved, violations }
+  }
   return {
     diagnostics: diagnosticsOf(
       solution,

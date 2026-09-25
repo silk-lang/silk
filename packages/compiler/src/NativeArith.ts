@@ -1,12 +1,8 @@
-import * as LlvmBlock from '@silklang/llvm/Block'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import * as Intrinsic from '@silklang/llvm/Intrinsic'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import * as LlvmType from '@silklang/llvm/Type'
 import * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import type * as Layout from './Layout.js'
 import * as Mir from './Mir.js'
 import * as NativeDebug from './NativeDebug.js'
@@ -16,7 +12,7 @@ import * as Scalar from './Scalar.js'
 import type * as SourceSpan from './SourceSpan.js'
 
 export interface LaneContext {
-  readonly body: FunctionBody.FunctionBody
+  readonly body: Emitter.Body
   readonly pointerBits: 32 | 64
   readonly i32: LlvmType.Type
   readonly integerTypes: ReadonlyMap<number, LlvmType.Type>
@@ -24,13 +20,13 @@ export interface LaneContext {
 }
 
 /** Reinterprets and resizes one physical ABI lane without changing its semantic bits. */
-export const coerceLane = Effect.fnUntraced(function* (
+export const coerceLane = (
   context: LaneContext,
   input: Value.Input,
   source: Layout.CallingLane,
   target: Layout.CallingLane,
   name: string,
-): Effect.fn.Return<Value.Input, LlvmError.LlvmError> {
+): Value.Input => {
   const sourceIsAddress = typeof source.type !== 'string'
   const targetIsAddress = typeof target.type !== 'string'
   if (sourceIsAddress && targetIsAddress) return input
@@ -58,26 +54,14 @@ export const coerceLane = Effect.fnUntraced(function* (
     return input
   let bits: Value.Input
   if (sourceIsAddress) {
-    bits = yield* FunctionBody.cast(
-      context.body,
-      'ptrtoint',
-      input,
-      sourceIntegerType,
-      `${name}_bits`,
-    )
+    bits = Emitter.cast(context.body, 'ptrtoint', input, sourceIntegerType, `${name}_bits`)
   } else if (sourceFloating) {
-    bits = yield* FunctionBody.cast(
-      context.body,
-      'bitcast',
-      input,
-      sourceIntegerType,
-      `${name}_bits`,
-    )
+    bits = Emitter.cast(context.body, 'bitcast', input, sourceIntegerType, `${name}_bits`)
   } else {
     bits = input
   }
   if (sourceBits !== targetBits)
-    bits = yield* FunctionBody.cast(
+    bits = Emitter.cast(
       context.body,
       targetBits > sourceBits ? 'zext' : 'trunc',
       bits,
@@ -85,7 +69,7 @@ export const coerceLane = Effect.fnUntraced(function* (
       `${name}_width`,
     )
   if (targetIsAddress)
-    return yield* FunctionBody.cast(
+    return Emitter.cast(
       context.body,
       'inttoptr',
       bits,
@@ -93,15 +77,9 @@ export const coerceLane = Effect.fnUntraced(function* (
       name,
     )
   return targetFloating
-    ? yield* FunctionBody.cast(
-        context.body,
-        'bitcast',
-        bits,
-        NativeType.laneType(context.types, target),
-        name,
-      )
+    ? Emitter.cast(context.body, 'bitcast', bits, NativeType.laneType(context.types, target), name)
     : bits
-})
+}
 
 export type IntegerPredicate =
   | 'eq'
@@ -139,8 +117,8 @@ export const comparisonPredicate = (
 }
 
 export interface OperationContext {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly i32: LlvmType.Type
   readonly integerTypes: Map<number, LlvmType.Type>
@@ -158,7 +136,7 @@ export interface OperationContext {
   readonly termination: NativeTermination.FunctionContext
 }
 
-export const emitCallableBinary = Effect.fnUntraced(function* (
+export const emitCallableBinary = (
   context: OperationContext,
   operator: Mir.BinaryOperator,
   left: Value.Input,
@@ -166,7 +144,7 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
   operandMirType: Mir.Type,
   span: SourceSpan.SourceSpan,
   nameOrdinal: number,
-) {
+) => {
   const {
     body,
     builder,
@@ -211,14 +189,14 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
         break
     }
     if (predicate !== undefined) {
-      const flag = yield* FunctionBody.floatingCompare(
+      const flag = Emitter.floatingCompare(
         body,
         predicate,
         left,
         right,
         `callable_fcmp${nameOrdinal}_flag`,
       )
-      return yield* FunctionBody.cast(body, 'zext', flag, i32, `callable_fcmp${nameOrdinal}`)
+      return Emitter.cast(body, 'zext', flag, i32, `callable_fcmp${nameOrdinal}`)
     }
     let mnemonic: FunctionBody.FloatingBinaryKind | undefined
     switch (operator) {
@@ -243,27 +221,21 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     }
     if (mnemonic === undefined)
       throw new RangeError(`LLVM callable float ${operator} is unavailable`)
-    const result = yield* FunctionBody.binary(
-      body,
-      mnemonic,
-      left,
-      right,
-      `callable_float${nameOrdinal}`,
-    )
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    const result = Emitter.binary(body, mnemonic, left, right, `callable_float${nameOrdinal}`)
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   const predicate = comparisonPredicate(operator, unsigned)
   if (predicate !== undefined) {
-    const flag = yield* FunctionBody.integerCompare(
+    const flag = Emitter.integerCompare(
       body,
       predicate,
       left,
       right,
       `callable_cmp${nameOrdinal}_flag`,
     )
-    const widened = yield* FunctionBody.cast(body, 'zext', flag, i32, `callable_cmp${nameOrdinal}`)
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, flag))
+    const widened = Emitter.cast(body, 'zext', flag, i32, `callable_cmp${nameOrdinal}`)
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, flag))
     return widened
   }
   if (
@@ -295,46 +267,34 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
         opcode = 'mul'
         break
     }
-    const result = yield* FunctionBody.binary(
-      body,
-      opcode,
-      left,
-      right,
-      `callable_integer${nameOrdinal}`,
-    )
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    const result = Emitter.binary(body, opcode, left, right, `callable_integer${nameOrdinal}`)
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   if (operator === 'ShiftLeft' || operator === 'ShiftRight') {
-    const trapBlock = yield* NativeTermination.trapBlock(termination, 'invalid shift count', span)
+    const trapBlock = NativeTermination.trapBlock(termination, 'invalid shift count', span)
     let width: number
     if (scalar === undefined) {
       width = 32
     } else {
       width = Scalar.bits(scalar, program.layout.target.pointerSize === 4 ? 32 : 64)
     }
-    const limit = yield* Constant.integerUnsigned(builder, operandType, BigInt(width))
-    const invalid = yield* FunctionBody.integerCompare(
+    const limit = Emitter.integerUnsigned(builder, operandType, BigInt(width))
+    const invalid = Emitter.integerCompare(
       body,
       'uge',
       right,
       limit,
       `callable_shift${nameOrdinal}_invalid`,
     )
-    const continueBlock = yield* LlvmBlock.make(body, `callable_shift${nameOrdinal}_ok`)
-    yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, continueBlock)
-    yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+    const continueBlock = Emitter.block(body, `callable_shift${nameOrdinal}_ok`)
+    Emitter.conditionalBranch(body, invalid, trapBlock, continueBlock)
+    Emitter.setInsertionPoint(body, continueBlock)
     let opcode: 'shl' | 'lshr' | 'ashr'
     if (operator === 'ShiftLeft') opcode = 'shl'
     else opcode = unsigned ? 'lshr' : 'ashr'
-    const result = yield* FunctionBody.binary(
-      body,
-      opcode,
-      left,
-      right,
-      `callable_shift${nameOrdinal}`,
-    )
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    const result = Emitter.binary(body, opcode, left, right, `callable_shift${nameOrdinal}`)
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   if (operator === 'RotateLeft' || operator === 'RotateRight') {
@@ -342,7 +302,7 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
       returnType: operandType,
       parameters: [operandType, operandType, operandType],
     }
-    const result = yield* Intrinsic.call(
+    const result = Emitter.intrinsicCall(
       body,
       operator === 'RotateLeft' ? 'fshl' : 'fshr',
       [operandType],
@@ -351,7 +311,7 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
       { signature },
     )
     if (result === undefined) throw new RangeError('LLVM callable rotate produced no value')
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   if (operator === 'SaturatingAdd' || operator === 'SaturatingSubtract') {
@@ -368,7 +328,7 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
         intrinsic = unsigned ? 'usub.sat' : 'ssub.sat'
         break
     }
-    const result = yield* Intrinsic.call(
+    const result = Emitter.intrinsicCall(
       body,
       intrinsic,
       [operandType],
@@ -378,7 +338,7 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     )
     if (result === undefined)
       throw new RangeError('LLVM callable saturating arithmetic produced no value')
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   if (operator === 'SaturatingMultiply') {
@@ -391,14 +351,14 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     const signatures = unsigned ? unsignedOverflowSignatures : signedOverflowSignatures
     let signature = signatures.get(bits)
     if (signature === undefined) {
-      const i1 = yield* LlvmType.integer(builder, 1)
+      const i1 = Emitter.integerType(builder, 1)
       signature = {
-        returnType: yield* LlvmType.structure(builder, [operandType, i1]),
+        returnType: Emitter.structureType(builder, [operandType, i1]),
         parameters: [operandType, operandType],
       }
       signatures.set(bits, signature)
     }
-    const pair = yield* Intrinsic.call(
+    const pair = Emitter.intrinsicCall(
       body,
       unsigned ? 'umul.with.overflow' : 'smul.with.overflow',
       [operandType],
@@ -408,13 +368,13 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     )
     if (pair === undefined)
       throw new RangeError('LLVM callable saturating multiply produced no value')
-    const wrapped = yield* FunctionBody.extractValue(
+    const wrapped = Emitter.extractValue(
       body,
       pair,
       [0],
       `callable_saturating${nameOrdinal}_wrapped`,
     )
-    const overflowed = yield* FunctionBody.extractValue(
+    const overflowed = Emitter.extractValue(
       body,
       pair,
       [1],
@@ -427,27 +387,27 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
       range = { minimum: -2147483648n, maximum: 2147483647n }
     }
     const maximum = unsigned
-      ? yield* Constant.integerUnsigned(builder, operandType, range.maximum)
-      : yield* Constant.integerSigned(builder, operandType, range.maximum)
+      ? Emitter.integerUnsigned(builder, operandType, range.maximum)
+      : Emitter.integerSigned(builder, operandType, range.maximum)
     let boundary: Value.Input = maximum
     if (!unsigned) {
-      const zero = yield* Constant.integerSigned(builder, operandType, 0n)
-      const minimum = yield* Constant.integerSigned(builder, operandType, range.minimum)
-      const signs = yield* FunctionBody.binary(
+      const zero = Emitter.integerSigned(builder, operandType, 0n)
+      const minimum = Emitter.integerSigned(builder, operandType, range.minimum)
+      const signs = Emitter.binary(
         body,
         'xor',
         left,
         right,
         `callable_saturating${nameOrdinal}_signs`,
       )
-      const negative = yield* FunctionBody.integerCompare(
+      const negative = Emitter.integerCompare(
         body,
         'slt',
         signs,
         zero,
         `callable_saturating${nameOrdinal}_negative`,
       )
-      boundary = yield* FunctionBody.select(
+      boundary = Emitter.select(
         body,
         negative,
         minimum,
@@ -455,14 +415,14 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
         `callable_saturating${nameOrdinal}_boundary`,
       )
     }
-    const result = yield* FunctionBody.select(
+    const result = Emitter.select(
       body,
       overflowed,
       boundary,
       wrapped,
       `callable_saturating${nameOrdinal}`,
     )
-    yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+    NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
     return result
   }
   let result: Value.Value
@@ -488,14 +448,14 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     const signatures = unsigned ? unsignedOverflowSignatures : signedOverflowSignatures
     let overflowSignature = signatures.get(bits)
     if (overflowSignature === undefined) {
-      const i1 = yield* LlvmType.integer(builder, 1)
+      const i1 = Emitter.integerType(builder, 1)
       overflowSignature = {
-        returnType: yield* LlvmType.structure(builder, [operandType, i1]),
+        returnType: Emitter.structureType(builder, [operandType, i1]),
         parameters: [operandType, operandType],
       }
       signatures.set(bits, overflowSignature)
     }
-    const pair = yield* Intrinsic.call(
+    const pair = Emitter.intrinsicCall(
       body,
       intrinsicId,
       [operandType],
@@ -505,96 +465,91 @@ export const emitCallableBinary = Effect.fnUntraced(function* (
     )
     if (pair === undefined)
       throw new RangeError('Backend callable overflow intrinsic produced no value')
-    result = yield* FunctionBody.extractValue(body, pair, [0], `callable_arith${nameOrdinal}`)
-    const overflowed = yield* FunctionBody.extractValue(
-      body,
-      pair,
-      [1],
-      `callable_arith${nameOrdinal}_flag`,
-    )
-    const continueBlock = yield* LlvmBlock.make(body, `callable_arith${nameOrdinal}_ok`)
-    yield* FunctionBody.conditionalBranch(
+    result = Emitter.extractValue(body, pair, [0], `callable_arith${nameOrdinal}`)
+    const overflowed = Emitter.extractValue(body, pair, [1], `callable_arith${nameOrdinal}_flag`)
+    const continueBlock = Emitter.block(body, `callable_arith${nameOrdinal}_ok`)
+    Emitter.conditionalBranch(
       body,
       overflowed,
-      yield* NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
+      NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
       continueBlock,
     )
-    yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+    Emitter.setInsertionPoint(body, continueBlock)
   } else {
-    const zero = yield* Constant.integerUnsigned(builder, operandType, 0n)
-    const zeroDivisor = yield* FunctionBody.integerCompare(
+    const zero = Emitter.integerUnsigned(builder, operandType, 0n)
+    const zeroDivisor = Emitter.integerCompare(
       body,
       'eq',
       right,
       zero,
       `callable_div${nameOrdinal}_zero`,
     )
-    const continueBlock = yield* LlvmBlock.make(body, `callable_div${nameOrdinal}_ok`)
-    const nonZero = yield* LlvmBlock.make(body, `callable_div${nameOrdinal}_nonzero`)
-    yield* FunctionBody.conditionalBranch(
+    const continueBlock = Emitter.block(body, `callable_div${nameOrdinal}_ok`)
+    const nonZero = Emitter.block(body, `callable_div${nameOrdinal}_nonzero`)
+    Emitter.conditionalBranch(
       body,
       zeroDivisor,
-      yield* NativeTermination.trapBlock(termination, 'division by zero', span),
+      NativeTermination.trapBlock(termination, 'division by zero', span),
       nonZero,
     )
-    yield* LlvmBlock.setInsertionPoint(body, nonZero)
+    Emitter.setInsertionPoint(body, nonZero)
     if (!unsigned) {
-      const minimum = yield* Constant.integerSigned(
+      const minimum = Emitter.integerSigned(
         builder,
         operandType,
         scalar?.category === 'Integer'
           ? Scalar.range(scalar, program.layout.target.pointerSize === 4 ? 32 : 64).minimum
           : -2147483648n,
       )
-      const negativeOne = yield* Constant.integerSigned(builder, operandType, -1n)
-      const minimumDividend = yield* FunctionBody.integerCompare(
+      const negativeOne = Emitter.integerSigned(builder, operandType, -1n)
+      const minimumDividend = Emitter.integerCompare(
         body,
         'eq',
         left,
         minimum,
         `callable_div${nameOrdinal}_min`,
       )
-      const negativeOneDivisor = yield* FunctionBody.integerCompare(
+      const negativeOneDivisor = Emitter.integerCompare(
         body,
         'eq',
         right,
         negativeOne,
         `callable_div${nameOrdinal}_negone`,
       )
-      const overflowCase = yield* FunctionBody.binary(
+      const overflowCase = Emitter.binary(
         body,
         'and',
         minimumDividend,
         negativeOneDivisor,
         `callable_div${nameOrdinal}_overflow`,
       )
-      yield* FunctionBody.conditionalBranch(
+      Emitter.conditionalBranch(
         body,
         overflowCase,
-        yield* NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
+        NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
         continueBlock,
       )
     } else {
-      yield* FunctionBody.branch(body, continueBlock)
+      Emitter.branch(body, continueBlock)
     }
-    yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+    Emitter.setInsertionPoint(body, continueBlock)
     let opcode: 'udiv' | 'sdiv' | 'urem' | 'srem'
     if (operator === 'Divide') opcode = unsigned ? 'udiv' : 'sdiv'
     else opcode = unsigned ? 'urem' : 'srem'
-    result = yield* FunctionBody.binary(body, opcode, left, right, `callable_arith${nameOrdinal}`)
+    result = Emitter.binary(body, opcode, left, right, `callable_arith${nameOrdinal}`)
   }
-  yield* NativeDebug.locate(debug, span, yield* Value.instruction(body, result))
+  NativeDebug.locate(debug, span, Emitter.valueInstruction(body, result))
   return result
-})
+}
 
-export const emitIntegerConversion = Effect.fnUntraced(function* (
+export const emitIntegerConversion = (
   context: OperationContext,
   input: Value.Input,
   sourceType: Mir.ScalarType,
   targetType: Mir.ScalarType,
   name: string,
   span: SourceSpan.SourceSpan,
-) {
+) => {
   const { body, builder, i32, integerTypes, program, termination } = context
   const source = Scalar.find(sourceType._tag)
   const target = Scalar.find(targetType._tag)
@@ -615,56 +570,50 @@ export const emitIntegerConversion = Effect.fnUntraced(function* (
   const checks: Array<Value.Input> = []
   if (targetRange.minimum > sourceRange.minimum) {
     checks.push(
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         source.signedness === 'Signed' ? 'slt' : 'ult',
         input,
         source.signedness === 'Signed'
-          ? yield* Constant.integerSigned(builder, physicalSource, targetRange.minimum)
-          : yield* Constant.integerUnsigned(builder, physicalSource, targetRange.minimum),
+          ? Emitter.integerSigned(builder, physicalSource, targetRange.minimum)
+          : Emitter.integerUnsigned(builder, physicalSource, targetRange.minimum),
         `${name}_below`,
       ),
     )
   }
   if (targetRange.maximum < sourceRange.maximum) {
     checks.push(
-      yield* FunctionBody.integerCompare(
+      Emitter.integerCompare(
         body,
         source.signedness === 'Signed' ? 'sgt' : 'ugt',
         input,
         source.signedness === 'Signed'
-          ? yield* Constant.integerSigned(builder, physicalSource, targetRange.maximum)
-          : yield* Constant.integerUnsigned(builder, physicalSource, targetRange.maximum),
+          ? Emitter.integerSigned(builder, physicalSource, targetRange.maximum)
+          : Emitter.integerUnsigned(builder, physicalSource, targetRange.maximum),
         `${name}_above`,
       ),
     )
   }
   let invalid = checks.at(0)
   for (const [ordinal, check] of checks.slice(1).entries())
-    invalid = yield* FunctionBody.binary(
-      body,
-      'or',
-      invalid ?? check,
-      check,
-      `${name}_invalid${ordinal}`,
-    )
+    invalid = Emitter.binary(body, 'or', invalid ?? check, check, `${name}_invalid${ordinal}`)
   if (invalid !== undefined) {
-    const following = yield* LlvmBlock.make(body, `${name}_ok`)
-    yield* FunctionBody.conditionalBranch(
+    const following = Emitter.block(body, `${name}_ok`)
+    Emitter.conditionalBranch(
       body,
       invalid,
-      yield* NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
+      NativeTermination.trapBlock(termination, 'arithmetic overflow', span),
       following,
     )
-    yield* LlvmBlock.setInsertionPoint(body, following)
+    Emitter.setInsertionPoint(body, following)
   }
   if (sourceBits === targetBits) return input
   const extension = source.signedness === 'Signed' ? 'sext' : 'zext'
-  return yield* FunctionBody.cast(
+  return Emitter.cast(
     body,
     sourceBits < targetBits ? extension : 'trunc',
     input,
     physicalTarget,
     name,
   )
-})
+}

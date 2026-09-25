@@ -2,6 +2,7 @@ import * as Effect from 'effect/Effect'
 import type * as AuthoredHir from './AuthoredHir.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import type * as CompilationProfile from './CompilationProfile.js'
+import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as ConfigurationError from './ConfigurationError.js'
 import * as Diagnostic from './Diagnostic.js'
 import * as Elaboration from './Elaboration.js'
@@ -279,8 +280,9 @@ const coordinator = (
   closure: ModuleClosure.Facts,
   completion: ProfileBootstrap.Completion,
   trace: CompilerTrace.CompilerTrace,
+  headers: Headers,
 ): Residualization.Coordinator => {
-  const { index, resolution } = NameResolution.analyze(closure)
+  const { index, resolution } = headers
   const session = Semantic.makeSession(
     `module-selection:${completion.profile.identity}`,
     index,
@@ -315,11 +317,22 @@ const coordinator = (
   )
 }
 
-/** Resolves one selection transaction against a stable, memoized source supply. */
+/** Completed declaration headers and name resolution of one module closure. */
+export interface Headers {
+  readonly index: DeclarationIndex.Index
+  readonly resolution: NameResolution.Resolution
+}
+
+/**
+ * Resolves one selection transaction against a stable, memoized source supply. `initialHeaders`
+ * are the bootstrap headers of `initial`'s modules, which the first evaluation pass reuses
+ * instead of analyzing the same closure again.
+ */
 export const select = Effect.fn('ModuleSelection.select')(function* (
   request: ModuleClosure.ProjectRequest,
   initial: ModuleClosure.ProjectClosure,
   completion: ProfileBootstrap.Completion,
+  initialHeaders: Headers,
 ): Effect.fn.Return<
   {
     readonly closure: ModuleClosure.ProjectClosure
@@ -340,7 +353,12 @@ export const select = Effect.fn('ModuleSelection.select')(function* (
       pending(module, decisions.get(module.name) ?? new Map()),
     )
     if (conditions.length === 0) break
-    const evaluation = coordinator(closure, completion, trace)
+    const evaluation = coordinator(
+      closure,
+      completion,
+      trace,
+      closure === initial ? initialHeaders : NameResolution.analyze(closure),
+    )
     const failures: Array<Diagnostic.Diagnostic> = []
     const failedConditions: Array<{
       readonly condition: Condition

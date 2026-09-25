@@ -83,7 +83,8 @@ export const children = (parent: Identity, keys: readonly Key[]): readonly Ident
       _tag: 'AuthoredIdentity',
       namespace: owner.namespace,
       module: owner.module,
-      path: [...owner.path, segment(key, occurrence)],
+      // Exact-size copy: `[...path, segment]` leaves ~16 slots of slack per retained identity.
+      path: owner.path.concat(segment(key, occurrence)),
     }
   })
 }
@@ -104,18 +105,37 @@ export const equals = (self: Identity, other: Identity): boolean =>
     )
   })
 
+// Identities and anchors are never edited after construction, and semantic analysis keys maps
+// by the same shared objects many times over, so each object's key is computed once.
+const keys = new WeakMap<Identity, string>()
+const anchorKeys = new WeakMap<Anchor, string>()
+
 /** A string key for one owner identity: equal exactly when `equals` holds, usable in maps. */
-export const key = (self: Identity): string =>
-  `${self.namespace}:${self.module}${self.path
-    .map(
-      (part) =>
-        `/${part.kind}${part.name === undefined ? '' : `=${part.name}`}${part.role === undefined ? '' : `@${part.role}`}#${part.occurrence}`,
-    )
-    .join('')}`
+export const key = (self: Identity): string => {
+  let cached = keys.get(self)
+  if (cached === undefined) {
+    cached = self.namespace + ':' + self.module
+    for (const part of self.path) {
+      cached += '/' + part.kind
+      if (part.name !== undefined) cached += '=' + part.name
+      if (part.role !== undefined) cached += '@' + part.role
+      cached += '#' + part.occurrence
+    }
+    keys.set(self, cached)
+  }
+  return cached
+}
 
 /** A string key for one owner-local anchor, usable in maps keyed by authored position. */
-export const anchorKey = (self: Anchor): string =>
-  `${key(self.owner)}${self.path.map((part) => `|${part.role}#${part.occurrence}`).join('')}`
+export const anchorKey = (self: Anchor): string => {
+  let cached = anchorKeys.get(self)
+  if (cached === undefined) {
+    cached = key(self.owner)
+    for (const part of self.path) cached += '|' + part.role + '#' + part.occurrence
+    anchorKeys.set(self, cached)
+  }
+  return cached
+}
 
 /** Copy and freeze a local anchor, rejecting invalid occurrence numbers as typed failures. */
 export const anchor = Effect.fn('AuthoredIdentity.anchor')(function* (

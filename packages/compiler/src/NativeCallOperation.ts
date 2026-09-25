@@ -1,11 +1,9 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as NativeValue from './NativeValue.js'
 import * as NativeResult from './NativeResult.js'
 import * as NativeArgument from './NativeArgument.js'
 import * as NativeCallable from './NativeCallable.js'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as Tir from './Tir.js'
 import * as Mir from './Mir.js'
 import * as FunctionIndex from './internal/FunctionIndex.js'
@@ -22,7 +20,7 @@ import * as Scalar from './Scalar.js'
 
 type Operation = Extract<LinearOperation, { readonly _tag: 'ApplyCallable' | 'Call' }>
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const {
     body,
     builder,
@@ -72,13 +70,13 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         if (callableTarget === undefined)
           throw new RangeError('Stored callable has no source declaration')
         captureGroups.push(
-          ...(yield* NativeCallable.capturedValues(
+          ...NativeCallable.capturedValues(
             context,
             sourceType,
             operation.callable,
             callableTarget.argumentParameters,
             `callable${operation.destination.ordinal}`,
-          )),
+          ),
         )
       } else {
         for (const capture of operation.captures) {
@@ -87,8 +85,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             targetUsesEnvironmentBorrows &&
             (capture.access === 'Shared' || capture.access === 'Exclusive')
           ) {
-            yield* NativeStorage.ensureAddressRoot(nativeStorage, capture.source)
-            const base = yield* NativeStorage.addressOf(nativeStorage, capture.source)
+            NativeStorage.ensureAddressRoot(nativeStorage, capture.source)
+            const base = NativeStorage.addressOf(nativeStorage, capture.source)
             value = { _tag: 'Direct', values: [base] }
           } else {
             value = NativeStorage.readLocal(nativeStorage, capture.source)
@@ -110,7 +108,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
       }
       if (target._tag === 'BuiltinCallableTarget') {
-        const supplied = yield* NativeArgument.materialize(
+        const supplied = NativeArgument.materialize(
           nativeStorage,
           arguments_,
           `builtin${operation.destination.ordinal}`,
@@ -129,7 +127,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               integerTypes.get(
                 Scalar.bits(conversionTarget, program.layout.target.pointerSize === 4 ? 32 : 64),
               ) ?? i32
-            yield* NativeScalarOperation.emitFloatToIntegerGuard(
+            NativeScalarOperation.emitFloatToIntegerGuard(
               context,
               first,
               sourceScalar,
@@ -137,19 +135,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               `callable_convert${operation.destination.ordinal}`,
               operation.provenance.span,
             )
-            const result = yield* FunctionBody.cast(
+            const result = Emitter.cast(
               body,
               conversionTarget.signedness === 'Signed' ? 'fptosi' : 'fptoui',
               first,
               destination,
               `callable_convert${operation.destination.ordinal}`,
             )
-            yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+            NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
             break
           }
           if (sourceScalar?.category !== 'Integer')
             throw new RangeError('LLVM callable conversion lost its source type')
-          const result = yield* NativeArith.emitIntegerConversion(
+          const result = NativeArith.emitIntegerConversion(
             arith,
             first,
             { _tag: sourceScalar.spelling },
@@ -157,7 +155,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `callable_convert${operation.destination.ordinal}`,
             operation.provenance.span,
           )
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
           break
         }
         const floatTarget = Scalar.floatConversionTarget(target.operation)
@@ -171,7 +169,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             if (source.spelling === floatTarget.spelling) {
               result = first
             } else {
-              result = yield* FunctionBody.cast(
+              result = Emitter.cast(
                 body,
                 source.spelling === 'f64' ? 'fptrunc' : 'fpext',
                 first,
@@ -180,7 +178,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               )
             }
           } else {
-            result = yield* FunctionBody.cast(
+            result = Emitter.cast(
               body,
               source.signedness === 'Signed' ? 'sitofp' : 'uitofp',
               first,
@@ -188,17 +186,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               `callable_convert${operation.destination.ordinal}`,
             )
           }
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
           break
         }
         if (target.operation === 'Negate' && Scalar.find(firstType._tag)?.category === 'Floating') {
-          const result = yield* FunctionBody.unary(
+          const result = Emitter.unary(
             body,
             'fneg',
             first,
             `callable_fneg${operation.destination.ordinal}`,
           )
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
           break
         }
         if (
@@ -212,7 +210,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           if (firstLane === undefined)
             throw new RangeError('LLVM callable unary operation lost its lane')
           const operandType = NativeType.laneType(types, firstLane)
-          const zero = yield* Constant.integerSigned(builder, operandType, 0n)
+          const zero = Emitter.integerSigned(builder, operandType, 0n)
           if (target.operation !== 'Not') {
             let unaryOperator: Mir.BinaryOperator
             switch (target.operation) {
@@ -231,10 +229,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             }
             const right =
               target.operation === 'BitNot'
-                ? yield* Constant.integerSigned(builder, operandType, -1n)
+                ? Emitter.integerSigned(builder, operandType, -1n)
                 : first
             const values = [
-              yield* NativeArith.emitCallableBinary(
+              NativeArith.emitCallableBinary(
                 arith,
                 unaryOperator,
                 target.operation === 'BitNot' ? first : zero,
@@ -244,11 +242,11 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
                 operation.destination.ordinal,
               ),
             ]
-            yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+            NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
             break
           }
-          const boolZero = yield* Constant.integerSigned(builder, i32, 0n)
-          const flag = yield* FunctionBody.integerCompare(
+          const boolZero = Emitter.integerSigned(builder, i32, 0n)
+          const flag = Emitter.integerCompare(
             body,
             'eq',
             first,
@@ -256,15 +254,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `callable_not${operation.destination.ordinal}_flag`,
           )
           const values = [
-            yield* FunctionBody.cast(
-              body,
-              'zext',
-              flag,
-              i32,
-              `callable_not${operation.destination.ordinal}`,
-            ),
+            Emitter.cast(body, 'zext', flag, i32, `callable_not${operation.destination.ordinal}`),
           ]
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
           break
         }
         const second = supplied.at(1)
@@ -278,7 +270,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           )
         }
         const values = [
-          yield* NativeArith.emitCallableBinary(
+          NativeArith.emitCallableBinary(
             arith,
             target.operation,
             first,
@@ -288,7 +280,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             operation.destination.ordinal,
           ),
         ]
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
         break
       }
       if (callableTarget === undefined) throw new RangeError('Callable target lost its declaration')
@@ -296,17 +288,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const handle = callableTarget.suspendable ? callableTarget.driver : callableTarget.handle
       if (handle === undefined)
         throw new RangeError('Backend callable application lost its completion driver')
-      const resultAddress = yield* NativeResult.allocate(
+      const resultAddress = NativeResult.allocate(
         body,
         callableTarget,
         `callable${operation.destination.ordinal}_result`,
       )
-      const called = yield* FunctionBody.callDirect(
+      const called = Emitter.callDirect(
         body,
         handle,
         NativeResult.argumentsFor(
           callableTarget,
-          yield* NativeCall.lowerArguments(call.synchronous, callableTarget, arguments_),
+          NativeCall.lowerArguments(call.synchronous, callableTarget, arguments_),
           resultAddress,
         ),
         `callable${operation.destination.ordinal}`,
@@ -314,7 +306,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       // A never-returning callback may inhabit a wider join result type. It produces no
       // payload to store; the enclosing MIR control flow owns its unreachable terminator.
       if (callableTarget.fn.result._tag === 'Bottom') break
-      const result = yield* NativeResult.readValue(
+      const result = NativeResult.readValue(
         body,
         callableTarget,
         called,
@@ -322,16 +314,12 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `callable${operation.destination.ordinal}`,
       )
       for (const root of [...nativeStorage.addressRoots].sort((left, right) => left - right)) {
-        yield* NativeStorage.reloadAddressRoot(nativeStorage, root)
+        NativeStorage.reloadAddressRoot(nativeStorage, root)
       }
-      yield* NativeStorage.writeValue(
+      NativeStorage.writeValue(
         nativeStorage,
         operation.destination,
-        yield* NativeDiagnosticOutcome.accept(
-          call.synchronous.diagnostic,
-          operation.destination,
-          result,
-        ),
+        NativeDiagnosticOutcome.accept(call.synchronous.diagnostic, operation.destination, result),
       )
       break
     }
@@ -355,17 +343,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError(
           `Backend cannot drive suspendable call target ${operation.target.name}`,
         )
-      const resultAddress = yield* NativeResult.allocate(
+      const resultAddress = NativeResult.allocate(
         body,
         target,
         `t${operation.destination.ordinal}_result`,
       )
-      const result = yield* FunctionBody.callDirect(
+      const result = Emitter.callDirect(
         body,
         handle,
         NativeResult.argumentsFor(
           target,
-          yield* NativeCall.lowerArguments(
+          NativeCall.lowerArguments(
             call.synchronous,
             target,
             NativeArgument.fromLocals(nativeStorage, operation.arguments),
@@ -376,29 +364,29 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
       if (target.fn.result._tag === 'Bottom') break
       for (const root of [...nativeStorage.addressRoots].sort((left, right) => left - right)) {
-        yield* NativeStorage.reloadAddressRoot(nativeStorage, root)
+        NativeStorage.reloadAddressRoot(nativeStorage, root)
       }
       if (target.resultLaneCount === 0) {
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [])
         break
       }
       if (result === undefined && target.resultStorage === undefined)
         throw new RangeError('Backend call produced no value')
       if (result !== undefined) {
-        const instruction = yield* Value.instruction(body, result)
-        yield* NativeDebug.locate(debug, operation.provenance.span, instruction)
+        const instruction = Emitter.valueInstruction(body, result)
+        NativeDebug.locate(debug, operation.provenance.span, instruction)
       }
-      const unpacked = yield* NativeResult.readValue(
+      const unpacked = NativeResult.readValue(
         body,
         target,
         result,
         resultAddress,
         `t${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeValue(
+      NativeStorage.writeValue(
         nativeStorage,
         operation.destination,
-        yield* NativeDiagnosticOutcome.accept(
+        NativeDiagnosticOutcome.accept(
           call.synchronous.diagnostic,
           operation.destination,
           unpacked,
@@ -408,4 +396,4 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
     }
   }
   context.state.checkOrdinal = checkOrdinal
-})
+}

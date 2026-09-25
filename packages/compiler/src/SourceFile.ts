@@ -8,7 +8,7 @@ const SourceFileTypeId: unique symbol = Symbol.for('@silklang/compiler/SourceFil
 export interface SourceFile {
   readonly [SourceFileTypeId]: typeof SourceFileTypeId
   readonly id: string
-  readonly bytes: ReadonlyArray<number>
+  readonly bytes: Uint8Array
   readonly origin: SourceOrigin.SourceOrigin
 }
 
@@ -21,7 +21,7 @@ export const make = (
   const source: SourceFile = {
     [SourceFileTypeId]: SourceFileTypeId,
     id,
-    bytes: Array.from(bytes),
+    bytes: new Uint8Array(bytes),
     origin,
   }
   return source
@@ -34,7 +34,7 @@ export const identity = (self: SourceFile): string => self.id
 export const length = (self: SourceFile): number => self.bytes.length
 
 /** Returns a defensive copy of the complete source byte sequence. */
-export const toUint8Array = (self: SourceFile): Uint8Array => Uint8Array.from(self.bytes)
+export const toUint8Array = (self: SourceFile): Uint8Array => self.bytes.slice()
 
 /**
  * Returns a defensive copy of the bytes covered by a valid span owned by this source identity.
@@ -42,14 +42,20 @@ export const toUint8Array = (self: SourceFile): Uint8Array => Uint8Array.from(se
  */
 export const slice = (self: SourceFile, span: SourceSpan.SourceSpan): Option.Option<Uint8Array> =>
   span.sourceId === self.id && span.end <= self.bytes.length
-    ? Option.some(Uint8Array.from(self.bytes.slice(span.start, span.end)))
+    ? Option.some(self.bytes.slice(span.start, span.end))
     : Option.none()
 
 /** Decodes a valid span's bytes as one-byte characters for identifier and keyword spellings. */
 export const spelling = (self: SourceFile, span: SourceSpan.SourceSpan): Option.Option<string> =>
-  Option.map(slice(self, span), (bytes) =>
-    Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''),
-  )
+  span.sourceId === self.id && span.end <= self.bytes.length
+    ? Option.some(latin1(self.bytes, span.start, span.end))
+    : Option.none()
+
+const latin1 = (bytes: Uint8Array, start: number, end: number): string => {
+  let text = ''
+  for (let index = start; index < end; index += 1) text += String.fromCharCode(bytes[index] ?? 0)
+  return text
+}
 
 /** Tests identity and byte-for-byte equality between two immutable source snapshots. */
 export const equals = (self: SourceFile, other: SourceFile): boolean =>

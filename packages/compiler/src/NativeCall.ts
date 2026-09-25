@@ -1,12 +1,7 @@
-import * as LlvmBlock from '@silklang/llvm/Block'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as FunctionActor from '@silklang/llvm/Function'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import { suspensionPointKey } from './Backend.js'
 import type * as Mir from './Mir.js'
 import * as NativeLanePointer from './NativeLanePointer.js'
@@ -31,18 +26,18 @@ export interface DeclaredTarget {
 }
 
 export interface SynchronousContext {
-  readonly body: FunctionBody.FunctionBody
+  readonly body: Emitter.Body
   readonly storage: NativeStorage.Context
   readonly diagnostic?: NativeDiagnosticContext.NativeDiagnosticContext
 }
 
 /** Ordinary calls inherit observation; independently owned execution bodies start a fresh root. */
-export const argumentsFor = Effect.fnUntraced(function* (
+export const argumentsFor = (
   context: Pick<SynchronousContext, 'diagnostic'>,
   target: Pick<DeclaredTarget, 'diagnosticParameter'>,
   arguments_: ReadonlyArray<Value.Input>,
   observation: 'Inherited' | 'Independent' = 'Inherited',
-) {
+) => {
   if (target.diagnosticParameter === undefined) return arguments_
   if (context.diagnostic === undefined)
     throw new RangeError('Native call lost its invocation diagnostic context')
@@ -51,58 +46,54 @@ export const argumentsFor = Effect.fnUntraced(function* (
   return [
     ...arguments_,
     observation === 'Independent'
-      ? yield* Constant.nullValue(context.diagnostic.builder, context.diagnostic.pointer)
-      : yield* NativeDiagnosticContext.current(context.diagnostic),
+      ? Emitter.nullValue(context.diagnostic.builder, context.diagnostic.pointer)
+      : NativeDiagnosticContext.current(context.diagnostic),
     observation === 'Independent'
-      ? yield* Constant.nullValue(context.diagnostic.builder, context.diagnostic.causeType)
-      : yield* NativeDiagnosticContext.currentCause(context.diagnostic),
+      ? Emitter.nullValue(context.diagnostic.builder, context.diagnostic.causeType)
+      : NativeDiagnosticContext.currentCause(context.diagnostic),
   ]
-})
+}
 
 /** Resolves logical arguments before appending the separately borrowed diagnostic context. */
-export const lowerArguments = Effect.fnUntraced(function* (
+export const lowerArguments = (
   context: SynchronousContext,
   target: Pick<DeclaredTarget, 'diagnosticParameter' | 'argumentParameters'>,
   inputs: NativeArgument.NativeArgument,
   observation: 'Inherited' | 'Independent' = 'Inherited',
-) {
+) => {
   const arguments_ =
     target.argumentParameters === undefined
-      ? yield* NativeArgument.materialize(context.storage, inputs, 'native_helper_arguments')
-      : yield* NativeArgument.lower(
+      ? NativeArgument.materialize(context.storage, inputs, 'native_helper_arguments')
+      : NativeArgument.lower(
           context.storage,
           target.argumentParameters,
           inputs,
           `call_argument${context.storage.sequences.materialize++}`,
         )
-  return yield* argumentsFor(context, target, arguments_, observation)
-})
+  return argumentsFor(context, target, arguments_, observation)
+}
 
 /** Calls one synchronous native target and unpacks its ABI result lanes. */
-export const callSynchronous = Effect.fnUntraced(function* (
+export const callSynchronous = (
   context: SynchronousContext,
   target: DeclaredTarget,
   arguments_: NativeArgument.NativeArgument,
   name: string,
-): Effect.fn.Return<NativeResult.Received, LlvmError.LlvmError> {
+): NativeResult.Received => {
   if (target.suspendable)
     throw new RangeError('LLVM synchronous helper selected a suspendable target')
-  const resultAddress = yield* NativeResult.allocate(context.body, target, `${name}_result`)
-  const result = yield* FunctionBody.callDirect(
+  const resultAddress = NativeResult.allocate(context.body, target, `${name}_result`)
+  const result = Emitter.callDirect(
     context.body,
     target.handle,
-    NativeResult.argumentsFor(
-      target,
-      yield* lowerArguments(context, target, arguments_),
-      resultAddress,
-    ),
+    NativeResult.argumentsFor(target, lowerArguments(context, target, arguments_), resultAddress),
     name,
   )
   for (const root of [...context.storage.addressRoots].sort((left, right) => left - right))
-    yield* NativeStorage.reloadAddressRoot(context.storage, root)
-  const unpacked = yield* NativeResult.readValue(context.body, target, result, resultAddress, name)
+    NativeStorage.reloadAddressRoot(context.storage, root)
+  const unpacked = NativeResult.readValue(context.body, target, result, resultAddress, name)
   return unpacked
-})
+}
 
 /** Runtime inputs consumed by an Effect execution operation. */
 export const operationInputs = (
@@ -121,8 +112,8 @@ export const operationInputs = (
 }
 
 export interface Context {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly i8: LlvmType.Type
   readonly i32: LlvmType.Type
@@ -145,11 +136,11 @@ export interface Context {
 }
 
 /** Retains one canonical relay frame in the transfer-owned continuation chain. */
-export const retainRelay = Effect.fnUntraced(function* (
+export const retainRelay = (
   context: Context,
   suspension: Mir.RunSuspendableEffectRegion,
   name: string,
-) {
+) => {
   const {
     body,
     builder,
@@ -171,35 +162,25 @@ export const retainRelay = Effect.fnUntraced(function* (
   const generated = resumeThunks.get(suspensionPointKey(suspension.point))
   if (generated === undefined)
     throw new RangeError('LLVM coroutine relay lost its native frame plan')
-  const frame = yield* FunctionBody.load(
-    body,
-    pointer,
-    invocationFrameStorage,
-    `${name}_invocation_frame`,
-  )
-  const appendPointerPointer = yield* FunctionBody.getElementPtr(
+  const frame = Emitter.load(body, pointer, invocationFrameStorage, `${name}_invocation_frame`)
+  const appendPointerPointer = Emitter.getElementPtr(
     body,
     i8,
     transferPointer,
-    [yield* Constant.integerUnsigned(builder, i32, BigInt(program.layout.target.pointerSize * 2))],
+    [Emitter.integerUnsigned(builder, i32, BigInt(program.layout.target.pointerSize * 2))],
     `${name}_append_ptr_ptr`,
   )
-  const appendPointer = yield* FunctionBody.load(
-    body,
-    pointer,
-    appendPointerPointer,
-    `${name}_append_ptr`,
-  )
-  const next = yield* FunctionBody.load(body, pointer, appendPointer, `${name}_next`)
-  yield* FunctionBody.store(
+  const appendPointer = Emitter.load(body, pointer, appendPointerPointer, `${name}_append_ptr`)
+  const next = Emitter.load(body, pointer, appendPointer, `${name}_next`)
+  Emitter.store(
     body,
     next,
-    yield* NativeLanePointer.lanePointer(lanePointers, body, frame, 0, `${name}_store_parent`),
+    NativeLanePointer.lanePointer(lanePointers, body, frame, 0, `${name}_store_parent`),
   )
-  yield* FunctionBody.store(
+  Emitter.store(
     body,
-    yield* Constant.fromGlobal(builder, yield* FunctionActor.global(builder, generated.handle)),
-    yield* NativeLanePointer.lanePointer(
+    Emitter.fromGlobal(builder, Emitter.functionGlobal(builder, generated.handle)),
+    NativeLanePointer.lanePointer(
       lanePointers,
       body,
       frame,
@@ -210,10 +191,10 @@ export const retainRelay = Effect.fnUntraced(function* (
   if (entry.diagnosticParameter !== undefined) {
     const diagnostic = context.synchronous.diagnostic
     if (diagnostic === undefined) throw new RangeError('Relay lost its diagnostic context')
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
-      yield* NativeDiagnosticContext.current(diagnostic),
-      yield* NativeLanePointer.lanePointer(
+      NativeDiagnosticContext.current(diagnostic),
+      NativeLanePointer.lanePointer(
         lanePointers,
         body,
         frame,
@@ -221,10 +202,10 @@ export const retainRelay = Effect.fnUntraced(function* (
         `${name}_store_observer`,
       ),
     )
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
       diagnostic.incomingCause,
-      yield* NativeLanePointer.lanePointer(
+      NativeLanePointer.lanePointer(
         lanePointers,
         body,
         frame,
@@ -232,10 +213,10 @@ export const retainRelay = Effect.fnUntraced(function* (
         `${name}_incoming_cause`,
       ),
     )
-    yield* FunctionBody.store(
+    Emitter.store(
       body,
-      yield* NativeDiagnosticContext.currentCause(diagnostic),
-      yield* NativeLanePointer.lanePointer(
+      NativeDiagnosticContext.currentCause(diagnostic),
+      NativeLanePointer.lanePointer(
         lanePointers,
         body,
         frame,
@@ -245,44 +226,43 @@ export const retainRelay = Effect.fnUntraced(function* (
     )
   }
   for (const field of generated.layout.payload) {
-    yield* NativeFrame.retain(storage, frame, field, `${name}_payload${field.slot}`)
+    NativeFrame.retain(storage, frame, field, `${name}_payload${field.slot}`)
   }
-  yield* FunctionBody.store(body, frame, appendPointer)
-  yield* FunctionBody.store(
+  Emitter.store(body, frame, appendPointer)
+  Emitter.store(
     body,
-    yield* NativeLanePointer.lanePointer(lanePointers, body, frame, 0, `${name}_next_append_ptr`),
+    NativeLanePointer.lanePointer(lanePointers, body, frame, 0, `${name}_next_append_ptr`),
     appendPointerPointer,
   )
-})
+}
 
-export const callValues = Effect.fnUntraced(function* (
+export const callValues = (
   context: Context,
   target: NativeLoweringContext.DeclaredFunction,
   arguments_: NativeArgument.NativeArgument,
   name: string,
   suspension?: Mir.RunSuspendableEffectRegion,
-) {
+) => {
   const { body, builder, entry, i32, storage, pointer, transferPointer } = context
-  if (!target.suspendable)
-    return yield* callSynchronous(context.synchronous, target, arguments_, name)
+  if (!target.suspendable) return callSynchronous(context.synchronous, target, arguments_, name)
   if (transferPointer === undefined || suspension === undefined)
     throw new RangeError(
       `LLVM suspension-aware call from ${entry.fn.id.module}.${entry.fn.id.name} to ${target.fn.id.module}.${target.fn.id.name} lost transfer control`,
     )
-  const resultAddress = yield* NativeResult.allocate(body, target, `${name}_result`)
-  const nullPointer = yield* Constant.nullValue(builder, pointer)
-  const result = yield* FunctionBody.callDirect(
+  const resultAddress = NativeResult.allocate(body, target, `${name}_result`)
+  const nullPointer = Emitter.nullValue(builder, pointer)
+  const result = Emitter.callDirect(
     body,
     target.handle,
     [
       ...NativeResult.argumentsFor(
         target,
-        yield* lowerArguments(context.synchronous, target, arguments_),
+        lowerArguments(context.synchronous, target, arguments_),
         resultAddress,
       ),
       transferPointer,
       nullPointer,
-      yield* Constant.integerUnsigned(builder, i32, 0n),
+      Emitter.integerUnsigned(builder, i32, 0n),
     ],
     name,
   )
@@ -290,44 +270,44 @@ export const callValues = Effect.fnUntraced(function* (
   // The callee may mutate borrowed state before transferring. Refresh it before either
   // consuming a completed result or spilling the caller's continuation payload.
   for (const root of [...storage.addressRoots].sort((left, right) => left - right))
-    yield* NativeStorage.reloadAddressRoot(storage, root)
-  const status = yield* NativeResult.status(body, target, result, `${name}_status`)
-  const completed = yield* LlvmBlock.make(body, `${name}_complete`)
-  const transferred = yield* LlvmBlock.make(body, `${name}_transfer`)
-  yield* FunctionBody.conditionalBranch(
+    NativeStorage.reloadAddressRoot(storage, root)
+  const status = NativeResult.status(body, target, result, `${name}_status`)
+  const completed = Emitter.block(body, `${name}_complete`)
+  const transferred = Emitter.block(body, `${name}_transfer`)
+  Emitter.conditionalBranch(
     body,
-    yield* FunctionBody.integerCompare(
+    Emitter.integerCompare(
       body,
       'eq',
       status,
-      yield* Constant.integerUnsigned(builder, i32, 0n),
+      Emitter.integerUnsigned(builder, i32, 0n),
       `${name}_is_complete`,
     ),
     completed,
     transferred,
   )
-  yield* LlvmBlock.setInsertionPoint(body, transferred)
-  yield* retainRelay(context, suspension, name)
-  const external = yield* LlvmBlock.make(body, `${name}_external`)
-  const nested = yield* LlvmBlock.make(body, `${name}_nested`)
-  yield* FunctionBody.conditionalBranch(
+  Emitter.setInsertionPoint(body, transferred)
+  retainRelay(context, suspension, name)
+  const external = Emitter.block(body, `${name}_external`)
+  const nested = Emitter.block(body, `${name}_nested`)
+  Emitter.conditionalBranch(
     body,
-    yield* FunctionBody.integerCompare(
+    Emitter.integerCompare(
       body,
       'eq',
       status,
-      yield* Constant.integerUnsigned(builder, i32, 2n),
+      Emitter.integerUnsigned(builder, i32, 2n),
       `${name}_is_external`,
     ),
     external,
     nested,
   )
-  yield* LlvmBlock.setInsertionPoint(body, external)
-  yield* NativeSuspension.returnStep(context.returns, 2n, [], `${name}_external`)
-  yield* LlvmBlock.setInsertionPoint(body, nested)
-  yield* NativeSuspension.returnStep(context.returns, 1n, [], `${name}_relayed`)
-  yield* LlvmBlock.setInsertionPoint(body, completed)
-  const unpacked = yield* NativeResult.readValue(
+  Emitter.setInsertionPoint(body, external)
+  NativeSuspension.returnStep(context.returns, 2n, [], `${name}_external`)
+  Emitter.setInsertionPoint(body, nested)
+  NativeSuspension.returnStep(context.returns, 1n, [], `${name}_relayed`)
+  Emitter.setInsertionPoint(body, completed)
+  const unpacked = NativeResult.readValue(
     body,
     target,
     result,
@@ -336,4 +316,4 @@ export const callValues = Effect.fnUntraced(function* (
     'SuspensionStep',
   )
   return unpacked
-})
+}

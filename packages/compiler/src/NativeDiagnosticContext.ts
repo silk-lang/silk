@@ -1,18 +1,13 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as NativeDiagnosticOutcome from './NativeDiagnosticOutcome.js'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import * as LlvmType from '@silklang/llvm/Type'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Block from '@silklang/llvm/Block'
-import * as Constant from '@silklang/llvm/Constant'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as NativeDiagnosticFailure from './NativeDiagnosticFailure.js'
 
 /** One invocation's current lexical observer reference; never module or thread-local storage. */
 export interface NativeDiagnosticContext {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly pointer: LlvmType.Type
   readonly byte: LlvmType.Type
   readonly word: LlvmType.Type
@@ -31,24 +26,18 @@ export interface NativeDiagnosticContext {
 }
 
 /** Creates the invocation-local slot initialized from the internal call ABI. */
-export const make = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
-  body: FunctionBody.FunctionBody,
+export const make = (
+  builder: Emitter.Module,
+  body: Emitter.Body,
   pointer: LlvmType.Type,
   byte: LlvmType.Type,
   word: LlvmType.Type,
   initial: Value.Input,
   initialCause?: Value.Input,
-): Effect.fn.Return<NativeDiagnosticContext, LlvmError.LlvmError> {
-  const causeType = yield* NativeDiagnosticFailure.type({ builder, pointer, word })
-  const recordType = yield* LlvmType.structure(builder, [
-    pointer,
-    pointer,
-    pointer,
-    pointer,
-    causeType,
-  ])
-  const callbackType = yield* LlvmType.functionType(builder, word, [
+): NativeDiagnosticContext => {
+  const causeType = NativeDiagnosticFailure.type({ builder, pointer, word })
+  const recordType = Emitter.structureType(builder, [pointer, pointer, pointer, pointer, causeType])
+  const callbackType = Emitter.functionType(builder, word, [
     pointer,
     pointer,
     byte,
@@ -59,11 +48,11 @@ export const make = Effect.fnUntraced(function* (
     pointer,
     word,
   ])
-  const current = yield* FunctionBody.alloca(body, pointer, 'diagnostic_observer_slot')
-  yield* FunctionBody.store(body, initial, current)
-  const incomingCause = initialCause ?? (yield* Constant.nullValue(builder, causeType))
-  const cause = yield* FunctionBody.alloca(body, causeType, 'diagnostic_cause_slot')
-  yield* FunctionBody.store(body, incomingCause, cause)
+  const current = Emitter.alloca(body, pointer, 'diagnostic_observer_slot')
+  Emitter.store(body, initial, current)
+  const incomingCause = initialCause ?? Emitter.nullValue(builder, causeType)
+  const cause = Emitter.alloca(body, causeType, 'diagnostic_cause_slot')
+  Emitter.store(body, incomingCause, cause)
   return {
     builder,
     body,
@@ -80,70 +69,70 @@ export const make = Effect.fnUntraced(function* (
     literals: new Map<string, readonly [Value.Input, Value.Input]>(),
     sourceState: { dirty: false },
   }
-})
+}
 
 /** Borrows the selected cause for a nested call without creating an owned reference. */
-export const currentCause = Effect.fnUntraced(function* (self: NativeDiagnosticContext) {
-  return yield* FunctionBody.load(self.body, self.causeType, self.cause, 'diagnostic_cause')
-})
+export const currentCause = (self: NativeDiagnosticContext) => {
+  return Emitter.load(self.body, self.causeType, self.cause, 'diagnostic_cause')
+}
 
 /** Loads the observer selected at this call site, including any intervening lexical scope. */
-export const current = Effect.fnUntraced(function* (self: NativeDiagnosticContext) {
-  return yield* FunctionBody.load(self.body, self.pointer, self.current, 'diagnostic_observer')
-})
+export const current = (self: NativeDiagnosticContext) => {
+  return Emitter.load(self.body, self.pointer, self.current, 'diagnostic_observer')
+}
 
 /** Borrows the selected failure for terminal observation; unrelated or absent contexts stay silent. */
-export const unhandled = Effect.fnUntraced(function* (self: NativeDiagnosticContext) {
-  const failure = yield* NativeDiagnosticFailure.unpack(self, yield* currentCause(self))
-  const selected = yield* FunctionBody.integerCompare(
+export const unhandled = (self: NativeDiagnosticContext) => {
+  const failure = NativeDiagnosticFailure.unpack(self, currentCause(self))
+  const selected = Emitter.integerCompare(
     self.body,
     'eq',
-    yield* FunctionBody.cast(
+    Emitter.cast(
       self.body,
       'ptrtoint',
       failure.observer,
       self.word,
       'unhandled_cause_owner_address',
     ),
-    yield* FunctionBody.cast(
+    Emitter.cast(
       self.body,
       'ptrtoint',
-      yield* current(self),
+      current(self),
       self.word,
       'unhandled_current_observer_address',
     ),
     'unhandled_selected_observer',
   )
-  return yield* NativeDiagnosticFailure.unhandled(
+  return NativeDiagnosticFailure.unhandled(
     {
       ...failure,
-      observer: yield* FunctionBody.select(
+      observer: Emitter.select(
         self.body,
         selected,
         failure.observer,
-        yield* Constant.nullValue(self.builder, self.pointer),
+        Emitter.nullValue(self.builder, self.pointer),
         'unhandled_observer',
       ),
     },
     self,
   )
-})
+}
 
 /** Addresses dispatch, state, captures, previous observer, or previous cause in a descriptor. */
-export const field = Effect.fnUntraced(function* (
+export const field = (
   self: NativeDiagnosticContext,
   record: Value.Input,
   ordinal: 0 | 1 | 2 | 3 | 4,
-) {
-  const index = yield* LlvmType.integer(self.builder, 32)
-  return yield* FunctionBody.getElementPtr(self.body, self.recordType, record, [
-    yield* Constant.integerUnsigned(self.builder, index, 0n),
-    yield* Constant.integerUnsigned(self.builder, index, BigInt(ordinal)),
+) => {
+  const index = Emitter.integerType(self.builder, 32)
+  return Emitter.getElementPtr(self.body, self.recordType, record, [
+    Emitter.integerUnsigned(self.builder, index, 0n),
+    Emitter.integerUnsigned(self.builder, index, BigInt(ordinal)),
   ])
-})
+}
 
 /** Dispatches to the observer that owns a retained context, independently of lexical selection. */
-export const emitAt = Effect.fnUntraced(function* (
+export const emitAt = (
   self: NativeDiagnosticContext,
   observer: Value.Input,
   event: 0 | 1 | 2 | 3 | 4 | 5 | 6,
@@ -151,35 +140,35 @@ export const emitAt = Effect.fnUntraced(function* (
   second: Value.Input,
   identity: readonly [Value.Input, Value.Input],
   origin: readonly [Value.Input, Value.Input],
-) {
+) => {
   const { body, builder, pointer, word } = self
-  const enabled = yield* Block.make(body, 'diagnostic_enabled')
-  const disabled = yield* Block.make(body, 'diagnostic_disabled')
-  const following = yield* Block.make(body, 'diagnostic_complete')
-  const zero = yield* Constant.integerUnsigned(builder, word, 0n)
-  yield* FunctionBody.conditionalBranch(
+  const enabled = Emitter.block(body, 'diagnostic_enabled')
+  const disabled = Emitter.block(body, 'diagnostic_disabled')
+  const following = Emitter.block(body, 'diagnostic_complete')
+  const zero = Emitter.integerUnsigned(builder, word, 0n)
+  Emitter.conditionalBranch(
     body,
-    yield* FunctionBody.integerCompare(
+    Emitter.integerCompare(
       body,
       'ne',
-      yield* FunctionBody.cast(body, 'ptrtoint', observer, word, 'diagnostic_observer_address'),
+      Emitter.cast(body, 'ptrtoint', observer, word, 'diagnostic_observer_address'),
       zero,
     ),
     enabled,
     disabled,
   )
-  yield* Block.setInsertionPoint(body, enabled)
-  const dispatch = yield* FunctionBody.load(body, pointer, yield* field(self, observer, 0))
-  const state = yield* FunctionBody.load(body, pointer, yield* field(self, observer, 1))
-  const captures = yield* FunctionBody.load(body, pointer, yield* field(self, observer, 2))
-  const result = yield* FunctionBody.call(
+  Emitter.setInsertionPoint(body, enabled)
+  const dispatch = Emitter.load(body, pointer, field(self, observer, 0))
+  const state = Emitter.load(body, pointer, field(self, observer, 1))
+  const captures = Emitter.load(body, pointer, field(self, observer, 2))
+  const result = Emitter.call(
     body,
     self.callbackType,
     dispatch,
     [
       captures,
       state,
-      yield* Constant.integerUnsigned(builder, self.byte, BigInt(event)),
+      Emitter.integerUnsigned(builder, self.byte, BigInt(event)),
       first,
       second,
       ...identity,
@@ -188,64 +177,52 @@ export const emitAt = Effect.fnUntraced(function* (
     'diagnostic_result',
   )
   if (result === undefined) throw new RangeError('Diagnostic callback returned no handle')
-  yield* FunctionBody.branch(body, following)
-  yield* Block.setInsertionPoint(body, disabled)
-  yield* FunctionBody.branch(body, following)
-  yield* Block.setInsertionPoint(body, following)
-  const joined = yield* FunctionBody.phi(body, word, 'diagnostic_handle')
-  yield* FunctionBody.addPhiIncoming(body, joined, result, enabled)
-  yield* FunctionBody.addPhiIncoming(body, joined, zero, disabled)
-  yield* FunctionBody.sealPhi(body, joined)
-  const value = yield* FunctionBody.phiValue(body, joined)
+  Emitter.branch(body, following)
+  Emitter.setInsertionPoint(body, disabled)
+  Emitter.branch(body, following)
+  Emitter.setInsertionPoint(body, following)
+  const joined = Emitter.phi(body, word, 'diagnostic_handle')
+  Emitter.addPhiIncoming(body, joined, result, enabled)
+  Emitter.addPhiIncoming(body, joined, zero, disabled)
+  Emitter.sealPhi(body, joined)
+  const value = Emitter.phiValue(body, joined)
   self.sourceState.dirty = true
   return value
-})
+}
 
 /** Dispatches a semantic event to the current observer; disabled observation yields zero. */
-export const emit = Effect.fnUntraced(function* (
+export const emit = (
   self: NativeDiagnosticContext,
   event: 0 | 1 | 2 | 3 | 4 | 5 | 6,
   first: Value.Input,
   second: Value.Input,
   identity: readonly [Value.Input, Value.Input],
   origin: readonly [Value.Input, Value.Input],
-) {
-  return yield* emitAt(self, yield* current(self), event, first, second, identity, origin)
-})
+) => {
+  return emitAt(self, current(self), event, first, second, identity, origin)
+}
 
 /** Borrows the active cause only from the selected observer's pool for fatal reporting. */
-export const fatal = Effect.fnUntraced(function* (
+export const fatal = (
   self: NativeDiagnosticContext,
   reason: readonly [Value.Input, Value.Input],
   origin: readonly [Value.Input, Value.Input],
-) {
-  const observer = yield* current(self)
-  const cause = yield* NativeDiagnosticFailure.unpack(self, yield* currentCause(self))
-  const zero = yield* Constant.integerUnsigned(self.builder, self.word, 0n)
-  const selected = yield* FunctionBody.select(
+) => {
+  const observer = current(self)
+  const cause = NativeDiagnosticFailure.unpack(self, currentCause(self))
+  const zero = Emitter.integerUnsigned(self.builder, self.word, 0n)
+  const selected = Emitter.select(
     self.body,
-    yield* FunctionBody.integerCompare(
+    Emitter.integerCompare(
       self.body,
       'eq',
-      yield* FunctionBody.cast(
-        self.body,
-        'ptrtoint',
-        observer,
-        self.word,
-        'fatal_observer_address',
-      ),
-      yield* FunctionBody.cast(
-        self.body,
-        'ptrtoint',
-        cause.observer,
-        self.word,
-        'fatal_cause_owner_address',
-      ),
+      Emitter.cast(self.body, 'ptrtoint', observer, self.word, 'fatal_observer_address'),
+      Emitter.cast(self.body, 'ptrtoint', cause.observer, self.word, 'fatal_cause_owner_address'),
       'fatal_cause_owner_matches',
     ),
     cause.handle,
     zero,
     'fatal_cause_handle',
   )
-  return yield* emitAt(self, observer, 6, selected, zero, reason, origin)
-})
+  return emitAt(self, observer, 6, selected, zero, reason, origin)
+}

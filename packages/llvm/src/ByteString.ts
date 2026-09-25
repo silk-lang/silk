@@ -46,14 +46,19 @@ export const fromUint8Array = (bytes: Uint8Array): ByteString => fromNumbers(byt
  * @since 0.0.0
  */
 export const fromString = (value: string): ByteString => {
+  // Every emitted value and block name is encoded here; index by UTF-16 unit instead of the
+  // allocating string iterator and hand the array over without a second copy.
   const bytes: Array<number> = []
-
-  for (const character of value) {
-    const codePoint = character.codePointAt(0) ?? 0
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index)
+    if (unit <= 0x7f) {
+      bytes.push(unit)
+      continue
+    }
+    const codePoint = value.codePointAt(index) ?? unit
+    if (codePoint > 0xffff) index += 1
     const scalarValue = codePoint >= 0xd800 && codePoint <= 0xdfff ? 0xfffd : codePoint
-    if (scalarValue <= 0x7f) {
-      bytes.push(scalarValue)
-    } else if (scalarValue <= 0x7ff) {
+    if (scalarValue <= 0x7ff) {
       bytes.push(0xc0 | (scalarValue >> 6), 0x80 | (scalarValue & 0x3f))
     } else if (scalarValue <= 0xffff) {
       bytes.push(
@@ -70,8 +75,7 @@ export const fromString = (value: string): ByteString => {
       )
     }
   }
-
-  return fromNumbers(bytes)
+  return { _tag: 'ByteString', bytes }
 }
 
 /**

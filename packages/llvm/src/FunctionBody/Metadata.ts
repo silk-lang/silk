@@ -58,46 +58,55 @@ export const attachMetadata = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const setDebugLocation = Effect.fnUntraced(function* (
+export const setDebugLocation = (
   self: FunctionBody,
   instruction: Instruction,
   location: Metadata.Optional,
-): Effect.fn.Return<void, LlvmError> {
-  yield* FunctionBodyState.mutateModule(self, 'FunctionBody.setDebugLocation', (draft, module) =>
-    Result.gen(function* () {
-      if (module.strip) return
-      const instructionIndex = yield* FunctionBodyState.resolveInstruction(
-        draft,
-        instruction,
-        'FunctionBody.setDebugLocation',
-      )
-      const metadataIndex = yield* Metadata.resolveIndex(
-        draft.builder,
-        module,
-        draft.moduleOwner,
-        location,
-        'FunctionBody.setDebugLocation',
-      )
-      if (metadataIndex !== undefined) {
-        const entry = module.metadata.entries.descriptions[metadataIndex]
-        if (
-          entry?._tag !== 'Forward' &&
-          (entry?._tag !== 'Node' || entry.value._tag !== 'Location')
-        ) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.setDebugLocation',
-              message:
-                'Instruction debug location must be a DILocation or a compatible forward reference',
-              input: location,
-            }),
-          )
-        }
-      }
-      draft.debugLocations[instructionIndex] = metadataIndex
-    }),
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.setDebugLocation', (draft) =>
+    setDebugLocationIn(draft, instruction, location),
   )
-})
+
+/** @internal */
+export const setDebugLocationIn = (
+  draft: FunctionBodyState.Draft,
+  instruction: Instruction,
+  location: Metadata.Optional,
+): Result.Result<void, LlvmError> => {
+  const module = draft.module
+  return Result.gen(function* () {
+    if (module.strip) return
+    const instructionIndex = yield* FunctionBodyState.resolveInstruction(
+      draft,
+      instruction,
+      'FunctionBody.setDebugLocation',
+    )
+    const metadataIndex = yield* Metadata.resolveIndex(
+      draft.builder,
+      module,
+      draft.moduleOwner,
+      location,
+      'FunctionBody.setDebugLocation',
+    )
+    if (metadataIndex !== undefined) {
+      const entry = module.metadata.entries.descriptions[metadataIndex]
+      if (
+        entry?._tag !== 'Forward' &&
+        (entry?._tag !== 'Node' || entry.value._tag !== 'Location')
+      ) {
+        return yield* Result.fail(
+          invalidInput({
+            operation: 'FunctionBody.setDebugLocation',
+            message:
+              'Instruction debug location must be a DILocation or a compatible forward reference',
+            input: location,
+          }),
+        )
+      }
+    }
+    draft.debugLocations[instructionIndex] = metadataIndex
+  })
+}
 
 /**
  * Attaches non-negative 32-bit branch weights to a conditional branch or switch.

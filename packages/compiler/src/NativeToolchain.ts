@@ -7,7 +7,7 @@ import * as Schema from 'effect/Schema'
 import { NodeServices } from '@effect/platform-node'
 import type * as ArtifactPlan from './ArtifactPlan.js'
 import * as CompilationProfile from './CompilationProfile.js'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -795,15 +795,47 @@ const runPlanned = Effect.fnUntraced(function* (
   stage: 'object' | 'runtime' | 'wasm-finalize',
   planned: ToolchainPlan.PlannedCommand,
 ): Effect.fn.Return<void, ToolchainError> {
-  const result = yield* Effect.try({
-    try: () =>
-      spawnSync(planned.command, [...planned.arguments], {
-        encoding: 'utf8',
-        ...(planned.environment === undefined ? {} : { env: { ...planned.environment } }),
-      }),
-    catch: (cause) => processError(operation, stage, planned, null, '', cause),
+  // Asynchronous so the driver can run analysis-only work while the tool runs.
+  const result = yield* Effect.callback<{
+    readonly status: number | null
+    readonly stdout: string
+    readonly stderr: string
+    readonly error?: Error
+  }>((resume) => {
+    const stdout: Array<Buffer> = []
+    const stderr: Array<Buffer> = []
+    let error: Error | undefined
+    const child = spawn(
+      planned.command,
+      [...planned.arguments],
+      planned.environment === undefined ? {} : { env: { ...planned.environment } },
+    )
+    let settled = false
+    const settle = (status: number | null) => {
+      if (settled) return
+      settled = true
+      resume(
+        Effect.succeed({
+          status,
+          stdout: Buffer.concat(stdout).toString('utf8'),
+          stderr: Buffer.concat(stderr).toString('utf8'),
+          ...(error === undefined ? {} : { error }),
+        }),
+      )
+    }
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
+    // A process that never starts reports `error` and may never close its streams.
+    child.on('error', (cause) => {
+      error = cause
+      if (child.pid === undefined) settle(null)
+    })
+    child.on('close', settle)
+    return Effect.sync(() => {
+      child.kill()
+    })
   })
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}${result.error?.message ?? ''}`
+  const output = `${result.stdout}${result.stderr}${result.error?.message ?? ''}`
   if (result.error !== undefined || result.status !== 0) {
     return yield* processError(operation, stage, planned, result.status, output, result.error)
   }

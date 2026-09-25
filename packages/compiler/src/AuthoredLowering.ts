@@ -294,7 +294,8 @@ const child = (cursor: Cursor, role: string): Cursor => {
   cursor.counts.set(role, occurrence + 1)
   return {
     owner: cursor.owner,
-    path: [...cursor.path, { _tag: 'LocalSegment', role, occurrence }],
+    // Exact-size copy: anchors retain these paths for the whole compilation.
+    path: cursor.path.concat({ _tag: 'LocalSegment', role, occurrence }),
     counts: new Map(),
   }
 }
@@ -310,7 +311,7 @@ const authored: AuthoredHir.Origin = { _tag: 'Authored' }
 const noCauses: ReadonlyArray<AuthoredHir.Cause> = []
 
 const slice = (draft: Draft, span: SourceSpan.SourceSpan): Uint8Array =>
-  Uint8Array.from(draft.source.bytes.slice(span.start, span.end))
+  draft.source.bytes.slice(span.start, span.end)
 
 const spellingOf = (draft: Draft, span: SourceSpan.SourceSpan): string =>
   decoder.decode(slice(draft, span))
@@ -1619,16 +1620,14 @@ const ownerChild = (
     _tag: 'AuthoredIdentity',
     namespace: parent.namespace,
     module: parent.module,
-    path: [
-      ...parent.path,
-      {
-        _tag: 'OwnerSegment',
-        kind: key.kind,
-        ...(key.name === undefined ? {} : { name: key.name }),
-        ...(key.role === undefined ? {} : { role: key.role }),
-        occurrence,
-      },
-    ],
+    // `concat` allocates exactly; `[...path, segment]` leaves ~16 slots of slack per retained path.
+    path: parent.path.concat({
+      _tag: 'OwnerSegment',
+      kind: key.kind,
+      ...(key.name === undefined ? {} : { name: key.name }),
+      ...(key.role === undefined ? {} : { role: key.role }),
+      occurrence,
+    }),
   }
 }
 
