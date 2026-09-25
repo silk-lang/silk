@@ -282,10 +282,10 @@ them back to a local owner, as required by Silk's ownership rules.
 Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 discovery root
 imports the existing query, source-index, and semantic cases. The focused HIR run checks exact
 integer magnitudes and fingerprints without pulling the full HIR suite into the semantic binary.
-`--no-cache` executes assertions even if a previous run stored passing results. The self-hosted M1
-CI job runs these commands for pull requests targeting the exact `selfhost` branch. The workflow's
-push trigger remains limited to `main`; use these commands locally to validate M1 on a pull request
-targeting `main`.
+`--no-cache` executes assertions even if a previous run stored passing results. The focused Linux
+workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
+Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
+named `selfhost-*`; pushing one does not start a second CI run before its pull request.
 
 ```sh
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
@@ -299,6 +299,16 @@ signature, memoized reuse, relevant and unrelated revisions, negative observatio
 HIR, typed-failure retry, nested query cancellation with same-store retry, and source-publication
 rollback. The cancellation proof combines the executed nested query case with reviewed semantic
 publication boundaries; it does not claim an executed full-semantic cancellation fixture.
+
+Keep this loop lean: each new case needs behavioral evidence that its neighbors cannot provide.
+Use the existing source-written roots, shared runners and fixtures, and the cheapest assertions
+that can falsify the claim. Cover representative integration and failure boundaries rather than
+adding per-feature native recompilations or exhaustive matrices. Run broader parser, HIR, corpus,
+fuzz, stress, and benchmark work when a milestone or a specific regression calls for it. The
+focused CI records separate step durations for dependency/toolchain setup, bootstrap compilation,
+and each source-written compile-and-run command. Those last commands include native compilation and
+test execution; their combined duration is not a runtime-only measurement. Compare actual cold and
+warm CI runs before setting a time target; five minutes is an aspiration, not a correctness bound.
 
 Check the self-hosted program with the bootstrap compiler when changing source outside that
 focused entry:
