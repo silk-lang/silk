@@ -1,13 +1,11 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativePlace from './NativePlace.js'
+import * as FunctionIndex from './internal/FunctionIndex.js'
 import * as NativeResult from './NativeResult.js'
 import * as NativePayload from './NativePayload.js'
 import * as NativeArgument from './NativeArgument.js'
 import * as ValueStorage from './ValueStorage.js'
-import * as LlvmBlock from '@silklang/llvm/Block'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import type * as Layout from './Layout.js'
@@ -51,12 +49,7 @@ type Operation = Extract<
 >
 
 /** Selects successful bytes without expanding the outcome's inactive alternatives. */
-const successPayload = Effect.fnUntraced(function* (
-  context: Context,
-  outcome: Mir.LocalId,
-  result: Mir.Type,
-  name: string,
-) {
+const successPayload = (context: Context, outcome: Mir.LocalId, result: Mir.Type, name: string) => {
   const source = context.storage.fn.localTypes.at(outcome.ordinal)
   if (source?._tag !== 'EffectOutcome') throw new RangeError('Effect success lost its outcome type')
   const stored = NativeStorage.readLocal(context.storage, outcome)
@@ -66,14 +59,14 @@ const successPayload = Effect.fnUntraced(function* (
       (member) => member.tag === 0,
     )?.storage._tag === 'Value'
   )
-    return yield* NativePlace.project(
+    return NativePlace.project(
       stored,
       context.storage,
       result,
       ValueStorage.outcome(context.program.layout, source.type).payloadOffset,
       name,
     )
-  const values = yield* NativeStorage.materialize(context.storage, outcome)
+  const values = NativeStorage.materialize(context.storage, outcome)
   const sourceLanes = NativeType.lanesFor(context.types, source).slice(1)
   const payload: Array<Value.Input> = []
   for (const [ordinal, lane] of NativeType.lanesFor(context.types, result).entries()) {
@@ -82,25 +75,14 @@ const successPayload = Effect.fnUntraced(function* (
     if (value === undefined || sourceLane === undefined)
       throw new RangeError('Effect success lost a payload lane')
     payload.push(
-      yield* NativeArith.coerceLane(
-        context.arith.lane,
-        value,
-        sourceLane,
-        lane,
-        `${name}_${ordinal}`,
-      ),
+      NativeArith.coerceLane(context.arith.lane, value, sourceLane, lane, `${name}_${ordinal}`),
     )
   }
   return { _tag: 'Direct' as const, values: payload }
-})
+}
 
 /** Materializes only the selected logical member at an outcome/capture boundary. */
-const memberPayload = Effect.fnUntraced(function* (
-  context: Context,
-  local: Mir.LocalId,
-  tag: number,
-  name: string,
-) {
+const memberPayload = (context: Context, local: Mir.LocalId, tag: number, name: string) => {
   const type = context.storage.fn.localTypes.at(local.ordinal)
   if (type?._tag !== 'EffectOutcome' && type?._tag !== 'EffectComposite')
     throw new RangeError('Member conversion requires a planned outcome or composite')
@@ -110,7 +92,7 @@ const memberPayload = Effect.fnUntraced(function* (
     type.type,
   )?.members.find((member) => member.tag === tag)
   if (member === undefined) throw new RangeError('Member conversion lost its storage binding')
-  return yield* NativePayload.materialize(
+  return NativePayload.materialize(
     NativePayload.project(
       NativePayload.local(context.storage, local),
       member.lanes.map((lane) => lane.slot),
@@ -122,9 +104,9 @@ const memberPayload = Effect.fnUntraced(function* (
     context.cleanup,
     name,
   )
-})
+}
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const {
     arith,
     body,
@@ -148,9 +130,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const diagnostic = call.synchronous.diagnostic
       const result =
         diagnostic === undefined
-          ? yield* Constant.integerUnsigned(builder, NativeType.laneType(types, lane), 0n)
-          : yield* NativeDiagnosticContext.unhandled(diagnostic)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          ? Emitter.integerUnsigned(builder, NativeType.laneType(types, lane), 0n)
+          : NativeDiagnosticContext.unhandled(diagnostic)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'Drop': {
@@ -173,7 +155,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             target: place.target.lanes,
           })
         }
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           cleanup,
           operation.cleanup,
           values,
@@ -191,7 +173,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ? operation.type.environment.fields
           : (operation.type.environment?.fields ?? [])
       if (operation._tag === 'MakeCallable' && operation.base !== undefined) {
-        yield* NativeStorage.constructField(nativeStorage, operation.destination, operation.base, 0)
+        NativeStorage.constructField(nativeStorage, operation.destination, operation.base, 0)
       }
       // Callable captures name their field ordinal; a staged section's start past the base fields.
       const fieldOrdinals =
@@ -202,7 +184,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const field = fields.at(fieldOrdinals.at(offset) ?? -1)
         if (field === undefined) throw new RangeError('Effect capture lost its environment field')
         if (field.representation !== 'Borrow') {
-          yield* NativeStorage.constructField(
+          NativeStorage.constructField(
             nativeStorage,
             operation.destination,
             capture.source,
@@ -210,14 +192,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           )
           continue
         }
-        yield* NativeStorage.ensureAddressRoot(nativeStorage, capture.source)
-        const base = yield* NativeStorage.addressOf(nativeStorage, capture.source)
+        NativeStorage.ensureAddressRoot(nativeStorage, capture.source)
+        const base = NativeStorage.addressOf(nativeStorage, capture.source)
         const destination = nativeStorage.addressStorage.get(operation.destination.ordinal)
         if (destination === undefined) throw new RangeError('Borrowed capture lost its destination')
-        yield* FunctionBody.store(
+        Emitter.store(
           body,
           base,
-          yield* NativeLanePointer.lanePointer(
+          NativeLanePointer.lanePointer(
             context.lanePointers,
             body,
             destination,
@@ -229,14 +211,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'UnpackEffectComposite': {
-      const source = yield* memberPayload(
+      const source = memberPayload(
         context,
         operation.source,
         operation.alternative,
         `effect_choice${operation.destination.ordinal}`,
       )
       const sourceType = entry.fn.localTypes.at(operation.source.ordinal)
-      const tag = yield* NativeStorage.readLane(nativeStorage, operation.source, 0)
+      const tag = NativeStorage.readLane(nativeStorage, operation.source, 0)
       if (sourceType?._tag !== 'EffectComposite' || tag === undefined)
         throw new RangeError('LLVM Effect choice projection lost its representation')
       const values: Array<Value.Input> = []
@@ -246,16 +228,16 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           throw new RangeError('LLVM Effect choice projection lost a capture lane')
         values.push(input)
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.matched.ordinal, [
-        yield* FunctionBody.cast(
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+      NativeStorage.writeLocal(nativeStorage, operation.matched.ordinal, [
+        Emitter.cast(
           body,
           'zext',
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             tag,
-            yield* Constant.integerSigned(builder, i32, BigInt(operation.alternative)),
+            Emitter.integerSigned(builder, i32, BigInt(operation.alternative)),
             `effect_choice${operation.destination.ordinal}_matched`,
           ),
           i32,
@@ -265,22 +247,22 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'PackEffectComposite': {
-      const source = yield* NativeStorage.materialize(nativeStorage, operation.source)
+      const source = NativeStorage.materialize(nativeStorage, operation.source)
       const sourceType = entry.fn.localTypes.at(operation.source.ordinal)
       if (sourceType?._tag !== 'EffectValue')
         throw new RangeError('LLVM Effect composite lost its selected alternative')
       const sourceLanes = NativeType.lanesFor(types, sourceType)
       const targetLanes = NativeType.lanesFor(types, operation.type)
       const values: Array<Value.Input> = [
-        yield* Constant.integerSigned(builder, i32, BigInt(operation.alternative)),
+        Emitter.integerSigned(builder, i32, BigInt(operation.alternative)),
       ]
       for (const [ordinal, targetLane] of targetLanes.slice(1).entries()) {
         const input = source.at(ordinal)
         const sourceLane = sourceLanes.at(ordinal)
         values.push(
           input === undefined || sourceLane === undefined
-            ? yield* Constant.nullValue(builder, NativeType.laneType(types, targetLane))
-            : yield* NativeArith.coerceLane(
+            ? Emitter.nullValue(builder, NativeType.laneType(types, targetLane))
+            : NativeArith.coerceLane(
                 arith.lane,
                 input,
                 sourceLane,
@@ -289,7 +271,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
               ),
         )
       }
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
       break
     }
     case 'PackEffectOutcome': {
@@ -298,17 +280,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const diagnostic = call.synchronous.diagnostic
       const diagnosticSlot = diagnostic?.outcomes.get(operation.destination.ordinal)
       if (diagnostic !== undefined && diagnosticSlot !== undefined) {
-        if (operation.tag === 0) yield* NativeDiagnosticOutcome.release(diagnosticSlot, diagnostic)
+        if (operation.tag === 0) NativeDiagnosticOutcome.release(diagnosticSlot, diagnostic)
         else
-          yield* NativeDiagnosticOutcome.produce(
+          NativeDiagnosticOutcome.produce(
             diagnosticSlot,
             diagnostic,
-            yield* NativeDiagnosticText.literal(
+            NativeDiagnosticText.literal(
               diagnostic,
               NativeTermination.identityOf(operation.type.type, operation.tag),
               `${entry.symbol}.failure${operation.destination.ordinal}.identity`,
             ),
-            yield* NativeDiagnosticText.literal(
+            NativeDiagnosticText.literal(
               diagnostic,
               NativeDiagnosticText.origin(
                 context.termination.module,
@@ -324,10 +306,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           (member) => member.tag === operation.tag,
         )?.storage._tag === 'Transport'
       ) {
-        const source = yield* NativeStorage.materialize(nativeStorage, operation.source)
+        const source = NativeStorage.materialize(nativeStorage, operation.source)
         const sourceLanes = NativeType.valueLanesFor(types, sourceType)
         const values: Array<Value.Input> = [
-          yield* Constant.integerSigned(builder, i32, BigInt(operation.tag)),
+          Emitter.integerSigned(builder, i32, BigInt(operation.tag)),
         ]
         for (const [ordinal, lane] of NativeType.lanesFor(types, operation.type)
           .slice(1)
@@ -336,8 +318,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           const sourceLane = sourceLanes.at(ordinal)
           values.push(
             value === undefined || sourceLane === undefined
-              ? yield* Constant.nullValue(builder, NativeType.laneType(types, lane))
-              : yield* NativeArith.coerceLane(
+              ? Emitter.nullValue(builder, NativeType.laneType(types, lane))
+              : NativeArith.coerceLane(
                   arith.lane,
                   value,
                   sourceLane,
@@ -346,20 +328,20 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
                 ),
           )
         }
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
         break
       }
       const destination = NativeStorage.readLocal(nativeStorage, operation.destination)
       if (destination._tag !== 'NativePlace')
         throw new RangeError('Effect outcome lost canonical storage')
-      yield* NativePlace.storeLane(
+      NativePlace.storeLane(
         destination,
         nativeStorage,
         0,
-        yield* Constant.integerSigned(builder, i32, BigInt(operation.tag)),
+        Emitter.integerSigned(builder, i32, BigInt(operation.tag)),
         `effect_outcome${operation.destination.ordinal}_tag`,
       )
-      const payload = yield* NativePlace.project(
+      const payload = NativePlace.project(
         destination,
         nativeStorage,
         sourceType,
@@ -367,9 +349,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         `effect_outcome${operation.destination.ordinal}_payload`,
       )
       const source = NativeStorage.readLocal(nativeStorage, operation.source)
-      if (source._tag === 'NativePlace') yield* NativePlace.transfer(payload, nativeStorage, source)
+      if (source._tag === 'NativePlace') NativePlace.transfer(payload, nativeStorage, source)
       else
-        yield* NativePlace.storeLanes(
+        NativePlace.storeLanes(
           payload,
           nativeStorage,
           source._tag === 'Empty' ? [] : source.values,
@@ -378,41 +360,41 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'PackEffectFailureUnion': {
-      const source = yield* NativeStorage.materialize(nativeStorage, operation.source)
+      const source = NativeStorage.materialize(nativeStorage, operation.source)
       const sourceTag = source.at(0)
       if (sourceTag === undefined) throw new RangeError('Effect failure union lost its tag lane')
-      let mappedTag: Value.Input = yield* Constant.integerSigned(builder, i32, -1n)
+      let mappedTag: Value.Input = Emitter.integerSigned(builder, i32, -1n)
       const diagnostic = call.synchronous.diagnostic
       const diagnosticSlot = diagnostic?.outcomes.get(operation.destination.ordinal)
       let diagnosticIdentity: readonly [Value.Input, Value.Input] | undefined
       if (diagnostic !== undefined && diagnosticSlot !== undefined)
         diagnosticIdentity = [
-          yield* Constant.nullValue(builder, diagnostic.pointer),
-          yield* Constant.integerUnsigned(builder, diagnostic.word, 0n),
+          Emitter.nullValue(builder, diagnostic.pointer),
+          Emitter.integerUnsigned(builder, diagnostic.word, 0n),
         ]
       for (const [ordinal, mapping] of operation.mappings.entries()) {
-        const matches = yield* FunctionBody.integerCompare(
+        const matches = Emitter.integerCompare(
           body,
           'eq',
           sourceTag,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.source)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.source)),
           `effect_failure_union${operation.destination.ordinal}_${ordinal}`,
         )
         if (diagnostic !== undefined && diagnosticIdentity !== undefined) {
-          const identity = yield* NativeDiagnosticText.literal(
+          const identity = NativeDiagnosticText.literal(
             diagnostic,
             NativeTermination.identityOf(operation.type.type, mapping.target),
             `${entry.symbol}.failure${operation.destination.ordinal}.${ordinal}.identity`,
           )
           diagnosticIdentity = [
-            yield* FunctionBody.select(
+            Emitter.select(
               body,
               matches,
               identity[0],
               diagnosticIdentity[0],
               `failure_identity${ordinal}`,
             ),
-            yield* FunctionBody.select(
+            Emitter.select(
               body,
               matches,
               identity[1],
@@ -421,10 +403,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             ),
           ]
         }
-        mappedTag = yield* FunctionBody.select(
+        mappedTag = Emitter.select(
           body,
           matches,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
           mappedTag,
           `effect_failure_union${operation.destination.ordinal}_${ordinal}_tag`,
         )
@@ -434,11 +416,11 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         diagnosticSlot !== undefined &&
         diagnosticIdentity !== undefined
       )
-        yield* NativeDiagnosticOutcome.produce(
+        NativeDiagnosticOutcome.produce(
           diagnosticSlot,
           diagnostic,
           diagnosticIdentity,
-          yield* NativeDiagnosticText.literal(
+          NativeDiagnosticText.literal(
             diagnostic,
             NativeDiagnosticText.origin(
               context.termination.module,
@@ -450,7 +432,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
       const values: Array<Value.Input> = [
         mappedTag,
-        ...(yield* NativeAggregate.failurePayload(
+        ...NativeAggregate.failurePayload(
           failure,
           source,
           operation.sourceType.type,
@@ -458,9 +440,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           operation.type.type,
           operation.mappings,
           `effect_failure_union${operation.destination.ordinal}_payload`,
-        )),
+        ),
       ]
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, values)
       break
     }
     case 'UnpackEffectSuccess': {
@@ -469,10 +451,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const destinationType = entry.fn.localTypes.at(operation.destination.ordinal)
         if (destinationType === undefined)
           throw new RangeError('Effect unpack lost its destination type')
-        yield* NativeStorage.writeValue(
+        NativeStorage.writeValue(
           nativeStorage,
           operation.destination,
-          yield* successPayload(
+          successPayload(
             context,
             operation.source,
             destinationType,
@@ -480,10 +462,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           ),
         )
       } else
-        yield* NativeStorage.writeLocal(
+        NativeStorage.writeLocal(
           nativeStorage,
           operation.destination.ordinal,
-          yield* memberPayload(
+          memberPayload(
             context,
             operation.source,
             0,
@@ -493,7 +475,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'RunEffect': {
-      const target = declared.find((candidate) =>
+      const target = FunctionIndex.nativeCandidates(declared, operation.target).find((candidate) =>
         Mir.matchesEffectInstance(
           candidate.fn,
           operation.target,
@@ -506,7 +488,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         throw new RangeError('Backend cannot resolve propagated effect target')
       const runArguments = NativeArgument.fromLocals(nativeStorage, operation.arguments)
       if (
-        yield* NativeSuspension.emitOrigin(
+        NativeSuspension.emitOrigin(
           suspension,
           operation,
           runArguments,
@@ -515,10 +497,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
         break
       const suspensionRegion = suspensionRegions.get(operation)
-      const outcomeValues = yield* NativeSuspension.joinOutcome(
+      const outcomeValues = NativeSuspension.joinOutcome(
         suspension,
         operation,
-        yield* NativeCall.callValues(
+        NativeCall.callValues(
           call,
           target,
           runArguments,
@@ -527,63 +509,57 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `effect_run${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
-      const tag = yield* NativeStorage.readLane(nativeStorage, operation.outcome, 0)
+      NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
+      const tag = NativeStorage.readLane(nativeStorage, operation.outcome, 0)
       if (tag === undefined) throw new RangeError('Effect outcome lost its tag')
-      const zero = yield* Constant.integerSigned(builder, i32, 0n)
-      const succeeded = yield* FunctionBody.integerCompare(
+      const zero = Emitter.integerSigned(builder, i32, 0n)
+      const succeeded = Emitter.integerCompare(
         body,
         'eq',
         tag,
         zero,
         `effect_run_success${operation.destination.ordinal}`,
       )
-      const successBlock = yield* LlvmBlock.make(
-        body,
-        `effect_run${operation.destination.ordinal}_success`,
-      )
-      const failureBlock = yield* LlvmBlock.make(
-        body,
-        `effect_run${operation.destination.ordinal}_failure`,
-      )
-      const followingBlock = yield* LlvmBlock.make(
+      const successBlock = Emitter.block(body, `effect_run${operation.destination.ordinal}_success`)
+      const failureBlock = Emitter.block(body, `effect_run${operation.destination.ordinal}_failure`)
+      const followingBlock = Emitter.block(
         body,
         `effect_run${operation.destination.ordinal}_following`,
       )
-      yield* FunctionBody.conditionalBranch(body, succeeded, successBlock, failureBlock)
-      yield* LlvmBlock.setInsertionPoint(body, successBlock)
-      yield* NativeStorage.writeValue(
+      Emitter.conditionalBranch(body, succeeded, successBlock, failureBlock)
+      Emitter.setInsertionPoint(body, successBlock)
+      NativeStorage.writeValue(
         nativeStorage,
         operation.destination,
-        yield* successPayload(
+        successPayload(
           context,
           operation.outcome,
           operation.type,
           `effect_success${operation.destination.ordinal}`,
         ),
       )
-      yield* NativeStorage.commitLocal(nativeStorage, operation.destination)
-      yield* FunctionBody.branch(body, followingBlock)
-      yield* LlvmBlock.setInsertionPoint(body, failureBlock)
-      yield* NativeTermination.storePropagated(
+      NativeStorage.commitLocal(nativeStorage, operation.destination)
+      Emitter.branch(body, followingBlock)
+      Emitter.setInsertionPoint(body, failureBlock)
+      NativeTermination.storePropagated(
         context.termination,
         operation.outcome,
         operation.provenance.span,
       )
-      let mappedTag: Value.Input = yield* Constant.integerSigned(builder, i32, -1n)
+      let mappedTag: Value.Input = Emitter.integerSigned(builder, i32, -1n)
       for (const [ordinal, mapping] of operation.tagMappings.entries()) {
-        const source = yield* Constant.integerSigned(builder, i32, BigInt(mapping.source))
-        const matches = yield* FunctionBody.integerCompare(
+        const source = Emitter.integerSigned(builder, i32, BigInt(mapping.source))
+        const matches = Emitter.integerCompare(
           body,
           'eq',
           tag,
           source,
           `effect_tag${operation.destination.ordinal}_${ordinal}`,
         )
-        mappedTag = yield* FunctionBody.select(
+        mappedTag = Emitter.select(
           body,
           matches,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
           mappedTag,
           `effect_mapped_tag${operation.destination.ordinal}_${ordinal}`,
         )
@@ -592,7 +568,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       // through their complete cleanup plans, matching the Drop lowering.
       for (const release of operation.releases ?? []) {
         if (!CleanupPlan.hasEffect(release.cleanup)) continue
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           cleanup,
           release.cleanup,
           NativePayload.local(nativeStorage, release.local),
@@ -601,7 +577,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           release.initialization,
         )
       }
-      yield* NativeReturn.propagateFailure(
+      NativeReturn.propagateFailure(
         suspension.returns,
         nativeStorage,
         operation.outcome,
@@ -610,15 +586,15 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         operation.tagMappings,
         'propagated_effect',
       )
-      yield* LlvmBlock.setInsertionPoint(body, followingBlock)
+      Emitter.setInsertionPoint(body, followingBlock)
       // Both arms of this outcome dispatch reach here, so neither arm's cached
       // values are readable in the join. Reloading re-roots them at this block.
-      yield* NativeStorage.reloadRoots(
+      NativeStorage.reloadRoots(
         nativeStorage,
         `effect_run${operation.destination.ordinal}_following`,
         operation.destination,
       )
-      yield* NativeStorage.reloadLocal(
+      NativeStorage.reloadLocal(
         nativeStorage,
         operation.destination,
         `effect_run${operation.destination.ordinal}`,
@@ -626,28 +602,28 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'RunEffectComposite': {
-      const choice = yield* NativeStorage.readLane(nativeStorage, operation.effect, 0)
+      const choice = NativeStorage.readLane(nativeStorage, operation.effect, 0)
       const compositeType = entry.fn.localTypes.at(operation.effect.ordinal)
       if (choice === undefined || compositeType?._tag !== 'EffectComposite')
         throw new RangeError('LLVM Effect composite lost its tag or representation')
       const joinedOutcomeLanes = NativeType.lanesFor(types, operation.outcomeType)
-      const following = yield* LlvmBlock.make(
+      const following = Emitter.block(
         body,
         `effect_composite${operation.destination.ordinal}_following`,
       )
       for (const [alternativeOrdinal, alternative] of operation.alternatives.entries()) {
-        const selected = yield* LlvmBlock.make(
+        const selected = Emitter.block(
           body,
           `effect_composite${operation.destination.ordinal}_alternative${alternativeOrdinal}`,
         )
-        const otherwise = yield* LlvmBlock.make(
+        const otherwise = Emitter.block(
           body,
           `effect_composite${operation.destination.ordinal}_otherwise${alternativeOrdinal}`,
         )
-        const selectedTag = yield* Constant.integerSigned(builder, i32, BigInt(alternativeOrdinal))
-        yield* FunctionBody.conditionalBranch(
+        const selectedTag = Emitter.integerSigned(builder, i32, BigInt(alternativeOrdinal))
+        Emitter.conditionalBranch(
           body,
-          yield* FunctionBody.integerCompare(
+          Emitter.integerCompare(
             body,
             'eq',
             choice,
@@ -657,41 +633,39 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           selected,
           otherwise,
         )
-        yield* LlvmBlock.setInsertionPoint(body, selected)
-        const target = declared.find((candidate) =>
-          Mir.matchesEffectInstance(
-            candidate.fn,
-            alternative.runner,
-            alternative.runnerTypeArguments,
-            alternative.runnerStaticArguments,
-            alternative.type.type,
-          ),
+        Emitter.setInsertionPoint(body, selected)
+        const target = FunctionIndex.nativeCandidates(declared, alternative.runner).find(
+          (candidate) =>
+            Mir.matchesEffectInstance(
+              candidate.fn,
+              alternative.runner,
+              alternative.runnerTypeArguments,
+              alternative.runnerStaticArguments,
+              alternative.type.type,
+            ),
         )
         if (target === undefined)
           throw new RangeError(
             `Backend cannot resolve Effect composite runner ${alternative.runner.module}.${alternative.runner.name}`,
           )
         const effectArguments = [
-          ...(yield* memberPayload(
+          ...memberPayload(
             context,
             operation.effect,
             alternativeOrdinal,
             `effect_composite${operation.destination.ordinal}_${alternativeOrdinal}`,
-          )),
+          ),
         ]
         effectArguments.push(
-          ...(yield* NativeStorage.materializeArguments(
-            nativeStorage,
-            alternative.arguments,
-          )).flat(),
+          ...NativeStorage.materializeArguments(nativeStorage, alternative.arguments).flat(),
         )
-        const received = yield* NativeCall.callValues(
+        const received = NativeCall.callValues(
           call,
           target,
           NativeArgument.fromValues(effectArguments),
           `effect_composite${operation.destination.ordinal}_${alternativeOrdinal}`,
         )
-        const called = yield* NativeResult.materialize(
+        const called = NativeResult.materialize(
           nativeStorage,
           received,
           `composite${operation.destination.ordinal}_received`,
@@ -706,17 +680,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           throw new RangeError('LLVM Effect composite runner lost its outcome tag')
         let mappedTag: Value.Input = sourceTag
         for (const [mappingOrdinal, mapping] of alternative.tagMappings.entries()) {
-          const matches = yield* FunctionBody.integerCompare(
+          const matches = Emitter.integerCompare(
             body,
             'eq',
             sourceTag,
-            yield* Constant.integerSigned(builder, i32, BigInt(mapping.source)),
+            Emitter.integerSigned(builder, i32, BigInt(mapping.source)),
             `effect_composite${operation.destination.ordinal}_${alternativeOrdinal}_tag${mappingOrdinal}`,
           )
-          mappedTag = yield* FunctionBody.select(
+          mappedTag = Emitter.select(
             body,
             matches,
-            yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+            Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
             mappedTag,
             `effect_composite${operation.destination.ordinal}_${alternativeOrdinal}_mapped${mappingOrdinal}`,
           )
@@ -727,8 +701,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           const sourceLane = sourceOutcomeLanes.at(ordinal + 1)
           joined.push(
             input === undefined || sourceLane === undefined
-              ? yield* Constant.nullValue(builder, NativeType.laneType(types, targetLane))
-              : yield* NativeArith.coerceLane(
+              ? Emitter.nullValue(builder, NativeType.laneType(types, targetLane))
+              : NativeArith.coerceLane(
                   arith.lane,
                   input,
                   sourceLane,
@@ -737,37 +711,37 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
                 ),
           )
         }
-        yield* NativeStorage.writeValue(
+        NativeStorage.writeValue(
           nativeStorage,
           operation.outcome,
-          yield* NativeDiagnosticOutcome.accept(call.synchronous.diagnostic, operation.outcome, {
+          NativeDiagnosticOutcome.accept(call.synchronous.diagnostic, operation.outcome, {
             ...called,
             values: joined,
           }),
         )
-        yield* NativeStorage.commitLocal(nativeStorage, operation.outcome)
-        yield* FunctionBody.branch(body, following)
-        yield* LlvmBlock.setInsertionPoint(body, otherwise)
+        NativeStorage.commitLocal(nativeStorage, operation.outcome)
+        Emitter.branch(body, following)
+        Emitter.setInsertionPoint(body, otherwise)
       }
-      yield* FunctionBody.branch(
+      Emitter.branch(
         body,
-        yield* NativeTermination.trapBlock(
+        NativeTermination.trapBlock(
           context.termination,
           'invalid effect outcome tag',
           operation.provenance.span,
         ),
       )
-      yield* LlvmBlock.setInsertionPoint(body, following)
-      yield* NativeStorage.reloadRoots(
+      Emitter.setInsertionPoint(body, following)
+      NativeStorage.reloadRoots(
         nativeStorage,
         `effect_composite${operation.destination.ordinal}_following`,
         operation.outcome,
       )
       if (operation.propagationType === undefined) {
-        yield* NativeStorage.writeValue(
+        NativeStorage.writeValue(
           nativeStorage,
           operation.destination,
-          yield* successPayload(
+          successPayload(
             context,
             operation.outcome,
             operation.type,
@@ -776,67 +750,67 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         break
       }
-      const tag = yield* NativeStorage.readLane(nativeStorage, operation.outcome, 0)
+      const tag = NativeStorage.readLane(nativeStorage, operation.outcome, 0)
       if (tag === undefined) throw new RangeError('Effect composite outcome lost its tag')
-      const succeeded = yield* FunctionBody.integerCompare(
+      const succeeded = Emitter.integerCompare(
         body,
         'eq',
         tag,
-        yield* Constant.integerSigned(builder, i32, 0n),
+        Emitter.integerSigned(builder, i32, 0n),
         `effect_composite_success${operation.destination.ordinal}`,
       )
-      const successBlock = yield* LlvmBlock.make(
+      const successBlock = Emitter.block(
         body,
         `effect_composite${operation.destination.ordinal}_success`,
       )
-      const failureBlock = yield* LlvmBlock.make(
+      const failureBlock = Emitter.block(
         body,
         `effect_composite${operation.destination.ordinal}_failure`,
       )
-      const completed = yield* LlvmBlock.make(
+      const completed = Emitter.block(
         body,
         `effect_composite${operation.destination.ordinal}_completed`,
       )
-      yield* FunctionBody.conditionalBranch(body, succeeded, successBlock, failureBlock)
-      yield* LlvmBlock.setInsertionPoint(body, successBlock)
-      yield* NativeStorage.writeValue(
+      Emitter.conditionalBranch(body, succeeded, successBlock, failureBlock)
+      Emitter.setInsertionPoint(body, successBlock)
+      NativeStorage.writeValue(
         nativeStorage,
         operation.destination,
-        yield* successPayload(
+        successPayload(
           context,
           operation.outcome,
           operation.type,
           `effect_success${operation.destination.ordinal}`,
         ),
       )
-      yield* NativeStorage.commitLocal(nativeStorage, operation.destination)
-      yield* FunctionBody.branch(body, completed)
-      yield* LlvmBlock.setInsertionPoint(body, failureBlock)
-      yield* NativeTermination.storePropagated(
+      NativeStorage.commitLocal(nativeStorage, operation.destination)
+      Emitter.branch(body, completed)
+      Emitter.setInsertionPoint(body, failureBlock)
+      NativeTermination.storePropagated(
         context.termination,
         operation.outcome,
         operation.provenance.span,
       )
-      let propagatedTag: Value.Input = yield* Constant.integerSigned(builder, i32, -1n)
+      let propagatedTag: Value.Input = Emitter.integerSigned(builder, i32, -1n)
       for (const [ordinal, mapping] of operation.tagMappings.entries()) {
-        const matches = yield* FunctionBody.integerCompare(
+        const matches = Emitter.integerCompare(
           body,
           'eq',
           tag,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.source)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.source)),
           `effect_composite_propagation_tag${operation.destination.ordinal}_${ordinal}`,
         )
-        propagatedTag = yield* FunctionBody.select(
+        propagatedTag = Emitter.select(
           body,
           matches,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
           propagatedTag,
           `effect_composite_propagated_tag${operation.destination.ordinal}_${ordinal}`,
         )
       }
       for (const release of operation.releases ?? []) {
         if (!CleanupPlan.hasEffect(release.cleanup)) continue
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           cleanup,
           release.cleanup,
           NativePayload.local(nativeStorage, release.local),
@@ -845,7 +819,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           release.initialization,
         )
       }
-      yield* NativeReturn.propagateFailure(
+      NativeReturn.propagateFailure(
         suspension.returns,
         nativeStorage,
         operation.outcome,
@@ -854,13 +828,13 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         operation.tagMappings,
         'propagated_effect_composite',
       )
-      yield* LlvmBlock.setInsertionPoint(body, completed)
-      yield* NativeStorage.reloadRoots(
+      Emitter.setInsertionPoint(body, completed)
+      NativeStorage.reloadRoots(
         nativeStorage,
         `effect_composite${operation.destination.ordinal}_completed`,
         operation.destination,
       )
-      yield* NativeStorage.reloadLocal(
+      NativeStorage.reloadLocal(
         nativeStorage,
         operation.destination,
         `effect_composite${operation.destination.ordinal}`,
@@ -873,7 +847,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         operation._tag === 'RunStaticEffect'
           ? [...operation.captures.map((capture) => capture.source), ...operation.arguments]
           : undefined
-      const target = declared.find(
+      const target = FunctionIndex.nativeCandidates(declared, operation.runner).find(
         (candidate) =>
           Mir.matchesEffectInstance(
             candidate.fn,
@@ -908,7 +882,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
       const effectArguments =
         operation._tag === 'RunEffectValue'
-          ? yield* NativeArgument.captures(
+          ? NativeArgument.captures(
               nativeStorage,
               target.argumentParameters,
               operation.effect,
@@ -920,7 +894,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             ])
       if (operation._tag !== 'RunStaticEffect') {
         if (
-          yield* NativeSuspension.emitOrigin(
+          NativeSuspension.emitOrigin(
             suspension,
             operation,
             effectArguments,
@@ -931,7 +905,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       }
       const suspensionRegion =
         operation._tag === 'RunStaticEffect' ? undefined : suspensionRegions.get(operation)
-      const called = yield* NativeCall.callValues(
+      const called = NativeCall.callValues(
         call,
         target,
         effectArguments,
@@ -940,23 +914,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
       const outcomeValues =
         operation._tag === 'RunStaticEffect'
-          ? yield* NativeDiagnosticOutcome.accept(
-              call.synchronous.diagnostic,
-              operation.outcome,
-              called,
-            )
-          : yield* NativeSuspension.joinOutcome(
+          ? NativeDiagnosticOutcome.accept(call.synchronous.diagnostic, operation.outcome, called)
+          : NativeSuspension.joinOutcome(
               suspension,
               operation,
               called,
               `effect_value_run${operation.destination.ordinal}`,
             )
-      yield* NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
+      NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
       if (operation.propagationType === undefined) {
-        yield* NativeStorage.writeValue(
+        NativeStorage.writeValue(
           nativeStorage,
           operation.destination,
-          yield* successPayload(
+          successPayload(
             context,
             operation.outcome,
             operation.type,
@@ -965,62 +935,62 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         break
       }
-      const tag = yield* NativeStorage.readLane(nativeStorage, operation.outcome, 0)
+      const tag = NativeStorage.readLane(nativeStorage, operation.outcome, 0)
       if (tag === undefined) throw new RangeError('Effect outcome lost its tag')
-      const zero = yield* Constant.integerSigned(builder, i32, 0n)
-      const succeeded = yield* FunctionBody.integerCompare(
+      const zero = Emitter.integerSigned(builder, i32, 0n)
+      const succeeded = Emitter.integerCompare(
         body,
         'eq',
         tag,
         zero,
         `effect_value_success${operation.destination.ordinal}`,
       )
-      const successBlock = yield* LlvmBlock.make(
+      const successBlock = Emitter.block(
         body,
         `effect_value${operation.destination.ordinal}_success`,
       )
-      const failureBlock = yield* LlvmBlock.make(
+      const failureBlock = Emitter.block(
         body,
         `effect_value${operation.destination.ordinal}_failure`,
       )
-      const followingBlock = yield* LlvmBlock.make(
+      const followingBlock = Emitter.block(
         body,
         `effect_value${operation.destination.ordinal}_following`,
       )
-      yield* FunctionBody.conditionalBranch(body, succeeded, successBlock, failureBlock)
-      yield* LlvmBlock.setInsertionPoint(body, successBlock)
-      yield* NativeStorage.writeValue(
+      Emitter.conditionalBranch(body, succeeded, successBlock, failureBlock)
+      Emitter.setInsertionPoint(body, successBlock)
+      NativeStorage.writeValue(
         nativeStorage,
         operation.destination,
-        yield* successPayload(
+        successPayload(
           context,
           operation.outcome,
           operation.type,
           `effect_success${operation.destination.ordinal}`,
         ),
       )
-      yield* NativeStorage.commitLocal(nativeStorage, operation.destination)
-      yield* FunctionBody.branch(body, followingBlock)
-      yield* LlvmBlock.setInsertionPoint(body, failureBlock)
-      yield* NativeTermination.storePropagated(
+      NativeStorage.commitLocal(nativeStorage, operation.destination)
+      Emitter.branch(body, followingBlock)
+      Emitter.setInsertionPoint(body, failureBlock)
+      NativeTermination.storePropagated(
         context.termination,
         operation.outcome,
         operation.provenance.span,
       )
-      let mappedTag: Value.Input = yield* Constant.integerSigned(builder, i32, -1n)
+      let mappedTag: Value.Input = Emitter.integerSigned(builder, i32, -1n)
       for (const [ordinal, mapping] of operation.tagMappings.entries()) {
-        const source = yield* Constant.integerSigned(builder, i32, BigInt(mapping.source))
-        const matches = yield* FunctionBody.integerCompare(
+        const source = Emitter.integerSigned(builder, i32, BigInt(mapping.source))
+        const matches = Emitter.integerCompare(
           body,
           'eq',
           tag,
           source,
           `effect_value_tag${operation.destination.ordinal}_${ordinal}`,
         )
-        mappedTag = yield* FunctionBody.select(
+        mappedTag = Emitter.select(
           body,
           matches,
-          yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+          Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
           mappedTag,
           `effect_value_mapped_tag${operation.destination.ordinal}_${ordinal}`,
         )
@@ -1029,7 +999,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       // through their complete cleanup plans, matching the Drop lowering.
       for (const release of operation.releases ?? []) {
         if (!CleanupPlan.hasEffect(release.cleanup)) continue
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           cleanup,
           release.cleanup,
           NativePayload.local(nativeStorage, release.local),
@@ -1038,7 +1008,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           release.initialization,
         )
       }
-      yield* NativeReturn.propagateFailure(
+      NativeReturn.propagateFailure(
         suspension.returns,
         nativeStorage,
         operation.outcome,
@@ -1047,15 +1017,15 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         operation.tagMappings,
         'propagated_effect_value',
       )
-      yield* LlvmBlock.setInsertionPoint(body, followingBlock)
+      Emitter.setInsertionPoint(body, followingBlock)
       // Both arms of this outcome dispatch reach here, so neither arm's cached
       // values are readable in the join. Reloading re-roots them at this block.
-      yield* NativeStorage.reloadRoots(
+      NativeStorage.reloadRoots(
         nativeStorage,
         `effect_value${operation.destination.ordinal}_following`,
         operation.destination,
       )
-      yield* NativeStorage.reloadLocal(
+      NativeStorage.reloadLocal(
         nativeStorage,
         operation.destination,
         `effect_value${operation.destination.ordinal}`,
@@ -1063,7 +1033,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       break
     }
     case 'CatchEffect': {
-      const target = declared.find((candidate) =>
+      const target = FunctionIndex.nativeCandidates(declared, operation.runner).find((candidate) =>
         Mir.matchesEffectInstance(
           candidate.fn,
           operation.runner,
@@ -1073,14 +1043,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
       )
       if (target === undefined) throw new RangeError('Backend cannot resolve Effect result runner')
-      const reifyArguments = yield* NativeArgument.captures(
+      const reifyArguments = NativeArgument.captures(
         nativeStorage,
         target.argumentParameters,
         operation.effect,
         operation.arguments,
       )
       if (
-        yield* NativeSuspension.emitOrigin(
+        NativeSuspension.emitOrigin(
           suspension,
           operation,
           reifyArguments,
@@ -1089,10 +1059,10 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
         break
       const suspensionRegion = suspensionRegions.get(operation)
-      const outcomeValues = yield* NativeSuspension.joinOutcome(
+      const outcomeValues = NativeSuspension.joinOutcome(
         suspension,
         operation,
-        yield* NativeCall.callValues(
+        NativeCall.callValues(
           call,
           target,
           reifyArguments,
@@ -1101,19 +1071,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         ),
         `effect_result_run${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
-      const tag = yield* NativeStorage.readLane(nativeStorage, operation.outcome, 0)
+      NativeStorage.writeValue(nativeStorage, operation.outcome, outcomeValues)
+      const tag = NativeStorage.readLane(nativeStorage, operation.outcome, 0)
       if (tag === undefined) throw new RangeError('Effect result lost its outcome tag')
-      const zero = yield* Constant.integerSigned(builder, i32, 0n)
-      const succeeded = yield* FunctionBody.integerCompare(
+      const zero = Emitter.integerSigned(builder, i32, 0n)
+      const succeeded = Emitter.integerCompare(
         body,
         'eq',
         tag,
         zero,
         `effect_result_success${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
-        yield* FunctionBody.cast(
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [
+        Emitter.cast(
           body,
           'zext',
           succeeded,
@@ -1121,26 +1091,26 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `effect_result_success_flag${operation.destination.ordinal}`,
         ),
       ])
-      const outcomeLanesValues = yield* NativeStorage.materialize(nativeStorage, operation.outcome)
+      const outcomeLanesValues = NativeStorage.materialize(nativeStorage, operation.outcome)
       const outcomeLanes = operation.outcomeShape.lanes
       const successLaneCount =
         operation.outcomeShape.tree._tag === 'OutcomeShape'
           ? operation.outcomeShape.tree.success.laneCount
           : 0
-      const coerce = Effect.fnUntraced(function* (
+      const coerce = (
         values: ReadonlyArray<Value.Input>,
         sourceLanes: ReadonlyArray<Layout.CallingLane>,
         targetLanes: ReadonlyArray<Layout.CallingLane>,
         label: string,
-      ) {
+      ) => {
         const coerced: Array<Value.Input> = []
         for (const [ordinal, targetLane] of targetLanes.entries()) {
           const input = values.at(ordinal)
           const sourceLane = sourceLanes.at(ordinal)
           coerced.push(
             input === undefined || sourceLane === undefined
-              ? yield* Constant.nullValue(builder, NativeType.laneType(types, targetLane))
-              : yield* NativeArith.coerceLane(
+              ? Emitter.nullValue(builder, NativeType.laneType(types, targetLane))
+              : NativeArith.coerceLane(
                   arith.lane,
                   input,
                   sourceLane,
@@ -1150,24 +1120,24 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           )
         }
         return coerced
-      })
-      const successValues = yield* coerce(
+      }
+      const successValues = coerce(
         outcomeLanesValues.slice(1, 1 + successLaneCount),
         outcomeLanes.slice(1, 1 + successLaneCount),
         operation.successShape.lanes,
         `effect_result${operation.destination.ordinal}_success`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.successValue.ordinal, successValues)
-      yield* NativeStorage.storeMutable(nativeStorage, operation.successValue, successValues)
+      NativeStorage.writeLocal(nativeStorage, operation.successValue.ordinal, successValues)
+      NativeStorage.storeMutable(nativeStorage, operation.successValue, successValues)
       const failureValues: Array<Value.Input> = []
       const failureLanes: Array<Layout.CallingLane> = []
       if (SilkType.isUnion(operation.failureValueType)) {
         failureValues.push(
-          yield* FunctionBody.binary(
+          Emitter.binary(
             body,
             'sub',
             tag,
-            yield* Constant.integerSigned(builder, i32, 1n),
+            Emitter.integerSigned(builder, i32, 1n),
             `effect_result${operation.destination.ordinal}_failure_tag`,
           ),
         )
@@ -1178,20 +1148,16 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       }
       failureValues.push(...outcomeLanesValues.slice(1))
       failureLanes.push(...outcomeLanes.slice(1))
-      const coercedFailureValues = yield* coerce(
+      const coercedFailureValues = coerce(
         failureValues,
         failureLanes,
         operation.failureValueShape.lanes,
         `effect_result${operation.destination.ordinal}_failure`,
       )
-      yield* NativeStorage.writeLocal(
-        nativeStorage,
-        operation.failureValue.ordinal,
-        coercedFailureValues,
-      )
-      yield* NativeStorage.storeMutable(nativeStorage, operation.failureValue, coercedFailureValues)
+      NativeStorage.writeLocal(nativeStorage, operation.failureValue.ordinal, coercedFailureValues)
+      NativeStorage.storeMutable(nativeStorage, operation.failureValue, coercedFailureValues)
       break
     }
   }
   context.state.checkOrdinal = checkOrdinal
-})
+}

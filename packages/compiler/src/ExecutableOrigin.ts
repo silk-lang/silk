@@ -368,6 +368,11 @@ const providerWorklist = (bindings: Iterable<ProviderBinding>): ProviderWorklist
   return self
 }
 
+// TIR bodies are immutable, and every suspension-graph rebuild, effect-origin query, and binding
+// lookup walks the same bodies again; flatten each body once.
+const callableBindingsCache = new WeakMap<Tir.TirFunction, ReadonlyMap<number, Tir.Expression>>()
+const callableExpressionsCache = new WeakMap<Tir.TirFunction, ReadonlyArray<Tir.Expression>>()
+
 export const make = (operations: Operations) => {
   const {
     specializeInstanceType,
@@ -827,6 +832,8 @@ export const make = (operations: Operations) => {
   }
 
   const callableBindings = (fn: Tir.TirFunction): ReadonlyMap<number, Tir.Expression> => {
+    const cached = callableBindingsCache.get(fn)
+    if (cached !== undefined) return cached
     const bindings = new Map<number, Tir.Expression>()
     const expression = (value: Tir.Expression): void => {
       if (value._tag === 'EffectBlock') {
@@ -866,6 +873,7 @@ export const make = (operations: Operations) => {
       }
     }
     statements(fn.statements)
+    callableBindingsCache.set(fn, bindings)
     return bindings
   }
 
@@ -1969,12 +1977,49 @@ export const make = (operations: Operations) => {
     )
   }
 
+  // Discovery, every suspension-graph rebuild, and provider selection ask for the same result
+  // identities. An unguarded query depends only on the compilation, the body, and the exact
+  // application, so its answer is retained; cycle-guarded queries are recomputed.
+  const resultEffectIdentities = new WeakMap<
+    ReadonlyMap<string, Elaboration.Result>,
+    WeakMap<DeclarationIndex.Index, WeakMap<Tir.TirFunction, Map<string, string | undefined>>>
+  >()
   const resultEffectIdentity = (
     fn: Tir.TirFunction,
     owner: InstanceKey,
     results: ReadonlyMap<string, Elaboration.Result>,
     index: DeclarationIndex.Index,
     resolving: ReadonlySet<string> = new Set(),
+  ): string | undefined => {
+    if (resolving.size > 0) return computeResultEffectIdentity(fn, owner, results, index, resolving)
+    let byIndex = resultEffectIdentities.get(results)
+    if (byIndex === undefined) {
+      byIndex = new WeakMap()
+      resultEffectIdentities.set(results, byIndex)
+    }
+    let byFunction = byIndex.get(index)
+    if (byFunction === undefined) {
+      byFunction = new WeakMap()
+      byIndex.set(index, byFunction)
+    }
+    let byOwner = byFunction.get(fn)
+    if (byOwner === undefined) {
+      byOwner = new Map()
+      byFunction.set(fn, byOwner)
+    }
+    const application = `${keyText(owner)}\u0003${owner.typeArguments.map(Type.genericArgumentKey).join('\u0001')}`
+    if (byOwner.has(application)) return byOwner.get(application)
+    const identity = computeResultEffectIdentity(fn, owner, results, index, resolving)
+    byOwner.set(application, identity)
+    return identity
+  }
+
+  const computeResultEffectIdentity = (
+    fn: Tir.TirFunction,
+    owner: InstanceKey,
+    results: ReadonlyMap<string, Elaboration.Result>,
+    index: DeclarationIndex.Index,
+    resolving: ReadonlySet<string>,
   ): string | undefined => {
     const substitution = instanceSubstitution(fn, owner)
     const expressions = Tir.returnExpressions(fn.statements)
@@ -2457,10 +2502,15 @@ export const make = (operations: Operations) => {
     second: Type.Substitution,
   ): Type.Substitution => new Map([...first, ...second])
 
-  const callableExpressions = (fn: Tir.TirFunction): ReadonlyArray<Tir.Expression> =>
-    fn.statements.flatMap((statement) =>
+  const callableExpressions = (fn: Tir.TirFunction): ReadonlyArray<Tir.Expression> => {
+    const cached = callableExpressionsCache.get(fn)
+    if (cached !== undefined) return cached
+    const expressions = fn.statements.flatMap((statement) =>
       Tir.statementExpressions(statement).flatMap(Tir.expressionTree),
     )
+    callableExpressionsCache.set(fn, expressions)
+    return expressions
+  }
 
   const declarationTarget = (
     target: Tir.CallableTarget,
@@ -2679,6 +2729,14 @@ export const make = (operations: Operations) => {
     const sections = expressions.flatMap((expression) =>
       expression._tag === 'CallableSection' ? [expression] : [],
     )
+    // Discovery asks once per ancestry context; most bodies construct no callable at all.
+    if (
+      sections.length === 0 &&
+      !expressions.some(
+        (expression) => expression._tag === 'CallableApply' && expression.staged !== undefined,
+      )
+    )
+      return []
     const seen = new Set<string>()
     const instances: Array<CallableInstance> = []
     const context: EffectOriginContext = {
@@ -3357,20 +3415,27 @@ export const make = (operations: Operations) => {
       }
     >()
     const providerBindings = new Map<string, ProviderBinding>()
+    // Effect blocks grouped by representation identity, in instance then body order.
+    let blocksByRepresentation:
+      | Map<string, Array<{ readonly owner: InstanceKey; readonly identity: string }>>
+      | undefined
     const resolveEffectIdentity = (identity: Type.EffectIdentityArgument): string | undefined => {
-      const candidates = instances.flatMap((instance) =>
-        callableExpressions(instance.function).flatMap((expression) =>
-          expression._tag === 'EffectBlock' &&
-          Tir.effectRepresentationIdentity(expression.site) === identity.identity
-            ? [
-                {
-                  owner: instance.key,
-                  identity: effectIdentity(instance.key, expression.site),
-                },
-              ]
-            : [],
-        ),
-      )
+      if (blocksByRepresentation === undefined) {
+        blocksByRepresentation = new Map()
+        for (const instance of instances)
+          for (const expression of callableExpressions(instance.function)) {
+            if (expression._tag !== 'EffectBlock') continue
+            const representation = Tir.effectRepresentationIdentity(expression.site)
+            const block = {
+              owner: instance.key,
+              identity: effectIdentity(instance.key, expression.site),
+            }
+            const group = blocksByRepresentation.get(representation)
+            if (group === undefined) blocksByRepresentation.set(representation, [block])
+            else group.push(block)
+          }
+      }
+      const candidates = blocksByRepresentation.get(identity.identity) ?? []
       const owner = identity.owner
       if (owner === undefined)
         return candidates.length === 1 ? candidates.at(0)?.identity : undefined
@@ -3390,12 +3455,22 @@ export const make = (operations: Operations) => {
       return visible.length === 1 ? visible.at(0)?.identity : undefined
     }
     const successOfIdentity = successIdentityResolver(instances, results, index)
+    let instancesByResultEffect: Map<string, Array<Instance>> | undefined
     const serviceRecipesOfIdentity = (
       identity: string,
       resolving: ReadonlySet<string>,
     ): ReadonlyArray<ServiceEffectRecipe> => {
       if (resolving.has(identity)) return []
-      const candidates = instances.filter((candidate) => candidate.resultEffect === identity)
+      if (instancesByResultEffect === undefined) {
+        instancesByResultEffect = new Map()
+        for (const instance of instances) {
+          if (instance.resultEffect === undefined) continue
+          const group = instancesByResultEffect.get(instance.resultEffect)
+          if (group === undefined) instancesByResultEffect.set(instance.resultEffect, [instance])
+          else group.push(instance)
+        }
+      }
+      const candidates = instancesByResultEffect.get(identity) ?? []
       const candidate = candidates.length === 1 ? candidates.at(0) : undefined
       const expressions =
         candidate === undefined ? [] : Tir.returnExpressions(candidate.function.statements)

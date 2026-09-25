@@ -1,11 +1,6 @@
-import * as Alignment from '@silklang/llvm/Alignment'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as Block from '@silklang/llvm/Block'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import * as Intrinsic from '@silklang/llvm/Intrinsic'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as Layout from './Layout.js'
 import * as Mir from './Mir.js'
 import * as NativeLanePointer from './NativeLanePointer.js'
@@ -28,7 +23,7 @@ export interface NativePlace {
 }
 
 export interface Context {
-  readonly body: FunctionBody.FunctionBody
+  readonly body: Emitter.Body
   readonly types: NativeType.LoweringContext
   readonly lanePointers: NativeLanePointer.Context
 }
@@ -104,33 +99,28 @@ export const stored = (layout: Layout.Plan, type: Type.Type, base: Value.Input):
 }
 
 /** Allocates one aligned byte extent; unlike scalarization this does not allocate per-field slots. */
-export const allocate = Effect.fnUntraced(function* (
+export const allocate = (
   context: Context,
   type: Mir.Type,
   tag: string,
   placement: 'current' | 'entry' = 'current',
-) {
+) => {
   const layout = NativeType.addressLayout(context.types.program.layout, type)
   if (layout === undefined) throw new RangeError('Cannot allocate an unavailable value layout')
-  const base = yield* FunctionBody.alloca(context.body, context.lanePointers.byteType, tag, {
-    count: yield* Constant.integerUnsigned(
-      context.lanePointers.builder,
+  const base = Emitter.alloca(context.body, context.lanePointers.byteType, tag, {
+    count: Emitter.integerUnsigned(
+      context.body,
       context.lanePointers.offsetType,
       BigInt(layout.size),
     ),
-    alignment: yield* Alignment.fromByteUnits(layout.alignment),
+    alignment: Emitter.alignment(context.body, layout.alignment),
     placement,
   })
   return make(context.types.program.layout, type, base)
-})
+}
 
 /** Resolves one lane on demand from the current base; frame rebinding cannot leave stale addresses. */
-export const lanePointer = Effect.fnUntraced(function* (
-  self: NativePlace,
-  context: Context,
-  ordinal: number,
-  tag: string,
-) {
+export const lanePointer = (self: NativePlace, context: Context, ordinal: number, tag: string) => {
   const lane = NativeType.valueLanesFor(context.types, self.type).at(ordinal)
   const offset =
     lane === undefined
@@ -143,29 +133,24 @@ export const lanePointer = Effect.fnUntraced(function* (
     throw new RangeError(
       `Place lane ${ordinal} at ${offset}+${physical.size} exceeds ${self.size} bytes for ${Mir.typeText(self.type)}`,
     )
-  return yield* NativeLanePointer.lanePointer(
+  return NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,
-    yield* base(self, context, `${tag}_base`),
+    base(self, context, `${tag}_base`),
     offset,
     tag,
   )
-})
+}
 
 /** A borrowed environment's pointer slot survives joins; its referent is resolved at each use. */
-export const base = Effect.fnUntraced(function* (self: NativePlace, context: Context, tag: string) {
+export const base = (self: NativePlace, context: Context, tag: string) => {
   return self.indirect
-    ? yield* FunctionBody.load(context.body, context.types.pointer, self.base, tag)
+    ? Emitter.load(context.body, context.types.pointer, self.base, tag)
     : self.base
-})
+}
 
 /** Reads exactly one selected slot. The result must not survive a possible alias write. */
-export const loadLane = Effect.fnUntraced(function* (
-  self: NativePlace,
-  context: Context,
-  ordinal: number,
-  tag: string,
-) {
+export const loadLane = (self: NativePlace, context: Context, ordinal: number, tag: string) => {
   const lane = NativeType.valueLanesFor(context.types, self.type).at(ordinal)
   if (lane === undefined) throw new RangeError('Place read lost its lane type')
   const location =
@@ -174,19 +159,19 @@ export const loadLane = Effect.fnUntraced(function* (
       : NativeType.addressLocation(context.types.program.layout, self.type, lane, ordinal)
   if (location === undefined)
     throw new RangeError(`Place lost read location for ${Mir.typeText(self.type)}`)
-  const value = (yield* readLocations(self, context, [{ lane, location }], tag)).at(0)
+  const value = readLocations(self, context, [{ lane, location }], tag).at(0)
   if (value === undefined) throw new RangeError('Selected storage read lost its value')
   return value
-})
+}
 
 /** Writes one slot without loading or reconstructing any of its siblings. */
-export const storeLane = Effect.fnUntraced(function* (
+export const storeLane = (
   self: NativePlace,
   context: Context,
   ordinal: number,
   value: Value.Input,
   tag: string,
-) {
+) => {
   const lane = NativeType.valueLanesFor(context.types, self.type).at(ordinal)
   if (lane === undefined) throw new RangeError('Place write lost its calling lane')
   const location =
@@ -195,8 +180,8 @@ export const storeLane = Effect.fnUntraced(function* (
       : NativeType.addressLocation(context.types.program.layout, self.type, lane, ordinal)
   if (location === undefined)
     throw new RangeError(`Place lost write location for ${Mir.typeText(self.type)}`)
-  yield* writeLocations(self, context, [{ lane, location, value }], tag)
-})
+  writeLocations(self, context, [{ lane, location, value }], tag)
+}
 
 const arithmetic = (context: Context): NativeArith.LaneContext => ({
   body: context.body,
@@ -206,21 +191,16 @@ const arithmetic = (context: Context): NativeArith.LaneContext => ({
   types: context.types,
 })
 
-const storedPointer = Effect.fnUntraced(function* (
-  self: NativePlace,
-  context: Context,
-  offset: number,
-  tag: string,
-) {
-  if (offset === 0) return yield* base(self, context, `${tag}_base`)
-  return yield* NativeLanePointer.lanePointer(
+const storedPointer = (self: NativePlace, context: Context, offset: number, tag: string) => {
+  if (offset === 0) return base(self, context, `${tag}_base`)
+  return NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,
-    yield* base(self, context, `${tag}_base`),
+    base(self, context, `${tag}_base`),
     offset,
     tag,
   )
-})
+}
 
 interface ReadRequest {
   readonly lane: Layout.CallingLane
@@ -228,19 +208,14 @@ interface ReadRequest {
 }
 
 /** The place proves an extent, not stronger alignment than the address actually carries. */
-const access = Effect.fnUntraced(function* (
-  self: NativePlace,
-  context: Context,
-  offset: number,
-  lane: Layout.CallingLane,
-) {
+const access = (self: NativePlace, context: Context, offset: number, lane: Layout.CallingLane) => {
   const physical = ValueStorage.scalarLayout(context.types.program.layout.target, lane)
   if (!Number.isSafeInteger(offset) || offset < 0 || offset + physical.size > self.size)
     throw new RangeError('Selected lane exceeds its planned place extent')
   let alignment = Math.min(self.alignment, physical.alignment)
   while (offset % alignment !== 0) alignment /= 2
-  return { alignment: yield* Alignment.fromByteUnits(alignment) }
-})
+  return { alignment: Emitter.alignment(context.body, alignment) }
+}
 interface WriteRequest extends ReadRequest {
   readonly value: Value.Input
 }
@@ -263,31 +238,31 @@ const choices = (requests: ReadonlyArray<ReadRequest>) => {
   return groups
 }
 
-const readLocations = Effect.fnUntraced(function* (
+const readLocations = (
   self: NativePlace,
   context: Context,
   requests: ReadonlyArray<ReadRequest>,
   tag: string,
-): Effect.fn.Return<ReadonlyArray<Value.Input>, LlvmError.LlvmError> {
+): ReadonlyArray<Value.Input> => {
   const values: Array<Value.Input | undefined> = Array.from(
     { length: requests.length },
     () => undefined,
   )
   for (const [ordinal, request] of requests.entries()) {
     if (request.location === undefined)
-      values[ordinal] = yield* Constant.nullValue(
-        context.lanePointers.builder,
+      values[ordinal] = Emitter.nullValue(
+        context.body,
         NativeType.laneType(context.types, request.lane),
       )
     else if (request.location._tag === 'Slot') {
-      const value = yield* FunctionBody.load(
+      const value = Emitter.load(
         context.body,
         NativeType.laneType(context.types, request.location.lane),
-        yield* storedPointer(self, context, request.location.offset, `${tag}_${ordinal}_ptr`),
+        storedPointer(self, context, request.location.offset, `${tag}_${ordinal}_ptr`),
         `${tag}_${ordinal}`,
-        yield* access(self, context, request.location.offset, request.location.lane),
+        access(self, context, request.location.offset, request.location.lane),
       )
-      values[ordinal] = yield* NativeArith.coerceLane(
+      values[ordinal] = NativeArith.coerceLane(
         arithmetic(context),
         value,
         request.location.lane,
@@ -302,33 +277,29 @@ const readLocations = Effect.fnUntraced(function* (
         group.flatMap((item) => item.location.alternatives.map((alternative) => alternative.tag)),
       ),
     ]
-    const discriminant = yield* FunctionBody.load(
+    const discriminant = Emitter.load(
       context.body,
       context.types.i32,
-      yield* storedPointer(self, context, offset, `${tag}_${offset}_tag_ptr`),
+      storedPointer(self, context, offset, `${tag}_${offset}_tag_ptr`),
       `${tag}_${offset}_tag`,
-      yield* access(self, context, offset, { _tag: 'CallingLane', type: 'i32', path: [] }),
+      access(self, context, offset, { _tag: 'CallingLane', type: 'i32', path: [] }),
     )
-    const done = yield* Block.make(context.body, `${tag}_${offset}_done`)
+    const done = Emitter.block(context.body, `${tag}_${offset}_done`)
     const incoming: Array<{
       readonly block: Block.Block
       readonly values: ReadonlyArray<Value.Input>
     }> = []
-    const fallback = yield* Block.make(context.body, `${tag}_${offset}_zero`)
-    const dispatch = yield* FunctionBody.switchTerminator(context.body, discriminant, fallback)
+    const fallback = Emitter.block(context.body, `${tag}_${offset}_zero`)
+    const dispatch = Emitter.switchTerminator(context.body, discriminant, fallback)
     for (const alternative of tags) {
-      const selected = yield* Block.make(context.body, `${tag}_${offset}_${alternative}_selected`)
-      yield* FunctionBody.addSwitchCase(
+      const selected = Emitter.block(context.body, `${tag}_${offset}_${alternative}_selected`)
+      Emitter.addSwitchCase(
         context.body,
         dispatch,
-        yield* Constant.integerSigned(
-          context.lanePointers.builder,
-          context.types.i32,
-          BigInt(alternative),
-        ),
+        Emitter.integerSigned(context.body, context.types.i32, BigInt(alternative)),
         selected,
       )
-      yield* Block.setInsertionPoint(context.body, selected)
+      Emitter.setInsertionPoint(context.body, selected)
       const selectedRequests = group.map((item) => {
         const request = requests.at(item.ordinal)
         if (request === undefined) throw new RangeError('Union conversion lost a lane')
@@ -337,7 +308,7 @@ const readLocations = Effect.fnUntraced(function* (
         )?.location
         return { lane: request.lane, ...(location === undefined ? {} : { location }) }
       })
-      const selectedValues = yield* readLocations(
+      const selectedValues = readLocations(
         self,
         context,
         selectedRequests,
@@ -345,33 +316,28 @@ const readLocations = Effect.fnUntraced(function* (
       )
       let exit = selected
       if (selectedRequests.some((request) => request.location?._tag === 'Choice')) {
-        exit = yield* Block.make(context.body, `${tag}_${offset}_${alternative}_exit`)
-        yield* FunctionBody.branch(context.body, exit)
-        yield* Block.setInsertionPoint(context.body, exit)
+        exit = Emitter.block(context.body, `${tag}_${offset}_${alternative}_exit`)
+        Emitter.branch(context.body, exit)
+        Emitter.setInsertionPoint(context.body, exit)
       }
-      yield* FunctionBody.branch(context.body, done)
+      Emitter.branch(context.body, done)
       incoming.push({ block: exit, values: selectedValues })
     }
-    yield* FunctionBody.sealSwitch(context.body, dispatch)
-    yield* Block.setInsertionPoint(context.body, fallback)
+    Emitter.sealSwitch(context.body, dispatch)
+    Emitter.setInsertionPoint(context.body, fallback)
     const zero: Array<Value.Input> = []
     for (const item of group) {
       const request = requests.at(item.ordinal)
       if (request === undefined) throw new RangeError('Union conversion lost a result lane')
-      zero.push(
-        yield* Constant.nullValue(
-          context.lanePointers.builder,
-          NativeType.laneType(context.types, request.lane),
-        ),
-      )
+      zero.push(Emitter.nullValue(context.body, NativeType.laneType(context.types, request.lane)))
     }
     incoming.push({ block: fallback, values: zero })
-    yield* FunctionBody.branch(context.body, done)
-    yield* Block.setInsertionPoint(context.body, done)
+    Emitter.branch(context.body, done)
+    Emitter.setInsertionPoint(context.body, done)
     for (const [index, item] of group.entries()) {
       const request = requests.at(item.ordinal)
       if (request === undefined) throw new RangeError('Union conversion lost its join type')
-      const phi = yield* FunctionBody.phi(
+      const phi = Emitter.phi(
         context.body,
         NativeType.laneType(context.types, request.lane),
         `${tag}_${item.ordinal}_result`,
@@ -379,38 +345,38 @@ const readLocations = Effect.fnUntraced(function* (
       for (const entry of incoming) {
         const value = entry.values.at(index)
         if (value === undefined) throw new RangeError('Union conversion lost a predecessor')
-        yield* FunctionBody.addPhiIncoming(context.body, phi, value, entry.block)
+        Emitter.addPhiIncoming(context.body, phi, value, entry.block)
       }
-      yield* FunctionBody.sealPhi(context.body, phi)
-      values[item.ordinal] = yield* FunctionBody.phiValue(context.body, phi)
+      Emitter.sealPhi(context.body, phi)
+      values[item.ordinal] = Emitter.phiValue(context.body, phi)
     }
   }
   return values.map((value) => {
     if (value === undefined) throw new RangeError('Incomplete storage conversion')
     return value
   })
-})
+}
 
-const writeLocations = Effect.fnUntraced(function* (
+const writeLocations = (
   self: NativePlace,
   context: Context,
   requests: ReadonlyArray<WriteRequest>,
   tag: string,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   for (const [ordinal, request] of requests.entries()) {
     if (request.location?._tag !== 'Slot') continue
-    const value = yield* NativeArith.coerceLane(
+    const value = NativeArith.coerceLane(
       arithmetic(context),
       request.value,
       request.lane,
       request.location.lane,
       `${tag}_${ordinal}_stored`,
     )
-    yield* FunctionBody.store(
+    Emitter.store(
       context.body,
       value,
-      yield* storedPointer(self, context, request.location.offset, `${tag}_${ordinal}`),
-      yield* access(self, context, request.location.offset, request.location.lane),
+      storedPointer(self, context, request.location.offset, `${tag}_${ordinal}`),
+      access(self, context, request.location.offset, request.location.lane),
     )
   }
   for (const [offset, group] of choices(requests)) {
@@ -419,29 +385,25 @@ const writeLocations = Effect.fnUntraced(function* (
         group.flatMap((item) => item.location.alternatives.map((alternative) => alternative.tag)),
       ),
     ]
-    const discriminant = yield* FunctionBody.load(
+    const discriminant = Emitter.load(
       context.body,
       context.types.i32,
-      yield* storedPointer(self, context, offset, `${tag}_${offset}_tag_ptr`),
+      storedPointer(self, context, offset, `${tag}_${offset}_tag_ptr`),
       `${tag}_${offset}_tag`,
-      yield* access(self, context, offset, { _tag: 'CallingLane', type: 'i32', path: [] }),
+      access(self, context, offset, { _tag: 'CallingLane', type: 'i32', path: [] }),
     )
-    const done = yield* Block.make(context.body, `${tag}_${offset}_done`)
-    const dispatch = yield* FunctionBody.switchTerminator(context.body, discriminant, done)
+    const done = Emitter.block(context.body, `${tag}_${offset}_done`)
+    const dispatch = Emitter.switchTerminator(context.body, discriminant, done)
     for (const alternative of tags) {
-      const selected = yield* Block.make(context.body, `${tag}_${offset}_${alternative}_selected`)
-      yield* FunctionBody.addSwitchCase(
+      const selected = Emitter.block(context.body, `${tag}_${offset}_${alternative}_selected`)
+      Emitter.addSwitchCase(
         context.body,
         dispatch,
-        yield* Constant.integerSigned(
-          context.lanePointers.builder,
-          context.types.i32,
-          BigInt(alternative),
-        ),
+        Emitter.integerSigned(context.body, context.types.i32, BigInt(alternative)),
         selected,
       )
-      yield* Block.setInsertionPoint(context.body, selected)
-      yield* writeLocations(
+      Emitter.setInsertionPoint(context.body, selected)
+      writeLocations(
         self,
         context,
         group.flatMap((item) => {
@@ -454,12 +416,12 @@ const writeLocations = Effect.fnUntraced(function* (
         }),
         `${tag}_${offset}_${alternative}`,
       )
-      yield* FunctionBody.branch(context.body, done)
+      Emitter.branch(context.body, done)
     }
-    yield* FunctionBody.sealSwitch(context.body, dispatch)
-    yield* Block.setInsertionPoint(context.body, done)
+    Emitter.sealSwitch(context.body, dispatch)
+    Emitter.setInsertionPoint(context.body, done)
   }
-})
+}
 
 const requests = (self: NativePlace, context: Context): ReadonlyArray<ReadRequest> =>
   NativeType.valueLanesFor(context.types, self.type).map((lane, ordinal) => {
@@ -472,14 +434,14 @@ const requests = (self: NativePlace, context: Context): ReadonlyArray<ReadReques
   })
 
 /** One explicit storage-to-ABI conversion; no result is retained in the local map. */
-export const loadSelected = Effect.fnUntraced(function* (
+export const loadSelected = (
   self: NativePlace,
   context: Context,
   ordinals: ReadonlyArray<number>,
   tag: string,
-) {
+) => {
   const lanes = NativeType.valueLanesFor(context.types, self.type)
-  return yield* readLocations(
+  return readLocations(
     self,
     context,
     ordinals.map((ordinal) => {
@@ -494,30 +456,26 @@ export const loadSelected = Effect.fnUntraced(function* (
     }),
     tag,
   )
-})
+}
 
 /** One explicit storage-to-ABI conversion; no result is retained in the local map. */
-export const loadLanes = Effect.fnUntraced(function* (
-  self: NativePlace,
-  context: Context,
-  tag: string,
-) {
-  return yield* readLocations(self, context, requests(self, context), tag)
-})
+export const loadLanes = (self: NativePlace, context: Context, tag: string) => {
+  return readLocations(self, context, requests(self, context), tag)
+}
 
 /** Initializes a boundary destination with one dispatch per stored union, not per lane. */
-export const storeLanes = Effect.fnUntraced(function* (
+export const storeLanes = (
   self: NativePlace,
   context: Context,
   values: ReadonlyArray<Value.Input>,
   tag: string,
-) {
+) => {
   const planned = requests(self, context)
   if (planned.length !== values.length)
     throw new RangeError(
       `Boundary ${tag} for ${Mir.typeText(self.type)} expected ${planned.length} lanes, received ${values.length}`,
     )
-  yield* writeLocations(
+  writeLocations(
     self,
     context,
     planned.map((request, ordinal) => {
@@ -527,17 +485,17 @@ export const storeLanes = Effect.fnUntraced(function* (
     }),
     tag,
   )
-})
+}
 
 /** Projects a canonical field or element, retaining its own concrete view. */
-export const project = Effect.fnUntraced(function* (
+export const project = (
   self: NativePlace,
   context: Context,
   type: Mir.Type,
   offset: number,
   tag: string,
   representation: NativePlace['representation'] = 'Value',
-) {
+) => {
   const layout = context.types.program.layout
   const physical =
     representation === 'StoredComposite' && type._tag === 'EffectComposite'
@@ -553,25 +511,21 @@ export const project = Effect.fnUntraced(function* (
   return make(
     context.types.program.layout,
     type,
-    yield* NativeLanePointer.lanePointer(
+    NativeLanePointer.lanePointer(
       context.lanePointers,
       context.body,
-      yield* base(self, context, `${tag}_base`),
+      base(self, context, `${tag}_base`),
       offset,
       tag,
     ),
     representation,
   )
-})
+}
 
 /** Converts only a planner-admitted stored/carrier pair; equivalent views use a byte copy. */
-export const transfer = Effect.fnUntraced(function* (
-  destination: NativePlace,
-  context: Context,
-  source: NativePlace,
-) {
+export const transfer = (destination: NativePlace, context: Context, source: NativePlace) => {
   if (destination.representation === source.representation)
-    return yield* copy(destination, context, source)
+    return copy(destination, context, source)
   if (
     !Type.equals(Mir.semanticType(source.type), Mir.semanticType(destination.type)) ||
     ValueStorage.find(
@@ -581,24 +535,15 @@ export const transfer = Effect.fnUntraced(function* (
     ) === undefined
   )
     throw new RangeError('Place transfer has no planned representation binding')
-  yield* storeLanes(
-    destination,
-    context,
-    yield* loadLanes(source, context, 'transfer_load'),
-    'transfer_store',
-  )
-})
+  storeLanes(destination, context, loadLanes(source, context, 'transfer_load'), 'transfer_store')
+}
 
 /**
  * Copies physical bytes between equivalent views, conservatively allowing overlap. This
  * does not transfer MIR initialization/drop obligations, and never interprets padding or
  * inactive payload bytes as scalar values. Ownership lowering remains their authority.
  */
-export const copy = Effect.fnUntraced(function* (
-  destination: NativePlace,
-  context: Context,
-  source: NativePlace,
-) {
+export const copy = (destination: NativePlace, context: Context, source: NativePlace) => {
   if (destination.size !== source.size)
     throw new RangeError('Place copy requires equal planned extents')
   if (destination.view !== source.view) {
@@ -630,29 +575,29 @@ export const copy = Effect.fnUntraced(function* (
     (destination.base === source.base && destination.indirect === source.indirect)
   )
     return
-  yield* Intrinsic.memmove(
+  Emitter.memmove(
     context.body,
-    yield* base(destination, context, 'copy_destination'),
-    yield* base(source, context, 'copy_source'),
-    yield* Constant.integerUnsigned(
-      context.lanePointers.builder,
+    base(destination, context, 'copy_destination'),
+    base(source, context, 'copy_source'),
+    Emitter.integerUnsigned(
+      context.body,
       context.lanePointers.offsetType,
       BigInt(destination.size),
     ),
     {
-      destinationAlignment: yield* Alignment.fromByteUnits(destination.alignment),
-      sourceAlignment: yield* Alignment.fromByteUnits(source.alignment),
+      destinationAlignment: Emitter.alignment(context.body, destination.alignment),
+      sourceAlignment: Emitter.alignment(context.body, source.alignment),
     },
   )
-})
+}
 
 /** Copies canonical failure bytes between outcome envelopes with different success layouts. */
-export const copyFailure = Effect.fnUntraced(function* (
+export const copyFailure = (
   destination: NativePlace,
   context: Context,
   source: NativePlace,
   mappings: ReadonlyArray<{ readonly source: number; readonly target: number }>,
-) {
+) => {
   if (destination.type._tag !== 'EffectOutcome' || source.type._tag !== 'EffectOutcome')
     throw new RangeError('Failure copy requires two outcome places')
   const layout = context.types.program.layout
@@ -680,20 +625,17 @@ export const copyFailure = Effect.fnUntraced(function* (
   // The active error has identical storage in both envelopes. Copy the largest mapped
   // error extent, including padding/inactive bytes, without interpreting those bytes as
   // scalar lanes. Nested-union expansion produced thousands of instructions per HTTP run.
-  yield* Intrinsic.memmove(
+  Emitter.memmove(
     context.body,
-    yield* storedPointer(destination, context, to.payloadOffset, 'failure_destination'),
-    yield* storedPointer(source, context, from.payloadOffset, 'failure_source'),
-    yield* Constant.integerUnsigned(
-      context.lanePointers.builder,
-      context.lanePointers.offsetType,
-      BigInt(size),
-    ),
+    storedPointer(destination, context, to.payloadOffset, 'failure_destination'),
+    storedPointer(source, context, from.payloadOffset, 'failure_source'),
+    Emitter.integerUnsigned(context.body, context.lanePointers.offsetType, BigInt(size)),
     {
-      destinationAlignment: yield* Alignment.fromByteUnits(
+      destinationAlignment: Emitter.alignment(
+        context.body,
         Math.min(destination.alignment, to.alignment),
       ),
-      sourceAlignment: yield* Alignment.fromByteUnits(Math.min(source.alignment, from.alignment)),
+      sourceAlignment: Emitter.alignment(context.body, Math.min(source.alignment, from.alignment)),
     },
   )
-})
+}

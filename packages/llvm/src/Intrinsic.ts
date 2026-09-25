@@ -8,6 +8,7 @@ import * as FunctionActor from './Function.js'
 import type * as FunctionBody from './FunctionBody.js'
 import * as FunctionBodyActor from './FunctionBody.js'
 import * as BuilderState from './internal/BuilderState.js'
+import * as FunctionBodyState from './internal/FunctionBodyState.js'
 import * as Handle from './internal/Handle.js'
 import type * as TypeDescription from './internal/TypeDescription.js'
 import { invalidInput, invalidState, type LlvmError, wrappedFailure } from './LlvmError.js'
@@ -313,92 +314,79 @@ export interface MemorySetOptions {
 }
 
 type OverloadedRecipe = (
-  builder: Builder.Builder,
+  context: BuilderState.Context,
   overloads: ReadonlyArray<Type.Type>,
-) => Effect.Effect<ExplicitSignature, LlvmError>
+) => Result.Result<ExplicitSignature, LlvmError>
 
-type SimpleRecipe = (builder: Builder.Builder) => Effect.Effect<ExplicitSignature, LlvmError>
+type SimpleRecipe = (context: BuilderState.Context) => Result.Result<ExplicitSignature, LlvmError>
 
-/** @internal */
-const memoryCopySignature = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
-  overloads: ReadonlyArray<Type.Type>,
-): Effect.fn.Return<ExplicitSignature, LlvmError> {
+const recipeFailure = (message: string, overloads: ReadonlyArray<Type.Type>) =>
+  Result.fail(invalidInput({ operation: 'Intrinsic.resolve', message, input: overloads }))
+
+const voidType = (context: BuilderState.Context) =>
+  Type.internIn(context, { _tag: 'Simple', tag: 'Void' })
+
+const integerType = (context: BuilderState.Context, bitWidth: number) =>
+  Type.internIn(context, { _tag: 'Integer', bitWidth })
+
+const memoryCopySignature: OverloadedRecipe = (context, overloads) => {
   const destination = overloads[0]
   const source = overloads[1]
   const length = overloads[2]
   if (destination === undefined || source === undefined || length === undefined) {
-    return yield* invalidInput({
-      operation: 'Intrinsic.resolve',
-      message: 'Memory copy intrinsics require destination, source, and length overload types',
-      input: overloads,
-    })
+    return recipeFailure(
+      'Memory copy intrinsics require destination, source, and length overload types',
+      overloads,
+    )
   }
-  return {
-    returnType: yield* Type.voidType(builder),
-    parameters: [destination, source, length, yield* Type.integer(builder, 1)],
-  }
-})
+  const returnType = voidType(context)
+  if (Result.isFailure(returnType)) return Result.fail(returnType.failure)
+  const i1 = integerType(context, 1)
+  if (Result.isFailure(i1)) return Result.fail(i1.failure)
+  return Result.succeed({
+    returnType: returnType.success,
+    parameters: [destination, source, length, i1.success],
+  })
+}
 
-/** @internal */
-const memorySetSignature = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
-  overloads: ReadonlyArray<Type.Type>,
-): Effect.fn.Return<ExplicitSignature, LlvmError> {
+const memorySetSignature: OverloadedRecipe = (context, overloads) => {
   const destination = overloads[0]
   const length = overloads[1]
   if (destination === undefined || length === undefined) {
-    return yield* invalidInput({
-      operation: 'Intrinsic.resolve',
-      message: 'Memory set intrinsics require destination and length overload types',
-      input: overloads,
-    })
+    return recipeFailure(
+      'Memory set intrinsics require destination and length overload types',
+      overloads,
+    )
   }
-  return {
-    returnType: yield* Type.voidType(builder),
-    parameters: [
-      destination,
-      yield* Type.integer(builder, 8),
-      length,
-      yield* Type.integer(builder, 1),
-    ],
+  const returnType = voidType(context)
+  if (Result.isFailure(returnType)) return Result.fail(returnType.failure)
+  const i8 = integerType(context, 8)
+  if (Result.isFailure(i8)) return Result.fail(i8.failure)
+  const i1 = integerType(context, 1)
+  if (Result.isFailure(i1)) return Result.fail(i1.failure)
+  return Result.succeed({
+    returnType: returnType.success,
+    parameters: [destination, i8.success, length, i1.success],
+  })
+}
+
+const variadicRecipe =
+  (name: string, arity: 1 | 2): OverloadedRecipe =>
+  (context, overloads) => {
+    const parameter = overloads[0]
+    if (parameter === undefined) {
+      return recipeFailure(`llvm.${name} requires one pointer overload type`, overloads)
+    }
+    return Result.map(voidType(context), (returnType) => ({
+      returnType,
+      parameters: arity === 1 ? [parameter] : [parameter, parameter],
+    }))
   }
-})
 
 const overloadedRecipes: Readonly<Partial<Record<Id, OverloadedRecipe>>> = {
-  va_start: Effect.fnUntraced(function* (builder, overloads) {
-    const parameter = overloads[0]
-    if (parameter === undefined) {
-      return yield* invalidInput({
-        operation: 'Intrinsic.resolve',
-        message: 'llvm.va_start requires one pointer overload type',
-        input: overloads,
-      })
-    }
-    return { returnType: yield* Type.voidType(builder), parameters: [parameter] }
-  }),
-  va_end: Effect.fnUntraced(function* (builder, overloads) {
-    const parameter = overloads[0]
-    if (parameter === undefined) {
-      return yield* invalidInput({
-        operation: 'Intrinsic.resolve',
-        message: 'llvm.va_end requires one pointer overload type',
-        input: overloads,
-      })
-    }
-    return { returnType: yield* Type.voidType(builder), parameters: [parameter] }
-  }),
-  va_copy: Effect.fnUntraced(function* (builder, overloads) {
-    const parameter = overloads[0]
-    if (parameter === undefined) {
-      return yield* invalidInput({
-        operation: 'Intrinsic.resolve',
-        message: 'llvm.va_copy requires one pointer overload type',
-        input: overloads,
-      })
-    }
-    return { returnType: yield* Type.voidType(builder), parameters: [parameter, parameter] }
-  }),
+  va_start: variadicRecipe('va_start', 1),
+  va_end: variadicRecipe('va_end', 1),
+  va_copy: variadicRecipe('va_copy', 2),
   memcpy: memoryCopySignature,
   'memcpy.inline': memoryCopySignature,
   memmove: memoryCopySignature,
@@ -406,25 +394,22 @@ const overloadedRecipes: Readonly<Partial<Record<Id, OverloadedRecipe>>> = {
   'memset.inline': memorySetSignature,
 }
 
+const voidRecipe: SimpleRecipe = (context) =>
+  Result.map(voidType(context), (returnType) => ({ returnType, parameters: [] }))
+
 const simpleRecipes: Readonly<Partial<Record<Id, SimpleRecipe>>> = {
-  assume: Effect.fnUntraced(function* (builder: Builder.Builder) {
-    return {
-      returnType: yield* Type.voidType(builder),
-      parameters: [yield* Type.integer(builder, 1)],
-    }
-  }),
-  trap: Effect.fnUntraced(function* (builder: Builder.Builder) {
-    return { returnType: yield* Type.voidType(builder), parameters: [] }
-  }),
-  debugtrap: Effect.fnUntraced(function* (builder: Builder.Builder) {
-    return { returnType: yield* Type.voidType(builder), parameters: [] }
-  }),
-  donothing: Effect.fnUntraced(function* (builder: Builder.Builder) {
-    return { returnType: yield* Type.voidType(builder), parameters: [] }
-  }),
-  sideeffect: Effect.fnUntraced(function* (builder: Builder.Builder) {
-    return { returnType: yield* Type.voidType(builder), parameters: [] }
-  }),
+  assume: (context) => {
+    const returnType = voidType(context)
+    if (Result.isFailure(returnType)) return Result.fail(returnType.failure)
+    return Result.map(integerType(context, 1), (i1) => ({
+      returnType: returnType.success,
+      parameters: [i1],
+    }))
+  },
+  trap: voidRecipe,
+  debugtrap: voidRecipe,
+  donothing: voidRecipe,
+  sideeffect: voidRecipe,
 }
 
 /** @internal */
@@ -474,64 +459,80 @@ const mangleDescription = (
   }
 }
 
-/** @internal */
-const intrinsicName = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
+const intrinsicName = (
+  context: BuilderState.Context,
   id: Id,
   overloads: ReadonlyArray<Type.Type>,
-): Effect.fn.Return<string, LlvmError> {
-  return yield* BuilderState.mutate(builder, 'Intrinsic.name', (state, owner) =>
-    Result.gen(function* () {
-      const suffix: Array<string> = []
-      for (const type of overloads) {
-        const index = yield* Handle.resolve(builder, owner, type, 'Type', 'Intrinsic.name')
-        const description = state.types.descriptions[index]
-        if (description === undefined) {
-          return yield* Result.fail(
-            invalidState({
-              operation: 'Intrinsic.name',
-              message: 'Intrinsic overload type is missing',
-              state: type,
-            }),
-          )
-        }
-        suffix.push(
-          yield* Result.try({
-            try: () => mangleDescription(state, description),
-            catch: (cause) =>
-              wrappedFailure({
-                operation: 'Intrinsic.name',
-                message: 'Intrinsic overload type cannot be mangled',
-                cause: cause,
-              }),
-          }),
-        )
-      }
-      return `llvm.${id}${suffix.length === 0 ? '' : `.${suffix.join('.')}`}`
-    }),
-  )
-})
+): Result.Result<string, LlvmError> => {
+  const { builder, state, owner } = context
+  const suffix: Array<string> = []
+  for (const type of overloads) {
+    const index = Handle.resolve(builder, owner, type, 'Type', 'Intrinsic.name')
+    if (Result.isFailure(index)) return Result.fail(index.failure)
+    const description = state.types.descriptions[index.success]
+    if (description === undefined) {
+      return Result.fail(
+        invalidState({
+          operation: 'Intrinsic.name',
+          message: 'Intrinsic overload type is missing',
+          state: type,
+        }),
+      )
+    }
+    const mangled = Result.try({
+      try: () => mangleDescription(state, description),
+      catch: (cause) =>
+        wrappedFailure({
+          operation: 'Intrinsic.name',
+          message: 'Intrinsic overload type cannot be mangled',
+          cause: cause,
+        }),
+    })
+    if (Result.isFailure(mangled)) return Result.fail(mangled.failure)
+    suffix.push(mangled.success)
+  }
+  return Result.succeed(`llvm.${id}${suffix.length === 0 ? '' : `.${suffix.join('.')}`}`)
+}
 
-/** @internal */
-const flagSet = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
+const flagSet = (
+  context: BuilderState.Context,
   names: ReadonlyArray<string>,
-): Effect.fn.Return<Attribute.Set, LlvmError> {
+): Result.Result<Attribute.Set, LlvmError> => {
   const values: Array<Attribute.Attribute> = []
-  for (const name of names) values.push(yield* Attribute.flag(builder, name))
-  return yield* Attribute.set(builder, values)
-})
+  for (const name of names) {
+    const flag = Attribute.flagIn(context, name)
+    if (Result.isFailure(flag)) return Result.fail(flag.failure)
+    values.push(flag.success)
+  }
+  return Attribute.setIn(context, values)
+}
 
-/** @internal */
-const commonAttributes = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
+const flagSets = (
+  context: BuilderState.Context,
+  groups: ReadonlyArray<ReadonlyArray<string>>,
+): Result.Result<ReadonlyArray<Attribute.Set>, LlvmError> => {
+  const sets: Array<Attribute.Set> = []
+  for (const names of groups) {
+    const set = flagSet(context, names)
+    if (Result.isFailure(set)) return Result.fail(set.failure)
+    sets.push(set.success)
+  }
+  return Result.succeed(sets)
+}
+
+const commonAttributes = (
+  context: BuilderState.Context,
   id: Id,
-): Effect.fn.Return<Attribute.FunctionSet | undefined, LlvmError> {
+): Result.Result<Attribute.FunctionSet | undefined, LlvmError> => {
   const base = ['nocallback', 'nofree', 'nounwind', 'willreturn']
   if (id === 'assume') {
-    return yield* Attribute.functionSet(builder, {
-      functionAttributes: yield* flagSet(builder, [...base, 'nosync']),
-      parameterAttributes: [yield* flagSet(builder, ['noundef'])],
+    const functionAttributes = flagSet(context, [...base, 'nosync'])
+    if (Result.isFailure(functionAttributes)) return Result.fail(functionAttributes.failure)
+    const parameter = flagSet(context, ['noundef'])
+    if (Result.isFailure(parameter)) return Result.fail(parameter.failure)
+    return Attribute.functionSetIn(context, {
+      functionAttributes: functionAttributes.success,
+      parameterAttributes: [parameter.success],
     })
   }
   if (
@@ -541,13 +542,21 @@ const commonAttributes = Effect.fnUntraced(function* (
     id !== 'memset' &&
     id !== 'memset.inline'
   ) {
-    return undefined
+    return Result.succeed(undefined)
   }
   const functionEntries: Array<Attribute.Attribute> = []
-  for (const name of base) functionEntries.push(yield* Attribute.flag(builder, name))
-  functionEntries.push(
-    yield* Attribute.integer(builder, 'memory', id === 'memset' || id === 'memset.inline' ? 2 : 3),
+  for (const name of base) {
+    const flag = Attribute.flagIn(context, name)
+    if (Result.isFailure(flag)) return Result.fail(flag.failure)
+    functionEntries.push(flag.success)
+  }
+  const memory = Attribute.integerIn(
+    context,
+    'memory',
+    id === 'memset' || id === 'memset.inline' ? 2 : 3,
   )
+  if (Result.isFailure(memory)) return Result.fail(memory.failure)
+  functionEntries.push(memory.success)
   const destination =
     id === 'memcpy' || id === 'memcpy.inline'
       ? ['noalias', 'nocapture', 'writeonly']
@@ -556,25 +565,20 @@ const commonAttributes = Effect.fnUntraced(function* (
     id === 'memcpy' || id === 'memcpy.inline'
       ? ['noalias', 'nocapture', 'readonly']
       : ['nocapture', 'readonly']
-  const parameters =
+  const parameters = flagSets(
+    context,
     id === 'memset' || id === 'memset.inline'
-      ? [
-          yield* flagSet(builder, destination),
-          yield* flagSet(builder, []),
-          yield* flagSet(builder, []),
-          yield* flagSet(builder, ['immarg']),
-        ]
-      : [
-          yield* flagSet(builder, destination),
-          yield* flagSet(builder, source),
-          yield* flagSet(builder, []),
-          yield* flagSet(builder, ['immarg']),
-        ]
-  return yield* Attribute.functionSet(builder, {
-    functionAttributes: yield* Attribute.set(builder, functionEntries),
-    parameterAttributes: parameters,
+      ? [destination, [], [], ['immarg']]
+      : [destination, source, [], ['immarg']],
+  )
+  if (Result.isFailure(parameters)) return Result.fail(parameters.failure)
+  const functionAttributes = Attribute.setIn(context, functionEntries)
+  if (Result.isFailure(functionAttributes)) return Result.fail(functionAttributes.failure)
+  return Attribute.functionSetIn(context, {
+    functionAttributes: functionAttributes.success,
+    parameterAttributes: parameters.success,
   })
-})
+}
 
 /**
  * Declares or retrieves a canonically mangled LLVM intrinsic.
@@ -600,92 +604,174 @@ const commonAttributes = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const resolve = Effect.fnUntraced(function* (
+export const resolve = (
   builder: Builder.Builder,
   id: Id,
   overloads: ReadonlyArray<Type.Type> = [],
   options: ResolveOptions = {},
-): Effect.fn.Return<FunctionActor.Function, LlvmError> {
+): Effect.Effect<FunctionActor.Function, LlvmError> =>
+  BuilderState.transition(builder, 'Intrinsic.resolve', (context) =>
+    resolveIn(context, id, overloads, options),
+  )
+
+/**
+ * Default resolutions (no explicit signature or attributes) are cached per builder. Checked
+ * arithmetic, traps, and memory copies resolve the same intrinsic at every emitted site, and
+ * rebuilding its signature, attribute sets, and mangled name dominated their emission cost in the
+ * self-hosted compiler build. A cached declaration is reused only while it is unchanged, so an
+ * incompatible later edit still reaches `Function.declare` and fails there.
+ *
+ * @internal
+ */
+export const resolveIn = (
+  context: BuilderState.Context,
+  id: Id,
+  overloads: ReadonlyArray<Type.Type> = [],
+  options: ResolveOptions = {},
+): Result.Result<FunctionActor.Function, LlvmError> => {
   if (!inventory.includes(id)) {
-    return yield* invalidState({
-      operation: 'Intrinsic.resolve',
-      message: 'Unknown pinned LLVM intrinsic',
-      state: id,
-    })
+    return Result.fail(
+      invalidState({
+        operation: 'Intrinsic.resolve',
+        message: 'Unknown pinned LLVM intrinsic',
+        state: id,
+      }),
+    )
+  }
+  const { state, owner } = context
+  let key: string | undefined
+  if (options.signature === undefined && options.attributes === undefined) {
+    key = id
+    for (const type of overloads) {
+      const index = Handle.indexOf(type)
+      if (index === undefined || Handle.ownerOf(type)?.token !== owner.token) {
+        key = undefined
+        break
+      }
+      key += `\u0000${index}`
+    }
+  }
+  const entry = key === undefined ? undefined : state.intrinsics.get(key)
+  if (entry !== undefined) {
+    const description = state.globals.functions.descriptions[entry.index]
+    if (
+      description !== undefined &&
+      description.type === entry.type &&
+      description.attributes === entry.attributes &&
+      description.callingConvention === 0 &&
+      description.personality === undefined
+    ) {
+      return Result.succeed(entry.function)
+    }
   }
   const recipe = overloadedRecipes[id]
   const simple = simpleRecipes[id]
   let signature = options.signature
   if (signature === undefined) {
-    if (recipe !== undefined) signature = yield* recipe(builder, overloads)
-    else if (simple !== undefined) signature = yield* simple(builder)
+    let made: Result.Result<ExplicitSignature, LlvmError> | undefined
+    if (recipe !== undefined) made = recipe(context, overloads)
+    else if (simple !== undefined) made = simple(context)
+    if (made !== undefined && Result.isFailure(made)) return Result.fail(made.failure)
+    signature = made?.success
   }
   if (signature === undefined) {
-    return yield* invalidInput({
-      operation: 'Intrinsic.resolve',
-      message: 'This intrinsic requires an explicit typed signature',
-      input: { id, overloads },
-    })
+    return Result.fail(
+      invalidInput({
+        operation: 'Intrinsic.resolve',
+        message: 'This intrinsic requires an explicit typed signature',
+        input: { id, overloads },
+      }),
+    )
   }
   const variadic = 'variadic' in signature ? signature.variadic : undefined
-  const type = yield* Type.functionType(
-    builder,
+  const type = Type.functionTypeIn(
+    context,
     signature.returnType,
     signature.parameters,
     variadic === undefined ? {} : { variadic },
   )
-  const attributes = options.attributes ?? (yield* commonAttributes(builder, id))
-  return yield* FunctionActor.declare(
-    builder,
-    yield* intrinsicName(builder, id, overloads),
-    type,
+  if (Result.isFailure(type)) return Result.fail(type.failure)
+  let attributes = options.attributes
+  if (attributes === undefined) {
+    const common = commonAttributes(context, id)
+    if (Result.isFailure(common)) return Result.fail(common.failure)
+    attributes = common.success
+  }
+  const name = intrinsicName(context, id, overloads)
+  if (Result.isFailure(name)) return Result.fail(name.failure)
+  const declared = FunctionActor.declareIn(
+    context,
+    name.success,
+    type.success,
     attributes === undefined ? {} : { attributes },
   )
-})
+  if (Result.isFailure(declared)) return declared
+  if (key !== undefined) {
+    const index = Handle.indexOf(declared.success)
+    const description =
+      index === undefined ? undefined : state.globals.functions.descriptions[index]
+    if (index !== undefined && description !== undefined) {
+      state.intrinsics.set(key, {
+        function: declared.success,
+        index,
+        type: description.type,
+        attributes: description.attributes,
+      })
+    }
+  }
+  return declared
+}
 
-/** @internal */
-const inputType = Effect.fnUntraced(function* (
-  body: FunctionBody.FunctionBody,
-  input: Value.Input,
-): Effect.fn.Return<Type.Type, LlvmError> {
-  return yield* FunctionBodyActor.inputType(body, input)
-})
-
-/** @internal */
-const memoryCallAttributes = Effect.fnUntraced(function* (
-  builder: Builder.Builder,
+/** Every aligned copy of one intrinsic rebuilds the same derived set; cache it per builder. */
+const memoryCallAttributes = (
+  context: BuilderState.Context,
   intrinsic: FunctionActor.Function,
   alignments: ReadonlyArray<Alignment.Alignment | undefined>,
-): Effect.fn.Return<Attribute.FunctionSet | undefined, LlvmError> {
-  const canonical = (yield* FunctionActor.properties(builder, intrinsic)).attributes
+): Result.Result<Attribute.FunctionSet | undefined, LlvmError> => {
+  const properties = FunctionActor.propertiesIn(context, intrinsic)
+  if (Result.isFailure(properties)) return Result.fail(properties.failure)
+  const canonical = properties.success.attributes
   if (
     canonical === undefined ||
     alignments.every((alignment) => alignment?.byteUnits === undefined)
   ) {
-    return canonical
+    return Result.succeed(canonical)
   }
-  const entries = yield* Attribute.functionSetEntries(builder, canonical)
+  const key = `${Handle.indexOf(canonical)}\u0000${alignments
+    .map((alignment) => alignment?.byteUnits ?? '')
+    .join('\u0000')}`
+  const cached = context.state.memoryCallAttributes.get(key)
+  if (cached !== undefined) return Result.succeed(cached)
+  const entries = Attribute.functionSetEntriesIn(context, canonical)
+  if (Result.isFailure(entries)) return Result.fail(entries.failure)
   const parameters: Array<Attribute.Set> = []
-  const length = Math.max(entries.parameterAttributes.length, alignments.length)
+  const length = Math.max(entries.success.parameterAttributes.length, alignments.length)
   for (let index = 0; index < length; index += 1) {
-    const base = entries.parameterAttributes[index] ?? (yield* Attribute.set(builder, []))
+    let base = entries.success.parameterAttributes[index]
+    if (base === undefined) {
+      const empty = Attribute.setIn(context, [])
+      if (Result.isFailure(empty)) return Result.fail(empty.failure)
+      base = empty.success
+    }
     const alignment = alignments[index]
-    parameters.push(
-      alignment?.byteUnits === undefined
-        ? base
-        : yield* Attribute.add(
-            builder,
-            base,
-            yield* Attribute.integer(builder, 'align', alignment.byteUnits),
-          ),
-    )
+    if (alignment?.byteUnits === undefined) {
+      parameters.push(base)
+      continue
+    }
+    const align = Attribute.integerIn(context, 'align', alignment.byteUnits)
+    if (Result.isFailure(align)) return Result.fail(align.failure)
+    const added = Attribute.addIn(context, base, align.success)
+    if (Result.isFailure(added)) return Result.fail(added.failure)
+    parameters.push(added.success)
   }
-  return yield* Attribute.functionSet(builder, {
-    functionAttributes: entries.functionAttributes,
-    returnAttributes: entries.returnAttributes,
+  const attributes = Attribute.functionSetIn(context, {
+    functionAttributes: entries.success.functionAttributes,
+    returnAttributes: entries.success.returnAttributes,
     parameterAttributes: parameters,
   })
-})
+  if (Result.isSuccess(attributes)) context.state.memoryCallAttributes.set(key, attributes.success)
+  return attributes
+}
 
 /**
  * Resolves an intrinsic and appends a direct, type-checked call in one operation.
@@ -693,18 +779,30 @@ const memoryCallAttributes = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const call = Effect.fnUntraced(function* (
+export const call = (
   body: FunctionBody.FunctionBody,
   id: Id,
   overloads: ReadonlyArray<Type.Type>,
   args: ReadonlyArray<Value.Input>,
   name?: string,
   options: ResolveOptions = {},
-): Effect.fn.Return<Value.Value | undefined, LlvmError> {
-  const builder = yield* FunctionBodyActor.builder(body)
-  const intrinsic = yield* resolve(builder, id, overloads, options)
-  return yield* FunctionBodyActor.callDirect(body, intrinsic, args, name)
-})
+): Effect.Effect<Value.Value | undefined, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Intrinsic.call', (draft) =>
+    callIn(draft, id, overloads, args, name, options),
+  )
+
+/** @internal */
+export const callIn = (
+  draft: FunctionBodyState.Draft,
+  id: Id,
+  overloads: ReadonlyArray<Type.Type>,
+  args: ReadonlyArray<Value.Input>,
+  name?: string,
+  options: ResolveOptions = {},
+): Result.Result<Value.Value | undefined, LlvmError> =>
+  Result.flatMap(resolveIn(draft.context, id, overloads, options), (intrinsic) =>
+    FunctionBodyActor.callDirectIn(draft, intrinsic, args, name),
+  )
 
 /**
  * Emits `llvm.assume(true)` with an empty `cold` operand bundle as an optimization hint.
@@ -712,16 +810,57 @@ export const call = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const assumeCold = Effect.fnUntraced(function* (
-  body: FunctionBody.FunctionBody,
-): Effect.fn.Return<void, LlvmError> {
-  const builder = yield* FunctionBodyActor.builder(body)
-  const assume = yield* resolve(builder, 'assume')
-  const condition = yield* Constant.integerUnsigned(builder, yield* Type.integer(builder, 1), 1)
-  yield* FunctionBodyActor.callDirect(body, assume, [condition], undefined, {
-    operandBundles: [{ tag: 'cold', operands: [] }],
+export const assumeCold = (body: FunctionBody.FunctionBody): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Intrinsic.assumeCold', (draft) => {
+    const assume = resolveIn(draft.context, 'assume')
+    if (Result.isFailure(assume)) return Result.fail(assume.failure)
+    const i1 = integerType(draft.context, 1)
+    if (Result.isFailure(i1)) return Result.fail(i1.failure)
+    const condition = Constant.integerOfIn(draft.context, i1.success, 1, false)
+    if (Result.isFailure(condition)) return Result.fail(condition.failure)
+    return voidResult(
+      FunctionBodyActor.callDirectIn(draft, assume.success, [condition.success], undefined, {
+        operandBundles: [{ tag: 'cold', operands: [] }],
+      }),
+    )
   })
-})
+
+const voidResult = <A>(result: Result.Result<A, LlvmError>): Result.Result<void, LlvmError> =>
+  Result.map(result, () => undefined)
+
+/** Emits one memory intrinsic call with its canonical and alignment-derived attributes. */
+const memoryCall = (
+  draft: FunctionBodyState.Draft,
+  id: Id,
+  overloadInputs: ReadonlyArray<Value.Input>,
+  args: ReadonlyArray<Value.Input>,
+  volatile: boolean | undefined,
+  alignments: ReadonlyArray<Alignment.Alignment | undefined>,
+): Result.Result<void, LlvmError> => {
+  const overloads: Array<Type.Type> = []
+  for (const input of overloadInputs) {
+    const type = FunctionBodyActor.inputTypeIn(draft, input)
+    if (Result.isFailure(type)) return Result.fail(type.failure)
+    overloads.push(type.success)
+  }
+  const intrinsic = resolveIn(draft.context, id, overloads)
+  if (Result.isFailure(intrinsic)) return Result.fail(intrinsic.failure)
+  const i1 = integerType(draft.context, 1)
+  if (Result.isFailure(i1)) return Result.fail(i1.failure)
+  const volatileFlag = Constant.integerOfIn(draft.context, i1.success, volatile ? 1 : 0, false)
+  if (Result.isFailure(volatileFlag)) return Result.fail(volatileFlag.failure)
+  const attributes = memoryCallAttributes(draft.context, intrinsic.success, alignments)
+  if (Result.isFailure(attributes)) return Result.fail(attributes.failure)
+  return voidResult(
+    FunctionBodyActor.callDirectIn(
+      draft,
+      intrinsic.success,
+      [...args, volatileFlag.success],
+      undefined,
+      attributes.success === undefined ? {} : { attributes: attributes.success },
+    ),
+  )
+}
 
 /**
  * Emits typed `llvm.memcpy` or `llvm.memcpy.inline` with canonical attributes.
@@ -729,37 +868,33 @@ export const assumeCold = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const memcpy = Effect.fnUntraced(function* (
+export const memcpy = (
   body: FunctionBody.FunctionBody,
   destination: Value.Input,
   source: Value.Input,
   length: Value.Input,
   options: MemoryCopyOptions = {},
-): Effect.fn.Return<void, LlvmError> {
-  const builder = yield* FunctionBodyActor.builder(body)
-  const overloads = [
-    yield* inputType(body, destination),
-    yield* inputType(body, source),
-    yield* inputType(body, length),
-  ]
-  const intrinsic = yield* resolve(builder, options.inline ? 'memcpy.inline' : 'memcpy', overloads)
-  const volatile = yield* Constant.integerUnsigned(
-    builder,
-    yield* Type.integer(builder, 1),
-    options.volatile ? 1 : 0,
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Intrinsic.memcpy', (draft) =>
+    memcpyIn(draft, destination, source, length, options),
   )
-  const attributes = yield* memoryCallAttributes(builder, intrinsic, [
-    options.destinationAlignment,
-    options.sourceAlignment,
-  ])
-  yield* FunctionBodyActor.callDirect(
-    body,
-    intrinsic,
-    [destination, source, length, volatile],
-    undefined,
-    attributes === undefined ? {} : { attributes },
+
+/** @internal */
+export const memcpyIn = (
+  draft: FunctionBodyState.Draft,
+  destination: Value.Input,
+  source: Value.Input,
+  length: Value.Input,
+  options: MemoryCopyOptions = {},
+): Result.Result<void, LlvmError> =>
+  memoryCall(
+    draft,
+    options.inline ? 'memcpy.inline' : 'memcpy',
+    [destination, source, length],
+    [destination, source, length],
+    options.volatile,
+    [options.destinationAlignment, options.sourceAlignment],
   )
-})
 
 /**
  * Emits typed `llvm.memmove` with canonical attributes and optional alignments.
@@ -767,37 +902,33 @@ export const memcpy = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const memmove = Effect.fnUntraced(function* (
+export const memmove = (
   body: FunctionBody.FunctionBody,
   destination: Value.Input,
   source: Value.Input,
   length: Value.Input,
   options: Omit<MemoryCopyOptions, 'inline'> = {},
-): Effect.fn.Return<void, LlvmError> {
-  const builder = yield* FunctionBodyActor.builder(body)
-  const overloads = [
-    yield* inputType(body, destination),
-    yield* inputType(body, source),
-    yield* inputType(body, length),
-  ]
-  const intrinsic = yield* resolve(builder, 'memmove', overloads)
-  const volatile = yield* Constant.integerUnsigned(
-    builder,
-    yield* Type.integer(builder, 1),
-    options.volatile ? 1 : 0,
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Intrinsic.memmove', (draft) =>
+    memmoveIn(draft, destination, source, length, options),
   )
-  const attributes = yield* memoryCallAttributes(builder, intrinsic, [
-    options.destinationAlignment,
-    options.sourceAlignment,
-  ])
-  yield* FunctionBodyActor.callDirect(
-    body,
-    intrinsic,
-    [destination, source, length, volatile],
-    undefined,
-    attributes === undefined ? {} : { attributes },
+
+/** @internal */
+export const memmoveIn = (
+  draft: FunctionBodyState.Draft,
+  destination: Value.Input,
+  source: Value.Input,
+  length: Value.Input,
+  options: Omit<MemoryCopyOptions, 'inline'> = {},
+): Result.Result<void, LlvmError> =>
+  memoryCall(
+    draft,
+    'memmove',
+    [destination, source, length],
+    [destination, source, length],
+    options.volatile,
+    [options.destinationAlignment, options.sourceAlignment],
   )
-})
 
 /**
  * Emits typed `llvm.memset` or `llvm.memset.inline` with canonical attributes.
@@ -805,27 +936,30 @@ export const memmove = Effect.fnUntraced(function* (
  * @category intrinsics
  * @since 0.0.0
  */
-export const memset = Effect.fnUntraced(function* (
+export const memset = (
   body: FunctionBody.FunctionBody,
   destination: Value.Input,
   byte: Value.Input,
   length: Value.Input,
   options: MemorySetOptions = {},
-): Effect.fn.Return<void, LlvmError> {
-  const builder = yield* FunctionBodyActor.builder(body)
-  const overloads = [yield* inputType(body, destination), yield* inputType(body, length)]
-  const intrinsic = yield* resolve(builder, options.inline ? 'memset.inline' : 'memset', overloads)
-  const volatile = yield* Constant.integerUnsigned(
-    builder,
-    yield* Type.integer(builder, 1),
-    options.volatile ? 1 : 0,
+): Effect.Effect<void, LlvmError> =>
+  FunctionBodyState.mutate(body, 'Intrinsic.memset', (draft) =>
+    memsetIn(draft, destination, byte, length, options),
   )
-  const attributes = yield* memoryCallAttributes(builder, intrinsic, [options.destinationAlignment])
-  yield* FunctionBodyActor.callDirect(
-    body,
-    intrinsic,
-    [destination, byte, length, volatile],
-    undefined,
-    attributes === undefined ? {} : { attributes },
+
+/** @internal */
+export const memsetIn = (
+  draft: FunctionBodyState.Draft,
+  destination: Value.Input,
+  byte: Value.Input,
+  length: Value.Input,
+  options: MemorySetOptions = {},
+): Result.Result<void, LlvmError> =>
+  memoryCall(
+    draft,
+    options.inline ? 'memset.inline' : 'memset',
+    [destination, length],
+    [destination, byte, length],
+    options.volatile,
+    [options.destinationAlignment],
   )
-})

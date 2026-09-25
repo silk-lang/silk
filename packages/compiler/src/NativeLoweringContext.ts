@@ -1,6 +1,5 @@
-import type * as Builder from '@silklang/llvm/Builder'
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as FunctionActor from '@silklang/llvm/Function'
-import type * as FunctionBody from '@silklang/llvm/FunctionBody'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
 import type * as Backend from './Backend.js'
@@ -38,8 +37,8 @@ export interface DeclaredFunction {
 
 /** Explicit native lowering state shared by the per-function lowering actors. */
 export interface LoweringContext {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly program: Mir.Module
   readonly request: Backend.CodegenRequest
   readonly layout: Layout.Plan

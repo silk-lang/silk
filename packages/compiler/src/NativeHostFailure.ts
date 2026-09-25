@@ -1,9 +1,5 @@
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import type * as Mir from './Mir.js'
 import type * as NativeLoweringContext from './NativeLoweringContext.js'
 import type * as NativeSuspension from './NativeSuspension.js'
@@ -15,8 +11,8 @@ import * as NativeTermination from './NativeTermination.js'
 
 /** Failure-return state for allocation boundaries. */
 export interface Context {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly entry: NativeLoweringContext.DeclaredFunction
   readonly types: NativeType.LoweringContext
   readonly suspension: NativeSuspension.ReturnContext
@@ -24,15 +20,15 @@ export interface Context {
 }
 
 /** Emits one host-boundary failure in the function's synchronous or suspension ABI. */
-export const emit = Effect.fnUntraced(function* (
+export const emit = (
   context: Context,
   operation: Extract<Mir.Operation, { readonly _tag: 'Allocate' }>,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   const lanes = NativeType.lanesFor(context.types, operation.propagationType)
   const values: Array<Value.Input> = []
   for (const [ordinal, lane] of lanes.entries()) {
     values.push(
-      yield* Constant.integerUnsigned(
+      Emitter.integerUnsigned(
         context.builder,
         NativeType.laneType(context.types, lane),
         ordinal === 0 ? BigInt(operation.failureTag) : 0n,
@@ -47,22 +43,22 @@ export const emit = Effect.fnUntraced(function* (
     // Allocation refusal returns immediately. This stack slot cannot survive a suspension
     // or escape the invocation; the completed result takes its reference before cleanup.
     const outcome = {
-      storage: yield* FunctionBody.alloca(
+      storage: Emitter.alloca(
         context.body,
         diagnostic.causeType,
         `allocation_failure${operation.destination.ordinal}`,
       ),
     }
-    yield* NativeDiagnosticOutcome.initialize(outcome, diagnostic)
-    yield* NativeDiagnosticOutcome.produce(
+    NativeDiagnosticOutcome.initialize(outcome, diagnostic)
+    NativeDiagnosticOutcome.produce(
       outcome,
       diagnostic,
-      yield* NativeDiagnosticText.literal(
+      NativeDiagnosticText.literal(
         diagnostic,
         NativeTermination.identityOf(operation.propagationType.type, operation.failureTag),
         `${context.entry.symbol}.allocation${operation.destination.ordinal}.identity`,
       ),
-      yield* NativeDiagnosticText.literal(
+      NativeDiagnosticText.literal(
         diagnostic,
         NativeDiagnosticText.origin(
           context.termination.module,
@@ -72,11 +68,11 @@ export const emit = Effect.fnUntraced(function* (
         `${context.entry.symbol}.allocation${operation.destination.ordinal}.origin`,
       ),
     )
-    metadata = yield* NativeDiagnosticOutcome.take(outcome, diagnostic)
+    metadata = NativeDiagnosticOutcome.take(outcome, diagnostic)
   }
-  yield* NativeReturn.completeResult(
+  NativeReturn.completeResult(
     context.suspension,
     { values: values, ...(metadata === undefined ? {} : { diagnostic: metadata }) },
     `host_failure${operation.destination.ordinal}`,
   )
-})
+}

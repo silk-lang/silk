@@ -90,12 +90,10 @@ const manifestOf = Effect.fnUntraced(function* (
 ) {
   const catalog = analysis.testCatalog
   if (catalog === undefined) return unreachable('expected test catalog')
-  return yield* TestExecution.make({
-    catalog,
-    discovery: Analysis.instancesOf(analysis),
-    results: analysis.results,
+  return TestExecution.make(
+    yield* TestExecution.closures(catalog, Analysis.instancesOf(analysis), analysis.results),
     environment,
-  })
+  )
 })
 
 const executionSnapshot = Effect.fnUntraced(function* (
@@ -529,16 +527,18 @@ pub fn main() -> () {
     ) {
       const catalog = snapshot_.analysis.testCatalog
       if (catalog === undefined) return unreachable('expected test catalog')
-      return yield* TestExecution.make({
-        catalog,
-        discovery: Analysis.instancesOf(snapshot_.analysis),
-        results: snapshot_.analysis.results,
-        environment: {
+      return TestExecution.make(
+        yield* TestExecution.closures(
+          catalog,
+          Analysis.instancesOf(snapshot_.analysis),
+          snapshot_.analysis.results,
+        ),
+        {
           ...defaultEnvironment,
           runnerIdentity: runner.identity,
           complete: runner.complete,
         },
-      })
+      )
     })
     const beforeRunner = yield* runnerOf(before)
     const changedRunner = yield* runnerOf(changed)
@@ -621,11 +621,9 @@ it.effect('keeps the bundled runner environment complete for ordinary tests', ()
       catalog,
     )
     assert.isTrue(runner.complete)
-    const manifest = yield* TestExecution.make({
-      catalog,
-      discovery: Analysis.instancesOf(analysis),
-      results: analysis.results,
-      environment: {
+    const manifest = TestExecution.make(
+      yield* TestExecution.closures(catalog, Analysis.instancesOf(analysis), analysis.results),
+      {
         profileIdentity: 'profile-a',
         bootstrapIdentity: 'bootstrap-a',
         runnerIdentity: runner.identity,
@@ -634,7 +632,7 @@ it.effect('keeps the bundled runner environment complete for ordinary tests', ()
         nativeIdentity: 'native-a',
         complete: runner.complete,
       },
-    })
+    )
     assert.deepEqual(
       manifest.entries.map((entry) => entry.test.name),
       ['cacheablePass'],

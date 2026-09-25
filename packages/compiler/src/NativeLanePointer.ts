@@ -1,27 +1,23 @@
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
+import * as Emitter from '@silklang/llvm/Emitter'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 
 export interface Context {
-  readonly builder: Builder.Builder
   readonly byteType: LlvmType.Type
   readonly offsetType: LlvmType.Type
 }
 
 /** Projects one byte-addressed native lane from a base pointer. */
-export const lanePointer = Effect.fnUntraced(function* (
+export const lanePointer = (
   self: Context,
-  body: FunctionBody.FunctionBody,
+  body: Emitter.Body,
   base: Value.Input,
   offset: number | Value.Input,
   name: string,
-) {
+) => {
   const index =
     typeof offset === 'number'
-      ? yield* Constant.integerUnsigned(self.builder, self.offsetType, BigInt(offset))
+      ? Emitter.integerUnsigned(body, self.offsetType, BigInt(offset))
       : offset
-  return yield* FunctionBody.getElementPtr(body, self.byteType, base, [index], name)
-})
+  return Emitter.getElementPtr(body, self.byteType, base, [index], name)
+}

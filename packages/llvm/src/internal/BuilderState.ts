@@ -13,6 +13,7 @@ import type * as Type from '../Type.js'
 import type * as Variable from '../Variable.js'
 import type * as AttributeDescription from './AttributeDescription.js'
 import type * as ConstantDescription from './ConstantDescription.js'
+import type * as FunctionBodyDescription from './FunctionBodyDescription.js'
 import type * as GlobalDescription from './GlobalDescription.js'
 import * as GlobalTable from './GlobalTable.js'
 import type * as MetadataDescription from './MetadataDescription.js'
@@ -40,14 +41,38 @@ export interface MutableState {
     Attribute.FunctionSet
   >
   constants: Table.Table<ConstantDescription.Description, Constant.Constant>
+  /** Integer constants keyed by `type * 2 + signed`, then by the validated input value. */
+  integerConstants: Map<number, Map<bigint, Constant.Constant>>
+  /** One shared function-body operand per constant; instruction descriptions retain operands. */
+  constantOperands: Array<FunctionBodyDescription.Operand | undefined>
+  /** UTF-8 encodings of local value and block names, shared across function bodies. */
+  localNames: Map<string, ByteString.ByteString>
   globals: GlobalTable.GlobalTable
   buildingFunctions: Set<number>
+  /** Default intrinsic resolutions keyed by intrinsic id and overload type indices. */
+  intrinsics: Map<string, IntrinsicResolution>
+  /** Memory-intrinsic call attributes keyed by canonical attribute set and alignments. */
+  memoryCallAttributes: Map<string, Attribute.FunctionSet | undefined>
   metadata: MetadataTable.MetadataTable
+}
+
+export interface IntrinsicResolution {
+  readonly function: FunctionActor.Function
+  readonly index: number
+  readonly type: number
+  readonly attributes: number | undefined
 }
 
 export interface State {
   readonly owner: OwnedHandle.Owner
   readonly value: MutableState
+}
+
+/** A builder's mutable state with its identity, as seen by one synchronous transition. */
+export interface Context {
+  readonly builder: Builder.Builder
+  readonly state: MutableState
+  readonly owner: OwnedHandle.Owner
 }
 
 export interface Snapshot {
@@ -82,10 +107,41 @@ export interface Snapshot {
 
 const states = new WeakMap<Builder.Builder, State>()
 
+const contexts = new WeakMap<Builder.Builder, Context>()
+
 /** @internal */
 export const register = (self: Builder.Builder, state: State): void => {
   states.set(self, state)
+  contexts.set(self, { builder: self, state: state.value, owner: state.owner })
 }
+
+/** @internal */
+export const context = (
+  self: Builder.Builder,
+  operation: string,
+): Result.Result<Context, LlvmError> => {
+  const found = contexts.get(self)
+  return found === undefined
+    ? Result.fail(invalidState({ operation, message: 'Unknown LLVM builder value', state: self }))
+    : Result.succeed(found)
+}
+
+/**
+ * Runs one synchronous transition over a builder context as a single suspended step.
+ *
+ * @internal
+ */
+export const transition = <A>(
+  self: Builder.Builder,
+  operation: string,
+  f: (context: Context) => Result.Result<A, LlvmError>,
+): Effect.Effect<A, LlvmError> =>
+  Effect.suspend(() => {
+    const found = contexts.get(self)
+    return found === undefined
+      ? Effect.fail(invalidState({ operation, message: 'Unknown LLVM builder value', state: self }))
+      : Effect.fromResult(f(found))
+  })
 
 /**
  * Transitions and snapshots are synchronous `Result` computations, so each critical section

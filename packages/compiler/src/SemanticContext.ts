@@ -41,10 +41,10 @@ const parentOwner = (owner: AuthoredIdentity.Identity): AuthoredIdentity.Identit
         path: owner.path.slice(0, -1),
       }
 
-/** Local prefixes of an anchor, from the anchor itself to the owner root. */
+/** Proper local prefixes of an anchor, from its parent position to the owner root. */
 const prefixes = (anchor: AuthoredIdentity.Anchor): ReadonlyArray<AuthoredIdentity.Anchor> => {
   const found: AuthoredIdentity.Anchor[] = []
-  for (let length = anchor.path.length; length >= 0; length -= 1) {
+  for (let length = anchor.path.length - 1; length >= 0; length -= 1) {
     found.push({ _tag: 'AuthoredAnchor', owner: anchor.owner, path: anchor.path.slice(0, length) })
   }
   return found
@@ -76,7 +76,20 @@ export const make = (lowered: AuthoredLowering.Lowered): SemanticContext => {
     (() => {
       throw new RangeError('Empty span rejected for a module')
     })()
+  // Semantic consumers ask for the same shared anchors repeatedly; the nearest presented entry
+  // of an immutable anchor never changes within one context.
+  const resolved = new WeakMap<AuthoredIdentity.Anchor, AuthoredPresentation.Entry | undefined>()
   const resolve = (anchor: AuthoredIdentity.Anchor): AuthoredPresentation.Entry | undefined => {
+    if (resolved.has(anchor)) return resolved.get(anchor)
+    const entry = resolveUncached(anchor)
+    resolved.set(anchor, entry)
+    return entry
+  }
+  const resolveUncached = (
+    anchor: AuthoredIdentity.Anchor,
+  ): AuthoredPresentation.Entry | undefined => {
+    const presented = index.entry(anchor)
+    if (presented !== undefined) return presented
     for (const candidate of prefixes(anchor)) {
       const entry = index.entry(candidate)
       if (entry !== undefined) return entry

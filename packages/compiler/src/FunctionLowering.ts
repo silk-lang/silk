@@ -34,16 +34,11 @@ export const selectCall = (
   staticArguments?: ReadonlyArray<StaticValue.Value>,
   providers: ReadonlyArray<Instances.CallProvider> = [],
 ): Instances.CallInstance | undefined => {
-  const span = expression.span
-  const atSite = calls.filter(
+  const atSite = Instances.callsAtSite(calls, owner, expression.span).filter(
     (call) =>
-      Instances.keyText(call.owner) === Instances.keyText(owner) &&
-      (expression.id === undefined ||
-        call.node === undefined ||
-        call.node.ordinal === expression.id.ordinal) &&
-      call.span.sourceId === span.sourceId &&
-      call.span.start === span.start &&
-      call.span.end === span.end,
+      expression.id === undefined ||
+      call.node === undefined ||
+      call.node.ordinal === expression.id.ordinal,
   )
   const exactProviders = atSite.filter((call) => Instances.callMatchesProviders(call, providers))
   const usedRuntimeProviderFallback = exactProviders.length === 0

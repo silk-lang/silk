@@ -30,8 +30,7 @@ const instanceViolationDiagnostics = (
     InstanceDiagnostics.copyDropViolations(discovery, self.index, registry),
     InstanceDiagnostics.requirementBindingViolations(discovery, self.index),
     InstanceDiagnostics.unlowerableWitnessViolations(discovery, self.index),
-    InstanceDiagnostics.storedCallableViolations(discovery, self.index),
-    InstanceDiagnostics.storedEffectViolations(discovery, self.index),
+    InstanceDiagnostics.storedExecutableViolations(discovery, self.index),
     ExecutableProperty.violationDiagnostics(discovery, self.index, registry),
     DiagnosticObservation.violationDiagnostics(discovery),
   )

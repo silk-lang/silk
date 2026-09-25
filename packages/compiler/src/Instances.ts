@@ -443,6 +443,71 @@ const carriedSectionArgument = (argument: Type.GenericArgument): Type.GenericArg
   return Type.isRuntimeConcrete(closed) ? closed : argument
 }
 
+// Discovery and every suspension-graph rebuild key the same target applications repeatedly. The
+// contract row is a function of the contract, its declared parameters, and the exact visible
+// arguments, so it is derived once per distinct application.
+const contractRows = new WeakMap<Tir.ContractFact, Map<string, ReadonlyArray<string> | undefined>>()
+
+const contractRowOf = (
+  contract: Tir.ContractFact,
+  typeParameters: ReadonlyArray<Type.Parameter>,
+  visibleArguments: ReadonlyArray<Type.GenericArgument>,
+): ReadonlyArray<string> | undefined => {
+  let rows = contractRows.get(contract)
+  if (rows === undefined) {
+    rows = new Map()
+    contractRows.set(contract, rows)
+  }
+  const application = `${typeParameters.map(Type.key).join('\u0001')}\u0002${visibleArguments
+    .map(Type.genericArgumentKey)
+    .join('\u0001')}`
+  if (rows.has(application)) return rows.get(application)
+  const selected = TypeInference.selectedSubstitution(typeParameters, visibleArguments)
+  let row: ReadonlyArray<string> | undefined
+  if (selected === undefined) row = undefined
+  else if (contract._tag !== 'Contract') row = []
+  else {
+    const { substitution, compatibility } = selected
+    row = [
+      ...contract.parameters.map((type) =>
+        Type.runtimeKey(Type.substitute(type, substitution, compatibility)),
+      ),
+      `result:${Type.runtimeKey(Type.substitute(contract.result, substitution))}`,
+      ...(contract.failureRow === undefined
+        ? []
+        : [
+            `failures:${Type.runtimeFailureRowKey(Type.substituteFailureRow(contract.failureRow, substitution))}`,
+          ]),
+      ...(contract.requirementRow === undefined
+        ? []
+        : [
+            `requirements:${Type.runtimeRequirementsRowKey(Type.substituteRequirementsRow(contract.requirementRow, substitution))}`,
+          ]),
+      ...contract.constraints.map(
+        (constraint) =>
+          `constraint:${Type.runtimeConstraintKey(Constraint.substitute(constraint, substitution))}`,
+      ),
+    ]
+  }
+  rows.set(application, row)
+  return row
+}
+
+const stagedApplications = new WeakMap<Tir.TirFunction, boolean>()
+
+/** Whether a body contains a staged callable application, whose base resolves by context. */
+const stagedApplication = (fn: Tir.TirFunction): boolean => {
+  let staged = stagedApplications.get(fn)
+  if (staged === undefined) {
+    staged = fn.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .some((expression) => expression._tag === 'CallableApply' && expression.staged !== undefined)
+    stagedApplications.set(fn, staged)
+  }
+  return staged
+}
+
 const keyOf = (
   declaration: DeclarationFacts.CanonicalId,
   contract: Tir.ContractFact,
@@ -450,65 +515,111 @@ const keyOf = (
   rawTypeArguments: ReadonlyArray<Type.GenericArgument> = [],
   staticArguments: ReadonlyArray<StaticValue.Value> = [],
   evidence: ReadonlyArray<string> = [],
-): InstanceKey =>
-  (() => {
-    const typeArguments = rawTypeArguments.map(carriedSectionArgument)
-    const selected = TypeInference.selectedSubstitution(
-      typeParameters,
-      typeArguments.filter((argument) => !Type.isHiddenExecutableArgument(argument)),
-    )
-    if (selected === undefined) {
-      throw new RangeError('Instance key type arguments do not match declaration parameters')
-    }
-    const { substitution, compatibility } = selected
-    return {
-      _tag: 'InstanceKey',
-      declaration,
-      typeArguments: Array.from(typeArguments),
-      evidence: [...evidence],
-      staticArguments: [...staticArguments],
-      contractRow:
-        contract._tag === 'Contract'
-          ? [
-              ...contract.parameters.map((type) =>
-                Type.runtimeKey(Type.substitute(type, substitution, compatibility)),
-              ),
-              `result:${Type.runtimeKey(Type.substitute(contract.result, substitution))}`,
-              ...(contract.failureRow === undefined
-                ? []
-                : [
-                    `failures:${Type.runtimeFailureRowKey(Type.substituteFailureRow(contract.failureRow, substitution))}`,
-                  ]),
-              ...(contract.requirementRow === undefined
-                ? []
-                : [
-                    `requirements:${Type.runtimeRequirementsRowKey(Type.substituteRequirementsRow(contract.requirementRow, substitution))}`,
-                  ]),
-              ...contract.constraints.map(
-                (constraint) =>
-                  `constraint:${Type.runtimeConstraintKey(Constraint.substitute(constraint, substitution))}`,
-              ),
-            ]
-          : [],
-    }
-  })()
+): InstanceKey => {
+  const typeArguments = rawTypeArguments.map(carriedSectionArgument)
+  const contractRow = contractRowOf(
+    contract,
+    typeParameters,
+    typeArguments.filter((argument) => !Type.isHiddenExecutableArgument(argument)),
+  )
+  if (contractRow === undefined)
+    throw new RangeError('Instance key type arguments do not match declaration parameters')
+  return {
+    _tag: 'InstanceKey',
+    declaration,
+    typeArguments,
+    evidence: [...evidence],
+    staticArguments: [...staticArguments],
+    contractRow,
+  }
+}
 
-const keyTextCache = new WeakMap<InstanceKey, string>()
+/** Memoized on the key object itself: most keys are fresh and read once or twice. */
+const cachedKeyText: unique symbol = Symbol('Instances.keyText')
 
 export const keyText = (key: InstanceKey): string => {
-  let cached = keyTextCache.get(key)
-  if (cached === undefined) {
-    cached = `${key.declaration.module}\u0000${key.declaration.name}\u0000${Type.runtimeArgumentKeys(
-      key.typeArguments,
-    ).join('\u0000')}${key.evidence.length === 0 ? '' : `\u0004${key.evidence.join('\u0000')}`}${
-      key.staticArguments.length === 0
-        ? ''
-        : `\u0001${key.staticArguments.map(StaticValue.key).join('\u0000')}`
-    }\u0002${key.contractRow.join('\u0000')}`
-    keyTextCache.set(key, cached)
-  }
-  return cached
+  const cached: unknown = Reflect.get(key, cachedKeyText)
+  if (typeof cached === 'string') return cached
+  const computed = `${key.declaration.module}\u0000${key.declaration.name}\u0000${Type.runtimeArgumentKeys(
+    key.typeArguments,
+  ).join('\u0000')}${key.evidence.length === 0 ? '' : `\u0004${key.evidence.join('\u0000')}`}${
+    key.staticArguments.length === 0
+      ? ''
+      : `\u0001${key.staticArguments.map(StaticValue.key).join('\u0000')}`
+  }\u0002${key.contractRow.join('\u0000')}`
+  if (Object.isExtensible(key)) Object.defineProperty(key, cachedKeyText, { value: computed })
+  return computed
 }
+
+const siteText = (owner: InstanceKey, span: SourceSpan.SourceSpan): string =>
+  `${keyText(owner)}\u0005${span.sourceId}:${span.start}:${span.end}`
+
+// Lowering resolves every call site against the whole program's call list; each list is indexed
+// once, on first query, instead of rescanned per site. Discovery arrays are never mutated after
+// publication, so the identity-keyed index cannot go stale.
+const callSiteIndex = new WeakMap<
+  ReadonlyArray<CallInstance>,
+  ReadonlyMap<string, ReadonlyArray<CallInstance>>
+>()
+
+/** The calls `owner` recorded at `span`, in `calls` order. */
+export const callsAtSite = (
+  calls: ReadonlyArray<CallInstance>,
+  owner: InstanceKey,
+  span: SourceSpan.SourceSpan,
+): ReadonlyArray<CallInstance> => {
+  let index = callSiteIndex.get(calls)
+  if (index === undefined) {
+    const built = new Map<string, Array<CallInstance>>()
+    for (const call of calls) {
+      const text = siteText(call.owner, call.span)
+      const group = built.get(text)
+      if (group === undefined) built.set(text, [call])
+      else group.push(call)
+    }
+    callSiteIndex.set(calls, built)
+    index = built
+  }
+  return index.get(siteText(owner, span)) ?? []
+}
+
+interface InstanceIndex {
+  readonly byKey: ReadonlyMap<string, Instance>
+  readonly byDeclaration: ReadonlyMap<string, ReadonlyArray<Instance>>
+}
+
+const instanceIndexCache = new WeakMap<ReadonlyArray<Instance>, InstanceIndex>()
+
+const instanceIndex = (instances: ReadonlyArray<Instance>): InstanceIndex => {
+  const cached = instanceIndexCache.get(instances)
+  if (cached !== undefined) return cached
+  const byKey = new Map<string, Instance>()
+  const byDeclaration = new Map<string, Array<Instance>>()
+  for (const instance of instances) {
+    const text = keyText(instance.key)
+    if (!byKey.has(text)) byKey.set(text, instance)
+    const declaration = `${instance.key.declaration.module}\u0000${instance.key.declaration.name}`
+    const group = byDeclaration.get(declaration)
+    if (group === undefined) byDeclaration.set(declaration, [instance])
+    else group.push(instance)
+  }
+  const built = { byKey, byDeclaration }
+  instanceIndexCache.set(instances, built)
+  return built
+}
+
+/** The first instance in `instances` with `key`'s identity. */
+export const instanceByKey = (
+  instances: ReadonlyArray<Instance>,
+  key: InstanceKey,
+): Instance | undefined => instanceIndex(instances).byKey.get(keyText(key))
+
+/** Every instance of one declaration, in `instances` order. */
+export const instancesOf = (
+  instances: ReadonlyArray<Instance>,
+  declaration: { readonly module: string; readonly name: string },
+): ReadonlyArray<Instance> =>
+  instanceIndex(instances).byDeclaration.get(`${declaration.module}\u0000${declaration.name}`) ?? []
 
 /** Identifies the machine body shared by proof contexts with one emitted contract. */
 export const runtimeKeyText = (key: InstanceKey): string =>
@@ -1010,19 +1121,55 @@ export interface ExecutionClosure {
 }
 
 /** Projects the complete execution graph rooted at one discovered specialization. */
+interface ClosureIndex {
+  readonly instances: ReadonlyMap<string, Instance>
+  readonly byOwner: ReadonlyMap<string, ReadonlyArray<ExecutionEdge>>
+  readonly residuals: ReadonlyMap<string, Residualization.Observation>
+}
+
+// Test identity computes one closure per test over the same discovery; index it once.
+const closureIndices = new WeakMap<Discovery, ClosureIndex>()
+
+const closureIndex = (self: Discovery): ClosureIndex => {
+  let index = closureIndices.get(self)
+  if (index === undefined) {
+    const byOwner = new Map<string, Array<ExecutionEdge>>()
+    for (const edge of self.executionEdges) {
+      const key = keyText(edge.owner)
+      const owned = byOwner.get(key)
+      if (owned === undefined) byOwner.set(key, [edge])
+      else owned.push(edge)
+    }
+    index = {
+      instances: new Map(self.instances.map((instance) => [keyText(instance.key), instance])),
+      byOwner,
+      residuals: new Map(self.residualBodies.map((body) => [body.application, body])),
+    }
+    closureIndices.set(self, index)
+  }
+  return index
+}
+
+const expressionSpanKeys = new WeakMap<Instance, ReadonlyArray<string>>()
+
+const instanceExpressionSpanKeys = (instance: Instance): ReadonlyArray<string> => {
+  let keys = expressionSpanKeys.get(instance)
+  if (keys === undefined) {
+    keys = instance.function.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .map((expression) => SourceSpan.key(expression.span))
+    expressionSpanKeys.set(instance, keys)
+  }
+  return keys
+}
+
 export const executionClosure = (
   self: Discovery,
   root: InstanceKey,
   excludedDeclarations: ReadonlySet<string> = new Set(),
 ): ExecutionClosure => {
-  const instances = new Map(self.instances.map((instance) => [keyText(instance.key), instance]))
-  const byOwner = new Map<string, Array<ExecutionEdge>>()
-  for (const edge of self.executionEdges) {
-    const key = keyText(edge.owner)
-    const owned = byOwner.get(key)
-    if (owned === undefined) byOwner.set(key, [edge])
-    else owned.push(edge)
-  }
+  const { instances, byOwner, residuals } = closureIndex(self)
   const selected = new Map<string, Instance>()
   const selectedEdges = new Map<string, ExecutionEdge>()
   const gaps: Array<ExecutionGap> = []
@@ -1050,7 +1197,6 @@ export const executionClosure = (
   const orderedInstances = [...selected.values()].sort((left, right) =>
     compareInstanceKeys(left.key, right.key),
   )
-  const residuals = new Map(self.residualBodies.map((body) => [body.application, body]))
   const residualBodies: Array<Residualization.Observation> = []
   for (const instance of orderedInstances) {
     const residual = residuals.get(instance.residualApplication)
@@ -1063,14 +1209,7 @@ export const executionClosure = (
       gaps.push({ _tag: 'IncompleteResidualAttribution', instance: instance.key })
   }
   const owners = new Set(orderedInstances.map((instance) => keyText(instance.key)))
-  const spans = new Set(
-    orderedInstances.flatMap((instance) =>
-      instance.function.statements
-        .flatMap(Tir.statementExpressions)
-        .flatMap(Tir.expressionTree)
-        .map((expression) => SourceSpan.key(expression.span)),
-    ),
-  )
+  const spans = new Set(orderedInstances.flatMap(instanceExpressionSpanKeys))
   return {
     _tag: 'ExecutionClosure',
     root,
@@ -1671,14 +1810,22 @@ export const discover = (
     Type.isNominal(type) ? `${type.module}\u0000${type.name}` : undefined
   const sameRuntimeType = (left: Type.Type, right: Type.Type): boolean =>
     Type.runtimeKey(left) === Type.runtimeKey(right)
+  // Runtime keys of every subterm of one whole type, shared by repeated subterm queries.
+  const runtimeSubtermKeys = new Map<string, ReadonlySet<string>>()
   const isStrictRuntimeStructuralSubterm = (candidate: Type.Type, whole: Type.Type): boolean => {
-    if (sameRuntimeType(candidate, whole)) return false
     const candidateKey = Type.runtimeKey(candidate)
-    let found = false
-    Type.visit(whole, (type) => {
-      if (Type.runtimeKey(type) === candidateKey) found = true
-    })
-    return found
+    const wholeKey = Type.runtimeKey(whole)
+    if (candidateKey === wholeKey) return false
+    let keys = runtimeSubtermKeys.get(wholeKey)
+    if (keys === undefined) {
+      const collected = new Set<string>()
+      Type.visit(whole, (type) => {
+        collected.add(Type.runtimeKey(type))
+      })
+      keys = collected
+      runtimeSubtermKeys.set(wholeKey, keys)
+    }
+    return keys.has(candidateKey)
   }
   /** A witness may delegate to a field's concrete type even when nominal types have no arguments. */
   const isDirectWitnessFieldSubterm = (candidate: Type.Type, whole: Type.Type): boolean => {
@@ -1760,10 +1907,27 @@ export const discover = (
     }
     return descended
   }
+  // Instance discovery asks the same cleanup-subterm questions for many instances; the
+  // answer depends only on runtime identities and the unfolding path, so memoize it.
+  const strictCleanupSubtermCache = new Map<string, boolean>()
   const isStrictCleanupSubterm = (
     candidate: Type.Type,
     whole: Type.Type,
     unfolding: ReadonlyMap<string, Type.Nominal> = new Map(),
+  ): boolean => {
+    let cacheKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
+    for (const nominal of unfolding.values()) cacheKey += `\u0001${Type.runtimeKey(nominal)}`
+    let cached = strictCleanupSubtermCache.get(cacheKey)
+    if (cached === undefined) {
+      cached = computeStrictCleanupSubterm(candidate, whole, unfolding)
+      strictCleanupSubtermCache.set(cacheKey, cached)
+    }
+    return cached
+  }
+  const computeStrictCleanupSubterm = (
+    candidate: Type.Type,
+    whole: Type.Type,
+    unfolding: ReadonlyMap<string, Type.Nominal>,
   ): boolean => {
     if (sameRuntimeType(candidate, whole)) return false
     const candidateDeclaration = nominalTypeText(candidate)
@@ -2079,8 +2243,13 @@ export const discover = (
     readonly ordinaryIdentities: ReadonlySet<string>
     readonly witnessTargets: ReadonlyArray<CallTarget>
     readonly cleanupRoots: ReadonlyMap<string, ReadonlyArray<Type.Type>>
+    /** Each call's concrete target, resolved once for every ancestry context of this key. */
+    readonly targetKeys: Map<CallTarget, InstanceKey | undefined>
   }
   const analyzedKeys = new Map<string, Analyzed | undefined>()
+  // Without a staged application a body's callables never consult recorded callables, so each
+  // key object's realization is shared by every ancestry context that reaches it.
+  const contextFreeCallables = new WeakMap<InstanceKey, ReadonlyArray<CallableInstance>>()
   const analyze = (key: InstanceKey): Analyzed | undefined => {
     const text = keyText(key)
     if (analyzedKeys.has(text)) return analyzedKeys.get(text)
@@ -2303,6 +2472,7 @@ export const discover = (
       ordinaryIdentities,
       witnessTargets,
       cleanupRoots,
+      targetKeys: new Map(),
     }
   }
   const restartDiscovery = (): void => {
@@ -2339,35 +2509,45 @@ export const discover = (
         if (analyzed === undefined) continue
         const { fn, substitution, calls, identityOfCall, ordinaryIdentities, cleanupRoots } =
           analyzed
-        for (const callable of concreteCallables(
-          fn,
-          key,
-          substitution,
-          results,
-          index,
-          resolveRecordedCallable,
-        )) {
-          recordedCallables.set(callableIdentity(callable), callable)
+        let callables = stagedApplication(fn) ? undefined : contextFreeCallables.get(key)
+        if (callables === undefined) {
+          callables = concreteCallables(
+            fn,
+            key,
+            substitution,
+            results,
+            index,
+            resolveRecordedCallable,
+          )
+          if (!stagedApplication(fn)) contextFreeCallables.set(key, callables)
         }
+        for (const callable of callables)
+          recordedCallables.set(callableIdentity(callable), callable)
         for (const call of calls.values()) {
           const identity = identityOfCall(call)
           const target = call.declaration
-          const targetFunction = FunctionIndex.tirByName(
-            results.get(target.module)?.tir,
-            target.name,
-          )
-          if (targetFunction === undefined) continue
-          const targetArguments = call.typeArguments.map((argument) =>
-            Type.substituteGenericArgument(argument, substitution),
-          )
-          const targetKey = keyOf(
-            target,
-            targetFunction.contract,
-            targetFunction.declaration.typeParameters.map((parameter) => parameter.type),
-            targetArguments,
-            call.staticArguments ?? [],
-            call.evidence ?? [],
-          )
+          let targetKey = analyzed.targetKeys.get(call)
+          if (targetKey === undefined && !analyzed.targetKeys.has(call)) {
+            const targetFunction = FunctionIndex.tirByName(
+              results.get(target.module)?.tir,
+              target.name,
+            )
+            targetKey =
+              targetFunction === undefined
+                ? undefined
+                : keyOf(
+                    target,
+                    targetFunction.contract,
+                    targetFunction.declaration.typeParameters.map((parameter) => parameter.type),
+                    call.typeArguments.map((argument) =>
+                      Type.substituteGenericArgument(argument, substitution),
+                    ),
+                    call.staticArguments ?? [],
+                    call.evidence ?? [],
+                  )
+            analyzed.targetKeys.set(call, targetKey)
+          }
+          if (targetKey === undefined) continue
           const edgeKind = ordinaryIdentities.has(identity) ? 'Runtime' : 'Cleanup'
           executionEdges.set(`${keyText(key)}\u0005${edgeKind}\u0005${keyText(targetKey)}`, {
             _tag: 'ExecutionEdge',

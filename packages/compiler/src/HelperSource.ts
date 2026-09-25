@@ -3,6 +3,7 @@ import * as Analysis from './Analysis.js'
 import type * as Backend from './Backend.js'
 import * as CompilationProfile from './CompilationProfile.js'
 import * as HelperCapability from './HelperCapability.js'
+import * as Preparation from './Preparation.js'
 import * as SourceResolver from './SourceResolver.js'
 
 /**
@@ -44,10 +45,11 @@ export const compile = Effect.fn('HelperSource.compile')(function* (
     unwind: 'none',
     sanitizers: [],
   }
-  const snapshot = yield* Analysis.makeRealized({
-    root: 'compiler-support/root',
-    configuration: { profile: input },
-  }).pipe(
+  // Codegen needs the realized program only: editor indexes (FrontendTooling) are not built.
+  const bundle = yield* Preparation.prepare(
+    { root: 'compiler-support/root', configuration: { profile: input } },
+    'executable',
+  ).pipe(
     Effect.provide(
       SourceResolver.memory(
         new Map([
@@ -62,13 +64,15 @@ export const compile = Effect.fn('HelperSource.compile')(function* (
     ),
     Effect.mapError((error) => invalid(error.message)),
   )
-  const diagnostics = Analysis.diagnostics(snapshot)
-  if (diagnostics.length !== 0 || snapshot.profile === undefined)
+  const { frontend, ...realization } = Preparation.realization(bundle)
+  const program = { ...frontend, ...realization }
+  const diagnostics = program.diagnostics
+  if (diagnostics.length !== 0 || program.profile === undefined)
     return yield* invalid(diagnostics.map((entry) => `${entry.code}: ${entry.message}`).join('\n'))
-  const artifact = yield* Analysis.codegen(snapshot, {
+  const artifact = yield* Analysis.codegen(program, {
     mode: profile.optimization === 'none' ? 'debug' : 'release',
     support: true,
   }).pipe(Effect.mapError((failure) => invalid(failure.message)))
   yield* HelperCapability.verifyExports(providers, artifact.foreignExports, profile.target)
-  return { artifact, profile: snapshot.profile }
+  return { artifact, profile: program.profile }
 })

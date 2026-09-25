@@ -55,29 +55,29 @@ export const builder = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const inputType = Effect.fnUntraced(function* (
+export const inputType = (
   self: FunctionBody,
   input: Value.Input,
-): Effect.fn.Return<Type.Type, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.inputType', (draft, module) =>
-    Result.gen(function* () {
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        input,
-        'FunctionBody.inputType',
-      )
-      const type = module.types.handles[resolved.type]
-      if (type === undefined) {
-        return yield* Result.fail(
-          invalidState({
-            operation: 'FunctionBody.inputType',
-            message: 'Input type handle is missing',
-            state: input,
-          }),
-        )
-      }
-      return type
-    }),
-  )
-})
+): Effect.Effect<Type.Type, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.inputType', (draft) => inputTypeIn(draft, input))
+
+/** @internal */
+export const inputTypeIn = (
+  draft: FunctionBodyState.Draft,
+  input: Value.Input,
+): Result.Result<Type.Type, LlvmError> => {
+  const module = draft.module
+  const resolved = FunctionBodyState.resolveOperand(draft, module, input, 'FunctionBody.inputType')
+  if (Result.isFailure(resolved)) return Result.fail(resolved.failure)
+  const type = module.types.handles[resolved.success.type]
+  if (type === undefined) {
+    return Result.fail(
+      invalidState({
+        operation: 'FunctionBody.inputType',
+        message: 'Input type handle is missing',
+        state: input,
+      }),
+    )
+  }
+  return Result.succeed(type)
+}

@@ -12,46 +12,57 @@ import { type FastMathInput, type FunctionBody, fastMath } from './_internal.js'
  * @category instructions
  * @since 0.0.0
  */
-export const unary = Effect.fnUntraced(function* (
+export const unary = (
   self: FunctionBody,
   kind: 'fneg',
   operand: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
   options: { readonly fastMath?: FastMathInput } = {},
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.unary', (draft, module) =>
-    Result.gen(function* () {
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        operand,
-        'FunctionBody.unary',
-      )
-      if (!(yield* FunctionBodyState.isFloatingType(module, resolved.type, 'FunctionBody.unary'))) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.unary',
-            message: 'fneg requires a floating-point scalar or vector',
-            input: operand,
-          }),
-        )
-      }
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        resolved.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'Unary',
-          kind,
-          operand: resolved.operand,
-          fastMath: fastMath(options.fastMath),
-          result,
-          name: finalName,
-        }),
-      )).value
-    }),
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.unary', (draft) =>
+    unaryIn(draft, kind, operand, name, options),
   )
-})
+
+/** @internal */
+export const unaryIn = (
+  draft: FunctionBodyState.Draft,
+  kind: 'fneg',
+  operand: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+  options: { readonly fastMath?: FastMathInput } = {},
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  return Result.gen(function* () {
+    const resolved = yield* FunctionBodyState.resolveOperand(
+      draft,
+      module,
+      operand,
+      'FunctionBody.unary',
+    )
+    if (!(yield* FunctionBodyState.isFloatingType(module, resolved.type, 'FunctionBody.unary'))) {
+      return yield* Result.fail(
+        invalidInput({
+          operation: 'FunctionBody.unary',
+          message: 'fneg requires a floating-point scalar or vector',
+          input: operand,
+        }),
+      )
+    }
+    return yield* FunctionBodyState.appendResult(
+      draft,
+      resolved.type,
+      name,
+      (result, finalName) => ({
+        _tag: 'Unary',
+        kind,
+        operand: resolved.operand,
+        fastMath: fastMath(options.fastMath),
+        result,
+        name: finalName,
+      }),
+    )
+  })
+}
 
 /**
  * Replaces an undefined or poison operand with an arbitrary stable value of the same type.
@@ -62,30 +73,37 @@ export const unary = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const freeze = Effect.fnUntraced(function* (
+export const freeze = (
   self: FunctionBody,
   operand: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.freeze', (draft, module) =>
-    Result.gen(function* () {
-      const resolved = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        operand,
-        'FunctionBody.freeze',
-      )
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        resolved.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'Freeze',
-          operand: resolved.operand,
-          result,
-          name: finalName,
-        }),
-      )).value
-    }),
-  )
-})
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.freeze', (draft) => freezeIn(draft, operand, name))
+
+/** @internal */
+export const freezeIn = (
+  draft: FunctionBodyState.Draft,
+  operand: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  return Result.gen(function* () {
+    const resolved = yield* FunctionBodyState.resolveOperand(
+      draft,
+      module,
+      operand,
+      'FunctionBody.freeze',
+    )
+    return yield* FunctionBodyState.appendResult(
+      draft,
+      resolved.type,
+      name,
+      (result, finalName) => ({
+        _tag: 'Freeze',
+        operand: resolved.operand,
+        result,
+        name: finalName,
+      }),
+    )
+  })
+}

@@ -105,96 +105,117 @@ export interface BinaryOptions {
  * @category instructions
  * @since 0.0.0
  */
-export const binary = Effect.fnUntraced(function* (
+export const binary = (
   self: FunctionBody,
   kind: BinaryKind,
   left: Value.Input,
   right: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
   options: BinaryOptions = {},
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.binary', (draft, module) =>
-    Result.gen(function* () {
-      const operands = yield* sameOperands(draft, module, left, right, 'FunctionBody.binary')
-      const floating = kind.startsWith('f')
-      const integerMath = IntegerMath.make(
-        options.integerMath ?? {
-          noSignedWrap: options.noSignedWrap,
-          noUnsignedWrap: options.noUnsignedWrap,
-          exact: options.exact,
-        },
-      )
-      const valid = floating
-        ? yield* FunctionBodyState.isFloatingType(
-            module,
-            operands.leftValue.type,
-            'FunctionBody.binary',
-          )
-        : yield* FunctionBodyState.isIntegerType(
-            module,
-            operands.leftValue.type,
-            'FunctionBody.binary',
-          )
-      if (!valid) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.binary',
-            message: `${kind} has incompatible operand types`,
-            input: { left, right },
-          }),
-        )
-      }
-      if (!floating && FastMathActor.toBitcode(fastMath(options.fastMath)) !== 0) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.binary',
-            message: 'Fast-math flags only apply to floating-point binary operations',
-            input: kind,
-          }),
-        )
-      }
-      const exactKinds: ReadonlyArray<BinaryKind> = ['udiv', 'sdiv', 'lshr', 'ashr']
-      const wrapKinds: ReadonlyArray<BinaryKind> = ['add', 'sub', 'mul', 'shl']
-      if (integerMath.exact && !exactKinds.includes(kind)) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.binary',
-            message: 'The exact flag is only valid on division and right shifts',
-            input: kind,
-          }),
-        )
-      }
-      if ((integerMath.noSignedWrap || integerMath.noUnsignedWrap) && !wrapKinds.includes(kind)) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.binary',
-            message: 'No-wrap flags are only valid on add, sub, mul, and shl',
-            input: kind,
-          }),
-        )
-      }
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        operands.leftValue.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'Binary',
-          kind,
-          left: operands.leftValue.operand,
-          right: operands.rightValue.operand,
-          integerFlags: {
-            noSignedWrap: integerMath.noSignedWrap,
-            noUnsignedWrap: integerMath.noUnsignedWrap,
-            exact: integerMath.exact,
-          },
-          fastMath: fastMath(options.fastMath),
-          result,
-          name: finalName,
-        }),
-      )).value
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.binary', (draft) =>
+    binaryIn(draft, kind, left, right, name, options),
+  )
+
+/** @internal */
+export const binaryIn = (
+  draft: FunctionBodyState.Draft,
+  kind: BinaryKind,
+  left: Value.Input,
+  right: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+  options: BinaryOptions = {},
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.binary'
+  const operands = sameOperands(draft, module, left, right, operation)
+  if (Result.isFailure(operands)) return Result.fail(operands.failure)
+  const floating = kind.startsWith('f')
+  const integerMath = IntegerMath.make(
+    options.integerMath ?? {
+      noSignedWrap: options.noSignedWrap,
+      noUnsignedWrap: options.noUnsignedWrap,
+      exact: options.exact,
+    },
+  )
+  const valid = floating
+    ? FunctionBodyState.isFloatingType(module, operands.success.leftValue.type, operation)
+    : FunctionBodyState.isIntegerType(module, operands.success.leftValue.type, operation)
+  if (Result.isFailure(valid)) return Result.fail(valid.failure)
+  if (!valid.success) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: `${kind} has incompatible operand types`,
+        input: { left, right },
+      }),
+    )
+  }
+  const math = fastMath(options.fastMath)
+  if (!floating && FastMathActor.toBitcode(math) !== 0) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'Fast-math flags only apply to floating-point binary operations',
+        input: kind,
+      }),
+    )
+  }
+  if (integerMath.exact && !exactKinds.includes(kind)) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'The exact flag is only valid on division and right shifts',
+        input: kind,
+      }),
+    )
+  }
+  if ((integerMath.noSignedWrap || integerMath.noUnsignedWrap) && !wrapKinds.includes(kind)) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'No-wrap flags are only valid on add, sub, mul, and shl',
+        input: kind,
+      }),
+    )
+  }
+  const { leftValue, rightValue } = operands.success
+  const integerFlags =
+    integerFlagSets[
+      (integerMath.noSignedWrap ? 1 : 0) |
+        (integerMath.noUnsignedWrap ? 2 : 0) |
+        (integerMath.exact ? 4 : 0)
+    ] ?? integerMath
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    leftValue.type,
+    name,
+    (result, finalName) => ({
+      _tag: 'Binary',
+      kind,
+      left: leftValue.operand,
+      right: rightValue.operand,
+      integerFlags,
+      fastMath: math,
+      result,
+      name: finalName,
     }),
   )
-})
+  return appended
+}
+
+const exactKinds: ReadonlyArray<BinaryKind> = ['udiv', 'sdiv', 'lshr', 'ashr']
+const wrapKinds: ReadonlyArray<BinaryKind> = ['add', 'sub', 'mul', 'shl']
+
+/** Shared flag records indexed by `noSignedWrap | noUnsignedWrap << 1 | exact << 2`. */
+const integerFlagSets: ReadonlyArray<FunctionBodyDescription.IntegerFlags> = Array.from(
+  { length: 8 },
+  (_, bits) => ({
+    noSignedWrap: (bits & 1) !== 0,
+    noUnsignedWrap: (bits & 2) !== 0,
+    exact: (bits & 4) !== 0,
+  }),
+)
 
 /** @internal */
 const integerOperandType = Effect.fnUntraced(function* (
@@ -292,54 +313,61 @@ export const bitwiseNot = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const integerCompare = Effect.fnUntraced(function* (
+export const integerCompare = (
   self: FunctionBody,
   predicate: IntegerPredicate,
   left: Value.Input,
   right: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(
-    self,
-    'FunctionBody.integerCompare',
-    (draft, module) =>
-      Result.gen(function* () {
-        const operands = yield* sameOperands(
-          draft,
-          module,
-          left,
-          right,
-          'FunctionBody.integerCompare',
-        )
-        if (
-          !(yield* FunctionBodyState.isIntegerType(
-            module,
-            operands.leftValue.type,
-            'FunctionBody.integerCompare',
-          ))
-        ) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.integerCompare',
-              message: 'icmp requires integer scalar or vector operands',
-              input: { left, right },
-            }),
-          )
-        }
-        const type = yield* FunctionBodyState.comparisonType(draft, module, operands.leftValue.type)
-        return (yield* FunctionBodyState.appendResult(draft, type, name, (result, finalName) => ({
-          _tag: 'Compare',
-          kind: 'integer',
-          predicate,
-          left: operands.leftValue.operand,
-          right: operands.rightValue.operand,
-          fastMath: FastMathActor.none,
-          result,
-          name: finalName,
-        }))).value
-      }),
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.integerCompare', (draft) =>
+    integerCompareIn(draft, predicate, left, right, name),
   )
-})
+
+/** @internal */
+export const integerCompareIn = (
+  draft: FunctionBodyState.Draft,
+  predicate: IntegerPredicate,
+  left: Value.Input,
+  right: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.integerCompare'
+  const operands = sameOperands(draft, module, left, right, operation)
+  if (Result.isFailure(operands)) return Result.fail(operands.failure)
+  const { leftValue, rightValue } = operands.success
+  const valid = FunctionBodyState.isIntegerType(module, leftValue.type, operation)
+  if (Result.isFailure(valid)) return Result.fail(valid.failure)
+  if (!valid.success) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'icmp requires integer scalar or vector operands',
+        input: { left, right },
+      }),
+    )
+  }
+  const type = FunctionBodyState.comparisonType(draft, module, leftValue.type)
+  if (Result.isFailure(type)) return Result.fail(type.failure)
+  const math = FastMathActor.none
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    type.success,
+    name,
+    (result, finalName) => ({
+      _tag: 'Compare',
+      kind: 'integer',
+      predicate,
+      left: leftValue.operand,
+      right: rightValue.operand,
+      fastMath: math,
+      result,
+      name: finalName,
+    }),
+  )
+  return appended
+}
 
 /**
  * Appends fast-math-aware `fcmp`, returning `i1` or a same-shaped vector of `i1`.
@@ -347,55 +375,63 @@ export const integerCompare = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const floatingCompare = Effect.fnUntraced(function* (
+export const floatingCompare = (
   self: FunctionBody,
   predicate: FloatingPredicate,
   left: Value.Input,
   right: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
   options: { readonly fastMath?: FastMathInput } = {},
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(
-    self,
-    'FunctionBody.floatingCompare',
-    (draft, module) =>
-      Result.gen(function* () {
-        const operands = yield* sameOperands(
-          draft,
-          module,
-          left,
-          right,
-          'FunctionBody.floatingCompare',
-        )
-        if (
-          !(yield* FunctionBodyState.isFloatingType(
-            module,
-            operands.leftValue.type,
-            'FunctionBody.floatingCompare',
-          ))
-        ) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.floatingCompare',
-              message: 'fcmp requires floating-point scalar or vector operands',
-              input: { left, right },
-            }),
-          )
-        }
-        const type = yield* FunctionBodyState.comparisonType(draft, module, operands.leftValue.type)
-        return (yield* FunctionBodyState.appendResult(draft, type, name, (result, finalName) => ({
-          _tag: 'Compare',
-          kind: 'floating',
-          predicate,
-          left: operands.leftValue.operand,
-          right: operands.rightValue.operand,
-          fastMath: fastMath(options.fastMath),
-          result,
-          name: finalName,
-        }))).value
-      }),
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.floatingCompare', (draft) =>
+    floatingCompareIn(draft, predicate, left, right, name, options),
   )
-})
+
+/** @internal */
+export const floatingCompareIn = (
+  draft: FunctionBodyState.Draft,
+  predicate: FloatingPredicate,
+  left: Value.Input,
+  right: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+  options: { readonly fastMath?: FastMathInput } = {},
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.floatingCompare'
+  const operands = sameOperands(draft, module, left, right, operation)
+  if (Result.isFailure(operands)) return Result.fail(operands.failure)
+  const { leftValue, rightValue } = operands.success
+  const valid = FunctionBodyState.isFloatingType(module, leftValue.type, operation)
+  if (Result.isFailure(valid)) return Result.fail(valid.failure)
+  if (!valid.success) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'fcmp requires floating-point scalar or vector operands',
+        input: { left, right },
+      }),
+    )
+  }
+  const type = FunctionBodyState.comparisonType(draft, module, leftValue.type)
+  if (Result.isFailure(type)) return Result.fail(type.failure)
+  const math = fastMath(options.fastMath)
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    type.success,
+    name,
+    (result, finalName) => ({
+      _tag: 'Compare',
+      kind: 'floating',
+      predicate,
+      left: leftValue.operand,
+      right: rightValue.operand,
+      fastMath: math,
+      result,
+      name: finalName,
+    }),
+  )
+  return appended
+}
 
 /**
  * Appends scalar or shape-matched vector `select` after validating its `i1` condition.
@@ -403,91 +439,97 @@ export const floatingCompare = Effect.fnUntraced(function* (
  * @category instructions
  * @since 0.0.0
  */
-export const select = Effect.fnUntraced(function* (
+export const select = (
   self: FunctionBody,
   condition: Value.Input,
   onTrue: Value.Input,
   onFalse: Value.Input,
   name?: ByteString.ByteString | Uint8Array | string,
   options: { readonly fastMath?: FastMathInput } = {},
-): Effect.fn.Return<Value.Value, LlvmError> {
-  return yield* FunctionBodyState.mutateModule(self, 'FunctionBody.select', (draft, module) =>
-    Result.gen(function* () {
-      const choices = yield* sameOperands(draft, module, onTrue, onFalse, 'FunctionBody.select')
-      const selected = yield* FunctionBodyState.resolveOperand(
-        draft,
-        module,
-        condition,
-        'FunctionBody.select',
-      )
-      const conditionType = yield* FunctionBodyState.typeAt(
-        module,
-        selected.type,
-        'FunctionBody.select',
-      )
-      const conditionScalar =
-        conditionType._tag === 'Vector'
-          ? yield* FunctionBodyState.typeAt(module, conditionType.child, 'FunctionBody.select')
-          : conditionType
-      if (conditionScalar._tag !== 'Integer' || conditionScalar.bitWidth !== 1) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.select',
-            message: 'select requires an i1 scalar or vector condition',
-            input: condition,
-          }),
-        )
-      }
-      if (conditionType._tag === 'Vector') {
-        const choiceType = yield* FunctionBodyState.typeAt(
-          module,
-          choices.leftValue.type,
-          'FunctionBody.select',
-        )
-        if (
-          choiceType._tag !== 'Vector' ||
-          choiceType.length !== conditionType.length ||
-          choiceType.scalable !== conditionType.scalable
-        ) {
-          return yield* Result.fail(
-            invalidInput({
-              operation: 'FunctionBody.select',
-              message: 'Vector select condition and choices must have the same shape',
-              input: { condition, onTrue, onFalse },
-            }),
-          )
-        }
-      }
-      if (
-        FastMathActor.toBitcode(fastMath(options.fastMath)) !== 0 &&
-        !(yield* FunctionBodyState.isFloatingType(
-          module,
-          choices.leftValue.type,
-          'FunctionBody.select',
-        ))
-      ) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'FunctionBody.select',
-            message: 'Fast-math select requires floating-point choices',
-            input: { onTrue, onFalse },
-          }),
-        )
-      }
-      return (yield* FunctionBodyState.appendResult(
-        draft,
-        choices.leftValue.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'Select',
-          condition: selected.operand,
-          onTrue: choices.leftValue.operand,
-          onFalse: choices.rightValue.operand,
-          fastMath: fastMath(options.fastMath),
-          result,
-          name: finalName,
+): Effect.Effect<Value.Value, LlvmError> =>
+  FunctionBodyState.mutate(self, 'FunctionBody.select', (draft) =>
+    selectIn(draft, condition, onTrue, onFalse, name, options),
+  )
+
+/** @internal */
+export const selectIn = (
+  draft: FunctionBodyState.Draft,
+  condition: Value.Input,
+  onTrue: Value.Input,
+  onFalse: Value.Input,
+  name?: ByteString.ByteString | Uint8Array | string,
+  options: { readonly fastMath?: FastMathInput } = {},
+): Result.Result<Value.Value, LlvmError> => {
+  const module = draft.module
+  const operation = 'FunctionBody.select'
+  const choices = sameOperands(draft, module, onTrue, onFalse, operation)
+  if (Result.isFailure(choices)) return Result.fail(choices.failure)
+  const { leftValue, rightValue } = choices.success
+  const selected = FunctionBodyState.resolveOperand(draft, module, condition, operation)
+  if (Result.isFailure(selected)) return Result.fail(selected.failure)
+  const conditionType = FunctionBodyState.typeAt(module, selected.success.type, operation)
+  if (Result.isFailure(conditionType)) return Result.fail(conditionType.failure)
+  const conditionVector =
+    conditionType.success._tag === 'Vector' ? conditionType.success : undefined
+  const conditionScalar =
+    conditionVector === undefined
+      ? conditionType
+      : FunctionBodyState.typeAt(module, conditionVector.child, operation)
+  if (Result.isFailure(conditionScalar)) return Result.fail(conditionScalar.failure)
+  if (conditionScalar.success._tag !== 'Integer' || conditionScalar.success.bitWidth !== 1) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'select requires an i1 scalar or vector condition',
+        input: condition,
+      }),
+    )
+  }
+  if (conditionVector !== undefined) {
+    const choiceType = FunctionBodyState.typeAt(module, leftValue.type, operation)
+    if (Result.isFailure(choiceType)) return Result.fail(choiceType.failure)
+    if (
+      choiceType.success._tag !== 'Vector' ||
+      choiceType.success.length !== conditionVector.length ||
+      choiceType.success.scalable !== conditionVector.scalable
+    ) {
+      return Result.fail(
+        invalidInput({
+          operation,
+          message: 'Vector select condition and choices must have the same shape',
+          input: { condition, onTrue, onFalse },
         }),
-      )).value
+      )
+    }
+  }
+  const math = fastMath(options.fastMath)
+  if (FastMathActor.toBitcode(math) !== 0) {
+    const floating = FunctionBodyState.isFloatingType(module, leftValue.type, operation)
+    if (Result.isFailure(floating)) return Result.fail(floating.failure)
+    if (!floating.success) {
+      return Result.fail(
+        invalidInput({
+          operation,
+          message: 'Fast-math select requires floating-point choices',
+          input: { onTrue, onFalse },
+        }),
+      )
+    }
+  }
+  const conditionOperand = selected.success.operand
+  const appended = FunctionBodyState.appendResult(
+    draft,
+    leftValue.type,
+    name,
+    (result, finalName) => ({
+      _tag: 'Select',
+      condition: conditionOperand,
+      onTrue: leftValue.operand,
+      onFalse: rightValue.operand,
+      fastMath: math,
+      result,
+      name: finalName,
     }),
   )
-})
+  return appended
+}

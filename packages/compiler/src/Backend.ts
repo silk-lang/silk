@@ -222,15 +222,26 @@ const checkForeignPlanning = Effect.fn('Backend.checkForeignPlanning')((program:
 
 export const sanitize = (name: string): string => name.replace(/[^A-Za-z0-9_]/g, '_')
 
+const textEncoder = new TextEncoder()
+const hexadecimalBytes = Array.from({ length: 256 }, (_, byte) =>
+  byte.toString(16).padStart(2, '0'),
+)
+
 const injectivePart = (value: string): string => {
-  const bytes = new TextEncoder().encode(value)
-  return `${bytes.length}_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join(
-    '',
-  )}`
+  const bytes = textEncoder.encode(value)
+  let hexadecimal = ''
+  for (const byte of bytes) hexadecimal += hexadecimalBytes[byte]
+  return `${bytes.length}_${hexadecimal}`
 }
 
-export const symbolFor = (fn: Mir.MirFunction): string =>
-  `silk_${sanitize(fn.id.module)}_${sanitize(fn.id.name)}__${[
+// Checked propagation names every frame literal after its function's symbol, so emission asks
+// for the same function's symbol once per propagation site.
+const symbols = new WeakMap<Mir.MirFunction, string>()
+
+export const symbolFor = (fn: Mir.MirFunction): string => {
+  const cached = symbols.get(fn)
+  if (cached !== undefined) return cached
+  const symbol = `silk_${sanitize(fn.id.module)}_${sanitize(fn.id.name)}__${[
     fn.instance.declaration.module,
     fn.instance.declaration.name,
     ...Type.runtimeArgumentKeys(fn.instance.typeArguments),
@@ -239,6 +250,9 @@ export const symbolFor = (fn: Mir.MirFunction): string =>
   ]
     .map(injectivePart)
     .join('_')}`
+  symbols.set(fn, symbol)
+  return symbol
+}
 
 export const suspensionPointKey = (point: Mir.SuspensionPointId): string =>
   `${Instances.keyText(point.owner)}\u0000${point.sourceId}\u0000${point.spanStart}\u0000${point.spanEnd}\u0000${point.ordinal}`

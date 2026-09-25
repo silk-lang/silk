@@ -1,10 +1,8 @@
-import * as LlvmBlock from '@silklang/llvm/Block'
-import * as Constant from '@silklang/llvm/Constant'
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as FunctionBody from '@silklang/llvm/FunctionBody'
 import * as Intrinsic from '@silklang/llvm/Intrinsic'
 import * as LlvmType from '@silklang/llvm/Type'
 import * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as Mir from './Mir.js'
 import type { LinearOperation } from './MirLinearization.js'
 import * as NativeArith from './NativeArith.js'
@@ -35,14 +33,14 @@ type Operation = Extract<
  * Branches to the shared trap block when a float would truncate outside the integer range or is
  * NaN instead of accepting LLVM poison from `fptosi`/`fptoui`.
  */
-export const emitFloatToIntegerGuard = Effect.fnUntraced(function* (
+export const emitFloatToIntegerGuard = (
   context: Context,
   value: Value.Input,
   source: Scalar.FloatScalar,
   target: Scalar.IntegerScalar,
   name: string,
   span: SourceSpan.SourceSpan,
-) {
+) => {
   const { body, builder, program } = context
   const floatType = source.spelling === 'f32' ? context.f32 : context.f64
   const pointerBits = program.layout.target.pointerSize === 4 ? 32 : 64
@@ -57,36 +55,30 @@ export const emitFloatToIntegerGuard = Effect.fnUntraced(function* (
   // `minimum - 1` and `minimum`, so the exclusive test against `minimum` is equivalent.
   const exactLow = target.signedness === 'Unsigned' || width <= precision
   const low = exactLow ? Number(range.minimum - 1n) : Number(range.minimum)
-  const constant = source.spelling === 'f32' ? Constant.floatFromNumber : Constant.doubleFromNumber
-  const lowConstant = yield* constant(builder, floatType, low)
-  const highConstant = yield* constant(builder, floatType, high)
+  const constant = source.spelling === 'f32' ? Emitter.floatFromNumber : Emitter.doubleFromNumber
+  const lowConstant = constant(builder, floatType, low)
+  const highConstant = constant(builder, floatType, high)
   // Unordered predicates make NaN inputs trap as well.
-  const below = yield* FunctionBody.floatingCompare(
+  const below = Emitter.floatingCompare(
     body,
     exactLow ? 'ule' : 'ult',
     value,
     lowConstant,
     `${name}_below`,
   )
-  const above = yield* FunctionBody.floatingCompare(
-    body,
-    'uge',
-    value,
-    highConstant,
-    `${name}_above`,
-  )
-  const invalid = yield* FunctionBody.binary(body, 'or', below, above, `${name}_invalid`)
-  const continueBlock = yield* LlvmBlock.make(body, `${name}_ok`)
-  yield* FunctionBody.conditionalBranch(
+  const above = Emitter.floatingCompare(body, 'uge', value, highConstant, `${name}_above`)
+  const invalid = Emitter.binary(body, 'or', below, above, `${name}_invalid`)
+  const continueBlock = Emitter.block(body, `${name}_ok`)
+  Emitter.conditionalBranch(
     body,
     invalid,
-    yield* NativeTermination.trapBlock(context.termination, 'arithmetic overflow', span),
+    NativeTermination.trapBlock(context.termination, 'arithmetic overflow', span),
     continueBlock,
   )
-  yield* LlvmBlock.setInsertionPoint(body, continueBlock)
-})
+  Emitter.setInsertionPoint(body, continueBlock)
+}
 
-export const emit = Effect.fnUntraced(function* (context: Context, operation: Operation) {
+export const emit = (context: Context, operation: Operation) => {
   const {
     body,
     builder,
@@ -106,15 +98,15 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
   let checkOrdinal = context.state.checkOrdinal
   switch (operation._tag) {
     case 'ConvertInteger': {
-      const result = yield* NativeArith.emitIntegerConversion(
+      const result = NativeArith.emitIntegerConversion(
         arith,
-        yield* NativeStorage.readScalar(nativeStorage, operation.source),
+        NativeStorage.readScalar(nativeStorage, operation.source),
         operation.sourceType,
         operation.type,
         `convert${operation.destination.ordinal}`,
         operation.provenance.span,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'ConvertScalar': {
@@ -127,9 +119,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         target.category === 'Boolean'
       )
         throw new RangeError('LLVM scalar conversion lost its types')
-      const sourceValue = yield* NativeStorage.readScalar(nativeStorage, operation.source)
+      const sourceValue = NativeStorage.readScalar(nativeStorage, operation.source)
       if (source.category === 'Character' && target.spelling === 'u32') {
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [sourceValue])
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [sourceValue])
         break
       }
       let destinationType: LlvmType.Type
@@ -153,7 +145,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           kind = 'fpext'
         }
       } else if (source.category === 'Floating' && target.category === 'Integer') {
-        yield* emitFloatToIntegerGuard(
+        emitFloatToIntegerGuard(
           context,
           sourceValue,
           source,
@@ -175,42 +167,37 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       } else {
         throw new RangeError('LLVM scalar conversion was not numeric')
       }
-      const result = yield* FunctionBody.cast(
+      const result = Emitter.cast(
         body,
         kind,
         sourceValue,
         destinationType,
         `convert${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'ReinterpretScalar': {
       const targetLane = NativeType.lanesFor(types, operation.type).at(0)
       if (targetLane === undefined) throw new RangeError('LLVM reinterpretation lost its lane')
-      const result = yield* FunctionBody.cast(
+      const result = Emitter.cast(
         body,
         'bitcast',
-        yield* NativeStorage.readScalar(nativeStorage, operation.source),
+        NativeStorage.readScalar(nativeStorage, operation.source),
         NativeType.laneType(types, targetLane),
         `reinterpret${operation.destination.ordinal}`,
       )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'FloatUnary': {
       const source = Scalar.find(operation.sourceType._tag)
       if (source?.category !== 'Floating')
         throw new RangeError('LLVM float unary lost its source type')
-      const subject = yield* NativeStorage.readScalar(nativeStorage, operation.source)
+      const subject = NativeStorage.readScalar(nativeStorage, operation.source)
       if (operation.operation === 'Negate') {
-        const result = yield* FunctionBody.unary(
-          body,
-          'fneg',
-          subject,
-          `fneg${operation.destination.ordinal}`,
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        const result = Emitter.unary(body, 'fneg', subject, `fneg${operation.destination.ordinal}`)
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       if (operation.operation === 'Sqrt') {
@@ -221,7 +208,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           returnType: floatType,
           parameters: [floatType],
         }
-        const result = yield* Intrinsic.call(
+        const result = Emitter.intrinsicCall(
           body,
           'sqrt',
           [floatType],
@@ -230,17 +217,13 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           { signature },
         )
         if (result === undefined) throw new RangeError('LLVM square root produced no value')
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       const width = source.spelling === 'f32' ? 32 : 64
       const integerType = integerTypes.get(width) ?? i32
-      const raw = yield* FunctionBody.cast(
+      const raw = Emitter.cast(
         body,
         'bitcast',
         subject,
@@ -251,38 +234,38 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       const exponentBits = source.spelling === 'f32' ? 8 : 11
       const exponentMask = ((1n << BigInt(exponentBits)) - 1n) << BigInt(fractionBits)
       const fractionMask = (1n << BigInt(fractionBits)) - 1n
-      const zero = yield* Constant.integerUnsigned(builder, integerType, 0n)
-      const exponentMaskValue = yield* Constant.integerUnsigned(builder, integerType, exponentMask)
-      const fractionMaskValue = yield* Constant.integerUnsigned(builder, integerType, fractionMask)
-      const exponent = yield* FunctionBody.binary(
+      const zero = Emitter.integerUnsigned(builder, integerType, 0n)
+      const exponentMaskValue = Emitter.integerUnsigned(builder, integerType, exponentMask)
+      const fractionMaskValue = Emitter.integerUnsigned(builder, integerType, fractionMask)
+      const exponent = Emitter.binary(
         body,
         'and',
         raw,
         exponentMaskValue,
         `fclass_exp${operation.destination.ordinal}`,
       )
-      const fraction = yield* FunctionBody.binary(
+      const fraction = Emitter.binary(
         body,
         'and',
         raw,
         fractionMaskValue,
         `fclass_frac${operation.destination.ordinal}`,
       )
-      const exponentZero = yield* FunctionBody.integerCompare(
+      const exponentZero = Emitter.integerCompare(
         body,
         'eq',
         exponent,
         zero,
         `fclass_exp_zero${operation.destination.ordinal}`,
       )
-      const exponentAll = yield* FunctionBody.integerCompare(
+      const exponentAll = Emitter.integerCompare(
         body,
         'eq',
         exponent,
         exponentMaskValue,
         `fclass_exp_all${operation.destination.ordinal}`,
       )
-      const fractionZero = yield* FunctionBody.integerCompare(
+      const fractionZero = Emitter.integerCompare(
         body,
         'eq',
         fraction,
@@ -291,7 +274,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       )
       let flag: Value.Input
       if (operation.operation === 'IsSignNegative') {
-        flag = yield* FunctionBody.integerCompare(
+        flag = Emitter.integerCompare(
           body,
           'slt',
           raw,
@@ -299,14 +282,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_sign${operation.destination.ordinal}`,
         )
       } else if (operation.operation === 'IsNaN') {
-        const fractionNonzero = yield* FunctionBody.integerCompare(
+        const fractionNonzero = Emitter.integerCompare(
           body,
           'ne',
           fraction,
           zero,
           `fclass_frac_nonzero${operation.destination.ordinal}`,
         )
-        flag = yield* FunctionBody.binary(
+        flag = Emitter.binary(
           body,
           'and',
           exponentAll,
@@ -314,7 +297,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_nan${operation.destination.ordinal}`,
         )
       } else if (operation.operation === 'IsInfinite') {
-        flag = yield* FunctionBody.binary(
+        flag = Emitter.binary(
           body,
           'and',
           exponentAll,
@@ -322,7 +305,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_inf${operation.destination.ordinal}`,
         )
       } else if (operation.operation === 'IsFinite') {
-        flag = yield* FunctionBody.integerCompare(
+        flag = Emitter.integerCompare(
           body,
           'ne',
           exponent,
@@ -330,21 +313,21 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_finite${operation.destination.ordinal}`,
         )
       } else if (operation.operation === 'IsNormal') {
-        const nonzero = yield* FunctionBody.integerCompare(
+        const nonzero = Emitter.integerCompare(
           body,
           'ne',
           exponent,
           zero,
           `fclass_nonzero${operation.destination.ordinal}`,
         )
-        const finite = yield* FunctionBody.integerCompare(
+        const finite = Emitter.integerCompare(
           body,
           'ne',
           exponent,
           exponentMaskValue,
           `fclass_notall${operation.destination.ordinal}`,
         )
-        flag = yield* FunctionBody.binary(
+        flag = Emitter.binary(
           body,
           'and',
           nonzero,
@@ -352,14 +335,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_normal${operation.destination.ordinal}`,
         )
       } else {
-        const fractionNonzero = yield* FunctionBody.integerCompare(
+        const fractionNonzero = Emitter.integerCompare(
           body,
           'ne',
           fraction,
           zero,
           `fclass_sub_frac${operation.destination.ordinal}`,
         )
-        flag = yield* FunctionBody.binary(
+        flag = Emitter.binary(
           body,
           'and',
           exponentZero,
@@ -367,30 +350,20 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           `fclass_sub${operation.destination.ordinal}`,
         )
       }
-      const result = yield* FunctionBody.cast(
-        body,
-        'zext',
-        flag,
-        i32,
-        `fclass${operation.destination.ordinal}`,
-      )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      const result = Emitter.cast(body, 'zext', flag, i32, `fclass${operation.destination.ordinal}`)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'FloatTranscendental': {
       const i64Type = integerTypes.get(64)
-      const result = yield* NativeTranscendental.emit(
+      const result = NativeTranscendental.emit(
         { builder, i32, ...(i64Type === undefined ? {} : { i64: i64Type }), f32, f64 },
         body,
         operation,
-        yield* NativeStorage.readScalar(nativeStorage, operation.source),
+        NativeStorage.readScalar(nativeStorage, operation.source),
       )
-      yield* NativeDebug.locate(
-        debug,
-        operation.provenance.span,
-        yield* Value.instruction(body, result),
-      )
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
     case 'CheckedScalarOutcome': {
@@ -408,11 +381,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         (target?.category !== 'Integer' && !characterConversion)
       )
         throw new RangeError('LLVM checked scalar operation lost its scalar types')
-      const left = yield* NativeStorage.readScalar(nativeStorage, leftLocal)
+      const left = NativeStorage.readScalar(nativeStorage, leftLocal)
       const right =
-        rightLocal === undefined
-          ? undefined
-          : yield* NativeStorage.readScalar(nativeStorage, rightLocal)
+        rightLocal === undefined ? undefined : NativeStorage.readScalar(nativeStorage, rightLocal)
       const pointerBits = program.layout.target.pointerSize === 4 ? 32 : 64
       const sourceBits = Scalar.bits(source, pointerBits)
       const targetBits = Scalar.bits(target, pointerBits)
@@ -422,38 +393,32 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
       let result: Value.Input
       let invalid: Value.Input
       if (characterConversion) {
-        const maximum = yield* Constant.integerUnsigned(builder, sourcePhysical, 0x10ffffn)
-        const surrogateMinimum = yield* Constant.integerUnsigned(builder, sourcePhysical, 0xd800n)
-        const surrogateMaximum = yield* Constant.integerUnsigned(builder, sourcePhysical, 0xdfffn)
-        const aboveMaximum = yield* FunctionBody.integerCompare(
-          body,
-          'ugt',
-          left,
-          maximum,
-          `${name}_above`,
-        )
-        const atLeastSurrogate = yield* FunctionBody.integerCompare(
+        const maximum = Emitter.integerUnsigned(builder, sourcePhysical, 0x10ffffn)
+        const surrogateMinimum = Emitter.integerUnsigned(builder, sourcePhysical, 0xd800n)
+        const surrogateMaximum = Emitter.integerUnsigned(builder, sourcePhysical, 0xdfffn)
+        const aboveMaximum = Emitter.integerCompare(body, 'ugt', left, maximum, `${name}_above`)
+        const atLeastSurrogate = Emitter.integerCompare(
           body,
           'uge',
           left,
           surrogateMinimum,
           `${name}_surrogate_minimum`,
         )
-        const atMostSurrogate = yield* FunctionBody.integerCompare(
+        const atMostSurrogate = Emitter.integerCompare(
           body,
           'ule',
           left,
           surrogateMaximum,
           `${name}_surrogate_maximum`,
         )
-        const surrogate = yield* FunctionBody.binary(
+        const surrogate = Emitter.binary(
           body,
           'and',
           atLeastSurrogate,
           atMostSurrogate,
           `${name}_surrogate`,
         )
-        invalid = yield* FunctionBody.binary(body, 'or', aboveMaximum, surrogate, `${name}_invalid`)
+        invalid = Emitter.binary(body, 'or', aboveMaximum, surrogate, `${name}_invalid`)
         result = left
       } else if (operation.operation.startsWith('CheckedConvertTo')) {
         if (target.category !== 'Integer')
@@ -463,44 +428,37 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const checks: Array<Value.Input> = []
         if (targetRange.minimum > sourceRange.minimum)
           checks.push(
-            yield* FunctionBody.integerCompare(
+            Emitter.integerCompare(
               body,
               source.signedness === 'Signed' ? 'slt' : 'ult',
               left,
               source.signedness === 'Signed'
-                ? yield* Constant.integerSigned(builder, sourcePhysical, targetRange.minimum)
-                : yield* Constant.integerUnsigned(builder, sourcePhysical, targetRange.minimum),
+                ? Emitter.integerSigned(builder, sourcePhysical, targetRange.minimum)
+                : Emitter.integerUnsigned(builder, sourcePhysical, targetRange.minimum),
               `${name}_below`,
             ),
           )
         if (targetRange.maximum < sourceRange.maximum)
           checks.push(
-            yield* FunctionBody.integerCompare(
+            Emitter.integerCompare(
               body,
               source.signedness === 'Signed' ? 'sgt' : 'ugt',
               left,
               source.signedness === 'Signed'
-                ? yield* Constant.integerSigned(builder, sourcePhysical, targetRange.maximum)
-                : yield* Constant.integerUnsigned(builder, sourcePhysical, targetRange.maximum),
+                ? Emitter.integerSigned(builder, sourcePhysical, targetRange.maximum)
+                : Emitter.integerUnsigned(builder, sourcePhysical, targetRange.maximum),
               `${name}_above`,
             ),
           )
         invalid =
-          checks.at(0) ??
-          (yield* Constant.integerUnsigned(builder, yield* LlvmType.integer(builder, 1), 0n))
+          checks.at(0) ?? Emitter.integerUnsigned(builder, Emitter.integerType(builder, 1), 0n)
         for (const [ordinal, check] of checks.slice(1).entries())
-          invalid = yield* FunctionBody.binary(
-            body,
-            'or',
-            invalid,
-            check,
-            `${name}_invalid${ordinal}`,
-          )
+          invalid = Emitter.binary(body, 'or', invalid, check, `${name}_invalid${ordinal}`)
         if (sourceBits === targetBits) {
           result = left
         } else {
           const extension = source.signedness === 'Signed' ? 'sext' : 'zext'
-          result = yield* FunctionBody.cast(
+          result = Emitter.cast(
             body,
             sourceBits < targetBits ? extension : 'trunc',
             left,
@@ -521,9 +479,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           target.signedness === 'Unsigned' ? unsignedOverflowSignatures : signedOverflowSignatures
         let signature = signatures.get(targetBits)
         if (signature === undefined) {
-          const i1 = yield* LlvmType.integer(builder, 1)
+          const i1 = Emitter.integerType(builder, 1)
           signature = {
-            returnType: yield* LlvmType.structure(builder, [targetPhysical, i1]),
+            returnType: Emitter.structureType(builder, [targetPhysical, i1]),
             parameters: [targetPhysical, targetPhysical],
           }
           signatures.set(targetBits, signature)
@@ -540,7 +498,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             stem = 'mul'
             break
         }
-        const pair = yield* Intrinsic.call(
+        const pair = Emitter.intrinsicCall(
           body,
           `${target.signedness === 'Unsigned' ? 'u' : 's'}${stem}.with.overflow`,
           [targetPhysical],
@@ -549,63 +507,63 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           { signature },
         )
         if (pair === undefined) throw new RangeError('LLVM checked arithmetic produced no outcome')
-        result = yield* FunctionBody.extractValue(body, pair, [0], `${name}_value`)
-        invalid = yield* FunctionBody.extractValue(body, pair, [1], `${name}_invalid`)
+        result = Emitter.extractValue(body, pair, [0], `${name}_value`)
+        invalid = Emitter.extractValue(body, pair, [1], `${name}_invalid`)
       } else if (target.category === 'Integer') {
         if (right === undefined)
           throw new RangeError('LLVM checked division lost its right operand')
-        const zero = yield* Constant.integerUnsigned(builder, targetPhysical, 0n)
-        invalid = yield* FunctionBody.integerCompare(body, 'eq', right, zero, `${name}_zero`)
+        const zero = Emitter.integerUnsigned(builder, targetPhysical, 0n)
+        invalid = Emitter.integerCompare(body, 'eq', right, zero, `${name}_zero`)
         if (
           target.signedness === 'Signed' &&
           (operation.operation === 'CheckedDivide' || operation.operation === 'CheckedRemainder')
         ) {
           const range = Scalar.range(target, pointerBits)
-          const minimum = yield* Constant.integerSigned(builder, targetPhysical, range.minimum)
-          const negativeOne = yield* Constant.integerSigned(builder, targetPhysical, -1n)
-          const minimumDividend = yield* FunctionBody.integerCompare(
+          const minimum = Emitter.integerSigned(builder, targetPhysical, range.minimum)
+          const negativeOne = Emitter.integerSigned(builder, targetPhysical, -1n)
+          const minimumDividend = Emitter.integerCompare(
             body,
             'eq',
             left,
             minimum,
             `${name}_minimum`,
           )
-          const negativeDivisor = yield* FunctionBody.integerCompare(
+          const negativeDivisor = Emitter.integerCompare(
             body,
             'eq',
             right,
             negativeOne,
             `${name}_negative_one`,
           )
-          const overflow = yield* FunctionBody.binary(
+          const overflow = Emitter.binary(
             body,
             'and',
             minimumDividend,
             negativeDivisor,
             `${name}_overflow`,
           )
-          invalid = yield* FunctionBody.binary(body, 'or', invalid, overflow, `${name}_invalid`)
+          invalid = Emitter.binary(body, 'or', invalid, overflow, `${name}_invalid`)
         }
-        const one = yield* Constant.integerUnsigned(builder, targetPhysical, 1n)
-        const safeRight = yield* FunctionBody.select(body, invalid, one, right, `${name}_divisor`)
+        const one = Emitter.integerUnsigned(builder, targetPhysical, 1n)
+        const safeRight = Emitter.select(body, invalid, one, right, `${name}_divisor`)
         let opcode: 'udiv' | 'sdiv' | 'urem' | 'srem'
         if (operation.operation === 'CheckedDivide')
           opcode = target.signedness === 'Unsigned' ? 'udiv' : 'sdiv'
         else opcode = target.signedness === 'Unsigned' ? 'urem' : 'srem'
-        result = yield* FunctionBody.binary(body, opcode, left, safeRight, `${name}_value`)
+        result = Emitter.binary(body, opcode, left, safeRight, `${name}_value`)
       } else {
         throw new RangeError('LLVM checked division lost its integer target')
       }
-      const zero = yield* Constant.integerUnsigned(builder, i32, 0n)
-      const one = yield* Constant.integerUnsigned(builder, i32, 1n)
-      const valid = yield* FunctionBody.select(body, invalid, zero, one, `${name}_valid`)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.valid.ordinal, [valid])
-      yield* NativeStorage.writeLocal(nativeStorage, operation.value.ordinal, [result])
+      const zero = Emitter.integerUnsigned(builder, i32, 0n)
+      const one = Emitter.integerUnsigned(builder, i32, 1n)
+      const valid = Emitter.select(body, invalid, zero, one, `${name}_valid`)
+      NativeStorage.writeLocal(nativeStorage, operation.valid.ordinal, [valid])
+      NativeStorage.writeLocal(nativeStorage, operation.value.ordinal, [result])
       break
     }
     case 'Binary': {
-      const left = yield* NativeStorage.readScalar(nativeStorage, operation.left)
-      const right = yield* NativeStorage.readScalar(nativeStorage, operation.right)
+      const left = NativeStorage.readScalar(nativeStorage, operation.left)
+      const right = NativeStorage.readScalar(nativeStorage, operation.right)
       const leftType = entry.fn.localTypes.at(operation.left.ordinal)
       const leftLane =
         leftType === undefined ? undefined : NativeType.valueLanesFor(types, leftType).at(0)
@@ -622,65 +580,45 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         if (operation.operator === 'TotalOrder') {
           const width = scalar.spelling === 'f32' ? 32 : 64
           const integerType = integerTypes.get(width) ?? i32
-          const leftBits = yield* FunctionBody.cast(
+          const leftBits = Emitter.cast(
             body,
             'bitcast',
             left,
             integerType,
             `total${ordinal}_left_bits`,
           )
-          const rightBits = yield* FunctionBody.cast(
+          const rightBits = Emitter.cast(
             body,
             'bitcast',
             right,
             integerType,
             `total${ordinal}_right_bits`,
           )
-          const zero = yield* Constant.integerUnsigned(builder, integerType, 0n)
-          const all = yield* Constant.integerUnsigned(
-            builder,
-            integerType,
-            (1n << BigInt(width)) - 1n,
-          )
-          const sign = yield* Constant.integerUnsigned(
-            builder,
-            integerType,
-            1n << BigInt(width - 1),
-          )
-          const key = Effect.fnUntraced(function* (bits: Value.Input, side: string) {
-            const negative = yield* FunctionBody.integerCompare(
+          const zero = Emitter.integerUnsigned(builder, integerType, 0n)
+          const all = Emitter.integerUnsigned(builder, integerType, (1n << BigInt(width)) - 1n)
+          const sign = Emitter.integerUnsigned(builder, integerType, 1n << BigInt(width - 1))
+          const key = (bits: Value.Input, side: string) => {
+            const negative = Emitter.integerCompare(
               body,
               'slt',
               bits,
               zero,
               `total${ordinal}_${side}_negative`,
             )
-            const mask = yield* FunctionBody.select(
-              body,
-              negative,
-              all,
-              sign,
-              `total${ordinal}_${side}_mask`,
-            )
-            return yield* FunctionBody.binary(
-              body,
-              'xor',
-              bits,
-              mask,
-              `total${ordinal}_${side}_key`,
-            )
-          })
-          const leftKey = yield* key(leftBits, 'left')
-          const rightKey = yield* key(rightBits, 'right')
-          const flag = yield* FunctionBody.integerCompare(
+            const mask = Emitter.select(body, negative, all, sign, `total${ordinal}_${side}_mask`)
+            return Emitter.binary(body, 'xor', bits, mask, `total${ordinal}_${side}_key`)
+          }
+          const leftKey = key(leftBits, 'left')
+          const rightKey = key(rightBits, 'right')
+          const flag = Emitter.integerCompare(
             body,
             'ule',
             leftKey,
             rightKey,
             `total${ordinal}_flag`,
           )
-          const result = yield* FunctionBody.cast(body, 'zext', flag, i32, `total${ordinal}`)
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          const result = Emitter.cast(body, 'zext', flag, i32, `total${ordinal}`)
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
           break
         }
         let predicate: FunctionBody.FloatingPredicate | undefined
@@ -708,15 +646,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             break
         }
         if (predicate !== undefined) {
-          const flag = yield* FunctionBody.floatingCompare(
-            body,
-            predicate,
-            left,
-            right,
-            `fcmp${ordinal}_flag`,
-          )
-          const result = yield* FunctionBody.cast(body, 'zext', flag, i32, `fcmp${ordinal}`)
-          yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+          const flag = Emitter.floatingCompare(body, predicate, left, right, `fcmp${ordinal}_flag`)
+          const result = Emitter.cast(body, 'zext', flag, i32, `fcmp${ordinal}`)
+          NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
           break
         }
         let mnemonic: FunctionBody.FloatingBinaryKind | undefined
@@ -742,28 +674,18 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         }
         if (mnemonic === undefined)
           throw new RangeError(`LLVM float operation ${operation.operator} is unavailable`)
-        const result = yield* FunctionBody.binary(body, mnemonic, left, right, `float${ordinal}`)
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        const result = Emitter.binary(body, mnemonic, left, right, `float${ordinal}`)
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       const predicate = NativeArith.comparisonPredicate(operation.operator, unsigned)
       if (predicate !== undefined) {
-        const flag = yield* FunctionBody.integerCompare(
-          body,
-          predicate,
-          left,
-          right,
-          `cmp${ordinal}_flag`,
-        )
-        const widened = yield* FunctionBody.cast(body, 'zext', flag, i32, `cmp${ordinal}`)
-        const instruction = yield* Value.instruction(body, flag)
-        yield* NativeDebug.locate(debug, operation.provenance.span, instruction)
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [widened])
+        const flag = Emitter.integerCompare(body, predicate, left, right, `cmp${ordinal}_flag`)
+        const widened = Emitter.cast(body, 'zext', flag, i32, `cmp${ordinal}`)
+        const instruction = Emitter.valueInstruction(body, flag)
+        NativeDebug.locate(debug, operation.provenance.span, instruction)
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [widened])
         break
       }
       if (
@@ -795,17 +717,13 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             mnemonic = 'mul'
             break
         }
-        const result = yield* FunctionBody.binary(body, mnemonic, left, right, `integer${ordinal}`)
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        const result = Emitter.binary(body, mnemonic, left, right, `integer${ordinal}`)
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       if (operation.operator === 'ShiftLeft' || operation.operator === 'ShiftRight') {
-        const trapBlock = yield* NativeTermination.trapBlock(
+        const trapBlock = NativeTermination.trapBlock(
           context.termination,
           'invalid shift count',
           operation.provenance.span,
@@ -816,27 +734,17 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         } else {
           width = Scalar.bits(scalar, program.layout.target.pointerSize === 4 ? 32 : 64)
         }
-        const limit = yield* Constant.integerUnsigned(builder, operandType, BigInt(width))
-        const invalid = yield* FunctionBody.integerCompare(
-          body,
-          'uge',
-          right,
-          limit,
-          `shift${ordinal}_invalid`,
-        )
-        const continueBlock = yield* LlvmBlock.make(body, `shift${ordinal}_ok`)
-        yield* FunctionBody.conditionalBranch(body, invalid, trapBlock, continueBlock)
-        yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+        const limit = Emitter.integerUnsigned(builder, operandType, BigInt(width))
+        const invalid = Emitter.integerCompare(body, 'uge', right, limit, `shift${ordinal}_invalid`)
+        const continueBlock = Emitter.block(body, `shift${ordinal}_ok`)
+        Emitter.conditionalBranch(body, invalid, trapBlock, continueBlock)
+        Emitter.setInsertionPoint(body, continueBlock)
         let opcode: 'shl' | 'lshr' | 'ashr'
         if (operation.operator === 'ShiftLeft') opcode = 'shl'
         else opcode = unsigned ? 'lshr' : 'ashr'
-        const result = yield* FunctionBody.binary(body, opcode, left, right, `shift${ordinal}`)
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        const result = Emitter.binary(body, opcode, left, right, `shift${ordinal}`)
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       if (operation.operator === 'RotateLeft' || operation.operator === 'RotateRight') {
@@ -844,7 +752,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           returnType: operandType,
           parameters: [operandType, operandType, operandType],
         }
-        const result = yield* Intrinsic.call(
+        const result = Emitter.intrinsicCall(
           body,
           operation.operator === 'RotateLeft' ? 'fshl' : 'fshr',
           [operandType],
@@ -853,12 +761,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           { signature },
         )
         if (result === undefined) throw new RangeError('LLVM rotate produced no value')
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       if (operation.operator === 'SaturatingAdd' || operation.operator === 'SaturatingSubtract') {
@@ -875,7 +779,7 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             intrinsic = unsigned ? 'usub.sat' : 'ssub.sat'
             break
         }
-        const result = yield* Intrinsic.call(
+        const result = Emitter.intrinsicCall(
           body,
           intrinsic,
           [operandType],
@@ -885,12 +789,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         )
         if (result === undefined)
           throw new RangeError('LLVM saturating arithmetic produced no value')
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       if (operation.operator === 'SaturatingMultiply') {
@@ -903,14 +803,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const signatures = unsigned ? unsignedOverflowSignatures : signedOverflowSignatures
         let signature = signatures.get(bits)
         if (signature === undefined) {
-          const i1 = yield* LlvmType.integer(builder, 1)
+          const i1 = Emitter.integerType(builder, 1)
           signature = {
-            returnType: yield* LlvmType.structure(builder, [operandType, i1]),
+            returnType: Emitter.structureType(builder, [operandType, i1]),
             parameters: [operandType, operandType],
           }
           signatures.set(bits, signature)
         }
-        const pair = yield* Intrinsic.call(
+        const pair = Emitter.intrinsicCall(
           body,
           unsigned ? 'umul.with.overflow' : 'smul.with.overflow',
           [operandType],
@@ -919,18 +819,8 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           { signature },
         )
         if (pair === undefined) throw new RangeError('LLVM saturating multiply produced no value')
-        const wrapped = yield* FunctionBody.extractValue(
-          body,
-          pair,
-          [0],
-          `saturating${ordinal}_wrapped`,
-        )
-        const overflowed = yield* FunctionBody.extractValue(
-          body,
-          pair,
-          [1],
-          `saturating${ordinal}_overflow`,
-        )
+        const wrapped = Emitter.extractValue(body, pair, [0], `saturating${ordinal}_wrapped`)
+        const overflowed = Emitter.extractValue(body, pair, [1], `saturating${ordinal}_overflow`)
         let range: { readonly minimum: bigint; readonly maximum: bigint }
         if (scalar?.category === 'Integer') {
           range = Scalar.range(scalar, program.layout.target.pointerSize === 4 ? 32 : 64)
@@ -938,27 +828,21 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
           range = { minimum: -2147483648n, maximum: 2147483647n }
         }
         const maximum = unsigned
-          ? yield* Constant.integerUnsigned(builder, operandType, range.maximum)
-          : yield* Constant.integerSigned(builder, operandType, range.maximum)
+          ? Emitter.integerUnsigned(builder, operandType, range.maximum)
+          : Emitter.integerSigned(builder, operandType, range.maximum)
         let boundary: Value.Input = maximum
         if (!unsigned) {
-          const zero = yield* Constant.integerSigned(builder, operandType, 0n)
-          const minimum = yield* Constant.integerSigned(builder, operandType, range.minimum)
-          const signs = yield* FunctionBody.binary(
-            body,
-            'xor',
-            left,
-            right,
-            `saturating${ordinal}_signs`,
-          )
-          const negative = yield* FunctionBody.integerCompare(
+          const zero = Emitter.integerSigned(builder, operandType, 0n)
+          const minimum = Emitter.integerSigned(builder, operandType, range.minimum)
+          const signs = Emitter.binary(body, 'xor', left, right, `saturating${ordinal}_signs`)
+          const negative = Emitter.integerCompare(
             body,
             'slt',
             signs,
             zero,
             `saturating${ordinal}_negative`,
           )
-          boundary = yield* FunctionBody.select(
+          boundary = Emitter.select(
             body,
             negative,
             minimum,
@@ -966,19 +850,9 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             `saturating${ordinal}_boundary`,
           )
         }
-        const result = yield* FunctionBody.select(
-          body,
-          overflowed,
-          boundary,
-          wrapped,
-          `saturating${ordinal}`,
-        )
-        yield* NativeDebug.locate(
-          debug,
-          operation.provenance.span,
-          yield* Value.instruction(body, result),
-        )
-        yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+        const result = Emitter.select(body, overflowed, boundary, wrapped, `saturating${ordinal}`)
+        NativeDebug.locate(debug, operation.provenance.span, Emitter.valueInstruction(body, result))
+        NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
         break
       }
       let result: Value.Value
@@ -1008,14 +882,14 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         const signatures = unsigned ? unsignedOverflowSignatures : signedOverflowSignatures
         let overflowSignature = signatures.get(bits)
         if (overflowSignature === undefined) {
-          const i1 = yield* LlvmType.integer(builder, 1)
+          const i1 = Emitter.integerType(builder, 1)
           overflowSignature = {
-            returnType: yield* LlvmType.structure(builder, [operandType, i1]),
+            returnType: Emitter.structureType(builder, [operandType, i1]),
             parameters: [operandType, operandType],
           }
           signatures.set(bits, overflowSignature)
         }
-        const pair = yield* Intrinsic.call(
+        const pair = Emitter.intrinsicCall(
           body,
           intrinsicId,
           [operandType],
@@ -1026,77 +900,71 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
         if (pair === undefined) {
           throw new RangeError('Backend overflow intrinsic produced no value')
         }
-        const valuePart = yield* FunctionBody.extractValue(body, pair, [0], `arith${ordinal}`)
-        const overflowed = yield* FunctionBody.extractValue(body, pair, [1], `arith${ordinal}_flag`)
-        const continueBlock = yield* LlvmBlock.make(body, `arith${ordinal}_ok`)
-        yield* FunctionBody.conditionalBranch(
+        const valuePart = Emitter.extractValue(body, pair, [0], `arith${ordinal}`)
+        const overflowed = Emitter.extractValue(body, pair, [1], `arith${ordinal}_flag`)
+        const continueBlock = Emitter.block(body, `arith${ordinal}_ok`)
+        Emitter.conditionalBranch(
           body,
           overflowed,
-          yield* NativeTermination.trapBlock(
+          NativeTermination.trapBlock(
             context.termination,
             'arithmetic overflow',
             operation.provenance.span,
           ),
           continueBlock,
         )
-        yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+        Emitter.setInsertionPoint(body, continueBlock)
         result = valuePart
       } else {
-        const zero = yield* Constant.integerUnsigned(builder, operandType, 0n)
-        const zeroDivisor = yield* FunctionBody.integerCompare(
-          body,
-          'eq',
-          right,
-          zero,
-          `div${ordinal}_zero`,
-        )
-        const continueBlock = yield* LlvmBlock.make(body, `div${ordinal}_ok`)
-        const nonZero = yield* LlvmBlock.make(body, `div${ordinal}_nonzero`)
-        yield* FunctionBody.conditionalBranch(
+        const zero = Emitter.integerUnsigned(builder, operandType, 0n)
+        const zeroDivisor = Emitter.integerCompare(body, 'eq', right, zero, `div${ordinal}_zero`)
+        const continueBlock = Emitter.block(body, `div${ordinal}_ok`)
+        const nonZero = Emitter.block(body, `div${ordinal}_nonzero`)
+        Emitter.conditionalBranch(
           body,
           zeroDivisor,
-          yield* NativeTermination.trapBlock(
+          NativeTermination.trapBlock(
             context.termination,
             'division by zero',
             operation.provenance.span,
           ),
           nonZero,
         )
-        yield* LlvmBlock.setInsertionPoint(body, nonZero)
+        Emitter.setInsertionPoint(body, nonZero)
         if (!unsigned) {
-          const minimum = yield* Constant.integerSigned(
+          const minimum = Emitter.integerSigned(
             builder,
             operandType,
             scalar?.category === 'Integer'
               ? Scalar.range(scalar, program.layout.target.pointerSize === 4 ? 32 : 64).minimum
               : -2147483648n,
           )
-          const negativeOne = yield* Constant.integerSigned(builder, operandType, -1n)
-          const minimumDividend = yield* FunctionBody.integerCompare(
+          const negativeOne = Emitter.integerSigned(builder, operandType, -1n)
+          const minimumDividend = Emitter.integerCompare(
             body,
             'eq',
             left,
             minimum,
             `div${ordinal}_min`,
           )
-          const negativeOneDivisor = yield* FunctionBody.integerCompare(
+          const negativeOneDivisor = Emitter.integerCompare(
             body,
             'eq',
             right,
             negativeOne,
             `div${ordinal}_negone`,
           )
-          const overflowCase = yield* FunctionBody.binary(
+          const overflowCase = Emitter.binary(
             body,
             'and',
             minimumDividend,
             negativeOneDivisor,
             `div${ordinal}_overflow`,
           )
-          yield* FunctionBody.conditionalBranch(
+          Emitter.conditionalBranch(
             body,
             overflowCase,
-            yield* NativeTermination.trapBlock(
+            NativeTermination.trapBlock(
               context.termination,
               'arithmetic overflow',
               operation.provenance.span,
@@ -1104,19 +972,19 @@ export const emit = Effect.fnUntraced(function* (context: Context, operation: Op
             continueBlock,
           )
         } else {
-          yield* FunctionBody.branch(body, continueBlock)
+          Emitter.branch(body, continueBlock)
         }
-        yield* LlvmBlock.setInsertionPoint(body, continueBlock)
+        Emitter.setInsertionPoint(body, continueBlock)
         let opcode: 'udiv' | 'sdiv' | 'urem' | 'srem'
         if (operation.operator === 'Divide') opcode = unsigned ? 'udiv' : 'sdiv'
         else opcode = unsigned ? 'urem' : 'srem'
-        result = yield* FunctionBody.binary(body, opcode, left, right, `arith${ordinal}`)
+        result = Emitter.binary(body, opcode, left, right, `arith${ordinal}`)
       }
-      const instruction = yield* Value.instruction(body, result)
-      yield* NativeDebug.locate(debug, operation.provenance.span, instruction)
-      yield* NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
+      const instruction = Emitter.valueInstruction(body, result)
+      NativeDebug.locate(debug, operation.provenance.span, instruction)
+      NativeStorage.writeLocal(nativeStorage, operation.destination.ordinal, [result])
       break
     }
   }
   context.state.checkOrdinal = checkOrdinal
-})
+}

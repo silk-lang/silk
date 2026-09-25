@@ -9,6 +9,7 @@ import * as BuilderState from './internal/BuilderState.js'
 import * as CanonicalKey from './internal/CanonicalKey.js'
 import * as Handle from './internal/Handle.js'
 import * as IntegerInput from './internal/IntegerInput.js'
+import type * as OwnedHandle from './internal/OwnedHandle.js'
 import * as ResolveActor from './internal/resolveActor.js'
 import * as Table from './internal/Table.js'
 import type * as TypeDescription from './internal/TypeDescription.js'
@@ -97,26 +98,57 @@ const keyForDescription = (description: TypeDescription.Description): string => 
   }
 }
 
-/** @internal */
-const intern = Effect.fnUntraced(function* (
+/**
+ * Plain transition rather than a generator: native emission interns on nearly every instruction.
+ *
+ * @internal
+ */
+const intern = (
   builder: Builder.Builder,
   description: TypeDescription.Description,
-) {
-  return yield* BuilderState.mutate(builder, 'Type.intern', (state, owner) =>
-    Result.gen(function* () {
-      const key = keyForDescription(description)
-      const interned = yield* Table.intern(
-        state.types,
-        'Type.intern',
-        'Type',
-        key,
-        description,
-        (index) => Handle.make('Type', owner, index),
-      )
-      return interned.handle
-    }),
+): Effect.Effect<Type, LlvmError> =>
+  BuilderState.mutate(builder, 'Type.intern', (state, owner) =>
+    Table.intern(
+      state.types,
+      'Type.intern',
+      'Type',
+      keyForDescription(description),
+      description,
+      (index) => Handle.make('Type', owner, index),
+    ),
   )
-})
+
+/**
+ * Interns an already-validated description inside a running builder transition.
+ *
+ * @internal
+ */
+export const internIndex = (
+  state: BuilderState.MutableState,
+  owner: OwnedHandle.Owner,
+  description: TypeDescription.Description,
+): number =>
+  Table.internIndex(state.types, keyForDescription(description), description, (index) =>
+    Handle.make('Type', owner, index),
+  )
+
+/**
+ * Interns a validated description inside a running builder transition and returns its handle.
+ *
+ * @internal
+ */
+export const internIn = (
+  context: BuilderState.Context,
+  description: TypeDescription.Description,
+): Result.Result<Type, LlvmError> =>
+  Table.intern(
+    context.state.types,
+    'Type.intern',
+    'Type',
+    keyForDescription(description),
+    description,
+    (index) => Handle.make('Type', context.owner, index),
+  )
 
 /** @internal */
 const simple = (builder: Builder.Builder, tag: TypeDescription.SimpleTag) =>
@@ -271,19 +303,19 @@ export const token = Effect.fnUntraced(function* (builder: Builder.Builder) {
  * @category types
  * @since 0.0.0
  */
-export const integer = Effect.fnUntraced(function* (
+export const integer = (
   builder: Builder.Builder,
   bitWidth: number,
-): Effect.fn.Return<Type, LlvmError> {
-  if (!Number.isSafeInteger(bitWidth) || bitWidth < 1 || bitWidth > 0xff_ffff) {
-    return yield* invalidInput({
-      operation: 'Type.integer',
-      message: 'LLVM integer width must be from 1 through 16777215 bits',
-      input: bitWidth,
-    })
-  }
-  return yield* intern(builder, { _tag: 'Integer', bitWidth })
-})
+): Effect.Effect<Type, LlvmError> =>
+  !Number.isSafeInteger(bitWidth) || bitWidth < 1 || bitWidth > 0xff_ffff
+    ? Effect.fail(
+        invalidInput({
+          operation: 'Type.integer',
+          message: 'LLVM integer width must be from 1 through 16777215 bits',
+          input: bitWidth,
+        }),
+      )
+    : intern(builder, { _tag: 'Integer', bitWidth })
 
 /**
  * Returns the canonical opaque pointer type for an address space.
@@ -291,12 +323,10 @@ export const integer = Effect.fnUntraced(function* (
  * @category types
  * @since 0.0.0
  */
-export const pointer = Effect.fnUntraced(function* (
+export const pointer = (
   builder: Builder.Builder,
   addressSpace: AddrSpace.AddrSpace = AddrSpace.defaultAddrSpace,
-) {
-  return yield* intern(builder, { _tag: 'Pointer', addressSpace })
-})
+): Effect.Effect<Type, LlvmError> => intern(builder, { _tag: 'Pointer', addressSpace })
 
 /** @internal */
 const indices = (
@@ -319,24 +349,40 @@ const indices = (
  * @category types
  * @since 0.0.0
  */
-export const functionType = Effect.fnUntraced(function* (
+export const functionType = (
   builder: Builder.Builder,
   returnType: Type,
   parameters: ReadonlyArray<Type>,
   options: { readonly variadic?: boolean } = {},
-): Effect.fn.Return<Type, LlvmError> {
-  const description = yield* BuilderState.mutate(builder, 'Type.functionType', (_state, owner) =>
-    Result.gen(function* () {
-      return {
-        _tag: 'Function' as const,
-        returnType: yield* Handle.resolve(builder, owner, returnType, 'Type', 'Type.functionType'),
-        parameters: yield* indices(builder, owner, parameters, 'Type.functionType'),
-        variadic: options.variadic ?? false,
-      }
-    }),
+): Effect.Effect<Type, LlvmError> =>
+  BuilderState.transition(builder, 'Type.functionType', (context) =>
+    functionTypeIn(context, returnType, parameters, options),
   )
-  return yield* intern(builder, description)
-})
+
+/** @internal */
+export const functionTypeIn = (
+  context: BuilderState.Context,
+  returnType: Type,
+  parameters: ReadonlyArray<Type>,
+  options: { readonly variadic?: boolean } = {},
+): Result.Result<Type, LlvmError> => {
+  const returnIndex = Handle.resolve(
+    context.builder,
+    context.owner,
+    returnType,
+    'Type',
+    'Type.functionType',
+  )
+  if (Result.isFailure(returnIndex)) return Result.fail(returnIndex.failure)
+  const parameterIndices = indices(context.builder, context.owner, parameters, 'Type.functionType')
+  if (Result.isFailure(parameterIndices)) return Result.fail(parameterIndices.failure)
+  return internIn(context, {
+    _tag: 'Function',
+    returnType: returnIndex.success,
+    parameters: parameterIndices.success,
+    variadic: options.variadic ?? false,
+  })
+}
 
 /** @internal */
 const vectorOf = Effect.fnUntraced(function* (
@@ -392,24 +438,34 @@ export const scalableVector = Effect.fnUntraced(function* (
  * @category types
  * @since 0.0.0
  */
-export const array = Effect.fnUntraced(function* (
+export const array = (
   builder: Builder.Builder,
   child: Type,
   length: number | bigint,
-): Effect.fn.Return<Type, LlvmError> {
-  const exactLength = yield* Effect.fromResult(
-    IntegerInput.normalize(length, {
-      operation: 'Type.array',
-      message: 'LLVM array length must be an unsigned 64-bit integer',
-      minimum: 0n,
-      maximum: 0xffff_ffff_ffff_ffffn,
-    }),
-  )
-  const childIndex = yield* BuilderState.mutate(builder, 'Type.array', (_state, owner) =>
-    Handle.resolve(builder, owner, child, 'Type', 'Type.array'),
-  )
-  return yield* intern(builder, { _tag: 'Array', child: childIndex, length: exactLength })
-})
+): Effect.Effect<Type, LlvmError> =>
+  BuilderState.transition(builder, 'Type.array', (context) => arrayIn(context, child, length))
+
+/** @internal */
+export const arrayIn = (
+  context: BuilderState.Context,
+  child: Type,
+  length: number | bigint,
+): Result.Result<Type, LlvmError> => {
+  const exactLength = IntegerInput.normalize(length, {
+    operation: 'Type.array',
+    message: 'LLVM array length must be an unsigned 64-bit integer',
+    minimum: 0n,
+    maximum: 0xffff_ffff_ffff_ffffn,
+  })
+  if (Result.isFailure(exactLength)) return Result.fail(exactLength.failure)
+  const childIndex = Handle.resolve(context.builder, context.owner, child, 'Type', 'Type.array')
+  if (Result.isFailure(childIndex)) return Result.fail(childIndex.failure)
+  return internIn(context, {
+    _tag: 'Array',
+    child: childIndex.success,
+    length: exactLength.success,
+  })
+}
 
 /**
  * Interns an anonymous literal structure, optionally using packed field layout.
@@ -417,22 +473,29 @@ export const array = Effect.fnUntraced(function* (
  * @category types
  * @since 0.0.0
  */
-export const structure = Effect.fnUntraced(function* (
+export const structure = (
   builder: Builder.Builder,
   fields: ReadonlyArray<Type>,
   options: { readonly packed?: boolean } = {},
-) {
-  const description = yield* BuilderState.mutate(builder, 'Type.structure', (_state, owner) =>
-    Result.gen(function* () {
-      return {
-        _tag: 'Structure' as const,
-        fields: yield* indices(builder, owner, fields, 'Type.structure'),
-        packed: options.packed ?? false,
-      }
-    }),
+): Effect.Effect<Type, LlvmError> =>
+  BuilderState.transition(builder, 'Type.structure', (context) =>
+    structureIn(context, fields, options),
   )
-  return yield* intern(builder, description)
-})
+
+/** @internal */
+export const structureIn = (
+  context: BuilderState.Context,
+  fields: ReadonlyArray<Type>,
+  options: { readonly packed?: boolean } = {},
+): Result.Result<Type, LlvmError> => {
+  const fieldIndices = indices(context.builder, context.owner, fields, 'Type.structure')
+  if (Result.isFailure(fieldIndices)) return Result.fail(fieldIndices.failure)
+  return internIn(context, {
+    _tag: 'Structure',
+    fields: fieldIndices.success,
+    packed: options.packed ?? false,
+  })
+}
 
 /**
  * Declares or retrieves a named structure with a stable identity and initially opaque body.
@@ -707,47 +770,66 @@ export const functionSignature = Effect.fnUntraced(function* (
  * @category types
  * @since 0.0.0
  */
-export const aggregateShape = Effect.fnUntraced(function* (
+export const aggregateShape = (
   builder: Builder.Builder,
   self: Type,
-): Effect.fn.Return<AggregateShape, LlvmError> {
-  return yield* inspect(builder, self, 'Type.aggregateShape', (description, state) =>
-    Result.gen(function* () {
-      if (description._tag === 'Array' || description._tag === 'Vector') {
-        return {
-          fields: [
-            yield* Table.handleAt(state.types, description.child, 'Type.aggregateShape', 'Type'),
-          ],
-          packed: false,
-          scalable: description._tag === 'Vector' && description.scalable,
-          length: description._tag === 'Array' ? description.length : BigInt(description.length),
-        }
-      }
-      let body: { readonly fields: ReadonlyArray<number>; readonly packed: boolean } | undefined
-      if (description._tag === 'Structure') body = description
-      else if (description._tag === 'NamedStructure') body = description.body
-      if (body === undefined) {
-        return yield* Result.fail(
-          invalidInput({
-            operation: 'Type.aggregateShape',
-            message: 'Expected a complete aggregate type',
-            input: self,
-          }),
-        )
-      }
-      const fields: Array<Type> = []
-      for (const index of body.fields) {
-        fields.push(yield* Table.handleAt(state.types, index, 'Type.aggregateShape', 'Type'))
-      }
-      return {
-        fields: fields,
-        packed: body.packed,
-        scalable: false,
-        length: undefined,
-      }
-    }),
+): Effect.Effect<AggregateShape, LlvmError> =>
+  BuilderState.transition(builder, 'Type.aggregateShape', (context) =>
+    aggregateShapeIn(context, self),
   )
-})
+
+/** @internal */
+export const aggregateShapeIn = (
+  context: BuilderState.Context,
+  self: Type,
+): Result.Result<AggregateShape, LlvmError> => {
+  const state = context.state
+  return Result.flatMap(
+    ResolveActor.resolve(
+      context.builder,
+      context.owner,
+      self,
+      'Type',
+      state.types,
+      'Type.aggregateShape',
+    ),
+    ({ description }) =>
+      Result.gen(function* () {
+        if (description._tag === 'Array' || description._tag === 'Vector') {
+          return {
+            fields: [
+              yield* Table.handleAt(state.types, description.child, 'Type.aggregateShape', 'Type'),
+            ],
+            packed: false,
+            scalable: description._tag === 'Vector' && description.scalable,
+            length: description._tag === 'Array' ? description.length : BigInt(description.length),
+          }
+        }
+        let body: { readonly fields: ReadonlyArray<number>; readonly packed: boolean } | undefined
+        if (description._tag === 'Structure') body = description
+        else if (description._tag === 'NamedStructure') body = description.body
+        if (body === undefined) {
+          return yield* Result.fail(
+            invalidInput({
+              operation: 'Type.aggregateShape',
+              message: 'Expected a complete aggregate type',
+              input: self,
+            }),
+          )
+        }
+        const fields: Array<Type> = []
+        for (const index of body.fields) {
+          fields.push(yield* Table.handleAt(state.types, index, 'Type.aggregateShape', 'Type'))
+        }
+        return {
+          fields: fields,
+          packed: body.packed,
+          scalable: false,
+          length: undefined,
+        }
+      }),
+  )
+}
 
 /** @internal */
 const simpleBitWidth = (tag: TypeDescription.SimpleTag): number | undefined => {

@@ -1277,19 +1277,15 @@ function lowerEffectBlockExpression(
     type,
     provenance: authored(expression.span),
   })
-  if (
-    !fn.generatedRunners.some(
-      (candidate) =>
-        candidate.specializationKey === baseRunnerKey(fn.owner.key, expression.site, type.type),
-    )
-  ) {
+  const specializationKey = baseRunnerKey(fn.owner.key, expression.site, type.type)
+  if (!fn.generatedRunners.some((candidate) => candidate.specializationKey === specializationKey)) {
     fn.generatedRunners.push({
       _tag: 'BlockEffectRunner',
       id: runner,
       owner: fn.owner,
       block: expression,
       type,
-      specializationKey: baseRunnerKey(fn.owner.key, expression.site, type.type),
+      specializationKey,
       providedRequirements: [],
       witnessTargets: specializedWitnessEffectTargets(fn.index, fn.owner, expression),
     })

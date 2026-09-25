@@ -239,7 +239,7 @@ const lineIndent = (source: SourceFile.SourceFile, commentStart: number): Uint8A
     if (byte === 0x0a || byte === 0x0d) break
     start -= 1
   }
-  return Uint8Array.from(source.bytes.slice(start, commentStart))
+  return source.bytes.slice(start, commentStart)
 }
 
 const lineBreak = (source: SourceFile.SourceFile, lineEnd: number): Uint8Array => {
@@ -269,7 +269,7 @@ const replacementBytes = (
 ): Uint8Array => {
   const newline = lineBreak(source, opening.span.end)
   const indentation = lineIndent(source, opening.span.start)
-  const marker = Uint8Array.from(source.bytes.slice(opening.span.start, opening.span.start + 3))
+  const marker = source.bytes.slice(opening.span.start, opening.span.start + 3)
   const spacing =
     source.bytes[opening.span.start + 3] === 0x20 ? Uint8Array.of(0x20) : new Uint8Array()
   const prefix = encoder.encode(value.continuationPrefix)
@@ -348,7 +348,7 @@ export const rewrite = Effect.fn('CodeFence.rewrite')(function* (
   }
 
   edits.sort((left, right) => right.start - left.start)
-  let output: Uint8Array = Uint8Array.from(source.bytes.slice(block.span.start, block.span.end))
+  let output: Uint8Array = source.bytes.slice(block.span.start, block.span.end)
   for (const edit of edits) {
     const start = edit.start - block.span.start
     const end = edit.end - block.span.start

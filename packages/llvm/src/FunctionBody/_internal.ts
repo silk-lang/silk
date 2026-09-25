@@ -57,18 +57,19 @@ export const sameOperands = (
     }
   },
   LlvmError
-> =>
-  Result.gen(function* () {
-    const leftValue = yield* FunctionBodyState.resolveOperand(draft, module, left, operation)
-    const rightValue = yield* FunctionBodyState.resolveOperand(draft, module, right, operation)
-    if (leftValue.type !== rightValue.type) {
-      return yield* Result.fail(
-        invalidInput({
-          operation,
-          message: 'Instruction operands must have one LLVM type',
-          input: { left, right },
-        }),
-      )
-    }
-    return { leftValue, rightValue }
-  })
+> => {
+  const leftValue = FunctionBodyState.resolveOperand(draft, module, left, operation)
+  if (Result.isFailure(leftValue)) return Result.fail(leftValue.failure)
+  const rightValue = FunctionBodyState.resolveOperand(draft, module, right, operation)
+  if (Result.isFailure(rightValue)) return Result.fail(rightValue.failure)
+  if (leftValue.success.type !== rightValue.success.type) {
+    return Result.fail(
+      invalidInput({
+        operation,
+        message: 'Instruction operands must have one LLVM type',
+        input: { left, right },
+      }),
+    )
+  }
+  return Result.succeed({ leftValue: leftValue.success, rightValue: rightValue.success })
+}

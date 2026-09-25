@@ -51,7 +51,12 @@ export const descriptionAt = <D, H>(
 export const find = <D, H>(table: Table<D, H>, key: string): number | undefined =>
   table.keys.get(key)
 
-/** @internal */
+/**
+ * Interns a description under its canonical key and returns the table handle. Every constant,
+ * type, and attribute request of native emission lands here, so it returns the handle directly.
+ *
+ * @internal
+ */
 export const intern = <D, H>(
   table: Table<D, H>,
   operation: string,
@@ -59,20 +64,23 @@ export const intern = <D, H>(
   key: string,
   description: D,
   makeHandle: (index: number) => H,
-): Result.Result<{ readonly index: number; readonly handle: H }, LlvmError> => {
+): Result.Result<H, LlvmError> =>
+  handleAt(table, internIndex(table, key, description, makeHandle), operation, kind)
+
+/** Interns a description under its canonical key and returns its table index. @internal */
+export const internIndex = <D, H>(
+  table: Table<D, H>,
+  key: string,
+  description: D,
+  makeHandle: (index: number) => H,
+): number => {
   const found = table.keys.get(key)
-  if (found !== undefined) {
-    return Result.map(handleAt(table, found, operation, kind), (handle) => ({
-      index: found,
-      handle,
-    }))
-  }
+  if (found !== undefined) return found
   const index = table.descriptions.length
   table.descriptions.push(description)
-  const handle = makeHandle(index)
-  table.handles.push(handle)
+  table.handles.push(makeHandle(index))
   table.keys.set(key, index)
-  return Result.succeed({ index, handle })
+  return index
 }
 
 /** @internal */

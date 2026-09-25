@@ -1,12 +1,8 @@
+import * as Emitter from '@silklang/llvm/Emitter'
 import * as NativePayload from './NativePayload.js'
 import type * as LlvmBlock from '@silklang/llvm/Block'
-import type * as Builder from '@silklang/llvm/Builder'
-import * as Constant from '@silklang/llvm/Constant'
-import * as FunctionBody from '@silklang/llvm/FunctionBody'
-import type * as LlvmError from '@silklang/llvm/LlvmError'
 import type * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
-import * as Effect from 'effect/Effect'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as Match from './Match.js'
 import * as Mir from './Mir.js'
@@ -25,8 +21,8 @@ import * as NativePlace from './NativePlace.js'
 import * as SilkType from './Type.js'
 
 export interface Context {
-  readonly builder: Builder.Builder
-  readonly body: FunctionBody.FunctionBody
+  readonly builder: Emitter.Module
+  readonly body: Emitter.Body
   readonly i32: LlvmType.Type
   readonly types: NativeType.LoweringContext
   readonly blocks: ReadonlyMap<number, LlvmBlock.Block>
@@ -42,13 +38,13 @@ export interface Context {
 const read = (context: Context, local: Mir.LocalId) =>
   NativeStorage.materialize(context.storage, local)
 
-const discriminants = Effect.fnUntraced(function* (
+const discriminants = (
   context: Context,
   local: Mir.LocalId,
   selectors: ReadonlyArray<Mir.PlaceSelector>,
   count: number,
   tag: string,
-) {
+) => {
   const type = context.entry.fn.localTypes.at(local.ordinal)
   if (
     selectors.length === 0 &&
@@ -58,10 +54,10 @@ const discriminants = Effect.fnUntraced(function* (
     // Reading a tag must not expand the union's payload and dispatch over every variant.
     const values: Array<Value.Input> = []
     for (let ordinal = 0; ordinal < count; ordinal += 1)
-      values.push(yield* NativeStorage.readLane(context.storage, local, ordinal))
+      values.push(NativeStorage.readLane(context.storage, local, ordinal))
     return values
   }
-  const resolved = yield* NativePlaceAddress.resolve(
+  const resolved = NativePlaceAddress.resolve(
     {
       ...context.cleanup,
       debug: context.debug,
@@ -78,9 +74,9 @@ const discriminants = Effect.fnUntraced(function* (
   )
   const values: Array<Value.Input> = []
   for (let ordinal = 0; ordinal < count; ordinal += 1)
-    values.push(yield* NativePlace.loadLane(storage, context.storage, ordinal, `${tag}_${ordinal}`))
+    values.push(NativePlace.loadLane(storage, context.storage, ordinal, `${tag}_${ordinal}`))
   return values
-})
+}
 
 /** Resolves one MIR control target to its declared LLVM block. */
 export const targetBlock = (
@@ -96,75 +92,76 @@ export const targetBlock = (
 export const jump = (
   context: Context,
   terminator: Extract<LinearTerminator, { readonly _tag: 'Jump' }>,
-): Effect.Effect<void, LlvmError.LlvmError> =>
-  FunctionBody.branch(context.body, targetBlock(context.blocks, terminator.target, 'Backend jump'))
+): void => {
+  Emitter.branch(context.body, targetBlock(context.blocks, terminator.target, 'Backend jump'))
+}
 
-export const branch = Effect.fnUntraced(function* (
+export const branch = (
   context: Context,
   terminator: Extract<LinearTerminator, { readonly _tag: 'Branch' }>,
   ordinal: number,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
-  const zero = yield* Constant.integerSigned(context.builder, context.i32, 0n)
-  const condition = yield* FunctionBody.integerCompare(
+): void => {
+  const zero = Emitter.integerSigned(context.builder, context.i32, 0n)
+  const condition = Emitter.integerCompare(
     context.body,
     'ne',
-    yield* NativeStorage.readScalar(context.storage, terminator.condition),
+    NativeStorage.readScalar(context.storage, terminator.condition),
     zero,
     `c${ordinal}`,
   )
-  yield* FunctionBody.conditionalBranch(
+  Emitter.conditionalBranch(
     context.body,
     condition,
     targetBlock(context.blocks, terminator.taken, 'Backend branch'),
     targetBlock(context.blocks, terminator.otherwise, 'Backend branch'),
   )
-})
+}
 
-export const enumMatchBranch = Effect.fnUntraced(function* (
+export const enumMatchBranch = (
   context: Context,
   terminator: Extract<LinearTerminator, { readonly _tag: 'EnumMatchBranch' }>,
   blockOrdinal: number,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
-  const value = (yield* discriminants(
+): void => {
+  const value = discriminants(
     context,
     terminator.scrutinee,
     terminator.selectors ?? [],
     1,
     `enum_match${blockOrdinal}`,
-  )).at(0)
+  ).at(0)
   if (value === undefined) throw new RangeError('LLVM enum match lost its discriminant')
   const lane = NativeType.lanesFor(context.types, terminator.type).at(0)
   if (lane === undefined) throw new RangeError('LLVM enum match lost its scalar lane')
   const type = NativeType.laneType(context.types, lane)
   const expected =
     terminator.representation.signedness === 'Signed'
-      ? yield* Constant.integerSigned(context.builder, type, terminator.discriminant)
-      : yield* Constant.integerUnsigned(context.builder, type, terminator.discriminant)
-  const condition = yield* FunctionBody.integerCompare(
+      ? Emitter.integerSigned(context.builder, type, terminator.discriminant)
+      : Emitter.integerUnsigned(context.builder, type, terminator.discriminant)
+  const condition = Emitter.integerCompare(
     context.body,
     'eq',
     value,
     expected,
     `enum_match${blockOrdinal}_member`,
   )
-  yield* FunctionBody.conditionalBranch(
+  Emitter.conditionalBranch(
     context.body,
     condition,
     targetBlock(context.blocks, terminator.taken, 'LLVM enum match branch'),
     targetBlock(context.blocks, terminator.otherwise, 'LLVM enum match branch'),
   )
-})
+}
 
-export const matchBranch = Effect.fnUntraced(function* (
+export const matchBranch = (
   context: Context,
   terminator: Extract<LinearTerminator, { readonly _tag: 'MatchBranch' }>,
   blockOrdinal: number,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   const count =
     terminator.member._tag === 'NominalUnionVariant' && terminator.shape.tree._tag === 'SumShape'
       ? 2
       : 1
-  const values = yield* discriminants(
+  const values = discriminants(
     context,
     terminator.scrutinee,
     terminator.selectors ?? [],
@@ -184,18 +181,18 @@ export const matchBranch = Effect.fnUntraced(function* (
       throw new RangeError('LLVM nominal union match has no tag lane')
     // A structural union shares payload carriers across members. Recover the nominal i32
     // tag from that carrier, which another member may have widened or made floating-point.
-    const discriminant = yield* NativeArith.coerceLane(
+    const discriminant = NativeArith.coerceLane(
       context.cleanup.arith,
       variantTag,
       carrierLane,
       tagLane,
       `match${blockOrdinal}_variant_tag`,
     )
-    const variantMatches = yield* FunctionBody.integerCompare(
+    const variantMatches = Emitter.integerCompare(
       context.body,
       'eq',
       discriminant,
-      yield* Constant.integerSigned(context.builder, context.i32, BigInt(member.variantOrdinal)),
+      Emitter.integerSigned(context.builder, context.i32, BigInt(member.variantOrdinal)),
       `match${blockOrdinal}_variant`,
     )
     if (!nested) {
@@ -209,14 +206,14 @@ export const matchBranch = Effect.fnUntraced(function* (
           : undefined
       if (outer === undefined)
         throw new RangeError('LLVM nominal union match lost its structural member')
-      const rootMatches = yield* FunctionBody.integerCompare(
+      const rootMatches = Emitter.integerCompare(
         context.body,
         'eq',
         tag,
-        yield* Constant.integerSigned(context.builder, context.i32, BigInt(outer.ordinal)),
+        Emitter.integerSigned(context.builder, context.i32, BigInt(outer.ordinal)),
         `match${blockOrdinal}_root`,
       )
-      condition = yield* FunctionBody.binary(
+      condition = Emitter.binary(
         context.body,
         'and',
         rootMatches,
@@ -232,44 +229,44 @@ export const matchBranch = Effect.fnUntraced(function* (
           )
         : undefined
     if (outer === undefined) throw new RangeError('LLVM union match lost its structural member')
-    condition = yield* FunctionBody.integerCompare(
+    condition = Emitter.integerCompare(
       context.body,
       'eq',
       tag,
-      yield* Constant.integerSigned(context.builder, context.i32, BigInt(outer.ordinal)),
+      Emitter.integerSigned(context.builder, context.i32, BigInt(outer.ordinal)),
       `match${blockOrdinal}_member`,
     )
   }
-  yield* FunctionBody.conditionalBranch(
+  Emitter.conditionalBranch(
     context.body,
     condition,
     targetBlock(context.blocks, terminator.taken, 'LLVM match branch'),
     targetBlock(context.blocks, terminator.otherwise, 'LLVM match branch'),
   )
-})
+}
 
 /** Emits one complete MIR terminator, including propagation cleanup and suspension return ABI. */
-export const emit = Effect.fnUntraced(function* (
+export const emit = (
   context: Context,
   terminator: LinearTerminator,
   blockOrdinal: number,
   blockId: Mir.RegionId,
-): Effect.fn.Return<void, LlvmError.LlvmError> {
+): void => {
   const { builder, body, i32 } = context
   const readLocal = (local: Mir.LocalId) => read(context, local)
   const block = { id: blockId }
   switch (terminator._tag) {
     case 'PropagateEffectFailure': {
-      yield* NativeTermination.storePropagated(
+      NativeTermination.storePropagated(
         context.termination,
         terminator.outcome,
         terminator.provenance.span,
       )
-      const source = yield* readLocal(terminator.source)
+      const source = readLocal(terminator.source)
       const sourceTag = terminator.sourceType._tag === 'Union' ? source.at(0) : undefined
       let mappedTag: Value.Input
       if (terminator.sourceType._tag === 'Nominal') {
-        mappedTag = yield* Constant.integerSigned(
+        mappedTag = Emitter.integerSigned(
           builder,
           i32,
           BigInt(terminator.tagMappings.at(0)?.target ?? -1),
@@ -277,19 +274,19 @@ export const emit = Effect.fnUntraced(function* (
       } else if (sourceTag === undefined) {
         throw new RangeError('Effect failure propagation lost its tag lane')
       } else {
-        mappedTag = yield* Constant.integerSigned(builder, i32, -1n)
+        mappedTag = Emitter.integerSigned(builder, i32, -1n)
         for (const [ordinal, mapping] of terminator.tagMappings.entries()) {
-          const matches = yield* FunctionBody.integerCompare(
+          const matches = Emitter.integerCompare(
             body,
             'eq',
             sourceTag,
-            yield* Constant.integerSigned(builder, i32, BigInt(mapping.source)),
+            Emitter.integerSigned(builder, i32, BigInt(mapping.source)),
             `effect_failure_propagation${terminator.source.ordinal}_${ordinal}`,
           )
-          mappedTag = yield* FunctionBody.select(
+          mappedTag = Emitter.select(
             body,
             matches,
-            yield* Constant.integerSigned(builder, i32, BigInt(mapping.target)),
+            Emitter.integerSigned(builder, i32, BigInt(mapping.target)),
             mappedTag,
             `effect_failure_propagation${terminator.source.ordinal}_${ordinal}_tag`,
           )
@@ -297,7 +294,7 @@ export const emit = Effect.fnUntraced(function* (
       }
       for (const release of terminator.releases ?? []) {
         if (!CleanupPlan.hasEffect(release.cleanup)) continue
-        yield* NativeAggregate.dropThroughPlan(
+        NativeAggregate.dropThroughPlan(
           context.cleanup,
           release.cleanup,
           NativePayload.local(context.storage, release.local),
@@ -306,7 +303,7 @@ export const emit = Effect.fnUntraced(function* (
       }
       const returned: Array<Value.Input> = [
         mappedTag,
-        ...(yield* NativeAggregate.failurePayload(
+        ...NativeAggregate.failurePayload(
           context.failure,
           source,
           Mir.semanticType(terminator.sourceType),
@@ -314,9 +311,9 @@ export const emit = Effect.fnUntraced(function* (
           terminator.propagationType.type,
           terminator.tagMappings,
           `effect_failure_propagation${terminator.source.ordinal}_payload`,
-        )),
+        ),
       ]
-      yield* NativeReturn.complete(
+      NativeReturn.complete(
         context.suspension,
         returned.slice(0, terminator.propagationLaneCount),
         'propagated_selective_failure',
@@ -325,39 +322,39 @@ export const emit = Effect.fnUntraced(function* (
       break
     }
     case 'Return': {
-      const instruction = yield* NativeReturn.completeLocal(
+      const instruction = NativeReturn.completeLocal(
         context.suspension,
         context.storage,
         terminator.value,
         `return_value_b${block.id.ordinal}`,
       )
-      yield* NativeDebug.locate(context.debug, terminator.provenance.span, instruction)
+      NativeDebug.locate(context.debug, terminator.provenance.span, instruction)
       break
     }
     case 'Jump': {
-      yield* jump(context, terminator)
+      jump(context, terminator)
       break
     }
     case 'Branch': {
-      yield* branch(context, terminator, blockOrdinal)
+      branch(context, terminator, blockOrdinal)
       break
     }
     case 'MatchBranch': {
-      yield* matchBranch(context, terminator, block.id.ordinal)
+      matchBranch(context, terminator, block.id.ordinal)
       break
     }
     case 'EnumMatchBranch': {
-      yield* enumMatchBranch(context, terminator, block.id.ordinal)
+      enumMatchBranch(context, terminator, block.id.ordinal)
       break
     }
     case 'Trap': {
-      const instruction = yield* NativeTermination.emitTrap(
+      const instruction = NativeTermination.emitTrap(
         context.termination,
         terminator.reason,
         terminator.provenance.span,
       )
-      yield* NativeDebug.locate(context.debug, terminator.provenance.span, instruction)
+      NativeDebug.locate(context.debug, terminator.provenance.span, instruction)
       break
     }
   }
-})
+}

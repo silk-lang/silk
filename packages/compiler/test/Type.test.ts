@@ -93,8 +93,8 @@ it('keeps requirement rows out of stored generic lifetime obligations', () => {
 
 it('reuses the runtime identity of an immutable type across nested layout queries', () => {
   let argumentReads = 0
-  const arguments_ = Object.freeze(['i32'] as const)
-  const nominal: Type.Nominal = Object.freeze({
+  const arguments_ = ['i32'] as const
+  const nominal: Type.Nominal = {
     _tag: 'NominalType',
     module: 'runtime-key',
     name: 'Box',
@@ -102,7 +102,7 @@ it('reuses the runtime identity of an immutable type across nested layout querie
       argumentReads += 1
       return arguments_
     },
-  })
+  }
   const first = Type.runtimeKey(nominal)
   const readsAfterFirst = argumentReads
   assert.isAbove(readsAfterFirst, 0)
@@ -146,7 +146,7 @@ it('canonicalizes lifetime binders without erasing declaration, scope or assumpt
 it('reuses lifetime proof keys across repeated comparisons and enclosing intersections', () => {
   let ownerReads = 0
   const owner = Object.freeze({ module: 'lifetimes', name: 'cached' })
-  const lifetime: Lifetime.Local = Object.freeze({
+  const lifetime: Lifetime.Local = {
     _tag: 'LocalLifetime',
     get owner() {
       ownerReads += 1
@@ -154,7 +154,7 @@ it('reuses lifetime proof keys across repeated comparisons and enclosing interse
     },
     context: 'Borrow:0',
     ordinal: 0,
-  })
+  }
   const first = Lifetime.key(lifetime)
   const readsAfterFirst = ownerReads
   assert.isAbove(readsAfterFirst, 0)
@@ -289,9 +289,9 @@ it('propagates later lifetime requirements through finite cycles and reports exp
   const solution = Lifetime.solve({
     pointCount: 4,
     regions: [
-      { lifetime: source, available: new Set([0, 1]), required: new Set([0]) },
-      { lifetime: holder, available: new Set([0, 1, 2, 3]), required: new Set([1]) },
-      { lifetime: copied, available: new Set([0, 1, 2, 3]), required: new Set([3]) },
+      { lifetime: source, unavailable: new Set([2, 3]), required: new Set([0]) },
+      { lifetime: holder, unavailable: new Set(), required: new Set([1]) },
+      { lifetime: copied, unavailable: new Set(), required: new Set([3]) },
     ],
     constraints: [
       { longer: source, shorter: holder },
@@ -313,9 +313,9 @@ it('requires every intersection constituent at concrete loan use points', () => 
   const solution = Lifetime.solve({
     pointCount: 3,
     regions: [
-      { lifetime: a, available: new Set([0, 1]), required: new Set() },
-      { lifetime: b, available: new Set([0, 1, 2]), required: new Set() },
-      { lifetime: meet, available: new Set([0, 1, 2]), required: new Set([2]) },
+      { lifetime: a, unavailable: new Set([2]), required: new Set() },
+      { lifetime: b, unavailable: new Set(), required: new Set() },
+      { lifetime: meet, unavailable: new Set(), required: new Set([2]) },
     ],
     constraints: [],
   })
