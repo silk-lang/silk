@@ -46,7 +46,10 @@ to the held revision, with no host file snapshot or mutable filesystem provider 
 `Semantic.revise` selects another immutable revision. The next demand validates retained source
 bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
 affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. `Semantic.eventLog` records queries actually run or hit; replaying a completed
+facts reusable. A body can also retain its checked payload after a same-file or imported callee
+body edit when its own declaration and the semantic results it consumed still match. That
+validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
+queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
 reads and name observations. The focused source-written M1 checks use these records to prove
 avoided provider reads and semantic demands; they do not measure speed. This API is not wired into
@@ -98,13 +101,31 @@ wave.
 
 A unit function can return `()` or fall through an empty body. A reachable non-unit fallthrough,
 incompatible return, or unsupported statement or expression is an anchored
-rejection. A completed body answer retains typed nodes, its source observation, callee signature
+rejection. A completed body answer retains typed nodes, the current source observation, callee signature
 dependencies, and required runtime-body declarations for later closure. A body demand checks only
 that declaration. Thus `fn caller() -> i32 { return leaf() }` can check successfully even when
 `leaf` has an invalid body; a later build must validate that required body. Mutual calls with written
 signatures do not force a body-query cycle. A body demand does not execute user code or prove that
 the whole program is valid. Imported calls retain positive and negative name, import, and source
 observations on fresh request hits.
+
+For example, after checking `caller`, changing only `leaf` from `return 1` to `return 2`
+keeps the caller's checked payload, including when both functions share a file:
+
+```silk,ignore
+fn leaf() -> i32 { return 1 }
+fn caller() -> i32 { let value = leaf() return value }
+```
+
+The edit leaves the called signature and the caller's declaration unchanged. Changing `leaf` to
+`fn leaf() -> bool { return true }` makes the caller's `i32` return invalid, so it is checked again
+and rejected. Adding or removing a previously missing imported declaration also updates its actual
+consumers. Reused bodies carry the current source observation and current dependency evidence.
+If a source edit moves the caller's syntax positions, changes its declaration, makes its owner
+mapping ambiguous, or changes a dependency whose result cannot be compared exactly in this scalar
+wave, the checker runs again. A changed nominal type result takes that conservative path. These
+events prove only checked semantic-body reuse;
+they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
 
 Ordinary runtime `if` statements require `bool` conditions and check both arms. For example,
 `fn choose(flag: bool) -> i32 { if flag { return 1 } else { return 2 } }` has no reachable

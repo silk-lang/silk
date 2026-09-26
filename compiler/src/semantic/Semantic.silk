@@ -5,6 +5,7 @@
 //! The store reads an import target only when a requested fact needs its binding.
 
 import hir.Hir {HirId, HirRef, Module, Node, ParameterMode, Range, Sign}
+import hir.Fingerprint
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
@@ -81,8 +82,13 @@ pub union Value {
   Type {pub resolved: Shared<Type>},
   /// A function's written signature.
   Signature {pub signature: Signature},
-  /// A complete checked ordinary function body.
-  Body {pub body: Shared<TypedBody>},
+  /// A complete checked ordinary function body with source ownership for its syntax positions.
+  Body {
+    /// The checked payload, whose local syntax positions match `source`.
+    pub body: Shared<TypedBody>,
+    /// The current source observation that owns every syntax position in `body`.
+    pub source: Shared<Observation>,
+  },
 }
 
 /// A direct query dependency retained with a completed semantic answer.
@@ -122,6 +128,8 @@ pub struct Answer {
   /// Every transitive present or absent source path for revision validation.
   pub sources: Vector<Shared<Observation>>
   footprint: Vector<Shared<DemandFootprint>>
+  answerId: usize
+  identity: Option<Shared<Value>>
 }
 
 struct Root {
@@ -153,10 +161,12 @@ pub struct Event {
 
 /// The lifecycle stage of an observable semantic query event.
 pub enum EventKind {
-  /// The query provider began work on a missing answer.
+  /// The query provider began work on a missing or invalid answer.
   Start,
   /// The query reused a completed answer.
   Hit,
+  /// A checked body kept its typed payload after current inputs and child results validated.
+  Reuse,
   /// The query provider completed and stored an answer.
   Finish,
 }
@@ -263,11 +273,33 @@ struct Resolver {
   active: Vector<Word>
   frames: Vector<SourceFrame>
   events: Vector<Event>
+  bodyEvidence: Vector<BodyEvidence>
+  nextAnswerId: usize
 }
 
 struct SourceFrame {
   observations: Vector<Shared<Observation>>
   footprint: Vector<Shared<DemandFootprint>>
+  direct: Vector<BodyDependency>
+}
+
+struct BodyDependency {
+  key: Key
+  dependency: Dependency
+  answerId: usize
+  identity: Option<Shared<Value>>
+}
+
+struct BodyEvidence {
+  key: Key
+  id: usize
+  direct: Vector<BodyDependency>
+}
+
+struct BodyCandidate {
+  body: Shared<TypedBody>
+  evidenceId: usize
+  directCount: usize
 }
 
 struct Running<'a, 'b> {
@@ -321,6 +353,211 @@ fn validAnswer(answer: &Result<Answer, NoRejection>, source: &SourceIndex) -> bo
       return true
     }
     Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn sameBucketWith(first: &NameObservation, other: &Shared<NameObservation>) -> bool {
+  return Shared.with<NameObservation, bool>(
+    other,
+    fn(second: &NameObservation) -> bool {
+      return NameObservation.equals(first, second)
+    },
+  )
+}
+
+fn sameBuckets(left: &Shared<NameObservation>, right: &Shared<NameObservation>) -> bool {
+  return Shared.with<NameObservation, bool>(
+    left,
+    fn(first: &NameObservation) -> bool {
+      return sameBucketWith(first, right)
+    },
+  )
+}
+
+fn reusableTypeKind(value: &Type) -> usize {
+  return match & value.* {
+    Type.Primitive {..} => usize.ONE
+    Type.Unit => 2
+    Type.Nominal {..} => 3
+  }
+}
+
+fn primitiveLength(value: &Type) -> usize {
+  return match & value.* {
+    Type.Primitive {name} => Bytes.asSlice(&name).length
+    _ => usize.ZERO
+  }
+}
+
+fn primitiveByte(value: &Type, at: usize) -> u8 {
+  return match & value.* {
+    Type.Primitive {name} => Bytes.asSlice(&name)[at]
+    _ => 0
+  }
+}
+
+fn sameReusableType(left: &Shared<Type>, right: &Shared<Type>) -> bool {
+  let first = Shared.with<Type, usize>(left, reusableTypeKind)
+  let second = Shared.with<Type, usize>(right, reusableTypeKind)
+  if first != second {
+    return false
+  }
+  if first == 2 {
+    return true
+  }
+  // Nominal type results may share a cached Type handle across answer generations. Recheck.
+  if first != usize.ONE {
+    return false
+  }
+  let length = Shared.with<Type, usize>(left, primitiveLength)
+  if length != Shared.with<Type, usize>(right, primitiveLength) {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < length {
+    let from = Shared.with<Type, u8>(
+      left,
+      fn(value: &Type) -> u8 {
+        return primitiveByte(value, at)
+      },
+    )
+    let to = Shared.with<Type, u8>(
+      right,
+      fn(value: &Type) -> u8 {
+        return primitiveByte(value, at)
+      },
+    )
+    if from != to {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameValue(left: &Value, right: &Value) -> bool {
+  return match & left.* {
+    Value.Name {bucket} => match & right.* {
+      Value.Name {bucket: other} => sameBuckets(&bucket, &other)
+      _ => false
+    }
+    Value.Namespace {module, ordinal} => match & right.* {
+      Value.Namespace {module: other, ordinal: position} => ModuleId.equals(&module, &other) && ordinal == position
+      _ => false
+    }
+    Value.Selected {declaration, module, ordinal} => match & right.* {
+      Value.Selected {declaration: other, module: selected, ordinal: position} => DeclarationId.equals(
+        &declaration,
+        &other,
+      ) && module == selected && ordinal == position
+      _ => false
+    }
+    Value.Type {resolved} => match & right.* {
+      Value.Type {resolved: other} => sameReusableType(&resolved, &other)
+      _ => false
+    }
+    Value.Signature {signature} => match & right.* {
+      Value.Signature {signature: other} => {
+        let first = Vector.asSlice<Shared<Type>>(&signature.parameters)
+        let second = Vector.asSlice<Shared<Type>>(&other.parameters)
+        if first.length != second.length || signature.isEffect != other.isEffect || !sameReusableType(
+          &signature.result,
+          &other.result,
+        ) {
+          return false
+        }
+        let mut at = usize.ZERO
+        while at < first.length {
+          if !sameReusableType(&first[at], &second[at]) {
+            return false
+          }
+          at = at + usize.ONE
+        }
+        return true
+      }
+      _ => false
+    }
+    Value.Body {..} => false
+  }
+}
+
+fn sameValueWith(first: &Value, other: &Shared<Value>) -> bool {
+  return Shared.with<Value, bool>(
+    other,
+    fn(second: &Value) -> bool {
+      return sameValue(first, second)
+    },
+  )
+}
+
+fn sameSharedValue(left: &Shared<Value>, right: &Shared<Value>) -> bool {
+  return Shared.with<Value, bool>(
+    left,
+    fn(first: &Value) -> bool {
+      return sameValueWith(first, right)
+    },
+  )
+}
+
+effect fn copySignature(signature: &Signature) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let mut parameters = Vector.make<Shared<Type>>()
+  let written = Vector.asSlice<Shared<Type>>(&signature.parameters)
+  let mut at = usize.ZERO
+  while at < written.length {
+    run Vector.append<Shared<Type>>(&mut parameters, Shared.clone<Type>(&written[at]))
+    at = at + usize.ONE
+  }
+  return Value.Signature {
+    signature: Signature {
+      parameters: move parameters,
+      result: Shared.clone<Type>(&signature.result),
+      isEffect: signature.isEffect,
+    },
+  }
+}
+
+effect fn identityOf(outcome: &Outcome) -> Option<Shared<Value>> ! OutOfMemoryError ? &mut Allocator {
+  return match & outcome.* {
+    Outcome.Rejected {diagnostic: _} => Option.none<Shared<Value>>()
+    Outcome.Success {value} => {
+      let copied = match & value {
+        Value.Name {bucket} => Value.Name {bucket: Shared.clone<NameObservation>(&bucket)}
+        Value.Namespace {module, ordinal} => Value.Namespace {
+          module: run ModuleId.copy(&module),
+          ordinal: ordinal,
+        }
+        Value.Selected {declaration, module, ordinal} => Value.Selected {
+          declaration: run DeclarationId.copy(&declaration),
+          module: module,
+          ordinal: ordinal,
+        }
+        Value.Type {resolved} => Value.Type {resolved: Shared.clone<Type>(&resolved)}
+        Value.Signature {signature} => run copySignature(&signature)
+        Value.Body {..} => {
+          return Option.none<Shared<Value>>()
+        }
+      }
+      return Option.some<Shared<Value>>(run Shared.make<Value>(move copied))
+    }
+  }
+}
+
+fn answerIdentity(answer: &Result<Answer, NoRejection>) -> Option<Shared<Value>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.identity {
+      Option<Shared<Value>>.Some {value: observed} => Option.some<Shared<Value>>(
+        Shared.clone<Value>(&observed),
+      )
+      Option<Shared<Value>>.None => Option.none<Shared<Value>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Value>>()
+  }
+}
+
+fn priorAnswerId(answer: &Result<Answer, NoRejection>) -> usize {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => value.answerId
+    Result<Answer, NoRejection>.Failure {error: _} => usize.ZERO
   }
 }
 
@@ -415,6 +652,29 @@ fn observationAt(answer: &Result<Answer, NoRejection>, at: usize) -> Option<Shar
       return Option.none<Shared<Observation>>()
     }
     Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Observation>>()
+  }
+}
+
+fn priorCandidate(answer: &Result<Answer, NoRejection>) -> Option<BodyCandidate> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value: previous} => match & previous.outcome {
+      Outcome.Success {value: Value.Body {body, source: _}} => Option.some<BodyCandidate>(
+        BodyCandidate {
+          body: Shared.clone<TypedBody>(&body),
+          evidenceId: previous.answerId,
+          directCount: Vector.length<Dependency>(&previous.dependencies),
+        },
+      )
+      _ => Option.none<BodyCandidate>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<BodyCandidate>()
+  }
+}
+
+fn isSuccessfulBody(outcome: &Outcome) -> bool {
+  return match & outcome.* {
+    Outcome.Success {value: Value.Body {..}} => true
+    _ => false
   }
 }
 
@@ -1029,21 +1289,26 @@ effect fn cycleAnswer(resolver: &mut Resolver, key: Key, span: Span) -> Shared<
         dependencies: Vector.make<Dependency>(),
         sources: Vector.make<Shared<Observation>>(),
         footprint: Vector.make<Shared<DemandFootprint>>(),
+        answerId: usize.ZERO,
+        identity: Option.none<Shared<Value>>(),
       },
     ),
   )
 }
 
-effect fn resolve(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, key: Key) -> Answer
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
-? &mut Allocator {
+effect fn resolve(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+  candidate: Option<BodyCandidate>,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   return match key.family {
     Family.Name => run resolveBucket(&mut resolver.*, &mut owner.*, key)
     Family.Import => run resolveImport(&mut resolver.*, &mut owner.*, key)
     Family.Alias => run resolveAlias(&mut resolver.*, &mut owner.*, key)
     Family.Identity => run resolveIdentity(&mut resolver.*, &mut owner.*, key)
     Family.Signature => run resolveSignature(&mut resolver.*, &mut owner.*, key)
-    Family.Body => run resolveBody(&mut resolver.*, &mut owner.*, key)
+    Family.Body => run resolveBody(&mut resolver.*, &mut owner.*, key, move candidate)
   }
 }
 
@@ -1051,6 +1316,7 @@ effect fn withRunning<'a, 'b>(
   resolver: &'a mut Resolver,
   query: &'b mut Query<Word, Answer, NoRejection>,
   key: Word,
+  candidate: Option<BodyCandidate>,
 ) -> Result<Answer, NoRejection>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -1065,13 +1331,32 @@ effect fn withRunning<'a, 'b>(
       SourceFrame {
         observations: Vector.make<Shared<Observation>>(),
         footprint: Vector.make<Shared<DemandFootprint>>(),
+        direct: Vector.make<BodyDependency>(),
       },
     )
     let selected = Vector.get<Key>(&resource.resolver.keys, u64.toUsize(resource.key.value))
-    let mut value = run resolve(&mut resource.resolver.*, &mut resource.query.*, selected)
+    let mut value = run resolve(
+      &mut resource.resolver.*,
+      &mut resource.query.*,
+      selected,
+      move candidate,
+    )
+    value.identity = run identityOf(&value.outcome)
     let frame = Vector.remove<SourceFrame>(&mut resource.resolver.*.frames, resource.base)
-    value.sources = move frame.observations
-    value.footprint = move frame.footprint
+    let SourceFrame {observations, footprint, direct} = move frame
+    value.sources = move observations
+    value.footprint = move footprint
+    let id = resource.resolver.nextAnswerId
+    resource.resolver.nextAnswerId = id + usize.ONE
+    value.answerId = id
+    if selected.family == Family.Body && isSuccessfulBody(&value.outcome) {
+      run Vector.append<BodyEvidence>(
+        &mut resource.resolver.*.bodyEvidence,
+        BodyEvidence {key: selected, id: id, direct: move direct},
+      )
+    } else {
+      drop direct
+    }
     return Result.succeed<Answer, NoRejection>(move value)
   }
   let release = effect fn(resource: &mut Running<'a, 'b>) -> () {
@@ -1101,6 +1386,7 @@ effect fn demandRaw(
   }
   let cached = Query.completed(&mut owner.*, word)
   let mut hit = false
+  let mut candidate = Option.none<BodyCandidate>()
   if let Option<Shared<Result<Answer, NoRejection>>>.Some {value} = move cached {
     if Shared.with<Result<Answer, NoRejection>, bool>(
       &value,
@@ -1110,6 +1396,12 @@ effect fn demandRaw(
     ) {
       hit = true
     } else {
+      if key.family == Family.Body {
+        candidate = Shared.with<Result<Answer, NoRejection>, Option<BodyCandidate>>(
+          &value,
+          priorCandidate,
+        )
+      }
       Query.forget(&mut owner.*, word)
     }
   }
@@ -1121,7 +1413,7 @@ effect fn demandRaw(
       NoRejection,
     > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
       run emit(&mut resolver.*, EventKind.Start, demanded)
-      return run withRunning(&mut resolver.*, &mut query.*, demanded)
+      return run withRunning(&mut resolver.*, &mut query.*, demanded, move candidate)
     },
   )
   if hit {
@@ -1143,6 +1435,22 @@ effect fn demandChild(
 ? &mut Allocator {
   let answer = run demandRaw(&mut resolver.*, &mut owner.*, key, span)
   let edge = run dependency(&mut resolver.*, key)
+  let active = Vector.asSlice<Word>(&resolver.active)
+  let parent = Vector.get<Key>(&resolver.keys, u64.toUsize(active[active.length - usize.ONE].value))
+  let mut bodyDependency = Option.none<BodyDependency>()
+  if parent.family == Family.Body {
+    bodyDependency = Option.some<BodyDependency>(
+      BodyDependency {
+        key: key,
+        dependency: run dependency(&mut resolver.*, key),
+        answerId: Shared.with<Result<Answer, NoRejection>, usize>(&answer, priorAnswerId),
+        identity: Shared.with<Result<Answer, NoRejection>, Option<Shared<Value>>>(
+          &answer,
+          answerIdentity,
+        ),
+      },
+    )
+  }
   let footprint = run Shared.make<DemandFootprint>(
     DemandFootprint {dependency: run dependency(&mut resolver.*, key)},
   )
@@ -1153,6 +1461,9 @@ effect fn demandChild(
     &mut frames[count - usize.ONE].footprint,
     move footprint,
   )
+  if let Option<BodyDependency>.Some {value} = move bodyDependency {
+    run Vector.append<BodyDependency>(&mut frames[count - usize.ONE].direct, move value)
+  }
   run mergeEvidence(&mut frames[count - usize.ONE], &answer)
   return move answer
 }
@@ -1191,6 +1502,8 @@ effect fn resolveBucket(
       dependencies: Vector.make<Dependency>(),
       sources: Vector.make<Shared<Observation>>(),
       footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
     }
   }
   let diagnostic = run reject(
@@ -1204,6 +1517,8 @@ effect fn resolveBucket(
     dependencies: Vector.make<Dependency>(),
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -1273,6 +1588,8 @@ effect fn resolveImport(
           dependencies: move dependencies,
           sources: Vector.make<Shared<Observation>>(),
           footprint: Vector.make<Shared<DemandFootprint>>(),
+          answerId: usize.ZERO,
+          identity: Option.none<Shared<Value>>(),
         }
       }
       let targetPath = run path(&mut resolver.*, &module, importPath)
@@ -1288,6 +1605,8 @@ effect fn resolveImport(
           dependencies: move dependencies,
           sources: Vector.make<Shared<Observation>>(),
           footprint: Vector.make<Shared<DemandFootprint>>(),
+          answerId: usize.ZERO,
+          identity: Option.none<Shared<Value>>(),
         }
       }
       let targetText = run modulePath(&targetPath)
@@ -1309,6 +1628,8 @@ effect fn resolveImport(
           dependencies: move dependencies,
           sources: Vector.make<Shared<Observation>>(),
           footprint: Vector.make<Shared<DemandFootprint>>(),
+          answerId: usize.ZERO,
+          identity: Option.none<Shared<Value>>(),
         }
       }
       let targetOrdinal = run internModule(&mut resolver.*, &target)
@@ -1320,6 +1641,8 @@ effect fn resolveImport(
           dependencies: move dependencies,
           sources: Vector.make<Shared<Observation>>(),
           footprint: Vector.make<Shared<DemandFootprint>>(),
+          answerId: usize.ZERO,
+          identity: Option.none<Shared<Value>>(),
         }
       }
       let selected = run importedMember(&mut resolver.*, &module, key.declaration, key.member)
@@ -1331,6 +1654,8 @@ effect fn resolveImport(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
         let names = Vector.asSlice<Bytes>(&member.segments)
@@ -1366,6 +1691,8 @@ effect fn resolveImport(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
         if candidate.kind == CandidateKind.ImportMember {
@@ -1394,6 +1721,8 @@ effect fn resolveImport(
               dependencies: move dependencies,
               sources: Vector.make<Shared<Observation>>(),
               footprint: Vector.make<Shared<DemandFootprint>>(),
+              answerId: usize.ZERO,
+              identity: Option.none<Shared<Value>>(),
             }
           }
           if let Option<usize>.Some {value: targetModuleOrdinal} = move binding.module {
@@ -1412,6 +1741,8 @@ effect fn resolveImport(
                   dependencies: move dependencies,
                   sources: Vector.make<Shared<Observation>>(),
                   footprint: Vector.make<Shared<DemandFootprint>>(),
+                  answerId: usize.ZERO,
+                  identity: Option.none<Shared<Value>>(),
                 }
               }
             }
@@ -1424,6 +1755,8 @@ effect fn resolveImport(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
         let declaration = run declarationAt(&mut resolver.*, &target, candidate.declaration)
@@ -1439,6 +1772,8 @@ effect fn resolveImport(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
       }
@@ -1449,6 +1784,8 @@ effect fn resolveImport(
       dependencies: move dependencies,
       sources: Vector.make<Shared<Observation>>(),
       footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
     }
   }
   let diagnostic = run reject(
@@ -1462,6 +1799,8 @@ effect fn resolveImport(
     dependencies: move dependencies,
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -1847,6 +2186,8 @@ effect fn resolveAlias(
                 dependencies: move dependencies,
                 sources: Vector.make<Shared<Observation>>(),
                 footprint: Vector.make<Shared<DemandFootprint>>(),
+                answerId: usize.ZERO,
+                identity: Option.none<Shared<Value>>(),
               }
             }
             return Answer {
@@ -1854,6 +2195,8 @@ effect fn resolveAlias(
               dependencies: move dependencies,
               sources: Vector.make<Shared<Observation>>(),
               footprint: Vector.make<Shared<DemandFootprint>>(),
+              answerId: usize.ZERO,
+              identity: Option.none<Shared<Value>>(),
             }
           }
           Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
@@ -1862,6 +2205,8 @@ effect fn resolveAlias(
               dependencies: move dependencies,
               sources: Vector.make<Shared<Observation>>(),
               footprint: Vector.make<Shared<DemandFootprint>>(),
+              answerId: usize.ZERO,
+              identity: Option.none<Shared<Value>>(),
             }
           }
         }
@@ -1873,6 +2218,8 @@ effect fn resolveAlias(
       dependencies: move dependencies,
       sources: Vector.make<Shared<Observation>>(),
       footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
     }
   }
   let diagnostic = run reject(
@@ -1886,6 +2233,8 @@ effect fn resolveAlias(
     dependencies: move dependencies,
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -1931,6 +2280,8 @@ effect fn resolveIdentity(
           dependencies: Vector.make<Dependency>(),
           sources: Vector.make<Shared<Observation>>(),
           footprint: Vector.make<Shared<DemandFootprint>>(),
+          answerId: usize.ZERO,
+          identity: Option.none<Shared<Value>>(),
         }
       }
     }
@@ -1940,6 +2291,8 @@ effect fn resolveIdentity(
       dependencies: Vector.make<Dependency>(),
       sources: Vector.make<Shared<Observation>>(),
       footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
     }
   }
   let diagnostic = run reject(
@@ -1953,6 +2306,8 @@ effect fn resolveIdentity(
     dependencies: Vector.make<Dependency>(),
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -1972,6 +2327,8 @@ effect fn resolveSignature(
         dependencies: move dependencies,
         sources: Vector.make<Shared<Observation>>(),
         footprint: Vector.make<Shared<DemandFootprint>>(),
+        answerId: usize.ZERO,
+        identity: Option.none<Shared<Value>>(),
       }
     }
     let mut parameters = Vector.make<Shared<Type>>()
@@ -2000,6 +2357,8 @@ effect fn resolveSignature(
               dependencies: move dependencies,
               sources: Vector.make<Shared<Observation>>(),
               footprint: Vector.make<Shared<DemandFootprint>>(),
+              answerId: usize.ZERO,
+              identity: Option.none<Shared<Value>>(),
             }
           }
           run Vector.append<Shared<Type>>(&mut parameters, move ty)
@@ -2010,6 +2369,8 @@ effect fn resolveSignature(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
       }
@@ -2033,6 +2394,8 @@ effect fn resolveSignature(
               dependencies: move dependencies,
               sources: Vector.make<Shared<Observation>>(),
               footprint: Vector.make<Shared<DemandFootprint>>(),
+              answerId: usize.ZERO,
+              identity: Option.none<Shared<Value>>(),
             }
           }
           result = move ty
@@ -2043,6 +2406,8 @@ effect fn resolveSignature(
             dependencies: move dependencies,
             sources: Vector.make<Shared<Observation>>(),
             footprint: Vector.make<Shared<DemandFootprint>>(),
+            answerId: usize.ZERO,
+            identity: Option.none<Shared<Value>>(),
           }
         }
       }
@@ -2060,6 +2425,8 @@ effect fn resolveSignature(
       dependencies: move dependencies,
       sources: Vector.make<Shared<Observation>>(),
       footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
     }
   }
   let diagnostic = run reject(
@@ -2073,6 +2440,8 @@ effect fn resolveSignature(
     dependencies: move dependencies,
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -2781,6 +3150,8 @@ fn rejectedBody(diagnostic: Shared<Rejection>, dependencies: Vector<Dependency>)
     dependencies: move dependencies,
     sources: Vector.make<Shared<Observation>>(),
     footprint: Vector.make<Shared<DemandFootprint>>(),
+    answerId: usize.ZERO,
+    identity: Option.none<Shared<Value>>(),
   }
 }
 
@@ -3208,11 +3579,198 @@ effect fn checkStatements(
   return Result.succeed<bool, Shared<Rejection>>(reachable)
 }
 
+effect fn currentKey(resolver: &mut Resolver, prior: &BodyDependency) -> Option<Key>
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let previous = prior.key
+  if previous.family == Family.Name {
+    return Option.some<Key>(previous)
+  }
+  let module = run resolvedModule(&resolver.*, previous.module)
+  let answer = run source(&mut resolver.*, &module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, &module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let mut found = Option.none<usize>()
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let matches = match & prior.dependency.declaration {
+        Option<DeclarationId>.Some {value: old} => DeclarationId.equals(
+          &old,
+          &declarations[at].identity,
+        )
+        Option<DeclarationId>.None => false
+      }
+      if !declarations[at].ambiguous && matches {
+        if let Option<usize>.Some {value: _} = &found {
+          return Option.none<Key>()
+        }
+        found = Option.some<usize>(at)
+      }
+      at = at + usize.ONE
+    }
+    if let Option<usize>.Some {value} = move found {
+      return Option.some<Key>(
+        Key {
+          family: previous.family,
+          module: previous.module,
+          name: previous.name,
+          declaration: value,
+          member: previous.member,
+          external: previous.external,
+        },
+      )
+    }
+  }
+  return Option.none<Key>()
+}
+
+fn takeEvidence(resolver: &mut Resolver, key: Key, id: usize) -> Option<BodyEvidence> {
+  let entries = Vector.asSlice<BodyEvidence>(&resolver.bodyEvidence)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].id == id && sameKey(entries[at].key, key) {
+      return Option.some<BodyEvidence>(Vector.remove<BodyEvidence>(&mut resolver.bodyEvidence, at))
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<BodyEvidence>()
+}
+
+effect fn reuseBody(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+  candidate: &BodyCandidate,
+) -> Option<Answer>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let body = Shared.clone<TypedBody>(&candidate.body)
+  let evidence = match move takeEvidence(&mut resolver.*, key, candidate.evidenceId) {
+    Option<BodyEvidence>.Some {value} => move value
+    Option<BodyEvidence>.None => {
+      return Option.none<Answer>()
+    }
+  }
+  let module = run resolvedModule(&resolver.*, key.module)
+  let sourceAnswer = run source(&mut resolver.*, &module)
+  let mut validInput = false
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    &module,
+  ) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if key.declaration < declarations.length && !declarations[key.declaration].ambiguous {
+      let hir = IndexedSource.authored(indexed)
+      let header = run Fingerprint.header(hir, declarations[key.declaration].local)
+      let implementation = run Fingerprint.body(hir, declarations[key.declaration].local)
+      validInput = Shared.with<TypedBody, bool>(
+        &body,
+        fn(checked: &TypedBody) -> bool {
+          return TypedBody.matchesInput(
+            checked,
+            indexed,
+            key.declaration,
+            Vector.asSlice<u8>(&header),
+            Vector.asSlice<u8>(&implementation),
+          )
+        },
+      )
+    }
+  }
+  if !validInput {
+    return Option.none<Answer>()
+  }
+  let prior = Vector.asSlice<BodyDependency>(&evidence.direct)
+  let count = prior.length
+  if count != candidate.directCount {
+    return Option.none<Answer>()
+  }
+  let mut dependencies = Vector.make<Dependency>()
+  let mut at = usize.ZERO
+  while at < count {
+    let current = run currentKey(&mut resolver.*, &prior[at])
+    let selected = match move current {
+      Option<Key>.Some {value} => value
+      Option<Key>.None => {
+        return Option.none<Answer>()
+      }
+    }
+    let now = run demandChild(
+      &mut resolver.*,
+      &mut owner.*,
+      &mut dependencies,
+      selected,
+      Span.make(usize.ZERO, usize.ZERO),
+    )
+    if prior[at].answerId == Shared.with<Result<Answer, NoRejection>, usize>(&now, priorAnswerId) && prior[at].answerId != usize.ZERO {
+      at = at + usize.ONE
+      continue
+    }
+    let previousIdentity = match & prior[at].identity {
+      Option<Shared<Value>>.Some {value} => Option.some<Shared<Value>>(Shared.clone<Value>(&value))
+      Option<Shared<Value>>.None => Option.none<Shared<Value>>()
+    }
+    let currentIdentity = Shared.with<Result<Answer, NoRejection>, Option<Shared<Value>>>(
+      &now,
+      answerIdentity,
+    )
+    let matching = match move previousIdentity {
+      Option<Shared<Value>>.Some {value: first} => match move currentIdentity {
+        Option<Shared<Value>>.Some {value: second} => sameSharedValue(&first, &second)
+        Option<Shared<Value>>.None => false
+      }
+      Option<Shared<Value>>.None => false
+    }
+    if !matching {
+      return Option.none<Answer>()
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<Answer>(
+    Answer {
+      outcome: Outcome.Success {
+        value: Value.Body {
+          body: move body,
+          source: run Shared.make<Observation>(
+            run SourceIndex.captureObservation(&resolver.source, &module),
+          ),
+        },
+      },
+      dependencies: move dependencies,
+      sources: Vector.make<Shared<Observation>>(),
+      footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
+    },
+  )
+}
+
 effect fn resolveBody(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
   key: Key,
+  candidate: Option<BodyCandidate>,
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Option<BodyCandidate>.Some {value} = move candidate {
+    let reused = run reuseBody(&mut resolver.*, &mut owner.*, key, &value)
+    if let Option<Answer>.Some {value: answer} = move reused {
+      let word = run internKey(&mut resolver.*, key)
+      run emit(&mut resolver.*, EventKind.Reuse, word)
+      return move answer
+    }
+    let count = Vector.length<SourceFrame>(&resolver.frames)
+    let stale = Vector.remove<SourceFrame>(&mut resolver.frames, count - usize.ONE)
+    drop stale
+    run Vector.append<SourceFrame>(
+      &mut resolver.frames,
+      SourceFrame {
+        observations: Vector.make<Shared<Observation>>(),
+        footprint: Vector.make<Shared<DemandFootprint>>(),
+        direct: Vector.make<BodyDependency>(),
+      },
+    )
+  }
   let module = run resolvedModule(&resolver.*, key.module)
   let signatureKey = Key {
     family: Family.Signature,
@@ -3459,11 +4017,9 @@ effect fn resolveBody(
                       move dependencies,
                     )
                   }
-                  let body = TypedBody.make(
-                    run DeclarationId.copy(&declaration.identity),
-                    run Shared.make<Observation>(
-                      run Observation.copy(IndexedSource.sourceObservation(indexed)),
-                    ),
+                  let body = run TypedBody.make(
+                    indexed,
+                    key.declaration,
                     move locals,
                     move nodes,
                     control.node,
@@ -3472,11 +4028,18 @@ effect fn resolveBody(
                   )
                   return Answer {
                     outcome: Outcome.Success {
-                      value: Value.Body {body: run Shared.make<TypedBody>(move body)},
+                      value: Value.Body {
+                        body: run Shared.make<TypedBody>(move body),
+                        source: run Shared.make<Observation>(
+                          run Observation.copy(IndexedSource.sourceObservation(indexed)),
+                        ),
+                      },
                     },
                     dependencies: move dependencies,
                     sources: Vector.make<Shared<Observation>>(),
                     footprint: Vector.make<Shared<DemandFootprint>>(),
+                    answerId: usize.ZERO,
+                    identity: Option.none<Shared<Value>>(),
                   }
                 }
               }
@@ -3528,6 +4091,8 @@ effect fn rejectRoot(
         dependencies: move dependencies,
         sources: move sources,
         footprint: Vector.make<Shared<DemandFootprint>>(),
+        answerId: usize.ZERO,
+        identity: Option.none<Shared<Value>>(),
       },
     ),
   )
@@ -3602,6 +4167,8 @@ impl Semantic {
         active: Vector.make<Word>(),
         frames: Vector.make<SourceFrame>(),
         events: Vector.make<Event>(),
+        bodyEvidence: Vector.make<BodyEvidence>(),
+        nextAnswerId: usize.ONE,
       },
       query: Query.make<Word, Answer, NoRejection>(),
     }
@@ -3610,8 +4177,9 @@ impl Semantic {
   ///
   /// # Details
   ///
-  /// Exact source and nested query observations keep unaffected facts reusable. Changed source
-  /// bytes or path presence invalidate dependent facts before their diagnostic spans are returned.
+  /// Exact source observations keep unchanged answers reusable. A checked body can keep its typed
+  /// payload across another declaration's edit after its own inputs and child results validate.
+  /// Changed source positions or incomplete evidence force a new body check.
   pub fn revise(self: &mut Self, revision: Revision) -> () {
     SourceIndex.revise(&mut self.resolver.source, move revision)
     return ()
@@ -3697,8 +4265,9 @@ impl Semantic {
   ///
   /// The body accepts exact literals, immutable locals, full direct calls, returns, and unit
   /// fallthrough. A direct call reads the callee signature and records its required runtime body.
-  /// It does not check the callee body. A completed answer replays its source and signature
-  /// evidence into each request that demands it.
+  /// It does not check the callee body. A completed answer replays its current source and
+  /// signature evidence into each request that demands it. A validated body reuse records a
+  /// `Reuse` event after the query starts; it does not record a cache hit.
   ///
   /// # Gotchas
   ///
