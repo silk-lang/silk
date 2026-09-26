@@ -191,11 +191,12 @@ pending feature, even though the rejection currently uses the `Unsupported` code
 An omitted callable or Effect environment elides like a borrow. An input retains the regions of its
 borrows, non-`'static` nominal lifetime arguments, and callable or Effect environments; the
 parameter and channel types of a callable or Effect are not stored. An input whose stored contents
-involve a type parameter has no nameable region. For an `Effect` result, inputs that retain nothing
-leave the omitted environment `'static`, so `fn closed() -> Effect<i32>` and
+involve a type parameter has no nameable region. For an ordinary function's `Effect` result, inputs that retain
+nothing leave the omitted environment `'static`, so `fn closed() -> Effect<i32>` and
 `fn later(value: i32) -> Effect<i32>` have results of the form `Effect<'static; i32>`. Otherwise a
 single borrowed input supplies it as before, and any other case is rejected as `AmbiguousLifetime`
-at the result. An `effect fn` captures every input, so its omitted environment is the intersection
+at the result. An `effect fn` success type that is an Effect gets no `'static` default. An `effect fn`
+captures every input, so its omitted environment is the intersection
 of the regions its inputs retain: `'static` for none, `'a & 'b` for two borrows, the pending
 Effect's region for `once Effect<A>`. Generic stored contents such as `value: T` are rejected as
 `AmbiguousLifetime` at that input, so the declaration writes `effect<'env> fn`. These defaults cover

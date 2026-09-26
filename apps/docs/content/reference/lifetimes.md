@@ -161,13 +161,15 @@ whose stored contents involve a type parameter, such as `value: T` or `Box<T>`, 
 region. The omitted environment is then ambiguous (SEM0210) at that input, and the declaration
 writes `effect<'env> fn` with the matching `T: 'env` bounds.
 
-A named function whose result is an `Effect` with an omitted environment elides it from the header
-under LIFE-003. A single borrowed input supplies the environment, and several borrowed inputs
-require it to be written. When no input carries borrowed data, the environment is `'static`, so
+An ordinary named function whose result is an `Effect` with an omitted environment elides it from
+the header under LIFE-003. A single borrowed input supplies the environment, and several borrowed
+inputs require it to be written. When no input carries borrowed data, the environment is `'static`, so
 `fn closed() -> Effect<i32>` and `fn answerExplicit(input: i32) -> Effect<i32>` both have results
 of the form `Effect<'static; i32>`. Any other input that retains a region or stores generic
 contents, with no single borrowed input, leaves the omitted environment ambiguous (SEM0210), so
-`fn f<'a>(value: Held<'a, i32>) -> Effect<i32>` writes `Effect<'a; i32>`.
+`fn f<'a>(value: Held<'a, i32>) -> Effect<i32>` writes `Effect<'a; i32>`. The `'static` default
+does not apply to an `effect fn` whose success type is an Effect: `effect fn f() -> Effect<i32>` is
+ambiguous and writes `Effect<'static; i32>`, whatever its own capture environment.
 
 These defaults cover only the result's own environment. They do not apply to an Effect nested in
 that result, or to callables and Effects inside a callable contract. Ordinary capture and lifetime

@@ -71,9 +71,12 @@ Each entry records:
   - **`effect fn`:** it captures every input. Its omitted environment is the order-independent,
     duplicate-free intersection of the regions its inputs retain, `'static` when they retain none.
     Generic stored contents make it ambiguous (SEM0210) at that input.
-  - **Named `fn` returning `Effect<A>`:** the omitted environment of the result is `'static` when
-    no input retains anything. Otherwise LIFE-003 applies unchanged: a single borrowed input
-    supplies it, and any other case requires it written.
+  - **Ordinary named `fn` returning `Effect<A>`:** the omitted environment of the result is
+    `'static` when no input retains anything. Otherwise LIFE-003 applies unchanged: a single
+    borrowed input supplies it, and any other case requires it written.
+  - **`effect fn` whose success type is an Effect:** that inner environment gets no `'static`
+    default, independently of the `effect fn`'s own capture environment. `effect fn f() -> Effect<i32>`
+    is ambiguous (SEM0210); write `Effect<'static; i32>` where that is intended.
 
   ```silk,ignore
   fn closed() -> Effect<i32> { return effect { return 42 } }      // Effect<'static; i32>
@@ -108,8 +111,9 @@ The omitted output lifetime has no unique input` at the result.
       environment; the native frontend rejects it. A 2026-09-26 scan of
       `packages/compiler/stdlib` found about 79 such declarations, for example `Effect.of(value: A)`,
       `raise(error: E)`, `HashMap.insert(key: K, ...)` and handler-taking `with*` functions. They
-      need a main-first migration to `effect<'env> fn` with `T: 'env` bounds before the native
-      frontend checks the standard library. Not started.
+      need a main-first migration to `effect<'env> fn` with `T: 'env` bounds. That migration and
+      the matching bootstrap alignment are required, tracked prerequisite work owned by the
+      coordinator before the native frontend checks the standard library, not optional cleanup.
     - Aligning the bootstrap is a separate main-first repair, which has not been scheduled.
 - **Source migration:**
   - Omitting the environment is the approved form, and existing code that omits it here is correct.
@@ -122,6 +126,8 @@ The omitted output lifetime has no unique input` at the result.
   - `closedEffect`, `inputEffect` and `heldEffect` equal `explicitStatic`;
   - `genericEffect`, `twoBorrowEffect` and `nestedStatic` reject as `AmbiguousLifetime`, and
     `heldOpenEffect` does so spanning its written `Effect<i32>` result;
+  - `effectSuccess` (`effect fn` returning `Effect<i32>`) rejects as `AmbiguousLifetime`, while
+    `effectSuccessStatic` resolves with a `'static` capture environment;
   - `closedDeferred`, `inputDeferred`, `runPending` and `callbackDeferred` are `'static`;
   - `borrowedDeferred`, `heldDeferred` and `keepPending` have one region, `twoBorrowed` two, and
     `sameRegion` (the same lifetime twice) one;

@@ -115,7 +115,7 @@ effect fn program() -> usize ! BufferError | OutOfMemoryError {
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn failed<E>(error: E) -> usize { drop error return usize.ZERO }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> usize { drop error return usize.ZERO }
 
 pub fn main() -> i32 {
   return usize.toI32(run Effect.catchAll(program(), failed))
