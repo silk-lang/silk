@@ -1,6 +1,7 @@
 # Self-hosted Silk frontend
 
-This directory contains the self-hosted lexer, parser, HIR lowering, and M1 semantic query library.
+This directory contains the self-hosted lexer, parser, HIR lowering, semantic queries, and the
+first demanded ordinary-body checks.
 The current executable reads one Silk file and prints its flat AST and syntax diagnostics, or its
 lowered module and declaration fingerprints in `hir` mode. It does not yet perform name resolution,
 type checking, or code generation on that input. The TypeScript bootstrap compiler still builds it.
@@ -67,14 +68,35 @@ cycles produce anchored semantic rejections.
 Demanded generic applications, type modifiers, complex type forms, variadic or generic functions,
 failure or requirement rows, constraints, and nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. Unused declarations with these forms are
-still indexed as written names and do not require semantic resolution. This M1 slice does not
-check bodies, evaluate static expressions, discover tests, perform conformance or layout checks,
-or emit code. The authored HIR keeps integer sign, radix, and exact decimal magnitude beyond
-`u64`; semantic integer typing is outside this slice. Structured typed failures and cancellation
-release incomplete query reservations and publication frames, so a later demand can retry the same
-store. A fatal runtime trap ends the process and has no such recovery guarantee. General compiler
-CLI integration, host-backed snapshots, and later semantic and backend milestones remain future
-work.
+still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
+checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
+and result. It accepts exact integer, Boolean, and unit literals, parameter reads, explicit returns,
+and unit fallthrough. An immediate integer return context selects its type, including through a
+resolved alias. Without context, an integer literal defaults to `i32`. For example, demanding
+`answer` succeeds without checking `broken`; demanding `broken` rejects the unknown name at its
+written span:
+
+```silk,ignore
+fn answer() -> i32 { return 42 }
+fn broken() -> i32 { return missing }
+```
+
+`fn fits() -> u8 { return 255 }` succeeds, while `fn tooLarge() -> u8 { return 256 }` rejects the
+exact out-of-range value. A unit function can return `()` or fall through an empty body. A reachable
+non-unit fallthrough, incompatible return, or unsupported statement or expression is an anchored
+rejection. A completed body answer retains typed nodes, its source observation, and a signature
+dependency for cache reuse and request replay. A body demand checks only that declaration; it does
+not execute user code or prove that the whole program is valid.
+
+This native semantic API is not wired into the inspection executable above. Local bindings, calls,
+branches, operators, pointer-sized types, effects, generic bodies, static evaluation, conformance,
+layout, and code emission are outside the current body subset. Unused declarations with these forms
+remain indexed. The authored HIR keeps integer sign, radix, and exact decimal magnitude beyond
+`u64`; body checking compares those digits without rounding through a host number. Structured
+typed failures and cancellation release incomplete query reservations and publication frames. A
+later demand can retry the same store. A fatal runtime trap ends the process and has no such
+recovery guarantee. Compiler CLI integration, host-backed snapshots, and later semantic and backend
+milestones remain future work.
 
 ## Inspect a source file
 
