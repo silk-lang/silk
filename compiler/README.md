@@ -1,6 +1,7 @@
 # Self-hosted Silk frontend
 
-This directory contains the self-hosted lexer, parser, HIR lowering, and M1 semantic query library.
+This directory contains the self-hosted lexer, parser, HIR lowering, semantic queries, and the
+first demanded ordinary-body checks.
 The current executable reads one Silk file and prints its flat AST and syntax diagnostics, or its
 lowered module and declaration fingerprints in `hir` mode. It does not yet perform name resolution,
 type checking, or code generation on that input. The TypeScript bootstrap compiler still builds it.
@@ -45,7 +46,10 @@ to the held revision, with no host file snapshot or mutable filesystem provider 
 `Semantic.revise` selects another immutable revision. The next demand validates retained source
 bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
 affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. `Semantic.eventLog` records queries actually run or hit; replaying a completed
+facts reusable. A body can also retain its checked payload after a same-file or imported callee
+body edit when its own declaration and the semantic results it consumed still match. That
+validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
+queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
 reads and name observations. The focused source-written M1 checks use these records to prove
 avoided provider reads and semantic demands; they do not measure speed. This API is not wired into
@@ -67,14 +71,82 @@ cycles produce anchored semantic rejections.
 Demanded generic applications, type modifiers, complex type forms, variadic or generic functions,
 failure or requirement rows, constraints, and nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. Unused declarations with these forms are
-still indexed as written names and do not require semantic resolution. This M1 slice does not
-check bodies, evaluate static expressions, discover tests, perform conformance or layout checks,
-or emit code. The authored HIR keeps integer sign, radix, and exact decimal magnitude beyond
-`u64`; semantic integer typing is outside this slice. Structured typed failures and cancellation
-release incomplete query reservations and publication frames, so a later demand can retry the same
-store. A fatal runtime trap ends the process and has no such recovery guarantee. General compiler
-CLI integration, host-backed snapshots, and later semantic and backend milestones remain future
-work.
+still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
+checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
+and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
+and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
+selects an exact integer literal's type, including through a resolved alias. Without context, an
+integer literal defaults to `i32`. For example, demanding
+`answer` succeeds without checking `broken`; demanding `broken` rejects the unknown name at its
+written span:
+
+```silk,ignore
+fn answer() -> i32 { return 42 }
+fn broken() -> i32 { return missing }
+```
+
+`fn fits() -> u8 { return 255 }` succeeds, while `fn tooLarge() -> u8 { return 256 }` rejects the
+exact out-of-range value. `fn inferred() -> u8 { let value = 255 return value }` rejects because
+`value` is already `i32`; `fn annotated() -> u8 { let value: u8 = 255 return value }` succeeds.
+Initializers see preceding locals and parameters, but not the binding they initialize. A local
+may shadow a parameter in the function body; a second local with the same name in that block
+rejects. A full direct call to a same-module or imported ordinary nongeneric function checks each
+argument against its written parameter type in source order. An exact integer literal uses that
+parameter as its immediate type context; an already typed local keeps its fixed type. For example,
+`fn pair(first: u8, second: i32) -> i32 { return second }` accepts `pair(255, 1)`, but rejects
+passing a local initialized by `255` as its first argument because that local is already `i32`.
+Too many arguments, a non-callable target, and an empty call of a function that needs arguments
+receive distinct rejections. A valid nonempty partial application remains `Unsupported` in this
+wave.
+
+A unit function can return `()` or fall through an empty body. A reachable non-unit fallthrough,
+incompatible return, or unsupported statement or expression is an anchored
+rejection. A completed body answer retains typed nodes, the current source observation, callee signature
+dependencies, and required runtime-body declarations for later closure. A body demand checks only
+that declaration. Thus `fn caller() -> i32 { return leaf() }` can check successfully even when
+`leaf` has an invalid body; a later build must validate that required body. Mutual calls with written
+signatures do not force a body-query cycle. A body demand does not execute user code or prove that
+the whole program is valid. Imported calls retain positive and negative name, import, and source
+observations on fresh request hits.
+
+For example, after checking `caller`, changing only `leaf` from `return 1` to `return 2`
+keeps the caller's checked payload, including when both functions share a file:
+
+```silk,ignore
+fn leaf() -> i32 { return 1 }
+fn caller() -> i32 { let value = leaf() return value }
+```
+
+The edit leaves the called signature and the caller's declaration unchanged. Changing `leaf` to
+`fn leaf() -> bool { return true }` makes the caller's `i32` return invalid, so it is checked again
+and rejected. Adding or removing a previously missing imported declaration also updates its actual
+consumers. Reused bodies carry the current source observation and current dependency evidence.
+If a source edit moves the caller's syntax positions, changes its declaration, makes its owner
+mapping ambiguous, or changes a dependency whose result cannot be compared exactly in this scalar
+wave, the checker runs again. A changed nominal type result takes that conservative path. These
+events prove only checked semantic-body reuse;
+they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
+
+Ordinary runtime `if` statements require `bool` conditions and check both arms. For example,
+`fn choose(flag: bool) -> i32 { if flag { return 1 } else { return 2 } }` has no reachable
+fallthrough. `fn partial(flag: bool) -> i32 { if flag { return 1 } }` rejects because the false path
+reaches the end, while a unit function may fall through. An arm with `return missing` rejects even
+when a constant or a caller's known argument selects the other arm. A binding inside an arm stays
+in that arm; another arm or a later statement cannot read it. Checked bodies retain both branch
+nodes and whether each block can complete. Source after a return is still checked, although it
+cannot make a completed path reachable again.
+
+This native semantic API is not wired into the inspection executable above. Function values,
+sections, methods, operators, pointer-sized types, effects, generic bodies, static evaluation,
+conformance, layout, and code emission are outside the current body subset. For example,
+`fn selected() -> i32 { static if true { return 1 } else { return 2 } }` produces `Unsupported`
+when demanded; static selection does not use runtime branch checking. Unused declarations with
+these forms remain indexed. The authored HIR keeps integer sign, radix, and exact decimal
+magnitude beyond `u64`; body checking compares those digits without rounding through a
+host number. Structured typed failures and cancellation release incomplete query reservations and
+publication frames. A later demand can retry the same store. A fatal runtime trap ends the
+process and has no such recovery guarantee. Compiler CLI integration, host-backed snapshots, and
+later semantic and backend milestones remain future work.
 
 ## Inspect a source file
 
