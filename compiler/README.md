@@ -188,21 +188,20 @@ return `Unsupported` rather than a provisional type. A `where` clause is differe
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
 
-An omitted callable or Effect environment elides like a borrow. The one exception is a named
-function with no parameters: the omitted environment of its `Effect` result is `'static`, and a
-parameterless `effect fn` records the same `'static` environment. The default covers only that
-result's own environment. `fn nested() -> Effect<'static; Effect<i32>>` leaves the inner
-environment without a default, and callable results and Effects nested inside callables need their
-environments written. An `effect fn` with exactly one borrowed input, and otherwise only owned
-inputs that carry no generic parameter or non-static lifetime, records that input's region as its
-environment, like the equivalent function returning `Effect`. Other omitted `effect fn`
-environments are not recorded. These are owned-only inputs, several borrowed inputs, and generic
-or lifetime-bearing inputs, where the reference does not yet determine a single rule. A function
-with inputs but no single borrowed default, such as `fn later(value: i32) -> Effect<i32>`, is
-`Unsupported`. That is the current support boundary, not a ruling that the form is invalid. For
-example, `fn closed() -> Effect<i32>` is `Effect<'static; i32>`, and
-`fn later<'env>(value: &'env i32) -> Effect<'env; i32>` resolves. Invalid or unknown lifetimes and
-pointer qualifiers have anchored rejections. Written `[T; N]` arrays
+An omitted callable or Effect environment elides like a borrow. For an `Effect` result, inputs that
+carry no borrowed data, meaning owned values with no generic parameter and no lifetime other than
+`'static`, leave nothing to retain, so the omitted environment is `'static`. Both
+`fn closed() -> Effect<i32>` and `fn later(value: i32) -> Effect<i32>` have results of the form
+`Effect<'static; i32>`. A
+single borrowed input supplies the environment as before. Several borrowed inputs, or a generic or
+lifetime-bearing owned input with no borrowed input, stay `Unsupported` until the environment is
+written. An `effect fn` captures every input, and its omitted environment is the intersection of the
+borrowed inputs' regions: `'static` when there are none, and `'a & 'b` for two. A generic or
+lifetime-bearing owned input leaves it unrecorded, so the declaration must write
+`effect<'env> fn`. These defaults cover only the result's own environment.
+`fn nested() -> Effect<'static; Effect<i32>>` leaves the inner environment without a default, and
+callables and Effects nested inside callables need their environments written. Invalid or unknown
+lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
 retain the exact non-negative decimal literal extent and element type, including at zero length;
 extents needing static execution remain `Unsupported` at their source span. Member type requests
 with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be

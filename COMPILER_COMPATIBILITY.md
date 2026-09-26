@@ -53,94 +53,70 @@ Each entry records:
 
 ## Entries
 
-### Omitted environment of a no-input `fn` returning `Effect`
+### Omitted Effect environments elaborated from inputs
 
-- **Status:** Approved by Julia on 2026-09-26. The reference states it in
-  [LIFE-004](apps/docs/content/reference/lifetimes.md#life-004--invocation-lifetimes-and-retained-environments-are-independent).
+- **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
+  and borrowed inputs, the earlier Q1/Q2, were approved at 19:10 UTC.
+  - **Reference:** [LIFE-004](apps/docs/content/reference/lifetimes.md#life-004--invocation-lifetimes-and-retained-environments-are-independent)
+    states the rules, and
+    [EFF-008](apps/docs/content/reference/effect-contracts.md#eff-008--an-effect-function-declares-the-contract-of-its-returned-effect)
+    links its equivalence to them.
   - **Native:** implemented and verified at the signature level on draft PR #517.
-  - **Bootstrap:** not implemented. It rejects the omitted form.
-- **Rule:** in a named function with no parameters, an omitted environment of the `Effect` result
-  is `'static`. A parameterless `effect fn` constructs an Effect with the same `'static`
-  environment.
+  - **Bootstrap:** not implemented for ordinary functions.
+- **Rule:**
+  - **`effect fn`:** it captures every input. Its omitted environment is the intersection of its
+    borrowed inputs' regions: `'static` with none, the sole region with one, and an
+    order-independent, duplicate-free intersection with several. An owned input that carries no
+    borrowed data (no generic parameter, no lifetime other than `'static`) adds nothing.
+  - **Named `fn` returning `Effect<A>`:** the omitted environment of the result is `'static` when
+    no input carries borrowed data. Otherwise LIFE-003 applies unchanged: a single borrowed input
+    supplies it, and several borrowed inputs require it written.
 
   ```silk,ignore
-  fn closed() -> Effect<i32> { return effect { return 42 } }
-  // The result type is Effect<'static; i32>.
+  fn closed() -> Effect<i32> { return effect { return 42 } }      // Effect<'static; i32>
+  fn answerExplicit(input: i32) -> Effect<i32> { ... }            // Effect<'static; i32>
+  effect fn two(left: &i32, right: &i32) -> i32 { return 0 }     // environment 'left & 'right
   ```
 
-  Normal capture and lifetime checks still apply. The Effect cannot retain anything that is not
-  valid for `'static`. Related clauses:
-  [EFF-007](apps/docs/content/reference/effect-contracts.md#eff-007--an-effect-contract-has-success-failure-and-requirement-channels),
-  whose example is this function, and
-  [LIFE-003](apps/docs/content/reference/lifetimes.md#life-003--elision-is-determined-by-the-declaration-header).
-
-- **Scope limits:** this is a narrow rule, not a general static default:
-  - The input-based elision rules are unchanged. An omitted output lifetime or environment still
-    comes from the single borrowed input when there is one.
-  - It covers only the result's own environment. `fn f() -> Effect<'static; Effect<i32>>` gives the
-    inner Effect no default.
-  - It does not apply to callables or Effects nested inside a callable contract, or to anonymous
-    callables.
-  - Functions with owned or generic inputs are not covered by this approval; see the open
-    inconsistency below.
+- **Scope limits:**
+  - A generic or lifetime-bearing owned input is never treated as closed. An `effect fn` with one
+    leaves its environment unelaborated, and a named `fn` without a borrowed input needs its result
+    environment written. Either way the declaration writes the environment, for example
+    `effect<'env> fn`, together with bounds such as `T: 'env`.
+  - The default covers only the result's own environment. `fn f() -> Effect<'static; Effect<i32>>`
+    gives the inner Effect none. Callables and Effects nested inside a callable contract, and
+    anonymous callables, get no default.
+  - Capture and lifetime checks still apply.
 - **Compilers:**
   - **Native self-hosted frontend (`compiler/`):**
-    - `fn closed() -> Effect<i32>` resolves to `Effect<'static; i32>`.
-    - A parameterless `effect fn` records a `'static` environment.
-    - An `effect fn` with exactly one borrowed input, and otherwise only owned inputs that carry no
-      generic parameter or non-static lifetime, records that input's region. This follows the
-      existing LIFE-003 default and EFF-008's equivalence with a function returning `Effect`.
-    - `fn later(value: i32) -> Effect<i32>` stays `Unsupported`.
-    - An `effect fn` with owned-only inputs, several borrowed inputs, or generic or
-      lifetime-bearing inputs records no environment.
+    - `fn closed() -> Effect<i32>`, `fn later(value: i32) -> Effect<i32>` and a function taking
+      `Held<'static, i32>` all resolve to `Effect<'static; i32>`.
+    - `fn f<T>(value: T) -> Effect<i32>` and `fn f(left: &i32, right: &i32) -> Effect<i32>` are
+      `Unsupported`. The environment must be written.
+    - An `effect fn` records a `'static`, single-region or two-member environment as above, and
+      none for `T` or `Held<'a, i32>` inputs. In that case `Signature.environment` is `None`,
+      meaning unelaborated, never closed.
   - **TypeScript bootstrap:** checked 2026-09-26 with the CLI built from this checkout.
-    - `fn closed() -> Effect<i32>` reports `SEM0210 The omitted output lifetime has no unique input`
-      at the result.
-    - `fn closed() -> Effect<'static; i32>` compiles and runs.
-    - A parameterless `effect fn` compiles.
+    - `fn closed() -> Effect<i32>` and `fn later(value: i32) -> Effect<i32>` both report `SEM0210
+The omitted output lifetime has no unique input` at the result.
+    - The explicit `Effect<'static; i32>` compiles and runs.
+    - `effect fn` forms with no, owned, several borrowed, or generic inputs compile. Whether their
+      environments follow this rule has not been verified.
     - Aligning the bootstrap is a separate main-first repair, which has not been scheduled.
 - **Source migration:**
-  - The omission remains the approved form, and existing code that omits the environment here is
-    correct.
-  - The explicit spelling `fn closed() -> Effect<'static; i32>` is equivalent valid syntax, not a
-    compatibility shim. Source may choose it intentionally, for example to compile with the current
-    bootstrap.
+  - Omitting the environment is the approved form, and existing code that omits it here is correct.
+  - The explicit spelling `Effect<'static; A>` is equivalent valid syntax, not a compatibility shim.
+    Source may choose it intentionally, for example to compile with the current bootstrap.
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
     mismatch against this entry.
-- **Diagnostics and limits:**
-  - The parameterless form resolves without a diagnostic.
-  - A capture or retained borrow that is not valid for `'static` gets its ordinary lifetime or
-    ownership diagnostic once body checking covers Effects.
-  - A result with inputs and no single borrowed default keeps its ordinary outcome: `SEM0210` in
-    the bootstrap, and `Unsupported` in the native frontend until that elaboration is implemented.
 - **Evidence:** the `callableAndEffectSignatureContracts` case in
   `compiler/src/semantic/SemanticCases.silk` asserts:
-  - `closedEffect` equals `explicitStatic`;
-  - `inputEffect` and `nestedStatic` are `Unsupported`;
-  - `closedDeferred` records a `'static` environment;
-  - `borrowedDeferred` records one region;
-  - `inputDeferred`, `twoBorrowed` and `genericDeferred` record none.
-- **Open inconsistency (EFF-008, LIFE-003, LIFE-004):** EFF-008 (Confirmed) presents
-  `effect fn answer(input: i32) -> i32` as equivalent to `fn answerExplicit(input: i32) -> Effect<i32>`.
-  LIFE-003 gives an omitted output relationship no default when no single borrowed input supplies
-  one, and LIFE-004 says only that omitted environments are elaborated from the header. The two
-  compilers disagree on these cases:
-  - The bootstrap rejects the ordinary form with `SEM0210` and accepts the `effect fn` forms,
-    including one with two borrowed inputs.
-  - The native frontend reports `Unsupported` for the ordinary form and records no `effect fn`
-    environment.
-
-  That is the current support boundary. It is not proof that EFF-008's example is invalid, and the
-  reference has not been rewritten to settle it. The unresolved cases are:
-  - owned-only inputs;
-  - two or more borrowed inputs without a receiver, where LIFE-004's anonymous-callable reading
-    suggests an intersection;
-  - generic or lifetime-bearing inputs, whose contents obligations are not a nameable region.
-
-  A decision from Julia is needed before any of them gets a default.
-
-- **Open questions:** also undecided is any case of "no inputs" beyond an empty parameter list. None
-  of these may be assumed until it is decided.
+  - `closedEffect`, `inputEffect` and `heldEffect` equal `explicitStatic`;
+  - `genericEffect`, `twoBorrowEffect` and `nestedStatic` are `Unsupported`;
+  - `closedDeferred` and `inputDeferred` are `'static`;
+  - `borrowedDeferred` has one region, `twoBorrowed` two, and `sameRegion` (the same lifetime twice)
+    one;
+  - `genericDeferred` and `heldDeferred` are unelaborated.
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 

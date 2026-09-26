@@ -150,13 +150,24 @@ failure `E`, requirement row `R`, and run access. Omitted environments are elabo
 header or local context. An Effect that retains borrowed data is not detached merely because its
 success and failure types contain no views.
 
-A named function with no parameters retains nothing from inputs, so the omitted environment of its
-`Effect` result is `'static`: `fn closed() -> Effect<i32>` has result `Effect<'static; i32>`, and
-writing that spelling is equivalent. A parameterless `effect fn` constructs an Effect with the same
-`'static` environment. Ordinary capture and lifetime checks still apply, so such an Effect cannot
-retain anything that is not valid for `'static`. This default covers only the parameterless case
-and only the result's own environment; it does not apply to an Effect nested in that result or to
-callables and Effects inside a callable contract.
+An `effect fn` captures every input, so an omitted `effect fn` environment is elaborated from its
+inputs as the intersection of its borrowed inputs' regions. An owned input that carries no borrowed
+data, meaning no generic parameter and no lifetime other than `'static`, adds nothing. An
+`effect fn` with only such inputs therefore has a `'static` environment. One borrowed input gives
+that input's region, and several give their intersection, in any order and without repeats. A
+generic or lifetime-bearing owned input leaves the environment undetermined. Such a declaration
+writes `effect<'env> fn` with the matching `T: 'env` bounds.
+
+A named function whose result is an `Effect` with an omitted environment elides it from the header
+under LIFE-003. A single borrowed input supplies the environment, and several borrowed inputs
+require it to be written. When no input carries borrowed data, the environment is `'static`, so
+`fn closed() -> Effect<i32>` and `fn answerExplicit(input: i32) -> Effect<i32>` both have results
+of the form `Effect<'static; i32>`. A generic or lifetime-bearing owned input with no borrowed
+input needs the environment written.
+
+These defaults cover only the result's own environment. They do not apply to an Effect nested in
+that result, or to callables and Effects inside a callable contract. Ordinary capture and lifetime
+checks still apply, so an Effect cannot retain anything that is not valid for its environment.
 
 Effect environment positions also accept finite intersections: `Effect<'call & 'env; A ! E ? R>`
 and `effect<'a & 'b> fn`. An intersection is valid only while every constituent is valid. It is
