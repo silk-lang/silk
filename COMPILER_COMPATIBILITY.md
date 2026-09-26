@@ -64,13 +64,16 @@ Each entry records:
   - **Native:** implemented and verified at the signature level on draft PR #517.
   - **Bootstrap:** not implemented for ordinary functions.
 - **Rule:**
-  - **`effect fn`:** it captures every input. Its omitted environment is the intersection of its
-    borrowed inputs' regions: `'static` with none, the sole region with one, and an
-    order-independent, duplicate-free intersection with several. An owned input that carries no
-    borrowed data (no generic parameter, no lifetime other than `'static`) adds nothing.
+  - **Retained regions:** an input retains the regions of its borrows, its non-`'static` nominal
+    lifetime arguments, and its callable or Effect environments. The parameter and channel types
+    of a callable or Effect input are not stored. Stored contents involving a type parameter, such
+    as `value: T` or `Box<T>`, have no nameable region.
+  - **`effect fn`:** it captures every input. Its omitted environment is the order-independent,
+    duplicate-free intersection of the regions its inputs retain, `'static` when they retain none.
+    Generic stored contents make it ambiguous (SEM0210) at that input.
   - **Named `fn` returning `Effect<A>`:** the omitted environment of the result is `'static` when
-    no input carries borrowed data. Otherwise LIFE-003 applies unchanged: a single borrowed input
-    supplies it, and several borrowed inputs require it written.
+    no input retains anything. Otherwise LIFE-003 applies unchanged: a single borrowed input
+    supplies it, and any other case requires it written.
 
   ```silk,ignore
   fn closed() -> Effect<i32> { return effect { return 42 } }      // Effect<'static; i32>
@@ -79,10 +82,8 @@ Each entry records:
   ```
 
 - **Scope limits:**
-  - A generic or lifetime-bearing owned input is never treated as closed. An `effect fn` with one
-    leaves its environment unelaborated, and a named `fn` without a borrowed input needs its result
-    environment written. Either way the declaration writes the environment, for example
-    `effect<'env> fn`, together with bounds such as `T: 'env`.
+  - Generic stored contents are never treated as closed. The declaration writes the environment,
+    for example `effect<'env> fn`, together with bounds such as `T: 'env`.
   - The default covers only the result's own environment. `fn f() -> Effect<'static; Effect<i32>>`
     gives the inner Effect none. Callables and Effects nested inside a callable contract, and
     anonymous callables, get no default.
@@ -91,17 +92,24 @@ Each entry records:
   - **Native self-hosted frontend (`compiler/`):**
     - `fn closed() -> Effect<i32>`, `fn later(value: i32) -> Effect<i32>` and a function taking
       `Held<'static, i32>` all resolve to `Effect<'static; i32>`.
-    - `fn f<T>(value: T) -> Effect<i32>` and `fn f(left: &i32, right: &i32) -> Effect<i32>` are
-      `Unsupported`. The environment must be written.
-    - An `effect fn` records a `'static`, single-region or two-member environment as above, and
-      none for `T` or `Held<'a, i32>` inputs. In that case `Signature.environment` is `None`,
-      meaning unelaborated, never closed.
+    - `fn f<T>(value: T) -> Effect<i32>`, `fn f(left: &i32, right: &i32) -> Effect<i32>` and
+      `fn f<'a>(value: Held<'a, i32>) -> Effect<i32>` reject as `AmbiguousLifetime` at the result.
+    - An `effect fn` records a `'static`, single-region or two-member environment as above,
+      `'a` for a `Held<'a, i32>` input, `'static` for `once Effect<'static; A ! E>` or
+      `fn<'static>(A) -> A` inputs, and the pending region for `once Effect<A>`. A stored `T`
+      input rejects as `AmbiguousLifetime` at that parameter's type.
   - **TypeScript bootstrap:** checked 2026-09-26 with the CLI built from this checkout.
     - `fn closed() -> Effect<i32>` and `fn later(value: i32) -> Effect<i32>` both report `SEM0210
 The omitted output lifetime has no unique input` at the result.
     - The explicit `Effect<'static; i32>` compiles and runs.
-    - `effect fn` forms with no, owned, several borrowed, or generic inputs compile. Whether their
-      environments follow this rule has not been verified.
+    - `effect fn` forms with no, owned, several borrowed, or generic stored inputs compile. Whether
+      their environments follow this rule has not been verified.
+    - **Divergence:** the bootstrap accepts an `effect fn` with generic stored inputs and an omitted
+      environment; the native frontend rejects it. A 2026-09-26 scan of
+      `packages/compiler/stdlib` found about 79 such declarations, for example `Effect.of(value: A)`,
+      `raise(error: E)`, `HashMap.insert(key: K, ...)` and handler-taking `with*` functions. They
+      need a main-first migration to `effect<'env> fn` with `T: 'env` bounds before the native
+      frontend checks the standard library. Not started.
     - Aligning the bootstrap is a separate main-first repair, which has not been scheduled.
 - **Source migration:**
   - Omitting the environment is the approved form, and existing code that omits it here is correct.
@@ -112,11 +120,12 @@ The omitted output lifetime has no unique input` at the result.
 - **Evidence:** the `callableAndEffectSignatureContracts` case in
   `compiler/src/semantic/SemanticCases.silk` asserts:
   - `closedEffect`, `inputEffect` and `heldEffect` equal `explicitStatic`;
-  - `genericEffect`, `twoBorrowEffect` and `nestedStatic` are `Unsupported`;
-  - `closedDeferred` and `inputDeferred` are `'static`;
-  - `borrowedDeferred` has one region, `twoBorrowed` two, and `sameRegion` (the same lifetime twice)
-    one;
-  - `genericDeferred` and `heldDeferred` are unelaborated.
+  - `genericEffect`, `twoBorrowEffect` and `nestedStatic` reject as `AmbiguousLifetime`, and
+    `heldOpenEffect` does so spanning its written `Effect<i32>` result;
+  - `closedDeferred`, `inputDeferred`, `runPending` and `callbackDeferred` are `'static`;
+  - `borrowedDeferred`, `heldDeferred` and `keepPending` have one region, `twoBorrowed` two, and
+    `sameRegion` (the same lifetime twice) one;
+  - `genericDeferred` rejects as `AmbiguousLifetime` spanning its stored type parameter.
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 

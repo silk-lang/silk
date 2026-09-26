@@ -150,20 +150,24 @@ failure `E`, requirement row `R`, and run access. Omitted environments are elabo
 header or local context. An Effect that retains borrowed data is not detached merely because its
 success and failure types contain no views.
 
-An `effect fn` captures every input, so an omitted `effect fn` environment is elaborated from its
-inputs as the intersection of its borrowed inputs' regions. An owned input that carries no borrowed
-data, meaning no generic parameter and no lifetime other than `'static`, adds nothing. An
-`effect fn` with only such inputs therefore has a `'static` environment. One borrowed input gives
-that input's region, and several give their intersection, in any order and without repeats. A
-generic or lifetime-bearing owned input leaves the environment undetermined. Such a declaration
+An `effect fn` captures every input, so an omitted `effect fn` environment is the intersection of
+the regions its inputs retain, in any order and without repeats. An input retains the region of a
+borrow, each non-`'static` lifetime argument of a nominal type, and the environment of a callable
+or Effect, including those nested in its stored contents. The parameter, success, failure, and
+requirement types of a callable or Effect input are not stored, so
+`effect fn run<A, E>(pending: once Effect<'static; A ! E>) -> A ! E` has a `'static` environment and
+`effect fn keep<A>(pending: once Effect<A>) -> A` retains the pending Effect's region. An input
+whose stored contents involve a type parameter, such as `value: T` or `Box<T>`, has no nameable
+region. The omitted environment is then ambiguous (SEM0210) at that input, and the declaration
 writes `effect<'env> fn` with the matching `T: 'env` bounds.
 
 A named function whose result is an `Effect` with an omitted environment elides it from the header
 under LIFE-003. A single borrowed input supplies the environment, and several borrowed inputs
 require it to be written. When no input carries borrowed data, the environment is `'static`, so
 `fn closed() -> Effect<i32>` and `fn answerExplicit(input: i32) -> Effect<i32>` both have results
-of the form `Effect<'static; i32>`. A generic or lifetime-bearing owned input with no borrowed
-input needs the environment written.
+of the form `Effect<'static; i32>`. Any other input that retains a region or stores generic
+contents, with no single borrowed input, leaves the omitted environment ambiguous (SEM0210), so
+`fn f<'a>(value: Held<'a, i32>) -> Effect<i32>` writes `Effect<'a; i32>`.
 
 These defaults cover only the result's own environment. They do not apply to an Effect nested in
 that result, or to callables and Effects inside a callable contract. Ordinary capture and lifetime

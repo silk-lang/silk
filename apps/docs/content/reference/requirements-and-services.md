@@ -341,9 +341,9 @@ through a row-polymorphic function preserves every service, nominal role, and re
 that row:
 
 ```silk
-fn preserve<A, ?R>(
-  pending: once Effect<A ? R>
-) -> Effect<A ? R> {
+fn preserve<'env, A, ?R>(
+  pending: once Effect<'env; A ? R>
+) -> Effect<'env; A ? R> {
   return move pending
 }
 ```
