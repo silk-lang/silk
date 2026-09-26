@@ -59,19 +59,30 @@ The current semantic subset resolves local names, ordinary namespace imports, se
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
 one namespace segment and one public member segment. Import paths map to slash-separated `.silk`
 logical source paths within the importing module's source origin and package. Selected public import
-chains resolve to the canonical declaration. The
-store resolves nongeneric type aliases and nominal type identities without inspecting fields or
-layout. Written nongeneric function signatures accept primitive,
-unit, and named alias or nominal parameter and result types; they do not inspect function bodies.
+chains resolve to the canonical declaration. The store resolves type aliases and nominal type
+identities without inspecting fields or layout.
+Ordinary type binders belong to their declarations; written function signatures resolve those
+binders and explicit nominal or alias type arguments, including substitution through alias targets.
+They accept primitive, unit, and named alias or nominal parameter and result types without
+inspecting function bodies. For example, demanding the signature of `use` resolves `Same<bool>`
+to `Pair<bool, bool>`:
+
+```silk,ignore
+struct Pair<A, B> {}
+type Same<T> = Pair<T, T>
+fn use(value: Same<bool>) -> Same<bool> { return move value }
+```
+
 The supported primitive spellings are `bool`, `char`, signed and unsigned integers through 64 bits
 and pointer size, `f32`, `f64`, and `string`. A missing result means unit. Public contracts reject
 private nominal types; missing modules, inaccessible members, collisions, and alias or import-name
 cycles produce anchored semantic rejections.
 
-Demanded generic applications, type modifiers, complex type forms, variadic or generic functions,
-failure or requirement rows, constraints, and nonstandard callable header modifiers currently
-return `Unsupported` rather than a provisional type. Unused declarations with these forms are
-still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
+Generic calls and demanded generic bodies, type inference, bounds, lifetime or row binders, type
+modifiers, complex type forms, variadic functions, failure or requirement rows, constraints, and
+nonstandard callable header modifiers currently return `Unsupported` rather than a provisional
+type. Nominal field and machine layout facts are not inspected. Unused declarations with these
+forms are still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
 and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
 and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
