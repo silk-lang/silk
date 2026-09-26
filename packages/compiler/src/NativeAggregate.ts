@@ -644,17 +644,6 @@ export const dropThroughPlan = (
       )
       Emitter.branch(body, following)
       Emitter.setInsertionPoint(body, last)
-      const loadLanes = (type: SilkType.Type, byteOffset: number, laneTag: string) => {
-        return NativePlace.loadLanes(
-          NativePlace.stored(
-            program.layout,
-            type,
-            NativeLanePointer.lanePointer(lanePointers, body, base, byteOffset, laneTag),
-          ),
-          context.storage,
-          laneTag,
-        )
-      }
       const helper = FunctionIndex.nativeCandidates(
         declared,
         LocalSharedPayloadCleanup.declaration,
@@ -666,7 +655,24 @@ export const dropThroughPlan = (
       NativeCall.callValues(
         call,
         helper,
-        NativeArgument.fromValues(loadLanes(plan.element, block.valueOffset, `${tag}_value`)),
+        // The helper's indirect parameter receives the payload's control-block address; loading
+        // and re-storing every payload lane here made each release site scale with payload shape.
+        {
+          _tag: 'Values',
+          values: [
+            NativePlace.stored(
+              program.layout,
+              plan.element,
+              NativeLanePointer.lanePointer(
+                lanePointers,
+                body,
+                base,
+                block.valueOffset,
+                `${tag}_value`,
+              ),
+            ),
+          ],
+        },
         `${tag}_value_cleanup`,
       )
       dropThroughPlan(

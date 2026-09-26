@@ -701,6 +701,38 @@ pub effect fn main() -> () ! Problem {
   }),
 )
 
+it.effect('passes a released shared payload to its cleanup helper by address', () =>
+  Effect.gen(function* () {
+    const artifact = yield* emit(
+      `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+struct Payload {
+  first: i32
+  second: i32
+  third: i32
+  fourth: i32
+}
+pub effect fn main() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let shared = run (Shared.make<Payload>(Payload { first: 1, second: 2, third: 3, fourth: 4 })
+    |> Effect.provideMut<Allocator>(&mut allocator))
+  drop shared
+  return 1
+}`,
+      { mode: 'release' },
+    )
+    const releases = artifact.ir
+      .split(/\n(?=[\w.]+:)/)
+      .filter((block) => /^[\w.]+_last:/.test(block) && block.includes('payloadCleanup'))
+    assert.isNotEmpty(releases)
+    for (const release of releases) {
+      assert.match(release, /call [^\n]+payloadCleanup[^\n]*\(ptr %[\w.]+_value[,)]/)
+      assert.notMatch(release, /= load i32|_argument = alloca/)
+    }
+  }),
+)
+
 it.effect('declares each reachable foreign symbol once and calls through its unwind guard', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
