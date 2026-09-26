@@ -120,8 +120,9 @@ its written `! E` and `? R` channels; omitting them means `never` and the empty 
 `never` is the empty structural union. `A | B` flattens nested unions and drops repeated members, so
 member order does not matter. A row keeps one entry per service and `at` role, with the strongest
 written access, plus any `?R` row parameters. Bounds such as `T: Hash + Clock + 'a` and
-`'long: 'short` are recorded in written order. For example, both headers below have the same
-channels, and `copy` retains both bounds:
+`'long: 'short` are recorded in written order. A callable or Effect bound such as
+`F: fn(i32) -> i32` records a representation parameter rather than an interface requirement. For
+example, both headers below have the same channels, and `copy` retains both bounds:
 
 ```silk,ignore
 service Clock {}
@@ -134,20 +135,38 @@ interface Hash {}
 fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
 ```
 
+A callable contract can quantify invocation lifetimes:
+`for<'call> fn<'env>(&'call i32) -> &'call i32` names them. An omitted lifetime in a callable
+parameter is a fresh invocation lifetime, so `fn<'env>(&i32) -> &i32` is the same contract; an
+omitted result lifetime inside the contract uses its sole borrowed parameter. Binder names are not
+identity. A quantified contract inside another quantified contract is rejected, including one
+quantified only by an omitted lifetime. An environment such as `Effect<'a & 'b; A>` is an
+order-independent intersection in which `'static` and repeats disappear, so `'b & 'static & 'a` is
+the same environment and `'a & 'a` is `'a`. A written `effect<'env> fn` or `effect<'a & 'b> fn`
+environment is recorded with the signature:
+
+```silk,ignore
+fn apply(transform: fn<'static>(&i32) -> &i32) -> i32 { return 0 }
+effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32 { return 0 }
+fn both<'a, 'b>(pending: Effect<'a & 'b; i32>) -> i32 { return 0 }
+```
+
 Only services may appear in a requirement row, and an `at` path must name a role. Interfaces and
 services are both valid bounds; a bound records the requirement and proves no conformance.
-Requirement and bound errors, a failure channel on an ordinary function, a `?R` binder used as an
-ordinary type, and a borrow or bare callable or Effect inside a structural union have anchored
-rejections. These contracts do not solve conformances, select providers, check captures, or run
-Effects. The scalar body checker still rejects effect bodies, generic bodies, and calls to effect
-or `unsafe` functions as `Unsupported`, even when their signatures resolve.
+Requirement and bound errors, a failure or requirement channel on an ordinary function, a `?R`
+binder used as an ordinary type, an ambiguous or nested callable quantifier, and a borrow or bare
+callable or Effect inside a structural union have anchored rejections. These contracts do not
+solve conformances, select providers, check captures, or run Effects. The scalar body checker still
+rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
+even when their signatures resolve.
 
 Generic calls and demanded generic bodies, type inference, row arguments and bounds on type
-declarations, `where` clauses, `for<'a>` quantifiers and elided lifetimes inside callable contracts,
-Effect environment intersections, row subtraction, requirements on type parameters or on ordinary
-functions, variadic functions, static parameters, and other nonstandard callable header modifiers
-currently return `Unsupported` rather than a provisional type. An omitted callable or Effect environment elides like
-a borrow; in a result with no single borrowed input to supply it, write the environment explicitly.
+declarations, `where` clauses, row subtraction such as `Without<R, K>` (which belongs to the later
+provision and requirement-algebra work), requirements on type parameters, variadic functions,
+static parameters, and other nonstandard callable header modifiers currently return `Unsupported`
+rather than a provisional type. An omitted callable or Effect environment elides like a borrow; in
+a result with no single borrowed input to supply it, write the environment explicitly. An omitted
+`effect fn` environment is not recorded yet.
 For example, `fn later() -> Effect<i32>` is `Unsupported`, while
 `fn later<'env>(value: &'env i32) -> Effect<'env; i32>` resolves. Invalid or unknown lifetimes and
 pointer qualifiers have anchored rejections. Written `[T; N]` arrays
