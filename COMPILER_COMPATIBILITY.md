@@ -108,15 +108,24 @@ The omitted output lifetime has no unique input` at the result.
     - `effect fn` forms with no, owned, several borrowed, or generic stored inputs compile. Whether
       their environments follow this rule has not been verified.
     - **Divergence:** the bootstrap accepts an `effect fn` with generic stored inputs and an omitted
-      environment; the native frontend rejects it. A 2026-09-26 scan of
-      `packages/compiler/stdlib` found about 79 such declarations, for example `Effect.of(value: A)`,
-      `raise(error: E)`, `HashMap.insert(key: K, ...)` and handler-taking `with*` functions. They
-      need a main-first migration to `effect<'env> fn` with `T: 'env` bounds. That migration and
-      the matching bootstrap alignment are required, tracked prerequisite work owned by the
-      coordinator before the native frontend checks the standard library, not optional cleanup.
-    - Aligning the bootstrap is a separate main-first repair, which has not been scheduled.
+      environment; the native frontend rejects it. The same holds for an `effect fn` whose success
+      type is an Effect with an omitted environment. Affected standard-library declarations
+      include `Effect.of(value: A)`, `raise(error: E)`, `HashMap.insert(key: K, ...)` and
+      handler-taking `with*` functions. A rough 2026-09-26 text scan suggested several dozen; the
+      authoritative inventory has not been taken.
+    - Aligning the bootstrap and migrating those declarations to `effect<'env> fn` with `T: 'env`
+      bounds is required main-first work, tracked as the in-progress prerequisite task "Fix ·
+      Bootstrap Effect environments & source coherence" (note
+      `814eae87-839e-4644-bd0f-5a1f38e52deb`). The native frontend does not check the standard
+      library until it lands.
 - **Source migration:**
-  - Omitting the environment is the approved form, and existing code that omits it here is correct.
+  - Omitting the environment is the approved form where the rules above give it a value: an
+    ordinary function's Effect result whose inputs retain nothing or that has one borrowed input,
+    and an `effect fn` whose inputs store no generic contents.
+  - Source outside those cases must write the environment: an `effect fn` with generic stored
+    inputs writes `effect<'env> fn` with `T: 'env` bounds, and an `effect fn` whose success type is
+    an Effect writes that Effect's environment, for example `Effect<'static; A>`. Existing source
+    that omits it there needs migration.
   - The explicit spelling `Effect<'static; A>` is equivalent valid syntax, not a compatibility shim.
     Source may choose it intentionally, for example to compile with the current bootstrap.
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
