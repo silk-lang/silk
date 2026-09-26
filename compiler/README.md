@@ -70,9 +70,10 @@ failure or requirement rows, constraints, and nonstandard callable header modifi
 return `Unsupported` rather than a provisional type. Unused declarations with these forms are
 still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
-and result. It accepts exact integer, Boolean, and unit literals, parameter reads, explicit returns,
-and unit fallthrough. An immediate integer return context selects its type, including through a
-resolved alias. Without context, an integer literal defaults to `i32`. For example, demanding
+and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
+and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
+selects an exact integer literal's type, including through a resolved alias. Without context, an
+integer literal defaults to `i32`. For example, demanding
 `answer` succeeds without checking `broken`; demanding `broken` rejects the unknown name at its
 written span:
 
@@ -82,13 +83,17 @@ fn broken() -> i32 { return missing }
 ```
 
 `fn fits() -> u8 { return 255 }` succeeds, while `fn tooLarge() -> u8 { return 256 }` rejects the
-exact out-of-range value. A unit function can return `()` or fall through an empty body. A reachable
+exact out-of-range value. `fn inferred() -> u8 { let value = 255 return value }` rejects because
+`value` is already `i32`; `fn annotated() -> u8 { let value: u8 = 255 return value }` succeeds.
+Initializers see preceding locals and parameters, but not the binding they initialize. A local
+may shadow a parameter in the function body; a second local with the same name in that block
+rejects. A unit function can return `()` or fall through an empty body. A reachable
 non-unit fallthrough, incompatible return, or unsupported statement or expression is an anchored
 rejection. A completed body answer retains typed nodes, its source observation, and a signature
 dependency for cache reuse and request replay. A body demand checks only that declaration; it does
 not execute user code or prove that the whole program is valid.
 
-This native semantic API is not wired into the inspection executable above. Local bindings, calls,
+This native semantic API is not wired into the inspection executable above. Calls,
 branches, operators, pointer-sized types, effects, generic bodies, static evaluation, conformance,
 layout, and code emission are outside the current body subset. Unused declarations with these forms
 remain indexed. The authored HIR keeps integer sign, radix, and exact decimal magnitude beyond
