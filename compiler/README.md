@@ -362,9 +362,10 @@ them back to a local owner, as required by Silk's ownership rules.
 
 ## Verification
 
-Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 discovery root
-imports the existing query, source-index, and semantic cases. The focused HIR run checks exact
-integer magnitudes and fingerprints without pulling the full HIR suite into the semantic binary.
+Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 query root
+imports query and source-index cases; the semantic cases use their own root to keep each native
+compilation within the CI heap limit. The focused HIR run checks exact integer magnitudes and
+fingerprints without pulling the full HIR suite into the semantic binary.
 `--no-cache` executes assertions even if a previous run stored passing results. The focused Linux
 workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
 Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
@@ -373,6 +374,7 @@ named `selfhost-*`; pushing one does not start a second CI run before its pull r
 ```sh
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --filter integer --no-cache
 ```
 

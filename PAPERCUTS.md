@@ -2,6 +2,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-26 · The combined M1 native test root reached JavaScript heap OOM in focused CI before any case ran, and `--filter` could not reduce compilation because it selects only at runtime · Run the query/source-index root and semantic root sequentially in the same job; all 27 cases pass uncached within the existing heap limit · self-hosted compiler
+
 - 2026-09-26 · A focused `Shared.with` assertion over optional generic-kind details passed source
   checking but failed during LLVM emission · Store the diagnostic's kind fields directly and inspect
   them with a named predicate; the focused native case then passed · self-hosted compiler
