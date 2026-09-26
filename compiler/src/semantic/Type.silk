@@ -2,11 +2,13 @@
 //!
 //! # When to use
 //! Use [`Type`] in signatures and typed bodies. Use [`equals`] to compare types from different
-//! queries or source revisions without comparing allocation positions.
+//! queries or source revisions without comparing allocation positions. Use [`Row`] for the
+//! normalized requirement channel of an Effect contract.
 
-import hir.Hir {Access, Multiplicity}
+import hir.Hir {Access, CallableMode, Multiplicity}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
+import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.option {Option}
 import silk.pointer {Pointer}
@@ -77,6 +79,62 @@ pub union Type {
   },
   /// An authored fixed array with an exact, target-independent decimal extent.
   Array {pub element: Shared<Type>, pub extent: Bytes},
+  /// A structural union: an unordered, duplicate-free set of two or more ordinary value types.
+  ///
+  /// The empty member set is `never`. A one-member union is represented by that member.
+  Union {pub members: Vector<Shared<Type>>},
+  /// A callable contract. Parameter order is identity; the environment is the captures' validity.
+  Callable {
+    /// Shared, exclusive, or consuming access to the captured environment.
+    pub mode: CallableMode,
+    /// Whether the final invocation requires an `unsafe` acknowledgement.
+    pub isUnsafe: bool,
+    /// The validity of the retained environment.
+    pub environment: Shared<Lifetime>,
+    /// The parameter types in written order.
+    pub parameters: Vector<Shared<Type>>,
+    /// The result type.
+    pub result: Shared<Type>,
+  },
+  /// A deferred computation with independent success, failure, and requirement channels.
+  Effect {
+    /// Shared, exclusive, or consuming run access.
+    pub mode: CallableMode,
+    /// The validity of the retained environment.
+    pub environment: Shared<Lifetime>,
+    /// The value produced on success.
+    pub success: Shared<Type>,
+    /// The ordinary typed-failure type; `never` when omitted.
+    pub failure: Shared<Type>,
+    /// The normalized requirement row; empty when omitted.
+    pub requirements: Shared<Row>,
+  },
+}
+
+/// One requirement-row entry, keyed by a service application and a nominal role.
+pub struct Requirement {
+  /// The service application the Effect needs when it runs.
+  pub capability: Shared<Type>
+  /// The nominal role declaration's type; absent selects the implicit default role.
+  pub roleType: Option<Shared<Type>>
+  /// The strongest access required for this key; not part of the key.
+  pub access: Access
+}
+
+/// One declaration-owned `?R` requirement-row parameter, independent of its spelling.
+pub struct RowParameter {
+  /// The declaration that binds the parameter.
+  pub declaration: DeclarationId
+  /// The parameter's position in its owner's complete binder list.
+  pub ordinal: usize
+}
+
+/// A normalized requirement row. Entry order and repetition do not affect identity.
+pub struct Row {
+  /// Distinct service-role keys, each with its strongest required access.
+  pub entries: Vector<Requirement>
+  /// Distinct row parameters whose rows this row includes.
+  pub parameters: Vector<RowParameter>
 }
 
 /// One canonical generic argument, with its type or lifetime kind retained.
@@ -187,6 +245,23 @@ fn sameAccess(left: Access, right: Access) -> bool {
   }
 }
 
+fn sameMode(left: CallableMode, right: CallableMode) -> bool {
+  return match left {
+    CallableMode.Shared => match right {
+      CallableMode.Shared => true
+      _ => false
+    }
+    CallableMode.Mutable => match right {
+      CallableMode.Mutable => true
+      _ => false
+    }
+    CallableMode.Once => match right {
+      CallableMode.Once => true
+      _ => false
+    }
+  }
+}
+
 fn sameMultiplicity(left: Multiplicity, right: Multiplicity) -> bool {
   return match left {
     Multiplicity.Single => match right {
@@ -213,7 +288,223 @@ fn sameArgument(left: &Argument, right: &Argument) -> bool {
   }
 }
 
+fn unionLength(value: &Type) -> usize {
+  return match & value.* {
+    Type.Union {members} => Vector.length<Shared<Type>>(&members)
+    _ => usize.MAX
+  }
+}
+
+fn unionMemberAt(value: &Type, at: usize) -> Option<Shared<Type>> {
+  if let Type.Union {members} = &value.* {
+    let values = Vector.asSlice<Shared<Type>>(&members)
+    return Option.some<Shared<Type>>(Shared.clone<Type>(&values[at]))
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn sameOrdered(left: &Vector<Shared<Type>>, right: &Vector<Shared<Type>>) -> bool {
+  let first = Vector.asSlice<Shared<Type>>(left)
+  let second = Vector.asSlice<Shared<Type>>(right)
+  if first.length != second.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if !sameShared(&first[at], &second[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn containsType(members: &[Shared<Type>], candidate: &Shared<Type>) -> bool {
+  let mut at = usize.ZERO
+  while at < members.length {
+    if sameShared(&members[at], candidate) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sameMembers(left: &Vector<Shared<Type>>, right: &Vector<Shared<Type>>) -> bool {
+  let first = Vector.asSlice<Shared<Type>>(left)
+  let second = Vector.asSlice<Shared<Type>>(right)
+  if first.length != second.length {
+    return false
+  }
+  // Both sides are duplicate-free, so equal lengths and inclusion give set equality.
+  let mut at = usize.ZERO
+  while at < first.length {
+    if !containsType(second, &first[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameRole(left: &Option<Shared<Type>>, right: &Option<Shared<Type>>) -> bool {
+  return match & left.* {
+    Option<Shared<Type>>.Some {value} => match & right.* {
+      Option<Shared<Type>>.Some {value: compared} => sameShared(&value, &compared)
+      Option<Shared<Type>>.None => false
+    }
+    Option<Shared<Type>>.None => match & right.* {
+      Option<Shared<Type>>.Some {value: _} => false
+      Option<Shared<Type>>.None => true
+    }
+  }
+}
+
+fn sameKey(left: &Requirement, right: &Requirement) -> bool {
+  return sameRole(&left.roleType, &right.roleType) && sameShared(
+    &left.capability,
+    &right.capability,
+  )
+}
+
+fn keyAt(entries: &[Requirement], candidate: &Requirement) -> usize {
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if sameKey(&entries[at], candidate) {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn hasParameter(parameters: &[RowParameter], candidate: &RowParameter) -> bool {
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if parameters[at].ordinal == candidate.ordinal && DeclarationId.equals(
+      &parameters[at].declaration,
+      &candidate.declaration,
+    ) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sameRowWith(first: &Row, right: &Shared<Row>) -> bool {
+  return Shared.with<Row, bool>(
+    right,
+    fn(second: &Row) -> bool {
+      return Row.equals(first, second)
+    },
+  )
+}
+
+fn rowAddress(value: &Row) -> usize {
+  return Pointer.address<Row>(Pointer.fromRef<Row>(value))
+}
+
+fn sameRows(left: &Shared<Row>, right: &Shared<Row>) -> bool {
+  // One Effect compared with itself reaches the same Shared row on both sides.
+  if Shared.with<Row, usize>(left, rowAddress) == Shared.with<Row, usize>(right, rowAddress) {
+    return true
+  }
+  return Shared.with<Row, bool>(
+    left,
+    fn(first: &Row) -> bool {
+      return sameRowWith(first, right)
+    },
+  )
+}
+
+impl Row {
+  /// Creates the empty row written by omitting `? R` or writing `? never`.
+  pub fn empty() -> Row {
+    return Row {entries: Vector.make<Requirement>(), parameters: Vector.make<RowParameter>()}
+  }
+  /// Adds one entry, keeping the strongest access when its service-role key is already present.
+  pub effect fn require(self: &mut Self, requirement: Requirement) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let found = keyAt(Vector.asSlice<Requirement>(&self.entries), &requirement)
+    if found == usize.MAX {
+      run Vector.append<Requirement>(&mut self.entries, move requirement)
+      return ()
+    }
+    // Exclusive access is the stronger requirement for one key.
+    if !sameAccess(requirement.access, Access.Shared) {
+      let entries = Vector.asMutSlice<Requirement>(&mut self.entries)
+      entries[found].access = Access.Mutable
+    }
+    return ()
+  }
+  /// Adds one row parameter unless the row already includes it.
+  pub effect fn include(self: &mut Self, parameter: RowParameter) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    if !hasParameter(Vector.asSlice<RowParameter>(&self.parameters), &parameter) {
+      run Vector.append<RowParameter>(&mut self.parameters, move parameter)
+    }
+    return ()
+  }
+  /// Reports whether two normalized rows have the same keys, accesses, and row parameters.
+  pub fn equals(self: &Self, other: &Row) -> bool {
+    let first = Vector.asSlice<Requirement>(&self.entries)
+    let second = Vector.asSlice<Requirement>(&other.entries)
+    let firstParameters = Vector.asSlice<RowParameter>(&self.parameters)
+    let secondParameters = Vector.asSlice<RowParameter>(&other.parameters)
+    if first.length != second.length || firstParameters.length != secondParameters.length {
+      return false
+    }
+    let mut at = usize.ZERO
+    while at < first.length {
+      let found = keyAt(second, &first[at])
+      if found == usize.MAX || !sameAccess(first[at].access, second[found].access) {
+        return false
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < firstParameters.length {
+      if !hasParameter(secondParameters, &firstParameters[at]) {
+        return false
+      }
+      at = at + usize.ONE
+    }
+    return true
+  }
+}
+
 impl Type {
+  /// Adds one union member, flattening a nested union and dropping a repeated member.
+  pub effect fn joinMember(members: &mut Vector<Shared<Type>>, member: &Shared<Type>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let count = Shared.with<Type, usize>(member, unionLength)
+    if count != usize.MAX {
+      let mut at = usize.ZERO
+      while at < count {
+        let part = Shared.with<Type, Option<Shared<Type>>>(
+          member,
+          fn(value: &Type) -> Option<Shared<Type>> {
+            return unionMemberAt(value, at)
+          },
+        )
+        if let Option<Shared<Type>>.Some {value: nested} = move part {
+          if !containsType(Vector.asSlice<Shared<Type>>(&members.*), &nested) {
+            run Vector.append<Shared<Type>>(&mut members.*, move nested)
+          }
+        }
+        at = at + usize.ONE
+      }
+      return ()
+    }
+    if !containsType(Vector.asSlice<Shared<Type>>(&members.*), member) {
+      run Vector.append<Shared<Type>>(&mut members.*, Shared.clone<Type>(member))
+    }
+    return ()
+  }
   /// Compares shared type values without treating their allocation addresses as identity.
   pub fn equalsShared(left: &Shared<Type>, right: &Shared<Type>) -> bool {
     return sameShared(left, right)
@@ -300,6 +591,36 @@ impl Type {
           Bytes.asSlice(&extent),
           Bytes.asSlice(&otherExtent),
         ) && sameShared(&element, &compared)
+        _ => false
+      }
+      Type.Union {members} => match & other.* {
+        Type.Union {members: compared} => sameMembers(&members, &compared)
+        _ => false
+      }
+      Type.Callable {mode, isUnsafe, environment, parameters, result} => match & other.* {
+        Type.Callable {
+          mode: otherMode,
+          isUnsafe: otherUnsafe,
+          environment: otherEnvironment,
+          parameters: otherParameters,
+          result: otherResult,
+        } => sameMode(mode, otherMode) && isUnsafe == otherUnsafe && sameLifetime(
+          &environment,
+          &otherEnvironment,
+        ) && sameOrdered(&parameters, &otherParameters) && sameShared(&result, &otherResult)
+        _ => false
+      }
+      Type.Effect {mode, environment, success, failure, requirements} => match & other.* {
+        Type.Effect {
+          mode: otherMode,
+          environment: otherEnvironment,
+          success: otherSuccess,
+          failure: otherFailure,
+          requirements: otherRequirements,
+        } => sameMode(mode, otherMode) && sameLifetime(&environment, &otherEnvironment) && sameShared(
+          &success,
+          &otherSuccess,
+        ) && sameShared(&failure, &otherFailure) && sameRows(&requirements, &otherRequirements)
         _ => false
       }
     }

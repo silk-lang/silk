@@ -112,10 +112,45 @@ These are type relationships, not a borrow-safety proof or a checked generic bod
 contracts reject private nominal types; missing modules, inaccessible members, collisions, and
 alias or import-name cycles produce anchored semantic rejections.
 
-Generic calls and demanded generic bodies, type inference, binder bounds, row binders,
-callable types, variadic functions, failure or requirement rows, constraints, and nonstandard
-callable header modifiers currently return `Unsupported` rather than a provisional type. Invalid
-or unknown lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
+Signatures also describe callable and Effect contracts. `fn(A) -> B`, `mut fn(A) -> B`, and
+`once fn(A) -> B` keep their invocation mode, `unsafe`, retained environment, ordered parameters,
+and result. The builtin `Effect<'env; A ! E ? R>` needs no import and keeps its run mode (`once
+Effect<...>`), environment, success type, failure type, and requirement row. An `effect fn` records
+its written `! E` and `? R` channels; omitting them means `never` and the empty row, not inference.
+`never` is the empty structural union. `A | B` flattens nested unions and drops repeated members, so
+member order does not matter. A row keeps one entry per service and `at` role, with the strongest
+written access, plus any `?R` row parameters. Bounds such as `T: Hash + Clock + 'a` and
+`'long: 'short` are recorded in written order. For example, both headers below have the same
+channels, and `copy` retains both bounds:
+
+```silk,ignore
+service Clock {}
+role Primary
+struct Missing {}
+struct Offline {}
+effect fn first() -> i32 ! Missing | Offline ? &Clock at Primary | &mut Clock at Primary { return 0 }
+effect fn second() -> i32 ! Offline | Missing ? &mut Clock at Primary { return 0 }
+interface Hash {}
+fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
+```
+
+Only services may appear in a requirement row, and an `at` path must name a role. Interfaces and
+services are both valid bounds; a bound records the requirement and proves no conformance.
+Requirement and bound errors, a failure channel on an ordinary function, a `?R` binder used as an
+ordinary type, and a borrow or bare callable or Effect inside a structural union have anchored
+rejections. These contracts do not solve conformances, select providers, check captures, or run
+Effects. The scalar body checker still rejects effect bodies, generic bodies, and calls to effect
+or `unsafe` functions as `Unsupported`, even when their signatures resolve.
+
+Generic calls and demanded generic bodies, type inference, row arguments and bounds on type
+declarations, `where` clauses, `for<'a>` quantifiers and elided lifetimes inside callable contracts,
+Effect environment intersections, row subtraction, requirements on type parameters or on ordinary
+functions, variadic functions, static parameters, and other nonstandard callable header modifiers
+currently return `Unsupported` rather than a provisional type. An omitted callable or Effect environment elides like
+a borrow; in a result with no single borrowed input to supply it, write the environment explicitly.
+For example, `fn later() -> Effect<i32>` is `Unsupported`, while
+`fn later<'env>(value: &'env i32) -> Effect<'env; i32>` resolves. Invalid or unknown lifetimes and
+pointer qualifiers have anchored rejections. Written `[T; N]` arrays
 retain the exact non-negative decimal literal extent and element type, including at zero length;
 extents needing static execution remain `Unsupported` at their source span. Member type requests
 with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
