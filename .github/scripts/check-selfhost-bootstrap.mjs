@@ -52,7 +52,12 @@ for (const commit of commits) {
     mainParent &&
     isAncestor(forkPoint, firstParent) &&
     !git('diff', '--name-only', mainParent, commit, '--', ...guardedPaths)
-  if (isCleanMainSync) continue
+  const isCleanBaseSync = otherParents.some(
+    (parent) =>
+      isAncestor(parent, baseCommit) &&
+      !git('diff', '--name-only', parent, commit, '--', ...guardedPaths),
+  )
+  if (isCleanMainSync || isCleanBaseSync) continue
 
   process.stderr.write(
     `Bootstrap inputs changed outside main-first synchronization in ${commit}:\n${changed}\n`,
