@@ -154,9 +154,9 @@ A named function with no parameters retains nothing from inputs, so the omitted 
 `Effect` result is `'static`: `fn closed() -> Effect<i32>` has result `Effect<'static; i32>`, and
 writing that spelling is equivalent. A parameterless `effect fn` constructs an Effect with the same
 `'static` environment. Ordinary capture and lifetime checks still apply, so such an Effect cannot
-retain anything that is not valid for `'static`. The default does not extend to functions with
-owned or generic inputs, where an omitted output environment still needs a single borrowed input,
-or to callables and Effects nested inside a callable contract.
+retain anything that is not valid for `'static`. This default covers only the parameterless case
+and only the result's own environment; it does not apply to an Effect nested in that result or to
+callables and Effects inside a callable contract.
 
 Effect environment positions also accept finite intersections: `Effect<'call & 'env; A ! E ? R>`
 and `effect<'a & 'b> fn`. An intersection is valid only while every constituent is valid. It is
