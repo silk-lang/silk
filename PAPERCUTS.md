@@ -2,6 +2,10 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-26 · A focused `Shared.with` assertion over optional generic-kind details passed source
+  checking but failed during LLVM emission · Store the diagnostic's kind fields directly and inspect
+  them with a named predicate; the focused native case then passed · self-hosted compiler
+
 - 2026-09-25 · Concurrent `pnpm exec` typechecks each triggered dependency auto-repair and raced
   on a hoisted `node_modules` symlink · Invoke the prepared `node_modules/.bin` binaries directly
   for focused checks and avoid parallel pnpm entry points · compiler
