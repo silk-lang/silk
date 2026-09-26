@@ -61,11 +61,12 @@ one namespace segment and one public member segment. Import paths map to slash-s
 logical source paths within the importing module's source origin and package. Selected public import
 chains resolve to the canonical declaration. The store resolves type aliases and nominal type
 identities without inspecting fields or layout.
-Ordinary type binders belong to their declarations; written function signatures resolve those
-binders and explicit nominal or alias type arguments, including substitution through alias targets.
-They accept primitive, unit, and named alias or nominal parameter and result types without
-inspecting function bodies. For example, demanding the signature of `use` resolves `Same<bool>`
-to `Pair<bool, bool>`:
+Ordinary type and lifetime binders belong to their declarations. Written function signatures
+resolve those binders and explicit nominal or alias arguments, including substitution through
+alias targets. Each omitted input lifetime gets a distinct declaration-owned identity; an omitted
+result lifetime uses the sole outer borrowed input when there is exactly one. An alias with an
+omitted lifetime is expanded in the caller's header, so its uses remain independent. For example,
+demanding the signature of `use` resolves `Same<bool>` to `Pair<bool, bool>`:
 
 ```silk,ignore
 struct Pair<A, B> {}
@@ -74,15 +75,26 @@ fn use(value: Same<bool>) -> Same<bool> { return move value }
 ```
 
 The supported primitive spellings are `bool`, `char`, signed and unsigned integers through 64 bits
-and pointer size, `f32`, `f64`, and `string`. A missing result means unit. Public contracts reject
-private nominal types; missing modules, inaccessible members, collisions, and alias or import-name
-cycles produce anchored semantic rejections.
+and pointer size, `f32`, and `f64`. A missing result means unit. Signature facts also preserve
+`string<'life>`, shared and exclusive references, borrowed slices, and raw pointer access,
+nullability, extent, and written alignment. The only supported raw pointer address space is zero;
+no target layout or host pointer width is inferred. The following header gives its parameter and
+result the same declared lifetime identity:
 
-Generic calls and demanded generic bodies, type inference, bounds, lifetime or row binders, type
-modifiers, complex type forms, variadic functions, failure or requirement rows, constraints, and
-nonstandard callable header modifiers currently return `Unsupported` rather than a provisional
-type. Nominal field and machine layout facts are not inspected. Unused declarations with these
-forms are still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
+```silk,ignore
+fn view<'data>(value: &'data [i32]) -> &'data [i32] { return value }
+```
+
+These are type relationships, not a borrow-safety proof or a checked generic body. Public
+contracts reject private nominal types; missing modules, inaccessible members, collisions, and
+alias or import-name cycles produce anchored semantic rejections.
+
+Generic calls and demanded generic bodies, type inference, binder bounds, row binders, arrays,
+callable types, variadic functions, failure or requirement rows, constraints, and nonstandard
+callable header modifiers currently return `Unsupported` rather than a provisional type. Invalid
+or unknown lifetimes and pointer qualifiers have anchored rejections. Nominal field and machine
+layout facts are not inspected. Unused declarations with these forms are still indexed as written
+names and do not require semantic resolution. `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
 and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
 and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
