@@ -333,6 +333,12 @@ struct LifetimeElision {
   invocation: bool
   // Inside an invocation-quantified contract, a further quantifier is outside the language.
   nested: bool
+  // Maps a provisional invocation ordinal to its canonical first-occurrence ordinal; empty when
+  // the provisional numbering is already canonical.
+  renumber: Vector<usize>
+  // Set only while resolving the `Effect` result of a function with no parameters, whose omitted
+  // environment is `'static`. The first environment elided under it consumes it.
+  staticEnvironment: bool
 }
 
 struct Channels {
@@ -2362,7 +2368,9 @@ effect fn elidedLifetime(
         run reject(&resolver.*, module, RejectionCode.NestedQuantifier, span),
       )
     }
-    let lifetime = run Shared.make<Lifetime>(Lifetime.Invocation {ordinal: elision.nextOrdinal})
+    let lifetime = run Shared.make<Lifetime>(
+      Lifetime.Invocation {ordinal: renumbered(&elision.renumber, elision.nextOrdinal)},
+    )
     elision.nextOrdinal = elision.nextOrdinal + usize.ONE
     run Vector.append<Shared<Lifetime>>(&mut elision.generated, Shared.clone<Lifetime>(&lifetime))
     return Result.succeed<Shared<Lifetime>, Shared<Rejection>>(move lifetime)
@@ -2786,7 +2794,8 @@ fn headerGenerics(header: Node) -> Range {
   }
 }
 
-// Whether any binder of a type, alias, interface, or service declaration writes a bound.
+// Whether a type, alias, interface, or service declaration writes a bound that needs proof: an
+// interface, service, or representation bound. Lifetime bounds are recorded without a proof claim.
 effect fn declaresBounds(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> bool
 ! Cycle | OutOfMemoryError
 ? &mut Allocator {
@@ -2800,13 +2809,22 @@ effect fn declaresBounds(resolver: &mut Resolver, module: &ModuleId, ordinal: us
         let syntax = run typeNode(&mut resolver.*, module, parameterId)
         if let Option<HeaderSyntax>.Some {value: parameter} = move syntax {
           if let Node.TypeParameter {bounds, ..} = parameter.header {
-            if bounds.length > usize.ZERO {
-              return true
-            }
-          }
-          if let Node.LifetimeParameter {bounds, ..} = parameter.header {
-            if bounds.length > usize.ZERO {
-              return true
+            let mut boundAt = usize.ZERO
+            while boundAt < bounds.length {
+              let bound = run typeChild(&mut resolver.*, module, bounds, boundAt)
+              if let Option<HirId>.Some {value: boundId} = move bound {
+                let boundSyntax = run typeNode(&mut resolver.*, module, boundId)
+                if let Option<HeaderSyntax>.Some {value: boundNode} = move boundSyntax {
+                  let mut lifetimeBound = false
+                  if let Node.Lifetime {..} = boundNode.header {
+                    lifetimeBound = true
+                  }
+                  if !lifetimeBound {
+                    return true
+                  }
+                }
+              }
+              boundAt = boundAt + usize.ONE
             }
           }
         }
@@ -2856,7 +2874,8 @@ effect fn declarationType(
         return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
       }
     }
-    // A declared bound constrains every application; proving it needs conformance solving.
+    // An interface or representation bound constrains every application; proving it needs
+    // conformance solving. Lifetime bounds stay recorded in the declaration's contract.
     let bounded = run declaresBounds(&mut resolver.*, &module, declaration)
     if bounded && Vector.length<Binder>(&binders) > usize.ZERO {
       return Result.failResult<Shared<Type>, Shared<Rejection>>(
@@ -3510,6 +3529,13 @@ effect fn elidedEnvironment(
   binders: &[Binder],
   elision: &mut LifetimeElision,
 ) -> Result<Intersection, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  if elision.staticEnvironment {
+    elision.staticEnvironment = false
+    let none = Vector.make<Shared<Lifetime>>()
+    return Result.succeed<Intersection, Shared<Rejection>>(
+      run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&none)),
+    )
+  }
   let elided = run environmentLifetime(
     &mut resolver.*,
     module,
@@ -3953,6 +3979,7 @@ effect fn quantifiedScope(
   module: &ModuleId,
   quantified: Range,
   binders: &[Binder],
+  renumber: &Vector<usize>,
 ) -> Result<Vector<Binder>, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let mut scope = Vector.make<Binder>()
   let mut at = usize.ZERO
@@ -3987,7 +4014,9 @@ effect fn quantifiedScope(
                   &mut scope,
                   Binder.Lifetime {
                     name: move spelling,
-                    value: run Shared.make<Lifetime>(Lifetime.Invocation {ordinal: at}),
+                    value: run Shared.make<Lifetime>(
+                      Lifetime.Invocation {ordinal: renumbered(renumber, at)},
+                    ),
                   },
                 )
                 accepted = true
@@ -4018,6 +4047,7 @@ effect fn invocationBounds(
   module: &ModuleId,
   quantified: Range,
   scope: &[Binder],
+  renumber: &Vector<usize>,
 ) -> Result<Vector<Outlives>, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let mut bounds = Vector.make<Outlives>()
   let mut at = usize.ZERO
@@ -4037,7 +4067,9 @@ effect fn invocationBounds(
                   run Vector.append<Outlives>(
                     &mut bounds,
                     Outlives {
-                      longer: run Shared.make<Lifetime>(Lifetime.Invocation {ordinal: at}),
+                      longer: run Shared.make<Lifetime>(
+                        Lifetime.Invocation {ordinal: renumbered(renumber, at)},
+                      ),
                       shorter: move shorter,
                     },
                   )
@@ -4060,6 +4092,146 @@ effect fn invocationBounds(
 // Resolves `for<'call> once fn<'env>(A) -> B`. Omitted parameter lifetimes are fresh invocation
 // binders and an omitted result lifetime uses the sole borrowed parameter; quantified contracts
 // do not nest.
+struct CallableParts {
+  inputs: Vector<Shared<Type>>
+  output: Shared<Type>
+  outlives: Vector<Outlives>
+  allocated: usize
+}
+
+// Resolves a callable contract's binder bounds, parameters and result under one numbering of its
+// invocation binders.
+effect fn callableParts(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  moduleOrdinal: usize,
+  module: &ModuleId,
+  syntax: Node,
+  binders: &[Binder],
+  nested: bool,
+  renumber: &Vector<usize>,
+) -> Result<CallableParts, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut quantified = Range.empty()
+  let mut parameters = Range.empty()
+  let mut result = HirId {index: usize.ZERO}
+  if let Node.CallableType {binders: written, parameters: inputs, result: output, ..} = syntax {
+    quantified = written
+    parameters = inputs
+    result = output
+  }
+  let scoped = run quantifiedScope(&mut resolver.*, module, quantified, binders, renumber)
+  let scope = match move scoped {
+    Result<Vector<Binder>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<CallableParts, Shared<Rejection>>(move error)
+    }
+  }
+  let declaredBounds = run invocationBounds(
+    &mut resolver.*,
+    module,
+    quantified,
+    Vector.asSlice<Binder>(&scope),
+    renumber,
+  )
+  let outlives = match move declaredBounds {
+    Result<Vector<Outlives>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Vector<Outlives>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<CallableParts, Shared<Rejection>>(move error)
+    }
+  }
+  let mut copied = Vector.make<usize>()
+  let slots = Vector.asSlice<usize>(renumber)
+  let mut slot = usize.ZERO
+  while slot < slots.length {
+    run Vector.append<usize>(&mut copied, slots[slot])
+    slot = slot + usize.ONE
+  }
+  let mut invocation = LifetimeElision {
+    owner: Option.none<DeclarationId>(),
+    nextOrdinal: quantified.length,
+    output: false,
+    resultDefault: Option.none<Shared<Lifetime>>(),
+    generated: Vector.make<Shared<Lifetime>>(),
+    invocation: true,
+    nested: nested,
+    renumber: move copied,
+    staticEnvironment: false,
+  }
+  let mut inputs = Vector.make<Shared<Type>>()
+  let mut borrowed = usize.ZERO
+  let mut candidate = Option.none<Shared<Lifetime>>()
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let child = run typeChild(&mut resolver.*, module, parameters, at)
+    if let Option<HirId>.Some {value: parameterId} = move child {
+      let resolved = run resolveType(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies.*,
+        moduleOrdinal,
+        parameterId,
+        Vector.asSlice<Binder>(&scope),
+        &mut invocation,
+      )
+      match move resolved {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => {
+          let outer = Shared.with<Type, Option<Shared<Lifetime>>>(&ty, outerLifetime)
+          if let Option<Shared<Lifetime>>.Some {value: lifetime} = move outer {
+            borrowed = borrowed + usize.ONE
+            candidate = Option.some<Shared<Lifetime>>(move lifetime)
+          }
+          run Vector.append<Shared<Type>>(&mut inputs, move ty)
+        }
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<CallableParts, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  invocation.output = true
+  if borrowed == usize.ONE {
+    invocation.resultDefault = move candidate
+  }
+  let output = run resolveType(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut dependencies.*,
+    moduleOrdinal,
+    result,
+    Vector.asSlice<Binder>(&scope),
+    &mut invocation,
+  )
+  return match move output {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => Result.succeed<
+      CallableParts,
+      Shared<Rejection>,
+    >(
+      CallableParts {
+        inputs: move inputs,
+        output: move ty,
+        outlives: move outlives,
+        allocated: invocation.nextOrdinal,
+      },
+    )
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => Result.failResult<
+      CallableParts,
+      Shared<Rejection>,
+    >(move error)
+  }
+}
+
+fn renumbered(renumber: &Vector<usize>, ordinal: usize) -> usize {
+  let slots = Vector.asSlice<usize>(renumber)
+  if ordinal < slots.length {
+    return slots[ordinal]
+  }
+  return ordinal
+}
+
 effect fn resolveCallable(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -4073,7 +4245,7 @@ effect fn resolveCallable(
 ) -> Result<Shared<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
-  if let Node.CallableType {mode, isUnsafe, binders: quantified, environment, parameters, result} = syntax {
+  if let Node.CallableType {mode, isUnsafe, binders: quantified, environment, ..} = syntax {
     if elision.invocation && quantified.length > usize.ZERO {
       return Result.failResult<Shared<Type>, Shared<Rejection>>(
         run reject(&resolver.*, module, RejectionCode.NestedQuantifier, span),
@@ -4099,99 +4271,94 @@ effect fn resolveCallable(
     let region = run Shared.make<Intersection>(
       run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions)),
     )
-    let scoped = run quantifiedScope(&mut resolver.*, module, quantified, binders)
-    let scope = match move scoped {
-      Result<Vector<Binder>, Shared<Rejection>>.Success {value: found} => move found
-      Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
-        return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
-      }
-    }
-    let declaredBounds = run invocationBounds(
-      &mut resolver.*,
-      module,
-      quantified,
-      Vector.asSlice<Binder>(&scope),
-    )
-    let outlives = match move declaredBounds {
-      Result<Vector<Outlives>, Shared<Rejection>>.Success {value: found} => move found
-      Result<Vector<Outlives>, Shared<Rejection>>.Failure {error} => {
-        return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
-      }
-    }
-    let mut invocation = LifetimeElision {
-      owner: Option.none<DeclarationId>(),
-      nextOrdinal: quantified.length,
-      output: false,
-      resultDefault: Option.none<Shared<Lifetime>>(),
-      generated: Vector.make<Shared<Lifetime>>(),
-      invocation: true,
-      nested: elision.invocation,
-    }
-    let mut inputs = Vector.make<Shared<Type>>()
-    let mut borrowed = usize.ZERO
-    let mut candidate = Option.none<Shared<Lifetime>>()
-    let mut at = usize.ZERO
-    while at < parameters.length {
-      let child = run typeChild(&mut resolver.*, module, parameters, at)
-      if let Option<HirId>.Some {value: parameterId} = move child {
-        let resolved = run resolveType(
-          &mut resolver.*,
-          &mut owner.*,
-          &mut dependencies.*,
-          moduleOrdinal,
-          parameterId,
-          Vector.asSlice<Binder>(&scope),
-          &mut invocation,
-        )
-        match move resolved {
-          Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => {
-            let outer = Shared.with<Type, Option<Shared<Lifetime>>>(&ty, outerLifetime)
-            if let Option<Shared<Lifetime>>.Some {value: lifetime} = move outer {
-              borrowed = borrowed + usize.ONE
-              candidate = Option.some<Shared<Lifetime>>(move lifetime)
-            }
-            run Vector.append<Shared<Type>>(&mut inputs, move ty)
-          }
-          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
-            return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
-          }
-        }
-      }
-      at = at + usize.ONE
-    }
-    invocation.output = true
-    if borrowed == usize.ONE {
-      invocation.resultDefault = move candidate
-    }
-    let output = run resolveType(
+    // The first pass numbers written binders by position and elided ones by allocation. The
+    // canonical numbering follows first occurrence across parameters then result, so spelling,
+    // binder order and unused binders do not change the contract.
+    let provisional = Vector.make<usize>()
+    let first = run callableParts(
       &mut resolver.*,
       &mut owner.*,
       &mut dependencies.*,
       moduleOrdinal,
-      result,
-      Vector.asSlice<Binder>(&scope),
-      &mut invocation,
+      module,
+      syntax,
+      binders,
+      elision.invocation,
+      &provisional,
     )
-    match move output {
-      Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => {
-        return Result.succeed<Shared<Type>, Shared<Rejection>>(
-          run Shared.make<Type>(
-            Type.Callable {
-              mode: mode,
-              isUnsafe: isUnsafe,
-              environment: move region,
-              invocationBinders: invocation.nextOrdinal,
-              invocationBounds: move outlives,
-              parameters: move inputs,
-              result: move ty,
-            },
-          ),
-        )
-      }
-      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+    let firstParts = match move first {
+      Result<CallableParts, Shared<Rejection>>.Success {value} => move value
+      Result<CallableParts, Shared<Rejection>>.Failure {error} => {
         return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
       }
     }
+    let mut order = Vector.make<usize>()
+    let inputs = Vector.asSlice<Shared<Type>>(&firstParts.inputs)
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      run Type.collectInvocations(&inputs[at], &mut order)
+      at = at + usize.ONE
+    }
+    run Type.collectInvocations(&firstParts.output, &mut order)
+    let bounds = Vector.asSlice<Outlives>(&firstParts.outlives)
+    at = usize.ZERO
+    while at < bounds.length {
+      run Type.collectLifetime(&bounds[at].longer, &mut order)
+      run Type.collectLifetime(&bounds[at].shorter, &mut order)
+      at = at + usize.ONE
+    }
+    let used = Vector.asSlice<usize>(&order)
+    let mut canonical = used.length == firstParts.allocated
+    at = usize.ZERO
+    while canonical && at < used.length {
+      canonical = used[at] == at
+      at = at + usize.ONE
+    }
+    let mut parts = move firstParts
+    if !canonical {
+      let mut renumber = Vector.make<usize>()
+      at = usize.ZERO
+      while at < parts.allocated {
+        run Vector.append<usize>(&mut renumber, usize.MAX)
+        at = at + usize.ONE
+      }
+      let slots = Vector.asMutSlice<usize>(&mut renumber)
+      at = usize.ZERO
+      while at < used.length {
+        slots[used[at]] = at
+        at = at + usize.ONE
+      }
+      let second = run callableParts(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies.*,
+        moduleOrdinal,
+        module,
+        syntax,
+        binders,
+        elision.invocation,
+        &renumber,
+      )
+      parts = match move second {
+        Result<CallableParts, Shared<Rejection>>.Success {value} => move value
+        Result<CallableParts, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    return Result.succeed<Shared<Type>, Shared<Rejection>>(
+      run Shared.make<Type>(
+        Type.Callable {
+          mode: mode,
+          isUnsafe: isUnsafe,
+          environment: move region,
+          invocationBinders: Vector.length<usize>(&order),
+          invocationBounds: move parts.outlives,
+          parameters: move parts.inputs,
+          result: move parts.output,
+        },
+      ),
+    )
   }
   return Result.failResult<Shared<Type>, Shared<Rejection>>(
     run reject(&resolver.*, module, RejectionCode.Unsupported, span),
@@ -4631,6 +4798,8 @@ effect fn resolveAlias(
         generated: Vector.make<Shared<Lifetime>>(),
         invocation: false,
         nested: false,
+        renumber: Vector.make<usize>(),
+        staticEnvironment: false,
       }
       let resolved = run resolveType(
         &mut resolver.*,
@@ -5137,6 +5306,8 @@ effect fn resolveMemberShape(
       generated: Vector.make<Shared<Lifetime>>(),
       invocation: false,
       nested: false,
+      renumber: Vector.make<usize>(),
+      staticEnvironment: false,
     }
     let mut types = Vector.make<Shared<Type>>()
     let writtenTypes = Vector.asSlice<HirId>(&annotations)
@@ -5382,6 +5553,8 @@ effect fn resolveContract(
       generated: Vector.make<Shared<Lifetime>>(),
       invocation: false,
       nested: false,
+      renumber: Vector.make<usize>(),
+      staticEnvironment: false,
     }
     let declared = run resolveConstraints(
       &mut resolver.*,
@@ -5459,6 +5632,31 @@ effect fn parametersOf(binders: &[Binder]) -> BinderLists ! OutOfMemoryError ? &
   return move lists
 }
 
+// Whether a written result is the builtin `Effect`, as resolved by `resolveType`.
+effect fn effectResult(resolver: &mut Resolver, module: &ModuleId, id: HirId, binders: &[Binder]) -> bool
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let written = run typeNode(&mut resolver.*, module, id)
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    let mut target = value.header
+    if let Node.AppliedType {target: applied, ..} = value.header {
+      let named = run typeNode(&mut resolver.*, module, applied)
+      if let Option<HeaderSyntax>.Some {value: found} = move named {
+        target = found.header
+      }
+    }
+    if let Node.NamedType {path: typeName, ..} = target {
+      let parsed = run path(&mut resolver.*, module, typeName)
+      let segments = Vector.asSlice<Bytes>(&parsed.segments)
+      return parsed.valid && segments.length == usize.ONE && same(
+        Bytes.asSlice(&segments[usize.ZERO]),
+        b"Effect",
+      ) && !hasBinder(binders, b"Effect")
+    }
+  }
+  return false
+}
+
 effect fn resolveSignature(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -5505,6 +5703,8 @@ effect fn resolveSignature(
       generated: Vector.make<Shared<Lifetime>>(),
       invocation: false,
       nested: false,
+      renumber: Vector.make<usize>(),
+      staticEnvironment: false,
     }
     let declared = run resolveConstraints(
       &mut resolver.*,
@@ -5523,8 +5723,16 @@ effect fn resolveSignature(
         return memberRejected(move error, move dependencies)
       }
     }
-    // An omitted `effect fn` environment stays unrecorded until its elaboration rule is settled.
+    // A parameterless `effect fn`, like a parameterless function returning `Effect`, retains
+    // nothing from inputs, so its omitted environment is `'static`. With parameters, an omitted
+    // environment stays unrecorded until its elaboration rule is settled.
     let mut environment = Option.none<Intersection>()
+    if value.isEffect && !value.environment.present && Vector.length<HirId>(&value.parameters) == usize.ZERO {
+      let none = Vector.make<Shared<Lifetime>>()
+      environment = Option.some<Intersection>(
+        run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&none)),
+      )
+    }
     if value.environment.present {
       let written = run writtenEnvironment(
         &mut resolver.*,
@@ -5603,7 +5811,17 @@ effect fn resolveSignature(
     if inputCount == usize.ONE {
       elision.resultDefault = move inputLifetime
     }
+    let closed = entries.length == usize.ZERO
     if let Option<HirId>.Some {value: id} = move value.result {
+      // A function with no parameters has nothing its Effect result could retain from inputs.
+      if closed {
+        elision.staticEnvironment = run effectResult(
+          &mut resolver.*,
+          &module,
+          id,
+          Vector.asSlice<Binder>(&binders),
+        )
+      }
       let resolved = run resolveType(
         &mut resolver.*,
         &mut owner.*,
@@ -7189,6 +7407,8 @@ effect fn resolveBody(
     generated: Vector.make<Shared<Lifetime>>(),
     invocation: false,
     nested: false,
+    renumber: Vector.make<usize>(),
+    staticEnvironment: false,
   }
   let writtenAnnotations = Vector.asSlice<HirId>(&annotationIds)
   let mut annotationAt = usize.ZERO
