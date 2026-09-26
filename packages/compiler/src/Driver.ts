@@ -33,7 +33,6 @@ import * as SourceResolver from './SourceResolver.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as Target from './Target.js'
 import * as TestExecution from './TestExecution.js'
-import type * as TestDiscovery from './TestDiscovery.js'
 import * as ToolchainIntegrity from './ToolchainIntegrity.js'
 import * as ToolchainPlan from './ToolchainPlan.js'
 
@@ -325,12 +324,11 @@ interface Staged {
   readonly program: Prepared['program']
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
   readonly artifactPlan: ArtifactPlan.ArtifactPlan
-  /** Retained only when the build discovered tests, whose manifest is built after linking. */
+  /** Link-independent test identities, computed before the large backend emission. */
   readonly tests:
     | {
-        readonly catalog: TestDiscovery.Catalog
-        readonly discovery: Prepared['instances']
-        readonly results: Prepared['frontend']['results']
+        readonly runner: { readonly identity: string; readonly complete: boolean }
+        readonly closures: TestExecution.Closures | undefined
         readonly bootstrapIdentity: string | undefined
       }
     | undefined
@@ -516,6 +514,23 @@ const prepareEmission = Effect.fnUntraced(function* (
         report: [...report],
       }
   }
+  const testCatalog = frontend.testCatalog
+  const bootstrapIdentity = bundle.completion?.bootstrapIdentity
+  const tests =
+    stage !== 'final' || !Target.isNative(target) || testCatalog === undefined
+      ? undefined
+      : {
+          runner: yield* TestExecution.runnerIdentity(
+            preparation.instances,
+            frontend.results,
+            testCatalog,
+          ),
+          closures:
+            request.artifactKind === 'NativeExecutable' && bootstrapIdentity !== undefined
+              ? yield* TestExecution.closures(testCatalog, preparation.instances, frontend.results)
+              : undefined,
+          bootstrapIdentity,
+        }
   return {
     _tag: 'Staged',
     sources: closure.sources,
@@ -526,15 +541,7 @@ const prepareEmission = Effect.fnUntraced(function* (
     program,
     diagnostics,
     artifactPlan,
-    tests:
-      frontend.testCatalog === undefined
-        ? undefined
-        : {
-            catalog: frontend.testCatalog,
-            discovery: preparation.instances,
-            results: frontend.results,
-            bootstrapIdentity: bundle.completion?.bootstrapIdentity,
-          },
+    tests,
   }
 })
 
@@ -936,22 +943,9 @@ export const compile = Effect.fn('Driver.compile')(
               report: [...report],
             }
 
-          // Test identities depend only on the analysis, so compute them while the native object
-          // compiler runs in its own process.
+          // Test identities were computed before emission so discovery and elaboration results
+          // are no longer retained while the backend builds the LLVM module.
           const tests = staged.tests
-          const testIdentities =
-            tests === undefined
-              ? undefined
-              : yield* Effect.forkChild(
-                  Effect.all([
-                    TestExecution.runnerIdentity(tests.discovery, tests.results, tests.catalog),
-                    cacheKind === 'NativeExecutable' && tests.bootstrapIdentity !== undefined
-                      ? Effect.asSome(
-                          TestExecution.closures(tests.catalog, tests.discovery, tests.results),
-                        )
-                      : Effect.succeedNone,
-                  ]),
-                )
 
           // 14. Resolve the native toolchain for the profile and turn LLVM bitcode into an object.
           // Track both generated object files and any helper capabilities reported by emission.
@@ -1105,16 +1099,12 @@ export const compile = Effect.fn('Driver.compile')(
                   { heapBytes },
                 )
               : undefined
-          const identities =
-            testIdentities === undefined ? undefined : yield* Fiber.join(testIdentities)
           const testManifest =
-            identities !== undefined &&
-            Option.isSome(identities[1]) &&
-            tests?.bootstrapIdentity !== undefined
-              ? TestExecution.make(identities[1].value, {
+            tests?.closures !== undefined && tests.bootstrapIdentity !== undefined
+              ? TestExecution.make(tests.closures, {
                   profileIdentity: staged.profile.identity,
                   bootstrapIdentity: tests.bootstrapIdentity,
-                  runnerIdentity: identities[0].identity,
+                  runnerIdentity: tests.runner.identity,
                   compilerIdentity: distribution.digest,
                   runtimeIdentity: TestExecution.runtimeIdentity(distribution),
                   nativeIdentity: TestExecution.nativeIdentity(
@@ -1123,7 +1113,7 @@ export const compile = Effect.fn('Driver.compile')(
                     bound.success.identity,
                     HelperCapability.policyIdentity(staged.profile),
                   ),
-                  complete: identities[0].complete,
+                  complete: tests.runner.complete,
                 })
               : undefined
           // Return the durable artifact together with linkage provenance, foreign symbols,
