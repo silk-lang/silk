@@ -87,21 +87,34 @@ exact out-of-range value. `fn inferred() -> u8 { let value = 255 return value }`
 `value` is already `i32`; `fn annotated() -> u8 { let value: u8 = 255 return value }` succeeds.
 Initializers see preceding locals and parameters, but not the binding they initialize. A local
 may shadow a parameter in the function body; a second local with the same name in that block
-rejects. A unit function can return `()` or fall through an empty body. A reachable
-non-unit fallthrough, incompatible return, or unsupported statement or expression is an anchored
-rejection. A completed body answer retains typed nodes, its source observation, and a signature
-dependency for cache reuse and request replay. A body demand checks only that declaration; it does
-not execute user code or prove that the whole program is valid.
+rejects. A full direct call to a same-module or imported ordinary nongeneric function checks each
+argument against its written parameter type in source order. An exact integer literal uses that
+parameter as its immediate type context; an already typed local keeps its fixed type. For example,
+`fn pair(first: u8, second: i32) -> i32 { return second }` accepts `pair(255, 1)`, but rejects
+passing a local initialized by `255` as its first argument because that local is already `i32`.
+Too many arguments, a non-callable target, and an empty call of a function that needs arguments
+receive distinct rejections. A valid nonempty partial application remains `Unsupported` in this
+wave.
 
-This native semantic API is not wired into the inspection executable above. Calls,
-branches, operators, pointer-sized types, effects, generic bodies, static evaluation, conformance,
-layout, and code emission are outside the current body subset. Unused declarations with these forms
-remain indexed. The authored HIR keeps integer sign, radix, and exact decimal magnitude beyond
-`u64`; body checking compares those digits without rounding through a host number. Structured
-typed failures and cancellation release incomplete query reservations and publication frames. A
-later demand can retry the same store. A fatal runtime trap ends the process and has no such
-recovery guarantee. Compiler CLI integration, host-backed snapshots, and later semantic and backend
-milestones remain future work.
+A unit function can return `()` or fall through an empty body. A reachable non-unit fallthrough,
+incompatible return, or unsupported statement or expression is an anchored
+rejection. A completed body answer retains typed nodes, its source observation, callee signature
+dependencies, and required runtime-body declarations for later closure. A body demand checks only
+that declaration. Thus `fn caller() -> i32 { return leaf() }` can check successfully even when
+`leaf` has an invalid body; a later build must validate that required body. Mutual calls with written
+signatures do not force a body-query cycle. A body demand does not execute user code or prove that
+the whole program is valid. Imported calls retain positive and negative name, import, and source
+observations on fresh request hits.
+
+This native semantic API is not wired into the inspection executable above. Function values,
+sections, methods, operators, branches, pointer-sized types, effects, generic bodies, static
+evaluation, conformance, layout, and code emission are outside the current body subset. Unused
+declarations with these forms remain indexed. The authored HIR keeps integer sign, radix, and exact
+decimal magnitude beyond `u64`; body checking compares those digits without rounding through a
+host number. Structured typed failures and cancellation release incomplete query reservations and
+publication frames. A later demand can retry the same store. A fatal runtime trap ends the
+process and has no such recovery guarantee. Compiler CLI integration, host-backed snapshots, and
+later semantic and backend milestones remain future work.
 
 ## Inspect a source file
 
