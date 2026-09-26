@@ -138,14 +138,15 @@ fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
 A callable contract can quantify invocation lifetimes:
 `for<'call> fn<'env>(&'call i32) -> &'call i32` names them. An omitted lifetime in a callable
 parameter is a fresh invocation lifetime, so `fn<'env>(&i32) -> &i32` is the same contract; an
-omitted result lifetime inside the contract uses its sole borrowed parameter. Invocation lifetimes
-are numbered by first use across the parameters and then the result, so binder names, binder order,
-and an unused binder are not identity, while written bounds such as `for<'a: 'b, 'b>` remain part
-of the contract. A quantified contract inside another quantified contract is rejected, including
-one quantified only by an omitted lifetime. An environment such as `Effect<'a & 'b; A>` is an
-order-independent intersection in which `'static` and repeats disappear, so `'b & 'static & 'a` is
-the same environment and `'a & 'a` is `'a`. A written `effect<'env> fn` or `effect<'a & 'b> fn`
-environment is recorded with the signature:
+omitted result lifetime inside the contract uses its sole borrowed parameter. Two contracts are
+equal when some renaming of their used invocation lifetimes makes them equal. Binder names, binder
+order, an unused binder, and member order in unions, rows, and environments are therefore not
+identity, while written bounds such as `for<'a: 'b, 'b>` remain part of the contract. A quantified
+contract inside another quantified contract is rejected, including one quantified only by an
+omitted lifetime. An environment such as `Effect<'a & 'b; A>` is an order-independent
+intersection in which `'static` and repeats disappear, so `'b & 'static & 'a` is the same
+environment and `'a & 'a` is `'a`. A written `effect<'env> fn` or `effect<'a & 'b> fn` environment
+is recorded with the signature:
 
 ```silk,ignore
 fn apply(transform: fn<'static>(&i32) -> &i32) -> i32 { return 0 }
