@@ -9166,6 +9166,13 @@ export const effectCaptureFacts = (
         }
         return
       }
+      if (fact._tag === 'CallableApply' && fact.staged === undefined) {
+        // Invoking an outer callable acquires the environment access its mode requires
+        // (ANON-OWN-001): a `once fn` call transfers ownership, a `mut fn` call borrows exclusively.
+        for (const child of Tir.expressionChildren(fact))
+          expression(child, child === fact.callee ? fact.access : 'Shared')
+        return
+      }
       for (const child of Tir.expressionChildren(fact)) expression(child)
       return
     }
