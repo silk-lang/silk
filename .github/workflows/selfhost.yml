@@ -65,9 +65,19 @@ jobs:
           set -euo pipefail
           probe="$RUNNER_TEMP/silk-semantic-memory-probe.mjs"
           cat > "$probe" <<'EOF'
+          import { spawn, spawnSync } from 'node:child_process'
+          import { constants } from 'node:os'
           import { readFileSync } from 'node:fs'
-          import { freemem, totalmem } from 'node:os'
-          import { getHeapStatistics } from 'node:v8'
+
+          const command = process.argv.slice(2)
+          if (command.length === 0) throw new Error('expected Node arguments')
+          const timeoutMs = Number(process.env.SILK_PROBE_TIMEOUT_MS ?? 360000)
+          const intervalMs = Number(process.env.SILK_PROBE_INTERVAL_MS ?? 10000)
+          const child = spawn(process.execPath, ['--inspect=127.0.0.1:0', ...command], {
+            detached: true,
+            stdio: ['inherit', 'pipe', 'pipe'],
+          })
+          child.stdout.pipe(process.stdout)
 
           const read = (path) => {
             try {
@@ -76,24 +86,127 @@ jobs:
               return 'unavailable'
             }
           }
+          const rssKb = () => {
+            const status = read('/proc/' + child.pid + '/status')
+            if (status !== 'unavailable') {
+              const match = status.match(/^VmRSS:\s+(\d+) kB$/m)
+              if (match !== null) return Number(match[1])
+            }
+            const value = spawnSync('ps', ['-o', 'rss=', '-p', String(child.pid)], {
+              encoding: 'utf8',
+            })
+            return Number(value.stdout.trim()) || null
+          }
+          const log = (tag, value) => console.error(tag + ' ' + JSON.stringify(value))
+
+          let socket
+          let heapPending = false
+          let heapRequest = 0
+          let heapDeadline
+          const disconnect = () => {
+            clearTimeout(heapDeadline)
+            heapPending = false
+            if (socket?.readyState === WebSocket.OPEN) socket.close()
+          }
+          const connect = (url) => {
+            socket = new WebSocket(url)
+            socket.addEventListener('message', (event) => {
+              const message = JSON.parse(event.data)
+              if (message.id !== heapRequest) return
+              clearTimeout(heapDeadline)
+              heapPending = false
+              if (message.result?.result?.value !== undefined) {
+                log('[semantic-heap]', message.result.result.value)
+              } else {
+                log('[semantic-heap-error]', { pid: child.pid, error: message.error ?? 'no result' })
+              }
+            })
+            socket.addEventListener('error', () => {
+              heapPending = false
+            })
+          }
+          let stderrBuffer = ''
+          child.stderr.on('data', (chunk) => {
+            stderrBuffer += chunk.toString()
+            let newline
+            while ((newline = stderrBuffer.indexOf('\n')) !== -1) {
+              const line = stderrBuffer.slice(0, newline + 1)
+              stderrBuffer = stderrBuffer.slice(newline + 1)
+              if (line.startsWith('Debugger listening on ws://')) {
+                const url = line.match(/ws:\/\/[^\s]+/)?.[0]
+                if (url !== undefined) connect(url)
+              } else if (line.includes('Waiting for the debugger to disconnect...')) {
+                disconnect()
+              } else if (!line.startsWith('For help, see:') && !line.startsWith('Debugger attached.')) {
+                process.stderr.write(line)
+              }
+            }
+          })
+          child.stderr.on('end', () => {
+            if (stderrBuffer.length > 0) process.stderr.write(stderrBuffer)
+          })
+
           const sample = () => {
-            console.error('[semantic-memory] ' + JSON.stringify({
+            log('[semantic-memory]', {
               at: new Date().toISOString(),
-              pid: process.pid,
-              node: process.version,
-              arch: process.arch,
-              heapLimit: getHeapStatistics().heap_size_limit,
-              memory: process.memoryUsage(),
+              pid: child.pid,
+              rssKb: rssKb(),
               cgroupCurrent: read('/sys/fs/cgroup/memory.current'),
               cgroupMax: read('/sys/fs/cgroup/memory.max'),
-              hostFree: freemem(),
-              hostTotal: totalmem(),
+            })
+            if (socket?.readyState !== WebSocket.OPEN || heapPending) return
+            heapPending = true
+            const id = ++heapRequest
+            socket.send(JSON.stringify({
+              id,
+              method: 'Runtime.evaluate',
+              params: {
+                expression: '({pid:process.pid,heapLimit:process.getBuiltinModule("node:v8").getHeapStatistics().heap_size_limit,memory:process.memoryUsage()})',
+                returnByValue: true,
+              },
             }))
+            heapDeadline = setTimeout(() => {
+              if (!heapPending || heapRequest !== id) return
+              heapPending = false
+              log('[semantic-heap-pending]', { pid: child.pid, seconds: 5 })
+            }, 5000)
           }
+          const interval = setInterval(sample, intervalMs)
           sample()
-          setInterval(sample, 10000).unref()
+
+          let escalationScheduled = false
+          const stopChild = (signal) => {
+            disconnect()
+            try {
+              process.kill(-child.pid, signal)
+            } catch {}
+            if (!escalationScheduled && signal !== 'SIGKILL') {
+              escalationScheduled = true
+              setTimeout(() => stopChild('SIGKILL'), 5000).unref()
+            }
+          }
+          let timedOut = false
+          const cutoff = setTimeout(() => {
+            timedOut = true
+            log('[semantic-timeout]', { pid: child.pid, seconds: timeoutMs / 1000 })
+            stopChild('SIGTERM')
+          }, timeoutMs)
+          process.on('SIGTERM', () => stopChild('SIGTERM'))
+          process.on('SIGINT', () => stopChild('SIGINT'))
+
+          const result = await new Promise((resolve) => {
+            child.on('error', (error) => resolve({ error: String(error) }))
+            child.on('close', (code, signal) => resolve({ code, signal }))
+          })
+          clearInterval(interval)
+          clearTimeout(cutoff)
+          disconnect()
+          log('[semantic-exit]', { pid: child.pid, ...result, timedOut })
+          process.exitCode = timedOut
+            ? 124
+            : result.code ?? 128 + (constants.signals[result.signal] ?? 1)
           EOF
-          NODE_OPTIONS="$NODE_OPTIONS --import=$probe" node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
+          node "$probe" packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
         env:
           NODE_OPTIONS: --max-old-space-size=6144
       - name: Run exact integer HIR cases
