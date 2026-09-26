@@ -151,6 +151,20 @@ effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32 { return 0 }
 fn both<'a, 'b>(pending: Effect<'a & 'b; i32>) -> i32 { return 0 }
 ```
 
+`Semantic.demandContract` returns the binders and bounds of a type, alias, interface, or service
+declaration without demanding its identity or members. A `?R` binder of such a declaration takes
+its row from the `? Row` suffix of an application, and the row is spliced wherever the binder is
+used. A bound is recorded, not proved, so an application of a bounded declaration is `Unsupported`
+until conformance solving exists. For example, `Sorted` has a contract, `Sorted<i32>` is
+`Unsupported`, and `Loaded<? &Clock>` resolves to an Effect requiring both `&Logger` and `&Clock`:
+
+```silk,ignore
+struct Sorted<T: Hash> { value: T }
+interface Load<E, ?R> {}
+type Loaded<?R> = Effect<'static; i32 ? &Logger | R>
+fn loadable<T: Load<Missing ? &Clock>>(source: &T) -> i32 { return 0 }
+```
+
 Only services may appear in a requirement row, and an `at` path must name a role. Interfaces and
 services are both valid bounds; a bound records the requirement and proves no conformance.
 Requirement and bound errors, a failure or requirement channel on an ordinary function, a `?R`
@@ -160,16 +174,16 @@ solve conformances, select providers, check captures, or run Effects. The scalar
 rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
 even when their signatures resolve.
 
-Generic calls and demanded generic bodies, type inference, row arguments and bounds on type
-declarations, `where` clauses, row subtraction such as `Without<R, K>` (which belongs to the later
-provision and requirement-algebra work), requirements on type parameters, variadic functions,
-static parameters, and other nonstandard callable header modifiers currently return `Unsupported`
-rather than a provisional type. An omitted callable or Effect environment elides like a borrow; in
-a result with no single borrowed input to supply it, write the environment explicitly. An omitted
-`effect fn` environment is not recorded yet.
-For example, `fn later() -> Effect<i32>` is `Unsupported`, while
-`fn later<'env>(value: &'env i32) -> Effect<'env; i32>` resolves. Invalid or unknown lifetimes and
-pointer qualifiers have anchored rejections. Written `[T; N]` arrays
+Generic calls and demanded generic bodies, type inference, applications of bounded declarations,
+a declaration with more than one `?R` binder when applied, a lifetime omitted inside a type
+declaration's bound, `where` clauses, row subtraction such as `Without<R, K>` (which belongs to
+the later provision and requirement-algebra work), requirements on type parameters, variadic
+functions, static parameters, and other nonstandard callable header modifiers currently return
+`Unsupported` rather than a provisional type. An omitted callable or Effect environment elides like
+a borrow; in a result with no single borrowed input to supply it, write the environment explicitly.
+An omitted `effect fn` environment is not recorded yet. For example, `fn later() -> Effect<i32>` is
+`Unsupported`, while `fn later<'env>(value: &'env i32) -> Effect<'env; i32>` resolves. Invalid or
+unknown lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
 retain the exact non-negative decimal literal extent and element type, including at zero length;
 extents needing static execution remain `Unsupported` at their source span. Member type requests
 with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
