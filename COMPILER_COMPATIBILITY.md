@@ -62,13 +62,15 @@ Each entry records:
     [EFF-008](apps/docs/content/reference/effect-contracts.md#eff-008--an-effect-function-declares-the-contract-of-its-returned-effect)
     links its equivalence to them.
   - **Native:** implemented and verified at the signature level on draft PR #517.
-  - **Bootstrap:** does not implement the ordinary-function `'static` result default, and does not
-    reject generic stored `effect fn` inputs.
+  - **Bootstrap:** on this branch it does not implement the ordinary-function `'static` result
+    default, and does not reject generic stored `effect fn` inputs. The alignment is pending on
+    main (the prerequisite below) and reaches this branch only through a reviewed sync.
 - **Rule:**
   - **Retained regions:** an input retains the regions of its borrows, its non-`'static` nominal
     lifetime arguments, and its callable or Effect environments. The parameter and channel types
-    of a callable or Effect input are not stored. Stored contents involving a type parameter, such
-    as `value: T` or `Box<T>`, have no nameable region.
+    of a callable or Effect input are not stored. A representation parameter, bound by
+    `F: fn(A) -> B` or `F: Effect<A>`, retains its bound contract's environment. Stored contents
+    involving any other type parameter, such as `value: T` or `Box<T>`, have no nameable region.
   - **`effect fn` capture environment:** it captures every input. Its omitted `effect<...>`
     environment is the order-independent, duplicate-free intersection of the regions its inputs
     retain, `'static` when they retain none. Generic stored contents make it ambiguous (SEM0210) at
@@ -105,10 +107,18 @@ Each entry records:
       `'a` for a `Held<'a, i32>` input, `'static` for `once Effect<'static; A ! E>` or
       `fn<'static>(A) -> A` inputs, and the pending region for `once Effect<A>`. A stored `T`
       input rejects as `AmbiguousLifetime` at that parameter's type.
+    - A representation parameter retains its contract's environment, looked up from the
+      declaration's own `Represents` bounds: `F: fn<'a>(i32) -> i32` gives `'a`, and
+      `F: once Effect<'static; A>` gives `'static`. An interface-bounded `T: Hash` stays unknown.
   - **TypeScript bootstrap:** checked 2026-09-26 with the CLI built from this checkout.
     - The explicit `Effect<'static; i32>` compiles and runs.
     - `effect fn` forms with no, owned, several borrowed, or generic stored inputs compile. Whether
       their capture environments follow this rule has not been verified.
+    - On main (PR #522, not yet synced here), a representation parameter also retains its bound
+      contract's environment, so native matches it. One asymmetry remains there: a representation
+      parameter bounded by `Intrinsic.Detached` retains nothing, while a plain `T: Detached` value
+      parameter stays unknown. Native keeps every non-representation parameter unknown and does
+      not special-case `Detached`.
   - **Divergences (bootstrap vs native):**
     - Ordinary function with no retaining input: `fn closed() -> Effect<i32>` and
       `fn later(value: i32) -> Effect<i32>` report `SEM0210 The omitted output lifetime has no
@@ -122,15 +132,18 @@ unique input` at the result in the bootstrap; native resolves them to `Effect<'s
     reports SEM0210 in the bootstrap (reviewer-verified 2026-09-26) and `AmbiguousLifetime` in
     native, because its success Effect has no borrowed input to supply the output lifetime.
   - **Prerequisite:** aligning the bootstrap and migrating the generic stored-input declarations
-    to `effect<'env> fn` with `T: 'env` bounds is required main-first work, tracked as the
+    to `effect<'env> fn` with the storage bounds LIFE-004 requires is required main-first work, tracked as the
     in-progress prerequisite task "Fix · Bootstrap Effect environments & source coherence" (note
     `814eae87-839e-4644-bd0f-5a1f38e52deb`). The native frontend does not check the standard
-    library until it lands.
+    library until it lands. Its LIFE-004 wording on implied storage obligations for enclosing
+    `impl`, interface, and service parameters replaces this branch's text at the reviewed sync;
+    this branch does not duplicate it.
 - **Source migration:**
   - Omitting an environment is the approved form where the rules above give it a value:
     - an ordinary function's Effect result whose inputs retain nothing, or that has one borrowed
       input;
-    - an `effect fn` capture environment when its inputs store no generic contents;
+    - an `effect fn` capture environment when its inputs store no generic contents other than
+      representation parameters;
     - an `effect fn` success Effect's environment when a single borrowed input supplies it under
       LIFE-003.
   - Otherwise source writes it. An `effect fn` with generic stored inputs writes `effect<'env> fn`
@@ -152,7 +165,10 @@ unique input` at the result in the bootstrap; native resolves them to `Effect<'s
   - `closedDeferred`, `inputDeferred`, `runPending` and `callbackDeferred` are `'static`;
   - `borrowedDeferred`, `heldDeferred` and `keepPending` have one region, `twoBorrowed` two, and
     `sameRegion` (the same lifetime twice) one;
-  - `genericDeferred` rejects as `AmbiguousLifetime` spanning its stored type parameter.
+  - `genericDeferred` rejects as `AmbiguousLifetime` spanning its stored type parameter;
+  - `representedBorrowed` (`F: fn<'a>(i32) -> i32`) has one region, `representedStatic`
+    (`F: once Effect<'static; A>`) is `'static`, and `conformedStored` (`T: Hash`) rejects as
+    `AmbiguousLifetime`.
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 
