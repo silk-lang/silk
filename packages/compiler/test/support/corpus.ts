@@ -5143,6 +5143,49 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // An anonymous body that invokes an outer `once fn` must take that environment; a shared loan
+    // let the owner clean the already-consumed capture again.
+    name: 'anonymous-forwarded-once-capture-cleanup',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+struct Counter { value: i32 }
+struct Token { counter: Shared<Counter> }
+fn increment(counter: &mut Counter) -> i32 {
+  counter.value = counter.value + 1
+  return counter.value
+}
+fn read(counter: &Counter) -> i32 { return counter.value }
+impl Drop for Token {
+  fn drop(self: &mut Token) -> () {
+    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    return ()
+  }
+}
+fn consume(token: Token) -> i32 {
+  drop token
+  return 42
+}
+fn forward(step: once fn() -> i32) -> i32 {
+  let invoke = fn() -> i32 { return step() }
+  return invoke()
+}
+effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let counter = run Shared.make<Counter>(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let token = Token { counter: Shared.clone<Counter>(&counter) }
+  if forward(fn() -> i32 { return consume(move token) }) != 42 { return 1 }
+  let count = Shared.with<Counter, i32>(&counter, read)
+  drop counter
+  if count != 1 { return 2 }
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return -1 }
+pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'generic-run-cleanup-counts',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
