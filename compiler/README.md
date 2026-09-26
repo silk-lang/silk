@@ -106,11 +106,22 @@ signatures do not force a body-query cycle. A body demand does not execute user 
 the whole program is valid. Imported calls retain positive and negative name, import, and source
 observations on fresh request hits.
 
+Ordinary runtime `if` statements require `bool` conditions and check both arms. For example,
+`fn choose(flag: bool) -> i32 { if flag { return 1 } else { return 2 } }` has no reachable
+fallthrough. `fn partial(flag: bool) -> i32 { if flag { return 1 } }` rejects because the false path
+reaches the end, while a unit function may fall through. An arm with `return missing` rejects even
+when a constant or a caller's known argument selects the other arm. A binding inside an arm stays
+in that arm; another arm or a later statement cannot read it. Checked bodies retain both branch
+nodes and whether each block can complete. Source after a return is still checked, although it
+cannot make a completed path reachable again.
+
 This native semantic API is not wired into the inspection executable above. Function values,
-sections, methods, operators, branches, pointer-sized types, effects, generic bodies, static
-evaluation, conformance, layout, and code emission are outside the current body subset. Unused
-declarations with these forms remain indexed. The authored HIR keeps integer sign, radix, and exact
-decimal magnitude beyond `u64`; body checking compares those digits without rounding through a
+sections, methods, operators, pointer-sized types, effects, generic bodies, static evaluation,
+conformance, layout, and code emission are outside the current body subset. For example,
+`fn selected() -> i32 { static if true { return 1 } else { return 2 } }` produces `Unsupported`
+when demanded; static selection does not use runtime branch checking. Unused declarations with
+these forms remain indexed. The authored HIR keeps integer sign, radix, and exact decimal
+magnitude beyond `u64`; body checking compares those digits without rounding through a
 host number. Structured typed failures and cancellation release incomplete query reservations and
 publication frames. A later demand can retry the same store. A fatal runtime trap ends the
 process and has no such recovery guarantee. Compiler CLI integration, host-backed snapshots, and

@@ -4,7 +4,7 @@
 //! Use [`Semantic`] with one held source revision. Demand one written fact at a time.
 //! The store reads an import target only when a requested fact needs its binding.
 
-import hir.Hir {HirId, Module, Node, ParameterMode, Range, Sign}
+import hir.Hir {HirId, HirRef, Module, Node, ParameterMode, Range, Sign}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
@@ -248,6 +248,11 @@ struct CallSyntax {
 struct ResolvedCall {
   id: HirId
   result: Result<CallTarget, Shared<Rejection>>
+}
+
+struct CheckedControl {
+  node: BodyNodeId
+  canComplete: bool
 }
 
 struct Resolver {
@@ -2325,9 +2330,12 @@ effect fn collectCall(hir: &Module, expression: HirId, calls: &mut Vector<CallSy
   return ()
 }
 
-effect fn collectBodyCalls(hir: &Module, written: Range, calls: &mut Vector<CallSyntax>) -> ()
-! OutOfMemoryError
-? &mut Allocator {
+effect fn collectBodySyntax(
+  hir: &Module,
+  written: Range,
+  annotations: &mut Vector<HirId>,
+  calls: &mut Vector<CallSyntax>,
+) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
   while at < written.length {
     let statement = Module.child(hir, written, at)
@@ -2340,8 +2348,40 @@ effect fn collectBodyCalls(hir: &Module, written: Range, calls: &mut Vector<Call
       Node.ExpressionStatement {expression} => {
         run collectCall(hir, expression, &mut calls.*)
       }
-      Node.BindingStatement {initializer, ..} => {
+      Node.BindingStatement {mutable, isStatic, annotation, initializer, ..} => {
+        if !mutable && !isStatic && annotation.present {
+          run Vector.append<HirId>(&mut annotations.*, annotation.id)
+        }
         run collectCall(hir, initializer, &mut calls.*)
+      }
+      Node.ConditionalStatement {condition, thenBranch, elseBranch} => {
+        run collectCall(hir, condition, &mut calls.*)
+        if let Node.Block {statements} = Module.node(hir, thenBranch) {
+          run collectBodySyntax(hir, statements, &mut annotations.*, &mut calls.*)
+        }
+        let mut otherwise = elseBranch
+        while otherwise.present {
+          match Module.node(hir, otherwise.id) {
+            Node.Block {statements} => {
+              run collectBodySyntax(hir, statements, &mut annotations.*, &mut calls.*)
+              otherwise = HirRef.absent()
+            }
+            Node.ConditionalStatement {
+              condition: nextCondition,
+              thenBranch: nextThen,
+              elseBranch: nextElse,
+            } => {
+              run collectCall(hir, nextCondition, &mut calls.*)
+              if let Node.Block {statements} = Module.node(hir, nextThen) {
+                run collectBodySyntax(hir, statements, &mut annotations.*, &mut calls.*)
+              }
+              otherwise = nextElse
+            }
+            _ => {
+              otherwise = HirRef.absent()
+            }
+          }
+        }
       }
       _ => ()
     }
@@ -2753,12 +2793,198 @@ fn sameBinderName(hir: &Module, left: HirId, right: HirId) -> bool {
   return false
 }
 
+effect fn checkBlock(
+  resolver: &Resolver,
+  module: &ModuleId,
+  hir: &Module,
+  locals: &mut Vector<BodyLocal>,
+  annotations: &[ResolvedAnnotation],
+  calls: &[ResolvedCall],
+  nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  block: HirId,
+  resultType: &Shared<Type>,
+) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  if let Node.Block {statements: written} = Module.node(hir, block) {
+    let mut bindings = Vector.make<HirId>()
+    let mut statements = Vector.make<BodyNodeId>()
+    let checked = run checkStatements(
+      resolver,
+      module,
+      hir,
+      &mut locals.*,
+      &mut bindings,
+      annotations,
+      calls,
+      &mut nodes.*,
+      &mut signatures.*,
+      &mut requiredBodies.*,
+      &mut statements,
+      written,
+      resultType,
+    )
+    let canComplete = match move checked {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<CheckedControl, Shared<Rejection>>(move error)
+      }
+    }
+    let node = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+    run Vector.append<BodyNode>(
+      &mut nodes.*,
+      BodyNode {
+        origin: BodyOrigin {syntax: block, span: Module.span(hir, block)},
+        kind: BodyNodeKind.Block {statements: move statements, canComplete: canComplete},
+      },
+    )
+    return Result.succeed<CheckedControl, Shared<Rejection>>(
+      CheckedControl {node: node, canComplete: canComplete},
+    )
+  }
+  return Result.failResult<CheckedControl, Shared<Rejection>>(
+    run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, block)),
+  )
+}
+
+effect fn checkConditional(
+  resolver: &Resolver,
+  module: &ModuleId,
+  hir: &Module,
+  locals: &mut Vector<BodyLocal>,
+  annotations: &[ResolvedAnnotation],
+  calls: &[ResolvedCall],
+  nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  statement: HirId,
+  resultType: &Shared<Type>,
+) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  if let Node.ConditionalStatement {condition, thenBranch, elseBranch} = Module.node(hir, statement) {
+    let checkedCondition = run checkExpression(
+      resolver,
+      module,
+      hir,
+      Vector.asSlice<BodyLocal>(&locals.*),
+      calls,
+      &mut nodes.*,
+      &mut signatures.*,
+      &mut requiredBodies.*,
+      condition,
+      &Option.none<Shared<Type>>(),
+    )
+    let conditionNode = match move checkedCondition {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<CheckedControl, Shared<Rejection>>(move error)
+      }
+    }
+    let boolType = run primitiveType(b"bool")
+    let conditionType = match & Vector.asSlice<BodyNode>(&nodes.*)[conditionNode.index].kind {
+      BodyNodeKind.Expression {ty, ..} => Shared.clone<Type>(&ty)
+      _ => {
+        return Result.failResult<CheckedControl, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, condition)),
+        )
+      }
+    }
+    if !sameSharedType(&conditionType, &boolType) {
+      return Result.failResult<CheckedControl, Shared<Rejection>>(
+        run reject(resolver, module, RejectionCode.ConditionNotBool, Module.span(hir, condition)),
+      )
+    }
+    let checkedThen = run checkBlock(
+      resolver,
+      module,
+      hir,
+      &mut locals.*,
+      annotations,
+      calls,
+      &mut nodes.*,
+      &mut signatures.*,
+      &mut requiredBodies.*,
+      thenBranch,
+      resultType,
+    )
+    let thenControl = match move checkedThen {
+      Result<CheckedControl, Shared<Rejection>>.Success {value} => value
+      Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<CheckedControl, Shared<Rejection>>(move error)
+      }
+    }
+    let mut checkedElse = Option.none<BodyNodeId>()
+    let mut elseCanComplete = true
+    if elseBranch.present {
+      let otherwise = match Module.node(hir, elseBranch.id) {
+        Node.Block {..} => run checkBlock(
+          resolver,
+          module,
+          hir,
+          &mut locals.*,
+          annotations,
+          calls,
+          &mut nodes.*,
+          &mut signatures.*,
+          &mut requiredBodies.*,
+          elseBranch.id,
+          resultType,
+        )
+        Node.ConditionalStatement {..} => run checkConditional(
+          resolver,
+          module,
+          hir,
+          &mut locals.*,
+          annotations,
+          calls,
+          &mut nodes.*,
+          &mut signatures.*,
+          &mut requiredBodies.*,
+          elseBranch.id,
+          resultType,
+        )
+        _ => Result.failResult<CheckedControl, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, elseBranch.id)),
+        )
+      }
+      match move otherwise {
+        Result<CheckedControl, Shared<Rejection>>.Success {value} => {
+          checkedElse = Option.some<BodyNodeId>(value.node)
+          elseCanComplete = value.canComplete
+        }
+        Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<CheckedControl, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    let canComplete = thenControl.canComplete || elseCanComplete
+    let node = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+    run Vector.append<BodyNode>(
+      &mut nodes.*,
+      BodyNode {
+        origin: BodyOrigin {syntax: statement, span: Module.span(hir, statement)},
+        kind: BodyNodeKind.Branch {
+          condition: conditionNode,
+          thenBranch: thenControl.node,
+          elseBranch: move checkedElse,
+          canComplete: canComplete,
+        },
+      },
+    )
+    return Result.succeed<CheckedControl, Shared<Rejection>>(
+      CheckedControl {node: node, canComplete: canComplete},
+    )
+  }
+  return Result.failResult<CheckedControl, Shared<Rejection>>(
+    run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, statement)),
+  )
+}
+
 effect fn checkStatements(
   resolver: &Resolver,
   module: &ModuleId,
   hir: &Module,
   locals: &mut Vector<BodyLocal>,
-  firstBinding: usize,
+  bindings: &mut Vector<HirId>,
   annotations: &[ResolvedAnnotation],
   calls: &[ResolvedCall],
   nodes: &mut Vector<BodyNode>,
@@ -2774,6 +3000,30 @@ effect fn checkStatements(
     let statement = Module.child(hir, written, at)
     let span = Module.span(hir, statement)
     match Module.node(hir, statement) {
+      Node.ConditionalStatement {..} => {
+        let checked = run checkConditional(
+          resolver,
+          module,
+          hir,
+          &mut locals.*,
+          annotations,
+          calls,
+          &mut nodes.*,
+          &mut signatures.*,
+          &mut requiredBodies.*,
+          statement,
+          resultType,
+        )
+        match move checked {
+          Result<CheckedControl, Shared<Rejection>>.Success {value} => {
+            run Vector.append<BodyNodeId>(&mut statements.*, value.node)
+            reachable = reachable && value.canComplete
+          }
+          Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<bool, Shared<Rejection>>(move error)
+          }
+        }
+      }
       Node.ReturnStatement {value: returned} => {
         if span.start == span.end && returned.present {
           match Module.node(hir, returned.id) {
@@ -2851,18 +3101,13 @@ effect fn checkStatements(
             run reject(&resolver.*, module, RejectionCode.Unsupported, span),
           )
         }
-        let known = Vector.asSlice<BodyLocal>(&locals.*)
-        let mut prior = firstBinding
+        let known = Vector.asSlice<HirId>(&bindings.*)
+        let mut prior = usize.ZERO
         while prior < known.length {
-          if let Node.BindingStatement {name: earlier, ..} = Module.node(
-            hir,
-            known[prior].origin.syntax,
-          ) {
-            if sameBinderName(hir, name, earlier) {
-              return Result.failResult<bool, Shared<Rejection>>(
-                run reject(&resolver.*, module, RejectionCode.Collision, Module.span(hir, name)),
-              )
-            }
+          if sameBinderName(hir, name, known[prior]) {
+            return Result.failResult<bool, Shared<Rejection>>(
+              run reject(&resolver.*, module, RejectionCode.Collision, Module.span(hir, name)),
+            )
           }
           prior = prior + usize.ONE
         }
@@ -2941,6 +3186,7 @@ effect fn checkStatements(
             ty: move ty,
           },
         )
+        run Vector.append<HirId>(&mut bindings.*, name)
         let node = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
         run Vector.append<BodyNode>(
           &mut nodes.*,
@@ -3029,20 +3275,7 @@ effect fn resolveBody(
         if let Node.CallableBody {block} = Module.node(hir, body) {
           if block.present {
             if let Node.Block {statements} = Module.node(hir, block.id) {
-              run collectBodyCalls(hir, statements, &mut writtenCalls)
-              let mut at = usize.ZERO
-              while at < statements.length {
-                let statement = Module.child(hir, statements, at)
-                if let Node.BindingStatement {mutable, isStatic, annotation, ..} = Module.node(
-                  hir,
-                  statement,
-                ) {
-                  if !mutable && !isStatic && annotation.present {
-                    run Vector.append<HirId>(&mut annotationIds, annotation.id)
-                  }
-                }
-                at = at + usize.ONE
-              }
+              run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls)
             }
           }
         }
@@ -3189,37 +3422,34 @@ effect fn resolveBody(
           if let Node.Declaration {body, ..} = Module.node(hir, declaration.local) {
             if let Node.CallableBody {block} = Module.node(hir, body) {
               if block.present {
-                if let Node.Block {statements: writtenStatements} = Module.node(hir, block.id) {
+                if let Node.Block {..} = Module.node(hir, block.id) {
                   let mut nodes = Vector.make<BodyNode>()
-                  let mut statements = Vector.make<BodyNodeId>()
                   let mut signatureDependencies = Vector.make<SignatureDependency>()
                   run Vector.append<SignatureDependency>(
                     &mut signatureDependencies,
                     SignatureDependency {declaration: run DeclarationId.copy(&declaration.identity)},
                   )
                   let mut requiredBodies = Vector.make<DeclarationId>()
-                  let checked = run checkStatements(
+                  let checked = run checkBlock(
                     &resolver.*,
                     &module,
                     hir,
                     &mut locals,
-                    parameterCount,
                     Vector.asSlice<ResolvedAnnotation>(&annotations),
                     Vector.asSlice<ResolvedCall>(&resolvedCalls),
                     &mut nodes,
                     &mut signatureDependencies,
                     &mut requiredBodies,
-                    &mut statements,
-                    writtenStatements,
+                    block.id,
                     &resultType,
                   )
-                  let reachable = match move checked {
-                    Result<bool, Shared<Rejection>>.Success {value} => value
-                    Result<bool, Shared<Rejection>>.Failure {error} => {
+                  let control = match move checked {
+                    Result<CheckedControl, Shared<Rejection>>.Success {value} => value
+                    Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
                       return rejectedBody(move error, move dependencies)
                     }
                   }
-                  if reachable && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
+                  if control.canComplete && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
                     return rejectedBody(
                       run reject(
                         &resolver.*,
@@ -3230,14 +3460,6 @@ effect fn resolveBody(
                       move dependencies,
                     )
                   }
-                  let root = BodyNodeId {index: Vector.length<BodyNode>(&nodes)}
-                  run Vector.append<BodyNode>(
-                    &mut nodes,
-                    BodyNode {
-                      origin: BodyOrigin {syntax: block.id, span: Module.span(hir, block.id)},
-                      kind: BodyNodeKind.Block {statements: move statements},
-                    },
-                  )
                   let body = TypedBody.make(
                     run DeclarationId.copy(&declaration.identity),
                     run Shared.make<Observation>(
@@ -3245,7 +3467,7 @@ effect fn resolveBody(
                     ),
                     move locals,
                     move nodes,
-                    root,
+                    control.node,
                     move signatureDependencies,
                     move requiredBodies,
                   )
