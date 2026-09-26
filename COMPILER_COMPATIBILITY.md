@@ -62,21 +62,25 @@ Each entry records:
     [EFF-008](apps/docs/content/reference/effect-contracts.md#eff-008--an-effect-function-declares-the-contract-of-its-returned-effect)
     links its equivalence to them.
   - **Native:** implemented and verified at the signature level on draft PR #517.
-  - **Bootstrap:** not implemented for ordinary functions.
+  - **Bootstrap:** does not implement the ordinary-function `'static` result default, and does not
+    reject generic stored `effect fn` inputs.
 - **Rule:**
   - **Retained regions:** an input retains the regions of its borrows, its non-`'static` nominal
     lifetime arguments, and its callable or Effect environments. The parameter and channel types
     of a callable or Effect input are not stored. Stored contents involving a type parameter, such
     as `value: T` or `Box<T>`, have no nameable region.
-  - **`effect fn`:** it captures every input. Its omitted environment is the order-independent,
-    duplicate-free intersection of the regions its inputs retain, `'static` when they retain none.
-    Generic stored contents make it ambiguous (SEM0210) at that input.
+  - **`effect fn` capture environment:** it captures every input. Its omitted `effect<...>`
+    environment is the order-independent, duplicate-free intersection of the regions its inputs
+    retain, `'static` when they retain none. Generic stored contents make it ambiguous (SEM0210) at
+    that input.
   - **Ordinary named `fn` returning `Effect<A>`:** the omitted environment of the result is
     `'static` when no input retains anything. Otherwise LIFE-003 applies unchanged: a single
     borrowed input supplies it, and any other case requires it written.
-  - **`effect fn` whose success type is an Effect:** that inner environment gets no `'static`
-    default, independently of the `effect fn`'s own capture environment. `effect fn f() -> Effect<i32>`
-    is ambiguous (SEM0210); write `Effect<'static; i32>` where that is intended.
+  - **`effect fn` whose success type is an Effect:** that Effect's omitted environment is an output
+    lifetime, elided by LIFE-003 independently of the capture environment above. A single borrowed
+    input supplies it, as in `effect fn nested(value: &Schema) -> Effect<i32>`. It gets no `'static`
+    default, so `effect fn f() -> Effect<i32>` is ambiguous (SEM0210) and writes
+    `Effect<'static; i32>` where that is intended.
 
   ```silk,ignore
   fn closed() -> Effect<i32> { return effect { return 42 } }      // Effect<'static; i32>
@@ -102,30 +106,38 @@ Each entry records:
       `fn<'static>(A) -> A` inputs, and the pending region for `once Effect<A>`. A stored `T`
       input rejects as `AmbiguousLifetime` at that parameter's type.
   - **TypeScript bootstrap:** checked 2026-09-26 with the CLI built from this checkout.
-    - `fn closed() -> Effect<i32>` and `fn later(value: i32) -> Effect<i32>` both report `SEM0210
-The omitted output lifetime has no unique input` at the result.
     - The explicit `Effect<'static; i32>` compiles and runs.
     - `effect fn` forms with no, owned, several borrowed, or generic stored inputs compile. Whether
-      their environments follow this rule has not been verified.
-    - **Divergence:** the bootstrap accepts an `effect fn` with generic stored inputs and an omitted
-      environment; the native frontend rejects it. The same holds for an `effect fn` whose success
-      type is an Effect with an omitted environment. Affected standard-library declarations
-      include `Effect.of(value: A)`, `raise(error: E)`, `HashMap.insert(key: K, ...)` and
-      handler-taking `with*` functions. A rough 2026-09-26 text scan suggested several dozen; the
-      authoritative inventory has not been taken.
-    - Aligning the bootstrap and migrating those declarations to `effect<'env> fn` with `T: 'env`
-      bounds is required main-first work, tracked as the in-progress prerequisite task "Fix ·
-      Bootstrap Effect environments & source coherence" (note
-      `814eae87-839e-4644-bd0f-5a1f38e52deb`). The native frontend does not check the standard
-      library until it lands.
+      their capture environments follow this rule has not been verified.
+  - **Divergences (bootstrap vs native):**
+    - Ordinary function with no retaining input: `fn closed() -> Effect<i32>` and
+      `fn later(value: i32) -> Effect<i32>` report `SEM0210 The omitted output lifetime has no
+unique input` at the result in the bootstrap; native resolves them to `Effect<'static; i32>`.
+    - `effect fn` with generic stored inputs and an omitted capture environment: the bootstrap
+      accepts it; native rejects it. Affected standard-library declarations include
+      `Effect.of(value: A)`, `raise(error: E)`, `HashMap.insert(key: K, ...)` and handler-taking
+      `with*` functions. A rough 2026-09-26 text scan suggested several dozen; the authoritative
+      inventory has not been taken.
+  - **Shared rejection, not a divergence:** a parameterless `effect fn outer() -> Effect<i32>`
+    reports SEM0210 in the bootstrap (reviewer-verified 2026-09-26) and `AmbiguousLifetime` in
+    native, because its success Effect has no borrowed input to supply the output lifetime.
+  - **Prerequisite:** aligning the bootstrap and migrating the generic stored-input declarations
+    to `effect<'env> fn` with `T: 'env` bounds is required main-first work, tracked as the
+    in-progress prerequisite task "Fix · Bootstrap Effect environments & source coherence" (note
+    `814eae87-839e-4644-bd0f-5a1f38e52deb`). The native frontend does not check the standard
+    library until it lands.
 - **Source migration:**
-  - Omitting the environment is the approved form where the rules above give it a value: an
-    ordinary function's Effect result whose inputs retain nothing or that has one borrowed input,
-    and an `effect fn` whose inputs store no generic contents.
-  - Source outside those cases must write the environment: an `effect fn` with generic stored
-    inputs writes `effect<'env> fn` with `T: 'env` bounds, and an `effect fn` whose success type is
-    an Effect writes that Effect's environment, for example `Effect<'static; A>`. Existing source
-    that omits it there needs migration.
+  - Omitting an environment is the approved form where the rules above give it a value:
+    - an ordinary function's Effect result whose inputs retain nothing, or that has one borrowed
+      input;
+    - an `effect fn` capture environment when its inputs store no generic contents;
+    - an `effect fn` success Effect's environment when a single borrowed input supplies it under
+      LIFE-003.
+  - Otherwise source writes it. An `effect fn` with generic stored inputs writes `effect<'env> fn`
+    with `T: 'env` bounds. An `effect fn` whose success type is an Effect, with no single borrowed
+    input, writes that Effect's environment, for example `Effect<'static; A>`; the parameterless
+    omission is already a shared rejection. Existing source that omits a required environment
+    needs migration.
   - The explicit spelling `Effect<'static; A>` is equivalent valid syntax, not a compatibility shim.
     Source may choose it intentionally, for example to compile with the current bootstrap.
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
