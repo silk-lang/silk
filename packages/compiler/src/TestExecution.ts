@@ -686,7 +686,8 @@ const closureOf = Effect.fnUntraced(function* (
 
 /**
  * Encodes every test's execution closure. Closures do not depend on native code generation or
- * linking, so the driver computes them while the object compiler runs.
+ * linking, so the driver computes them before backend emission and releases discovery and
+ * elaboration results before constructing the LLVM module.
  */
 export const closures = Effect.fn('TestExecution.closures')(function* (
   catalog: TestDiscovery.Catalog,
