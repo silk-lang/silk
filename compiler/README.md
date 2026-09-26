@@ -60,7 +60,30 @@ explicit aliases, and a hybrid namespace alias with selected members. Qualified 
 one namespace segment and one public member segment. Import paths map to slash-separated `.silk`
 logical source paths within the importing module's source origin and package. Selected public import
 chains resolve to the canonical declaration. The store resolves type aliases and nominal type
-identities without inspecting fields or layout.
+identities without inspecting fields or layout. Separate `demandMembers` and `demandMemberShape`
+queries enumerate a struct's fields, tuple positions, enum cases, or union variants, then resolve
+only a selected member's written types under a canonical nominal application. The member ordinal
+comes from the ordered enumeration; a unit variant or scalar enum case has no payload types.
+Neither query computes inline storage or target layout. For example, the identity and written
+`next` field type below terminate even though a later layout request must reject its infinite
+by-value representation:
+
+```silk,ignore
+struct Node { next: Node }
+```
+
+A generic member query substitutes the application's explicit type and lifetime arguments without
+checking another member. In `Box<bool>`, requesting `value` yields `bool` even if `deferred` has an
+invalid written type; requesting `deferred` then rejects at its written type:
+
+```silk,ignore
+struct Box<T> {
+  value: T
+  deferred: Missing
+}
+fn boxed() -> Box<bool> { return () }
+```
+
 Ordinary type and lifetime binders belong to their declarations. Written function signatures
 resolve those binders and explicit nominal or alias arguments, including substitution through
 alias targets. Each omitted input lifetime gets a distinct declaration-owned identity; an omitted
@@ -89,11 +112,15 @@ These are type relationships, not a borrow-safety proof or a checked generic bod
 contracts reject private nominal types; missing modules, inaccessible members, collisions, and
 alias or import-name cycles produce anchored semantic rejections.
 
-Generic calls and demanded generic bodies, type inference, binder bounds, row binders, arrays,
+Generic calls and demanded generic bodies, type inference, binder bounds, row binders,
 callable types, variadic functions, failure or requirement rows, constraints, and nonstandard
 callable header modifiers currently return `Unsupported` rather than a provisional type. Invalid
-or unknown lifetimes and pointer qualifiers have anchored rejections. Nominal field and machine
-layout facts are not inspected. Unused declarations with these forms are still indexed as written
+or unknown lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
+retain the exact non-negative decimal literal extent and element type, including at zero length;
+extents needing static execution remain `Unsupported` at their source span. Member type requests
+with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
+represented by the nominal application. No machine layout fact is inspected. Unused declarations
+with these forms are still indexed as written
 names and do not require semantic resolution. `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
 and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
