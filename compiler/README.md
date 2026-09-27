@@ -220,9 +220,11 @@ conflicting head. Two unbounded heads that rename each other exactly, lifetimes 
 `DuplicateConformance`; every other conflict is `OverlappingConformance`. Unions and requirement
 rows are sets: `Box<T | i32>` and `Box<bool>` stay distinct, and `? &Clock | R` covers
 `? &mut Clock` but `? &mut Clock | R` never covers `? &Clock`. A union member or row entry that
-nests a parameter, or a set parameter used elsewhere in the head, is `Unsupported` until shared
-matching decides it; it is never reported as a conflict. Sealed-property and inherent heads have no
-coherence answer yet.
+nests a parameter is matched against closed peers under one shared assignment; a successful
+pairing is a conflict, and contradictory fixed evidence is distinct. Closed row keys compare after
+lifetime projection and retain the strongest access when keys collapse. Set parameters used
+elsewhere in the head and pairings whose normalized cardinality may change remain `Unsupported`
+until matching can decide them. Sealed-property and inherent heads have no coherence answer yet.
 
 `Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
 binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
