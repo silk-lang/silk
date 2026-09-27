@@ -213,14 +213,25 @@ and `Intrinsic.NonParking` are witness-free properties recorded on generic bound
 representation parameter retains no region. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
-Generic calls and demanded generic bodies, type inference, applications of declarations with
-interface or representation bounds, a declaration with more than one `?R` binder when applied,
-row subtraction such as `Without<R, K>` (which belongs to the later provision and
-requirement-algebra work), requirements on type parameters,
+Generic bodies, non-scalar call operands, applications of declarations with interface or
+representation bounds, provider-derived argument inference, row subtraction such as
+`Without<R, K>` (which belongs to the later provision and requirement-algebra work), and
+requirements on type parameters,
 variadic functions, static parameters, and other nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
+
+Calls in the scalar body subset accept a contiguous ordered prefix of type, lifetime, and
+positional row arguments. Direct ordinary type parameters are inferred from supplied operands;
+conflicting evidence and binders present only in the result reject without using the expected
+result. The typed call retains its completed generic application. Multiple row binders can be
+supplied positionally; row and lifetime inference from non-scalar operands awaits the shared exact
+matcher. `typeof(item)` in a type position names one visible, fully specialized named callable
+representation. Identical callable use signatures do not make two named items identical. A public
+signature cannot expose a private item. A `some` result records one producer-owned opaque
+representation and its executable use contract. Checking its concrete realization in a body
+remains part of the later complete-body work.
 An omitted lifetime inside a declaration bound is recorded as a generated declaration binder;
 applications requiring conformance proof remain `Unsupported` until that proof is available.
 
@@ -293,7 +304,7 @@ exact out-of-range value. `fn inferred() -> u8 { let value = 255 return value }`
 `value` is already `i32`; `fn annotated() -> u8 { let value: u8 = 255 return value }` succeeds.
 Initializers see preceding locals and parameters, but not the binding they initialize. A local
 may shadow a parameter in the function body; a second local with the same name in that block
-rejects. A full direct call to a same-module or imported ordinary nongeneric function checks each
+rejects. A full direct call to a same-module or imported ordinary function checks each
 argument against its written parameter type in source order. An exact integer literal uses that
 parameter as its immediate type context; an already typed local keeps its fixed type. For example,
 `fn pair(first: u8, second: i32) -> i32 { return second }` accepts `pair(255, 1)`, but rejects
