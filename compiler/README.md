@@ -217,9 +217,12 @@ referent, region, and result match exactly. Failures and requirements may only n
 still see the operation's header. An `effect fn` member's environment must be a promised region, a
 region the operation's inputs retain, or one with a written bound to a promised region; a written
 member environment must also be kept by its stored inputs. No member body is read, and a
-successful answer proves no conformance. A member that binds parameters of its own, including an
-elided borrow, and an environment covered only through a chain of bounds are `Unsupported` until
-exact matching and bound entailment exist.
+successful answer proves no conformance. Member-owned type, lifetime, and row binders receive
+exact evidence from the substituted operation; an owned contract operand may be lent to an elided
+member borrow without letting that borrow escape. A fixed requirement beside one open member row
+is covered by the operation's fixed row before the open member row binds to its rigid parameters;
+the resolved member row must still be covered by the operation row. Ambiguous environment
+intersections and an environment covered only through a chain of bounds remain `Unsupported`.
 `demandCoherence` decides a conformance head before any applicability or bound proof. Every written
 parameter must occur in the interface application or provider (`UnconstrainedImplParameter`), and
 every bound must name a parameter inside the provider without repeating an open parameter or
@@ -456,11 +459,11 @@ Effect signature contracts with written channels and recorded bounds; constant t
 constant-to-constant values; and revision validation for each of these facts. A form outside that
 vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
 
-- **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
+- **M2.3, remaining generic contracts:** generic bodies, conformance proof integration, and
   applications of declarations with interface, service, or representation bounds, such as
-  `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
-  parameters, lifetimes omitted inside a type declaration's bound, and substituting generated field
-  lifetimes into requested member types.
+  `Sorted<i32>`, remain pending. Ordered multi-row applications, declaration-bound lifetime
+  completion, and generated field-lifetime substitution are supported in the current semantic
+  layer. Requirements on type parameters still await their abstract-body work.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
