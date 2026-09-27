@@ -20,7 +20,7 @@ import hir.Hir {
 import hir.Fingerprint
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.Lifetime {Intersection, Lifetime}
+import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {CandidateKind, IndexedDeclaration, ModuleIndex, NameObservation}
 import semantic.Query {Cycle, Query}
@@ -5981,6 +5981,7 @@ effect fn resolveContract(
         headerGenerics(value.header),
         Vector.asSlice<Binder>(&none),
         true,
+        false,
       )
       if let Option<Shared<Rejection>>.Some {value: diagnostic} = move conflict {
         return memberRejected(move diagnostic, move dependencies)
@@ -6062,16 +6063,39 @@ fn binderNameId(parameter: Node) -> HirRef {
   }
 }
 
+// The kind of one written generic binder, as its enclosing-scope counterpart would record it.
+fn writtenBinderKind(parameter: Node) -> GenericKind {
+  return match parameter {
+    Node.RowParameter {..} => GenericKind.Requirement
+    Node.LifetimeParameter {..} => GenericKind.Lifetime
+    _ => GenericKind.Type
+  }
+}
+
+// Whether an enclosing binder with this spelling has exactly this kind.
+fn restatesSameKind(enclosing: &[Binder], spelling: &[u8], kind: GenericKind) -> bool {
+  let mut at = usize.ZERO
+  while at < enclosing.length {
+    if same(binderName(&enclosing[at]), spelling) {
+      return binderKind(&enclosing[at]) == kind
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // Rejects a written binder that reuses a spelling already bound around it. The implicit `Self`
-// provider reserves its name. An inherent member's restated owner binder is a refinement and never
-// reaches this check; restating an interface, service, or conformance binder has no settled meaning,
-// so that form stays `Unsupported` rather than choosing shadowing or refinement.
+// provider reserves its name. An inherent member may restate an owner binder of the same kind as a
+// refinement; restating it with another kind would silently shadow it, so that is a duplicate.
+// Restating an interface, service, or conformance binder has no settled meaning, so that form stays
+// `Unsupported` rather than choosing shadowing or refinement.
 effect fn scopedBinderRejection(
   resolver: &mut Resolver,
   module: &ModuleId,
   generics: Range,
   enclosing: &[Binder],
   reservesSelf: bool,
+  refines: bool,
 ) -> Option<Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run source(&mut resolver.*, module)
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
@@ -6094,9 +6118,16 @@ effect fn scopedBinderRejection(
             )
           }
           if hasBinder(enclosing, spelling) {
-            return Option.some<Shared<Rejection>>(
-              run reject(&resolver.*, module, RejectionCode.Unsupported, Module.span(hir, parameter)),
-            )
+            let written = writtenBinderKind(Module.node(hir, parameter))
+            let mut code = RejectionCode.Unsupported
+            if refines {
+              code = RejectionCode.DuplicateTypeParameter
+            }
+            if !refines || !restatesSameKind(enclosing, spelling, written) {
+              return Option.some<Shared<Rejection>>(
+                run reject(&resolver.*, module, code, Module.span(hir, parameter)),
+              )
+            }
           }
         }
       }
@@ -6539,6 +6570,150 @@ effect fn ordinalOfIdentity(resolver: &mut Resolver, module: &ModuleId, identity
   return Option.none<usize>()
 }
 
+// The index ordinal of the nominal declaration a provider type applies, in the held `module`.
+effect fn ordinalOfProvider(resolver: &mut Resolver, module: &ModuleId, provider: &Shared<Type>) -> Option<
+  usize,
+> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let candidate = &declarations[at].identity
+      if Shared.with<Type, bool>(
+        provider,
+        fn(applied: &Type) -> bool {
+          return match & applied.* {
+            Type.Nominal {declaration, ..} => DeclarationId.equals(candidate, &declaration)
+            _ => false
+          }
+        },
+      ) {
+        return Option.some<usize>(at)
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Option.none<usize>()
+}
+
+// Whether a member identity is published by an owner's inherent member list, or the kept
+// rejection that replaces it.
+struct MemberVerdict {
+  published: bool
+  rejected: Option<Shared<Rejection>>
+}
+
+fn memberVerdict(answer: &Result<Answer, NoRejection>, member: &DeclarationId) -> MemberVerdict {
+  let mut verdict = MemberVerdict {published: false, rejected: Option.none<Shared<Rejection>>()}
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.InherentMembers {members, rejected}} = &value.outcome {
+      let listed = Vector.asSlice<Shared<DeclarationId>>(&members)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if Shared.with<DeclarationId, bool>(
+          &listed[at],
+          fn(declaration: &DeclarationId) -> bool {
+            return DeclarationId.equals(declaration, member)
+          },
+        ) {
+          verdict.published = true
+        }
+        at = at + usize.ONE
+      }
+      let refused = Vector.asSlice<RejectedMember>(&rejected)
+      at = usize.ZERO
+      while at < refused.length {
+        if Shared.with<DeclarationId, bool>(
+          &refused[at].declaration,
+          fn(declaration: &DeclarationId) -> bool {
+            return DeclarationId.equals(declaration, member)
+          },
+        ) {
+          verdict.rejected = Option.some<Shared<Rejection>>(Shared.clone<Rejection>(&refused[at].rejection))
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return move verdict
+}
+
+// For a member of an inherent `impl`, the rejecting answer that owner-wide uniqueness or the head
+// gives instead of its signature; `None` when the owner publishes the member.
+effect fn inherentMemberRefusal(
+  resolver: &mut Resolver,
+  query: &mut Query<Word, Answer, NoRejection>,
+  module: &ModuleId,
+  implementation: usize,
+  member: usize,
+) -> Option<Shared<Result<Answer, NoRejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let moduleOrdinal = run internModule(&mut resolver.*, module)
+  let headKey = Key {
+    family: Family.ImplementationHead,
+    module: moduleOrdinal,
+    name: usize.ZERO,
+    declaration: implementation,
+    member: usize.ZERO,
+    external: false,
+  }
+  let head = run demandRaw(&mut resolver.*, &mut query.*, headKey, Span.make(usize.ZERO, usize.ZERO))
+  let resolved = Shared.with<Result<Answer, NoRejection>, Option<Shared<ImplementationHead>>>(
+    &head,
+    headOf,
+  )
+  let found = match move resolved {
+    Option<Shared<ImplementationHead>>.Some {value} => move value
+    Option<Shared<ImplementationHead>>.None => {
+      return Option.some<Shared<Result<Answer, NoRejection>>>(move head)
+    }
+  }
+  let provider = Shared.with<ImplementationHead, Shared<Type>>(&found, headProvider)
+  let located = run ordinalOfProvider(&mut resolver.*, module, &provider)
+  let ownerOrdinal = match move located {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => {
+      return Option.some<Shared<Result<Answer, NoRejection>>>(
+        run rejectAbsent(&mut resolver.*, module, Span.make(usize.ZERO, usize.ZERO)),
+      )
+    }
+  }
+  let membersKey = Key {
+    family: Family.InherentMembers,
+    module: moduleOrdinal,
+    name: usize.ZERO,
+    declaration: ownerOrdinal,
+    member: usize.ZERO,
+    external: false,
+  }
+  let listed = run demandRaw(&mut resolver.*, &mut query.*, membersKey, Span.make(usize.ZERO, usize.ZERO))
+  if Shared.with<Result<Answer, NoRejection>, bool>(&listed, hasRejection) {
+    return Option.some<Shared<Result<Answer, NoRejection>>>(move listed)
+  }
+  let identity = run declarationAt(&mut resolver.*, module, member)
+  if let Option<DeclarationId>.Some {value: declared} = move identity {
+    let verdict = Shared.with<Result<Answer, NoRejection>, MemberVerdict>(
+      &listed,
+      fn(answer: &Result<Answer, NoRejection>) -> MemberVerdict {
+        return memberVerdict(answer, &declared)
+      },
+    )
+    if verdict.published {
+      return Option.none<Shared<Result<Answer, NoRejection>>>()
+    }
+    if let Option<Shared<Rejection>>.Some {value: diagnostic} = move verdict.rejected {
+      return Option.some<Shared<Result<Answer, NoRejection>>>(
+        run rootRejection(&mut resolver.*, module, move diagnostic),
+      )
+    }
+  }
+  return Option.some<Shared<Result<Answer, NoRejection>>>(
+    run rejectAbsent(&mut resolver.*, module, Span.make(usize.ZERO, usize.ZERO)),
+  )
+}
+
 // The ordinal of the `occurrence`th top-level `impl` declaration of a module.
 effect fn implementationOrdinal(resolver: &mut Resolver, module: &ModuleId, occurrence: usize) -> Option<
   usize,
@@ -6677,8 +6852,30 @@ fn argumentOrdinal(argument: &Argument, implementation: &DeclarationId) -> usize
         return lifetimeOrdinalOf(region, implementation)
       },
     )
-    Argument.Row {..} => usize.MAX
+    Argument.Row {value} => Shared.with<Row, usize>(
+      &value,
+      fn(row: &Row) -> usize {
+        return rowParameterOrdinal(row, implementation)
+      },
+    )
   }
+}
+
+// The ordinal of a row that is exactly one requirement-row parameter bound by `implementation`.
+fn rowParameterOrdinal(row: &Row, implementation: &DeclarationId) -> usize {
+  let parameters = Vector.asSlice<RowParameter>(&row.parameters)
+  if Vector.length<Requirement>(&row.entries) != usize.ZERO || parameters.length != usize.ONE {
+    return usize.MAX
+  }
+  if Shared.with<DeclarationId, bool>(
+    &parameters[usize.ZERO].declaration,
+    fn(declaration: &DeclarationId) -> bool {
+      return DeclarationId.equals(declaration, implementation)
+    },
+  ) {
+    return parameters[usize.ZERO].ordinal
+  }
+  return usize.MAX
 }
 
 // Whether a nominal owner's arguments are exactly the implementation's binders, each once: the
@@ -6843,6 +7040,7 @@ effect fn resolveImplementationHead(
     generics,
     Vector.asSlice<Binder>(&none),
     true,
+    false,
   )
   if let Option<Shared<Rejection>>.Some {value: diagnostic} = move conflict {
     return memberRejected(move diagnostic, move dependencies)
@@ -7031,6 +7229,15 @@ effect fn resolveImplementationHead(
       run reject(&resolver.*, &module, RejectionCode.ConformanceOwner, span),
       move dependencies,
     )
+  }
+  // ENUM-003: a scalar enum is always Copy and never admits a Drop hook, so neither is requested.
+  if let ImplementationKind.Sealed {..} = &kind {
+    if Shared.with<Type, OwnerKind>(&provider, nominalKind) == OwnerKind.Enumeration {
+      return memberRejected(
+        run reject(&resolver.*, &module, RejectionCode.InvalidSealedRequest, span),
+        move dependencies,
+      )
+    }
   }
   // An inherent head belongs to every instantiation of an owner of this module: its arguments are
   // the implementation's own unbounded binders, written ones in declaration order, each once.
@@ -7652,17 +7859,13 @@ effect fn resolveSignature(
     // An inherent member may restate an owner binder to add bounds for that member alone; the
     // restated binder keeps the owner's identity. Elsewhere a restated spelling stays unsupported.
     let refines = run refinesEnclosing(&mut resolver.*, &module, key.declaration)
-    let none = Vector.make<Binder>()
-    let mut restatable = visible
-    if refines {
-      restatable = Vector.asSlice<Binder>(&none)
-    }
     let conflict = run scopedBinderRejection(
       &mut resolver.*,
       &module,
       value.generics,
-      restatable,
+      visible,
       hasBinder(visible, b"Self"),
+      refines,
     )
     if let Option<Shared<Rejection>>.Some {value: diagnostic} = move conflict {
       return memberRejected(move diagnostic, move dependencies)
@@ -7982,6 +8185,19 @@ effect fn resolveSignature(
           &mut regions,
           &mut rows,
         )
+        // A written `effect<'a> fn` environment can mention an owner lifetime nothing else does.
+        if let Option<Intersection>.Some {value: declaredEnvironment} = &environment {
+          let retainedRegions = Vector.asSlice<LifetimeMember>(&declaredEnvironment.members)
+          let mut regionAt = usize.ZERO
+          while regionAt < retainedRegions.length {
+            run Type.collectOwnedLifetime(
+              &retainedRegions[regionAt].region,
+              &implementation,
+              &mut regions,
+            )
+            regionAt = regionAt + usize.ONE
+          }
+        }
         let declared = Vector.asSlice<Constraint>(&constraints)
         let mut declaredAt = usize.ZERO
         while declaredAt < declared.length {
@@ -10505,6 +10721,12 @@ impl Semantic {
     drop listed
     let selected = run select(&mut self.resolver, module, contract, false)
     let lookup = run memberOrdinal(&mut self.resolver, module, selected.declaration, operation)
+    if let Option<Span>.Some {value: span} = move lookup.repeated {
+      let diagnostic = run reject(&self.resolver, module, RejectionCode.Collision, span)
+      let repeated = run rootRejection(&mut self.resolver, module, move diagnostic)
+      run recordRoot(&mut request.*, Family.Signature, module, operation, &repeated)
+      return move repeated
+    }
     if let Option<usize>.Some {value: ordinal} = move lookup.ordinal {
       let key = Key {
         family: Family.Signature,
@@ -10675,6 +10897,21 @@ impl Semantic {
         return move repeated
       }
       if let Option<usize>.Some {value: ordinal} = move lookup.ordinal {
+        // An inherent member is only reachable when its owner publishes it.
+        let inherent = run refinesEnclosing(&mut self.resolver, module, ordinal)
+        if inherent {
+          let refusal = run inherentMemberRefusal(
+            &mut self.resolver,
+            &mut self.query,
+            module,
+            parent,
+            ordinal,
+          )
+          if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: refused} = move refusal {
+            run recordRoot(&mut request.*, Family.Signature, module, member, &refused)
+            return move refused
+          }
+        }
         let key = Key {
           family: Family.Signature,
           module: moduleOrdinal,
