@@ -207,6 +207,20 @@ the operation's own binders stay its parameters, and no bound is proved. Under
 `impl Convert<i32> for Box<bool>`, `fn convert<U>(value: Self, other: U) -> T` has the parameters
 `Box<bool>` and `U` and the result `i32`.
 
+`demandWitnesses` pairs each operation of one conformance with the member that implements it and
+checks the member's header against `demandOperationUnder`'s header. A missing or unknown member, a
+mapped source function for a scalar or `string` provider, or an incompatible member rejects with
+`IncompatibleWitness`, which names the first failing component. Ordinary and effect functions
+never stand in for each other; an unsafe member cannot implement a safe operation. Operand modes
+are literal: a member may ask for weaker access but not stronger or consuming access, and the
+referent, region, and result match exactly. Failures and requirements may only narrow; callers
+still see the operation's header. An `effect fn` member's environment must be a promised region, a
+region the operation's inputs retain, or one with a written bound to a promised region; a written
+member environment must also be kept by its stored inputs. No member body is read, and a
+successful answer proves no conformance. A member that binds parameters of its own, including an
+elided borrow, and an environment covered only through a chain of bounds are `Unsupported` until
+exact matching and bound entailment exist.
+
 `Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
 binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
 and `Intrinsic.NonParking` are witness-free properties recorded on generic bounds, and a Detached
