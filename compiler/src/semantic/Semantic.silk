@@ -9,6 +9,7 @@ import hir.Hir {
   CallableMode,
   HirId,
   HirRef,
+  InfixOperator,
   Module,
   Node,
   OwnerKind,
@@ -13541,8 +13542,25 @@ effect fn resolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<
   return Option.none<Result<CallTarget, Shared<Rejection>>>()
 }
 
-effect fn checkExpression(
-  resolver: &Resolver,
+fn bodyExpressionType(nodes: &[BodyNode], node: BodyNodeId) -> Option<Shared<Type>> {
+  return match &nodes[node.index].kind {
+    BodyNodeKind.Expression {ty, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&ty))
+    _ => Option.none<Shared<Type>>()
+  }
+}
+
+struct CheckedOperand {
+  node: BodyNodeId
+  ty: Shared<Type>
+}
+
+struct CheckedOperands {
+  left: CheckedOperand
+  right: CheckedOperand
+}
+
+effect fn checkOperatorOperand(
+  resolver: &mut Resolver,
   module: &ModuleId,
   hir: &Module,
   locals: &[BodyLocal],
@@ -13553,7 +13571,50 @@ effect fn checkExpression(
   expression: HirId,
   expected: &Option<Shared<Type>>,
   contractBody: bool,
-) -> Result<BodyNodeId, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+) -> Result<CheckedOperand, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let checked = run checkExpression(
+    &mut resolver.*,
+    module,
+    hir,
+    locals,
+    calls,
+    &mut nodes.*,
+    &mut signatures.*,
+    &mut requiredBodies.*,
+    expression,
+    expected,
+    contractBody,
+  )
+  let node = match move checked {
+    Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+    Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<CheckedOperand, Shared<Rejection>>(move error)
+    }
+  }
+  let ty = match bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), node) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return Result.failResult<CheckedOperand, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, Module.span(hir, expression)),
+      )
+    }
+  }
+  return Result.succeed<CheckedOperand, Shared<Rejection>>(CheckedOperand {node: node, ty: move ty})
+}
+
+effect fn checkExpression(
+  resolver: &mut Resolver,
+  module: &ModuleId,
+  hir: &Module,
+  locals: &[BodyLocal],
+  calls: &[ResolvedCall],
+  nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  expression: HirId,
+  expected: &Option<Shared<Type>>,
+  contractBody: bool,
+) -> Result<BodyNodeId, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let span = Module.span(hir, expression)
   let mut ty = run Shared.make<Type>(Type.Unit)
   let mut form = BodyExpression.Unit
@@ -13671,6 +13732,111 @@ effect fn checkExpression(
         _ => return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
       form = BodyExpression.Move {value: operandNode}
+    }
+    Node.PrefixExpression {operator, operatorAnchor, operand} => {
+      let checked = run checkExpression(
+        &mut resolver.*,
+        module,
+        hir,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        operand,
+        &Option.none<Shared<Type>>(),
+        contractBody,
+      )
+      let operandNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let operandType = match bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), operandNode) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, operatorAnchor)
+        }
+      }
+      let family = run operatorFamily(&mut resolver.*, &operandType)
+      let selected = Operator.prefix(operator, family)
+      match move selected {
+        Option<Operator.ResultType>.Some {value: result} => {
+          ty = match result {
+            Operator.ResultType.Operand => Shared.clone<Type>(&operandType)
+            Operator.ResultType.Boolean => run primitiveType(b"bool")
+          }
+          form = BodyExpression.ConcretePrefix {operator: operator, operand: operandNode}
+        }
+        Option<Operator.ResultType>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.MissingOperator, operatorAnchor)
+        }
+      }
+    }
+    Node.InfixExpression {operator, operatorAnchor, left, right} => {
+      if operator == InfixOperator.And || operator == InfixOperator.Or {
+        // Conditional right-hand evaluation belongs to the control-flow body wave.
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, operatorAnchor)
+      }
+      let leftLiteral = match Module.node(hir, left) {
+        Node.IntegerLiteral {suffix, ..} => !suffix.present
+        _ => false
+      }
+      // A bare literal has no fixed type before its other operand is known. Checking that
+      // operand first only selects a literal type; the retained pair preserves runtime order.
+      let firstExpression = match leftLiteral { true => right, false => left }
+      let secondExpression = match leftLiteral { true => left, false => right }
+      let first = run checkOperatorOperand(
+        &mut resolver.*, module, hir, locals, calls, &mut nodes.*, &mut signatures.*,
+        &mut requiredBodies.*, firstExpression, &Option.none<Shared<Type>>(), contractBody,
+      )
+      let firstOperand = match move first {
+        Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
+        Result<CheckedOperand, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let secondLiteral = match Module.node(hir, secondExpression) {
+        Node.IntegerLiteral {suffix, ..} => !suffix.present
+        _ => false
+      }
+      let mut secondExpected = Option.none<Shared<Type>>()
+      if secondLiteral && Shared.with<Type, bool>(&firstOperand.ty, fixedIntegerType) {
+        secondExpected = Option.some<Shared<Type>>(Shared.clone<Type>(&firstOperand.ty))
+      }
+      let second = run checkOperatorOperand(
+        &mut resolver.*, module, hir, locals, calls, &mut nodes.*, &mut signatures.*,
+        &mut requiredBodies.*, secondExpression, &secondExpected, contractBody,
+      )
+      let secondOperand = match move second {
+        Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
+        Result<CheckedOperand, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let pair = match leftLiteral {
+        true => CheckedOperands {left: move secondOperand, right: move firstOperand}
+        false => CheckedOperands {left: move firstOperand, right: move secondOperand}
+      }
+      let leftFamily = run operatorFamily(&mut resolver.*, &pair.left.ty)
+      let rightFamily = run operatorFamily(&mut resolver.*, &pair.right.ty)
+      let sameType = run Type.equalsShared(&pair.left.ty, &pair.right.ty)
+      let selected = Operator.infix(operator, leftFamily, rightFamily, sameType)
+      match move selected {
+        Option<Operator.ResultType>.Some {value: result} => {
+          ty = match result {
+            Operator.ResultType.Operand => Shared.clone<Type>(&pair.left.ty)
+            Operator.ResultType.Boolean => run primitiveType(b"bool")
+          }
+          form = BodyExpression.ConcreteInfix {
+            operator: operator, left: pair.left.node, right: pair.right.node,
+          }
+        }
+        Option<Operator.ResultType>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.MissingOperator, operatorAnchor)
+        }
+      }
     }
     Node.CallExpression {callee: _, generics, arguments} => {
       if generics.present {
@@ -13853,7 +14019,7 @@ fn sameBinderName(hir: &Module, left: HirId, right: HirId) -> bool {
 }
 
 effect fn checkBlock(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
   module: &ModuleId,
   hir: &Module,
   locals: &mut Vector<BodyLocal>,
@@ -13865,7 +14031,7 @@ effect fn checkBlock(
   block: HirId,
   resultType: &Shared<Type>,
   contractBody: bool,
-) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+) -> Result<CheckedControl, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   if let Node.Block {statements: written} = Module.node(hir, block) {
     let mut bindings = Vector.make<HirId>()
     let mut statements = Vector.make<BodyNodeId>()
@@ -13909,7 +14075,7 @@ effect fn checkBlock(
 }
 
 effect fn checkConditional(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
   module: &ModuleId,
   hir: &Module,
   locals: &mut Vector<BodyLocal>,
@@ -13921,7 +14087,7 @@ effect fn checkConditional(
   statement: HirId,
   resultType: &Shared<Type>,
   contractBody: bool,
-) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+) -> Result<CheckedControl, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   if let Node.ConditionalStatement {condition, thenBranch, elseBranch} = Module.node(hir, statement) {
     let checkedCondition = run checkExpression(
       resolver,
@@ -14046,7 +14212,7 @@ effect fn checkConditional(
 }
 
 effect fn checkStatements(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
   module: &ModuleId,
   hir: &Module,
   locals: &mut Vector<BodyLocal>,
@@ -14060,7 +14226,7 @@ effect fn checkStatements(
   written: Range,
   resultType: &Shared<Type>,
   contractBody: bool,
-) -> Result<bool, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+) -> Result<bool, Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let mut reachable = true
   let mut at = usize.ZERO
   while at < written.length {
