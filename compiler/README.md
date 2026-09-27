@@ -210,7 +210,33 @@ extents needing static execution remain `Unsupported` at their source span. Memb
 with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
 represented by the nominal application. No machine layout fact is inspected. Unused declarations
 with these forms are still indexed as written
-names and do not require semantic resolution. `Semantic.demandBody`
+names and do not require semantic resolution.
+
+Constants have two separate facts. `Semantic.demandConstant` resolves only the written type, which
+must be `bool`, `char`, an integer or floating-point primitive, or `string`, whose omitted lifetime is
+`'static`. Any other type is `InvalidConstant`, and the initializer is never read; an omitted
+annotation is a syntax error. `Semantic.demandInitializer` first demands that type, then publishes a value only when no
+static execution is needed: an exact `bool` literal, or a fixed-width integer literal that fits the
+declared type and any suffix. A bare name of another constant, in the same module or selected by an
+import, demands that constant's type and then its value. For example:
+
+```silk,ignore
+const limit: u8 = 255
+const copied: u8 = limit
+const first: i32 = second
+const second: i32 = first
+```
+
+`copied` has the value 255, while the value demands of `first` and `second` reject with a `Cycle`
+whose path names both declarations; their `i32` types remain available. A literal of the wrong kind
+or out of range is `InvalidConstant`, and a constant of a different type is `TypeMismatch`. Every
+other initializer is an anchored `Unsupported` with no value: floating-point, text, and character
+literals, pointer-sized integers (whose range belongs to the selected target), namespace-qualified
+names, calls to static functions, operators, and names of non-constant declarations. Static
+evaluation of those forms, target selection, foreign `static` data, and package parameters are
+later work. Function bodies and array extents do not read constants yet.
+
+`Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
 and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
 and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation

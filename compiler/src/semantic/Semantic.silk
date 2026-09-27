@@ -1,4 +1,4 @@
-//! Lazy name, import, type, signature, and ordinary scalar body queries.
+//! Lazy name, import, type, signature, constant, and ordinary scalar body queries.
 //!
 //! # When to use
 //! Use [`Semantic`] with one held source revision. Demand one written fact at a time.
@@ -77,6 +77,10 @@ pub enum Family {
   Contract,
   /// The types written on a function header.
   Signature,
+  /// The written type of a constant declaration, independent of its initializer.
+  Constant,
+  /// The value of a constant initializer that needs no static execution.
+  Initializer,
   /// One checked ordinary function body.
   Body,
 }
@@ -160,6 +164,14 @@ pub enum MemberKind {
   Variant,
 }
 
+/// A constant's value, published only when its initializer needs no static execution.
+pub union ConstantValue {
+  /// An exact integer at the constant's fixed-width type. Zero is always positive.
+  Integer {pub sign: Sign, pub magnitude: Bytes},
+  /// A Boolean.
+  Boolean {pub value: bool},
+}
+
 /// One completed semantic query value.
 pub union Value {
   /// The complete syntactic name bucket, including an empty bucket.
@@ -178,6 +190,8 @@ pub union Value {
   Contract {pub contract: Contract},
   /// A function's written signature.
   Signature {pub signature: Signature},
+  /// A constant's initializer value at the type published by its `Constant` fact.
+  Initializer {pub value: Shared<ConstantValue>},
   /// A complete checked ordinary function body with source ownership for its syntax positions.
   Body {
     /// The checked payload, whose local syntax positions match `source`.
@@ -642,6 +656,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       }
       _ => false
     }
+    Value.Initializer {..} => false
     Value.Body {..} => false
   }
 }
@@ -807,6 +822,9 @@ effect fn identityOf(outcome: &Outcome) -> Option<Shared<Value>> ! OutOfMemoryEr
           return Option.none<Shared<Value>>()
         }
         Value.Signature {signature} => run copySignature(&signature)
+        Value.Initializer {..} => {
+          return Option.none<Shared<Value>>()
+        }
         Value.Body {..} => {
           return Option.none<Shared<Value>>()
         }
@@ -1666,7 +1684,7 @@ effect fn dependency(resolver: &mut Resolver, key: Key) -> Dependency
   }
   let mut declaration = Option.none<DeclarationId>()
   let mut member = Option.none<usize>()
-  if key.family == Family.Import || key.family == Family.Alias || key.family == Family.Identity || key.family == Family.Members || key.family == Family.MemberShape || key.family == Family.Contract || key.family == Family.Signature || key.family == Family.Body {
+  if key.family == Family.Import || key.family == Family.Alias || key.family == Family.Identity || key.family == Family.Members || key.family == Family.MemberShape || key.family == Family.Contract || key.family == Family.Signature || key.family == Family.Constant || key.family == Family.Initializer || key.family == Family.Body {
     declaration = run declarationAt(&mut resolver.*, &module, key.declaration)
   }
   if (key.family == Family.Import || key.family == Family.MemberShape) && key.member != usize.MAX {
@@ -1702,7 +1720,7 @@ effect fn cycleAnswer(resolver: &mut Resolver, key: Key, span: Span) -> Shared<
     if sameKey(existing, key) {
       withinCycle = true
     }
-    if withinCycle && (existing.family == Family.Alias || existing.family == Family.Import) {
+    if withinCycle && (existing.family == Family.Alias || existing.family == Family.Import || existing.family == Family.Initializer) {
       let ownerModule = Vector.asSlice<ModuleId>(&resolver.modules)
       let owner = run ModuleId.copy(&ownerModule[existing.module])
       let found = run declarationAt(&mut resolver.*, &owner, existing.declaration)
@@ -1759,6 +1777,8 @@ effect fn resolve(
     Family.MemberShape => run resolveMemberShape(&mut resolver.*, &mut owner.*, key)
     Family.Contract => run resolveContract(&mut resolver.*, &mut owner.*, key)
     Family.Signature => run resolveSignature(&mut resolver.*, &mut owner.*, key)
+    Family.Constant => run resolveConstant(&mut resolver.*, &mut owner.*, key)
+    Family.Initializer => run resolveInitializer(&mut resolver.*, &mut owner.*, key)
     Family.Body => run resolveBody(&mut resolver.*, &mut owner.*, key, move candidate)
   }
 }
@@ -7339,6 +7359,373 @@ effect fn reuseBody(
   )
 }
 
+// The written form of one constant initializer, read before any nested demand.
+union InitializerSyntax {
+  Missing,
+  Integer {sign: Sign, magnitude: Bytes, suffix: Option<Bytes>},
+  Boolean {value: bool},
+  Named {name: Bytes},
+  Other,
+}
+
+struct WrittenInitializer {
+  syntax: InitializerSyntax
+  span: Span
+}
+
+// CONST-001 admits one primitive scalar or `string`; `char` follows the lexical constant forms.
+fn constantType(value: &Type) -> bool {
+  return match & value.* {
+    Type.Primitive {..} => true
+    Type.String {..} => true
+    _ => false
+  }
+}
+
+fn pointerSized(value: &Type) -> bool {
+  return match & value.* {
+    Type.Primitive {name} => same(Bytes.asSlice(&name), b"usize") || same(
+      Bytes.asSlice(&name),
+      b"isize",
+    )
+    _ => false
+  }
+}
+
+fn initializerValue(answer: &Result<Answer, NoRejection>) -> Option<Shared<ConstantValue>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Initializer {value: found}} => Option.some<
+        Shared<ConstantValue>,
+      >(Shared.clone<ConstantValue>(&found))
+      _ => Option.none<Shared<ConstantValue>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<ConstantValue>>()
+  }
+}
+
+effect fn resolveConstant(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let module = run resolvedModule(&resolver.*, key.module)
+  let mut dependencies = Vector.make<Dependency>()
+  let written = run header(&mut resolver.*, &module, key.declaration)
+  let mut span = Span.make(usize.ZERO, usize.ZERO)
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    span = value.span
+    if let Node.ConstantHeader {annotation, ..} = value.header {
+      if !annotation.present {
+        return memberRejected(
+          run reject(&resolver.*, &module, RejectionCode.InvalidConstant, value.span),
+          move dependencies,
+        )
+      }
+      let noBinders = Vector.make<Binder>()
+      // A constant is static data, so an omitted `string` lifetime is `'static`.
+      let mut elision = LifetimeElision {
+        owner: Option.none<DeclarationId>(),
+        nextOrdinal: usize.ZERO,
+        output: true,
+        resultDefault: Option.some<Shared<Lifetime>>(run Shared.make<Lifetime>(Lifetime.Static)),
+        generated: Vector.make<Shared<Lifetime>>(),
+        invocation: false,
+        nested: false,
+        renumber: Vector.make<usize>(),
+        staticEnvironment: false,
+      }
+      let resolved = run resolveType(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies,
+        key.module,
+        annotation.id,
+        Vector.asSlice<Binder>(&noBinders),
+        &mut elision,
+      )
+      return match move resolved {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => {
+          if Shared.with<Type, bool>(&ty, constantType) {
+            return memberSuccess(Value.Type {resolved: move ty}, move dependencies)
+          }
+          let mut annotationSpan = value.span
+          let annotationSyntax = run typeNode(&mut resolver.*, &module, annotation.id)
+          if let Option<HeaderSyntax>.Some {value: typeSyntax} = move annotationSyntax {
+            annotationSpan = typeSyntax.span
+          }
+          return memberRejected(
+            run reject(&resolver.*, &module, RejectionCode.InvalidConstant, annotationSpan),
+            move dependencies,
+          )
+        }
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => memberRejected(
+          move error,
+          move dependencies,
+        )
+      }
+    }
+  }
+  // Foreign statics and package parameters are not constants; they stay outside this family.
+  return memberRejected(
+    run reject(&resolver.*, &module, RejectionCode.Unsupported, span),
+    move dependencies,
+  )
+}
+
+effect fn initializerSyntax(
+  resolver: &mut Resolver,
+  module: &ModuleId,
+  ordinal: usize,
+  fallback: Span,
+) -> WrittenInitializer ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if ordinal < declarations.length {
+      let hir = IndexedSource.authored(indexed)
+      if let Node.Declaration {body, ..} = Module.node(hir, declarations[ordinal].local) {
+        if let Node.InitializerBody {value} = Module.node(hir, body) {
+          if !value.present {
+            return WrittenInitializer {syntax: InitializerSyntax.Missing, span: fallback}
+          }
+          let span = Module.span(hir, value.id)
+          return match Module.node(hir, value.id) {
+            Node.IntegerLiteral {sign, magnitude, suffix, ..} => {
+              let mut written = Option.none<Bytes>()
+              if suffix.present {
+                written = Option.some<Bytes>(run Bytes.copy(Module.text(hir, suffix.symbol)))
+              }
+              let digits = Module.text(hir, magnitude)
+              let mut canonical = sign
+              if digits.length == usize.ONE && digits[0] == 48 {
+                canonical = Sign.Positive
+              }
+              return WrittenInitializer {
+                syntax: InitializerSyntax.Integer {
+                  sign: canonical,
+                  magnitude: run Bytes.copy(digits),
+                  suffix: move written,
+                },
+                span: span,
+              }
+            }
+            Node.BooleanLiteral {value: written} => WrittenInitializer {
+              syntax: InitializerSyntax.Boolean {value: written},
+              span: span,
+            }
+            Node.IdentifierExpression {name, ..} => {
+              if let Node.Name {text} = Module.node(hir, name) {
+                return WrittenInitializer {
+                  syntax: InitializerSyntax.Named {name: run Bytes.copy(Module.text(hir, text))},
+                  span: span,
+                }
+              }
+              return WrittenInitializer {syntax: InitializerSyntax.Other, span: span}
+            }
+            _ => WrittenInitializer {syntax: InitializerSyntax.Other, span: span}
+          }
+        }
+      }
+    }
+  }
+  return WrittenInitializer {syntax: InitializerSyntax.Other, span: fallback}
+}
+
+effect fn resolveInitializer(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let module = run resolvedModule(&resolver.*, key.module)
+  let mut dependencies = Vector.make<Dependency>()
+  // The value demand starts from the separately demandable type fact of the same declaration.
+  let declared = run demandChild(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut dependencies,
+    Key {
+      family: Family.Constant,
+      module: key.module,
+      name: usize.ZERO,
+      declaration: key.declaration,
+      member: usize.ZERO,
+      external: false,
+    },
+    Span.make(usize.ZERO, usize.ZERO),
+  )
+  let selected = Shared.with<Result<Answer, NoRejection>, TypeSelection>(&declared, selectedType)
+  if let Option<Shared<Rejection>>.Some {value} = move selected.rejected {
+    return memberRejected(move value, move dependencies)
+  }
+  let ty = match move selected.resolved {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => {
+      return memberRejected(
+        run reject(
+          &resolver.*,
+          &module,
+          RejectionCode.Unsupported,
+          Span.make(usize.ZERO, usize.ZERO),
+        ),
+        move dependencies,
+      )
+    }
+  }
+  let mut fallback = Span.make(usize.ZERO, usize.ZERO)
+  let declaredHeader = run header(&mut resolver.*, &module, key.declaration)
+  if let Option<HeaderSyntax>.Some {value} = move declaredHeader {
+    fallback = value.span
+  }
+  let written = run initializerSyntax(&mut resolver.*, &module, key.declaration, fallback)
+  let WrittenInitializer {syntax, span} = move written
+  let mut code = RejectionCode.InvalidConstant
+  match move syntax {
+    InitializerSyntax.Integer {sign, magnitude, suffix} => {
+      if Shared.with<Type, bool>(&ty, pointerSized) {
+        // Pointer-sized ranges belong to the selected target, which is not chosen here.
+        code = RejectionCode.Unsupported
+      } else if Shared.with<Type, bool>(&ty, fixedIntegerType) && Shared.with<Type, bool>(
+        &ty,
+        fn(resolved: &Type) -> bool {
+          return match & resolved.* {
+            Type.Primitive {name} => {
+              let spelling = Bytes.asSlice(&name)
+              if let Option<Bytes>.Some {value: suffixName} = &suffix {
+                if !same(Bytes.asSlice(&suffixName), spelling) {
+                  return false
+                }
+              }
+              return fitsInteger(spelling, sign, Bytes.asSlice(&magnitude))
+            }
+            _ => false
+          }
+        },
+      ) {
+        return memberSuccess(
+          Value.Initializer {
+            value: run Shared.make<ConstantValue>(
+              ConstantValue.Integer {sign: sign, magnitude: move magnitude},
+            ),
+          },
+          move dependencies,
+        )
+      }
+    }
+    InitializerSyntax.Boolean {value} => {
+      if Shared.with<Type, usize>(&ty, scalarCode) == 2 {
+        return memberSuccess(
+          Value.Initializer {
+            value: run Shared.make<ConstantValue>(ConstantValue.Boolean {value: value}),
+          },
+          move dependencies,
+        )
+      }
+    }
+    InitializerSyntax.Named {name} => {
+      let target = run selectDeclaration(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies,
+        key.module,
+        &module,
+        Bytes.asSlice(&name),
+        false,
+        span,
+        RejectionCode.Unsupported,
+      )
+      let found = match move target {
+        Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => value
+        Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
+          return memberRejected(move error, move dependencies)
+        }
+      }
+      let targetModule = run resolvedModule(&resolver.*, found.module)
+      let mut isConstant = false
+      let targetHeader = run header(&mut resolver.*, &targetModule, found.ordinal)
+      if let Option<HeaderSyntax>.Some {value} = move targetHeader {
+        if let Node.ConstantHeader {..} = value.header {
+          isConstant = true
+        }
+      }
+      if !isConstant {
+        // Reading any other declaration here needs static evaluation.
+        return memberRejected(
+          run reject(&resolver.*, &module, RejectionCode.Unsupported, span),
+          move dependencies,
+        )
+      }
+      // The type edge is demanded before, and independently of, the value edge.
+      let referencedType = run demandChild(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies,
+        Key {
+          family: Family.Constant,
+          module: found.module,
+          name: usize.ZERO,
+          declaration: found.ordinal,
+          member: usize.ZERO,
+          external: false,
+        },
+        span,
+      )
+      let referenced = Shared.with<Result<Answer, NoRejection>, TypeSelection>(
+        &referencedType,
+        selectedType,
+      )
+      if let Option<Shared<Rejection>>.Some {value} = move referenced.rejected {
+        return memberRejected(move value, move dependencies)
+      }
+      let mut matches = false
+      if let Option<Shared<Type>>.Some {value: other} = move referenced.resolved {
+        matches = run Type.equalsShared(&ty, &other)
+      }
+      if !matches {
+        return memberRejected(
+          run reject(&resolver.*, &module, RejectionCode.TypeMismatch, span),
+          move dependencies,
+        )
+      }
+      let referencedValue = run demandChild(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies,
+        Key {
+          family: Family.Initializer,
+          module: found.module,
+          name: usize.ZERO,
+          declaration: found.ordinal,
+          member: usize.ZERO,
+          external: false,
+        },
+        span,
+      )
+      let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+        &referencedValue,
+        answerRejection,
+      )
+      if let Option<Shared<Rejection>>.Some {value} = move failure {
+        return memberRejected(move value, move dependencies)
+      }
+      let copied = Shared.with<Result<Answer, NoRejection>, Option<Shared<ConstantValue>>>(
+        &referencedValue,
+        initializerValue,
+      )
+      if let Option<Shared<ConstantValue>>.Some {value} = move copied {
+        return memberSuccess(Value.Initializer {value: move value}, move dependencies)
+      }
+      code = RejectionCode.Unsupported
+    }
+    InitializerSyntax.Missing => {}
+    InitializerSyntax.Other => {
+      // Calls, operators, and other literal kinds need static evaluation or unported scalar rules.
+      code = RejectionCode.Unsupported
+    }
+  }
+  return memberRejected(run reject(&resolver.*, &module, code, span), move dependencies)
+}
+
 effect fn resolveBody(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -7979,6 +8366,54 @@ impl Semantic {
       Family.Signature,
     )
     run recordRoot(&mut request.*, Family.Signature, module, name, &answer)
+    return move answer
+  }
+  /// Resolves a constant's written type without reading its initializer.
+  ///
+  /// # Details
+  ///
+  /// The type is one primitive scalar or `string`, whose omitted lifetime is `'static`. Any other
+  /// type is an anchored `InvalidConstant` rejection.
+  pub effect fn demandConstant(
+    self: &mut Self,
+    request: &mut Request,
+    module: &ModuleId,
+    name: &[u8],
+  ) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    let answer = run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.Constant)
+    run recordRoot(&mut request.*, Family.Constant, module, name, &answer)
+    return move answer
+  }
+  /// Publishes a constant's value when its initializer needs no static execution.
+  ///
+  /// # Details
+  ///
+  /// The value demand first demands the constant's type. An exact Boolean or fixed-width integer
+  /// literal is the value. A bare name of another constant demands that constant's type, then its
+  /// value, so a repeated initializer path is a `Cycle` rejection while both types stay available.
+  ///
+  /// # Gotchas
+  ///
+  /// Every other initializer, including a pointer-sized integer, floating-point, text, call, or
+  /// operator, is an anchored `Unsupported` rejection rather than a provisional value.
+  pub effect fn demandInitializer(
+    self: &mut Self,
+    request: &mut Request,
+    module: &ModuleId,
+    name: &[u8],
+  ) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    let answer = run demandNamed(
+      &mut self.resolver,
+      &mut self.query,
+      module,
+      name,
+      Family.Initializer,
+    )
+    run recordRoot(&mut request.*, Family.Initializer, module, name, &answer)
     return move answer
   }
   /// Checks one demanded ordinary function body with fixed-width integer, Boolean, or unit types.
