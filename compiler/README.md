@@ -234,7 +234,9 @@ other initializer is an anchored `Unsupported` with no value: floating-point, te
 literals, pointer-sized integers (whose range belongs to the selected target), namespace-qualified
 names, calls to static functions, operators, and names of non-constant declarations. Static
 evaluation of those forms, target selection, foreign `static` data, and package parameters are
-later work. Function bodies and array extents do not read constants yet.
+later work. Array extents do not read constants yet. A function body that names a module declaration
+without a local binding, such as `return limit`, looks the name up and rejects `Unsupported` at the
+use; only an absent name is `UnknownName`.
 
 `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
