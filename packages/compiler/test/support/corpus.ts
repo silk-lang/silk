@@ -6817,6 +6817,50 @@ export const httpRedirectCorpusProgram = Object.freeze({
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
+    name: 'nested-moved-shared-options-drop-once',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.shared { Shared }
+
+struct Audit { drops: i32 }
+struct Node { audit: Shared<Audit> }
+fn mark(audit: &mut Audit) -> () { audit.drops = audit.drops + 1 }
+fn count(audit: &Audit) -> i32 { return audit.drops }
+impl Drop for Node {
+  fn drop(self: &mut Node) -> () {
+    let ignored = Shared.withMut<Audit, ()>(&self.audit, mark)
+  }
+}
+effect fn verdict(root: &Shared<Node>) -> i32 {
+  let promised = Option.some<Shared<Node>>(Shared.clone<Node>(root))
+  let provided = Option.some<Shared<Node>>(Shared.clone<Node>(root))
+  if let Option<Shared<Node>>.Some {value: left} = move promised {
+    if let Option<Shared<Node>>.Some {value: right} = move provided {
+      let compatible = true
+      if !compatible { return 2 }
+    }
+  }
+  return 1
+}
+effect fn exercise() -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let audit = run Shared.make<Audit>(Audit {drops: 0})
+  let root = run Shared.make<Node>(Node {audit: Shared.clone<Audit>(&audit)})
+  let answer = run verdict(&root)
+  if answer != 1 { return 3 }
+  if Shared.with<Audit, i32>(&audit, count) != 0 { return 4 }
+  drop root
+  if Shared.with<Audit, i32>(&audit, count) != 1 { return 5 }
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 1 }
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run (Effect.catchAll(exercise(), recover) |> Effect.provideMut<Allocator>(&mut allocator))
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'test-exchange-binary-framing',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.bytes { Bytes }

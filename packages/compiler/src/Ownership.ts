@@ -3635,7 +3635,8 @@ const checkFunction = (
           )
         )
           return false
-        checkPath(state, live, place.root, place.path, selection.span, 'Move')
+        // LowerExpression resolves the move transition at the scrutinee expression span.
+        checkPath(state, live, place.root, place.path, selection.subject.span, 'Move')
       }
       if (state.execution !== undefined) state.execution.temporaries.length = temporaryMark
       return true
