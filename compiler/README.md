@@ -233,22 +233,22 @@ the import, and different bindings have separate query identities. Its imported 
 usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
-Generic bodies, non-scalar call operands, applications of declarations with interface or
+Generic bodies, non-scalar call results, applications of declarations with interface or
 representation bounds, provider-derived argument inference, row subtraction such as
-`Without<R, K>` (which belongs to the later provision and requirement-algebra work), and
-requirements on type parameters,
-variadic functions, static parameters, and other nonstandard callable header modifiers currently
+`Without<R, K>` (which belongs to the later provision and requirement-algebra work), requirements
+on type parameters, variadic functions, static parameters, and other nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
 
-Calls in the scalar body subset accept a contiguous ordered prefix of type, lifetime, and
-positional row arguments. Direct ordinary type parameters are inferred from supplied operands;
-conflicting evidence and binders present only in the result reject without using the expected
-result. The typed call retains its completed generic application. Multiple row binders can be
-supplied positionally; row and lifetime inference from non-scalar operands awaits the shared exact
-matcher. `typeof(item)` in a type position names one visible, fully specialized named callable
-representation. Identical callable use signatures do not make two named items identical. A public
+Calls with scalar results accept a contiguous ordered prefix of type, lifetime, and positional row
+arguments. The exact matcher infers ordinary, lifetime, and row parameters from typed operands,
+including nested nominal types and multiple rows fixed by independent evidence. Conflicting
+evidence and binders present only in the result reject without using the expected result. The
+typed call retains its completed generic application. Non-scalar parameter locals and their call
+arguments retain resolved types; unsupported body forms still reject. `typeof(item)` in a type
+position names one visible, fully specialized named callable representation. Identical callable
+use signatures do not make two named items identical. A public
 signature cannot expose a private item. A `some` result records one producer-owned opaque
 representation and its executable use contract. Checking its concrete realization in a body
 remains part of the later complete-body work.
