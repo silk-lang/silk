@@ -122,12 +122,10 @@ Each entry records:
     - A witness binder that occurs only in the witness's written environment is inferred from the
       promised environment. An intersection of free binders against one promised region is
       rejected, not guessed.
-  - **Remaining native gap:** an `Intrinsic.Detached`-bounded representation parameter is not
-    supported natively, because the native semantic queries have no `Intrinsic` handling. The
-    bootstrap gives such a parameter no retained region, so its contribution is `'static`. The
-    bootstrap treats a plain `T: Intrinsic.Detached` value parameter as unknown, like any stored
-    generic. Native does not yet check the standard library, so this entry claims agreement only
-    for the cases listed here.
+  - **`Intrinsic.Detached`:** both compilers give a Detached-bounded representation parameter no
+    retained region, so its contribution is `'static`, and treat a plain `T: Intrinsic.Detached`
+    value parameter as unknown, like any stored generic. Native does not yet check the standard
+    library, so this entry claims agreement only for the cases listed here.
   - **Shared rejection:** a parameterless `effect fn outer() -> Effect<i32>` reports SEM0210 in the
     bootstrap and `AmbiguousLifetime` in native, because its success Effect has no borrowed input
     to supply the output lifetime.
