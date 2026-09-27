@@ -59,19 +59,189 @@ The current semantic subset resolves local names, ordinary namespace imports, se
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
 one namespace segment and one public member segment. Import paths map to slash-separated `.silk`
 logical source paths within the importing module's source origin and package. Selected public import
-chains resolve to the canonical declaration. The
-store resolves nongeneric type aliases and nominal type identities without inspecting fields or
-layout. Written nongeneric function signatures accept primitive,
-unit, and named alias or nominal parameter and result types; they do not inspect function bodies.
-The supported primitive spellings are `bool`, `char`, signed and unsigned integers through 64 bits
-and pointer size, `f32`, `f64`, and `string`. A missing result means unit. Public contracts reject
-private nominal types; missing modules, inaccessible members, collisions, and alias or import-name
-cycles produce anchored semantic rejections.
+chains resolve to the canonical declaration. The store resolves type aliases and nominal type
+identities without inspecting fields or layout. Separate `demandMembers` and `demandMemberShape`
+queries enumerate a struct's fields, tuple positions, enum cases, or union variants, then resolve
+only a selected member's written types under a canonical nominal application. The member ordinal
+comes from the ordered enumeration; a unit variant or scalar enum case has no payload types.
+Neither query computes inline storage or target layout. For example, the identity and written
+`next` field type below terminate even though a later layout request must reject its infinite
+by-value representation:
 
-Demanded generic applications, type modifiers, complex type forms, variadic or generic functions,
-failure or requirement rows, constraints, and nonstandard callable header modifiers currently
-return `Unsupported` rather than a provisional type. Unused declarations with these forms are
-still indexed as written names and do not require semantic resolution. `Semantic.demandBody`
+```silk,ignore
+struct Node { next: Node }
+```
+
+A generic member query substitutes the application's explicit type and lifetime arguments without
+checking another member. In `Box<bool>`, requesting `value` yields `bool` even if `deferred` has an
+invalid written type; requesting `deferred` then rejects at its written type:
+
+```silk,ignore
+struct Box<T> {
+  value: T
+  deferred: Missing
+}
+fn boxed() -> Box<bool> { return () }
+```
+
+Ordinary type and lifetime binders belong to their declarations. Written function signatures
+resolve those binders and explicit nominal or alias arguments, including substitution through
+alias targets. Each omitted input lifetime gets a distinct declaration-owned identity; an omitted
+result lifetime uses the sole outer borrowed input when there is exactly one. An alias with an
+omitted lifetime is expanded in the caller's header, so its uses remain independent. For example,
+demanding the signature of `use` resolves `Same<bool>` to `Pair<bool, bool>`:
+
+```silk,ignore
+struct Pair<A, B> {}
+type Same<T> = Pair<T, T>
+fn use(value: Same<bool>) -> Same<bool> { return move value }
+```
+
+The supported primitive spellings are `bool`, `char`, signed and unsigned integers through 64 bits
+and pointer size, `f32`, and `f64`. A missing result means unit. Signature facts also preserve
+`string<'life>`, shared and exclusive references, borrowed slices, and raw pointer access,
+nullability, extent, and written alignment. The only supported raw pointer address space is zero;
+no target layout or host pointer width is inferred. The following header gives its parameter and
+result the same declared lifetime identity:
+
+```silk,ignore
+fn view<'data>(value: &'data [i32]) -> &'data [i32] { return value }
+```
+
+These are type relationships, not a borrow-safety proof or a checked generic body. Public
+contracts reject private nominal types; missing modules, inaccessible members, collisions, and
+alias or import-name cycles produce anchored semantic rejections. Each cycle member rejects at its
+own reference to the next member, with a path that starts and ends at that member, so its answer
+does not depend on which member was demanded first. In `type A = B` and `type B = A`, `A` rejects
+at its `B` and `B` at its `A`.
+
+Signatures also describe callable and Effect contracts. `fn(A) -> B`, `mut fn(A) -> B`, and
+`once fn(A) -> B` keep their invocation mode, `unsafe`, retained environment, ordered parameters,
+and result. The builtin `Effect<'env; A ! E ? R>` needs no import and keeps its run mode (`once
+Effect<...>`), environment, success type, failure type, and requirement row. An `effect fn` records
+its written `! E` and `? R` channels; omitting them means `never` and the empty row, not inference.
+`never` is the empty structural union. `A | B` flattens nested unions and drops repeated members, so
+member order does not matter. A row keeps one entry per service and `at` role, with the strongest
+written access, plus any `?R` row parameters. Bounds such as `T: Hash + Clock + 'a` and
+`'long: 'short` are recorded in written order. A callable or Effect bound such as
+`F: fn(i32) -> i32` records a representation parameter rather than an interface requirement. For
+example, both headers below have the same channels, and `copy` retains both bounds:
+
+```silk,ignore
+service Clock {}
+role Primary
+struct Missing {}
+struct Offline {}
+effect fn first() -> i32 ! Missing | Offline ? &Clock at Primary | &mut Clock at Primary { return 0 }
+effect fn second() -> i32 ! Offline | Missing ? &mut Clock at Primary { return 0 }
+interface Hash {}
+fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
+```
+
+A callable contract can quantify invocation lifetimes:
+`for<'call> fn<'env>(&'call i32) -> &'call i32` names them. An omitted lifetime in a callable
+parameter is a fresh invocation lifetime, so `fn<'env>(&i32) -> &i32` is the same contract; an
+omitted result lifetime inside the contract uses its sole borrowed parameter. Two contracts are
+equal when some renaming of their used invocation lifetimes makes them equal. Binder names, binder
+order, an unused binder, and member order in unions, rows, and environments are therefore not
+identity, while written bounds such as `for<'a: 'b, 'b>` remain part of the contract. A quantified
+contract inside another quantified contract is rejected, including one quantified only by an
+omitted lifetime. An environment such as `Effect<'a & 'b; A>` is an order-independent
+intersection in which `'static` and repeats disappear, so `'b & 'static & 'a` is the same
+environment and `'a & 'a` is `'a`. A written `effect<'env> fn` or `effect<'a & 'b> fn` environment
+is recorded with the signature:
+
+```silk,ignore
+fn apply(transform: fn<'static>(&i32) -> &i32) -> i32 { return 0 }
+effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32 { return 0 }
+fn both<'a, 'b>(pending: Effect<'a & 'b; i32>) -> i32 { return 0 }
+```
+
+`Semantic.demandContract` returns the binders and bounds of a type, alias, interface, or service
+declaration without demanding its identity or members. A `?R` binder of such a declaration takes
+its row from the `? Row` suffix of an application, and the row is spliced wherever the binder is
+used. A bound is recorded, not proved. An application of a declaration with an interface, service,
+or representation bound is `Unsupported` until conformance solving exists; lifetime bounds such as
+`T: 'a` are recorded without blocking applications. For example, `Sorted` has a contract,
+`Sorted<i32>` is `Unsupported`, and `Loaded<? &Clock>` resolves to an Effect requiring both
+`&Logger` and `&Clock`:
+
+```silk,ignore
+struct Sorted<T: Hash> { value: T }
+interface Load<E, ?R> {}
+type Loaded<?R> = Effect<'static; i32 ? &Logger | R>
+fn loadable<T: Load<Missing ? &Clock>>(source: &T) -> i32 { return 0 }
+```
+
+Only services may appear in a requirement row, and an `at` path must name a role. Interfaces and
+services are both valid bounds; a bound records the requirement and proves no conformance.
+Requirement and bound errors, a failure or requirement channel on an ordinary function, a `?R`
+binder used as an ordinary type, an ambiguous or nested callable quantifier, and a borrow or bare
+callable or Effect inside a structural union have anchored rejections. These contracts do not
+solve conformances, select providers, check captures, or run Effects. The scalar body checker still
+rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
+even when their signatures resolve.
+
+Generic calls and demanded generic bodies, type inference, applications of declarations with
+interface or representation bounds, a declaration with more than one `?R` binder when applied, a
+lifetime omitted inside a type declaration's bound, row subtraction such as `Without<R, K>` (which
+belongs to the later provision and requirement-algebra work), requirements on type parameters,
+variadic functions, static parameters, and other nonstandard callable header modifiers currently
+return `Unsupported` rather than a provisional type. A `where` clause is different: the first
+stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
+pending feature, even though the rejection currently uses the `Unsupported` code.
+
+An omitted callable or Effect environment elides like a borrow. An input retains the regions of its
+borrows, non-`'static` nominal lifetime arguments, and callable or Effect environments; the
+parameter and channel types of a callable or Effect are not stored. A representation parameter
+(`F: fn(A) -> B`, `F: Effect<A>`) retains its bound contract's environment. An input whose stored
+contents involve any other type parameter has no nameable region. For an ordinary function's `Effect` result, inputs that retain
+nothing leave the omitted environment `'static`, so `fn closed() -> Effect<i32>` and
+`fn later(value: i32) -> Effect<i32>` have results of the form `Effect<'static; i32>`. Otherwise a
+single borrowed input supplies it as before, and any other case is rejected as `AmbiguousLifetime`
+at the result. An `effect fn` success type that is an Effect gets no `'static` default. An `effect fn`
+captures every input, so its omitted environment is the intersection
+of the regions its inputs retain: `'static` for none, `'a & 'b` for two borrows, the pending
+Effect's region for `once Effect<A>`. Generic stored contents such as `value: T` are rejected as
+`AmbiguousLifetime` at that input, so the declaration writes `effect<'env> fn`. These defaults cover
+only the result's own environment.
+`fn nested() -> Effect<'static; Effect<i32>>` leaves the inner environment without a default, and
+callables and Effects nested inside callables need their environments written. Invalid or unknown
+lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
+retain the exact non-negative decimal literal extent and element type, including at zero length;
+extents needing static execution remain `Unsupported` at their source span. Member type requests
+with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
+represented by the nominal application. No machine layout fact is inspected. Unused declarations
+with these forms are still indexed as written
+names and do not require semantic resolution.
+
+Constants have two separate facts. `Semantic.demandConstant` resolves only the written type, which
+must be `bool`, `char`, an integer or floating-point primitive, or `string`, whose omitted lifetime is
+`'static`. Any other type is `InvalidConstant`, and the initializer is never read; an omitted
+annotation is a syntax error. `Semantic.demandInitializer` first demands that type, then publishes a value only when no
+static execution is needed: an exact `bool` literal, or a fixed-width integer literal that fits the
+declared type and any suffix. A bare name of another constant, in the same module or selected by an
+import, demands that constant's type and then its value. For example:
+
+```silk,ignore
+const limit: u8 = 255
+const copied: u8 = limit
+const first: i32 = second
+const second: i32 = first
+```
+
+`copied` has the value 255, while the value demands of `first` and `second` reject with a `Cycle`,
+each at its own reference to the other, whichever is demanded first; their `i32` types remain
+available. A literal of the wrong kind or out of range is `InvalidConstant`, and a constant of a
+different type is `TypeMismatch`. Every other initializer is an anchored `Unsupported` with no
+value: floating-point, text, and character literals, pointer-sized integers (whose range belongs to
+the selected target), namespace-qualified names, calls to static functions, operators, and names of
+non-constant declarations. Static evaluation of those forms, target selection, foreign `static`
+data, and package parameters are later work. Array extents do not read constants yet. A function
+body that names a module declaration without a local binding, such as `return limit`, looks the name
+up and rejects `Unsupported` at the use; only an absent name is `UnknownName`.
+
+`Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
 and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
 and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
@@ -127,6 +297,54 @@ wave, the checker runs again. A changed nominal type result takes that conservat
 events prove only checked semantic-body reuse;
 they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
 
+Richer facts follow the same validation rule. A fact stays valid only while every present or absent
+source it observed is unchanged, so an edit anywhere in a module restarts the facts that read that
+module, and a restarted fact may equal its earlier value. Facts that never read the edited module
+remain hits. Only a checked body compares the results it consumed. A nominal type, member list,
+member shape, contract, constant value, or signature with binders, bounds, channels, or an
+environment always compares as changed. No body in the scalar subset succeeds while depending on
+one of those results, and the comparison runs only after each consumed fact has been revalidated
+against current sources. For example, take `consumer.silk`:
+
+```silk,ignore
+import geometry as Geometry
+fn origin(at: Geometry.Point) -> () { return () }
+fn caller() -> i32 { return Geometry.leaf() }
+fn unrelated() -> i32 { return 2 }
+```
+
+and `geometry.silk`:
+
+```silk,ignore
+type Element = i32
+pub struct Point { width: Element }
+pub fn leaf() -> i32 { return 1 }
+```
+
+Changing `Element` to `bool` changes the requested `width` shape to `bool`. The recomputed identity
+of `Point`, its member names, and the `origin` signature equal their earlier values. `caller` keeps
+its checked payload because the `leaf` signature is unchanged, and `unrelated`, which never read
+`geometry.silk`, is a hit. Then replace `Point` with `struct Point { height: Missing depth: i32 }`.
+The member names change, the second member (previously `UnknownMember`) has type `i32`, and the
+first member rejects `Missing` at its current span. A new store on the same revision returns the
+same results. A typed failure while revalidating `caller` publishes no answer; the retry checks the
+body again instead of restoring the earlier payload. The leaf body is never demanded.
+
+Constant type and value facts have separate consumers. Suppose `library.silk` contains
+`pub const base: u8 = 7` and the importing module contains:
+
+```silk,ignore
+import library { base }
+const copied: u8 = base
+const later: u8 = pending
+```
+
+Changing `base` to `9` restarts the value of `copied` but not its type fact, which never read the
+library. Changing `base` to `pub const base: bool = true` makes the value of `copied` a `TypeMismatch`
+at the `base` reference. The value of `later` is `UnknownName` at `pending` until
+`const pending: u8 = 4` is added, and an edit that turns two initializers into a cycle rejects their
+values with `Cycle` while their types stay available.
+
 Ordinary runtime `if` statements require `bool` conditions and check both arms. For example,
 `fn choose(flag: bool) -> i32 { if flag { return 1 } else { return 2 } }` has no reachable
 fallthrough. `fn partial(flag: bool) -> i32 { if flag { return 1 } }` rejects because the false path
@@ -147,6 +365,33 @@ host number. Structured typed failures and cancellation release incomplete query
 publication frames. A later demand can retry the same store. A fatal runtime trap ends the
 process and has no such recovery guarantee. Compiler CLI integration, host-backed snapshots, and
 later semantic and backend milestones remain future work.
+
+### Semantic scope and later waves
+
+These queries complete the M2.2 type and signature vocabulary: declaration-owned generic binders
+and explicit applications; references, slices, raw pointers, lifetimes, and modifiers; nominal
+identity, member enumeration, requested member shapes, and authored array extents; callable and
+Effect signature contracts with written channels and recorded bounds; constant types and literal or
+constant-to-constant values; and revision validation for each of these facts. A form outside that
+vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
+
+- **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
+  applications of declarations with interface, service, or representation bounds, such as
+  `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
+  parameters, and lifetimes omitted inside a type declaration's bound.
+- **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
+  initializers with calls, operators, qualified names, or floating-point, text, or character values;
+  pointer-sized ranges and other target selection; target constants; static parameters; and package
+  parameters.
+- **M2.5, ownership, Effects, and remaining bodies:** borrow and capture safety, Effect bodies and
+  calls, `unsafe` calls, partial application, aggregate construction and member access, constant
+  reads such as `return limit`, and provision algebra such as `Without<R, K>`.
+- **M2.6, representation and reflection:** layout, offsets, and rejecting infinite by-value storage
+  such as `struct Node { next: Node }`.
+- **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
+
+Some `Unsupported` forms are later work that no wave owns yet: omitted field lifetimes in member
+requests, and native-boundary declarations such as foreign `static` data and C variadic functions.
 
 ## Inspect a source file
 
@@ -351,9 +596,10 @@ them back to a local owner, as required by Silk's ownership rules.
 
 ## Verification
 
-Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 discovery root
-imports the existing query, source-index, and semantic cases. The focused HIR run checks exact
-integer magnitudes and fingerprints without pulling the full HIR suite into the semantic binary.
+Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 query root
+imports query and source-index cases; the semantic cases use their own root to keep each native
+compilation within the CI heap limit. The focused HIR run checks exact integer magnitudes and
+fingerprints without pulling the full HIR suite into the semantic binary.
 `--no-cache` executes assertions even if a previous run stored passing results. The focused Linux
 workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
 Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
@@ -362,6 +608,7 @@ named `selfhost-*`; pushing one does not start a second CI run before its pull r
 ```sh
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --filter integer --no-cache
 ```
 

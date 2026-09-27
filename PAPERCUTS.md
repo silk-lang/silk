@@ -2,6 +2,12 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-26 · The combined M1 native test root reached JavaScript heap OOM in focused CI before any case ran, and `--filter` could not reduce compilation because it selects only at runtime · Run the query/source-index root and semantic root sequentially in the same job; all 27 cases pass uncached within the existing heap limit · self-hosted compiler
+
+- 2026-09-26 · A focused `Shared.with` assertion over optional generic-kind details passed source
+  checking but failed during LLVM emission · Store the diagnostic's kind fields directly and inspect
+  them with a named predicate; the focused native case then passed · self-hosted compiler
+
 - 2026-09-25 · Concurrent `pnpm exec` typechecks each triggered dependency auto-repair and raced
   on a hoisted `node_modules` symlink · Invoke the prepared `node_modules/.bin` binaries directly
   for focused checks and avoid parallel pnpm entry points · compiler
@@ -265,3 +271,8 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-26 · A compiled Silk test binary run directly with a captured `--silk-test-plan` exited 2 silently because `/tmp` paths are symlinks the runner's `OsFileSystem` rejects · Pass `/private/tmp/...` plan and result paths; direct runs then give a seconds-long loop for flaky native traps · compiler
 - 2026-09-26 · lldb address breakpoints (`-a`) on the large debug test binary stayed unresolved and batch `-C` command output was silent · Break by full symbol name from `nm` and log with a `breakpoint command add -F` Python callback writing to a file · compiler
 - 2026-09-26 · `silk check --manifest-path compiler/silk.toml` passed while the test root rejected a borrow from a temporary `Vector.asSlice(...)[at]` place in a test-reachable helper · Bind the slice before borrowing its element, then run the focused native test root as the ownership check · self-hosted compiler
+- 2026-09-26 · Direct `==` comparison of HIR `Access`/`Multiplicity` enums in the expanded `Type.equals` made native emission fail with `Backend cannot resolve call target Type.equals` before a focused semantic test ran · Compare the enum variants with explicit matches; a minimal Type actor probe and the semantic root then emit successfully · self-hosted compiler
+- 2026-09-26 · A nested borrowed-union match in nominal generic argument validation emitted LLVM instructions that did not dominate their uses · Split binder-kind and argument-kind inspection into separate simple matches before native compilation · self-hosted compiler
+- 2026-09-26 · A signature naming the same imported type twice (`fn t(a: &Clock, b: &Clock)` with `import services { Clock }`) trapped in `silk/shared.conflict`; a local type repeated the same way passed · `appendObservation` borrowed the incoming `Shared<Observation>` while comparing it with the frame's copy of that same handle from the first merge; compare handles by address first (as `Type.sameShared` does). Found by staging one probe demand per test so the runner's printed test name located the trap · self-hosted compiler
+- 2026-09-26 · Native test helpers with a closure inside another closure fail with `SEM0199 Anonymous callable bodies cannot be nested`, and `service`/`role` are keywords that cannot be field names · Use one closure level and pass captured values to named helper functions; name fields `capability`/`roleType` · self-hosted compiler
+- 2026-09-26 · Adding a `Vector<Shared<Lifetime>>` reachable from `Type` (an environment intersection) failed the semantic root with `SEM0053 Recursive specialization changes type arguments from drop@impl#0<Shared<Lifetime>> to releaseFull<Shared<Lifetime>>` at `silk/vector.silk:558`, with no pointer to the user code; `Type` already drops `Vector<Shared<Type>>` in the same recursion · Wrap the element in a struct (`Intersection.members: Vector<Member>`); moving the vector behind `Shared` did not help. Bisect by frontend-only runs (`timeout 90`), about 40 s each · self-hosted compiler

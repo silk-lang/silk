@@ -23,6 +23,13 @@ skill and update this file rather than preserving an older convention.
 
 Maintain PAPERCUTS.md, a global log shared by all agents sessions of anything that slowed down development. When you lose time to one mid-session, append date · symptom · fix · project. Check this file first when tooling fails mysteriously.
 
+## Compiler compatibility
+
+Before treating a standard-library or compiler build failure as a compiler defect, read
+[COMPILER_COMPATIBILITY.md](COMPILER_COMPATIBILITY.md). It records approved language changes, how
+the TypeScript bootstrap and the self-hosted frontend currently differ, and which changes are still
+unimplemented. Add or retire entries there when an intentional divergence starts or ends.
+
 ## Agent skills
 
 Follow [ATOM-REACT-STYLEGUIDE.md](ATOM-REACT-STYLEGUIDE.md) for Effect Atom and `@effect/atom-react` code.
