@@ -220,6 +220,22 @@ member environment must also be kept by its stored inputs. No member body is rea
 successful answer proves no conformance. A member that binds parameters of its own, including an
 elided borrow, and an environment covered only through a chain of bounds are `Unsupported` until
 exact matching and bound entailment exist.
+`demandCoherence` decides a conformance head before any applicability or bound proof. Every written
+parameter must occur in the interface application or provider (`UnconstrainedImplParameter`), and
+every bound must name a parameter inside the provider without repeating an open parameter or
+rewriting a fixed argument of the same interface (`NonterminatingConformance`, with the step). The
+head is then compared with every other head in its owner bucket, read from both permitted modules.
+Two heads conflict when some substitution makes both applications equal once lifetimes are erased:
+bounds never separate them, so `impl<T: Left> M for Box<T>` and `impl<T: Right> M for Box<T>`
+conflict, and neither head is admitted. Both heads report one diagnostic: the head later by module
+identity and then source position is primary, and `path` names it and then the earliest other
+conflicting head. Two unbounded heads that rename each other exactly, lifetimes included, are
+`DuplicateConformance`; every other conflict is `OverlappingConformance`. Unions and requirement
+rows are sets: `Box<T | i32>` and `Box<bool>` stay distinct, and `? &Clock | R` covers
+`? &mut Clock` but `? &mut Clock | R` never covers `? &Clock`. A union member or row entry that
+nests a parameter, or a set parameter used elsewhere in the head, is `Unsupported` until shared
+matching decides it; it is never reported as a conflict. Sealed-property and inherent heads have no
+coherence answer yet.
 
 `Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
 binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
