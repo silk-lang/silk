@@ -573,7 +573,7 @@ Returns whether the head contains the generated 100-continue expectation.
 ## `prepare`
 
 ```silk
-pub effect<'env> fn prepare<'value: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(origin: &'life1 silk/http_origin.Origin, version: Version, method: silk/http.Method<'value>, target: silk/http_target.RequestTarget<'value>, headers: &'life2 silk/http_headers.Headers<'value>, policy: &'life3 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
+pub effect<'value & 'life1 & 'life2 & 'life3> fn prepare<'value, 'life1, 'life2, 'life3>(origin: &'life1 silk/http_origin.Origin, version: Version, method: silk/http.Method<'value>, target: silk/http_target.RequestTarget<'value>, headers: &'life2 silk/http_headers.Headers<'value>, policy: &'life3 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
 ```
 
 Validates and serializes one request before any transport operation.
@@ -589,7 +589,7 @@ to policy and cannot also occur in `headers`. Output owns all borrowed input byt
 ## `prepareForward`
 
 ```silk
-pub effect<'env> fn prepareForward<'configuration: 'env, 'value: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'life5: 'env, 'env>(route: &'life2 silk/http_proxy.Route<'configuration>, uri: &'life3 silk/uri.Uri<'value>, version: Version, method: silk/http.Method<'value>, headers: &'life4 silk/http_headers.Headers<'value>, policy: &'life5 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! ProxyError | RequestError | OutOfMemoryError ? &mut Allocator
+pub effect<'value & 'life2 & 'life3 & 'life4 & 'life5> fn prepareForward<'configuration: 'value & 'life2 & 'life3 & 'life4 & 'life5, 'value, 'life2, 'life3, 'life4, 'life5>(route: &'life2 silk/http_proxy.Route<'configuration>, uri: &'life3 silk/uri.Uri<'value>, version: Version, method: silk/http.Method<'value>, headers: &'life4 silk/http_headers.Headers<'value>, policy: &'life5 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! ProxyError | RequestError | OutOfMemoryError ? &mut Allocator
 ```
 
 Prepares one Forward route as an origin-bound absolute-form request for its plain proxy peer.
@@ -606,7 +606,7 @@ including for HTTP/1.0.
 ## `prepareConnect`
 
 ```silk
-pub effect<'env> fn prepareConnect<'configuration: 'env, 'life1: 'env, 'env>(route: &'life1 silk/http_proxy.Route<'configuration>, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! ProxyError | RequestError | OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn prepareConnect<'configuration: 'life1, 'life1>(route: &'life1 silk/http_proxy.Route<'configuration>, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! ProxyError | RequestError | OutOfMemoryError ? &mut Allocator
 ```
 
 Prepares the one body-free HTTP/1.1 CONNECT head admitted by a Tunnel route.
@@ -622,7 +622,7 @@ peer, or proxy credentials.
 ## `fromUri`
 
 ```silk
-pub effect<'env> fn fromUri<'value: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(uri: &'life1 silk/uri.Uri<'value>, version: Version, method: silk/http.Method<'value>, headers: &'life2 silk/http_headers.Headers<'value>, policy: &'life3 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
+pub effect<'value & 'life1 & 'life2 & 'life3> fn fromUri<'value, 'life1, 'life2, 'life3>(uri: &'life1 silk/uri.Uri<'value>, version: Version, method: silk/http.Method<'value>, headers: &'life2 silk/http_headers.Headers<'value>, policy: &'life3 silk/http_request.HeaderPolicy<'value>, body: BodyMode, require100: bool, limits: Limits, maxHeadBytes: usize, maxCredentialBytes: usize) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
 ```
 
 Converts a validated URI to an origin-form request with query and no fragment.

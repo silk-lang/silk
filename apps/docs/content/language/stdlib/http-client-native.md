@@ -473,7 +473,7 @@ replace that identity. `Http10` disables ALPN; other policies offer only HTTP/1.
 ## `withUnixConnection`
 
 ```silk
-pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'life4: 'env, 'env>(path: &'life4 [u8], origin: Origin, options: Options, limits: Limits, handler: H) -> A ! E | ClientError | NativeClientError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource where R in Without<R, &HttpTransport>
+pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'env, 'life5: 'env>(path: &'life5 [u8], origin: Origin, options: Options, limits: Limits, handler: H) -> A ! E | ClientError | NativeClientError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource where R in Without<R, &HttpTransport>
 ```
 
 Connects an explicit Unix socket while retaining a separate HTTP and TLS authority.

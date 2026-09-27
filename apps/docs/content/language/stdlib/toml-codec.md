@@ -31,7 +31,7 @@ A type that writes one TOML value through the ambient Writer.
 ### Operation `serialize`
 
 ```silk
-effect<'env> fn serialize<'life0: 'env, 'env>(self: &'life0 Self) -> () ! TomlError | WriterError ? &mut Writer
+effect<'life0> fn serialize<'life0>(self: &'life0 Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
 Writes one value in TOML syntax through the ambient Writer.
@@ -91,7 +91,7 @@ Selects static TOML conversion witnesses.
 ### Associated function `TomlCodec.writeOne`
 
 ```silk
-pub effect<'env> fn writeOne<T: 'env, 'life1: 'env, 'env>(value: &'life1 T) -> () ! TomlError | WriterError ? &mut Writer
+pub effect<'life1> fn writeOne<T: 'life1, 'life1>(value: &'life1 T) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
 Writes a typed value in value position through the ambient Writer.

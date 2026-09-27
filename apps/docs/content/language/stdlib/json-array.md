@@ -44,7 +44,7 @@ Opens an array after checking its depth limit.
 ### Associated function `JsonArray.items`
 
 ```silk
-pub effect<'env1> fn items<'env: 'env1, T: 'env1, E, ?R, 'env1>(self: once Effect<'env; silk/json_array.JsonArray ! E ? R>, values: &'env [T]) -> JsonArray ! E | JsonError | WriterError ? R | &mut Writer
+pub effect<'env> fn items<'env, T: 'env, E, ?R>(self: once Effect<'env; silk/json_array.JsonArray ! E ? R>, values: &'env [T]) -> JsonArray ! E | JsonError | WriterError ? R | &mut Writer
 ```
 
 Writes all values in source order and returns the open array state.

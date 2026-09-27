@@ -871,7 +871,7 @@ pub fn main() -> i32 { return 42 }`
           'resolve',
           0,
           [
-            "pub effect<'env> fn resolve<'life0: 'env, 'life1: 'env, 'env>(",
+            "pub effect<'life0 & 'life1> fn resolve<'life0, 'life1>(",
             '! FileError | OutOfMemoryError ? &mut Allocator',
           ],
         ],

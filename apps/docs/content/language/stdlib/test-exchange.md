@@ -176,7 +176,7 @@ Starts a receipt bound to the complete plan bytes and invocation nonce.
 ## `appendResult`
 
 ```silk
-pub effect<'env> fn appendResult<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(receipt: &'life0 mut silk/test_exchange.Receipt, ordinal: u64, declaration: &'life1 [u8], execution: &'life2 [u8], disposition: u8) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1 & 'life2> fn appendResult<'life0, 'life1, 'life2>(receipt: &'life0 mut silk/test_exchange.Receipt, ordinal: u64, declaration: &'life1 [u8], execution: &'life2 [u8], disposition: u8) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one selected per-test result in canonical ordinal order.

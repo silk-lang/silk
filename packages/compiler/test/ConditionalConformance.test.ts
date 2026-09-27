@@ -177,17 +177,17 @@ for Client<'policy, E, R> {
 )
 
 const effectContext = `interface Handler<P, A, E, ?R> {
-  effect fn handle(handler: Self, provider: &mut P) -> A ! E ? R
+  effect<'env> fn handle<'env>(handler: Self, provider: &mut P) -> A ! E ? R
 }
 
 interface Contextual<P, A, E, ?R> {
-  effect fn use(context: Self, provider: &mut P) -> A ! E ? R
+  effect<'env> fn use<'env>(context: Self, provider: &mut P) -> A ! E ? R
 }
 
 struct Context<P, A, E, ?R, H> { handler: H }
 
 impl<P, A, E, ?R, OuterH> Context<P, A, E, R, OuterH> {
-  effect fn use<H: Handler<P, A, E ? R>>(
+  effect<'env> fn use<H: Handler<P, A, E ? R> + 'env, 'env>(
     context: Context<P, A, E, R, H>,
     provider: &mut P,
   ) -> A ! E ? R {
@@ -201,7 +201,7 @@ impl<P, A, E, ?R, H: Handler<P, A, E ? R>>
   use: Context.use
 }
 
-effect fn acquire<P, A, E, ?R, C: Contextual<P, A, E ? R>>(
+effect<'env> fn acquire<P, A, E, ?R, C: Contextual<P, A, E ? R> + 'env, 'env>(
   provider: &mut P,
   context: C,
 ) -> A ! E ? R {
@@ -214,14 +214,14 @@ service Clock {}
 struct Problem {}
 struct OtherProblem {}
 interface SplitHandler<A, E, ?R> {
-  effect fn handle(handler: Self) -> A ! E ? R
+  effect<'env> fn handle<'env>(handler: Self) -> A ! E ? R
 }
 interface Split<A, E, ?R, ?Q> {
-  effect fn use(context: Self) -> A ! E ? R | Q
+  effect<'env> fn use<'env>(context: Self) -> A ! E ? R | Q
 }
 struct SplitContext<A, E, ?R, H> { handler: H }
 impl<A, E, ?R, OuterH> SplitContext<A, E, R, OuterH> {
-  effect fn use<H: SplitHandler<A, E ? R>>(context: SplitContext<A, E, R, H>)
+  effect<'env> fn use<H: SplitHandler<A, E ? R> + 'env, 'env>(context: SplitContext<A, E, R, H>)
   -> A ! E | Problem ? R | &mut Clock {
     let SplitContext<A, E, R, H> {handler} = move context
     return run SplitHandler<A, E ? R>.handle(move handler)
@@ -231,11 +231,11 @@ impl<A, E, ?R, H: SplitHandler<A, E ? R>>
   Split<A, E | Problem, R ? &mut Clock> for SplitContext<A, E, R, H> {
   use: SplitContext.use
 }
-effect fn acceptSplit<A, E, ?R, ?Q, C: Split<A, E, R ? Q>>(context: C) -> A ! E ? R | Q
+effect<'env> fn acceptSplit<A, E, ?R, ?Q, C: Split<A, E, R ? Q> + 'env, 'env>(context: C) -> A ! E ? R | Q
 where R in Without<R, ByteDuplex>, Q in Without<Q, ByteDuplex> {
   return run Split<A, E, R ? Q>.use(move context)
 }
-effect fn splitBridge<A, E, ?R, H: SplitHandler<A, E ? R>>(handler: H)
+effect<'env> fn splitBridge<A, E, ?R, H: SplitHandler<A, E ? R> + 'env, 'env>(handler: H)
 -> A ! E | Problem ? R | &mut Clock
 where R in Without<R, ByteDuplex> {
   return run acceptSplit<A, E | Problem, R>(
@@ -277,7 +277,7 @@ it.effect('infers exact Effect-polymorphic and split-row conditional contexts', 
       `${effectContext}
 ${splitContext}
 
-effect fn bridge<P, A, E, ?R, H: Handler<P, A, E ? R>>(
+effect<'env> fn bridge<P, A, E, ?R, H: Handler<P, A, E ? R> + 'env, 'env>(
   provider: &mut P,
   handler: H,
 ) -> A ! E ? R {
@@ -335,7 +335,8 @@ pub fn main() -> i32 {
         ),
       )
     const mapping = conformance?.operations.at(0)
-    assert.strictEqual(mapping?.targetArguments?.length, 6)
+    // The witness writes its retained environment, so it also binds `'env`.
+    assert.strictEqual(mapping?.targetArguments?.length, 7)
     assert.deepEqual(mapping?.targetArguments?.slice(0, 5).map(Type.encodeGenericArgument), [
       'P',
       'A',
@@ -421,12 +422,12 @@ it.effect('rejects conditional Effect contexts without the exact handler evidenc
   Effect.gen(function* () {
     const negativeSource = `${effectContext}
 
-effect fn missing<P, A, E, ?R, H>(provider: &mut P, handler: H) -> A ! E ? R {
+effect<'env> fn missing<P, A, E, ?R, H: 'env, 'env>(provider: &mut P, handler: H) -> A ! E ? R {
   let context = Context<P, A, E, R, H> {handler: move handler}
   return run acquire(move provider, move context)
 }
 
-effect fn mismatch<P, A, E, ?R, ?S, H: Handler<P, A, E ? R>>(
+effect<'env> fn mismatch<P, A, E, ?R, ?S, H: Handler<P, A, E ? R> + 'env, 'env>(
   provider: &mut P,
   handler: H,
 ) -> A ! E ? S {

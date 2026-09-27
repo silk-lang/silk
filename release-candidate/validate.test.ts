@@ -22,71 +22,64 @@ const formatterPackageRoot = resolve(workspaceRoot, 'packages/formatter')
 const lspPackageRoot = resolve(workspaceRoot, 'packages/lsp')
 const webContainerPackageRoot = resolve(workspaceRoot, 'packages/platform-webcontainer')
 
-// Consumers install with --offline, so an override may only name a version the workspace store
-// already holds. A caret range resolves fresh against the registry and picks whatever is newest,
-// which is not what was installed — so every ranged dependency needs an exact override here.
-// Read each from its installed copy rather than pinning a literal, which silently drifts out of
-// the store the next time the dependency is bumped.
-// pnpm's isolated store keeps these under the package that declares them, not the workspace root.
-const installedVersion = (packageRoot: string, name: string): string =>
-  JSON.parse(readFileSync(resolve(packageRoot, `node_modules/${name}/package.json`), 'utf8'))
-    .version
+// Consumers install with --offline against the runner's package mirror. pnpm refreshes that
+// mirror's metadata for every lockfile entry while verifying the lockfile, so a range left free
+// re-resolves to the newest published version, whose own new dependencies the mirror never saw.
+// Pin every package the published candidates reach to the version the workspace lockfile
+// installed, and check that each consumer resolved exactly those versions.
+const publishedPackageRoots: ReadonlyArray<string> = [
+  packageRoot,
+  compilerPackageRoot,
+  cliPackageRoot,
+  docgenPackageRoot,
+  formatterPackageRoot,
+  lspPackageRoot,
+  webContainerPackageRoot,
+]
 
-const installedPackageRoot = (name: string): string =>
-  realpathSync(resolve(cliPackageRoot, `node_modules/${name}`))
-
-const lspInstalledVersion = (name: string): string =>
-  JSON.parse(readFileSync(resolve(lspPackageRoot, `node_modules/${name}/package.json`), 'utf8'))
-    .version
-
-interface InstalledDependencyParent {
+interface InstalledManifest {
   readonly name: string
-  readonly root: string
+  readonly version: string
+  readonly dependencies?: Readonly<Record<string, string>>
+  readonly optionalDependencies?: Readonly<Record<string, string>>
+  readonly peerDependencies?: Readonly<Record<string, string>>
 }
 
-const installedDependencyRoot = (parent: InstalledDependencyParent, name: string): string =>
-  realpathSync(resolve(parent.root, ...parent.name.split('/').map(() => '..'), name))
+const installedManifest = (root: string): InstalledManifest =>
+  JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
 
-const installedDependencyNames = (parent: InstalledDependencyParent): ReadonlyArray<string> =>
-  Object.keys(
-    JSON.parse(readFileSync(resolve(parent.root, 'package.json'), 'utf8')).dependencies ?? {},
-  ).sort()
-
-const installedDependencyVersion = (parent: InstalledDependencyParent, name: string): string =>
-  JSON.parse(readFileSync(resolve(installedDependencyRoot(parent, name), 'package.json'), 'utf8'))
-    .version
-
-const platformNodeParent: InstalledDependencyParent = Object.freeze({
-  name: '@effect/platform-node',
-  root: installedPackageRoot('@effect/platform-node'),
-})
-
-const platformNodeSharedParent: InstalledDependencyParent = Object.freeze({
-  name: '@effect/platform-node-shared',
-  root: installedDependencyRoot(platformNodeParent, '@effect/platform-node-shared'),
-})
-
-const consumerDependencyParents: ReadonlyArray<InstalledDependencyParent> = Object.freeze([
-  { name: 'effect', root: installedPackageRoot('effect') },
-  platformNodeParent,
-  platformNodeSharedParent,
-  {
-    name: '@types/ws',
-    root: installedDependencyRoot(platformNodeSharedParent, '@types/ws'),
-  },
-])
+// pnpm's isolated layout places a package's dependencies beside it, above its own name segments.
+const installedDependencyRoot = (parentRoot: string, parentName: string, name: string): string =>
+  resolve(parentRoot, ...parentName.split('/').map(() => '..'), name)
 
 const consumerDependencyVersions = new Map<string, string>()
-for (const parent of consumerDependencyParents) {
-  for (const name of installedDependencyNames(parent)) {
-    const version = installedDependencyVersion(parent, name)
-    const existing = consumerDependencyVersions.get(name)
-    if (existing !== undefined && existing !== version)
-      throw new Error(
-        `packed consumer dependency ${name} has incompatible installed versions ${existing} and ${version}`,
-      )
-    consumerDependencyVersions.set(name, version)
+const pinnedDependencyRoots = new Set<string>()
+const pinInstalledClosure = (root: string): void => {
+  const realRoot = realpathSync(root)
+  if (pinnedDependencyRoots.has(realRoot)) return
+  pinnedDependencyRoots.add(realRoot)
+  const manifest = installedManifest(realRoot)
+  const existing = consumerDependencyVersions.get(manifest.name)
+  if (existing !== undefined && existing !== manifest.version)
+    throw new Error(
+      `packed consumer dependency ${manifest.name} has incompatible installed versions ${existing} and ${manifest.version}`,
+    )
+  consumerDependencyVersions.set(manifest.name, manifest.version)
+  for (const name of Object.keys(manifest.dependencies ?? {}))
+    pinInstalledClosure(installedDependencyRoot(realRoot, manifest.name, name))
+  // Optional and peer dependencies are pinned only when the workspace installed them.
+  for (const name of [
+    ...Object.keys(manifest.optionalDependencies ?? {}),
+    ...Object.keys(manifest.peerDependencies ?? {}),
+  ]) {
+    const dependencyRoot = installedDependencyRoot(realRoot, manifest.name, name)
+    if (existsSync(dependencyRoot)) pinInstalledClosure(dependencyRoot)
   }
+}
+for (const publishedRoot of publishedPackageRoots) {
+  for (const [name, range] of Object.entries(installedManifest(publishedRoot).dependencies ?? {}))
+    if (!range.startsWith('workspace:'))
+      pinInstalledClosure(resolve(publishedRoot, 'node_modules', name))
 }
 
 const consumerDependencyOverrides = Array.from(consumerDependencyVersions)
@@ -96,13 +89,36 @@ const consumerDependencyOverrides = Array.from(consumerDependencyVersions)
 const consumerWorkspace = (configuration = ''): string =>
   `overrides:\n${consumerDependencyOverrides.join('\n')}\n${configuration}`
 
-test('consumer workspaces pin runtime transitive ranges to installed versions', () => {
-  const workspace = consumerWorkspace()
-  for (const parent of consumerDependencyParents) {
-    for (const name of installedDependencyNames(parent))
-      expect(workspace).toContain(`  '${name}': ${installedDependencyVersion(parent, name)}`)
-  }
+// Lockfile v9 `packages:` keys: `  name@version:` or `  '@scope/name@version':`.
+const resolvedConsumerPackages = (lockfile: string): ReadonlyArray<readonly [string, string]> => {
+  const section = lockfile.split(/^snapshots:$/m)[0]?.split(/^packages:$/m)[1] ?? ''
+  return Array.from(section.matchAll(/^ {2}'?(@?[^@\s']+)@([^\s']+?)'?:$/gm), (match) => [
+    match[1] ?? '',
+    match[2] ?? '',
+  ])
+}
+
+test('consumer workspaces pin the installed runtime closure of every published package', () => {
+  // mdast-util-from-markdown reaches micromark only transitively through @silklang/docgen.
+  expect(consumerDependencyVersions.get('micromark')).toBe(
+    installedManifest(
+      installedDependencyRoot(
+        realpathSync(resolve(docgenPackageRoot, 'node_modules/mdast-util-from-markdown')),
+        'mdast-util-from-markdown',
+        'micromark',
+      ),
+    ).version,
+  )
   expect(consumerDependencyOverrides).toHaveLength(consumerDependencyVersions.size)
+  expect(
+    resolvedConsumerPackages(
+      "lockfileVersion: '9.0'\n\npackages:\n\n  '@types/debug@4.1.13':\n    resolution: {}\n\n  micromark@4.0.3:\n    resolution: {}\n\n  '@silklang/llvm@file:/a.tgz':\n    resolution: {}\n\nsnapshots:\n",
+    ),
+  ).toEqual([
+    ['@types/debug', '4.1.13'],
+    ['micromark', '4.0.3'],
+    ['@silklang/llvm', 'file:/a.tgz'],
+  ])
 })
 
 const installConsumer = (cwd: string): void => {
@@ -111,8 +127,14 @@ const installConsumer = (cwd: string): void => {
     encoding: 'utf8',
     timeout: 60_000,
   })
-  if (result.status === 0) return
-  throw new Error(`pnpm install failed in ${cwd}\n${result.stdout ?? ''}\n${result.stderr ?? ''}`)
+  if (result.status !== 0)
+    throw new Error(`pnpm install failed in ${cwd}\n${result.stdout ?? ''}\n${result.stderr ?? ''}`)
+  const resolved = resolvedConsumerPackages(readFileSync(resolve(cwd, 'pnpm-lock.yaml'), 'utf8'))
+  const external = resolved.filter(([name]) => !name.startsWith('@silklang/'))
+  expect(external.map(([name]) => name)).toContain('effect')
+  expect(Object.fromEntries(external)).toEqual(
+    Object.fromEntries(external.map(([name]) => [name, consumerDependencyVersions.get(name)])),
+  )
 }
 
 type NonActorExportKind =
@@ -761,9 +783,7 @@ test('the compiler release candidate exposes only its LLVM compiler actors', () 
     )
     writeFileSync(
       resolve(consumerRoot, 'pnpm-workspace.yaml'),
-      consumerWorkspace(
-        `  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n  smol-toml: ${installedVersion(compilerPackageRoot, 'smol-toml')}\n`,
-      ),
+      consumerWorkspace(`  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n`),
     )
     installConsumer(consumerRoot)
     const inspected = execFileSync(
@@ -872,7 +892,7 @@ test('the docgen release candidate exposes all documentation actors', () => {
     writeFileSync(
       resolve(consumerRoot, 'pnpm-workspace.yaml'),
       consumerWorkspace(
-        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n  smol-toml: ${installedVersion(compilerPackageRoot, 'smol-toml')}\n`,
+        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n`,
       ),
     )
     installConsumer(consumerRoot)
@@ -965,7 +985,7 @@ test('the formatter release candidate installs offline with root and deep API pa
     writeFileSync(
       resolve(consumerRoot, 'pnpm-workspace.yaml'),
       consumerWorkspace(
-        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n  smol-toml: ${installedVersion(compilerPackageRoot, 'smol-toml')}\n`,
+        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n`,
       ),
     )
     installConsumer(consumerRoot)
@@ -1099,7 +1119,7 @@ test('the CLI release candidate installs with its project-first command surface'
     writeFileSync(
       resolve(consumerRoot, 'pnpm-workspace.yaml'),
       consumerWorkspace(
-        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/formatter': file:${resolve(archiveRoot, formatterArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n  smol-toml: ${installedVersion(compilerPackageRoot, 'smol-toml')}\nallowBuilds:\n  msgpackr-extract: false\n  sharp: false\n`,
+        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/formatter': file:${resolve(archiveRoot, formatterArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\nallowBuilds:\n  msgpackr-extract: false\n  sharp: false\n`,
       ),
     )
     installConsumer(consumerRoot)
@@ -1254,7 +1274,7 @@ test('the lsp release candidate installs and answers an initialize request', asy
     writeFileSync(
       resolve(consumerRoot, 'pnpm-workspace.yaml'),
       consumerWorkspace(
-        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/formatter': file:${resolve(archiveRoot, formatterArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\n  smol-toml: ${installedVersion(compilerPackageRoot, 'smol-toml')}\n  vscode-languageserver: ${lspInstalledVersion('vscode-languageserver')}\n  vscode-languageserver-textdocument: ${lspInstalledVersion('vscode-languageserver-textdocument')}\nallowBuilds:\n  msgpackr-extract: false\n  sharp: false\n`,
+        `  '@silklang/compiler': file:${resolve(archiveRoot, compilerArchive ?? '')}\n  '@silklang/docgen': file:${resolve(archiveRoot, docgenArchive ?? '')}\n  '@silklang/formatter': file:${resolve(archiveRoot, formatterArchive ?? '')}\n  '@silklang/llvm': file:${resolve(archiveRoot, llvmArchive ?? '')}\nallowBuilds:\n  msgpackr-extract: false\n  sharp: false\n`,
       ),
     )
     installConsumer(consumerRoot)

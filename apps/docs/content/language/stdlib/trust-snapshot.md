@@ -444,7 +444,7 @@ output and leaves this snapshot unchanged.
 ### Associated function `TrustSnapshot.combine`
 
 ```silk
-pub effect<'env> fn combine<'life0: 'env, 'life1: 'env, 'env>(primary: &'life0 silk/trust_snapshot.TrustSnapshot, additional: &'life1 silk/trust_snapshot.TrustSnapshot, limits: SnapshotLimits) -> silk/result.Result<silk/trust_snapshot.TrustSnapshot, silk/trust_snapshot.TrustSourceError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn combine<'life0, 'life1>(primary: &'life0 silk/trust_snapshot.TrustSnapshot, additional: &'life1 silk/trust_snapshot.TrustSnapshot, limits: SnapshotLimits) -> silk/result.Result<silk/trust_snapshot.TrustSnapshot, silk/trust_snapshot.TrustSourceError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies `primary` anchors, then `additional` anchors, into one independent owner.

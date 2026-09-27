@@ -868,7 +868,7 @@ The namespace for bounded deterministic certificate-path validation.
 ### Associated function `CertificatePath.validate`
 
 ```silk
-pub effect<'env> fn validate<'a: 'env, 'life1: 'env, 'env>(leaf: &'a silk/certificate.Certificate, intermediates: &'a [silk/certificate.Certificate], anchors: &'a [silk/trust_anchor.TrustAnchor], at: &'life1 silk/system_clock.Instant, limits: ValidationLimits) -> silk/result.Result<silk/certificate_path.ValidatedPath<'a>, silk/certificate_path.ValidationError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'a & 'life1> fn validate<'a, 'life1>(leaf: &'a silk/certificate.Certificate, intermediates: &'a [silk/certificate.Certificate], anchors: &'a [silk/trust_anchor.TrustAnchor], at: &'life1 silk/system_clock.Instant, limits: ValidationLimits) -> silk/result.Result<silk/certificate_path.ValidatedPath<'a>, silk/certificate_path.ValidationError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Builds and validates the first deterministic TLS-server path to explicit authority.

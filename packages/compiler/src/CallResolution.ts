@@ -1575,6 +1575,29 @@ export const analyzeCallContract = (
         ],
       }
     }
+    // The applied operation states its retained-storage obligations over this call's capability
+    // arguments and selected invocation lifetimes, so they are discharged like a function's.
+    const obligations =
+      reference._tag === 'ResolvedInterfaceOperation'
+        ? selectedLifetimeBoundDiagnostics(
+            reference.interfaceContract.lifetimes.lifetimeBounds ?? [],
+            new Map(),
+            resolution?.lifetimeCompatibility,
+            Location.at(call.anchor),
+            reference.interfaceContract.lifetimes.typeOutlives ?? [],
+          )
+        : []
+    const obligationFailure = obligations.at(0)
+    if (obligationFailure !== undefined)
+      return {
+        mappings: [],
+        fact: {
+          _tag: 'Unavailable',
+          reason: { _tag: 'UnavailableCallSyntax', anchor: call.anchor },
+          cause: Diagnostic.identity(obligationFailure),
+        },
+        diagnostics: obligations,
+      }
     return {
       mappings: [],
       fact: {

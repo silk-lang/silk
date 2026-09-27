@@ -55,7 +55,7 @@ The owner of bounded exact-prefix transfer operations.
 ### Associated function `BufferedTransfer.transferAtMost`
 
 ```silk
-pub effect<'env> fn transferAtMost<'source: 'env, 'destination: 'env, SP: 'env, DP: 'env, 'life4: 'env, 'life5: 'env, 'env>(source: &'life4 mut silk/buffered_duplex.BufferedDuplex<'source, SP>, destination: &'life5 mut silk/buffered_duplex.BufferedDuplex<'destination, DP>, limit: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> TransferOutcome ! BufferError ? &mut MonotonicClock where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life4 & 'life5> fn transferAtMost<'source: 'life4 & 'life5, 'destination: 'life4 & 'life5, SP: 'life4 & 'life5, DP: 'life4 & 'life5, 'life4, 'life5>(source: &'life4 mut silk/buffered_duplex.BufferedDuplex<'source, SP>, destination: &'life5 mut silk/buffered_duplex.BufferedDuplex<'destination, DP>, limit: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> TransferOutcome ! BufferError ? &mut MonotonicClock where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Transfers no more than `limit`, consuming only destination-accepted bytes.
@@ -65,7 +65,7 @@ Transfers no more than `limit`, consuming only destination-accepted bytes.
 ### Associated function `BufferedTransfer.transferExact`
 
 ```silk
-pub effect<'env> fn transferExact<'source: 'env, 'destination: 'env, SP: 'env, DP: 'env, 'life4: 'env, 'life5: 'env, 'env>(source: &'life4 mut silk/buffered_duplex.BufferedDuplex<'source, SP>, destination: &'life5 mut silk/buffered_duplex.BufferedDuplex<'destination, DP>, count: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life4 & 'life5> fn transferExact<'source: 'life4 & 'life5, 'destination: 'life4 & 'life5, SP: 'life4 & 'life5, DP: 'life4 & 'life5, 'life4, 'life5>(source: &'life4 mut silk/buffered_duplex.BufferedDuplex<'source, SP>, destination: &'life5 mut silk/buffered_duplex.BufferedDuplex<'destination, DP>, count: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Transfers exactly `count` bytes or reports early end with the transferred prefix.

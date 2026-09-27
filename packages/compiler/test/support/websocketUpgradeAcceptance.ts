@@ -651,7 +651,7 @@ ${positiveCase}
   if canceled != 42 { return canceled }
   return 0
 }
-effect fn recover<E>(error: E) -> i32 {
+effect<'env> fn recover<E: 'env, 'env>(error: E) -> i32 {
   drop error
   return 199
 }

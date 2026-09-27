@@ -176,7 +176,7 @@ Reports whether one bucket holds an element. Out-of-range buckets hold nothing.
 ### Method `HashSet.insert`
 
 ```silk
-pub effect<'env> fn insert<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut HashSet<T>, value: T) -> bool ! OutOfMemoryError ? &mut Allocator
+pub effect<'env> fn insert<T: 'env, 'env, 'life3: 'env>(self: &'life3 mut HashSet<T>, value: T) -> bool ! OutOfMemoryError ? &mut Allocator
 ```
 
 Inserts one owned element, reporting whether an equivalent element was already held.

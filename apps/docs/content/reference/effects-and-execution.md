@@ -127,14 +127,16 @@ Effect layers.
 
 ```silk
 effect fn inner() -> i32 { return 42 }
-effect fn outer() -> Effect<i32> { return inner() }
+effect fn outer() -> Effect<'static; i32> { return inner() }
 
 pub fn main() -> i32 {
   return run run outer()
 }
 ```
 
-**Boundary:** Running `outer()` once produces `Effect<i32>`, not `i32`.
+**Boundary:** Running `outer()` once produces `Effect<'static; i32>`, not `i32`. The inner
+environment is written: an `effect fn` success type that is an Effect gets no omitted-environment
+default.
 
 The following invalid case does not demonstrate automatic flattening:
 
@@ -169,7 +171,7 @@ source executes each layer or applies an explicit flattening operation.
 
 ```silk
 effect fn inner() -> i32 { return 42 }
-effect fn nested() -> Effect<i32> { return inner() }
+effect fn nested() -> Effect<'static; i32> { return inner() }
 ```
 
 **Boundary:** Declaring the success type as `i32` does not request implicit flattening. Returning an

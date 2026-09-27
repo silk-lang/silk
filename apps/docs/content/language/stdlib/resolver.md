@@ -561,7 +561,7 @@ A replaceable domain-only resolver provider.
 ### Operation `resolveDomain`
 
 ```silk
-effect<'env> fn resolveDomain<'life0: 'env, 'life1: 'env, 'env>(request: &'life0 silk/resolver.ResolveRequest, domain: &'life1 silk/network_address.DomainHost) -> ResolvedEndpoints ! ResolverError | OutOfMemoryError ? &mut Resolver | &mut Allocator
+effect<'life0 & 'life1> fn resolveDomain<'life0, 'life1>(request: &'life0 silk/resolver.ResolveRequest, domain: &'life1 silk/network_address.DomainHost) -> ResolvedEndpoints ! ResolverError | OutOfMemoryError ? &mut Resolver | &mut Allocator
 ```
 
 Resolves one admitted domain request and owns all returned endpoint storage.

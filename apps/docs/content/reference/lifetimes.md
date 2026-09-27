@@ -150,6 +150,35 @@ failure `E`, requirement row `R`, and run access. Omitted environments are elabo
 header or local context. An Effect that retains borrowed data is not detached merely because its
 success and failure types contain no views.
 
+An `effect fn` captures every input, so an omitted `effect fn` environment is the intersection of
+the regions its inputs retain, in any order and without repeats. An input retains the region of a
+borrow, each non-`'static` lifetime argument of a nominal type, and the environment of a callable
+or Effect, including those nested in its stored contents. The parameter, success, failure, and
+requirement types of a callable or Effect input are not stored, so
+`effect fn run<A, E>(pending: once Effect<'static; A ! E>) -> A ! E` has a `'static` environment and
+`effect fn keep<A>(pending: once Effect<A>) -> A` retains the pending Effect's region. An input
+whose stored contents involve a type parameter, such as `value: T` or `Box<T>`, has no nameable
+region. The omitted environment is then ambiguous (SEM0210) at that input, and the declaration
+writes `effect<'env> fn`. A written environment carries the obligation that every captured value
+outlives it: each call, and each witness of an interface or service operation, must satisfy it. A
+`T: 'env` bound states that obligation explicitly and is optional; it adds nothing the written
+environment does not already require, including for a parameter of an enclosing `impl`,
+interface, or service.
+
+An ordinary named function whose result is an `Effect` with an omitted environment elides it from
+the header under LIFE-003. A single borrowed input supplies the environment, and several borrowed
+inputs require it to be written. When no input carries borrowed data, the environment is `'static`, so
+`fn closed() -> Effect<i32>` and `fn answerExplicit(input: i32) -> Effect<i32>` both have results
+of the form `Effect<'static; i32>`. Any other input that retains a region or stores generic
+contents, with no single borrowed input, leaves the omitted environment ambiguous (SEM0210), so
+`fn f<'a>(value: Held<'a, i32>) -> Effect<i32>` writes `Effect<'a; i32>`. The `'static` default
+does not apply to an `effect fn` whose success type is an Effect: `effect fn f() -> Effect<i32>` is
+ambiguous and writes `Effect<'static; i32>`, whatever its own capture environment.
+
+These defaults cover only the result's own environment. They do not apply to an Effect nested in
+that result, or to callables and Effects inside a callable contract. Ordinary capture and lifetime
+checks still apply, so an Effect cannot retain anything that is not valid for its environment.
+
 Effect environment positions also accept finite intersections: `Effect<'call & 'env; A ! E ? R>`
 and `effect<'a & 'b> fn`. An intersection is valid only while every constituent is valid. It is
 associative, commutative, and idempotent; `'static` is its identity. Canonical identity does not

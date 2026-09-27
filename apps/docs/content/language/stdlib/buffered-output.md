@@ -70,7 +70,7 @@ Reports whether a preceding external failure made this output terminal.
 ### Method `BufferedOutput.writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedOutput, input: &'life1 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life0 & 'life1> fn writeSome<'life0, 'life1>(self: &'life0 mut BufferedOutput, input: &'life1 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts one positive input prefix, writing pending bytes only when space is needed.
@@ -80,7 +80,7 @@ Accepts one positive input prefix, writing pending bytes only when space is need
 ### Method `BufferedOutput.writeAll`
 
 ```silk
-pub effect<'env> fn writeAll<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedOutput, input: &'life1 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life0 & 'life1> fn writeAll<'life0, 'life1>(self: &'life0 mut BufferedOutput, input: &'life1 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts the complete finite input or reports its accepted prefix on failure.
@@ -90,7 +90,7 @@ Accepts the complete finite input or reports its accepted prefix on failure.
 ### Method `BufferedOutput.writeVecAll`
 
 ```silk
-pub effect<'env> fn writeVecAll<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedOutput, inputs: &'life1 [silk/bytes.Bytes], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life0 & 'life1> fn writeVecAll<'life0, 'life1>(self: &'life0 mut BufferedOutput, inputs: &'life1 [silk/bytes.Bytes], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts borrowed byte vectors in order after checking aggregate length arithmetic.
@@ -120,7 +120,7 @@ Explicitly completes pending output; equivalent to flush.
 ### Method `BufferedOutput.writeSomeWriter`
 
 ```silk
-pub effect<'env> fn writeSomeWriter<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedOutput, input: &'life1 [u8]) -> usize ! BufferError ? &mut Writer
+pub effect<'life0 & 'life1> fn writeSomeWriter<'life0, 'life1>(self: &'life0 mut BufferedOutput, input: &'life1 [u8]) -> usize ! BufferError ? &mut Writer
 ```
 
 Accepts one prefix for a Writer-backed adapter without advertising deadlines.
@@ -130,7 +130,7 @@ Accepts one prefix for a Writer-backed adapter without advertising deadlines.
 ### Method `BufferedOutput.writeAllWriter`
 
 ```silk
-pub effect<'env> fn writeAllWriter<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedOutput, input: &'life1 [u8]) -> () ! BufferError ? &mut Writer
+pub effect<'life0 & 'life1> fn writeAllWriter<'life0, 'life1>(self: &'life0 mut BufferedOutput, input: &'life1 [u8]) -> () ! BufferError ? &mut Writer
 ```
 
 Accepts a complete finite value for a Writer-backed adapter.

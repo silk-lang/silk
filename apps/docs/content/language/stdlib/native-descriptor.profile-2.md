@@ -96,7 +96,7 @@ Byte-transfer policy for borrowed native descriptors with no resource ownership.
 ### Associated function `NativeDescriptor.read`
 
 ```silk
-pub effect<'env> fn read<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(fd: i32, buffer: &'life0 mut [u8], count: &'life1 mut usize, error: &'life2 mut i32) -> bool
+pub effect<'life0 & 'life1 & 'life2> fn read<'life0, 'life1, 'life2>(fd: i32, buffer: &'life0 mut [u8], count: &'life1 mut usize, error: &'life2 mut i32) -> bool
 ```
 
 Reads one committed prefix, retrying interrupted calls without advancing the buffer.
@@ -112,7 +112,7 @@ transfer count. Bytes beyond a successful prefix retain their initial values.
 ### Associated function `NativeDescriptor.writeAll`
 
 ```silk
-pub effect<'env> fn writeAll<'life0: 'env, 'life1: 'env, 'env>(fd: i32, buffer: &'life0 [u8], error: &'life1 mut i32) -> bool
+pub effect<'life0 & 'life1> fn writeAll<'life0, 'life1>(fd: i32, buffer: &'life0 [u8], error: &'life1 mut i32) -> bool
 ```
 
 Completes a byte sequence by advancing only after positive transfers.

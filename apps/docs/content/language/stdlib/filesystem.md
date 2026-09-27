@@ -183,7 +183,7 @@ This has the same UTF-8 precondition as [`view`](#declaration-73696c6b2f66696c65
 ### Associated function `Path.join`
 
 ```silk
-pub effect<'env> fn join<'life0: 'env, 'life1: 'env, 'env>(base: &'life0 silk/filesystem.Path, fragment: string<'life1>) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn join<'life0, 'life1>(base: &'life0 silk/filesystem.Path, fragment: string<'life1>) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one normalized relative text fragment to an absolute base path.
@@ -198,7 +198,7 @@ trailing slash. Use [`resolve`](#declaration-73696c6b2f66696c6573797374656d3a3a5
 ### Associated function `Path.joinUtf8`
 
 ```silk
-pub effect<'env> fn joinUtf8<'life0: 'env, 'life1: 'env, 'env>(base: &'life0 silk/filesystem.Path, fragment: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn joinUtf8<'life0, 'life1>(base: &'life0 silk/filesystem.Path, fragment: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
 ```
 
 Validates UTF-8 bytes as one normalized relative fragment and appends them to `base`.
@@ -213,7 +213,7 @@ same malformed components rejected by [`join`](#declaration-73696c6b2f66696c6573
 ### Associated function `Path.joinBytes`
 
 ```silk
-pub effect<'env> fn joinBytes<'life0: 'env, 'life1: 'env, 'env>(base: &'life0 silk/filesystem.Path, fragment: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn joinBytes<'life0, 'life1>(base: &'life0 silk/filesystem.Path, fragment: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one normalized relative byte fragment while preserving non-UTF-8 names.
@@ -229,7 +229,7 @@ when the caller also requires valid UTF-8.
 ### Associated function `Path.resolve`
 
 ```silk
-pub effect<'env> fn resolve<'life0: 'env, 'life1: 'env, 'env>(base: &'life0 silk/filesystem.Path, relativeText: string<'life1>) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn resolve<'life0, 'life1>(base: &'life0 silk/filesystem.Path, relativeText: string<'life1>) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
 ```
 
 Resolves relative text lexically against an explicit absolute base.
@@ -451,7 +451,7 @@ independently of the provider read.
 ### Operation `writeFile`
 
 ```silk
-effect<'env> fn writeFile<'life0: 'env, 'life1: 'env, 'env>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8]) -> () ! FileError ? &mut FileSystem
+effect<'life0 & 'life1> fn writeFile<'life0, 'life1>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8]) -> () ! FileError ? &mut FileSystem
 ```
 
 Writes one complete byte view with create-or-truncate semantics.
@@ -536,7 +536,7 @@ descendants are intentionally in scope for removal.
 ### Operation `createTemporaryDirectory`
 
 ```silk
-effect<'env> fn createTemporaryDirectory<'life0: 'env, 'life1: 'env, 'env>(parent: &'life0 silk/filesystem.Path, prefix: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+effect<'life0 & 'life1> fn createTemporaryDirectory<'life0, 'life1>(parent: &'life0 silk/filesystem.Path, prefix: &'life1 [u8]) -> Path ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
 ```
 
 Creates one directory under an existing parent under a name no other caller holds.
@@ -859,7 +859,7 @@ Borrows an error and returns its provider-specific numeric detail, if one was re
 ### Associated function `FileSystem.temporaryDirectory`
 
 ```silk
-pub effect<'env> fn temporaryDirectory<'life0: 'env, 'life1: 'env, 'env>(parent: &'life0 silk/filesystem.Path, prefix: string<'life1>) -> TemporaryDirectory ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect<'life0 & 'life1> fn temporaryDirectory<'life0, 'life1>(parent: &'life0 silk/filesystem.Path, prefix: string<'life1>) -> TemporaryDirectory ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
 ```
 
 Creates an explicitly owned temporary directory under `parent` with a name beginning in `prefix`.
@@ -954,7 +954,7 @@ composition, so concurrent namespace changes may still race according to provide
 ### Associated function `FileSystem.writeFileWithParents`
 
 ```silk
-pub effect<'env> fn writeFileWithParents<'life0: 'env, 'life1: 'env, 'env>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8]) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect<'life0 & 'life1> fn writeFileWithParents<'life0, 'life1>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8]) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
 ```
 
 Ensures every parent directory exists, then writes the complete byte view to `path`.

@@ -500,7 +500,7 @@ Retains through StandardInput without advertising a deadline.
 ### Method `BufferedInput.readSome`
 
 ```silk
-pub effect<'env> fn readSome<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life0 & 'life1> fn readSome<'life0, 'life1>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Copies one positive prefix or reports sticky end.
@@ -510,7 +510,7 @@ Copies one positive prefix or reports sticky end.
 ### Method `BufferedInput.readSomeStandard`
 
 ```silk
-pub effect<'env> fn readSomeStandard<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8]) -> ReadTransfer ! BufferError ? &mut StandardInput
+pub effect<'life0 & 'life1> fn readSomeStandard<'life0, 'life1>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8]) -> ReadTransfer ! BufferError ? &mut StandardInput
 ```
 
 Copies one positive prefix through StandardInput or reports sticky end.
@@ -520,7 +520,7 @@ Copies one positive prefix through StandardInput or reports sticky end.
 ### Method `BufferedInput.readExact`
 
 ```silk
-pub effect<'env> fn readExact<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life0 & 'life1> fn readExact<'life0, 'life1>(self: &'life0 mut BufferedInput, output: &'life1 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Fills the complete destination or reports its precisely copied prefix.

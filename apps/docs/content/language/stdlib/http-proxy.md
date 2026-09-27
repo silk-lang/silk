@@ -945,7 +945,7 @@ Purely selects Direct, Forward, or Tunnel for one original origin.
 ## `classifyConnect`
 
 ```silk
-pub effect<'env> fn classifyConnect<'life0: 'env, 'life1: 'env, 'env>(head: &'life0 silk/http_head.ResponseHead<'life1>) -> () ! ProxyError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0> fn classifyConnect<'life0, 'life1: 'life0>(head: &'life0 silk/http_head.ResponseHead<'life1>) -> () ! ProxyError | OutOfMemoryError ? &mut Allocator
 ```
 
 Classifies a complete final CONNECT response into success or bounded rejection metadata.

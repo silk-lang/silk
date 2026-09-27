@@ -20,7 +20,7 @@ impl<T> Drop for Guard<T> {
   fn drop(self: &mut Guard<T>) -> () { return () }
 }
 
-effect fn hold<T>(value: T) -> i32 ! OutOfMemoryError {
+effect<'env> fn hold<T: 'env, 'env>(value: T) -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let layout = Layout.of<[i32; 2]>()
   let recipe = Allocator.allocate(move layout) |> Effect.provideMut(&mut allocator)

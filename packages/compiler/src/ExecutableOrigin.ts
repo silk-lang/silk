@@ -1940,6 +1940,24 @@ export const make = (operations: Operations) => {
       )
         return undefined
     }
+    // A witness binder that occurs only in its written environment was matched to the operation's
+    // environment when the conformance was checked; this invocation's environment fixes it. If
+    // matching fails, the binder stays unresolved and no target is selected.
+    const written = target.declaration.lifetimeElaboration?.explicitEnvironment
+    if (written !== undefined && serviceOperation !== undefined) {
+      const environment = (lifetime: Lifetime.Lifetime) =>
+        Type.effect(Type.unit, [], { environment: lifetime, lifetimeBinders: [] })
+      TypeInference.infer(
+        environment(written),
+        environment(
+          Type.substituteLifetime(
+            DeclarationFacts.executableLifetimes(serviceOperation).environment,
+            operationSubstitution,
+          ),
+        ),
+        targetSubstitution,
+      )
+    }
     const typeArguments = target.declaration.typeParameters.flatMap((parameter) => {
       const argument = targetSubstitution.get(Type.key(parameter.type))
       return argument === undefined ? [] : [argument]

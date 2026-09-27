@@ -102,7 +102,7 @@ never caches, installs, or replaces caller-owned snapshots.
 ### Associated function `NativeFileTrustSource.make`
 
 ```silk
-pub effect<'env> fn make<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 silk/filesystem.Path) -> NativeFileTrustSource ! TrustSourceError | OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn make<'life0, 'life1>(root: &'life0 [u8], path: &'life1 silk/filesystem.Path) -> NativeFileTrustSource ! TrustSourceError | OutOfMemoryError ? &mut Allocator
 ```
 
 Validates and copies explicit native file-trust configuration without performing I/O.

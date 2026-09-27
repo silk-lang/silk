@@ -28,6 +28,25 @@ it.effect('lowers shared source service dispatch through native LLVM', () =>
   }),
 )
 
+it.effect('lowers a generic service witness that names its retained environment', () =>
+  Effect.gen(function* () {
+    const self = yield* snapshot(`import silk.effect { Effect }
+service Dispatch<H> { effect<'env> fn with<'env>(handler: H) -> i32 ? &mut Dispatch<H> }
+struct Provider<H> {}
+impl<H> Dispatch<H> for Provider<H> {
+  effect<'env> fn with<'env>(self: &mut Self, handler: H) -> i32 { drop handler return 5 }
+}
+effect fn useDispatch() -> i32 ? &mut Dispatch<i32> { return run Dispatch.with<i32>(5) }
+pub fn main() -> i32 {
+  let mut provider = Provider<i32> {}
+  return run useDispatch() |> Effect.provideMut<Dispatch<i32>>(&mut provider)
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const mir = Analysis.loweredMir(self)
+    assert.isTrue(mir.functions.some((fn) => fn.id.name.includes('with')))
+  }),
+)
+
 it.effect('rejects a generic service witness bound its header never promises', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`interface Marker<T> { fn mark(value: T) -> i32 }

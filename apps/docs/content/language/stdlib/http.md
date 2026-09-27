@@ -908,7 +908,7 @@ Returns the borrowed ordered fields.
 ### Method `RequestHead.copy`
 
 ```silk
-pub effect<'env> fn copy<'value: 'env, 'life1: 'env, 'env>(self: &'life1 RequestHead<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedRequestHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'value: 'life1, 'life1>(self: &'life1 RequestHead<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedRequestHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies the complete request head into independent bounded storage.
@@ -1006,7 +1006,7 @@ Returns the borrowed ordered fields.
 ### Method `ResponseHead.copy`
 
 ```silk
-pub effect<'env> fn copy<'value: 'env, 'life1: 'env, 'env>(self: &'life1 ResponseHead<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'value: 'life1, 'life1>(self: &'life1 ResponseHead<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies the complete response head into independent bounded storage.
@@ -1016,7 +1016,7 @@ Copies the complete response head into independent bounded storage.
 ### Method `ResponseHead.copyMatchingHeaders`
 
 ```silk
-pub effect<'env> fn copyMatchingHeaders<'value: 'env, 'life1: 'env, 'env>(self: &'life1 ResponseHead<'value>, name: string<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'value & 'life1> fn copyMatchingHeaders<'value, 'life1>(self: &'life1 ResponseHead<'value>, name: string<'value>, limits: Limits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies the response status, reason, and only matching fields into independent storage.

@@ -41,7 +41,7 @@ Operations for writing the visible projection of a named aggregate.
 ### Associated function `JsonReflect.write`
 
 ```silk
-pub effect<'env> fn write<T: 'env, 'life1: 'env, 'life2: 'env, 'env>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+pub effect<'life1 & 'life2> fn write<T: 'life1 & 'life2, 'life1, 'life2>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
 ```
 
 Writes one JSON object from visible labeled fields in declaration order.

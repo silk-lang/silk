@@ -38,7 +38,7 @@ A type that writes one JSON value without allocating JSON-owned storage.
 ### Operation `serialize`
 
 ```silk
-effect<'env> fn serialize<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 Self, options: &'life1 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+effect<'life0 & 'life1> fn serialize<'life0, 'life1>(self: &'life0 Self, options: &'life1 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
 ```
 
 Writes one value through the ambient Writer with the supplied format policy.
@@ -78,7 +78,7 @@ A type that decodes one owned JSON value and can allocate.
 ### Operation `deserialize`
 
 ```silk
-effect<'env> fn deserialize<'life0: 'env, 'life1: 'env, 'env>(scanner: &'life0 mut silk/json_scanner.JsonScanner<'life1>) -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
+effect<'life0> fn deserialize<'life0, 'life1: 'life0>(scanner: &'life0 mut silk/json_scanner.JsonScanner<'life1>) -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
 Decodes one value and leaves enclosing array or object delimiters unread.
@@ -108,7 +108,7 @@ Decodes one value without requiring an allocator.
 ### Associated function `JsonCodec.deserializeOne`
 
 ```silk
-pub effect<'env> fn deserializeOne<T, 'life1: 'env, 'life2: 'env, 'env>(scanner: &'life1 mut silk/json_scanner.JsonScanner<'life2>) -> T ! JsonError | OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn deserializeOne<T, 'life1, 'life2: 'life1>(scanner: &'life1 mut silk/json_scanner.JsonScanner<'life2>) -> T ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
 Deserializes one value with its declared allocator upper bound.
@@ -118,7 +118,7 @@ Deserializes one value with its declared allocator upper bound.
 ### Associated function `JsonCodec.writeOne`
 
 ```silk
-pub effect<'env> fn writeOne<T: 'env, 'life1: 'env, 'life2: 'env, 'env>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+pub effect<'life1 & 'life2> fn writeOne<T: 'life1 & 'life2, 'life1, 'life2>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
 ```
 
 Writes one value through its Serialize witness.

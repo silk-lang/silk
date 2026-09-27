@@ -266,7 +266,7 @@ Creates an empty admitted list without allocating.
 ### Associated function `NameList.copy`
 
 ```silk
-pub effect<'env> fn copy<'life0: 'env, 'life1: 'env, 'env>(names: &'life0 [string<'life1>], limits: NameListLimits) -> silk/result.Result<silk/http_redirect.NameList, silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0> fn copy<'life0, 'life1: 'life0>(names: &'life0 [string<'life1>], limits: NameListLimits) -> silk/result.Result<silk/http_redirect.NameList, silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Validates and copies field names under exact count, per-name, and owned-byte boundaries.
@@ -1181,7 +1181,7 @@ Returns framing metadata before an attempt writes its request head.
 ### Operation `pull`
 
 ```silk
-effect<'env> fn pull<'life2: 'env, 'life3: 'env, 'env>(producer: &'life2 mut Self, output: &'life3 mut [u8]) -> BodyChunk ! E ? R
+effect<'life2 & 'life3> fn pull<'life2, 'life3>(producer: &'life2 mut Self, output: &'life3 mut [u8]) -> BodyChunk ! E ? R
 ```
 
 Initializes at most `output.length` bytes and reports progress without retaining `output`.
@@ -1207,7 +1207,7 @@ success or failure. Factory result and callback types remain outside this public
 ### Operation `acquire`
 
 ```silk
-effect<'env> fn acquire<'life3: 'env, 'env>(factory: &'life3 mut Self) -> P ! FactoryError ? FactoryRequirements
+effect<'life3> fn acquire<'life3>(factory: &'life3 mut Self) -> P ! FactoryError ? FactoryRequirements
 ```
 
 Acquires one fresh owned producer for the next retained-body attempt.
@@ -1348,7 +1348,7 @@ exposing redirect's concrete callback adapter.
 ### Operation `handle`
 
 ```silk
-effect<'call> fn handle<'call: 'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R | &mut silk/http_redirect.Attempt<'policy, P, A, E, ? R> where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
+effect<'call> fn handle<'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R | &mut silk/http_redirect.Attempt<'policy, P, A, E, ? R> where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Handles one live routed exchange inside its acquisition bracket.
@@ -1390,7 +1390,7 @@ exchange loan.
 ### Operation `withAttempt`
 
 ```silk
-effect<'env> fn withAttempt<'life7: 'env, 'env>(client: &'life7 mut Self, request: silk/http_redirect.AttemptRequest<'policy>, deadline: silk/option.Option<silk/system_clock.Instant>) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut silk/http_redirect.Attempt<'policy, P, A, HandlerError, ? HandlerRequirements> where HandlerRequirements in Without<HandlerRequirements, &ByteDuplex>, HandlerRequirements in Without<HandlerRequirements, &HttpTransport>
+effect<'policy & 'life7> fn withAttempt<'life7>(client: &'life7 mut Self, request: silk/http_redirect.AttemptRequest<'policy>, deadline: silk/option.Option<silk/system_clock.Instant>) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut silk/http_redirect.Attempt<'policy, P, A, HandlerError, ? HandlerRequirements> where HandlerRequirements in Without<HandlerRequirements, &ByteDuplex>, HandlerRequirements in Without<HandlerRequirements, &HttpTransport>
 ```
 
 Rebuilds, acquires, and drives one scoped request while preserving both channel families.
@@ -1416,7 +1416,7 @@ validated method only for its exchange scope. Neither exchange form can escape i
 ### Operation `handleRouted`
 
 ```silk
-effect<'call> fn handleRouted<'call: 'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, RoutedP>>) -> A ! E ? R | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, E, ? R> where &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &HttpTransport from &mut HttpTransport, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex
+effect<'call> fn handleRouted<'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, RoutedP>>) -> A ! E ? R | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, E, ? R> where &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &HttpTransport from &mut HttpTransport, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Handles one routed exchange after route preparation and acquisition finish.
@@ -1426,7 +1426,7 @@ Handles one routed exchange after route preparation and acquisition finish.
 ### Operation `handleDirect`
 
 ```silk
-effect<'call> fn handleDirect<'call: 'call, 'exchangeView: 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, DirectP>) -> A ! E ? R | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, E, ? R> where &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut DirectP provides &HttpTransport from &mut HttpTransport
+effect<'call> fn handleDirect<'call, 'exchangeView: 'call>(request: &'call silk/http_redirect.AttemptRequest<'policy>, method: silk/http.Method<'call>, exchange: &'call mut silk/http_client.Exchange<'exchangeView, DirectP>) -> A ! E ? R | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, E, ? R> where &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut DirectP provides &HttpTransport from &mut HttpTransport
 ```
 
 Handles one direct exchange after direct request preparation and acquisition finish.
@@ -1452,7 +1452,7 @@ does not require duplex authority because it cannot establish a CONNECT tunnel.
 ### Operation `withAttempt`
 
 ```silk
-effect<'env> fn withAttempt<'life8: 'env, 'env>(client: &'life8 mut Self, request: silk/http_redirect.AttemptRequest<'policy>, deadline: silk/option.Option<silk/system_clock.Instant>) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError, ? HandlerRequirements> where HandlerRequirements in Without<HandlerRequirements, &ByteDuplex>, HandlerRequirements in Without<HandlerRequirements, &HttpTransport>
+effect<'policy & 'life8> fn withAttempt<'life8>(client: &'life8 mut Self, request: silk/http_redirect.AttemptRequest<'policy>, deadline: silk/option.Option<silk/system_clock.Instant>) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut silk/http_redirect.HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError, ? HandlerRequirements> where HandlerRequirements in Without<HandlerRequirements, &ByteDuplex>, HandlerRequirements in Without<HandlerRequirements, &HttpTransport>
 ```
 
 Rebuilds, acquires, and drives one routed or direct scoped request.
@@ -1482,7 +1482,7 @@ redirects followed. Neither the URI nor exchange loan can escape in `A`.
 ### Operation `handle`
 
 ```silk
-effect<'call> fn handle<'call: 'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call, 'life9: 'call>(handler: &'life9 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
+effect<'call> fn handle<'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call, 'life9: 'call>(handler: &'life9 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Handles exactly one selected final response.
@@ -1512,7 +1512,7 @@ owned final URI and live exchange only for that call.
 ### Operation `handleRouted`
 
 ```silk
-effect<'call> fn handleRouted<'call: 'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call, 'life10: 'call>(handler: &'life10 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, RoutedP>>) -> A ! E ? R where &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &HttpTransport from &mut HttpTransport, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex
+effect<'call> fn handleRouted<'call, 'exchangeView: 'call, 'transport: 'exchangeView + 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call, 'life10: 'call>(handler: &'life10 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, RoutedP>>) -> A ! E ? R where &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &HttpTransport from &mut HttpTransport, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut RoutedP provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Handles exactly one final response on a routed transport.
@@ -1522,7 +1522,7 @@ Handles exactly one final response on a routed transport.
 ### Operation `handleDirect`
 
 ```silk
-effect<'call> fn handleDirect<'call: 'call, 'exchangeView: 'call, 'life7: 'call>(handler: &'life7 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, DirectP>) -> A ! E ? R where &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut DirectP provides &HttpTransport from &mut HttpTransport
+effect<'call> fn handleDirect<'call, 'exchangeView: 'call, 'life7: 'call>(handler: &'life7 mut Self, uri: silk/uri.Uri<'call>, hop: usize, exchange: &'call mut silk/http_client.Exchange<'exchangeView, DirectP>) -> A ! E ? R where &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut DirectP provides &HttpTransport from &mut HttpTransport
 ```
 
 Handles exactly one final response on a direct HTTP transport.
@@ -1729,7 +1729,7 @@ transition stops factory acquisition. All source and acquisition channels remain
 ## `writeBody`
 
 ```silk
-pub effect<'env> fn writeBody<'bytes: 'env, 'oneShot: 'env, 'replay: 'env, 'exchange: 'env, P: 'env, OneShotError, ReplayError, ?OneShotRequirements, ?ReplayRequirements, OneShot: 'env, ReplayProducer: 'env, 'life11: 'env, 'life12: 'env, 'life13: 'env, 'life14: 'env, 'life15: 'env, 'life16: 'env, 'env>(exchange: &'life11 mut silk/http_client.Exchange<'exchange, P>, current: &'life12 silk/uri.Uri<'life13>, expected: BodyMode, body: silk/http_redirect.AttemptBody<'bytes, 'oneShot, 'replay, OneShot, ReplayProducer>, scratch: &'life14 mut [u8], trailers: &'life15 silk/http_headers.Headers<'life16>, hop: usize) -> BodyWriteOutcome ! RedirectError | OneShotError | ReplayError | ClientError | OutOfMemoryError ? OneShotRequirements | ReplayRequirements | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'env> fn writeBody<'bytes: 'env, 'oneShot: 'env, 'replay: 'env, 'exchange: 'env, P: 'env, OneShotError, ReplayError, ?OneShotRequirements, ?ReplayRequirements, OneShot: 'env, ReplayProducer: 'env, 'env, 'life12: 'env, 'life13: 'env, 'life14: 'env, 'life15: 'env, 'life16: 'env, 'life17: 'env>(exchange: &'life12 mut silk/http_client.Exchange<'exchange, P>, current: &'life13 silk/uri.Uri<'life14>, expected: BodyMode, body: silk/http_redirect.AttemptBody<'bytes, 'oneShot, 'replay, OneShot, ReplayProducer>, scratch: &'life15 mut [u8], trailers: &'life16 silk/http_headers.Headers<'life17>, hop: usize) -> BodyWriteOutcome ! RedirectError | OneShotError | ReplayError | ClientError | OutOfMemoryError ? OneShotRequirements | ReplayRequirements | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Drives one admitted attempt from prepared head through the first final response.
@@ -1877,7 +1877,7 @@ Computes the exact RFC redirect method and body transition for a selected status
 ## `resolveLocation`
 
 ```silk
-pub effect<'env> fn resolveLocation<'head: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(current: &'life1 silk/uri.Uri<'life2>, headers: &'life3 silk/http_headers.Headers<'head>, limits: HistoryLimits, hop: usize, status: Status) -> silk/result.Result<silk/uri.OwnedUri, silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life3> fn resolveLocation<'head: 'life1 & 'life3, 'life1, 'life2: 'life1 & 'life3, 'life3>(current: &'life1 silk/uri.Uri<'life2>, headers: &'life3 silk/http_headers.Headers<'head>, limits: HistoryLimits, hop: usize, status: Status) -> silk/result.Result<silk/uri.OwnedUri, silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Returns one independently owned HTTP or HTTPS URI from the selected response `Location`.
@@ -1937,7 +1937,7 @@ history allocation.
 ### Method `History.insert`
 
 ```silk
-pub effect<'env> fn insert<'method: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life1 mut History, method: silk/http.Method<'method>, origin: Origin, uri: &'life2 silk/uri.Uri<'life3>) -> silk/result.Result<(), silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'method & 'life1 & 'life2> fn insert<'method, 'life1, 'life2, 'life3: 'method & 'life1 & 'life2>(self: &'life1 mut History, method: silk/http.Method<'method>, origin: Origin, uri: &'life2 silk/uri.Uri<'life3>) -> silk/result.Result<(), silk/http_redirect.RedirectError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Checks and inserts one transformed method, normalized origin, and exact path/query key.
@@ -1967,7 +1967,7 @@ Returns the initialized bytes used by stored keys in the preallocated history ar
 ## `sanitizeHeaders`
 
 ```silk
-pub effect<'env> fn sanitizeHeaders<'value: 'env, 'life1: 'env, 'life2: 'env, 'env>(headers: &'life1 silk/http_headers.Headers<'value>, policy: &'life2 silk/http_redirect.Policy, crossOrigin: bool, body: BodyDecision, limits: HeaderLimits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life2> fn sanitizeHeaders<'value: 'life1 & 'life2, 'life1, 'life2>(headers: &'life1 silk/http_headers.Headers<'value>, policy: &'life2 silk/http_redirect.Policy, crossOrigin: bool, body: BodyDecision, limits: HeaderLimits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Returns independently owned fields after redirect-specific removal and cross-origin filtering.

@@ -90,7 +90,7 @@ Creates an empty reader for one JSON document without allocation.
 ### Method `JsonReader.next`
 
 ```silk
-pub effect<'env> fn next<'scratch: 'env, 'life1: 'env, 'life2: 'env, 'env>(self: &'life1 mut silk/json_reader.JsonReader, input: &'life2 mut silk/buffered_input.BufferedInput, scratch: &'scratch mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> silk/json_reader.JsonReadToken<'scratch> ! JsonError | BufferError ? &mut ByteDuplex | &mut MonotonicClock
+pub effect<'scratch & 'life1 & 'life2> fn next<'scratch, 'life1, 'life2>(self: &'life1 mut silk/json_reader.JsonReader, input: &'life2 mut silk/buffered_input.BufferedInput, scratch: &'scratch mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> silk/json_reader.JsonReadToken<'scratch> ! JsonError | BufferError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Returns the next token with raw bytes copied into caller scratch.

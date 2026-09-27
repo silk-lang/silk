@@ -63,7 +63,7 @@ Descriptor-relative filesystem operations with source-owned error and lifetime p
 ### Associated function `NativeFileSystem.openFile`
 
 ```silk
-pub effect<'env> fn openFile<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], writing: bool, operation: i32) -> FileHandle ! FileError
+pub effect<'life0 & 'life1> fn openFile<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], writing: bool, operation: i32) -> FileHandle ! FileError
 ```
 
 Opens and validates a regular file; writes truncate only after successful kind inspection.
@@ -73,7 +73,7 @@ Opens and validates a regular file; writes truncate only after successful kind i
 ### Associated function `NativeFileSystem.openDirectory`
 
 ```silk
-pub effect<'env> fn openDirectory<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], operation: i32) -> DirectoryHandle ! FileError
+pub effect<'life0 & 'life1> fn openDirectory<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], operation: i32) -> DirectoryHandle ! FileError
 ```
 
 Opens a directory and transfers its descriptor to a stream only after fdopendir succeeds.
@@ -83,7 +83,7 @@ Opens a directory and transfers its descriptor to a stream only after fdopendir 
 ### Associated function `NativeFileSystem.inspect`
 
 ```silk
-pub effect<'env> fn inspect<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], outputKind: &'life2 mut i32, length: &'life3 mut usize, operation: i32) -> () ! FileError
+pub effect<'life0 & 'life1 & 'life2 & 'life3> fn inspect<'life0, 'life1, 'life2, 'life3>(root: &'life0 [u8], path: &'life1 [u8], outputKind: &'life2 mut i32, length: &'life3 mut usize, operation: i32) -> () ! FileError
 ```
 
 Inspects a no-follow child and returns regular-file or directory metadata.
@@ -93,7 +93,7 @@ Inspects a no-follow child and returns regular-file or directory metadata.
 ### Associated function `NativeFileSystem.command`
 
 ```silk
-pub effect<'env> fn command<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], command: i32, operation: i32) -> () ! FileError
+pub effect<'life0 & 'life1> fn command<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], command: i32, operation: i32) -> () ! FileError
 ```
 
 Creates or removes one normalized child, rejecting replacement through symlinks.
@@ -103,7 +103,7 @@ Creates or removes one normalized child, rejecting replacement through symlinks.
 ### Associated function `NativeFileSystem.readFile`
 
 ```silk
-pub effect<'env> fn readFile<'life0: 'env, 'life1: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.FileHandle, output: &'life1 mut [u8], operation: i32) -> usize ! FileError
+pub effect<'life0 & 'life1> fn readFile<'life0, 'life1>(handle: &'life0 mut silk/native_filesystem.FileHandle, output: &'life1 mut [u8], operation: i32) -> usize ! FileError
 ```
 
 Reads one checked prefix, retrying EINTR and leaving the remaining initialized tail unchanged.
@@ -113,7 +113,7 @@ Reads one checked prefix, retrying EINTR and leaving the remaining initialized t
 ### Associated function `NativeFileSystem.writeFile`
 
 ```silk
-pub effect<'env> fn writeFile<'life0: 'env, 'life1: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.FileHandle, input: &'life1 [u8], operation: i32) -> () ! FileError
+pub effect<'life0 & 'life1> fn writeFile<'life0, 'life1>(handle: &'life0 mut silk/native_filesystem.FileHandle, input: &'life1 [u8], operation: i32) -> () ! FileError
 ```
 
 Completes initialized bytes, advancing after positive counts and preserving failure prefixes.
@@ -123,7 +123,7 @@ Completes initialized bytes, advancing after positive counts and preserving fail
 ### Associated function `NativeFileSystem.next`
 
 ```silk
-pub effect<'env> fn next<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.DirectoryHandle, output: &'life1 mut [u8], count: &'life2 mut usize, required: &'life3 mut usize, outputKind: &'life4 mut i32, operation: i32) -> bool ! FileError
+pub effect<'life0 & 'life1 & 'life2 & 'life3 & 'life4> fn next<'life0, 'life1, 'life2, 'life3, 'life4>(handle: &'life0 mut silk/native_filesystem.DirectoryHandle, output: &'life1 mut [u8], count: &'life2 mut usize, required: &'life3 mut usize, outputKind: &'life4 mut i32, operation: i32) -> bool ! FileError
 ```
 
 Copies the next owned byte name, retaining it when output capacity is insufficient.
@@ -137,7 +137,7 @@ False reports required capacity without advancing; true with zero count is latch
 ### Associated function `NativeFileSystem.createUnique`
 
 ```silk
-pub effect<'env> fn createUnique<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'life5: 'env, 'life6: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], prefix: &'life2 [u8], counter: &'life3 mut u64, output: &'life4 mut [u8], count: &'life5 mut usize, required: &'life6 mut usize, operation: i32) -> bool ! FileError
+pub effect<'life0 & 'life1 & 'life2 & 'life3 & 'life4 & 'life5 & 'life6> fn createUnique<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'life6>(root: &'life0 [u8], path: &'life1 [u8], prefix: &'life2 [u8], counter: &'life3 mut u64, output: &'life4 mut [u8], count: &'life5 mut usize, required: &'life6 mut usize, operation: i32) -> bool ! FileError
 ```
 
 Exclusively creates one predictable counter name, retrying at most 128 collisions.

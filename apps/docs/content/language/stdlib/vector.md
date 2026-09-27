@@ -211,7 +211,7 @@ Do not retain this slice across an operation that can grow the vector.
 ### Method `Vector.append`
 
 ```silk
-pub effect<'env> fn append<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut Vector<T>, value: T) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'env> fn append<T: 'env, 'env, 'life2: 'env>(self: &'life2 mut Vector<T>, value: T) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one owned value, growing geometrically when capacity is exhausted.
@@ -226,7 +226,7 @@ length, and capacity.
 ### Method `Vector.insert`
 
 ```silk
-pub effect<'env> fn insert<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut Vector<T>, index: usize, value: T) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'env> fn insert<T: 'env, 'env, 'life2: 'env>(self: &'life2 mut Vector<T>, index: usize, value: T) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Inserts one owned value at an index, shifting later elements without requiring T to be Copy.
@@ -321,7 +321,7 @@ Overwrites the element at one index, dropping the old element first. Traps out o
 ### Method `Vector.reserve`
 
 ```silk
-pub effect<'env> fn reserve<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut Vector<T>, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn reserve<T: 'life1, 'life1>(self: &'life1 mut Vector<T>, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Grows capacity to hold at least `additional` more elements without another allocation.
@@ -336,7 +336,7 @@ remain unchanged.
 ### Method `Vector.reserveExact`
 
 ```silk
-pub effect<'env> fn reserveExact<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut Vector<T>, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn reserveExact<T: 'life1, 'life1>(self: &'life1 mut Vector<T>, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Reserves space for `additional` elements without geometric capacity growth.
@@ -356,7 +356,7 @@ The length stays unchanged. Size overflow or allocation failure leaves all exist
 ### Method `Vector.sort`
 
 ```silk
-pub effect<'env> fn sort<T: 'env, 'life1: 'env, 'env>(self: &'life1 mut Vector<T>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn sort<T: 'life1, 'life1>(self: &'life1 mut Vector<T>) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Orders the elements in place. Equal elements keep their input order.
@@ -391,7 +391,7 @@ The vector must already be ordered by the same `Order` witness.
 ### Method `Vector.appendBytes`
 
 ```silk
-pub effect<'env> fn appendBytes<'life1: 'env, 'life2: 'env, 'env>(self: &'life1 mut silk/vector.Vector<u8>, values: &'life2 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life2> fn appendBytes<'life1, 'life2>(self: &'life1 mut silk/vector.Vector<u8>, values: &'life2 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends every byte of one borrowed sequence in source order with one bulk copy.

@@ -3419,7 +3419,7 @@ union Outcome<A, E> { Good { value: A }, Bad { error: E } }
 struct First { code: i32 }
 struct Second { code: i32 }
 fn good<A, E>(value: A) -> Outcome<A, E> { return Outcome<A, E>.Good { value: move value } }
-effect fn bad<A, E>(error: E) -> Outcome<A, E> { return Outcome<A, E>.Bad { error: move error } }
+effect<'env> fn bad<A, E: 'env, 'env>(error: E) -> Outcome<A, E> { return Outcome<A, E>.Bad { error: move error } }
 effect fn outcome<A, E>(protected: once Effect<A ! E>) -> Outcome<A, E> {
   let succeeded = Effect.map<A, Outcome<A, E>, E>(move protected, good)
   return run Effect.catchAll<Outcome<A, E>, Outcome<A, E>, E, never>(move succeeded, bad)

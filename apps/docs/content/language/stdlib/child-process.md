@@ -480,7 +480,7 @@ own working directory.
 ### Associated function `ChildProcess.requestWithin`
 
 ```silk
-pub effect<'env> fn requestWithin<'life0: 'env, 'life1: 'env, 'env>(program: &'life0 silk/filesystem.Path, directory: &'life1 silk/filesystem.Path) -> ProcessRequest ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn requestWithin<'life0, 'life1>(program: &'life0 silk/filesystem.Path, directory: &'life1 silk/filesystem.Path) -> ProcessRequest ! OutOfMemoryError ? &mut Allocator
 ```
 
 Creates a request that runs `program` in `directory` instead of the caller's
@@ -491,7 +491,7 @@ working directory.
 ### Associated function `ChildProcess.addArgument`
 
 ```silk
-pub effect<'env> fn addArgument<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut silk/child_process.ProcessRequest, value: &'life1 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn addArgument<'life0, 'life1>(self: &'life0 mut silk/child_process.ProcessRequest, value: &'life1 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one NUL-free byte argument after all arguments already in the request.
@@ -510,7 +510,7 @@ If allocation fails, do not reuse `self`; it can contain an incomplete argument 
 ### Associated function `ChildProcess.setVariable`
 
 ```silk
-pub effect<'env> fn setVariable<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(self: &'life0 mut silk/child_process.ProcessRequest, name: &'life1 [u8], value: &'life2 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1 & 'life2> fn setVariable<'life0, 'life1, 'life2>(self: &'life0 mut silk/child_process.ProcessRequest, name: &'life1 [u8], value: &'life2 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends one NUL-free environment entry as `name`, `=`, and `value` bytes.
