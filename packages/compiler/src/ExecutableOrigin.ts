@@ -2459,11 +2459,9 @@ export const make = (operations: Operations) => {
       resolving: new Set<string>(),
       recordResolvedCall: (expression, target) => {
         if (expression._tag === 'CallableApply') {
-          if (
-            Type.isEffect(expression.type) ||
-            target.typeArguments.some(Type.isHiddenExecutableArgument)
-          )
-            record(expression, target)
+          // An application invokes exactly the instance its own complete call names, so lowering
+          // and the verifier read the call rather than reconstructing its target arguments.
+          record(expression, target)
           return
         }
         if (carriesHiddenIdentity(expression, substitution)) record(expression, target)
@@ -2778,8 +2776,39 @@ export const make = (operations: Operations) => {
           ? [expression]
           : [],
       )
+      // A constrained section whose captures are concrete under its own selection has one
+      // environment whatever its applications: the unapplied binders cannot change what it
+      // stores. The environment exists even when the section is only relayed or dropped, so its
+      // captures are released once. Its identity keeps those binders as section binders, exactly
+      // as a relay carrying it names it, and each application invokes the target through its own
+      // complete call. Only captures that mention an unapplied binder need the application's
+      // solution, one environment per application.
+      const ownSelection = new Map(
+        [...section.substitution].map(([parameter, argument]) => [
+          parameter,
+          Type.substituteGenericArgument(argument, ownerSubstitution),
+        ]),
+      )
+      const preApplicationArguments = section.typeArguments.map((argument) =>
+        Type.substituteGenericArgument(argument, ownerSubstitution, context.compatibility),
+      )
+      const preApplicationIdentity = Type.callableIdentityArgument(
+        '',
+        Tir.callableTargetIdentity(section.target),
+        preApplicationArguments,
+      )
+      const preApplication =
+        Type.namesUnappliedSection(preApplicationIdentity) &&
+        Type.isRuntimeConcreteGenericArgument(preApplicationIdentity) &&
+        section.captures.every(
+          (capture) =>
+            capture.value._tag !== 'Unavailable' &&
+            Type.isRuntimeConcrete(
+              specializeInstanceType(capture.value.type, owner, [ownerSubstitution, ownSelection]),
+            ),
+        )
       const candidates: ReadonlyArray<Type.Substitution> =
-        applications.length === 0
+        applications.length === 0 || preApplication
           ? [new Map()]
           : applications.map((application) => application.substitution)
       for (const applicationSubstitution of candidates) {
@@ -2790,8 +2819,15 @@ export const make = (operations: Operations) => {
             Type.substituteGenericArgument(argument, ownerSubstitution),
           ]),
         )
-        const type = specializeInstanceType(section.type, owner, [ownerSubstitution, substitution])
-        const arguments_ = targetArguments(section.target, substitution, results)
+        const specialized = specializeInstanceType(section.type, owner, [
+          ownerSubstitution,
+          substitution,
+        ])
+        const closed = preApplication ? Type.closeSectionSchema(specialized) : specialized
+        const type = Type.isTypeArgument(closed) ? closed : specialized
+        const arguments_ = preApplication
+          ? preApplicationArguments
+          : targetArguments(section.target, substitution, results)
         const captureTypes = section.captures.flatMap((capture) =>
           capture.value._tag === 'Unavailable'
             ? []
@@ -2806,7 +2842,8 @@ export const make = (operations: Operations) => {
           !Type.isCallable(type) ||
           !Type.isRuntimeConcrete(type) ||
           arguments_ === undefined ||
-          arguments_.some((argument) => !Type.isRuntimeConcreteGenericArgument(argument)) ||
+          (!preApplication &&
+            arguments_.some((argument) => !Type.isRuntimeConcreteGenericArgument(argument))) ||
           captureTypes.length !== section.captures.length ||
           captureTypes.some((capture) => !Type.isRuntimeConcrete(capture))
         ) {

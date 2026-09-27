@@ -128,7 +128,17 @@ const decodeCallableParameterMode = (
   return mode
 }
 
-const encodeParameter = (value: Type.Parameter): SerializedRecord => ({
+const encodeParameter = (value: Type.Parameter): SerializedRecord => {
+  // A section binder names an unapplied binder only inside its own section's callable identity;
+  // encoding it as an ordinary parameter would collide with the declaration's own parameter.
+  if (value.sectionBinder === true)
+    throw new RangeError(
+      `Section binder ${value.owner.module}.${value.owner.name}:${value.ordinal} cannot cross a module surface`,
+    )
+  return encodeOrdinaryParameter(value)
+}
+
+const encodeOrdinaryParameter = (value: Type.Parameter): SerializedRecord => ({
   tag: 'Parameter',
   owner: { module: value.owner.module, name: value.owner.name },
   ordinal: value.ordinal,

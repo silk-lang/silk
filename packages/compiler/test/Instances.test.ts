@@ -483,12 +483,22 @@ pub fn main() -> i32 { let whenEnabled = select(true) return whenEnabled(42) }`)
         { name: 'select', arguments: ['i32'] },
       ],
     )
-    assert.deepEqual(generic.callables.at(0)?.typeArguments.map(Type.encodeGenericArgument), [
-      'i32',
-    ])
-    assert.strictEqual(
-      Type.encode(generic.callables.at(0)?.type ?? 'i32'),
-      "fn<'static>(i32) -> i32",
+    // The section leaves `T` open, so its one environment is named before its application: the
+    // identity keeps `T` as the section's own binder and the stored value has the closed contract.
+    // The application invokes the complete `select<i32>` instance above through its own call.
+    const [environment, ...others] = generic.callables
+    assert.deepEqual(others, [])
+    assert.isTrue(
+      environment?.typeArguments.every(
+        (argument) => Type.isTypeArgument(argument) && Type.isSectionBinder(argument),
+      ),
+    )
+    assert.strictEqual(Type.encode(environment?.type ?? 'i32'), "fn<'static>(never) -> never")
+    assert.deepEqual(
+      generic.calls
+        .filter((call) => call.target.declaration.name === 'select')
+        .map((call) => call.target.typeArguments.map(Type.encodeGenericArgument)),
+      [['i32']],
     )
   }),
 )
@@ -706,6 +716,56 @@ pub fn main() -> () {
             'silk/option.Option<silk/bytes.Bytes>',
       ),
     )
+  }),
+)
+
+it.effect('admits sibling shared payload cleanup selected outside any cleanup measure', () =>
+  Effect.gen(function* () {
+    // Dropping a `Shared<Outer>` directly starts each payload hook's cleanup measure afresh; the
+    // hook's own helpers run at its `Shared<Head>` and `Shared<Ty>` arguments, which the
+    // `Shared<Outer>` root does not cover by descent. Entering the same types through a vector
+    // starts a measured path instead.
+    const types = `struct Ty { value: i32 }
+struct Head { tys: Vector<Shared<Ty>> }
+struct Outer { heads: Vector<Shared<Head>> }
+`
+    const direct = yield* snapshot(`import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+import silk.vector { Vector }
+${types}effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let outer = run (Shared.make<Outer>(Outer { heads: Vector.make<Shared<Head>>() })
+    |> Effect.provideMut<Allocator>(&mut allocator))
+  drop outer
+  return 0
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`)
+    const measured = yield* snapshot(`import silk.shared { Shared }
+import silk.vector { Vector }
+${types}pub fn main() -> i32 {
+  let outer = Vector.make<Shared<Outer>>()
+  drop outer
+  return 0
+}`)
+    const releases = (result: Analysis.Snapshot): Array<string> =>
+      result.instances.instances
+        .filter(
+          (instance) =>
+            instance.key.declaration.module === 'silk/vector' &&
+            instance.key.declaration.name === 'releaseFull',
+        )
+        .map((instance) => instance.key.typeArguments.map(Type.encodeGenericArgument).join(', '))
+        .sort()
+    for (const result of [direct, measured]) {
+      assert.deepEqual(Analysis.diagnostics(result), [])
+      assert.deepEqual(result.instances.violations, [])
+    }
+    assert.deepEqual(releases(direct), [
+      'silk/shared.Shared<golden/program.Head>',
+      'silk/shared.Shared<golden/program.Ty>',
+    ])
   }),
 )
 
@@ -960,6 +1020,62 @@ pub fn main() -> i32 {
 }`)
     assert.deepEqual(Analysis.diagnostics(result), [])
     assert.deepEqual(Analysis.instancesOf(result).violations, [])
+  }),
+)
+
+it.effect('answers each cleanup subterm question independently of other roots', () =>
+  Effect.gen(function* () {
+    // Each owner exercises one unfolding-guard branch: `Node` repeats its own type, `Bad` and the
+    // `Left`/`Right` pair recurse without descending, `Outer` descends, and `Fork` reaches one
+    // owner through two fields. No answer may depend on which other root's questions came first,
+    // so one discovery of every owner equals the union of the separate discoveries.
+    const declarations = `import silk.box { Box }
+import silk.option { Option }
+import silk.vector { Vector }
+struct Node { value: i32 next: Option<Box<Node>> }
+struct Bad<T> { next: Option<Box<Bad<Box<T>>>> }
+struct Left<T> { next: Box<Right<Box<T>>> }
+struct Right<T> { next: Box<Left<Box<T>>> }
+struct Outer<T> { next: Box<Middle<T>> }
+struct Middle<T> { next: Box<T> }
+struct Leaf { nodes: Vector<Node> }
+struct Fork { first: Box<Leaf> second: Vector<Leaf> }
+`
+    const owners = [
+      { owner: 'Node', codes: [] },
+      { owner: 'Bad<i32>', codes: ['SEM0053'] },
+      { owner: 'Left<i32>', codes: ['SEM0053'] },
+      { owner: 'Outer<Outer<i32>>', codes: [] },
+      { owner: 'Fork', codes: [] },
+    ]
+    const program = (held: ReadonlyArray<string>) =>
+      snapshot(`${declarations}pub fn main() -> i32 {
+${held.map((owner, ordinal) => `  let held${ordinal} = Vector.make<${owner}>()`).join('\n')}
+  return 0
+}`)
+    const keys = (result: Analysis.Snapshot): ReadonlyArray<string> =>
+      result.instances.instances
+        .filter((instance) => instance.key.declaration.name !== 'main')
+        .map((instance) => Instances.keyText(instance.key))
+    const violations = (result: Analysis.Snapshot): ReadonlyArray<string> =>
+      result.instances.violations.map(
+        (violation) =>
+          `${Instances.keyText(violation.caller)}\u0005${Instances.keyText(violation.target)}`,
+      )
+    const codes = (result: Analysis.Snapshot): ReadonlyArray<string> =>
+      Analysis.diagnostics(result).map((diagnostic) => diagnostic.code)
+    const union = (lists: ReadonlyArray<ReadonlyArray<string>>): Array<string> =>
+      [...new Set(lists.flat())].sort()
+    const separate: Array<Analysis.Snapshot> = []
+    for (const { owner, codes: expected } of owners) {
+      const result = yield* program([owner])
+      assert.deepEqual(codes(result), expected, owner)
+      separate.push(result)
+    }
+    const combined = yield* program(owners.map(({ owner }) => owner))
+    assert.deepEqual(union([codes(combined)]), union(separate.map(codes)))
+    assert.deepEqual([...violations(combined)].sort(), union(separate.map(violations)))
+    assert.deepEqual([...keys(combined)].sort(), union(separate.map(keys)))
   }),
 )
 

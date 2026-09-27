@@ -3443,11 +3443,17 @@ export const effectCallableApplicationRepresentation = (
       return identity === undefined ? [] : [identity]
     })
   const target = callee.target.declaration
+  const identityTarget = Tir.callableTargetIdentity(callee.target)
+  // The applied Effect names the complete instance: the section's identity with its own unapplied
+  // binders instantiated by this application, never the binders themselves.
   const owner = {
     declaration: { module: target.module, name: target.name },
     typeArguments: [
       ...callee.typeArguments.map((argument) =>
-        Type.substituteGenericArgument(argument, substitution),
+        Type.substituteGenericArgument(
+          Type.solveSectionBinders(argument, identityTarget, substitution),
+          substitution,
+        ),
       ),
       ...hidden,
     ],

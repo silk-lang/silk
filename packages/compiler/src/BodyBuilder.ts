@@ -1041,6 +1041,61 @@ export const semanticOfPatternSelection = (
 ): PatternSelectionFact | undefined =>
   self.semanticPatternSelections.get(selection) as PatternSelectionFact | undefined
 
+/**
+ * The target arguments a constrained section's hidden identity names before its application.
+ *
+ * The section's callable schema lists the binders it leaves open for the complete application;
+ * each becomes its section-scoped binder wherever it occurs, including inside a selected argument
+ * such as `B := Option<A>`. A binder the schema selects keeps its selection, even when that
+ * selection is the enclosing function's own parameter of the same name (a function sectioning
+ * itself), which owner substitution later closes. The selection is composed to a fixpoint first so a binder
+ * reached only through another selected binder is still found. Lifetimes stay as they are:
+ * runtime identity erases them and applications instantiate them per invocation.
+ */
+const sectionIdentityArguments = (
+  parameters: ReadonlyArray<Type.Parameter>,
+  selection: Type.Substitution,
+  schema: Type.CallableSchema | undefined,
+  enclosing: boolean,
+): ReadonlyArray<Type.GenericArgument> => {
+  const unapplied = new Map<string, Type.GenericArgument>()
+  for (const binder of schema?.binders ?? []) {
+    if (binder.kind === 'Lifetime' || schema?.substitution.has(Type.key(binder)) === true) continue
+    unapplied.set(Type.key(binder), Type.parameterArgument(Type.sectionBinder(binder)))
+  }
+  const selected = new Map(
+    [...selection].filter(
+      ([parameter]) =>
+        !unapplied.has(parameter) &&
+        parameters.some((candidate) => Type.key(candidate) === parameter),
+    ),
+  )
+  // In a function sectioning itself, selection values name the enclosing function's parameters,
+  // which share their keys with the target's binders; they are kept verbatim for owner substitution.
+  if (enclosing)
+    return parameters.map(
+      (parameter) =>
+        selected.get(Type.key(parameter)) ??
+        unapplied.get(Type.key(parameter)) ??
+        Type.parameterArgument(parameter),
+    )
+  for (let pass = 0; pass < parameters.length; pass += 1) {
+    let changed = false
+    for (const [parameter, argument] of selected) {
+      const composed = Type.substituteGenericArgument(argument, selected)
+      if (Type.genericArgumentKey(composed) === Type.genericArgumentKey(argument)) continue
+      selected.set(parameter, composed)
+      changed = true
+    }
+    if (!changed) break
+  }
+  return parameters.map((parameter) => {
+    const argument = selected.get(Type.key(parameter))
+    if (argument !== undefined) return Type.substituteGenericArgument(argument, unapplied)
+    return unapplied.get(Type.key(parameter)) ?? Type.parameterArgument(parameter)
+  })
+}
+
 const residualExpression = (
   fact: ExpressionDecision,
   options: LowerStatementOptions,
@@ -2072,10 +2127,13 @@ const residualExpression = (
       }
     const typeArguments =
       fact.reference._tag === 'Resolved'
-        ? fact.reference.declaration.typeParameters.map(
-            (parameter) =>
-              fact.substitution.get(Type.key(parameter.type)) ??
-              Type.parameterArgument(parameter.type),
+        ? sectionIdentityArguments(
+            fact.reference.declaration.typeParameters.map((parameter) => parameter.type),
+            fact.substitution,
+            Type.isCallable(fact.type.type) ? fact.type.type.schema : undefined,
+            options.functionId !== undefined &&
+              fact.reference.declaration.id.sourceId === options.functionId.sourceId &&
+              fact.reference.declaration.id.ordinal === options.functionId.ordinal,
           )
         : fact.typeArguments
     return {

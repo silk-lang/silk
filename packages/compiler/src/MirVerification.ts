@@ -1977,6 +1977,177 @@ const storedEffectCleanupValid = (
   )
 }
 
+/**
+ * Whether a callable construction names exactly the environment it realizes.
+ *
+ * With an environment, the target arguments are that environment's identity followed by the
+ * identities of the callables it captured. The identity segment is checked as the environment's
+ * own callable identity, where a section binder owned by the constructed target is closed; every
+ * captured identity is checked on its own. Nothing else admits a section binder.
+ */
+const constructionTargetArgumentsConcrete = (
+  operation: Extract<Operation, { readonly _tag: 'MakeCallable' }>,
+): boolean => {
+  const environment = operation.type.environment
+  if (environment === undefined)
+    return operation.typeArguments.every(SilkType.isRuntimeConcreteGenericArgument)
+  const expected = Layout.callableTargetArguments(environment)
+  if (
+    !Tir.sameCallableTarget(operation.target, environment.callable.target) ||
+    expected.length !== operation.typeArguments.length ||
+    expected.some(
+      (argument, ordinal) =>
+        SilkType.genericArgumentKey(argument) !==
+        SilkType.genericArgumentKey(operation.typeArguments[ordinal] ?? argument),
+    )
+  )
+    return false
+  const identityLength = environment.callable.typeArguments.length
+  return (
+    SilkType.isRuntimeConcreteGenericArgument(
+      SilkType.callableIdentityArgument(
+        '',
+        Tir.callableTargetIdentity(operation.target),
+        operation.typeArguments.slice(0, identityLength),
+      ),
+    ) &&
+    operation.typeArguments.slice(identityLength).every(SilkType.isRuntimeConcreteGenericArgument)
+  )
+}
+
+/**
+ * The hidden callable identity an instance key carries for one callable parameter.
+ *
+ * Mirrors Instances.parameterCallableIdentity on a lowered function: callable parameters are
+ * those whose type is a callable contract, and the key names their identities in parameter order
+ * among its callable identity arguments.
+ */
+const parameterCallableIdentity = (
+  fn: MirFunction,
+  ordinal: number,
+): SilkType.CallableIdentityArgument | undefined => {
+  const callables = fn.localTypes
+    .slice(0, fn.parameterCount)
+    .flatMap((type, parameter) => (SilkType.isCallable(semanticType(type)) ? [parameter] : []))
+  const position = callables.indexOf(ordinal)
+  return position < 0
+    ? undefined
+    : fn.instance.typeArguments.filter(SilkType.isCallableIdentityArgument).at(position)
+}
+
+/** A captured callable names exactly the identity its invoked parameter position carries. */
+const capturedIdentityMatches = (
+  field: Layout.CallableEnvironmentField,
+  expected: SilkType.CallableIdentityArgument | undefined,
+): boolean => {
+  if (field.representation !== 'Callable' && field.callableIdentity === undefined) return true
+  return (
+    field.callableIdentity !== undefined &&
+    expected !== undefined &&
+    SilkType.genericArgumentKey(field.callableIdentity) === SilkType.genericArgumentKey(expected)
+  )
+}
+
+/** Whether a captured environment field passes to its parameter as the backend passes it. */
+const capturedFieldPasses = (
+  field: Layout.CallableEnvironmentField,
+  parameter: DeclarationFacts.SemanticType,
+): boolean => {
+  if (field.representation === 'Borrow')
+    return (
+      SilkType.isReference(parameter) &&
+      parameter.access === field.access &&
+      acceptsRuntimeOperand(field.type, parameter.target)
+    )
+  if (field.representation === 'Callable') return acceptsRuntimeOperand(field.type, parameter)
+  return (
+    (field.access === 'Take' || field.access === 'Copy') &&
+    acceptsRuntimeOperand(field.type, parameter)
+  )
+}
+
+/**
+ * Whether an application invokes a section environment named before its application.
+ *
+ * The environment's identity keeps the section's unapplied binders, so its value type cannot
+ * describe any one application. The application instead names the complete instance it invokes;
+ * that instance must instantiate the environment identity exactly, accept every captured field in
+ * its captured parameter position as the backend passes it, and its remaining parameters and
+ * result are the application's contract.
+ */
+const invokesPreApplicationEnvironment = (
+  self: Module,
+  operation: Extract<Operation, { readonly _tag: 'ApplyCallable' }>,
+  source: Type | undefined,
+): boolean => {
+  if (
+    operation.realization !== 'Environment' ||
+    operation.callable === undefined ||
+    operation.target !== undefined ||
+    operation.captures.length > 0 ||
+    source?._tag !== 'CallableValue' ||
+    source.environment === undefined
+  )
+    return false
+  const environment = source.environment
+  const target = environment.callable.target
+  if (target._tag !== 'DeclarationCallableTarget' || !Tir.sameCallableTarget(source.target, target))
+    return false
+  const identityTarget = Tir.callableTargetIdentity(target)
+  const identity = environment.callable.typeArguments
+  if (
+    !SilkType.namesUnappliedSection(SilkType.callableIdentityArgument('', identityTarget, identity))
+  )
+    return false
+  const invoked = self.functions.find((candidate) =>
+    matchesInstance(candidate, target.declaration, operation.typeArguments),
+  )
+  if (
+    invoked === undefined ||
+    !SilkType.instantiatesSectionIdentity(identityTarget, identity, operation.typeArguments)
+  )
+    return false
+  const captured = environment.fields.map((field) => field.parameterOrdinal)
+  if (
+    new Set(captured).size !== captured.length ||
+    captured.some((ordinal) => ordinal < 0 || ordinal >= invoked.parameterCount)
+  )
+    return false
+  const remaining = Array.from({ length: invoked.parameterCount }, (_, ordinal) => ordinal).filter(
+    (ordinal) => !captured.includes(ordinal),
+  )
+  // The declared result names the same contract as the realized value; an Effect result's run
+  // access and lifetime proofs are non-runtime facts (matchesCall pins its realization).
+  const declared = operation.callableType.result
+  const realized = semanticType(operation.type)
+  return (
+    (SilkType.isEffect(declared) && SilkType.isEffect(realized)
+      ? EffectExecutionContract.equals(declared, realized)
+      : SilkType.runtimeKey(declared) === SilkType.runtimeKey(realized)) &&
+    operation.callableType.parameters.length === remaining.length &&
+    remaining.every((ordinal, position) => {
+      const parameter = invoked.localTypes.at(ordinal)
+      const applied = operation.callableType.parameters.at(position)
+      return (
+        parameter !== undefined &&
+        applied !== undefined &&
+        SilkType.runtimeKey(applied) === SilkType.runtimeKey(semanticType(parameter))
+      )
+    }) &&
+    environment.fields.every((field) => {
+      const parameter = invoked.localTypes.at(field.parameterOrdinal)
+      return (
+        parameter !== undefined &&
+        capturedFieldPasses(field, semanticType(parameter)) &&
+        capturedIdentityMatches(field, parameterCallableIdentity(invoked, field.parameterOrdinal))
+      )
+    }) &&
+    matchesCall(invoked, target.declaration, operation.typeArguments, undefined, operation.type) &&
+    operation.access === source.type.mode &&
+    operation.callableType.unsafe === source.type.unsafe
+  )
+}
+
 const operationTypes = (operation: Operation): ReadonlyArray<DeclarationFacts.SemanticType> => {
   switch (operation._tag) {
     case 'SetInitialized':
@@ -2121,10 +2292,11 @@ const operationTypes = (operation: Operation): ReadonlyArray<DeclarationFacts.Se
         ...operation.runnerTypeArguments.filter(SilkType.isTypeArgument),
       ]
     case 'MakeCallable':
-      return [
-        semanticType(operation.type),
-        ...operation.typeArguments.filter(SilkType.isTypeArgument),
-      ]
+      // A construction's environment identity is checked as that identity; its ordinary arguments
+      // count as open types only when that check fails.
+      return constructionTargetArgumentsConcrete(operation)
+        ? [semanticType(operation.type)]
+        : [semanticType(operation.type), ...operation.typeArguments.filter(SilkType.isTypeArgument)]
     case 'ApplyCallable':
       return [
         operation.callableType,
@@ -6473,7 +6645,7 @@ const computeVerify = Effect.fnUntraced(function* (
             SilkType.equals(destination.type, operation.type.type) &&
             Tir.sameCallableTarget(destination.target, operation.target) &&
             Tir.sameCallableTarget(operation.type.target, operation.target) &&
-            operation.typeArguments.every(SilkType.isRuntimeConcreteGenericArgument) &&
+            constructionTargetArgumentsConcrete(operation) &&
             (environment === undefined
               ? operation.captures.length === 0
               : capturesValid &&
@@ -6550,20 +6722,21 @@ const computeVerify = Effect.fnUntraced(function* (
             operation.callable === undefined &&
             operation.target !== undefined &&
             directCapturesValid
+          const preApplicationForm = invokesPreApplicationEnvironment(self, operation, source)
           const valid =
             destination !== undefined &&
             SilkType.equals(semanticType(destination), semanticType(operation.type)) &&
             operation.access === operation.callableType.mode &&
             operation.typeArguments.every(SilkType.isRuntimeConcreteGenericArgument) &&
             argumentsValid &&
-            (environmentForm || directForm)
+            (environmentForm || directForm || preApplicationForm)
           if (!valid) {
             violations.push({
               _tag: 'Violation',
               rule: 'InvalidCallableOperation',
               function: fn.id,
               region: region.id,
-              detail: `callable application disagrees with its mode, arguments, realization, or result (destination=${destination !== undefined && SilkType.equals(semanticType(destination), semanticType(operation.type))}, mode=${operation.access}/${operation.callableType.mode}:${operation.access === operation.callableType.mode}, source=${source?._tag === 'CallableValue' ? source.type.mode : 'none'}, types=${operation.typeArguments.every(SilkType.isRuntimeConcreteGenericArgument)}, arguments=${argumentsValid}, environment=${environmentForm}, direct=${directForm}, captures=${directCapturesValid})`,
+              detail: `callable application disagrees with its mode, arguments, realization, or result (destination=${destination !== undefined && SilkType.equals(semanticType(destination), semanticType(operation.type))}, mode=${operation.access}/${operation.callableType.mode}:${operation.access === operation.callableType.mode}, source=${source?._tag === 'CallableValue' ? source.type.mode : 'none'}, types=${operation.typeArguments.every(SilkType.isRuntimeConcreteGenericArgument)}, arguments=${argumentsValid}, environment=${environmentForm}, direct=${directForm}, preApplication=${preApplicationForm}, captures=${directCapturesValid})`,
             })
           }
         }
