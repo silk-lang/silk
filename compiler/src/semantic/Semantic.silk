@@ -510,6 +510,7 @@ struct SelectedDeclaration {
 struct CallTarget {
   declaration: DeclarationId
   signature: Shared<Result<Answer, NoRejection>>
+  explicit: Vector<Argument>
 }
 
 union CallReference {
@@ -1298,6 +1299,23 @@ fn applicationArgument(value: &Type, at: usize) -> Option<Argument> {
     }
     _ => Option.none<Argument>()
   }
+}
+
+effect fn copyArguments(arguments: &[Argument]) -> Vector<Argument>
+! OutOfMemoryError
+? &mut Allocator {
+  let mut copied = Vector.make<Argument>()
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let argument = match & arguments[at] {
+      Argument.Type {value} => Argument.Type {value: Shared.clone<Type>(&value)}
+      Argument.Lifetime {value} => Argument.Lifetime {value: Shared.clone<Lifetime>(&value)}
+      Argument.Row {value} => Argument.Row {value: Shared.clone<Row>(&value)}
+    }
+    run Vector.append<Argument>(&mut copied, move argument)
+    at = at + usize.ONE
+  }
+  return move copied
 }
 
 fn applicationMatches(value: &Type, declaration: &DeclarationId) -> bool {
@@ -10953,25 +10971,74 @@ effect fn collectBodySyntax(
 
 // A written call prefix fixes the first binders in declaration order. The remaining binders are
 // inference variables, never gaps that a later written argument may skip.
-effect fn checkCallPrefix(
+effect fn resolveCallPrefix(
   resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  callerOrdinal: usize,
   caller: &ModuleId,
   target: &ModuleId,
   ordinal: usize,
+  signature: &Shared<Result<Answer, NoRejection>>,
   written: HirRef,
-) -> Option<Shared<Rejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
+) -> Result<Vector<Argument>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut explicit = Vector.make<Argument>()
   if !written.present {
-    return Option.none<Shared<Rejection>>()
+    return Result.succeed<Vector<Argument>, Shared<Rejection>>(move explicit)
   }
   let source = run typeNode(&mut resolver.*, caller, written.id)
   if let Option<HeaderSyntax>.Some {value} = move source {
     if let Node.TypeArguments {arguments, environment, failures, requirements} = value.header {
       let template = run templateBinders(&mut resolver.*, target, ordinal)
-      let binders = match move template {
+      let mut binders = match move template {
         Result<Vector<Binder>, Shared<Rejection>>.Success {value: found} => move found
         Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
-          return Option.some<Shared<Rejection>>(move error)
+          return Result.failResult<Vector<Argument>, Shared<Rejection>>(move error)
         }
+      }
+      let totalLifetimes = Shared.with<Result<Answer, NoRejection>, usize>(
+        signature,
+        fn(answer: &Result<Answer, NoRejection>) -> usize {
+          return match & answer.* {
+            Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+              Outcome.Success {value: Value.Signature {signature: resolved}} => Vector.length<
+                Shared<Lifetime>,
+              >(&resolved.lifetimeParameters)
+              _ => usize.ZERO
+            }
+            Result<Answer, NoRejection>.Failure {error: _} => usize.ZERO
+          }
+        },
+      )
+      let mut generatedAt = writtenLifetimeCount(Vector.asSlice<Binder>(&binders))
+      while generatedAt < totalLifetimes {
+        let generated = Shared.with<Result<Answer, NoRejection>, Option<Shared<Lifetime>>>(
+          signature,
+          fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Lifetime>> {
+            return match & answer.* {
+              Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+                Outcome.Success {value: Value.Signature {signature: resolved}} => {
+                  let lifetimes = Vector.asSlice<Shared<Lifetime>>(&resolved.lifetimeParameters)
+                  if generatedAt < lifetimes.length {
+                    return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(&lifetimes[generatedAt]))
+                  }
+                  return Option.none<Shared<Lifetime>>()
+                }
+                _ => Option.none<Shared<Lifetime>>()
+              }
+              Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Lifetime>>()
+            }
+          },
+        )
+        if let Option<Shared<Lifetime>>.Some {value} = move generated {
+          run Vector.append<Binder>(
+            &mut binders,
+            Binder.Lifetime {name: Bytes.make(), value: move value},
+          )
+        }
+        generatedAt = generatedAt + usize.ONE
       }
       let formal = Vector.asSlice<Binder>(&binders)
       if arguments.length > formal.length {
@@ -10988,14 +11055,30 @@ effect fn checkCallPrefix(
             excessSpan = found.span
           }
         }
-        return Option.some<Shared<Rejection>>(
+        return Result.failResult<Vector<Argument>, Shared<Rejection>>(
           run rejectArity(&resolver.*, caller, excessSpan, formal.length, arguments.length),
         )
       }
-      if environment.present || failures.present || requirements.present {
-        return Option.some<Shared<Rejection>>(
-          run reject(&resolver.*, caller, RejectionCode.Unsupported, value.span),
+      if environment.present || failures.present {
+        let mut supplied = GenericKind.Lifetime
+        if failures.present {
+          supplied = GenericKind.Failure
+        }
+        return Result.failResult<Vector<Argument>, Shared<Rejection>>(
+          run rejectKind(&resolver.*, caller, value.span, b"", GenericKind.Type, supplied),
         )
+      }
+      let noBinders = Vector.make<Binder>()
+      let mut elision = LifetimeElision {
+        owner: Option.none<DeclarationId>(),
+        nextOrdinal: usize.ZERO,
+        output: false,
+        resultDefault: Option.none<Shared<Lifetime>>(),
+        generated: Vector.make<Shared<Lifetime>>(),
+        invocation: false,
+        nested: false,
+        renumber: Vector.make<usize>(),
+        staticEnvironment: false,
       }
       let mut at = usize.ZERO
       while at < arguments.length {
@@ -11014,7 +11097,7 @@ effect fn checkCallPrefix(
             if (expected == GenericKind.Type && supplied != GenericKind.Type)
               || (expected == GenericKind.Lifetime && supplied != GenericKind.Lifetime)
               || (expected == GenericKind.Requirement && supplied == GenericKind.Lifetime) {
-              return Option.some<Shared<Rejection>>(
+              return Result.failResult<Vector<Argument>, Shared<Rejection>>(
                 run rejectKind(
                   &resolver.*,
                   caller,
@@ -11025,17 +11108,128 @@ effect fn checkCallPrefix(
                 ),
               )
             }
+            if expected == GenericKind.Type {
+              let resolved = run resolveType(
+                &mut resolver.*,
+                &mut owner.*,
+                &mut dependencies.*,
+                callerOrdinal,
+                argument,
+                Vector.asSlice<Binder>(&noBinders),
+                &mut elision,
+              )
+              match move resolved {
+                Result<Shared<Type>, Shared<Rejection>>.Success {value: ty} => {
+                  run Vector.append<Argument>(&mut explicit, Argument.Type {value: move ty})
+                }
+                Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+                  return Result.failResult<Vector<Argument>, Shared<Rejection>>(move error)
+                }
+              }
+            } else if expected == GenericKind.Lifetime {
+              let resolved = run lifetimeAt(
+                &mut resolver.*,
+                caller,
+                argument,
+                Vector.asSlice<Binder>(&noBinders),
+              )
+              match move resolved {
+                Result<Shared<Lifetime>, Shared<Rejection>>.Success {value: lifetime} => {
+                  run Vector.append<Argument>(
+                    &mut explicit,
+                    Argument.Lifetime {value: move lifetime},
+                  )
+                }
+                Result<Shared<Lifetime>, Shared<Rejection>>.Failure {error} => {
+                  return Result.failResult<Vector<Argument>, Shared<Rejection>>(move error)
+                }
+              }
+            } else {
+              let mut row = Row.empty()
+              let added = run rowArgument(
+                &mut resolver.*,
+                &mut owner.*,
+                &mut dependencies.*,
+                callerOrdinal,
+                caller,
+                argument,
+                binderName(&formal[at]),
+                Vector.asSlice<Binder>(&noBinders),
+                &mut elision,
+                &mut row,
+              )
+              if let Option<Shared<Rejection>>.Some {value: diagnostic} = move added {
+                return Result.failResult<Vector<Argument>, Shared<Rejection>>(move diagnostic)
+              }
+              run Vector.append<Argument>(
+                &mut explicit,
+                Argument.Row {value: run Shared.make<Row>(move row)},
+              )
+            }
           }
         }
         at = at + usize.ONE
       }
-      return Option.none<Shared<Rejection>>()
+      if requirements.present {
+        if rowBinderCount(formal) > usize.ONE {
+          // The reference does not define a suffix when more than one row remains writable.
+          return Result.failResult<Vector<Argument>, Shared<Rejection>>(
+            run reject(&resolver.*, caller, RejectionCode.Unsupported, value.span),
+          )
+        }
+        if arguments.length == formal.length {
+          return Result.failResult<Vector<Argument>, Shared<Rejection>>(
+            run rejectArity(
+              &resolver.*,
+              caller,
+              value.span,
+              formal.length,
+              arguments.length + usize.ONE,
+            ),
+          )
+        }
+        if binderKind(&formal[arguments.length]) != GenericKind.Requirement {
+          return Result.failResult<Vector<Argument>, Shared<Rejection>>(
+            run rejectKind(
+              &resolver.*,
+              caller,
+              value.span,
+              binderName(&formal[arguments.length]),
+              binderKind(&formal[arguments.length]),
+              GenericKind.Requirement,
+            ),
+          )
+        }
+        let resolved = run resolveChannels(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut dependencies.*,
+          callerOrdinal,
+          caller,
+          HirRef.absent(),
+          requirements,
+          Vector.asSlice<Binder>(&noBinders),
+          &mut elision,
+        )
+        match move resolved {
+          Result<Channels, Shared<Rejection>>.Success {value: channels} => {
+            run Vector.append<Argument>(
+              &mut explicit,
+              Argument.Row {value: move channels.requirements},
+            )
+          }
+          Result<Channels, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<Vector<Argument>, Shared<Rejection>>(move error)
+          }
+        }
+      }
+      return Result.succeed<Vector<Argument>, Shared<Rejection>>(move explicit)
     }
-    return Option.some<Shared<Rejection>>(
+    return Result.failResult<Vector<Argument>, Shared<Rejection>>(
       run reject(&resolver.*, caller, RejectionCode.Unsupported, value.span),
     )
   }
-  return Option.some<Shared<Rejection>>(
+  return Result.failResult<Vector<Argument>, Shared<Rejection>>(
     run reject(&resolver.*, caller, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
   )
 }
@@ -11207,15 +11401,22 @@ effect fn callTarget(
       if let Option<Shared<Rejection>>.Some {value: diagnostic} = move failure {
         return Result.failResult<CallTarget, Shared<Rejection>>(move diagnostic)
       }
-      let prefix = run checkCallPrefix(
+      let prefix = run resolveCallPrefix(
         &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies.*,
+        moduleOrdinal,
         module,
         &targetModule,
         target.ordinal,
+        &signature,
         syntax.generics,
       )
-      if let Option<Shared<Rejection>>.Some {value: diagnostic} = move prefix {
-        return Result.failResult<CallTarget, Shared<Rejection>>(move diagnostic)
+      let explicit = match move prefix {
+        Result<Vector<Argument>, Shared<Rejection>>.Success {value} => move value
+        Result<Vector<Argument>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<CallTarget, Shared<Rejection>>(move error)
+        }
       }
       if Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureGenericCount) > usize.ZERO {
         return Result.failResult<CallTarget, Shared<Rejection>>(
@@ -11225,7 +11426,11 @@ effect fn callTarget(
       let identity = run declarationAt(&mut resolver.*, &targetModule, target.ordinal)
       if let Option<DeclarationId>.Some {value: declaration} = move identity {
         return Result.succeed<CallTarget, Shared<Rejection>>(
-          CallTarget {declaration: move declaration, signature: move signature},
+          CallTarget {
+            declaration: move declaration,
+            signature: move signature,
+            explicit: move explicit,
+          },
         )
       }
     }
@@ -11249,6 +11454,7 @@ effect fn resolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<
             CallTarget {
               declaration: run DeclarationId.copy(&value.declaration),
               signature: Shared.clone<Result<Answer, NoRejection>>(&value.signature),
+              explicit: run copyArguments(Vector.asSlice<Argument>(&value.explicit)),
             },
           ),
         )
