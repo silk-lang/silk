@@ -66,6 +66,7 @@ import {
   operationChildren,
   operationsOf,
   operationTree,
+  realizesReturn,
   regionTargets,
   semanticType,
   suspensionLocals,
@@ -3868,9 +3869,7 @@ const computeVerify = Effect.fnUntraced(function* (
         const returned = fn.localTypes.at(outcome.value.ordinal)
         if (
           returned === undefined ||
-          (returned._tag !== 'Bottom' &&
-            SilkType.runtimeKey(semanticType(returned)) !==
-              SilkType.runtimeKey(semanticType(fn.result)))
+          (returned._tag !== 'Bottom' && !realizesReturn(returned, fn.result))
         )
           violations.push({
             _tag: 'Violation',
@@ -3907,8 +3906,7 @@ const computeVerify = Effect.fnUntraced(function* (
         if (
           returned !== undefined &&
           returned._tag !== 'Bottom' &&
-          SilkType.runtimeKey(semanticType(returned)) !==
-            SilkType.runtimeKey(semanticType(fn.result))
+          !realizesReturn(returned, fn.result)
         ) {
           violations.push({
             _tag: 'Violation',

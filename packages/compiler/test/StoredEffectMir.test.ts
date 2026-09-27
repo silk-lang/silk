@@ -284,6 +284,19 @@ pub fn main() -> i32 {
       projected?._tag === 'EffectValue' ? projected.storage?._tag : undefined,
       'StoredEffectField',
     )
+    if (projected?._tag === 'EffectValue') {
+      // A stored Effect keeps exact runtime identity, so its unstored view of the same realization
+      // does not satisfy it as a returned value in either direction.
+      const unstored: Mir.Type = {
+        _tag: 'EffectValue',
+        type: projected.type,
+        site: projected.site,
+        environment: projected.environment,
+      }
+      assert.isTrue(Mir.realizesReturn(projected, projected))
+      assert.isFalse(Mir.realizesReturn(projected, unstored))
+      assert.isFalse(Mir.realizesReturn(unstored, projected))
+    }
     assert.strictEqual(run?._tag, 'RunEffectValue')
     if (run?._tag !== 'RunEffectValue' || stored?._tag !== 'StoredEffectField') return
     const owner =
