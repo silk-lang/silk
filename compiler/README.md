@@ -59,7 +59,9 @@ The current semantic subset resolves local names, ordinary namespace imports, se
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
 one namespace segment and one public member segment. Import paths map to slash-separated `.silk`
 logical source paths within the importing module's source origin and package. Selected public import
-chains resolve to the canonical declaration. The store resolves type aliases and nominal type
+chains resolve to the canonical declaration. Repeating an identical import binding, or writing an
+alias equal to its default name, is one binding; two imports that bind one spelling to different
+declarations still collide. The store resolves type aliases and nominal type
 identities without inspecting fields or layout. Separate `demandMembers` and `demandMemberShape`
 queries enumerate a struct's fields, tuple positions, enum cases, or union variants, then resolve
 only a selected member's written types under a canonical nominal application. The member ordinal
@@ -74,15 +76,25 @@ struct Node { next: Node }
 
 A generic member query substitutes the application's explicit type and lifetime arguments without
 checking another member. In `Box<bool>`, requesting `value` yields `bool` even if `deferred` has an
-invalid written type; requesting `deferred` then rejects at its written type:
+invalid written type; requesting `deferred` then rejects at its undeclared lifetime:
 
 ```silk,ignore
 struct Box<T> {
   value: T
-  deferred: Missing
+  deferred: &'undeclared i32
 }
 fn boxed() -> Box<bool> { return () }
 ```
+
+Applying a struct, tuple, or union needs its complete lifetime arity. Each lifetime its fields leave
+unwritten is a generated parameter of the declaration, bound after its written parameters in field
+order: an omitted borrow, slice, or `string` lifetime, an omitted callable or Effect environment,
+and every lifetime of a nested nominal or alias used without lifetime arguments. An application
+therefore resolves its field type names, through imports and aliases, but never their member types
+or layout. With `deferred: Missing` above, `Box<bool>` rejects `UnknownName` at `Missing`, while
+`Box`'s identity and member names stay available. A recursive field that would add lifetimes on
+every turn, such as `struct Chain { next: &Chain }`, is `Unsupported`; recursion that omits none,
+or writes its lifetimes as in `struct Node<'a> { next: &'a Node<'a> }`, keeps a finite arity.
 
 Ordinary type and lifetime binders belong to their declarations. Written function signatures
 resolve those binders and explicit nominal or alias arguments, including substitution through
@@ -182,6 +194,25 @@ solve conformances, select providers, check captures, or run Effects. The scalar
 rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
 even when their signatures resolve.
 
+`Semantic.demandOperations` lists an interface's or service's operations; each operation resolves
+under its contract's binders and an implicit `Self`. `demandImplementations` returns a module's
+conformance and sealed-property `impl` heads, `demandConformanceHeads` every head for one contract
+and provider owner read from only the modules permitted to own it, and `demandImplementationMembers`
+a conformance's inline and mapped members. `demandInherentMembers` publishes an owner's inherent
+members across its `impl` blocks; a repeated or claimed name publishes neither. `demandSignatureOf`
+resolves a function or operation by its declaration identity under the same gates as the name
+lookups `demandOperation` and `demandInherentMember`. `demandOperationUnder` resolves a contract
+operation under one conformance head: the contract's binders and `Self` take the head's arguments,
+the operation's own binders stay its parameters, and no bound is proved. Under
+`impl Convert<i32> for Box<bool>`, `fn convert<U>(value: Self, other: U) -> T` has the parameters
+`Box<bool>` and `U` and the result `i32`.
+
+`Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
+binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
+and `Intrinsic.NonParking` are witness-free properties recorded on generic bounds, and a Detached
+representation parameter retains no region. Other intrinsic families, `impl Intrinsic`, and calls
+such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
+
 Generic calls and demanded generic bodies, type inference, applications of declarations with
 interface or representation bounds, a declaration with more than one `?R` binder when applied, a
 lifetime omitted inside a type declaration's bound, row subtraction such as `Without<R, K>` (which
@@ -209,9 +240,9 @@ only the result's own environment.
 callables and Effects nested inside callables need their environments written. Invalid or unknown
 lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
 retain the exact non-negative decimal literal extent and element type, including at zero length;
-extents needing static execution remain `Unsupported` at their source span. Member type requests
-with omitted field lifetimes are likewise `Unsupported` until those generated lifetimes can be
-represented by the nominal application. No machine layout fact is inspected. Unused declarations
+extents needing static execution remain `Unsupported` at their source span. A member type request
+that elides a generated field lifetime is `Unsupported` until applications substitute generated
+lifetimes into member types. No machine layout fact is inspected. Unused declarations
 with these forms are still indexed as written
 names and do not require semantic resolution.
 
@@ -324,9 +355,11 @@ pub fn leaf() -> i32 { return 1 }
 Changing `Element` to `bool` changes the requested `width` shape to `bool`. The recomputed identity
 of `Point`, its member names, and the `origin` signature equal their earlier values. `caller` keeps
 its checked payload because the `leaf` signature is unchanged, and `unrelated`, which never read
-`geometry.silk`, is a hit. Then replace `Point` with `struct Point { height: Missing depth: i32 }`.
-The member names change, the second member (previously `UnknownMember`) has type `i32`, and the
-first member rejects `Missing` at its current span. A new store on the same revision returns the
+`geometry.silk`, is a hit. Then replace `Point` with
+`struct Point { height: &'undeclared i32 depth: i32 }`. The member names change, the second member
+(previously `UnknownMember`) has type `i32`, and the first member rejects its undeclared lifetime at
+its current span. A written lifetime needs no resolution for `Point`'s arity, so `origin` still
+resolves; a field type name such as `Missing` would instead reject every application of `Point`. A new store on the same revision returns the
 same results. A typed failure while revalidating `caller` publishes no answer; the retry checks the
 body again instead of restoring the earlier payload. The leaf body is never demanded.
 
@@ -378,7 +411,8 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
 - **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
   applications of declarations with interface, service, or representation bounds, such as
   `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
-  parameters, and lifetimes omitted inside a type declaration's bound.
+  parameters, lifetimes omitted inside a type declaration's bound, and substituting generated field
+  lifetimes into requested member types.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
@@ -390,8 +424,8 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
   such as `struct Node { next: Node }`.
 - **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
 
-Some `Unsupported` forms are later work that no wave owns yet: omitted field lifetimes in member
-requests, and native-boundary declarations such as foreign `static` data and C variadic functions.
+Some `Unsupported` forms are later work that no wave owns yet: native-boundary declarations such as
+foreign `static` data and C variadic functions.
 
 ## Inspect a source file
 
