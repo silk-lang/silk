@@ -3443,11 +3443,17 @@ export const effectCallableApplicationRepresentation = (
       return identity === undefined ? [] : [identity]
     })
   const target = callee.target.declaration
+  const identityTarget = Tir.callableTargetIdentity(callee.target)
+  // The applied Effect names the complete instance: the section's identity with its own unapplied
+  // binders instantiated by this application, never the binders themselves.
   const owner = {
     declaration: { module: target.module, name: target.name },
     typeArguments: [
       ...callee.typeArguments.map((argument) =>
-        Type.substituteGenericArgument(argument, substitution),
+        Type.substituteGenericArgument(
+          Type.solveSectionBinders(argument, identityTarget, substitution),
+          substitution,
+        ),
       ),
       ...hidden,
     ],
@@ -3605,7 +3611,7 @@ export const isOwnStructArgument = (
 const writtenFieldsOf = (
   node: AuthoredHir.Expression,
 ): ReadonlyArray<AuthoredHir.FieldInitializer> => {
-  if (node._tag === 'StructExpression') return node.fields
+  if (node._tag === 'StructExpression' || node._tag === 'RecordExpression') return node.fields
   if (node._tag === 'MemberExpression') return node.fields ?? []
   return []
 }
@@ -3720,7 +3726,7 @@ export const analyzeAggregateLiteral = (
 
   const seen = new Map<string, StructInitializerFact>()
   // A variant literal (`R<A, F>.Success { value: ... }`) carries its initializers on the member
-  // expression, not on a struct expression, so both node shapes supply the written fields.
+  // expression and a contextual `.{ ... }` on a record expression, so every shape supplies them.
   const writtenFields = writtenFieldsOf(node)
   const initializers = writtenFields.map((initializer): StructInitializerFact => {
     const nameToken = initializer.name

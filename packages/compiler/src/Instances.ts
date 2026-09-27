@@ -409,40 +409,6 @@ export const invalid = (rootModule: string): Discovery => ({
   residualOwnership: [],
 })
 
-/**
- * Closes a partial section's binder-owned channels before the type becomes instance identity.
- *
- * A constrained partial section is deliberately open in its target contract's own unapplied
- * binders: its Effect channels close only at application, so its surface mentions binder-owned
- * success/failure types and requirement rows no carrying call can resolve.
- * Elaboration's constrained
- * callable escape gate proves such a value only ever reaches a whole-value relay, an application,
- * or a drop — every other escape is rejected there with its own diagnostic — and the callable
- * itself is erased onto its hidden identity argument. The instance identity therefore closes the
- * schema's unapplied value binders to `never` and requirement binders to empty rows, exactly
- * the shape the erased relay needs, so a proven relay is not re-rejected as unresolved.
- */
-const carriedSectionArgument = (argument: Type.GenericArgument): Type.GenericArgument => {
-  if (!Type.isTypeArgument(argument)) return argument
-  if (!Type.isCallable(argument) || argument.schema === undefined) return argument
-  if (Type.isRuntimeConcrete(argument)) return argument
-  const closure = new Map<string, Type.GenericArgument>()
-  for (const binder of argument.schema.binders) {
-    const selected = argument.schema.substitution.get(Type.key(binder))
-    if (
-      selected !== undefined &&
-      !Type.equalsGenericArgument(selected, Type.parameterArgument(binder))
-    )
-      continue
-    if (binder.kind === 'RequirementRow')
-      closure.set(Type.key(binder), Type.requirementRowArgument([]))
-    else if (binder.kind === 'Value') closure.set(Type.key(binder), 'never')
-  }
-  if (closure.size === 0) return argument
-  const closed = Type.substitute(argument, closure)
-  return Type.isRuntimeConcrete(closed) ? closed : argument
-}
-
 // Discovery and every suspension-graph rebuild key the same target applications repeatedly. The
 // contract row is a function of the contract, its declared parameters, and the exact visible
 // arguments, so it is derived once per distinct application.
@@ -516,7 +482,7 @@ const keyOf = (
   staticArguments: ReadonlyArray<StaticValue.Value> = [],
   evidence: ReadonlyArray<string> = [],
 ): InstanceKey => {
-  const typeArguments = rawTypeArguments.map(carriedSectionArgument)
+  const typeArguments = rawTypeArguments.map(Type.closeSectionSchema)
   const contractRow = contractRowOf(
     contract,
     typeParameters,
@@ -1907,27 +1873,41 @@ export const discover = (
     }
     return descended
   }
-  // Instance discovery asks the same cleanup-subterm questions for many instances; the
-  // answer depends only on runtime identities and the unfolding path, so memoize it.
+  // Instance discovery asks the same cleanup-subterm questions for many instances; the answer
+  // depends only on runtime identities, so top-level questions are memoized for the discovery.
   const strictCleanupSubtermCache = new Map<string, boolean>()
-  const isStrictCleanupSubterm = (
-    candidate: Type.Type,
-    whole: Type.Type,
-    unfolding: ReadonlyMap<string, Type.Nominal> = new Map(),
-  ): boolean => {
-    let cacheKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
-    for (const nominal of unfolding.values()) cacheKey += `\u0001${Type.runtimeKey(nominal)}`
+  const isStrictCleanupSubterm = (candidate: Type.Type, whole: Type.Type): boolean => {
+    const cacheKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
     let cached = strictCleanupSubtermCache.get(cacheKey)
     if (cached === undefined) {
-      cached = computeStrictCleanupSubterm(candidate, whole, unfolding)
+      cached = strictCleanupSubtermUnder(candidate, whole, new Map(), new Map())
       strictCleanupSubtermCache.set(cacheKey, cached)
     }
     return cached
+  }
+  // A nested answer also depends on the unfolding path, which begins at the question's own root,
+  // so it is rarely shared between questions. It is memoized only while one question is answered;
+  // retaining it for the whole discovery kept millions of path-keyed entries alive.
+  const strictCleanupSubtermUnder = (
+    candidate: Type.Type,
+    whole: Type.Type,
+    unfolding: ReadonlyMap<string, Type.Nominal>,
+    memo: Map<string, boolean>,
+  ): boolean => {
+    let memoKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
+    for (const nominal of unfolding.values()) memoKey += `\u0001${Type.runtimeKey(nominal)}`
+    let memoized = memo.get(memoKey)
+    if (memoized === undefined) {
+      memoized = computeStrictCleanupSubterm(candidate, whole, unfolding, memo)
+      memo.set(memoKey, memoized)
+    }
+    return memoized
   }
   const computeStrictCleanupSubterm = (
     candidate: Type.Type,
     whole: Type.Type,
     unfolding: ReadonlyMap<string, Type.Nominal>,
+    memo: Map<string, boolean>,
   ): boolean => {
     if (sameRuntimeType(candidate, whole)) return false
     const candidateDeclaration = nominalTypeText(candidate)
@@ -1972,10 +1952,11 @@ export const discover = (
         fields.some(
           (field) =>
             field.declaredType._tag === 'Resolved' &&
-            isStrictCleanupSubterm(
+            strictCleanupSubtermUnder(
               candidate,
               Type.substitute(field.declaredType.type, substitution),
               nextUnfolding,
+              memo,
             ),
         )
       )
@@ -2000,8 +1981,16 @@ export const discover = (
     selectedRoots: ReadonlyArray<Type.Type>,
     ancestor: InstanceKey | undefined,
   ): CleanupMeasure | undefined => {
+    // A hook selected from a context without a measure starts one. Its concrete arguments are the
+    // frame, as when a measured context selects a hook: a root such as `Shared<P>` covers another
+    // `Shared<X>` only by type-argument descent, so without the frame the hook's own helper calls
+    // at those arguments would lose the measure. The frame admits only arguments equal to or
+    // strictly inside the hook's ordinary type arguments; a later hook still needs root coverage
+    // or a non-growing frame step, so recursion that grows a type argument remains rejected.
     if (measure === undefined)
-      return selectedRoots.length === 0 ? undefined : cleanupMeasureOf(selectedRoots)
+      return selectedRoots.length === 0
+        ? undefined
+        : cleanupMeasureOf(selectedRoots, typeArgumentsOf(target))
     // Each selected cleanup hook may expose a more deeply owned payload hidden from the
     // original roots by an opaque buffer. Its concrete arguments justify the next cleanup
     // owner, provided a repeated hook family does not grow. Keep the original roots fixed.

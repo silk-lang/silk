@@ -361,6 +361,109 @@ it.effect(
     )
   }),
 )
+it.effect('accepts a returned Effect that realizes the declared result contract', () =>
+  Effect.gen(function* () {
+    // `fallible` returns a fail-only block (`never` success) under a declared `i32` success, and
+    // `pending` returns a take-once witness Effect under a declared shared Effect. Both returned
+    // values pin the same realization the MIR result names.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'mir/effect-return-realization',
+      ascii(`import silk.effect { Effect }
+struct Problem { code: i32 }
+interface Decoder<S, Arguments> {
+  effect<'env> fn decode<'env>(self: &S, arguments: Arguments) -> i32 ! Problem
+}
+struct Schema { value: i32 }
+effect fn decodeSchema(self: &Schema, encoded: i32) -> i32 ! Problem {
+  return self.value + encoded
+}
+impl Decoder<Schema, i32> for Schema { decode: Schema.decodeSchema }
+fn pending<T: Decoder<T, i32>>(value: &T) -> Effect<i32 ! Problem> {
+  return Decoder.decode(value, 2)
+}
+fn fallible() -> Effect<'static; i32 ! Problem> {
+  return effect { fail Problem { code: 40 } }
+}
+effect fn recover(problem: Problem) -> i32 { return problem.code }
+pub fn main() -> i32 {
+  let schema = Schema { value: 40 }
+  let decoded = run Effect.catch<Problem>(pending<Schema>(&schema), recover)
+  let recovered = run Effect.catch<Problem>(fallible(), recover)
+  return decoded + recovered - 40
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+
+    const effectReturn = (name: string) => {
+      const fn =
+        mir.functions.find((candidate) => candidate.id.name === name) ?? raise(`expected ${name}`)
+      const value =
+        fn.regions.flatMap((region) =>
+          region._tag === 'OperationRegion' && region.outcome._tag === 'Return'
+            ? [region.outcome.value]
+            : [],
+        )[0] ?? raise(`expected ${name} to return`)
+      const returned = fn.localTypes.at(value.ordinal)
+      const result = fn.result
+      if (result._tag !== 'EffectValue' || returned?._tag !== 'EffectValue')
+        return raise(`expected ${name} to return an Effect value`)
+      return { fn, ordinal: value.ordinal, returned, result }
+    }
+    const fallible = effectReturn('fallible')
+    const pending = effectReturn('pending')
+    assert.isTrue(Mir.realizesReturn(fallible.returned, fallible.result))
+    assert.isTrue(Mir.realizesReturn(pending.returned, pending.result))
+    // A declared `never` success does not accept a realized value.
+    assert.isFalse(Mir.realizesReturn(fallible.result, fallible.returned))
+    // The site and environment instance each pin the realization.
+    assert.isFalse(
+      Mir.realizesReturn(fallible.returned, { ...fallible.result, site: pending.result.site }),
+    )
+    assert.isFalse(
+      Mir.realizesReturn(fallible.returned, {
+        ...fallible.result,
+        environment: {
+          ...fallible.result.environment,
+          instance: pending.result.environment.instance,
+        },
+      }),
+    )
+    // Failure and requirement rows stay exact, including requirement access.
+    const withRows = (
+      failures: ReadonlyArray<Type.Type>,
+      access: 'Shared' | 'Exclusive',
+    ): Mir.Type => ({
+      ...fallible.result,
+      type: Type.effect('i32', failures, fallible.result.type, 'Shared', [
+        { capability: Type.nominal('mir/rows', 'Clock', []), role: 'DefaultRole', access },
+      ]),
+    })
+    assert.isTrue(Mir.realizesReturn(withRows([], 'Shared'), withRows([], 'Shared')))
+    assert.isFalse(Mir.realizesReturn(withRows([], 'Shared'), withRows(['bool'], 'Shared')))
+    assert.isFalse(Mir.realizesReturn(withRows([], 'Shared'), withRows([], 'Exclusive')))
+
+    const reversed: Mir.Module = {
+      ...mir,
+      functions: mir.functions.map((fn) =>
+        fn === fallible.fn
+          ? {
+              ...fn,
+              result: fallible.returned,
+              localTypes: fn.localTypes.map((type, ordinal) =>
+                ordinal === fallible.ordinal ? fallible.result : type,
+              ),
+            }
+          : fn,
+      ),
+    }
+    assert.include(
+      (yield* MirVerification.verify(reversed)).map((violation) => violation.rule),
+      'InvalidReturn',
+    )
+  }),
+)
 it.effect(
   'reports broken graphs deterministically as data',
   Effect.fnUntraced(function* () {

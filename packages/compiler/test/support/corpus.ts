@@ -1439,6 +1439,44 @@ pub fn main() -> i32 {
   return run bind(read())
 }`
 
+/** A section built inside a generic owner and applied there, at two owner instances. */
+export const constrainedSectionGenericOwner = `struct Token { value: i32 }
+fn select<U>(value: U, enabled: bool) -> U { return move value }
+fn pickOne<T>(value: T) -> T {
+  let pick = select(true)
+  return pick(move value)
+}
+pub fn main() -> i32 {
+  let token = pickOne(Token { value: 40 })
+  return pickOne(2) + token.value
+}`
+
+/** A generic function item piped inside a generic owner, at two owner instances. */
+export const genericItemPipelineInGenericOwner = `struct Token { value: i32 }
+fn keep<U>(value: U) -> U { return move value }
+fn pass<T>(value: T) -> T { return move value |> keep }
+pub fn main() -> i32 {
+  let token = pass(Token { value: 40 })
+  return pass(2) + token.value
+}`
+
+/** A section selecting its target's binder through an owner-typed capture, applied directly. */
+export const ownerTypedDirectSection = `struct Token { value: i32 }
+fn pair<A>(first: A, second: A) -> A {
+  drop second
+  return move first
+}
+fn choose<T>(left: T, right: T) -> T { return move left |> pair(move right) }
+fn chooseBound<T>(left: T, right: T) -> T {
+  let finish = pair(move right)
+  return finish(move left)
+}
+pub fn main() -> i32 {
+  let token = choose(Token { value: 40 }, Token { value: 1 })
+  let other = chooseBound(Token { value: 0 }, Token { value: 1 })
+  return choose(2, 3) + chooseBound(0, 5) + token.value + other.value
+}`
+
 /** Fixed-seed xoshiro256** known answers pinned for native execution. */
 export const seededRandomFingerprint = `import silk.effect { Effect }
 import silk.insecure_random { InsecureRandom }
@@ -2222,6 +2260,86 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
   {
     name: 'constrained-callable-forwarding',
     source: constrainedCallableForwarding,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // A constrained section owning a capture evaluates it once at construction; dropped unapplied,
+    // its environment drops the capture once; applied, the target consumes it.
+    name: 'constrained-section-owned-capture-lifecycle',
+    source: `import silk.effect { Effect }
+unsafe extern "C" fn silk_record_event(value: i32) -> ()
+unsafe extern "C" fn silk_finish_events() -> i32
+struct Recorder { value: i32 }
+impl Drop for Recorder {
+  fn drop(self: &mut Recorder) -> () { unsafe { silk_record_event(self.value) } return () }
+}
+fn make(value: i32) -> Recorder {
+  unsafe { silk_record_event(value + 10) }
+  return Recorder { value: value }
+}
+effect fn guarded<A>(pending: once Effect<A>, recorder: Recorder) -> A {
+  drop recorder
+  return run move pending
+}
+effect fn ready() -> i32 { return 7 }
+pub fn main() -> i32 {
+  let dropped = guarded(make(1))
+  drop dropped
+  let applied = guarded(make(2))
+  unsafe { silk_record_event(20) }
+  let value = run applied(ready())
+  unsafe { silk_record_event(value) }
+  unsafe { return silk_finish_events() }
+}`,
+    nativeCSources: {
+      events: `#include <stdint.h>
+#include <stdio.h>
+void silk_record_event(int32_t value) { printf("%d,", value); }
+int32_t silk_finish_events(void) { puts(""); return 42; }
+`,
+    },
+    nativeStdout: '11,1,12,20,2,7,\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // A generic item piped inside a generic owner: `U := T` is solved in the owner's terms.
+    name: 'generic-item-pipeline-in-generic-owner',
+    source: genericItemPipelineInGenericOwner,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // One section site in a generic owner, applied at the owner's instances for Token and i32.
+    name: 'constrained-section-generic-owner',
+    source: constrainedSectionGenericOwner,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // Owner-typed sections at two owner types, applied directly in a pipeline and through a value.
+    name: 'owner-typed-direct-section',
+    source: ownerTypedDirectSection,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // One provider section, applied to an i32 and a bool Effect, shares its environment.
+    name: 'constrained-section-two-applications',
+    source: `import silk.effect { Effect }
+service Counter { effect fn get() -> i32 ? &Counter }
+struct Fixed { value: i32 }
+effect fn get(self: &Fixed) -> i32 { return self.value }
+impl Counter for Fixed { get: Fixed.get }
+effect fn seed() -> i32 ? &Counter { return run Counter.get() }
+effect fn flag() -> bool ? &Counter {
+  let value = run Counter.get()
+  return value == 42
+}
+pub fn main() -> i32 {
+  let fixed = Fixed { value: 42 }
+  let bind = Effect.provide<Counter>(&fixed)
+  let number = run bind(seed())
+  let ok = run bind(flag())
+  if ok { return number }
+  return 1
+}`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
@@ -8864,7 +8982,7 @@ pub effect fn main() ! NotFoundError | OfflineError {
   fail OfflineError { code: 42 }
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.OfflineError\n  at memory/driver.main (memory/driver:4:54)\n  at silk/effect.Effect.flatMap (silk/effect:294:18)\n',
+      'unhandled error: memory/driver.OfflineError\n  at memory/driver.main (memory/driver:5:3)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
     // A failed Effect entry must exit with status 1 even when reporting cannot write to fd 2.
     // Unused process arguments must not change either its status or its diagnostic trace.
     nativeRuns: [
@@ -8901,7 +9019,7 @@ pub effect fn main() ! NotFoundError {
   return ()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:3:42)\n  at memory/driver.middle (memory/driver:8:10)\n  at memory/driver.main (memory/driver:13:10)\n  at silk/effect.Effect.flatMap (silk/effect:294:18)\n',
+      'unhandled error: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:4:3)\n  at memory/driver.middle (memory/driver:8:11)\n  at memory/driver.main (memory/driver:13:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -8932,7 +9050,7 @@ pub effect fn main() ! Primary {
   run primary()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:5:38)\n  at memory/driver.main (memory/driver:23:23)\n  at silk/effect.Effect.flatMap (silk/effect:294:18)\n',
+      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:6:3)\n  at memory/driver.main (memory/driver:24:3)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -8955,7 +9073,7 @@ pub effect fn main() ! OfflineError {
   return ()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.OfflineError\n  at memory/driver.recover (memory/driver:10:64)\n  at silk/effect.Effect.catch (silk/effect:398:11)\n  at memory/driver.main (memory/driver:15:10)\n  at silk/effect.Effect.flatMap (silk/effect:294:18)\nwhile handling: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:6:42)\n',
+      'unhandled error: memory/driver.OfflineError\n  at memory/driver.recover (memory/driver:11:3)\n  at silk/effect.Effect.catch (silk/effect:405:12)\n  at memory/driver.main (memory/driver:15:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\nwhile handling: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:7:3)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -8969,7 +9087,7 @@ pub effect fn main() {
   return ()
 }`,
     nativeStderr:
-      'fatal trap: division by zero\n  at memory/driver.calculate (memory/driver:2:9)\n',
+      'fatal trap: division by zero\n  at memory/driver.calculate (memory/driver:2:10)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -8987,7 +9105,7 @@ pub effect fn load() -> i32 ! NotFoundError {
 }`,
     },
     nativeStderr:
-      'unhandled error: errors/kinds.NotFoundError\n  at errors/kinds.load (errors/kinds:2:46)\n  at memory/driver.main (memory/driver:3:10)\n  at silk/effect.Effect.flatMap (silk/effect:294:18)\n',
+      'unhandled error: errors/kinds.NotFoundError\n  at errors/kinds.load (errors/kinds:3:3)\n  at memory/driver.main (memory/driver:3:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
     expected: { _tag: 'Trap' },
   },
   {

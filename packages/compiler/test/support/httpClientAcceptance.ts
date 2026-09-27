@@ -548,7 +548,7 @@ ${routeHttpWriteHook}
     if count > maximum {
       count = maximum
     }
-    let mut capacity = 256
+    let mut capacity: usize = 256
     if self.scenario == 22 { capacity = 512 }
     if count > capacity - self.accepted {
       self.closed = true
@@ -643,7 +643,7 @@ ${routeByteReadHook}
     run checkByteDeadline(&deadline, ByteIoOperation.Write)
 ${routeByteWriteHook}
     self.writeOrdinal = self.writeOrdinal + usize.ONE
-    let mut capacity = 256
+    let mut capacity: usize = 256
     if self.scenario == 22 { capacity = 512 }
     if input.length > capacity - self.accepted {
       self.closed = true

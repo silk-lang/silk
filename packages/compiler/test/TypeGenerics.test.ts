@@ -1,4 +1,10 @@
 import { records } from './support/records.js'
+import {
+  constrainedCallableForwarding,
+  constrainedSectionGenericOwner,
+  genericItemPipelineInGenericOwner,
+  ownerTypedDirectSection,
+} from './support/corpus.js'
 import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
@@ -10,6 +16,7 @@ import * as DeclarationFacts from '../src/DeclarationFacts.js'
 import * as Diagnostic from '../src/Diagnostic.js'
 import * as FormattedDocument from '../src/FormattedDocument.js'
 import * as Instances from '../src/Instances.js'
+import * as Layout from '../src/Layout.js'
 import * as Lifetime from '../src/Lifetime.js'
 import * as TypeInference from '../src/internal/TypeInference.js'
 import * as Lexer from '../src/Lexer.js'
@@ -377,6 +384,713 @@ pub fn main() -> i32 { return 0 }`
     assert.isDefined(surface)
     assert.include(surface?.canonical ?? '', 'ProviderConstraint')
     assert.include(surface?.canonical ?? '', 'WithoutRowExpression')
+  }),
+)
+
+/** Every layout environment realized for a section of `target`, with its owner name. */
+const sectionEnvironments = (snapshot: Analysis.Snapshot, target: string) => {
+  const layout = Analysis.layoutOf(snapshot)
+  return layout._tag !== 'Available'
+    ? []
+    : layout.value.callableEnvironments.flatMap((environment) =>
+        environment._tag === 'CallableEnvironment' &&
+        environment.callable.target._tag === 'DeclarationCallableTarget' &&
+        environment.callable.target.declaration.name === target
+          ? [environment.callable]
+          : [],
+      )
+}
+
+/** Section binders may appear only inside a section's own hidden callable identity. */
+const leaksSectionBinder = (type: Type.Type): boolean =>
+  Type.parameters(type).some(Type.isSectionBinder)
+
+it.effect('admits and lowers a constrained callable relayed through bound calls', () =>
+  Effect.gen(function* () {
+    // `forwardAgain` binds the result of `forward` before returning it, so the relay resolves a
+    // body local to the parameter the caller supplies. The relays carry the section before its
+    // application, so their hidden identity names the one environment the section constructs.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-relay',
+      new TextEncoder().encode(constrainedCallableForwarding),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const [environment, ...others] = sectionEnvironments(snapshot, 'Effect.provide')
+    assert.isDefined(environment)
+    assert.deepEqual(others, [])
+    for (const name of ['forward', 'forwardAgain']) {
+      const relays = mir.functions.filter((fn) => fn.id.name === name)
+      assert.strictEqual(relays.length, 1, name)
+      const relay = relays[0] ?? unreachable(`expected ${name}`)
+      assert.isFalse(
+        relay.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+        name,
+      )
+      const identity = relay.instance.typeArguments.find(Type.isCallableIdentityArgument)
+      assert.deepEqual(
+        identity?.typeArguments.map(Type.runtimeGenericArgumentKey),
+        environment?.typeArguments.map(Type.runtimeGenericArgumentKey),
+        name,
+      )
+    }
+    for (const fn of mir.functions) {
+      assert.isFalse(fn.instance.typeArguments.filter(Type.isTypeArgument).some(leaksSectionBinder))
+      assert.isFalse(fn.localTypes.some((type) => leaksSectionBinder(Mir.semanticType(type))))
+    }
+  }),
+)
+
+it.effect('shares one section environment across applications at different types', () =>
+  Effect.gen(function* () {
+    // Both applications solve the section's leading Effect differently, but its captures do not
+    // mention those binders, so one environment serves two distinct invocations.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-two-applications',
+      new TextEncoder().encode(`import silk.effect { Effect }
+service Counter { effect fn get() -> i32 ? &Counter }
+struct Fixed { value: i32 }
+effect fn get(self: &Fixed) -> i32 { return self.value }
+impl Counter for Fixed { get: Fixed.get }
+effect fn seed() -> i32 ? &Counter { return run Counter.get() }
+effect fn flag() -> bool ? &Counter {
+  let value = run Counter.get()
+  return value == 42
+}
+pub fn main() -> i32 {
+  let fixed = Fixed { value: 42 }
+  let bind = Effect.provide<Counter>(&fixed)
+  let number = run bind(seed())
+  let ok = run bind(flag())
+  if ok { return number }
+  return 0
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+    assert.strictEqual(sectionEnvironments(snapshot, 'Effect.provide').length, 1)
+    const invoked = Analysis.instancesOf(snapshot).instances.filter(
+      (instance) => instance.key.declaration.name === 'Effect.provide',
+    )
+    assert.strictEqual(new Set(invoked.map((instance) => Instances.keyText(instance.key))).size, 2)
+  }),
+)
+
+it.effect('keeps constrained section environments exact per site and selection', () =>
+  Effect.gen(function* () {
+    // `open` leaves the protected success unapplied while `fixedSuccess` selects it; each site keeps
+    // its own environment and selection. `repeat` sections itself, so its capture selects the
+    // section's binder with the enclosing function's own parameter, which owner substitution
+    // closes. `dropped` owns a capture and is never applied.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-identities',
+      new TextEncoder().encode(`import silk.effect { Effect }
+service Counter { effect fn get() -> i32 ? &Counter }
+struct Fixed { value: i32 }
+effect fn get(self: &Fixed) -> i32 { return self.value }
+impl Counter for Fixed { get: Fixed.get }
+struct Token { value: i32 }
+effect fn seed() -> i32 ? &Counter { return run Counter.get() }
+effect fn guarded<A>(pending: once Effect<A>, token: Token) -> A {
+  drop token
+  return run move pending
+}
+effect fn ready() -> i32 { return 1 }
+fn increment(value: i32) -> i32 { return value + 1 }
+fn repeat<A>(value: A, step: fn(A) -> A, count: i32) -> A {
+  if count == 0 { return move value }
+  let next = repeat(step, count - 1)
+  return next(step(move value))
+}
+pub fn main() -> i32 {
+  let fixed = Fixed { value: 40 }
+  let open = Effect.provide<Counter>(&fixed)
+  let fixedSuccess = Effect.provide<Counter, i32>(&fixed)
+  let dropped = guarded(Token { value: 0 })
+  drop dropped
+  let left = run open(seed())
+  let right = run fixedSuccess(seed())
+  let direct = run guarded(ready(), Token { value: 1 })
+  return repeat(left + right - 80, increment, 2) + direct - 1
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const provides = sectionEnvironments(snapshot, 'Effect.provide')
+    assert.strictEqual(provides.length, 2)
+    const unapplied = provides.filter((environment) =>
+      Type.namesUnappliedSection(
+        Type.callableIdentityArgument(
+          '',
+          Tir.callableTargetIdentity(environment.target),
+          environment.typeArguments,
+        ),
+      ),
+    )
+    // Both sections leave binders open (the failure and requirement remainder), but only `open`
+    // leaves the success open; `fixedSuccess` keeps its selected `i32`.
+    assert.strictEqual(unapplied.length, 2)
+    assert.isTrue(
+      provides.some((environment) =>
+        environment.typeArguments.some(
+          (argument) => Type.genericArgumentKey(argument) === 'builtin:i32',
+        ),
+      ),
+    )
+    // A section dropped without any application still has its one environment, so its owned
+    // capture is released; the obligation of its unapplied binder is erased with it.
+    assert.strictEqual(sectionEnvironments(snapshot, 'guarded').length, 1)
+    assert.isFalse(
+      mir.functions.some((fn) =>
+        fn.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+      ),
+    )
+    assert.isAtLeast(sectionEnvironments(snapshot, 'repeat').length, 1)
+    for (const fn of mir.functions)
+      assert.isFalse(fn.localTypes.some((type) => leaksSectionBinder(Mir.semanticType(type))))
+  }),
+)
+
+it.effect('lowers a constrained section that is relayed but never applied', () =>
+  Effect.gen(function* () {
+    const source = constrainedCallableForwarding.replace(
+      'let bind = forwardAgain(Effect.provide<Counter>(&fixed))\n  return run bind(read())',
+      'let bind = forwardAgain(Effect.provide<Counter>(&fixed))\n  drop bind\n  return 42',
+    )
+    assert.notStrictEqual(source, constrainedCallableForwarding)
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-relay-unapplied',
+      new TextEncoder().encode(source),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    // Trap bodies verify, so the absence of traps is asserted directly.
+    assert.isFalse(
+      mir.functions.some((fn) =>
+        fn.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+      ),
+    )
+    const [environment, ...others] = sectionEnvironments(snapshot, 'Effect.provide')
+    assert.deepEqual(others, [])
+    const relay = mir.functions.find((fn) => fn.id.name === 'forward')
+    assert.deepEqual(
+      relay?.instance.typeArguments
+        .find(Type.isCallableIdentityArgument)
+        ?.typeArguments.map(Type.runtimeGenericArgumentKey),
+      environment?.typeArguments.map(Type.runtimeGenericArgumentKey),
+    )
+  }),
+)
+
+it.effect('verifies pre-application section construction and application exactly', () =>
+  Effect.gen(function* () {
+    // `guarded` and `after` leave the protected success open; `after` also captures a callable.
+    // Each is applied through its value, which invokes a complete instance; one is only dropped.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-verification',
+      new TextEncoder().encode(`import silk.effect { Effect }
+struct Token { value: i32 }
+effect fn guarded<A>(pending: once Effect<A>, token: Token) -> A {
+  drop token
+  return run move pending
+}
+effect fn after<A>(pending: once Effect<A>, step: fn(i32) -> i32) -> A {
+  let value = run move pending
+  drop step
+  return move value
+}
+fn increment(value: i32) -> i32 { return value + 1 }
+effect fn ready() -> i32 { return 1 }
+pub fn main() -> i32 {
+  let dropped = guarded(Token { value: 0 })
+  drop dropped
+  let applied = guarded(Token { value: 1 })
+  let stepped = after(increment)
+  let first = run applied(ready())
+  let second = run stepped(ready())
+  return first + second
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const main = mir.functions.find((fn) => fn.id.name === 'main') ?? unreachable('expected main')
+    assert.isFalse(
+      main.regions.some(
+        (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+      ),
+    )
+    const operations = main.regions.flatMap((region) =>
+      region._tag === 'OperationRegion' ? region.operations : [],
+    )
+    type Construction = Extract<Mir.Operation, { readonly _tag: 'MakeCallable' }>
+    type Application = Extract<Mir.Operation, { readonly _tag: 'ApplyCallable' }>
+    const constructionOf = (name: string): Construction =>
+      operations.find(
+        (operation): operation is Construction =>
+          operation._tag === 'MakeCallable' &&
+          operation.target._tag === 'DeclarationCallableTarget' &&
+          operation.target.declaration.name === name,
+      ) ?? unreachable(`expected a ${name} construction`)
+    const guarded = constructionOf('guarded')
+    const after = constructionOf('after')
+    const application =
+      operations.find(
+        (operation): operation is Application =>
+          operation._tag === 'ApplyCallable' &&
+          operation.callable !== undefined &&
+          main.localTypes.at(operation.callable.ordinal)?._tag === 'CallableValue',
+      ) ?? unreachable('expected an application through a section value')
+    const rules = (module: Mir.Module) =>
+      MirVerification.verify(module).pipe(
+        Effect.map((violations) => violations.map((violation) => violation.rule)),
+      )
+    // Replaces operations and local types of `main` together, so each mutation stays consistent.
+    const mutated = (
+      operationsBy: ReadonlyMap<Mir.Operation, Mir.Operation>,
+      localsBy: ReadonlyMap<number, Mir.Type> = new Map(),
+    ): Mir.Module => ({
+      ...mir,
+      functions: mir.functions.map((fn) =>
+        fn !== main
+          ? fn
+          : {
+              ...fn,
+              localTypes: fn.localTypes.map((type, ordinal) => localsBy.get(ordinal) ?? type),
+              regions: fn.regions.map((region) =>
+                region._tag !== 'OperationRegion'
+                  ? region
+                  : {
+                      ...region,
+                      operations: region.operations.map(
+                        (operation) => operationsBy.get(operation) ?? operation,
+                      ),
+                    },
+              ),
+            },
+      ),
+    })
+    const environmentOf = (construction: Construction) =>
+      construction.type.environment ?? unreachable('expected a construction environment')
+    // A construction whose environment identity is rewritten consistently everywhere it appears.
+    const reidentified = (
+      construction: Construction,
+      identity: ReadonlyArray<Type.GenericArgument>,
+      captured?: ReadonlyArray<Type.GenericArgument>,
+    ): Mir.Module => {
+      const environment = environmentOf(construction)
+      const changed = {
+        ...environment,
+        callable: { ...environment.callable, typeArguments: identity },
+      }
+      const type = { ...construction.type, environment: changed }
+      const typeArguments = [
+        ...identity,
+        ...(captured ?? Layout.callableTargetArguments(environment).slice(identity.length)),
+      ]
+      return mutated(
+        new Map([[construction, { ...construction, type, typeArguments }]]),
+        new Map([[construction.destination.ordinal, type]]),
+      )
+    }
+    const identityOf = (construction: Construction) =>
+      environmentOf(construction).callable.typeArguments
+    const binderOf = (construction: Construction) =>
+      identityOf(construction).find(
+        (argument) => Type.isTypeArgument(argument) && Type.isSectionBinder(argument),
+      ) ?? unreachable('expected a section binder')
+    const replacing = (
+      arguments_: ReadonlyArray<Type.GenericArgument>,
+      from: Type.GenericArgument,
+      to: Type.GenericArgument,
+    ) => arguments_.map((argument) => (argument === from ? to : argument))
+    const binder = binderOf(guarded)
+    const ordinary = Type.parameter({ module: 'generics/construction', name: 'free' }, 0, 'A')
+    const foreign = Type.sectionBinder(
+      Type.parameter({ module: 'generics/construction', name: 'other' }, 0, 'A'),
+    )
+
+    // Construction: the identity closes only its own target's section binders.
+    assert.include(
+      yield* rules(reidentified(guarded, replacing(identityOf(guarded), binder, ordinary))),
+      'InvalidCallableOperation',
+    )
+    assert.include(
+      yield* rules(reidentified(guarded, replacing(identityOf(guarded), binder, foreign))),
+      'InvalidCallableOperation',
+    )
+    // A section binder in the captured-identity segment is never closed.
+    assert.include(
+      yield* rules(reidentified(after, identityOf(after), [binderOf(after)])),
+      'InvalidCallableOperation',
+    )
+    // The construction target must be its environment's target.
+    assert.include(
+      yield* rules(mutated(new Map([[guarded, { ...guarded, target: after.target }]]))),
+      'InvalidCallableOperation',
+    )
+    // Arguments that disagree with the environment (operation only) are rejected on their own.
+    assert.include(
+      yield* rules(
+        mutated(
+          new Map([[guarded, { ...guarded, typeArguments: guarded.typeArguments.slice(1) }]]),
+        ),
+      ),
+      'InvalidCallableOperation',
+    )
+
+    // Application: the invocation must be a complete instance of the environment's identity.
+    const applyWith = (changes: Partial<Application>) =>
+      rules(mutated(new Map([[application, { ...application, ...changes }]])))
+    assert.include(yield* applyWith({ target: guarded.target }), 'InvalidCallableOperation')
+    assert.include(
+      yield* applyWith({ typeArguments: [...application.typeArguments, binder] }),
+      'InvalidCallableOperation',
+    )
+    assert.include(
+      yield* applyWith({ typeArguments: ['bool', ...application.typeArguments.slice(1)] }),
+      'InvalidCallableOperation',
+    )
+    assert.include(
+      yield* applyWith({ callableType: { ...application.callableType, result: 'i64' } }),
+      'InvalidCallableOperation',
+    )
+    assert.include(
+      yield* applyWith({
+        callableType: {
+          ...application.callableType,
+          parameters: [
+            Type.nominal('generics/constrained-section-verification', 'Token', []),
+            ...application.callableType.parameters,
+          ],
+        },
+      }),
+      'InvalidCallableOperation',
+    )
+    // Captured fields: ordinals are unique and in range, and pass as the backend passes them.
+    const source = application.callable ?? unreachable('expected an applied value')
+    const value = main.localTypes.at(source.ordinal)
+    if (value?._tag !== 'CallableValue' || value.environment === undefined)
+      return unreachable('expected an applied environment value')
+    const environment = value.environment
+    const withFields = (fields: typeof environment.fields) =>
+      rules(
+        mutated(
+          new Map(),
+          new Map([[source.ordinal, { ...value, environment: { ...environment, fields } }]]),
+        ),
+      )
+    const [field] = environment.fields
+    if (field === undefined) return unreachable('expected a captured field')
+    assert.include(yield* withFields([field, field]), 'InvalidCallableOperation')
+    assert.include(
+      yield* withFields([{ ...field, parameterOrdinal: 9 }]),
+      'InvalidCallableOperation',
+    )
+    assert.include(
+      yield* withFields([{ ...field, representation: 'Borrow', access: 'Shared' }]),
+      'InvalidCallableOperation',
+    )
+    // The applied value's own target must be its environment's target: a relayed or parameter
+    // value has no construction in this body to vouch for it.
+    assert.include(
+      yield* rules(
+        mutated(new Map(), new Map([[source.ordinal, { ...value, target: after.target }]])),
+      ),
+      'InvalidCallableOperation',
+    )
+  }),
+)
+
+it.effect('binds each captured callable to its own invoked parameter', () =>
+  Effect.gen(function* () {
+    // `forward` and `backward` capture the same two same-signature callables in opposite order.
+    // Each application must invoke the instance whose hidden callable identities match its own
+    // captures position by position; the other instance exists and has the same signature.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-callable-positions',
+      new TextEncoder().encode(`import silk.effect { Effect }
+effect fn both<A>(pending: once Effect<A>, first: fn(i32) -> i32, second: fn(i32) -> i32) -> A {
+  let value = run move pending
+  drop first
+  drop second
+  return move value
+}
+fn increment(value: i32) -> i32 { return value + 1 }
+fn decrement(value: i32) -> i32 { return value - 1 }
+effect fn ready() -> i32 { return 1 }
+pub fn main() -> i32 {
+  let forward = both(increment, decrement)
+  let backward = both(decrement, increment)
+  let left = run forward(ready())
+  let right = run backward(ready())
+  return left + right
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const main = mir.functions.find((fn) => fn.id.name === 'main') ?? unreachable('expected main')
+    const applications = main.regions
+      .flatMap((region) => (region._tag === 'OperationRegion' ? region.operations : []))
+      .filter(
+        (operation): operation is Extract<Mir.Operation, { readonly _tag: 'ApplyCallable' }> =>
+          operation._tag === 'ApplyCallable' && operation.callable !== undefined,
+      )
+    const [forward, backward] = applications
+    if (forward === undefined || backward === undefined)
+      return unreachable('expected both applications')
+    assert.notDeepEqual(
+      forward.typeArguments.map(Type.genericArgumentKey),
+      backward.typeArguments.map(Type.genericArgumentKey),
+    )
+    // The swapped application names `backward`'s real instance and result, so every other premise
+    // holds; only the positions of the captured callables disagree.
+    const swapped: Mir.Module = {
+      ...mir,
+      functions: mir.functions.map((fn) =>
+        fn !== main
+          ? fn
+          : {
+              ...fn,
+              localTypes: fn.localTypes.map((type, ordinal) =>
+                ordinal === forward.destination.ordinal ? backward.type : type,
+              ),
+              regions: fn.regions.map((region) =>
+                region._tag !== 'OperationRegion'
+                  ? region
+                  : {
+                      ...region,
+                      operations: region.operations.map((operation) =>
+                        operation === forward
+                          ? {
+                              ...forward,
+                              typeArguments: backward.typeArguments,
+                              callableType: backward.callableType,
+                              type: backward.type,
+                            }
+                          : operation,
+                      ),
+                    },
+              ),
+            },
+      ),
+    }
+    assert.include(
+      (yield* MirVerification.verify(swapped)).map((violation) => violation.rule),
+      'InvalidCallableOperation',
+    )
+  }),
+)
+
+it('instantiates a nested section identity only with a consistent solution', () => {
+  const owner = { module: 'generics/nested', name: 'wrap' }
+  const a = Type.sectionBinder(Type.parameter(owner, 0, 'A'))
+  const option = (argument: Type.Type) => Type.nominal('silk/option', 'Option', [argument])
+  const target = { _tag: 'Declaration' as const, module: owner.module, name: owner.name }
+  assert.isTrue(Type.instantiatesSectionIdentity(target, [a, option(a)], ['i32', option('i32')]))
+  assert.isFalse(Type.instantiatesSectionIdentity(target, [a, option(a)], ['i32', option('bool')]))
+  // A selected position must stay as the section chose it.
+  assert.isFalse(Type.instantiatesSectionIdentity(target, [a, 'bool'], ['i32', 'i64']))
+  // A binder that no top-level position binds leaves the invocation unrelated to the identity.
+  assert.isFalse(Type.instantiatesSectionIdentity(target, [option(a)], [option('i32')]))
+})
+
+it.effect('keeps ordinary environment applications checked by their value type', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/ordinary-environment-application',
+      new TextEncoder().encode(`fn add(left: i32, right: i32) -> i32 { return left + right }
+pub fn main() -> i32 { let plusTwo = add(2) return plusTwo(40) }`),
+    )
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const main = mir.functions.find((fn) => fn.id.name === 'main') ?? unreachable('expected main')
+    const application =
+      main.regions
+        .flatMap((region) => (region._tag === 'OperationRegion' ? region.operations : []))
+        .find(
+          (operation): operation is Extract<Mir.Operation, { readonly _tag: 'ApplyCallable' }> =>
+            operation._tag === 'ApplyCallable',
+        ) ?? unreachable('expected an application')
+    const changed: Mir.Module = {
+      ...mir,
+      functions: mir.functions.map((fn) =>
+        fn !== main
+          ? fn
+          : {
+              ...fn,
+              regions: fn.regions.map((region) =>
+                region._tag !== 'OperationRegion'
+                  ? region
+                  : {
+                      ...region,
+                      operations: region.operations.map((operation) =>
+                        operation !== application
+                          ? operation
+                          : {
+                              ...application,
+                              callableType: { ...application.callableType, parameters: ['bool'] },
+                            },
+                      ),
+                    },
+              ),
+            },
+      ),
+    }
+    assert.include(
+      (yield* MirVerification.verify(changed)).map((violation) => violation.rule),
+      'InvalidCallableOperation',
+    )
+  }),
+)
+
+it.effect('applies a section built inside a generic owner at each owner instance', () =>
+  Effect.gen(function* () {
+    // `select(true)` leaves `U` open; inside `pickOne<T>` its application solves `U := T`, the
+    // owner's own parameter, which each owner instance then makes concrete.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-generic-owner',
+      new TextEncoder().encode(constrainedSectionGenericOwner),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    assert.isFalse(
+      mir.functions.some((fn) =>
+        fn.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+      ),
+    )
+    // One environment per owner instance, and one concrete invocation of `select` per owner.
+    const byName = (left: string, right: string) => left.localeCompare(right)
+    const owners = sectionEnvironments(snapshot, 'select')
+      .map((environment) => environment.owner.typeArguments.map(Type.encodeGenericArgument).join())
+      .sort(byName)
+    const invoked = Analysis.instancesOf(snapshot)
+      .calls.filter((call) => call.target.declaration.name === 'select')
+      .map((call) => call.target.typeArguments.map(Type.encodeGenericArgument).join())
+      .sort(byName)
+    const expected = ['generics/constrained-section-generic-owner.Token', 'i32'].sort(byName)
+    assert.deepEqual(owners, expected)
+    assert.deepEqual(invoked, expected)
+  }),
+)
+
+it.effect('applies a generic function item piped inside a generic owner', () =>
+  Effect.gen(function* () {
+    // `move value |> keep` solves `U := T` in `pass<T>`'s terms; each owner instance makes it
+    // concrete and invokes its own `keep<…>`.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/generic-item-pipeline-owner',
+      new TextEncoder().encode(genericItemPipelineInGenericOwner),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    assert.isFalse(
+      mir.functions.some((fn) =>
+        fn.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+      ),
+    )
+    const byName = (left: string, right: string) => left.localeCompare(right)
+    assert.deepEqual(
+      Analysis.instancesOf(snapshot)
+        .instances.filter((instance) => instance.key.declaration.name === 'keep')
+        .map((instance) => instance.key.typeArguments.map(Type.encodeGenericArgument).join())
+        .sort(byName),
+      ['generics/generic-item-pipeline-owner.Token', 'i32'].sort(byName),
+    )
+  }),
+)
+
+it.effect('invokes an owner-typed section with its complete call at each owner type', () =>
+  Effect.gen(function* () {
+    // `pair(move right)` selects `A := T` through its capture. Applied directly in a pipeline
+    // (`choose`) or through a value (`chooseBound`), each application invokes exactly `pair<T>`
+    // for the owner instance, named by its own complete call.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/owner-typed-direct-section',
+      new TextEncoder().encode(ownerTypedDirectSection),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const mir = Analysis.loweredMir(snapshot)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    assert.isFalse(
+      mir.functions.some((fn) =>
+        fn.regions.some(
+          (region) => region._tag === 'OperationRegion' && region.outcome._tag === 'Trap',
+        ),
+      ),
+    )
+    const byName = (left: string, right: string) => left.localeCompare(right)
+    for (const owner of ['choose', 'chooseBound']) {
+      const applications = mir.functions
+        .filter((fn) => fn.id.name === owner)
+        .flatMap((fn) =>
+          fn.regions.flatMap((region) =>
+            region._tag === 'OperationRegion'
+              ? region.operations.flatMap((operation) =>
+                  operation._tag === 'ApplyCallable'
+                    ? [operation.typeArguments.map(Type.encodeGenericArgument).join()]
+                    : [],
+                )
+              : [],
+          ),
+        )
+        .sort(byName)
+      assert.deepEqual(
+        applications,
+        ['generics/owner-typed-direct-section.Token', 'i32'].sort(byName),
+        owner,
+      )
+    }
+    assert.deepEqual(
+      Analysis.instancesOf(snapshot)
+        .calls.filter(
+          (call) =>
+            call.owner.declaration.name === 'choose' && call.target.declaration.name === 'pair',
+        )
+        .map((call) => call.target.typeArguments.map(Type.encodeGenericArgument).join())
+        .sort(byName),
+      ['generics/owner-typed-direct-section.Token', 'i32'].sort(byName),
+    )
+  }),
+)
+
+it.effect('rejects applying a take-once constrained section twice', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-section-once',
+      new TextEncoder().encode(`import silk.effect { Effect }
+struct Token { value: i32 }
+effect fn guarded<A>(pending: once Effect<A>, token: Token) -> A {
+  drop token
+  return run move pending
+}
+effect fn ready() -> i32 { return 1 }
+pub fn main() -> i32 {
+  let once = guarded(Token { value: 0 })
+  let first = run once(ready())
+  let second = run once(ready())
+  return first + second
+}`),
+    )
+    assert.isTrue(
+      Analysis.diagnostics(snapshot).some((diagnostic) => diagnostic.code.startsWith('OWN')),
+    )
   }),
 )
 

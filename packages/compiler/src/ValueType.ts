@@ -868,11 +868,9 @@ export const functionItemValueType = (
   item: Extract<Tir.Expression, { readonly _tag: 'FunctionItem' }>,
   applicationSubstitution: Type.Substitution = new Map(),
 ): Extract<Mir.Type, { readonly _tag: 'CallableValue' }> | undefined => {
-  const type = Type.substitute(
-    fn.semantic(item.type),
-    applicationSubstitution,
-    fn.owner.specialization.compatibility,
-  )
+  // The application solves the item's binders in the owner's terms, so it precedes the owner
+  // specialization, as for a directly applied section.
+  const type = fn.semantic(Type.substitute(item.type, applicationSubstitution))
   return Type.isCallable(type) && Type.isRuntimeConcrete(type)
     ? {
         _tag: 'CallableValue',

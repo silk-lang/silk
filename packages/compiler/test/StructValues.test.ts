@@ -86,6 +86,27 @@ fn duplicateAnonymous() -> i32 { let value = .{ age: 1, age: 2 } return 0 }`),
   }),
 )
 
+it.effect('constructs a named struct from every immediate record context', () =>
+  Effect.gen(function* () {
+    const self = yield* Analysis.ofSource(
+      'record-values/contextual',
+      ascii(`struct Pair { left: i32 right: i32 }
+enum Choice { First, Second }
+fn sum(pair: Pair) -> i32 { return pair.left + pair.right }
+fn returned() -> Pair { return .{ left: 20, right: 22 } }
+fn parameter() -> i32 { return sum(.{ left: 20, right: 22 }) }
+fn selected(choice: Choice) -> Pair {
+  let pair: Pair = match choice {
+    Choice.First => .{ left: 20, right: 22 }
+    Choice.Second => .{ left: 21, right: 21 }
+  }
+  return move pair
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
 it.effect('keeps separate same-shaped anonymous record occurrences nominally incompatible', () =>
   Effect.gen(function* () {
     const self = yield* Analysis.ofSource(
