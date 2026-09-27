@@ -59,7 +59,9 @@ The current semantic subset resolves local names, ordinary namespace imports, se
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
 one namespace segment and one public member segment. Import paths map to slash-separated `.silk`
 logical source paths within the importing module's source origin and package. Selected public import
-chains resolve to the canonical declaration. The store resolves type aliases and nominal type
+chains resolve to the canonical declaration. Repeating an identical import binding, or writing an
+alias equal to its default name, is one binding; two imports that bind one spelling to different
+declarations still collide. The store resolves type aliases and nominal type
 identities without inspecting fields or layout. Separate `demandMembers` and `demandMemberShape`
 queries enumerate a struct's fields, tuple positions, enum cases, or union variants, then resolve
 only a selected member's written types under a canonical nominal application. The member ordinal

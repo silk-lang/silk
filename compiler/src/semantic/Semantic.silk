@@ -22,7 +22,7 @@ import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
-import semantic.ModuleIndex {CandidateKind, IndexedDeclaration, ModuleIndex, NameObservation}
+import semantic.ModuleIndex {Candidate, CandidateKind, IndexedDeclaration, ModuleIndex, NameObservation}
 import semantic.Query {Cycle, Query}
 import semantic.Rejection {GenericKind, Rejection, RejectionCode}
 import semantic.SourceIndex {
@@ -1539,6 +1539,92 @@ effect fn declarationAt(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
   return Option.none<DeclarationId>()
 }
 
+fn pathText(hir: &Module, path: HirId, other: HirId) -> bool {
+  if let Node.Path {segments} = Module.node(hir, path) {
+    if let Node.Path {segments: compared} = Module.node(hir, other) {
+      if segments.length != compared.length {
+        return false
+      }
+      let mut at = usize.ZERO
+      while at < segments.length {
+        let left = Module.node(hir, Module.child(hir, segments, at))
+        let right = Module.node(hir, Module.child(hir, compared, at))
+        if let Node.Name {text} = left {
+          if let Node.Name {text: otherText} = right {
+            if !same(Module.text(hir, text), Module.text(hir, otherText)) {
+              return false
+            }
+          } else {
+            return false
+          }
+        } else {
+          return false
+        }
+        at = at + usize.ONE
+      }
+      return true
+    }
+  }
+  return false
+}
+
+// The selected member name of one import-member candidate, as written before any alias.
+fn importedMemberName(hir: &Module, header: HirId, ordinal: usize) -> HirRef {
+  if let Node.ImportHeader {members, ..} = Module.node(hir, header) {
+    if members.present && ordinal < members.range.length {
+      if let Node.ImportMember {name, ..} = Module.node(hir, Module.child(hir, members.range, ordinal)) {
+        return HirRef.of(name)
+      }
+    }
+  }
+  return HirRef.absent()
+}
+
+fn sameWrittenName(hir: &Module, left: HirRef, right: HirRef) -> bool {
+  if !left.present || !right.present {
+    return false
+  }
+  if let Node.Name {text} = Module.node(hir, left.id) {
+    if let Node.Name {text: otherText} = Module.node(hir, right.id) {
+      return same(Module.text(hir, text), Module.text(hir, otherText))
+    }
+  }
+  return false
+}
+
+// IMPORT-006: importing an identical binding twice is one binding. A candidate repeats an earlier
+// one with the same spelling when both are imports of the same kind and visibility, naming the same
+// module path and, for a member import, the same selected member.
+fn repeatsImport(hir: &Module, declarations: &[IndexedDeclaration], candidates: &[Candidate], at: usize) -> bool {
+  let current = &candidates[at]
+  if current.kind == CandidateKind.Declaration {
+    return false
+  }
+  let mut before = usize.ZERO
+  while before < at {
+    let earlier = &candidates[before]
+    if same(Bytes.asSlice(&earlier.name), Bytes.asSlice(&current.name)) && earlier.kind == current.kind && earlier.isPublic == current.isPublic {
+      let earlierHeader = declarations[earlier.declaration].header
+      let currentHeader = declarations[current.declaration].header
+      if let Node.ImportHeader {path: earlierPath, ..} = Module.node(hir, earlierHeader) {
+        if let Node.ImportHeader {path: currentPath, ..} = Module.node(hir, currentHeader) {
+          let samePath = pathText(hir, earlierPath, currentPath)
+          let sameMember = current.kind == CandidateKind.ImportModule || sameWrittenName(
+            hir,
+            importedMemberName(hir, earlierHeader, earlier.ordinal),
+            importedMemberName(hir, currentHeader, current.ordinal),
+          )
+          if samePath && sameMember {
+            return true
+          }
+        }
+      }
+    }
+    before = before + usize.ONE
+  }
+  return false
+}
+
 effect fn select(resolver: &mut Resolver, module: &ModuleId, name: &[u8], external: bool) -> Selection
 ! Cycle | OutOfMemoryError
 ? &mut Allocator {
@@ -1557,9 +1643,10 @@ effect fn select(resolver: &mut Resolver, module: &ModuleId, name: &[u8], extern
       span: Span {start: usize.ZERO, end: usize.ZERO},
       isPublic: false,
     }
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
     let mut at = usize.ZERO
     while at < candidates.length {
-      if same(Bytes.asSlice(&candidates[at].name), name) {
+      if same(Bytes.asSlice(&candidates[at].name), name) && !repeatsImport(hir, declarations, candidates, at) {
         count = count + usize.ONE
         if candidates[at].isPublic {
           publicCount = publicCount + usize.ONE
@@ -8446,12 +8533,16 @@ effect fn resolveImplementationMembers(
   return memberSuccess(Value.ImplementationMembers {members: move members}, move dependencies)
 }
 
-// A nominal or alias name written in a field type, with whether its application writes lifetimes.
+// A nominal or alias name written in a field type. Its application arguments are scanned only once
+// the target is known, because each argument's kind follows the target's binder at that position.
 struct FieldReference {
   path: HirId
   span: Span
+  arguments: HirRef
   writtenLifetimes: bool
 }
+
+impl Copy for FieldReference {}
 
 // What one declaration's written field types (or an alias's target) contribute before any name
 // is resolved: omitted borrow, slice, and `string` lifetimes, and named references.
@@ -8512,87 +8603,161 @@ effect fn scanFieldType(hir: &Module, id: HirId, binders: &[Binder], scan: &mut 
     return ()
   }
   let mut named = HirRef.absent()
-  let mut arguments = Range.empty()
+  let mut hasMode = false
   let mut typeArguments = HirRef.absent()
-  let mut applied = false
-  if let Node.NamedType {path, hasMode, ..} = node {
-    if !hasMode {
-      named = HirRef.of(path)
-    }
+  if let Node.NamedType {path, hasMode: moded, ..} = node {
+    named = HirRef.of(path)
+    hasMode = moded
   }
   if let Node.AppliedType {target, arguments: written} = node {
-    if let Node.NamedType {path, hasMode, ..} = Module.node(hir, target) {
-      if !hasMode {
-        named = HirRef.of(path)
-      }
+    if let Node.NamedType {path, hasMode: moded, ..} = Module.node(hir, target) {
+      named = HirRef.of(path)
+      hasMode = moded
     }
-    if let Node.TypeArguments {arguments: supplied, ..} = Module.node(hir, written) {
-      arguments = supplied
+    if let Node.TypeArguments {..} = Module.node(hir, written) {
       typeArguments = HirRef.of(written)
-      applied = true
     }
   }
   if !named.present {
     return ()
   }
+  let mut effectType = false
   if let Node.Path {segments} = Module.node(hir, named.id) {
     if segments.length == usize.ONE {
       if let Node.Name {text} = Module.node(hir, Module.child(hir, segments, usize.ZERO)) {
         let spelling = Module.text(hir, text)
+        if hasBinder(binders, spelling) || same(spelling, b"never") || primitive(spelling) {
+          return ()
+        }
         if same(spelling, b"string") {
-          if !applied || !writesLifetime(hir, arguments) {
+          if !typeArguments.present || !argumentsWriteLifetime(hir, typeArguments.id) {
             scan.omitted = scan.omitted + usize.ONE
           }
           return ()
         }
-        if hasBinder(binders, spelling) || same(spelling, b"never") || primitive(spelling) {
-          return ()
-        }
-        if same(spelling, b"Effect") {
-          if typeArguments.present {
-            if let Node.TypeArguments {arguments: supplied, environment, failures, ..} = Module.node(
-              hir,
-              typeArguments.id,
-            ) {
-              if !environment.present {
-                scan.omitted = scan.omitted + usize.ONE
-              }
-              let mut at = usize.ZERO
-              while at < supplied.length {
-                run scanFieldType(hir, Module.child(hir, supplied, at), binders, &mut scan.*)
-                at = at + usize.ONE
-              }
-              if failures.present {
-                run scanFieldType(hir, failures.id, binders, &mut scan.*)
-              }
-            }
-          }
-          return ()
-        }
+        effectType = same(spelling, b"Effect")
       }
     }
   }
-  let mut at = usize.ZERO
-  while at < arguments.length {
-    let argument = Module.child(hir, arguments, at)
-    let lifetimeArgument = match Module.node(hir, argument) {
-      Node.Lifetime {..} => true
-      _ => false
+  // Only `Effect` takes a run mode; any other moded name is invalid where its member is demanded.
+  if effectType {
+    if typeArguments.present {
+      if let Node.TypeArguments {arguments: supplied, environment, failures, requirements} = Module.node(
+        hir,
+        typeArguments.id,
+      ) {
+        if !environment.present {
+          scan.omitted = scan.omitted + usize.ONE
+        }
+        let mut at = usize.ZERO
+        while at < supplied.length {
+          run scanFieldType(hir, Module.child(hir, supplied, at), binders, &mut scan.*)
+          at = at + usize.ONE
+        }
+        if failures.present {
+          run scanFieldType(hir, failures.id, binders, &mut scan.*)
+        }
+        if requirements.present {
+          run scanRowSyntax(hir, requirements.id, binders, &mut scan.*)
+        }
+      }
     }
-    if !lifetimeArgument {
-      run scanFieldType(hir, argument, binders, &mut scan.*)
-    }
-    at = at + usize.ONE
+    return ()
+  }
+  if hasMode {
+    return ()
   }
   run Vector.append<FieldReference>(
     &mut scan.references,
     FieldReference {
       path: named.id,
       span: Module.span(hir, id),
-      writtenLifetimes: applied && writesLifetime(hir, arguments),
+      arguments: typeArguments,
+      writtenLifetimes: typeArguments.present && argumentsWriteLifetime(hir, typeArguments.id),
     },
   )
   return ()
+}
+
+fn argumentsWriteLifetime(hir: &Module, arguments: HirId) -> bool {
+  if let Node.TypeArguments {arguments: supplied, ..} = Module.node(hir, arguments) {
+    return writesLifetime(hir, supplied)
+  }
+  return false
+}
+
+// Scans a requirement row: only its capability types can carry lifetimes. A borrow in a row is an
+// access marker, not a borrowed value; a row binder or `never` contributes nothing.
+effect fn scanRowSyntax(hir: &Module, id: HirId, binders: &[Binder], scan: &mut FieldScan) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let node = Module.node(hir, id)
+  if let Node.RequirementRow {members} = node {
+    let mut at = usize.ZERO
+    while at < members.length {
+      run scanRowSyntax(hir, Module.child(hir, members, at), binders, &mut scan.*)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if let Node.UnionType {members} = node {
+    let mut at = usize.ZERO
+    while at < members.length {
+      run scanRowSyntax(hir, Module.child(hir, members, at), binders, &mut scan.*)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if let Node.Requirement {capability, ..} = node {
+    return run scanFieldType(hir, capability, binders, &mut scan.*)
+  }
+  if let Node.ReferenceType {referent, ..} = node {
+    return run scanFieldType(hir, referent, binders, &mut scan.*)
+  }
+  if let Node.RequirementSelector {subject, ..} = node {
+    return run scanFieldType(hir, subject, binders, &mut scan.*)
+  }
+  return ()
+}
+
+// Scans an application's arguments by the target's binder kinds: a type argument is a written type,
+// a row argument is a requirement row, and a lifetime argument contributes nothing.
+effect fn scanApplicationArguments(
+  resolver: &mut Resolver,
+  module: &ModuleId,
+  arguments: HirId,
+  target: &[Binder],
+  binders: &[Binder],
+) -> FieldScan ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut scan = FieldScan {omitted: usize.ZERO, references: Vector.make<FieldReference>()}
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let hir = IndexedSource.authored(value)
+    if let Node.TypeArguments {arguments: supplied, requirements, ..} = Module.node(hir, arguments) {
+      let mut at = usize.ZERO
+      while at < supplied.length {
+        let argument = Module.child(hir, supplied, at)
+        let mut kind = GenericKind.Type
+        if at < target.length {
+          kind = binderKind(&target[at])
+        }
+        let isLifetime = match Module.node(hir, argument) {
+          Node.Lifetime {..} => true
+          _ => false
+        }
+        if kind == GenericKind.Requirement {
+          run scanRowSyntax(hir, argument, binders, &mut scan)
+        } else if !isLifetime {
+          run scanFieldType(hir, argument, binders, &mut scan)
+        }
+        at = at + usize.ONE
+      }
+      if requirements.present {
+        run scanRowSyntax(hir, requirements.id, binders, &mut scan)
+      }
+    }
+  }
+  return move scan
 }
 
 // Scans a struct's, tuple's, or union's field types, or an alias's target, in written order.
@@ -8870,17 +9035,19 @@ effect fn resolveFieldLifetimes(
       nodeDeclaration,
       Vector.asSlice<Binder>(&binders),
     )
-    let mut contribution = scan.omitted
-    let references = Vector.asSlice<FieldReference>(&scan.references)
+    let FieldScan {omitted: written, references: found} = move scan
+    let mut contribution = written
+    let mut pending = move found
     let mut referenceAt = usize.ZERO
-    while referenceAt < references.length {
+    while referenceAt < Vector.length<FieldReference>(&pending) {
+      let reference = Vector.get<FieldReference>(&pending, referenceAt)
       let selected = run fieldTarget(
         &mut resolver.*,
         &mut owner.*,
         &mut dependencies,
         nodeModuleOrdinal,
         &nodeModule,
-        &references[referenceAt],
+        &reference,
       )
       let target = match move selected {
         Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => value
@@ -8899,17 +9066,36 @@ effect fn resolveFieldLifetimes(
         }
       }
       let targetTemplate = run templateBinders(&mut resolver.*, &targetModule, target.ordinal)
-      let written = match move targetTemplate {
-        Result<Vector<Binder>, Shared<Rejection>>.Success {value} => writtenLifetimeCount(
-          Vector.asSlice<Binder>(&value),
-        )
+      let targetBinders = match move targetTemplate {
+        Result<Vector<Binder>, Shared<Rejection>>.Success {value} => move value
         Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
           return memberRejected(move error, move dependencies)
         }
       }
-      let unwritten = !references[referenceAt].writtenLifetimes
+      let writtenLifetimes = writtenLifetimeCount(Vector.asSlice<Binder>(&targetBinders))
+      if reference.arguments.present {
+        let nested = run scanApplicationArguments(
+          &mut resolver.*,
+          &nodeModule,
+          reference.arguments.id,
+          Vector.asSlice<Binder>(&targetBinders),
+          Vector.asSlice<Binder>(&binders),
+        )
+        let FieldScan {omitted: argumentOmissions, references: argumentReferences} = move nested
+        contribution = contribution + argumentOmissions
+        let more = Vector.asSlice<FieldReference>(&argumentReferences)
+        let mut moreAt = usize.ZERO
+        while moreAt < more.length {
+          run Vector.append<FieldReference>(&mut pending, more[moreAt])
+          moreAt = moreAt + usize.ONE
+        }
+      }
+      // Any written lifetime argument is taken as the complete list. Declaration applications
+      // currently elide the rest of a partial list; whether a partial list is valid at all is an
+      // open question under GEN-002, so this count does not guess at it.
+      let unwritten = !reference.writtenLifetimes
       if unwritten {
-        contribution = contribution + written
+        contribution = contribution + writtenLifetimes
       }
       // An aggregate used without lifetimes also omits its generated ones; an alias's target
       // elides its own omissions at every use.
@@ -8917,7 +9103,7 @@ effect fn resolveFieldLifetimes(
         let node = run fieldNode(&mut modules, &mut declarations, target.module, target.ordinal)
         run Vector.append<usize>(&mut sources, at)
         run Vector.append<usize>(&mut targets, node)
-        run Vector.append<Span>(&mut edgeSpans, references[referenceAt].span)
+        run Vector.append<Span>(&mut edgeSpans, reference.span)
       }
       referenceAt = referenceAt + usize.ONE
     }
