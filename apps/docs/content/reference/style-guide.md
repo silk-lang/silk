@@ -124,7 +124,10 @@ or service, not to collect functions. When a contract operation is also a useful
 declare it as an inherent member and map the conformance operation to it; an inline conformance
 body remains valid when no separately callable operation is useful.
 
-Only the module declaring a nominal type may declare its inherent impls and its conformances.
+Only the module declaring a nominal type may declare its inherent impls. A conformance belongs to
+the provider's module or, for an interface, to the interface's module, as
+[IMPL-004](generics-interfaces-and-specialization.md#impl-004--an-interface-or-its-nominal-provider-may-own-a-conformance)
+defines.
 Another module adds behavior for an existing public type as a free function qualified by the
 module that defines it—or imported directly—never by injecting a member into the owner. Modules and
 nominal types are not reopenable namespaces. If two imported modules or selected functions would
@@ -221,8 +224,8 @@ Namespace imports, member aliases, and hybrid imports have their ordinary langua
 reference page specifically documenting those forms should show them directly even though general
 examples prefer the owner import. A root type declared beside an owner is not an associated item of
 that owner: select `ParseError` directly with `import silk.format { Format, ParseError }` rather
-than writing `Format.ParseError`. Conformances still belong to the provider's module, whichever
-type an example imports.
+than writing `Format.ParseError`. A conformance still belongs to the module IMPL-004 permits,
+whichever type an example imports.
 
 **Tooling:** Formatters do not rewrite between namespace and selective imports. Documentation lint
 may prefer qualification in general examples but must permit selective imports where the example is

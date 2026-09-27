@@ -1600,8 +1600,10 @@ The later interface rules must preserve decisions already confirmed elsewhere:
   forms. See [SERV-001](requirements-and-services.md#serv-001--a-conformance-may-define-or-map-each-operation).
 - A service is an interface with dependency eligibility and no other distinct conformance behavior.
   See [SERV-003](requirements-and-services.md#serv-003--a-service-is-a-dependency-eligible-interface).
-- Only the module defining a nominal provider type may declare its conformances. See
-  [STYLE-002](style-guide.md#style-002--operations-intrinsic-to-one-type-are-inherent-members-with-the-receiver-first).
+- An interface conformance for a nominal provider belongs to the interface's module or the
+  provider's module; a service conformance belongs to the provider's module; a scalar or `string`
+  provider's conformance belongs to the interface's module. See
+  [IMPL-004](#impl-004--an-interface-or-its-nominal-provider-may-own-a-conformance).
 - Interface operation operands retain their declared move or borrow modes. They do not receive
   blanket reference adaptation.
 - Effectful operations preserve ordinary failure types, requirement rows, and explicit Effect
