@@ -1966,22 +1966,31 @@ export interface CallableFlow {
 
 const callableSourceOf = (
   current: ExpressionDecision | Tir.Expression,
+  builder: BodyBuilder.BodyBuilder,
   bindings: ReadonlySet<number> = new Set(),
   tirBindings: ReadonlyMap<number, Tir.Expression> = new Map(),
   index?: DeclarationIndex.Index,
 ): CallableSource | undefined => {
   if ('origin' in current) {
     if (current._tag === 'Move')
-      return callableSourceOf(current.subject, bindings, tirBindings, index)
-    if (current._tag === 'ParameterReference')
-      return { _tag: 'Parameter', ordinal: current.parameter.ordinal }
+      return callableSourceOf(current.subject, builder, bindings, tirBindings, index)
+    // TIR locals are dense body identities; relays and escapes name declaration identities.
+    if (current._tag === 'ParameterReference') {
+      const parameter = BodyBuilder.semanticOfLocal(builder, current.parameter)
+      return isParameterFact(parameter)
+        ? { _tag: 'Parameter', ordinal: parameter.id.ordinal }
+        : undefined
+    }
     if (current._tag === 'BindingReference') {
-      const ordinal = current.binding.ordinal
+      const binding = BodyBuilder.semanticOfLocal(builder, current.binding)
+      if (!isBindingDeclarationFact(binding)) return undefined
+      const ordinal = binding.id.ordinal
       if (bindings.has(ordinal)) return undefined
       const initializer = tirBindings.get(ordinal)
       if (initializer === undefined) return undefined
       const source = callableSourceOf(
         initializer,
+        builder,
         new Set(bindings).add(ordinal),
         tirBindings,
         index,
@@ -1999,7 +2008,7 @@ const callableSourceOf = (
       _tag: 'Call',
       target: `${current.target.module}\u0000${current.target.name}`,
       arguments: current.arguments.flatMap((argument, position) => {
-        const source = callableSourceOf(argument, bindings, tirBindings, index)
+        const source = callableSourceOf(argument, builder, bindings, tirBindings, index)
         return source === undefined
           ? []
           : [{ parameter: parameters.at(position)?.id.ordinal ?? position, source }]
@@ -2007,7 +2016,7 @@ const callableSourceOf = (
     }
   }
   if (current._tag === 'Move')
-    return callableSourceOf(current.subject, bindings, tirBindings, index)
+    return callableSourceOf(current.subject, builder, bindings, tirBindings, index)
   if (current._tag === 'Identifier') {
     if (current.reference._tag === 'Resolved')
       return { _tag: 'Parameter', ordinal: current.reference.parameter.id.ordinal }
@@ -2016,6 +2025,7 @@ const callableSourceOf = (
     if (bindings.has(ordinal)) return undefined
     const source = callableSourceOf(
       current.reference.binding.initializer,
+      builder,
       new Set(bindings).add(ordinal),
       tirBindings,
       index,
@@ -2029,7 +2039,13 @@ const callableSourceOf = (
     _tag: 'Call',
     target,
     arguments: current.mappings.flatMap((mapping) => {
-      const source = callableSourceOf(mapping.argument.expression, bindings, tirBindings, index)
+      const source = callableSourceOf(
+        mapping.argument.expression,
+        builder,
+        bindings,
+        tirBindings,
+        index,
+      )
       return source === undefined ? [] : [{ parameter: mapping.parameter.id.ordinal, source }]
     }),
   }
@@ -2185,7 +2201,7 @@ const callableFlowOf = (
     fn.declaration.parameters.length === 1 &&
     terminal?._tag === 'Return' &&
     leading.every((statement) => statement._tag === 'Bind')
-      ? callableSourceOf(terminal.expression, new Set(), tirBindings, index)
+      ? callableSourceOf(terminal.expression, builder, new Set(), tirBindings, index)
       : undefined
   return {
     ...(source === undefined
