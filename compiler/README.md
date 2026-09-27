@@ -194,6 +194,25 @@ solve conformances, select providers, check captures, or run Effects. The scalar
 rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
 even when their signatures resolve.
 
+`Semantic.demandOperations` lists an interface's or service's operations; each operation resolves
+under its contract's binders and an implicit `Self`. `demandImplementations` returns a module's
+conformance and sealed-property `impl` heads, `demandConformanceHeads` every head for one contract
+and provider owner read from only the modules permitted to own it, and `demandImplementationMembers`
+a conformance's inline and mapped members. `demandInherentMembers` publishes an owner's inherent
+members across its `impl` blocks; a repeated or claimed name publishes neither. `demandSignatureOf`
+resolves a function or operation by its declaration identity under the same gates as the name
+lookups `demandOperation` and `demandInherentMember`. `demandOperationUnder` resolves a contract
+operation under one conformance head: the contract's binders and `Self` take the head's arguments,
+the operation's own binders stay its parameters, and no bound is proved. Under
+`impl Convert<i32> for Box<bool>`, `fn convert<U>(value: Self, other: U) -> T` has the parameters
+`Box<bool>` and `U` and the result `i32`.
+
+`Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
+binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
+and `Intrinsic.NonParking` are witness-free properties recorded on generic bounds, and a Detached
+representation parameter retains no region. Other intrinsic families, `impl Intrinsic`, and calls
+such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
+
 Generic calls and demanded generic bodies, type inference, applications of declarations with
 interface or representation bounds, a declaration with more than one `?R` binder when applied, a
 lifetime omitted inside a type declaration's bound, row subtraction such as `Without<R, K>` (which
