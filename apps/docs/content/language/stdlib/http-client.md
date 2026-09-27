@@ -875,7 +875,7 @@ Returns the next permitted stage.
 ### Method `Exchange.head`
 
 ```silk
-pub effect<'env> fn head<'exchange: 'env, P: 'env, 'head: 'env, 'env>(self: &'head Exchange<'exchange, P>) -> silk/http_head.ResponseHead<'head> ! ClientError
+pub effect<'head> fn head<'exchange: 'head, P: 'head, 'head>(self: &'head Exchange<'exchange, P>) -> silk/http_head.ResponseHead<'head> ! ClientError
 ```
 
 Borrows the most recently received head until the exchange is mutably used again.
@@ -896,7 +896,7 @@ A higher-ranked callback that cannot return its connection loan.
 ### Operation `handle`
 
 ```silk
-effect<'call> fn handle<'call: 'call>(handler: Self, connection: &'call mut silk/http_client.Connection<P>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
+effect<'call> fn handle<'call>(handler: Self, connection: &'call mut silk/http_client.Connection<P>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Runs inside an exclusive connection scope and preserves caller channels.
@@ -1104,7 +1104,7 @@ A higher-ranked callback for one selected route and its final HTTP connection.
 ### Operation `handle`
 
 ```silk
-effect<'call> fn handle<'call: 'call, 'transport: 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(handler: Self, route: silk/http_proxy.Route<'configuration>, connection: &'call mut silk/http_client.Connection<silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
+effect<'call> fn handle<'call, 'transport: 'call, 'provider: 'transport + 'call, 'tunnel: 'provider + 'call>(handler: Self, route: silk/http_proxy.Route<'configuration>, connection: &'call mut silk/http_client.Connection<silk/http_client.RouteTransport<'transport, 'provider, 'tunnel, P>>) -> A ! E ? R where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Runs after route acquisition and required origin authentication complete.
@@ -1190,7 +1190,7 @@ Lends an owned connection for a callback, then closes it on every exit.
 ## `withConnected`
 
 ```silk
-pub effect<'env> fn withConnected<'env: 'env, P: 'env, A, E, ?R, H: 'env>(transport: &'env mut P, origin: Origin, version: Version, limits: Limits, overallDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> A ! E | ClientError | OutOfMemoryError ? R | &mut Allocator where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withConnected<'env, P: 'env, A, E, ?R, H: 'env>(transport: &'env mut P, origin: Origin, version: Version, limits: Limits, overallDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> A ! E | ClientError | OutOfMemoryError ? R | &mut Allocator where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Lends an explicit transport through one terminal connection scope while its physical owner stays outside.
@@ -1200,7 +1200,7 @@ Lends an explicit transport through one terminal connection scope while its phys
 ## `close`
 
 ```silk
-pub effect<'env> fn close<P: 'env, 'life1: 'env, 'env>(connection: &'life1 mut silk/http_client.Connection<P>) -> () ! ClientError where &mut P provides &HttpTransport from &mut HttpTransport
+pub effect<'life1> fn close<P: 'life1, 'life1>(connection: &'life1 mut silk/http_client.Connection<P>) -> () ! ClientError where &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Closes an owned connection terminally without flushing or draining; repeated closure is local.
@@ -1210,7 +1210,7 @@ Closes an owned connection terminally without flushing or draining; repeated clo
 ## `withExchange`
 
 ```silk
-pub effect<'env> fn withExchange<'exchange: 'env, 'callback: 'env, P: 'env, A, E, ?R, 'life6: 'env, 'env>(connection: &'exchange mut silk/http_client.Connection<P>, request: &'life6 silk/http_request.PreparedRequest, requestedOptions: RequestOptions, callback: for<'call, 'exchangeView: 'call> once fn<'callback>(&'call mut silk/http_client.Exchange<'exchangeView, P>) -> once Effect<'call & 'callback; A ! E ? R>) -> A ! E | ClientError | OutOfMemoryError ? R | &mut Allocator
+pub effect<'exchange & 'callback & 'life6> fn withExchange<'exchange, 'callback, P: 'exchange & 'callback & 'life6, A, E, ?R, 'life6>(connection: &'exchange mut silk/http_client.Connection<P>, request: &'life6 silk/http_request.PreparedRequest, requestedOptions: RequestOptions, callback: for<'call, 'exchangeView: 'call> once fn<'callback>(&'call mut silk/http_client.Exchange<'exchangeView, P>) -> once Effect<'call & 'callback; A ! E ? R>) -> A ! E | ClientError | OutOfMemoryError ? R | &mut Allocator
 ```
 
 Lends one prepared exchange. Incomplete or failed callbacks permanently remove reuse authority.
@@ -1220,7 +1220,7 @@ Lends one prepared exchange. Incomplete or failed callbacks permanently remove r
 ## `send`
 
 ```silk
-pub effect<'env> fn send<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn send<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Sends the prepared head once; Require100 also flushes before waiting for response heads.
@@ -1230,7 +1230,7 @@ Sends the prepared head once; Require100 also flushes before waiting for respons
 ## `writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<'exchange: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, input: &'life3 [u8]) -> WriteProgress ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn writeSome<'exchange: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, input: &'life3 [u8]) -> WriteProgress ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Accepts one payload prefix and preserves exact payload and transport progress on failure.
@@ -1240,7 +1240,7 @@ Accepts one payload prefix and preserves exact payload and transport progress on
 ## `finishRequest`
 
 ```silk
-pub effect<'env> fn finishRequest<'exchange: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, trailers: &'life3 silk/http_headers.Headers<'life4>) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn finishRequest<'exchange: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3, 'life4: 'life2 & 'life3>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, trailers: &'life3 silk/http_headers.Headers<'life4>) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Completes bounded request trailers and flushes before response reads are permitted.
@@ -1250,7 +1250,7 @@ Completes bounded request trailers and flushes before response reads are permitt
 ## `receive`
 
 ```silk
-pub effect<'env> fn receive<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> u16 ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn receive<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> u16 ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Receives one bounded head; informational and final error statuses remain ordinary response values.
@@ -1260,7 +1260,7 @@ Receives one bounded head; informational and final error statuses remain ordinar
 ## `receiveFinal`
 
 ```silk
-pub effect<'env> fn receiveFinal<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> u16 ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn receiveFinal<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> u16 ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Receives bounded informational heads until the shared parser reaches one final response.
@@ -1275,7 +1275,7 @@ original `ClientError`. This operation does not copy response metadata or consum
 ## `readSome`
 
 ```silk
-pub effect<'env> fn readSome<'exchange: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, output: &'life3 mut [u8]) -> usize ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn readSome<'exchange: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, output: &'life3 mut [u8]) -> usize ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Reads one framed payload prefix without consuming the next message suffix.
@@ -1285,7 +1285,7 @@ Reads one framed payload prefix without consuming the next message suffix.
 ## `discardRemainingAtMost`
 
 ```silk
-pub effect<'env> fn discardRemainingAtMost<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64, deadline: silk/option.Option<silk/system_clock.Instant>) -> DiscardOutcome ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn discardRemainingAtMost<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64, deadline: silk/option.Option<silk/system_clock.Instant>) -> DiscardOutcome ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Discards response framing up to one aggregate wire-byte limit and reports whether it completed.
@@ -1310,7 +1310,7 @@ Malformed framing and read, deadline, allocation, or transport failures remain t
 ## `drainAndFinishAtMost`
 
 ```silk
-pub effect<'env> fn drainAndFinishAtMost<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64, deadline: Instant) -> DiscardOutcome ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn drainAndFinishAtMost<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64, deadline: Instant) -> DiscardOutcome ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Drains and finishes the selected response under one finite aggregate wire-byte limit.
@@ -1336,7 +1336,7 @@ transport, and content-decoder failures remain their original typed failures.
 ## `discardRemaining`
 
 ```silk
-pub effect<'env> fn discardRemaining<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2> fn discardRemaining<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, maxWireBytes: u64) -> () ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Discards response framing under the smaller caller and client wire budget, without consuming a subsequent message.
@@ -1347,7 +1347,7 @@ A deadline, limit, framing, or transport failure permanently removes reuse autho
 ## `trailers`
 
 ```silk
-pub effect<'env> fn trailers<'head: 'env, 'exchange: 'env, P: 'env, 'env>(exchange: &'head silk/http_client.Exchange<'exchange, P>) -> silk/option.Option<silk/http_body.Trailers<'head>> ! ClientError
+pub effect<'head> fn trailers<'head, 'exchange: 'head, P: 'head>(exchange: &'head silk/http_client.Exchange<'exchange, P>) -> silk/option.Option<silk/http_body.Trailers<'head>> ! ClientError
 ```
 
 Returns completed chunk trailers borrowed exclusively from the active exchange.
@@ -1357,7 +1357,7 @@ Returns completed chunk trailers borrowed exclusively from the active exchange.
 ## `finishResponse`
 
 ```silk
-pub effect<'env> fn finishResponse<'exchange: 'env, P: 'env, 'life2: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> () ! ClientError
+pub effect<'life2> fn finishResponse<'exchange: 'life2, P: 'life2, 'life2>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>) -> () ! ClientError
 ```
 
 Completes the response only after framing proves its boundary; never drains unread bytes.
@@ -1387,7 +1387,7 @@ An exclusive non-HTTP channel that reads the buffered response suffix first.
 ### Method `Tunnel.transferByteDuplex`
 
 ```silk
-pub effect<'env> fn transferByteDuplex<'tunnel: 'env, P: 'env, 'transfer: 'env, 'callback: 'env, A, E, ?CallbackRequirements, 'env>(self: &'transfer mut Tunnel<'tunnel, P>, callback: for<'call, 'duplexView: 'call> once fn<'callback>(&'call mut silk/http_client.TransferredTunnel<'duplexView, P>) -> once Effect<'call & 'callback; A ! E ? CallbackRequirements>) -> A ! E | ClientError ? CallbackRequirements where &mut P provides &ByteDuplex from &mut ByteDuplex, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'transfer & 'callback> fn transferByteDuplex<'tunnel: 'transfer & 'callback, P: 'transfer & 'callback, 'transfer, 'callback, A, E, ?CallbackRequirements>(self: &'transfer mut Tunnel<'tunnel, P>, callback: for<'call, 'duplexView: 'call> once fn<'callback>(&'call mut silk/http_client.TransferredTunnel<'duplexView, P>) -> once Effect<'call & 'callback; A ! E ? CallbackRequirements>) -> A ! E | ClientError ? CallbackRequirements where &mut P provides &ByteDuplex from &mut ByteDuplex, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Transfers the exact tunnel provider and retained input suffix to one scoped byte duplex.
@@ -1408,7 +1408,7 @@ Closed authority unchanged.
 ### Method `Tunnel.readSome`
 
 ```silk
-pub effect<'env> fn readSome<'tunnel: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut Tunnel<'tunnel, P>, output: &'life3 mut [u8], requestedDeadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn readSome<'tunnel: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut Tunnel<'tunnel, P>, output: &'life3 mut [u8], requestedDeadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Reads the retained tunnel suffix before asking the underlying transport for more input.
@@ -1418,7 +1418,7 @@ Reads the retained tunnel suffix before asking the underlying transport for more
 ### Method `Tunnel.writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<'tunnel: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut Tunnel<'tunnel, P>, input: &'life3 [u8], requestedDeadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn writeSome<'tunnel: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut Tunnel<'tunnel, P>, input: &'life3 [u8], requestedDeadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Writes one tunnel prefix under the caller's absolute deadline.
@@ -1443,7 +1443,7 @@ deadline. Complete close is terminal and attempts the concrete provider close at
 ## `withTunnel`
 
 ```silk
-pub effect<'env> fn withTunnel<'tunnel: 'env, 'exchange: 'tunnel + 'env, 'callback: 'env, P: 'env, A, E, ?R, 'env>(exchange: &'tunnel mut silk/http_client.Exchange<'exchange, P>, callback: for<'call, 'tunnelView: 'call> once fn<'callback>(&'call mut silk/http_client.Tunnel<'tunnelView, P>) -> once Effect<'call & 'callback; A ! E ? R>) -> A ! E | ClientError ? R
+pub effect<'tunnel & 'callback> fn withTunnel<'tunnel, 'exchange: 'tunnel + 'tunnel & 'callback, 'callback, P: 'tunnel & 'callback, A, E, ?R>(exchange: &'tunnel mut silk/http_client.Exchange<'exchange, P>, callback: for<'call, 'tunnelView: 'call> once fn<'callback>(&'call mut silk/http_client.Tunnel<'tunnelView, P>) -> once Effect<'call & 'callback; A ! E ? R>) -> A ! E | ClientError ? R
 ```
 
 Hands successful CONNECT to one scoped tunnel callback and permanently consumes HTTP reuse authority.
@@ -1501,7 +1501,7 @@ closeRaw = TransferredTunnel.closeTransport
 ## `beginContent`
 
 ```silk
-pub effect<'env> fn beginContent<'head: 'env, 'exchange: 'head + 'env, P: 'env, 'env>(exchange: &'head mut silk/http_client.Exchange<'exchange, P>, mode: ContentMode, limits: ContentLimits) -> AppliedPlan ! ClientError | silk/http_content.ContentError<'head> | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock
+pub effect<'head> fn beginContent<'head, 'exchange: 'head, P: 'head>(exchange: &'head mut silk/http_client.Exchange<'exchange, P>, mode: ContentMode, limits: ContentLimits) -> AppliedPlan ! ClientError | silk/http_content.ContentError<'head> | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock
 ```
 
 Selects one content pipeline from this exchange's current head before a nonempty raw read or a discard.
@@ -1516,7 +1516,7 @@ The returned copy records the applied representation policy without exposing the
 ## `readContentSome`
 
 ```silk
-pub effect<'env> fn readContentSome<'exchange: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, output: &'life3 mut [u8]) -> ContentProgress ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'life2 & 'life3> fn readContentSome<'exchange: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(exchange: &'life2 mut silk/http_client.Exchange<'exchange, P>, output: &'life3 mut [u8]) -> ContentProgress ! ClientError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Reads content-decoded bytes through the same rich transport and absolute deadline as the exchange.

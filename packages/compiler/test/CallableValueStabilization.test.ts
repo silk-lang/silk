@@ -20,7 +20,7 @@ it.effect(
           `struct Loan<'provider, P> { provider: &'provider mut P }
 struct Owned<P> { provider: P }
 struct Route<'configuration> { label: &'configuration i32 }
-effect fn scoped<'env, P>(provider: P, use: for<'call> once fn<'env>(&'call mut Owned<P>) -> once Effect<'call & 'env; i32>) -> i32 {
+effect<'env> fn scoped<'env, P: 'env>(provider: P, use: for<'call> once fn<'env>(&'call mut Owned<P>) -> once Effect<'call & 'env; i32>) -> i32 {
   let mut owned = Owned<P> {provider: move provider}
   return run use(&mut owned)
 }
@@ -73,7 +73,7 @@ fn generic<T>(holder: Holder<T>) -> () {
   let inspect = fn(value: &Holder<T>) -> () { drop value }
   inspect(&holder)
 }
-effect fn genericEffect<T>(holder: Holder<T>) -> () {
+effect<'env> fn genericEffect<T: 'env, 'env>(holder: Holder<T>) -> () {
   let inspect = effect fn(value: &Holder<T>) -> () { drop value }
   run inspect(&holder)
 }
@@ -97,7 +97,7 @@ effect fn scope<'env, T, A, E, ?R>(
   holder: &mut Holder<T>,
   use: for<'call, 'view: 'call> once fn<'env>(&'call mut Holder<'view, T>) -> once Effect<'call & 'env; A ! E ? R>,
 ) -> A ! E ? R { return run use(move holder) }
-effect fn caller<'env, T, C, A, E, ?R>(
+effect<'env> fn caller<'env, T, C: 'env, A, E, ?R>(
   holder: &mut Holder<T>,
   captured: C,
   work: once fn<'env>() -> once Effect<'env; A ! E | Problem ? R | &Logger>,

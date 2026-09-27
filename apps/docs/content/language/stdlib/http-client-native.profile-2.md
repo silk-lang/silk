@@ -533,7 +533,7 @@ Rejects native HTTP acquisition before allocation or provider dispatch on this t
 ## `withUnixConnection`
 
 ```silk
-pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'life4: 'env, 'env>(path: &'life4 [u8], origin: Origin, options: Options, limits: Limits, handler: H) -> A ! E | NativeClientError ? R
+pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'env, 'life5: 'env>(path: &'life5 [u8], origin: Origin, options: Options, limits: Limits, handler: H) -> A ! E | NativeClientError ? R
 ```
 
 Rejects Unix HTTP acquisition before allocation or provider dispatch on this target.

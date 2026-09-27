@@ -1453,7 +1453,7 @@ One affine authenticated TLS 1.3 client state machine.
 ### Associated function `Client.make`
 
 ```silk
-pub effect<'env> fn make<'a: 'env, 'life1: 'env, 'env>(config: &'life1 silk/tls_client.ClientConfig<'a>, trust: TrustSnapshot, validationTime: Instant) -> silk/result.Result<silk/tls_client.Client, silk/tls_client.TlsError> ! OutOfMemoryError ? &mut Allocator | &mut Random
+pub effect<'life1> fn make<'a: 'life1, 'life1>(config: &'life1 silk/tls_client.ClientConfig<'a>, trust: TrustSnapshot, validationTime: Instant) -> silk/result.Result<silk/tls_client.Client, silk/tls_client.TlsError> ! OutOfMemoryError ? &mut Allocator | &mut Random
 ```
 
 Creates a client, consumes explicit trust, copies validated configuration, and queues ClientHello.
@@ -1494,7 +1494,7 @@ Returns authenticated metadata only after the one-shot authentication event beco
 ### Method `Client.feedInput`
 
 ```silk
-pub effect<'env> fn feedInput<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut Client, input: &'life1 [u8]) -> silk/result.Result<silk/tls_client.Progress, silk/tls_client.TlsError> ! OutOfMemoryError ? &mut Allocator | &mut Random
+pub effect<'life0 & 'life1> fn feedInput<'life0, 'life1>(self: &'life0 mut Client, input: &'life1 [u8]) -> silk/result.Result<silk/tls_client.Progress, silk/tls_client.TlsError> ! OutOfMemoryError ? &mut Allocator | &mut Random
 ```
 
 Feeds a peer-ciphertext prefix without retaining the caller slice.

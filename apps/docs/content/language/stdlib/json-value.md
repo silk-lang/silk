@@ -304,7 +304,7 @@ Deserializes one complete JSON document, with allocation charged to the ambient 
 ### Associated function `Json.serialize`
 
 ```silk
-pub effect<'env> fn serialize<T: 'env, 'life1: 'env, 'life2: 'env, 'env>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+pub effect<'life1 & 'life2> fn serialize<T: 'life1 & 'life2, 'life1, 'life2>(value: &'life1 T, options: &'life2 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
 ```
 
 Serializes one value through its static witness and the ambient Writer.
@@ -324,7 +324,7 @@ Writes a tree compactly through the ambient Writer.
 ### Associated function `Json.writeWith`
 
 ```silk
-pub effect<'env> fn writeWith<'life0: 'env, 'life1: 'env, 'env>(document: &'life0 silk/json_value.Value, options: &'life1 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+pub effect<'life0 & 'life1> fn writeWith<'life0, 'life1>(document: &'life0 silk/json_value.Value, options: &'life1 silk/json_output.JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
 ```
 
 Writes a tree with explicit indentation and depth policy.

@@ -1143,7 +1143,7 @@ Affine allocation-free incremental body decoder.
 ### Associated function `Decoder.make`
 
 ```silk
-pub effect<'env> fn make<'head: 'env, 'life1: 'env, 'env>(selection: silk/http_body.Selection<'head>, limits: Limits, policy: silk/http_body.TrailerPolicy<'life1>) -> silk/result.Result<silk/http_body.Decoder, silk/http_body.BodyError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'head & 'life1> fn make<'head, 'life1>(selection: silk/http_body.Selection<'head>, limits: Limits, policy: silk/http_body.TrailerPolicy<'life1>) -> silk/result.Result<silk/http_body.Decoder, silk/http_body.BodyError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Acquires every decoder buffer and copies trailer policy and Connection exclusions.
@@ -1313,7 +1313,7 @@ Affine allocation-free incremental body encoder.
 ### Associated function `Encoder.make`
 
 ```silk
-pub effect<'env> fn make<'head: 'env, 'life1: 'env, 'env>(selection: silk/http_body.Selection<'head>, limits: Limits, policy: silk/http_body.TrailerPolicy<'life1>) -> silk/result.Result<silk/http_body.Encoder, silk/http_body.BodyError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'head & 'life1> fn make<'head, 'life1>(selection: silk/http_body.Selection<'head>, limits: Limits, policy: silk/http_body.TrailerPolicy<'life1>) -> silk/result.Result<silk/http_body.Encoder, silk/http_body.BodyError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Acquires bounded chunk and finish-snapshot storage.

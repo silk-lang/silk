@@ -954,7 +954,7 @@ Iterates fields in original order without combining duplicate names.
 ### Method `RequestHead.copy`
 
 ```silk
-pub effect<'env> fn copy<'owner: 'env, 'life1: 'env, 'env>(self: &'life1 RequestHead<'owner>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedRequestHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'owner: 'life1, 'life1>(self: &'life1 RequestHead<'owner>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedRequestHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies this head into the shared independently owned HTTP head representation.
@@ -1032,7 +1032,7 @@ Iterates fields in original order without combining duplicate names.
 ### Method `ResponseHead.copy`
 
 ```silk
-pub effect<'env> fn copy<'owner: 'env, 'life1: 'env, 'env>(self: &'life1 ResponseHead<'owner>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'owner: 'life1, 'life1>(self: &'life1 ResponseHead<'owner>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies this head into the shared independently owned HTTP head representation.
@@ -1042,7 +1042,7 @@ Copies this head into the shared independently owned HTTP head representation.
 ### Method `ResponseHead.copyMatchingHeaders`
 
 ```silk
-pub effect<'env> fn copyMatchingHeaders<'owner: 'env, 'name: 'env, 'life2: 'env, 'env>(self: &'life2 ResponseHead<'owner>, name: string<'name>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'name & 'life2> fn copyMatchingHeaders<'owner: 'name & 'life2, 'name, 'life2>(self: &'life2 ResponseHead<'owner>, name: string<'name>, limits: ValueLimits) -> silk/result.Result<silk/http.OwnedResponseHead, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies the status, reason, and only matching fields into independent storage.

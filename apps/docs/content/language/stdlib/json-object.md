@@ -45,7 +45,7 @@ Opens an object after checking its depth limit.
 ### Associated function `JsonObject.field`
 
 ```silk
-pub effect<'env1> fn field<'env: 'env1, T: 'env1, E, ?R, 'env1>(self: once Effect<'env; silk/json_object.JsonObject ! E ? R>, key: string<'env>, value: &'env T) -> JsonObject ! E | JsonError | WriterError ? R | &mut Writer
+pub effect<'env> fn field<'env, T: 'env, E, ?R>(self: once Effect<'env; silk/json_object.JsonObject ! E ? R>, key: string<'env>, value: &'env T) -> JsonObject ! E | JsonError | WriterError ? R | &mut Writer
 ```
 
 Writes one named value and returns the open object state.
@@ -59,7 +59,7 @@ The incoming Effect runs once. If it fails, this operation writes nothing.
 ### Associated function `JsonObject.fieldIfSome`
 
 ```silk
-pub effect<'env1> fn fieldIfSome<'env: 'env1, T: 'env1, E, ?R, 'env1>(self: once Effect<'env; silk/json_object.JsonObject ! E ? R>, key: string<'env>, value: &'env silk/option.Option<T>) -> JsonObject ! E | JsonError | WriterError ? R | &mut Writer
+pub effect<'env> fn fieldIfSome<'env, T: 'env, E, ?R>(self: once Effect<'env; silk/json_object.JsonObject ! E ? R>, key: string<'env>, value: &'env silk/option.Option<T>) -> JsonObject ! E | JsonError | WriterError ? R | &mut Writer
 ```
 
 Writes a present named value or leaves an absent member out of the object.

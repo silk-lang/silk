@@ -1791,7 +1791,7 @@ impl<
     return self.settingsValue
   }
 
-  effect fn acquire(
+  effect<'env> fn acquire<'env>(
     client: Self,
     peer: Origin,
     deadline: Option<Instant>,
@@ -3594,7 +3594,7 @@ effect fn canceledRedirectBody(audit: Shared<RouteAudit>) -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn canceledRedirectFailed<E>(error: E) -> i32 {
+effect<'env> fn canceledRedirectFailed<E: 'env, 'env>(error: E) -> i32 {
   drop error
   return -1
 }

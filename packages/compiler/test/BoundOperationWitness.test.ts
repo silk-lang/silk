@@ -420,7 +420,7 @@ it.effect('cleans an owned witness operand after success or failure', () =>
 struct Failed {}
 struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
-interface Decode { effect fn decode(value: Self) -> i32 ! Failed }
+interface Decode { effect<'env> fn decode<'env>(value: Self) -> i32 ! Failed }
 effect fn decode(value: &Token) -> i32 ! Failed {
   if value.value == 0 { fail Failed {} }
   return value.value
@@ -829,7 +829,7 @@ interface Combined { operator + fn add(left: &mut Self, right: &mut Self) -> i32
 struct Cell { code: i32 }
 fn cellAdd(left: &Cell, right: &Cell) -> i32 { return left.code + right.code }
 impl Combined for Cell { add: Cell.cellAdd }
-effect fn branch<T: Combined>(flag: bool, left: T, right: T) -> i32 {
+effect<'env> fn branch<T: Combined + 'env, 'env>(flag: bool, left: T, right: T) -> i32 {
   let fixed = Fixed {}
   let mut ownedLeft = move left
   let mut ownedRight = move right

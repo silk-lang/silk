@@ -69,7 +69,7 @@ growth is a fatal trap and is not a `OutOfMemoryError`.
 ### Associated function `Execution.drive`
 
 ```silk
-pub effect<'env1> fn drive<'env: 'env1, A: 'env1, D: 'env1, C, S, 'env1>(execution: Intrinsic.Execution<A>, branchState: D, onComplete: C, onSuspend: S) -> ()
+pub effect<'env> fn drive<'env, A: 'env, D: 'env, C, S>(execution: Intrinsic.Execution<A>, branchState: D, onComplete: C, onSuspend: S) -> ()
 ```
 
 Drives one `Initial`, `InitialReady`, or `Eligible` activation and transfers `branchState` to one outcome callback.

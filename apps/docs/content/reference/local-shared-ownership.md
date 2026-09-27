@@ -53,7 +53,7 @@ pub fn main() -> i32 {
 The exact public signatures are:
 
 ```silk,ignore
-effect fn make<T>(value: T) -> Shared<T>
+effect<'env> fn make<T: 'env, 'env>(value: T) -> Shared<T>
 ! Allocator.OutOfMemoryError
 ? &mut Allocator
 

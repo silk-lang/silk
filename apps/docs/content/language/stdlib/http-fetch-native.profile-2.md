@@ -54,7 +54,7 @@ Owns one native fresh-acquisition context without a connection pool.
 ### Associated function `Context.makeWithPool`
 
 ```silk
-pub effect<'env> fn makeWithPool<'configuration: 'env, 'life1: 'env, 'env>(route: silk/http_proxy.Route<'configuration>, options: Options, limits: Limits, pool: &'life1 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>) -> silk/http_fetch_native.Context<'configuration> ! PoolError | TrustSourceError | OutOfMemoryError ? &mut Allocator
+pub effect<'configuration & 'life1> fn makeWithPool<'configuration, 'life1>(route: silk/http_proxy.Route<'configuration>, options: Options, limits: Limits, pool: &'life1 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>) -> silk/http_fetch_native.Context<'configuration> ! PoolError | TrustSourceError | OutOfMemoryError ? &mut Allocator
 ```
 
 Owns one native fresh-acquisition context and a copied direct-pool capability.

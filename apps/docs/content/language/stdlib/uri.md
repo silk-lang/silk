@@ -55,7 +55,7 @@ component and byte. The returned view retains the input lifetime.
 ### Method `Uri.copy`
 
 ```silk
-pub effect<'env> fn copy<'text: 'env, 'life1: 'env, 'env>(self: &'life1 Uri<'text>) -> OwnedUri ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'text: 'life1, 'life1>(self: &'life1 Uri<'text>) -> OwnedUri ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies this parsed URI into independently owned storage with one allocation for its text.
@@ -185,7 +185,7 @@ Borrows the fragment without `#`, or returns `None` when absent. An empty fragme
 ### Associated function `Uri.resolveInto`
 
 ```silk
-pub effect<'env> fn resolveInto<'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'life5: 'env, 'env>(output: &'life1 mut silk/bytes.Bytes, base: &'life2 silk/uri.Uri<'life3>, reference: &'life4 silk/uri_reference.UriReference<'life5>) -> silk/result.Result<(), silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life2 & 'life4> fn resolveInto<'life1, 'life2, 'life3: 'life1 & 'life2 & 'life4, 'life4, 'life5: 'life1 & 'life2 & 'life4>(output: &'life1 mut silk/bytes.Bytes, base: &'life2 silk/uri.Uri<'life3>, reference: &'life4 silk/uri_reference.UriReference<'life5>) -> silk/result.Result<(), silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Resolves into reusable byte storage with strict RFC 3986 section 5.2 semantics.
@@ -207,7 +207,7 @@ invalid recomposition returns a syntax error and leaves the attempted serializat
 ### Associated function `Uri.resolveOwned`
 
 ```silk
-pub effect<'env> fn resolveOwned<'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'env>(base: &'life1 silk/uri.Uri<'life2>, reference: &'life3 silk/uri_reference.UriReference<'life4>) -> silk/result.Result<silk/uri.OwnedUri, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life3> fn resolveOwned<'life1, 'life2: 'life1 & 'life3, 'life3, 'life4: 'life1 & 'life3>(base: &'life1 silk/uri.Uri<'life2>, reference: &'life3 silk/uri_reference.UriReference<'life4>) -> silk/result.Result<silk/uri.OwnedUri, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Resolves with one owned backing allocation and adopts the completed serialization without copying.

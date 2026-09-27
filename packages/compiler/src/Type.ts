@@ -3779,6 +3779,64 @@ export const storageLifetimes = (self: Type): ReadonlyArray<Lifetime.Lifetime> =
   ).values(),
 ]
 
+/** What an Effect retains when it captures one value: nameable regions and unknown generic contents. */
+export interface Retention {
+  /** Non-static regions, each once. */
+  readonly regions: ReadonlyArray<Lifetime.Lifetime>
+  /** Stored type parameters, whose contents have no nameable region. */
+  readonly unknown: ReadonlyArray<Parameter>
+}
+
+const isBorrow = (type: Type): type is Reference | Slice | String =>
+  isReference(type) || isSlice(type) || isString(type)
+
+/**
+ * Collects what a captured value retains. A borrow retains its own region, which also bounds its
+ * referent; a raw pointer claims no loan; a callable or Effect retains only its environment.
+ */
+export const retention = (self: Type): Retention => {
+  const found = fold<Lifetime.Lifetime | Parameter>(self, {
+    type: (type) => {
+      if (isBorrow(type)) return type.lifetime
+      if (isCallable(type) || isEffect(type)) return type.environment
+      if (isRepresented(type))
+        return isRepresentationParameterArgument(type.representation.argument) &&
+          type.representation.argument.parameter.staticProperties.includes('Intrinsic.Detached')
+          ? undefined
+          : type.contract.environment
+      if (!isParameter(type)) return undefined
+      if (type.representationBound !== undefined)
+        return type.staticProperties.includes('Intrinsic.Detached')
+          ? undefined
+          : type.representationBound.environment
+      return type.kind === 'Value' ? type : undefined
+    },
+    argument: (argument) => {
+      if (Lifetime.isLifetime(argument)) return argument
+      if (isRepresentationArgument(argument)) return representationStorageLifetime(argument)
+      return undefined
+    },
+    descendArgument: (argument) =>
+      !isRepresentationArgument(argument) && !isHiddenIdentityArgument(argument),
+    descend: (type) =>
+      !isBorrow(type) &&
+      !isPointer(type) &&
+      !isParameter(type) &&
+      !isCallable(type) &&
+      !isEffect(type) &&
+      !isRepresented(type) &&
+      !isForeignFunction(type),
+  })
+  const regions = new Map<string, Lifetime.Lifetime>()
+  const unknown = new Map<string, Parameter>()
+  for (const entry of found)
+    if (Lifetime.isLifetime(entry)) {
+      for (const atom of Lifetime.atoms(entry))
+        if (atom._tag !== 'StaticLifetime') regions.set(Lifetime.key(atom), atom)
+    } else unknown.set(key(entry), entry)
+  return { regions: [...regions.values()], unknown: [...unknown.values()] }
+}
+
 /** Lists retained type nodes while keeping executable invocation contracts outside storage. */
 export const storageTypes = (self: Type): ReadonlyArray<Type> =>
   fold(self, {

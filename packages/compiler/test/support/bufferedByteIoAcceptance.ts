@@ -1013,7 +1013,7 @@ fn pairCancellationParked(state: &mut i32, execution: Intrinsic.Execution<bool>)
   state.* = 42
   return ()
 }
-effect fn pairCancellationFailed<E>(error: E) -> bool { drop error return false }
+effect<'env> fn pairCancellationFailed<E: 'env, 'env>(error: E) -> bool { drop error return false }
 
 fn pairCancellationResult(state: &mut PairCancellationState) -> i32 {
   if state.sourceCloses == usize.ONE && state.destinationCloses == usize.ONE { return 42 }
@@ -1432,7 +1432,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
   return 0
 }
 
-effect fn failed<E>(error: E) -> i32 { drop error return 99 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 99 }
 
 pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }
 `
@@ -1602,7 +1602,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
   return 0
 }
 
-effect fn failed<E>(error: E) -> i32 { drop error return 99 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 99 }
 
 pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }
 `

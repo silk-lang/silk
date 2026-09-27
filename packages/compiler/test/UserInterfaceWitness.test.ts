@@ -211,7 +211,7 @@ struct Application<T> {}
 interface EntryResult<T> { fn code(value: T) -> i32 }
 impl EntryResult<i32> for Application<i32> { fn code(value: i32) -> i32 { return value } }
 impl EntryResult<()> for Application<()> { fn code(value: ()) -> i32 { return 0 } }
-effect fn failed<E>(error: E) -> i32 { drop error return 1 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 1 }
 effect fn succeeded(value: ()) -> i32 { return 0 }
 impl<'env, E> EntryResult<Effect<'env; () ! E>> for Application<Effect<'env; () ! E>> {
   fn code(value: Effect<'env; () ! E>) -> i32 {

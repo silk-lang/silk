@@ -64,7 +64,7 @@ it.effect('relays the exact selected Effect from an owned interface witness adap
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
 struct Token { value: i32 }
-interface Decode { effect fn decode(value: Self) -> i32 }
+interface Decode { effect<'env> fn decode<'env>(value: Self) -> i32 }
 effect fn decode(value: &Token) -> i32 {
   return run Effect.suspend(effect { return value.value })
 }
@@ -250,7 +250,7 @@ it.effect('specializes generic suspension captures without retaining type parame
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
 struct Owner { value: i32 }
-effect fn delayed<T>(value: T) -> T {
+effect<'env> fn delayed<T: 'env, 'env>(value: T) -> T {
   return run Effect.suspend(effect { return move value })
 }
 pub fn main() -> i32 {
@@ -504,10 +504,10 @@ effect fn useTransport() -> i32 ! Problem ? &mut Clock {
  run flushIo() |> Effect.provideMut<Io>(&mut transport)
  return 42
 }
-interface Handler { effect fn handle(self: Self) -> i32 ! Problem ? &mut Clock }
+interface Handler { effect<'env> fn handle<'env>(self: Self) -> i32 ! Problem ? &mut Clock }
 struct HandlerValue {}
 impl Handler for HandlerValue { effect fn handle(self: Self) -> i32 ! Problem ? &mut Clock { drop self return run useTransport() } }
-effect fn withHandler<H: Handler>(handler: H) -> i32 ! Problem ? &mut Clock { return run Handler.handle(move handler) }
+effect<'env> fn withHandler<H: Handler + 'env, 'env>(handler: H) -> i32 ! Problem ? &mut Clock { return run Handler.handle(move handler) }
 effect fn all() -> i32 ! Problem {
  let mut fixed = Fixed {}
  let first = run withHandler(HandlerValue {}) |> Effect.provideMut<Clock>(&mut fixed)

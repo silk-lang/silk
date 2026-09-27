@@ -435,7 +435,7 @@ Compile-time contract for an independently owned conservative connection key.
 ### Operation `copy`
 
 ```silk
-effect<'env> fn copy<'life2: 'env, 'env>(key: &'life2 Self) -> Self ! CopyError ? CopyRequirements
+effect<'life2> fn copy<'life2>(key: &'life2 Self) -> Self ! CopyError ? CopyRequirements
 ```
 
 Copies the complete key before entering shared state.
@@ -475,7 +475,7 @@ Fallible bounded-copy contract for immutable context retained beside shared muta
 ### Operation `copy`
 
 ```silk
-effect<'env> fn copy<'life2: 'env, 'env>(context: &'life2 Self) -> Self ! CopyError ? CopyRequirements
+effect<'life2> fn copy<'life2>(context: &'life2 Self) -> Self ! CopyError ? CopyRequirements
 ```
 
 Fallibly copies all bounded context before a new Shared alias is published.
@@ -505,7 +505,7 @@ Checks key compatibility without allocation, clock access, or transport contact.
 ### Operation `acquire`
 
 ```silk
-effect<'env> fn acquire<'life4: 'env, 'life5: 'env, 'env>(context: &'life4 Self, key: &'life5 K, deadline: silk/option.Option<silk/system_clock.Instant>) -> silk/http_client.Connection<P> ! AcquisitionError ? AcquisitionRequirements
+effect<'life4 & 'life5> fn acquire<'life4, 'life5>(context: &'life4 Self, key: &'life5 K, deadline: silk/option.Option<silk/system_clock.Instant>) -> silk/http_client.Connection<P> ! AcquisitionError ? AcquisitionRequirements
 ```
 
 Opens one complete HTTP owner under only the effective acquisition deadline.
@@ -525,7 +525,7 @@ A higher-ranked root-pool callback whose pool borrow cannot escape.
 ### Operation `handle`
 
 ```silk
-effect<'scope> fn handle<'scope: 'scope>(handler: Self, pool: &'scope mut silk/http_connection_pool.Pool<K, P, C>) -> A ! E ? R
+effect<'scope> fn handle<'scope>(handler: Self, pool: &'scope mut silk/http_connection_pool.Pool<K, P, C>) -> A ! E ? R
 ```
 
 Uses one root pool until success, failure, or structured cancellation closes it.
@@ -743,7 +743,7 @@ Constructs one finite pool, lends its root, and closes it on every structured ex
 ## `copyHandle`
 
 ```silk
-pub effect<'env> fn copyHandle<K: 'env, P: 'env, CopyError, ?CopyRequirements, C: 'env, 'life5: 'env, 'env>(handle: &'life5 silk/http_connection_pool.Handle<K, P, C>) -> silk/http_connection_pool.Handle<K, P, C> ! CopyError ? CopyRequirements
+pub effect<'life5> fn copyHandle<K: 'life5, P: 'life5, CopyError, ?CopyRequirements, C: 'life5, 'life5>(handle: &'life5 silk/http_connection_pool.Handle<K, P, C>) -> silk/http_connection_pool.Handle<K, P, C> ! CopyError ? CopyRequirements
 ```
 
 Copies immutable context before cloning Shared state, so copy failure publishes no alias.
@@ -763,7 +763,7 @@ Inspects exact shared accounting without allocating or consulting the clock.
 ## `withConnection`
 
 ```silk
-pub effect<'env> fn withConnection<P: 'env, A, E, KeyCopyError, AcquisitionError, ?KeyCopyRequirements, ?AcquisitionRequirements, ?CallbackRequirements, K: 'env, C: 'env, H: 'env, 'life11: 'env, 'life12: 'env, 'env>(handle: &'life11 silk/http_connection_pool.Handle<K, P, C>, key: &'life12 K, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | KeyCopyError | AcquisitionError | PoolError ? KeyCopyRequirements | AcquisitionRequirements | CallbackRequirements | &mut MonotonicClock where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withConnection<P: 'env, A, E, KeyCopyError, AcquisitionError, ?KeyCopyRequirements, ?AcquisitionRequirements, ?CallbackRequirements, K: 'env, C: 'env, H: 'env, 'env, 'life12: 'env, 'life13: 'env>(handle: &'life12 silk/http_connection_pool.Handle<K, P, C>, key: &'life13 K, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | KeyCopyError | AcquisitionError | PoolError ? KeyCopyRequirements | AcquisitionRequirements | CallbackRequirements | &mut MonotonicClock where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Checks out exactly one owner, lends it to `handler`, and publishes it only when client-eligible.
@@ -780,7 +780,7 @@ instead of replaying the request.
 ## `collect`
 
 ```silk
-pub effect<'env> fn collect<K: 'env, P: 'env, C: 'env, 'life3: 'env, 'env>(handle: &'life3 silk/http_connection_pool.Handle<K, P, C>) -> Collection ? &mut MonotonicClock where &mut P provides &HttpTransport from &mut HttpTransport
+pub effect<'life3> fn collect<K: 'life3, P: 'life3, C: 'life3, 'life3>(handle: &'life3 silk/http_connection_pool.Handle<K, P, C>) -> Collection ? &mut MonotonicClock where &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Samples the monotonic clock once, lazily removes every expired idle owner, and closes outside Shared.
@@ -790,7 +790,7 @@ Samples the monotonic clock once, lazily removes every expired idle owner, and c
 ## `close`
 
 ```silk
-pub effect<'env> fn close<K: 'env, P: 'env, C: 'env, 'life3: 'env, 'env>(pool: &'life3 mut silk/http_connection_pool.Pool<K, P, C>) -> () ! ClientError where &mut P provides &HttpTransport from &mut HttpTransport
+pub effect<'life3> fn close<K: 'life3, P: 'life3, C: 'life3, 'life3>(pool: &'life3 mut silk/http_connection_pool.Pool<K, P, C>) -> () ! ClientError where &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Marks the pool closed idempotently and physically closes all currently idle owners outside Shared.

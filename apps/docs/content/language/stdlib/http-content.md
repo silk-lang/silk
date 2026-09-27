@@ -1283,7 +1283,7 @@ A higher-level response owner must bind the plan and those wire bytes to the sam
 ### Associated function `Decoder.make`
 
 ```silk
-pub effect<'env> fn make<'head: 'env, 'method: 'env, 'names: 'env, 'env>(plan: silk/http_content.CodingPlan<'head, 'method, 'names>) -> Decoder ! silk/http_content.ContentError<'head> | OutOfMemoryError ? &mut Allocator
+pub effect<'head & 'method & 'names> fn make<'head, 'method, 'names>(plan: silk/http_content.CodingPlan<'head, 'method, 'names>) -> Decoder ! silk/http_content.ContentError<'head> | OutOfMemoryError ? &mut Allocator
 ```
 
 Acquires the existing bounded framing and codec stack from one validated plan.
@@ -1459,7 +1459,7 @@ Borrows trailers only through successful content and body completion.
 ### Method `ContentReader.readSome`
 
 ```silk
-pub effect<'env> fn readSome<'reader: 'env, 'transport: 'env, 'head: 'env, P: 'env, 'life4: 'env, 'life5: 'env, 'env>(self: &'life4 mut ContentReader<'reader, 'transport, 'head, P>, output: &'life5 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ContentProgress ! silk/http_content.ContentError<'head> ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life4 & 'life5> fn readSome<'reader: 'life4 & 'life5, 'transport: 'life4 & 'life5, 'head: 'life4 & 'life5, P: 'life4 & 'life5, 'life4, 'life5>(self: &'life4 mut ContentReader<'reader, 'transport, 'head, P>, output: &'life5 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ContentProgress ! silk/http_content.ContentError<'head> ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Streams one provisional prefix with one unchanged absolute deadline.
@@ -1469,7 +1469,7 @@ Streams one provisional prefix with one unchanged absolute deadline.
 ## `withReader`
 
 ```silk
-pub effect<'env> fn withReader<'reader: 'env, 'transport: 'reader + 'env, 'head: 'reader + 'env, 'method: 'reader + 'env, 'names: 'reader + 'env, 'callback: 'env, A, E, ?CallbackRequirements, P: 'env, 'env>(plan: silk/http_content.CodingPlan<'head, 'method, 'names>, body: &'reader mut silk/buffered_duplex.BufferedDuplex<'transport, P>, callback: for<'call, 'readerView: 'call, 'transportView: 'readerView, 'headView: 'readerView> once fn<'callback>(&'call mut silk/http_content.ContentReader<'readerView, 'transportView, 'headView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | silk/http_content.ContentError<'head> | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'reader & 'head & 'method & 'names & 'callback> fn withReader<'reader, 'transport: 'reader + 'reader & 'head & 'method & 'names & 'callback, 'head: 'reader, 'method: 'reader, 'names: 'reader, 'callback, A, E, ?CallbackRequirements, P: 'reader & 'head & 'method & 'names & 'callback>(plan: silk/http_content.CodingPlan<'head, 'method, 'names>, body: &'reader mut silk/buffered_duplex.BufferedDuplex<'transport, P>, callback: for<'call, 'readerView: 'call, 'transportView: 'readerView, 'headView: 'readerView> once fn<'callback>(&'call mut silk/http_content.ContentReader<'readerView, 'transportView, 'headView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | silk/http_content.ContentError<'head> | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Runs one higher-ranked callback while exclusively borrowing the encoded body.

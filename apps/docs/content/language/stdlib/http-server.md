@@ -686,7 +686,7 @@ One callback-scoped active request and its single-message framing decoder.
 ### Method `Request.head`
 
 ```silk
-pub effect<'env> fn head<'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'head: 'env, 'env>(self: &'head Request<'request, 'connection, 'transport, P>) -> silk/http_head.RequestHead<'head> ! ServerError
+pub effect<'head> fn head<'request: 'head, 'connection: 'head, 'transport: 'head, P: 'head, 'head>(self: &'head Request<'request, 'connection, 'transport, P>) -> silk/http_head.RequestHead<'head> ! ServerError
 ```
 
 Borrows the completed parsed head from active request storage.
@@ -696,7 +696,7 @@ Borrows the completed parsed head from active request storage.
 ### Method `Request.bodyComplete`
 
 ```silk
-pub effect<'env> fn bodyComplete<'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(self: &'life4 Request<'request, 'connection, 'transport, P>) -> bool ! ServerError
+pub effect<'life4> fn bodyComplete<'request: 'life4, 'connection: 'life4, 'transport: 'life4, P: 'life4, 'life4>(self: &'life4 Request<'request, 'connection, 'transport, P>) -> bool ! ServerError
 ```
 
 Returns whether request framing completed; fails unless the request remains active.
@@ -706,7 +706,7 @@ Returns whether request framing completed; fails unless the request remains acti
 ### Method `Request.expectationRejected`
 
 ```silk
-pub effect<'env> fn expectationRejected<'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(self: &'life4 Request<'request, 'connection, 'transport, P>) -> bool ! ServerError
+pub effect<'life4> fn expectationRejected<'request: 'life4, 'connection: 'life4, 'transport: 'life4, P: 'life4, 'life4>(self: &'life4 Request<'request, 'connection, 'transport, P>) -> bool ! ServerError
 ```
 
 Returns whether Expect requires rejection; fails unless the request remains active.
@@ -726,7 +726,7 @@ One nested final-response writer. Its fields are private so completion cannot be
 ### Method `ResponseWriter.writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<'writer: 'env, 'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life5: 'env, 'life6: 'env, 'env>(self: &'life5 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, input: &'life6 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> WriteProgress ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life5 & 'life6> fn writeSome<'writer: 'life5 & 'life6, 'request: 'life5 & 'life6, 'connection: 'life5 & 'life6, 'transport: 'life5 & 'life6, P: 'life5 & 'life6, 'life5, 'life6>(self: &'life5 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, input: &'life6 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> WriteProgress ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts one payload prefix into the shared framing and bounded output owners.
@@ -736,7 +736,7 @@ Accepts one payload prefix into the shared framing and bounded output owners.
 ### Method `ResponseWriter.writeAll`
 
 ```silk
-pub effect<'env> fn writeAll<'writer: 'env, 'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life5: 'env, 'life6: 'env, 'env>(self: &'life5 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, input: &'life6 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> WriteProgress ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life5 & 'life6> fn writeAll<'writer: 'life5 & 'life6, 'request: 'life5 & 'life6, 'connection: 'life5 & 'life6, 'transport: 'life5 & 'life6, P: 'life5 & 'life6, 'life5, 'life6>(self: &'life5 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, input: &'life6 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> WriteProgress ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts the complete caller payload in order.
@@ -746,7 +746,7 @@ Accepts the complete caller payload in order.
 ### Method `ResponseWriter.finish`
 
 ```silk
-pub effect<'env> fn finish<'writer: 'env, 'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'value: 'env, 'life6: 'env, 'life7: 'env, 'env>(self: &'life6 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, trailers: &'life7 silk/http_headers.Headers<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life6 & 'life7> fn finish<'writer: 'life6 & 'life7, 'request: 'life6 & 'life7, 'connection: 'life6 & 'life7, 'transport: 'life6 & 'life7, P: 'life6 & 'life7, 'value: 'life6 & 'life7, 'life6, 'life7>(self: &'life6 mut ResponseWriter<'writer, 'request, 'connection, 'transport, P>, trailers: &'life7 silk/http_headers.Headers<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Snapshots trailers, completes response framing, and flushes the response exactly once.
@@ -766,7 +766,7 @@ Compile-time handler selected for one scoped server connection.
 ### Operation `handle`
 
 ```silk
-effect<'call> fn handle<'call: 'call, 'connection: 'call, 'transport: 'connection + 'call>(handler: Self, connection: &'call mut silk/http_server.Connection<'connection, 'transport, P>) -> A ! E ? R where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+effect<'call> fn handle<'call, 'connection: 'call, 'transport: 'connection + 'call>(handler: Self, connection: &'call mut silk/http_server.Connection<'connection, 'transport, P>) -> A ! E ? R where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Runs within the connection loan and preserves the handler failure and requirement channels.
@@ -786,7 +786,7 @@ Validates server-only construction invariants without allocation or I/O.
 ## `withConnection`
 
 ```silk
-pub effect<'env1> fn withConnection<'env: 'env1, A, E, ?CallbackRequirements, P: 'env1, H: 'env1, 'env1>(transport: &'env mut P, limits: Limits, handler: H) -> A ! E | ServerError | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withConnection<'env, A, E, ?CallbackRequirements, P: 'env, H: 'env>(transport: &'env mut P, limits: Limits, handler: H) -> A ! E | ServerError | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Runs one higher-ranked server callback over a single bound concrete provider.
@@ -796,7 +796,7 @@ Runs one higher-ranked server callback over a single bound concrete provider.
 ## `withRequest`
 
 ```silk
-pub effect<'env> fn withRequest<'request: 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, 'callback: 'env, A, E, ?CallbackRequirements, P: 'env, 'env>(connection: &'request mut silk/http_server.Connection<'connection, 'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'requestView: 'call, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(&'call mut silk/http_server.Request<'requestView, 'connectionView, 'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> silk/option.Option<A> ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'request & 'callback> fn withRequest<'request, 'connection: 'request + 'request & 'callback, 'transport: 'connection + 'request & 'callback, 'callback, A, E, ?CallbackRequirements, P: 'request & 'callback>(connection: &'request mut silk/http_server.Connection<'connection, 'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'requestView: 'call, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(&'call mut silk/http_server.Request<'requestView, 'connectionView, 'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> silk/option.Option<A> ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Admits at most one request and lends it exclusively. `None` is clean end between requests.
@@ -806,7 +806,7 @@ Admits at most one request and lends it exclusively. `None` is clean end between
 ## `readSome`
 
 ```silk
-pub effect<'env> fn readSome<'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'life5: 'env, 'env>(request: &'life4 mut silk/http_server.Request<'request, 'connection, 'transport, P>, output: &'life5 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life4 & 'life5> fn readSome<'request: 'life4 & 'life5, 'connection: 'life4 & 'life5, 'transport: 'life4 & 'life5, P: 'life4 & 'life5, 'life4, 'life5>(request: &'life4 mut silk/http_server.Request<'request, 'connection, 'transport, P>, output: &'life5 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Reads one provisional decoded payload prefix.
@@ -816,7 +816,7 @@ Reads one provisional decoded payload prefix.
 ## `discardRemaining`
 
 ```silk
-pub effect<'env> fn discardRemaining<'request: 'env, 'connection: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(request: &'life4 mut silk/http_server.Request<'request, 'connection, 'transport, P>, maxWireBytes: u64, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life4> fn discardRemaining<'request: 'life4, 'connection: 'life4, 'transport: 'life4, P: 'life4, 'life4>(request: &'life4 mut silk/http_server.Request<'request, 'connection, 'transport, P>, maxWireBytes: u64, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Explicitly discards the remaining framed request under the smaller configured/caller wire bound.
@@ -826,7 +826,7 @@ Explicitly discards the remaining framed request under the smaller configured/ca
 ## `finishConnection`
 
 ```silk
-pub effect<'env> fn finishConnection<'connection: 'env, 'transport: 'env, P: 'env, 'life3: 'env, 'env>(connection: &'life3 mut silk/http_server.Connection<'connection, 'transport, P>, maxDrainBytes: usize, deadline: Instant) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life3> fn finishConnection<'connection: 'life3, 'transport: 'life3, P: 'life3, 'life3>(connection: &'life3 mut silk/http_server.Connection<'connection, 'transport, P>, maxDrainBytes: usize, deadline: Instant) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Gracefully flushes, shuts down writes, and performs one finite best-effort input drain.
@@ -836,7 +836,7 @@ Gracefully flushes, shuts down writes, and performs one finite best-effort input
 ## `sendInformational`
 
 ```silk
-pub effect<'env> fn sendInformational<'request: 'env, 'connection: 'env, 'transport: 'env, 'value: 'env, P: 'env, 'life5: 'env, 'life6: 'env, 'env>(request: &'life5 mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life6 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life5 & 'life6> fn sendInformational<'request: 'life5 & 'life6, 'connection: 'life5 & 'life6, 'transport: 'life5 & 'life6, 'value: 'life5 & 'life6, P: 'life5 & 'life6, 'life5, 'life6>(request: &'life5 mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life6 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Sends one bounded informational response and flushes it before returning.
@@ -846,7 +846,7 @@ Sends one bounded informational response and flushes it before returning.
 ## `respond`
 
 ```silk
-pub effect<'env> fn respond<'writer: 'env, 'request: 'writer + 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, 'value: 'writer + 'env, 'names: 'request + 'env, 'callback: 'env, A, E, ?CallbackRequirements, P: 'env, 'life11: 'env, 'env>(request: &'writer mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life11 silk/http.ResponseHead<'value>, mode: BodyMode, reuse: ReusePolicy, trailerPolicy: silk/http_body.TrailerPolicy<'names>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'writerView: 'call, 'requestView: 'writerView, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(&'call mut silk/http_server.ResponseWriter<'writerView, 'requestView, 'connectionView, 'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'writer & 'names & 'callback & 'life11> fn respond<'writer, 'request: 'writer + 'writer & 'names & 'callback & 'life11, 'connection: 'request + 'writer & 'names & 'callback & 'life11, 'transport: 'connection + 'writer & 'names & 'callback & 'life11, 'value: 'writer + 'writer & 'names & 'callback & 'life11, 'names: 'request, 'callback, A, E, ?CallbackRequirements, P: 'writer & 'names & 'callback & 'life11, 'life11>(request: &'writer mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life11 silk/http.ResponseHead<'value>, mode: BodyMode, reuse: ReusePolicy, trailerPolicy: silk/http_body.TrailerPolicy<'names>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'writerView: 'call, 'requestView: 'writerView, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(&'call mut silk/http_server.ResponseWriter<'writerView, 'requestView, 'connectionView, 'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Begins exactly one final response and lends its streaming writer.
@@ -856,7 +856,7 @@ Begins exactly one final response and lends its streaming writer.
 ## `reject`
 
 ```silk
-pub effect<'env> fn reject<'loan: 'env, 'request: 'loan + 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, 'value: 'env, P: 'env, 'life6: 'env, 'env>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life6 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'loan & 'life6> fn reject<'loan, 'request: 'loan + 'loan & 'life6, 'connection: 'request + 'loan & 'life6, 'transport: 'connection + 'loan & 'life6, 'value: 'loan & 'life6, P: 'loan & 'life6, 'life6>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, head: &'life6 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ServerError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Sends a final body-free response without waiting for unread request content.
@@ -866,7 +866,7 @@ Sends a final body-free response without waiting for unread request content.
 ## `withUpgrade`
 
 ```silk
-pub effect<'env> fn withUpgrade<'loan: 'env, 'request: 'loan + 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, 'value: 'loan + 'env, 'callback: 'env, A, E, ?CallbackRequirements, P: 'env, 'life10: 'env, 'life11: 'env, 'env>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, selectedProtocol: string<'life10>, response: &'life11 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'transportView: 'call> once fn<'callback>(&'call mut silk/buffered_duplex.BufferedDuplex<'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'loan & 'callback & 'life10 & 'life11> fn withUpgrade<'loan, 'request: 'loan + 'loan & 'callback & 'life10 & 'life11, 'connection: 'request + 'loan & 'callback & 'life10 & 'life11, 'transport: 'connection + 'loan & 'callback & 'life10 & 'life11, 'value: 'loan + 'loan & 'callback & 'life10 & 'life11, 'callback, A, E, ?CallbackRequirements, P: 'loan & 'callback & 'life10 & 'life11, 'life10, 'life11>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, selectedProtocol: string<'life10>, response: &'life11 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'transportView: 'call> once fn<'callback>(&'call mut silk/buffered_duplex.BufferedDuplex<'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Completes a validated HTTP Upgrade response and lends the exact buffered suffix.
@@ -876,7 +876,7 @@ Completes a validated HTTP Upgrade response and lends the exact buffered suffix.
 ## `withTunnel`
 
 ```silk
-pub effect<'env> fn withTunnel<'loan: 'env, 'request: 'loan + 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, 'value: 'loan + 'env, 'callback: 'env, A, E, ?CallbackRequirements, P: 'env, 'life10: 'env, 'env>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, response: &'life10 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'transportView: 'call> once fn<'callback>(&'call mut silk/buffered_duplex.BufferedDuplex<'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'loan & 'callback & 'life10> fn withTunnel<'loan, 'request: 'loan + 'loan & 'callback & 'life10, 'connection: 'request + 'loan & 'callback & 'life10, 'transport: 'connection + 'loan & 'callback & 'life10, 'value: 'loan + 'loan & 'callback & 'life10, 'callback, A, E, ?CallbackRequirements, P: 'loan & 'callback & 'life10, 'life10>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, response: &'life10 silk/http.ResponseHead<'value>, deadline: silk/option.Option<silk/system_clock.Instant>, callback: for<'call, 'transportView: 'call> once fn<'callback>(&'call mut silk/buffered_duplex.BufferedDuplex<'transportView, P>) -> once Effect<'call; A ! E ? CallbackRequirements>) -> A ! E | ServerError | OutOfMemoryError ? CallbackRequirements | &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Completes a successful CONNECT response and lends the exact buffered tunnel suffix.

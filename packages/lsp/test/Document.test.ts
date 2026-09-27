@@ -3133,7 +3133,7 @@ pub fn main() -> i32 { return helper(1) + double(2) + helper(3) }
 
 it.effect('shows retained generic requirements outside the hover source signature', () =>
   Effect.gen(function* () {
-    const source = `effect fn retain<T>(value: T) -> i32 { return 0 }
+    const source = `effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32 { return 0 }
 fn hold<T>(value: T) -> i32 {
   let pending = retain(move value)
   drop pending

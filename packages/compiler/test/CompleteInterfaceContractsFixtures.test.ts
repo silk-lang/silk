@@ -62,7 +62,10 @@ layer(NodeServices.layer)('complete interface contract fixtures', (it) => {
       const first = yield* SyntaxFormatter.format(syntax)
       const text = decoder.decode(FormattedDocument.toUint8Array(first))
       assert.include(text, 'pub interface Decoder<Arguments, A, E, ?R>')
-      assert.include(text, 'effect fn decode(self: &Self, encoded: Arguments) -> A ! E ? R')
+      assert.include(
+        text,
+        "effect<'env> fn decode<'env>(self: &Self, encoded: Arguments) -> A ! E ? R",
+      )
       const second = yield* SyntaxFormatter.format(
         Parser.parse(
           Lexer.lex(
@@ -87,7 +90,7 @@ layer(NodeServices.layer)('complete interface contract fixtures', (it) => {
       )
       const contract = declaration?.operationContracts.at(0)
       assert.strictEqual(contract?.functionKind, 'Effect')
-      assert.deepEqual(contract?.operands.map(encodedOperand), ["&'life4 Self", 'Arguments'])
+      assert.deepEqual(contract?.operands.map(encodedOperand), ["&'life5 Self", 'Arguments'])
       assert.deepEqual(
         contract?.operands.map((operand) => operand.access),
         ['Shared', 'Take'],
@@ -141,7 +144,7 @@ layer(NodeServices.layer)('complete interface contract fixtures', (it) => {
       assert.strictEqual(matching.application.providerMatches, true)
       assert.strictEqual(matching.application.available, true)
       const contract = matching.application.operations.at(0)
-      assert.deepEqual(contract?.operands.map(encodedOperand), ["&'life4 T", 'i32'])
+      assert.deepEqual(contract?.operands.map(encodedOperand), ["&'life5 T", 'i32'])
       assert.strictEqual(
         contract?.success._tag === 'Resolved' ? Type.encode(contract.success.type) : undefined,
         'bool',
@@ -256,7 +259,7 @@ layer(NodeServices.layer)('complete interface contract fixtures', (it) => {
       const contract = conformance?.operations.at(0)?.contract
       assert.strictEqual(contract?.functionKind, 'Effect')
       assert.deepEqual(contract?.operands.map(encodedOperand), [
-        "&'life5 complete-interface-contracts/mapped-effect.Schema",
+        "&'life6 complete-interface-contracts/mapped-effect.Schema",
         'i32',
       ])
       assert.strictEqual(contract?.receiverAccess, 'Shared')

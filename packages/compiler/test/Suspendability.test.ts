@@ -30,7 +30,7 @@ struct ReadyClock {}
 impl Clock for ReadyClock { effect fn now(self: &mut Self) -> i32 { return 42 } }
 struct Guard<P> { provider: P }
 struct Config<'data> { value: &'data i32 }
-effect fn scoped<P>(provider: P, config: &Config) -> i32 ? &mut Clock {
+effect<'env> fn scoped<P: 'env, 'env>(provider: P, config: &Config) -> i32 ? &mut Clock {
   let use = effect fn(owned: &mut Guard<P>) -> i32 ? &mut Clock {
     let value = run Clock.now()
     drop owned
@@ -1396,7 +1396,7 @@ struct UnusedProvider {}
 impl UnusedProvider { effect fn work(self: &mut Self) -> i32 { return 7 } }
 impl Transport for UnusedProvider { work: UnusedProvider.work }
 struct Guard<P> { provider: Option<P> }
-effect fn scoped<P>(provider: P) -> i32
+effect<'env> fn scoped<P: 'env, 'env>(provider: P) -> i32
 where &mut P provides &Transport from &mut Transport {
   let use = effect fn(owned: &mut Guard<P>) -> i32 {
     return match &mut owned.provider {

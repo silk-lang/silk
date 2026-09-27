@@ -1185,7 +1185,7 @@ fn cancellationParked(state: &mut (), execution: Intrinsic.Execution<i32>) -> ()
   drop move execution
   return ()
 }
-effect fn cancellationFailed<E>(error: E) -> i32 { drop error return -4 }
+effect<'env> fn cancellationFailed<E: 'env, 'env>(error: E) -> i32 { drop error return -4 }
 
 effect fn pendingDirectWrite(
   owner: &mut OwnedConnection<DirectCancellationDuplex>,

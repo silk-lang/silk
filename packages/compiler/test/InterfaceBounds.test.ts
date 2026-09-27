@@ -92,7 +92,13 @@ pub fn main() -> i32 {
         reason: diagnostic.reason._tag,
         sourceId: diagnostic.span.sourceId,
       })),
-      [{ code: 'SEM0129', reason: 'ReturnTypeMismatch', sourceId: 'interface-bounds/main' }],
+      // The bound operation's borrowed input is retained by its Effect exactly as a direct
+      // generic call's is, so escaping that Effect also expires the borrow.
+      [
+        { code: 'OWN0019', reason: 'ExpiredLifetime', sourceId: 'interface-bounds/main' },
+        { code: 'OWN0019', reason: 'ExpiredLifetime', sourceId: 'interface-bounds/main' },
+        { code: 'SEM0129', reason: 'ReturnTypeMismatch', sourceId: 'interface-bounds/main' },
+      ],
     )
   }),
 )

@@ -220,7 +220,7 @@ use `FirstPathSegment` for data that must not become a relative reference's sche
 ### Associated function `UriPercent.encodeInto`
 
 ```silk
-pub effect<'env> fn encodeInto<'life0: 'env, 'life1: 'env, 'env>(output: &'life0 mut silk/bytes.Bytes, values: &'life1 [u8], component: PercentComponent) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn encodeInto<'life0, 'life1>(output: &'life0 mut silk/bytes.Bytes, values: &'life1 [u8], component: PercentComponent) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Replaces a reusable byte buffer with percent-encoded ASCII component data.
@@ -250,7 +250,7 @@ Use this to reserve a combined serialization before appending its individual com
 ### Associated function `UriPercent.appendEncoded`
 
 ```silk
-pub effect<'env> fn appendEncoded<'life0: 'env, 'life1: 'env, 'env>(output: &'life0 mut silk/bytes.Bytes, values: &'life1 [u8], component: PercentComponent) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn appendEncoded<'life0, 'life1>(output: &'life0 mut silk/bytes.Bytes, values: &'life1 [u8], component: PercentComponent) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends encoded component data while retaining all existing destination bytes.
@@ -299,7 +299,7 @@ zero-filled before being overwritten, and plus signs remain literal bytes.
 ### Associated function `UriPercent.decodeInto`
 
 ```silk
-pub effect<'env> fn decodeInto<'life0: 'env, 'life1: 'env, 'env>(output: &'life0 mut silk/bytes.Bytes, text: string<'life1>) -> silk/result.Result<(), silk/uri_percent.DecodeError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn decodeInto<'life0, 'life1>(output: &'life0 mut silk/bytes.Bytes, text: string<'life1>) -> silk/result.Result<(), silk/uri_percent.DecodeError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Replaces reusable byte storage with strictly decoded bytes, preserving literal plus signs.

@@ -97,7 +97,7 @@ acquire = Context.acquire
 ## `withDirectPool`
 
 ```silk
-pub effect<'env> fn withDirectPool<A, E, ?R, H: 'env, 'life4: 'env, 'env>(config: Config, options: Options, limits: Limits, preparedTrust: silk/option.Option<&'life4 silk/trust_snapshot.TrustSnapshot>, handler: H) -> A ! E | PoolError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator where &mut NativeTransport provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withDirectPool<A, E, ?R, H: 'env, 'env, 'life5: 'env>(config: Config, options: Options, limits: Limits, preparedTrust: silk/option.Option<&'life5 silk/trust_snapshot.TrustSnapshot>, handler: H) -> A ! E | PoolError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator where &mut NativeTransport provides &HttpTransport from &mut HttpTransport
 ```
 
 Constructs and lends a bounded pool for direct TCP and HTTPS origins.
@@ -112,7 +112,7 @@ The context clears `options.deadline`; each checkout supplies its opening deadli
 ## `withUnixPool`
 
 ```silk
-pub effect<'env> fn withUnixPool<A, E, ?R, H: 'env, 'life4: 'env, 'life5: 'env, 'env>(config: Config, path: &'life4 [u8], options: Options, limits: Limits, preparedTrust: silk/option.Option<&'life5 silk/trust_snapshot.TrustSnapshot>, handler: H) -> A ! E | PoolError | NativeClientError | NativeSocketError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator where &mut NativeTransport provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withUnixPool<A, E, ?R, H: 'env, 'env, 'life5: 'env, 'life6: 'env>(config: Config, path: &'life5 [u8], options: Options, limits: Limits, preparedTrust: silk/option.Option<&'life6 silk/trust_snapshot.TrustSnapshot>, handler: H) -> A ! E | PoolError | NativeClientError | NativeSocketError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator where &mut NativeTransport provides &HttpTransport from &mut HttpTransport
 ```
 
 Constructs and lends a bounded pool for one exact Unix path and HTTP or HTTPS origins.
@@ -157,7 +157,7 @@ the comparison does not inspect mutable pool state.
 ## `withConnection`
 
 ```silk
-pub effect<'env> fn withConnection<A, E, ?R, H: 'env, 'life4: 'env, 'env>(handle: &'life4 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>, origin: Origin, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | PoolError | NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random where &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut NativeTransport provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withConnection<A, E, ?R, H: 'env, 'env, 'life5: 'env>(handle: &'life5 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>, origin: Origin, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | PoolError | NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random where &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut NativeTransport provides &HttpTransport from &mut HttpTransport
 ```
 
 Checks out one direct origin and lends its exclusive connection to `handler`.
@@ -172,7 +172,7 @@ A Unix or proxy pool returns `PoolError.ContextMismatch` before native contact.
 ## `withUnixConnection`
 
 ```silk
-pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'life4: 'env, 'life5: 'env, 'env>(handle: &'life4 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>, path: &'life5 [u8], origin: Origin, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | PoolError | NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random where &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut NativeTransport provides &HttpTransport from &mut HttpTransport
+pub effect<'env> fn withUnixConnection<A, E, ?R, H: 'env, 'env, 'life5: 'env, 'life6: 'env>(handle: &'life5 silk/http_connection_pool.Handle<silk/http_connection_pool.ConnectionKey, silk/http_client_native.NativeTransport, silk/http_connection_pool_native.Context>, path: &'life6 [u8], origin: Origin, requestDeadline: silk/option.Option<silk/system_clock.Instant>, acquisitionDeadline: silk/option.Option<silk/system_clock.Instant>, handler: H) -> silk/http_connection_pool.CheckoutResult<A> ! E | PoolError | NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random where &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random, &mut NativeTransport provides &HttpTransport from &mut HttpTransport
 ```
 
 Checks out one origin through the pool's exact Unix path and lends its connection to `handler`.

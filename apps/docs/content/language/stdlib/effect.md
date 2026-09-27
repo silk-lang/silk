@@ -155,7 +155,7 @@ builtin `Effect<A ! E ? R>` type, which needs no import.
 ### Associated function `Effect.log`
 
 ```silk
-pub effect<'env> fn log<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn log<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Info` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -170,7 +170,7 @@ neither buffers nor recovers that failure. Use [`logAt`](#declaration-73696c6b2f
 ### Associated function `Effect.logAt`
 
 ```silk
-pub effect<'env> fn logAt<Args: 'env, 'life1: 'env, 'env>(level: LogLevel, static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logAt<Args: 'life1, 'life1>(level: LogLevel, static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `level` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -185,7 +185,7 @@ destination; its [`LogError`](./logger.md#declaration-73696c6b2f6c6f676765723a3a
 ### Associated function `Effect.logTrace`
 
 ```silk
-pub effect<'env> fn logTrace<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logTrace<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Trace` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -195,7 +195,7 @@ Sends one complete message at `LogLevel.Trace` through the required mutable [`Lo
 ### Associated function `Effect.logDebug`
 
 ```silk
-pub effect<'env> fn logDebug<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logDebug<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Debug` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -205,7 +205,7 @@ Sends one complete message at `LogLevel.Debug` through the required mutable [`Lo
 ### Associated function `Effect.logInfo`
 
 ```silk
-pub effect<'env> fn logInfo<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logInfo<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Info` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -215,7 +215,7 @@ Sends one complete message at `LogLevel.Info` through the required mutable [`Log
 ### Associated function `Effect.logWarning`
 
 ```silk
-pub effect<'env> fn logWarning<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logWarning<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Warning` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -225,7 +225,7 @@ Sends one complete message at `LogLevel.Warning` through the required mutable [`
 ### Associated function `Effect.logError`
 
 ```silk
-pub effect<'env> fn logError<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+pub effect<'life1> fn logError<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Sends one complete message at `LogLevel.Error` through the required mutable [`Logger`](./logger.md#declaration-73696c6b2f6c6f676765723a3a4c6f67676572).
@@ -575,7 +575,7 @@ Earlier failure payloads are released before the next attempt; the last failure 
 ### Associated function `Effect.bindRequirement`
 
 ```silk
-pub effect<'env1> fn bindRequirement<'env: 'env1, ?S, A, P: 'env1, E, ?R, 'env1>(self: once Effect<'env; A ! E ? R>, provider: &'env P) -> A ! E ? Without<R, S> where &P provides S from R
+pub effect<'env> fn bindRequirement<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: &'env P) -> A ! E ? Without<R, S> where &P provides S from R
 ```
 
 Satisfies one exact shared service requirement with a provider borrowed for this execution.
@@ -592,7 +592,7 @@ lexical: the provider remains owned by the caller after the Effect completes.
 ### Associated function `Effect.bindRequirementMut`
 
 ```silk
-pub effect<'env1> fn bindRequirementMut<'env: 'env1, ?S, A, P: 'env1, E, ?R, 'env1>(self: once Effect<'env; A ! E ? R>, provider: &'env mut P) -> A ! E ? Without<R, S> where &mut P provides S from R
+pub effect<'env> fn bindRequirementMut<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: &'env mut P) -> A ! E ? Without<R, S> where &mut P provides S from R
 ```
 
 Satisfies one service requirement with a provider borrowed exclusively for this execution.
@@ -608,7 +608,7 @@ a synthesized `&mut Logger`. The caller regains exclusive access after the Effec
 ### Associated function `Effect.bindRequirementOwned`
 
 ```silk
-pub effect<'env1> fn bindRequirementOwned<'env: 'env1, ?S, A, P: 'env1, E, ?R, 'env1>(self: once Effect<'env; A ! E ? R>, provider: P) -> A ! E ? Without<R, S> where P provides S from R
+pub effect<'env> fn bindRequirementOwned<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: P) -> A ! E ? Without<R, S> where P provides S from R
 ```
 
 Satisfies one typed service requirement by taking ownership of its provider.
@@ -624,7 +624,7 @@ repeatable. The provider is released with the Effect's lexical scope; it is not 
 ### Associated function `Effect.provide`
 
 ```silk
-pub effect<'env1> fn provide<'env: 'env1, ?S, A, P: 'env1, E, ?R, 'env1>(self: once Effect<'env; A ! E ? R>, provider: &'env P) -> A ! E ? Without<R, S> where &P provides S from R
+pub effect<'env> fn provide<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: &'env P) -> A ! E ? Without<R, S> where &P provides S from R
 ```
 
 Provides a shared service for one lexical Effect execution.
@@ -639,7 +639,7 @@ shared row member is removed, and every unrelated requirement remains visible in
 ### Associated function `Effect.provideMut`
 
 ```silk
-pub effect<'env1> fn provideMut<'env: 'env1, ?S, A, P: 'env1, E, ?R, 'env1>(self: once Effect<'env; A ! E ? R>, provider: &'env mut P) -> A ! E ? Without<R, S> where &mut P provides S from R
+pub effect<'env> fn provideMut<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: &'env mut P) -> A ! E ? Without<R, S> where &mut P provides S from R
 ```
 
 Provides a service from an exclusive borrow for one lexical Effect execution.

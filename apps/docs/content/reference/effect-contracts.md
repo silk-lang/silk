@@ -89,6 +89,12 @@ fn answerExplicit(input: i32) -> Effect<i32> {
 The complete body of an `effect fn` is deferred. Parameters are supplied when the function is
 called, but no statement inside the body runs until the resulting Effect is run.
 
+Both forms have the retained environment elaborated under
+[LIFE-004](lifetimes.md#life-004--invocation-lifetimes-and-retained-environments-are-independent).
+Here the only input is an owned `i32`, so `answer` and `answerExplicit` both produce an Effect with
+a `'static` environment. With several borrowed inputs the two spellings differ: an `effect fn`
+intersects their regions, while the explicit result must write its environment.
+
 For a declaration `effect fn work(...) -> A ! E ? R`, calling `work(...)` produces exactly
 `Effect<A ! E ? R>`.
 
