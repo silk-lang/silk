@@ -110,7 +110,10 @@ fn view<'data>(value: &'data [i32]) -> &'data [i32] { return value }
 
 These are type relationships, not a borrow-safety proof or a checked generic body. Public
 contracts reject private nominal types; missing modules, inaccessible members, collisions, and
-alias or import-name cycles produce anchored semantic rejections.
+alias or import-name cycles produce anchored semantic rejections. Each cycle member rejects at its
+own reference to the next member, with a path that starts and ends at that member, so its answer
+does not depend on which member was demanded first. In `type A = B` and `type B = A`, `A` rejects
+at its `B` and `B` at its `A`.
 
 Signatures also describe callable and Effect contracts. `fn(A) -> B`, `mut fn(A) -> B`, and
 `once fn(A) -> B` keep their invocation mode, `unsafe`, retained environment, ordered parameters,
@@ -227,16 +230,16 @@ const first: i32 = second
 const second: i32 = first
 ```
 
-`copied` has the value 255, while the value demands of `first` and `second` reject with a `Cycle`
-whose path names both declarations; their `i32` types remain available. A literal of the wrong kind
-or out of range is `InvalidConstant`, and a constant of a different type is `TypeMismatch`. Every
-other initializer is an anchored `Unsupported` with no value: floating-point, text, and character
-literals, pointer-sized integers (whose range belongs to the selected target), namespace-qualified
-names, calls to static functions, operators, and names of non-constant declarations. Static
-evaluation of those forms, target selection, foreign `static` data, and package parameters are
-later work. Array extents do not read constants yet. A function body that names a module declaration
-without a local binding, such as `return limit`, looks the name up and rejects `Unsupported` at the
-use; only an absent name is `UnknownName`.
+`copied` has the value 255, while the value demands of `first` and `second` reject with a `Cycle`,
+each at its own reference to the other, whichever is demanded first; their `i32` types remain
+available. A literal of the wrong kind or out of range is `InvalidConstant`, and a constant of a
+different type is `TypeMismatch`. Every other initializer is an anchored `Unsupported` with no
+value: floating-point, text, and character literals, pointer-sized integers (whose range belongs to
+the selected target), namespace-qualified names, calls to static functions, operators, and names of
+non-constant declarations. Static evaluation of those forms, target selection, foreign `static`
+data, and package parameters are later work. Array extents do not read constants yet. A function
+body that names a module declaration without a local binding, such as `return limit`, looks the name
+up and rejects `Unsupported` at the use; only an absent name is `UnknownName`.
 
 `Semantic.demandBody`
 checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
@@ -375,19 +378,20 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
 - **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
   applications of declarations with interface, service, or representation bounds, such as
   `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
-  parameters, lifetimes omitted inside a type declaration's bound, and omitted field lifetimes in
-  member requests.
+  parameters, and lifetimes omitted inside a type declaration's bound.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
-  pointer-sized ranges and other target selection; target constants; static parameters; package
-  parameters; and foreign `static` data and C variadic declarations, whose meaning depends on the
-  selected target.
+  pointer-sized ranges and other target selection; target constants; static parameters; and package
+  parameters.
 - **M2.5, ownership, Effects, and remaining bodies:** borrow and capture safety, Effect bodies and
   calls, `unsafe` calls, partial application, aggregate construction and member access, constant
   reads such as `return limit`, and provision algebra such as `Without<R, K>`.
 - **M2.6, representation and reflection:** layout, offsets, and rejecting infinite by-value storage
   such as `struct Node { next: Node }`.
 - **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
+
+Some `Unsupported` forms are later work that no wave owns yet: omitted field lifetimes in member
+requests, and native-boundary declarations such as foreign `static` data and C variadic functions.
 
 ## Inspect a source file
 
