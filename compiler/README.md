@@ -294,6 +294,54 @@ wave, the checker runs again. A changed nominal type result takes that conservat
 events prove only checked semantic-body reuse;
 they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
 
+Richer facts follow the same validation rule. A fact stays valid only while every present or absent
+source it observed is unchanged, so an edit anywhere in a module restarts the facts that read that
+module, and a restarted fact may equal its earlier value. Facts that never read the edited module
+remain hits. Only a checked body compares the results it consumed. A nominal type, member list,
+member shape, contract, constant value, or signature with binders, bounds, channels, or an
+environment always compares as changed. No body in the scalar subset succeeds while depending on
+one of those results, and the comparison runs only after each consumed fact has been revalidated
+against current sources. For example, take `consumer.silk`:
+
+```silk,ignore
+import geometry as Geometry
+fn origin(at: Geometry.Point) -> () { return () }
+fn caller() -> i32 { return Geometry.leaf() }
+fn unrelated() -> i32 { return 2 }
+```
+
+and `geometry.silk`:
+
+```silk,ignore
+type Element = i32
+pub struct Point { width: Element }
+pub fn leaf() -> i32 { return 1 }
+```
+
+Changing `Element` to `bool` changes the requested `width` shape to `bool`. The recomputed identity
+of `Point`, its member names, and the `origin` signature equal their earlier values. `caller` keeps
+its checked payload because the `leaf` signature is unchanged, and `unrelated`, which never read
+`geometry.silk`, is a hit. Then replace `Point` with `struct Point { height: Missing depth: i32 }`.
+The member names change, the second member (previously `UnknownMember`) has type `i32`, and the
+first member rejects `Missing` at its current span. A new store on the same revision returns the
+same results. A typed failure while revalidating `caller` publishes no answer; the retry checks the
+body again instead of restoring the earlier payload. The leaf body is never demanded.
+
+Constant type and value facts have separate consumers. Suppose `library.silk` contains
+`pub const base: u8 = 7` and the importing module contains:
+
+```silk,ignore
+import library { base }
+const copied: u8 = base
+const later: u8 = pending
+```
+
+Changing `base` to `9` restarts the value of `copied` but not its type fact, which never read the
+library. Changing `base` to `pub const base: bool = true` makes the value of `copied` a `TypeMismatch`
+at the `base` reference. The value of `later` is `UnknownName` at `pending` until
+`const pending: u8 = 4` is added, and an edit that turns two initializers into a cycle rejects their
+values with `Cycle` while their types stay available.
+
 Ordinary runtime `if` statements require `bool` conditions and check both arms. For example,
 `fn choose(flag: bool) -> i32 { if flag { return 1 } else { return 2 } }` has no reachable
 fallthrough. `fn partial(flag: bool) -> i32 { if flag { return 1 } }` rejects because the false path
@@ -314,6 +362,32 @@ host number. Structured typed failures and cancellation release incomplete query
 publication frames. A later demand can retry the same store. A fatal runtime trap ends the
 process and has no such recovery guarantee. Compiler CLI integration, host-backed snapshots, and
 later semantic and backend milestones remain future work.
+
+### Semantic scope and later waves
+
+These queries complete the M2.2 type and signature vocabulary: declaration-owned generic binders
+and explicit applications; references, slices, raw pointers, lifetimes, and modifiers; nominal
+identity, member enumeration, requested member shapes, and authored array extents; callable and
+Effect signature contracts with written channels and recorded bounds; constant types and literal or
+constant-to-constant values; and revision validation for each of these facts. A form outside that
+vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
+
+- **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
+  applications of declarations with interface, service, or representation bounds, such as
+  `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
+  parameters, lifetimes omitted inside a type declaration's bound, and omitted field lifetimes in
+  member requests.
+- **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
+  initializers with calls, operators, qualified names, or floating-point, text, or character values;
+  pointer-sized ranges and other target selection; target constants; static parameters; package
+  parameters; and foreign `static` data and C variadic declarations, whose meaning depends on the
+  selected target.
+- **M2.5, ownership, Effects, and remaining bodies:** borrow and capture safety, Effect bodies and
+  calls, `unsafe` calls, partial application, aggregate construction and member access, constant
+  reads such as `return limit`, and provision algebra such as `Without<R, K>`.
+- **M2.6, representation and reflection:** layout, offsets, and rejecting infinite by-value storage
+  such as `struct Node { next: Node }`.
+- **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
 
 ## Inspect a source file
 
