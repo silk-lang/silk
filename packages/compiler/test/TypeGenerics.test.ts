@@ -1,4 +1,5 @@
 import { records } from './support/records.js'
+import { constrainedCallableForwarding } from './support/corpus.js'
 import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
@@ -377,6 +378,18 @@ pub fn main() -> i32 { return 0 }`
     assert.isDefined(surface)
     assert.include(surface?.canonical ?? '', 'ProviderConstraint')
     assert.include(surface?.canonical ?? '', 'WithoutRowExpression')
+  }),
+)
+
+it.effect('admits a constrained callable relayed through bound calls', () =>
+  Effect.gen(function* () {
+    // `forwardAgain` binds the result of `forward` before returning it, so the relay resolves a
+    // body local to the parameter the caller supplies.
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'generics/constrained-relay',
+      new TextEncoder().encode(constrainedCallableForwarding),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
   }),
 )
 
