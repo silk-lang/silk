@@ -227,7 +227,10 @@ coherence answer yet.
 `Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
 binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
 and `Intrinsic.NonParking` are witness-free properties recorded on generic bounds, and a Detached
-representation parameter retains no region. Other intrinsic families, `impl Intrinsic`, and calls
+representation parameter retains no region. An `Intrinsic.application` import selects the canonical
+module explicitly bound to the semantic request; an active import without that binding rejects at
+the import, and different bindings have separate query identities. Its imported members obey the
+usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
 Generic bodies, non-scalar call operands, applications of declarations with interface or
