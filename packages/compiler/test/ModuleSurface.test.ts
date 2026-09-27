@@ -347,6 +347,17 @@ impl Drop for Guard { fn drop(self: &mut Guard) -> () { unsafe { return () } } }
   }),
 )
 
+it('refuses to encode a section binder as an ordinary parameter', () => {
+  const parameter = Type.parameter({ module: 'surface/section', name: 'provide' }, 0, 'A')
+  assert.strictEqual(
+    ModuleSurface.encodeSemanticType(parameter),
+    ModuleSurface.encodeSemanticType(
+      Type.parameter({ module: 'surface/section', name: 'provide' }, 0, 'A'),
+    ),
+  )
+  assert.throws(() => ModuleSurface.encodeSemanticType(Type.sectionBinder(parameter)), RangeError)
+})
+
 it.effect('round-trips constrained callable schemas without source origins', () =>
   Effect.gen(function* () {
     const owner = { module: 'surface/Main', name: 'provide' }
