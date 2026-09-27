@@ -432,8 +432,8 @@ conversions use the enclosing type-mismatch diagnostic.
 
 **Status:** Confirmed
 
-A `const` declaration requires a type annotation. Its type is `bool`, a supported integer or
-floating-point primitive, or `string`. Its initializer is a statically evaluated expression that
+A `const` declaration requires a type annotation. Its type is `bool`, `char`, a supported integer
+or floating-point primitive, or `string`. Its initializer is a statically evaluated expression that
 must produce exactly the declared type for the selected target. Constants do not infer their type
 or hold aggregate values.
 
@@ -441,6 +441,7 @@ or hold aggregate values.
 pub const limit: i32 = 2
 const ratio: f64 = 1.5
 const enabled: bool = true
+const separator: char = ','
 const pattern: string = r"\d+"
 ```
 
