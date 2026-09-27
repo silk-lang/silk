@@ -70,7 +70,11 @@ export const selectCall = (
             call.target.declaration.module === implementation.module &&
             call.target.declaration.name === implementation.name,
         )
-  const expected = typeArguments?.filter((argument) => !Type.isHiddenExecutableArgument(argument))
+  // Instance keys close a relayed section's unapplied schema binders; the authored arguments are
+  // compared in that same closed form.
+  const expected = typeArguments
+    ?.map(Type.closeSectionSchema)
+    .filter((argument) => !Type.isHiddenExecutableArgument(argument))
   const exactSpecialized =
     expected === undefined
       ? selected

@@ -378,15 +378,18 @@ export const resultCallableValueType = (
 ): Extract<Mir.Type, { readonly _tag: 'CallableValue' }> | undefined => {
   const contract = Type.isRepresented(type) ? type.contract : type
   if (!Type.isCallable(contract)) return undefined
-  const visible = typeArguments.filter((argument) => !Type.isHiddenExecutableArgument(argument))
+  // Complete arguments name one instance, hidden identities included: relays of two sections with
+  // one closed callable type differ only there. Visible arguments alone must agree on one identity.
+  const complete = typeArguments.some(Type.isHiddenExecutableArgument)
+  const visible = (arguments_: ReadonlyArray<Type.GenericArgument>) =>
+    arguments_.filter((argument) => !Type.isHiddenExecutableArgument(argument))
   const identities = instances.flatMap((instance) =>
     instance.key.declaration.module === target.module &&
     instance.key.declaration.name === target.name &&
     instance.resultCallable !== undefined &&
-    sameArguments(
-      instance.key.typeArguments.filter((argument) => !Type.isHiddenExecutableArgument(argument)),
-      visible,
-    )
+    (complete
+      ? sameArguments(instance.key.typeArguments, typeArguments)
+      : sameArguments(visible(instance.key.typeArguments), visible(typeArguments)))
       ? [instance.resultCallable]
       : [],
   )
