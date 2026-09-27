@@ -1948,17 +1948,16 @@ export const discover = (
         declaration._tag === 'StructDeclaration'
           ? declaration.fields
           : declaration.variants.flatMap((variant) => variant.fields)
+      // A field of exactly the candidate's type is itself a strict subterm of `whole`.
       if (
-        fields.some(
-          (field) =>
-            field.declaredType._tag === 'Resolved' &&
-            strictCleanupSubtermUnder(
-              candidate,
-              Type.substitute(field.declaredType.type, substitution),
-              nextUnfolding,
-              memo,
-            ),
-        )
+        fields.some((field) => {
+          if (field.declaredType._tag !== 'Resolved') return false
+          const type = Type.substitute(field.declaredType.type, substitution)
+          return (
+            sameRuntimeType(candidate, type) ||
+            strictCleanupSubtermUnder(candidate, type, nextUnfolding, memo)
+          )
+        })
       )
         return true
     }

@@ -811,6 +811,29 @@ pub fn main() -> () {
   }),
 )
 
+it.effect('admits cleanup of a payload owned directly by a root element field', () =>
+  Effect.gen(function* () {
+    const result = yield* snapshot(`import silk.shared { Shared }
+import silk.vector { Vector }
+union Type {
+  Nominal { arguments: Vector<Argument> },
+  Union { members: Vector<Shared<Type>> }
+}
+union Argument {
+  Type { value: Shared<Type> },
+  Empty
+}
+struct Binding { value: Argument }
+pub fn main() -> () {
+  let bindings = Vector.make<Binding>()
+  drop bindings
+  return ()
+}`)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    assert.deepEqual(result.instances.violations, [])
+  }),
+)
+
 it.effect('admits nested cleanup reached through a lexical service provider', () =>
   Effect.gen(function* () {
     const result = yield* snapshot(`import silk.effect { Effect }
