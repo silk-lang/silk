@@ -214,13 +214,15 @@ representation parameter retains no region. Other intrinsic families, `impl Intr
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
 Generic calls and demanded generic bodies, type inference, applications of declarations with
-interface or representation bounds, a declaration with more than one `?R` binder when applied, a
-lifetime omitted inside a type declaration's bound, row subtraction such as `Without<R, K>` (which
-belongs to the later provision and requirement-algebra work), requirements on type parameters,
+interface or representation bounds, a declaration with more than one `?R` binder when applied,
+row subtraction such as `Without<R, K>` (which belongs to the later provision and
+requirement-algebra work), requirements on type parameters,
 variadic functions, static parameters, and other nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
+An omitted lifetime inside a declaration bound is recorded as a generated declaration binder;
+applications requiring conformance proof remain `Unsupported` until that proof is available.
 
 An omitted callable or Effect environment elides like a borrow. An input retains the regions of its
 borrows, non-`'static` nominal lifetime arguments, and callable or Effect environments; the
