@@ -663,7 +663,7 @@ export const websocketUpgradePortableAcceptanceSource = websocketUpgradeAcceptan
   .replace(/effect fn inspection\([\s\S]*?(?=fn deadline\()/, '')
   .replace(/effect fn suspended\([\s\S]*?(?=effect fn allCases\()/, '')
   .replace(
-    /effect fn allCases\([\s\S]*?(?=effect fn recover)/,
+    /effect fn allCases\([\s\S]*?(?=effect<'env> fn recover)/,
     `effect fn allCases() -> i32 ! PolicyError | OutOfMemoryError | ServerError | UpgradeError | BufferError {
 ${positiveCase}
   return 0

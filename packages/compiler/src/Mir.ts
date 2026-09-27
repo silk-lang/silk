@@ -1807,6 +1807,34 @@ export const matchesInstance = (
     return expected !== undefined && StaticValue.key(argument) === StaticValue.key(expected)
   })
 
+/**
+ * Tests whether a returned value physically realizes its function's declared result.
+ *
+ * Unstored Effect values pinned to one site and environment instance name one machine, so only
+ * their executable contract has to agree: run access and executable lifetime proofs are non-runtime
+ * facts, and a realized `never` success widens into the declared success (EFF-007), while a
+ * declared `never` success accepts only a realized `never`. Stored Effects and every other type
+ * keep exact runtime identity.
+ */
+export const realizesReturn = (returned: Type, result: Type): boolean => {
+  if (
+    returned._tag !== 'EffectValue' ||
+    result._tag !== 'EffectValue' ||
+    returned.storage !== undefined ||
+    result.storage !== undefined
+  )
+    return SilkType.runtimeKey(semanticType(returned)) === SilkType.runtimeKey(semanticType(result))
+  const realized = SilkType.isNever(returned.type.success)
+    ? { ...returned.type, success: result.type.success }
+    : returned.type
+  return (
+    EffectExecutionContract.equals(realized, result.type) &&
+    Tir.sameExecutableSite(returned.site, result.site) &&
+    Instances.runtimeKeyText(returned.environment.instance) ===
+      Instances.runtimeKeyText(result.environment.instance)
+  )
+}
+
 /** Tests whether one concrete MIR function realizes a call's exact physical result contract. */
 export const matchesCall = (
   fn: MirFunction,
