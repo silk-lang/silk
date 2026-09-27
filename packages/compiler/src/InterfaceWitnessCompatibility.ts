@@ -119,6 +119,18 @@ const operandProblem = (
   return undefined
 }
 
+/** A witness Effect must stay valid for at least the environment the operation promises. */
+export const environment = (
+  promised: Lifetime.Lifetime,
+  witness: Lifetime.Lifetime,
+  context: TypeCompatibility.Context = TypeCompatibility.context(),
+): Compatibility =>
+  TypeCompatibility.isCompatible(
+    TypeCompatibility.check(Type.string(witness), Type.string(promised), context),
+  )
+    ? { _tag: 'Compatible' }
+    : incompatible({ _tag: 'LifetimeContract' })
+
 /** Opens the promised lifetime binders rigidly and rejects stronger witness bounds. */
 export const lifetimeContract = (
   contract: Type.ExecutableLifetimes,

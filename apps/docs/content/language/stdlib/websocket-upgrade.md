@@ -699,7 +699,7 @@ A compile-time policy that makes one explicit decision from a scoped request off
 ### Operation `decide`
 
 ```silk
-effect<'call> fn decide<'call: 'call, 'head: 'call>(handler: &'call Self, offer: &'call silk/websocket_upgrade.Offer<'head>) -> silk/websocket_upgrade.Decision<'call> ! D ? R
+effect<'call> fn decide<'call, 'head: 'call>(handler: &'call Self, offer: &'call silk/websocket_upgrade.Offer<'head>) -> silk/websocket_upgrade.Decision<'call> ! D ? R
 ```
 
 Borrows policy and offer data for one decision and preserves failure and requirement channels.
@@ -751,7 +751,7 @@ its close authority armed. This operation provides no frame or native TLS server
 ## `reject`
 
 ```silk
-pub effect<'env> fn reject<'loan: 'env, 'request: 'loan + 'env, 'connection: 'request + 'env, 'transport: 'connection + 'env, P: 'env, 'life5: 'env, 'env>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, error: &'life5 silk/websocket_upgrade.UpgradeError, limits: Limits, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! UpgradeError | ServerError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'loan & 'life5> fn reject<'loan, 'request: 'loan + 'loan & 'life5, 'connection: 'request + 'loan & 'life5, 'transport: 'connection + 'loan & 'life5, P: 'loan & 'life5, 'life5>(request: &'loan mut silk/http_server.Request<'request, 'connection, 'transport, P>, error: &'life5 silk/websocket_upgrade.UpgradeError, limits: Limits, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! UpgradeError | ServerError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Sends the deterministic body-free HTTP rejection for a typed handshake failure.

@@ -148,7 +148,7 @@ effect fn parkedOperation(reading: bool) -> i32 ! ByteIoError | OutOfMemoryError
   return usize.toI32(written)
 }
 
-effect fn suspensionFailed<E>(error: E) -> i32 { drop error return -1 }
+effect<'env> fn suspensionFailed<E: 'env, 'env>(error: E) -> i32 { drop error return -1 }
 
 effect fn actualSuspension() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -438,7 +438,7 @@ effect fn program() -> i32 ! ByteIoError | OutOfMemoryError ? &mut Allocator | &
   return 42
 }
 
-effect fn failed<E>(error: E) -> i32 { drop error return -1 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return -1 }
 pub fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = VirtualClock {

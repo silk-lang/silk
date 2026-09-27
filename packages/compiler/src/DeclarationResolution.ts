@@ -1291,6 +1291,26 @@ export const witnessBinding = (
 }
 
 /** Infers an interface witness declaration's own binders without assuming header position. */
+/**
+ * The rigid region of one owned operand lent to a source witness for a single invocation. The
+ * adapter owns the operand for that whole invocation.
+ */
+const witnessBorrow = (implementation: DeclarationFact): Lifetime.Lifetime =>
+  Lifetime.placeholder(
+    Lifetime.bound(
+      {
+        module: implementation.id.sourceId,
+        name:
+          implementation.name._tag === 'Present'
+            ? implementation.name.spelling
+            : `witness@${implementation.id.ordinal}`,
+      },
+      0,
+      'witnessBorrow',
+    ),
+    'owned witness invocation',
+  )
+
 export const inferInterfaceWitnessTarget = (
   implementation: DeclarationFact,
   contract: InterfaceOperationApplicationFact | undefined,
@@ -1318,24 +1338,7 @@ export const inferInterfaceWitnessTarget = (
       Type.isReference(pattern.type) &&
       !Type.isReference(operand.type.type) &&
       !Type.isSlice(operand.type.type)
-        ? Type.reference(
-            pattern.type.access,
-            operand.type.type,
-            Lifetime.placeholder(
-              Lifetime.bound(
-                {
-                  module: implementation.id.sourceId,
-                  name:
-                    implementation.name._tag === 'Present'
-                      ? implementation.name.spelling
-                      : `witness@${implementation.id.ordinal}`,
-                },
-                0,
-                'witnessBorrow',
-              ),
-              'owned witness invocation',
-            ),
-          )
+        ? Type.reference(pattern.type.access, operand.type.type, witnessBorrow(implementation))
         : operand.type.type
     constraints.push({
       label: Type.equals(
@@ -1359,6 +1362,27 @@ export const inferInterfaceWitnessTarget = (
       ...Type.freeLifetimes(constraint.pattern).map(Lifetime.key),
     ]),
   )
+  // A witness binder that occurs only in its written retained environment is determined by the
+  // promised environment: structural matching binds it only when the written environment is
+  // exactly that region. Anything else, such as an intersection of several free binders against
+  // one promised region, fails inference and the mapping stays rejected. Compatibility itself is
+  // unchanged; this only names the binder.
+  const environment = implementation.lifetimeElaboration?.explicitEnvironment
+  if (
+    environment !== undefined &&
+    contract.functionKind === 'Effect' &&
+    binders.some((binder) => !covered.has(Type.key(binder)))
+  ) {
+    constraints.push({
+      label: 'environment',
+      pattern: Type.effect(Type.unit, [], { environment, lifetimeBinders: [] }),
+      actual: Type.effect(Type.unit, [], {
+        environment: contract.lifetimes.environment,
+        lifetimeBinders: [],
+      }),
+    })
+    for (const atom of Lifetime.atoms(environment)) covered.add(Lifetime.key(atom))
+  }
   if (binders.some((binder) => !covered.has(Type.key(binder))))
     constraints.push({
       label: 'failure and requirement rows',
@@ -1452,6 +1476,33 @@ export const interfaceWitnessCompatibility = (
     }),
   )
   if (lifetimeCompatibility._tag === 'Incompatible') return lifetimeCompatibility
+  if (contract.functionKind === 'Effect' && implementation.functionKind === 'Effect') {
+    // An owned operand lent to this witness stays with the adapter for the whole invocation, so
+    // exactly that rigid borrow does not shorten the promised environment. It still cannot escape
+    // through the success value, which the operand and success checks below compare as written.
+    const lent = Lifetime.key(witnessBorrow(implementation))
+    const witnessEnvironment = Lifetime.intersection(
+      Lifetime.atoms(
+        Type.substituteLifetime(executableLifetimes(implementation).environment, substitution),
+      ).filter((atom) => Lifetime.key(atom) !== lent),
+    )
+    const environmentCompatibility = InterfaceWitnessCompatibility.environment(
+      contract.lifetimes.environment,
+      witnessEnvironment,
+      // The promised retained bounds (each captured region outlives the environment) hold here.
+      TypeCompatibility.context({
+        assumptions: Lifetime.assumptions([
+          ...(conformanceLifetimes.lifetimeBounds ?? []),
+          ...(expectedLifetimes.lifetimeBounds ?? []),
+        ]),
+        typeBounds: [
+          ...(conformanceLifetimes.typeOutlives ?? []),
+          ...(expectedLifetimes.typeOutlives ?? []),
+        ],
+      }),
+    )
+    if (environmentCompatibility._tag === 'Incompatible') return environmentCompatibility
+  }
   const contractOperands = contract.operands.flatMap((operand) =>
     operand.type._tag === 'Resolved'
       ? [compatibilityOperand(operand.parameter, operand.type.type, contract.provider)]

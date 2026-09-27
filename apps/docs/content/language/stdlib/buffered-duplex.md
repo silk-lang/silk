@@ -72,7 +72,7 @@ Returns the pending output count, or zero after terminal close.
 ### Method `BufferedDuplex.consume`
 
 ```silk
-pub effect<'env> fn consume<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, count: usize) -> () ! BufferError
+pub effect<'life2> fn consume<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, count: usize) -> () ! BufferError
 ```
 
 Consumes exactly an initialized unread prefix.
@@ -82,7 +82,7 @@ Consumes exactly an initialized unread prefix.
 ### Method `BufferedDuplex.fill`
 
 ```silk
-pub effect<'env> fn fill<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, minimum: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> FillOutcome ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn fill<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, minimum: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> FillOutcome ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Retains at least `minimum` input bytes or reports sticky source end.
@@ -92,7 +92,7 @@ Retains at least `minimum` input bytes or reports sticky source end.
 ### Method `BufferedDuplex.readSome`
 
 ```silk
-pub effect<'env> fn readSome<'transport: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, output: &'life3 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2 & 'life3> fn readSome<'transport: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut BufferedDuplex<'transport, P>, output: &'life3 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Copies one retained or newly read prefix.
@@ -102,7 +102,7 @@ Copies one retained or newly read prefix.
 ### Method `BufferedDuplex.readExact`
 
 ```silk
-pub effect<'env> fn readExact<'transport: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, output: &'life3 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2 & 'life3> fn readExact<'transport: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut BufferedDuplex<'transport, P>, output: &'life3 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Fills the complete destination or reports its exact copied prefix.
@@ -112,7 +112,7 @@ Fills the complete destination or reports its exact copied prefix.
 ### Method `BufferedDuplex.discardAtMost`
 
 ```silk
-pub effect<'env> fn discardAtMost<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, limit: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> DiscardOutcome ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn discardAtMost<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, limit: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> DiscardOutcome ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Discards no more than one finite limit.
@@ -122,7 +122,7 @@ Discards no more than one finite limit.
 ### Method `BufferedDuplex.discardExact`
 
 ```silk
-pub effect<'env> fn discardExact<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, count: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn discardExact<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, count: usize, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Discards exactly one finite count.
@@ -132,7 +132,7 @@ Discards exactly one finite count.
 ### Method `BufferedDuplex.writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<'transport: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, input: &'life3 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2 & 'life3> fn writeSome<'transport: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut BufferedDuplex<'transport, P>, input: &'life3 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts one positive input prefix into owned pending storage.
@@ -142,7 +142,7 @@ Accepts one positive input prefix into owned pending storage.
 ### Method `BufferedDuplex.writeAll`
 
 ```silk
-pub effect<'env> fn writeAll<'transport: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, input: &'life3 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2 & 'life3> fn writeAll<'transport: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut BufferedDuplex<'transport, P>, input: &'life3 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts one complete finite input in order.
@@ -152,7 +152,7 @@ Accepts one complete finite input in order.
 ### Method `BufferedDuplex.writeVecAll`
 
 ```silk
-pub effect<'env> fn writeVecAll<'transport: 'env, P: 'env, 'life2: 'env, 'life3: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, inputs: &'life3 [silk/bytes.Bytes], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2 & 'life3> fn writeVecAll<'transport: 'life2 & 'life3, P: 'life2 & 'life3, 'life2, 'life3>(self: &'life2 mut BufferedDuplex<'transport, P>, inputs: &'life3 [silk/bytes.Bytes], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Accepts borrowed byte vectors in order after checking aggregate length arithmetic.
@@ -162,7 +162,7 @@ Accepts borrowed byte vectors in order after checking aggregate length arithmeti
 ### Method `BufferedDuplex.flush`
 
 ```silk
-pub effect<'env> fn flush<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn flush<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Writes pending bytes exactly once and then flushes the provider boundary.
@@ -172,7 +172,7 @@ Writes pending bytes exactly once and then flushes the provider boundary.
 ### Method `BufferedDuplex.finish`
 
 ```silk
-pub effect<'env> fn finish<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn finish<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Explicitly finishes pending output.
@@ -182,7 +182,7 @@ Explicitly finishes pending output.
 ### Method `BufferedDuplex.shutdownWrite`
 
 ```silk
-pub effect<'env> fn shutdownWrite<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life2> fn shutdownWrite<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! BufferError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Flushes pending output and then closes only the provider's write direction.
@@ -198,7 +198,7 @@ the enclosing buffered scope, which terminally closes the retained provider.
 ### Method `BufferedDuplex.close`
 
 ```silk
-pub effect<'env> fn close<'transport: 'env, P: 'env, 'life2: 'env, 'env>(self: &'life2 mut BufferedDuplex<'transport, P>) -> () ! ByteIoError where &mut P provides &ByteDuplex from &mut ByteDuplex
+pub effect<'life2> fn close<'transport: 'life2, P: 'life2, 'life2>(self: &'life2 mut BufferedDuplex<'transport, P>) -> () ! ByteIoError where &mut P provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Terminally closes the provider once and abandons all buffered bytes without a flush.
@@ -230,7 +230,7 @@ interface selection adds no runtime service or requirement-row member.
 ### Operation `use`
 
 ```silk
-effect<'session> fn use<'session: 'session, 'transport: 'session>(context: Self, session: &'session mut silk/buffered_duplex.BufferedDuplex<'transport, P>) -> A ! E ? R where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+effect<'session> fn use<'session, 'transport: 'session>(context: Self, session: &'session mut silk/buffered_duplex.BufferedDuplex<'transport, P>) -> A ! E ? R where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Consumes one owned context while using a temporary buffered session.
@@ -240,7 +240,7 @@ Consumes one owned context while using a temporary buffered session.
 ## `withBuffered`
 
 ```silk
-pub effect<'env1> fn withBuffered<'env: 'env1, A, E, ?CallbackRequirements, P: 'env1, 'env1>(transport: &'env mut P, callback: for<'call> once fn<'env>(&'call mut silk/buffered_duplex.BufferedDuplex<'call, P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withBuffered<'env, A, E, ?CallbackRequirements, P: 'env>(transport: &'env mut P, callback: for<'call> once fn<'env>(&'call mut silk/buffered_duplex.BufferedDuplex<'call, P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Runs one callback with default 8,192-byte input and output buffers.
@@ -250,7 +250,7 @@ Runs one callback with default 8,192-byte input and output buffers.
 ## `withBufferedCapacity`
 
 ```silk
-pub effect<'env1> fn withBufferedCapacity<'env: 'env1, A, E, ?CallbackRequirements, P: 'env1, 'env1>(transport: &'env mut P, inputCapacity: usize, outputCapacity: usize, callback: for<'call> once fn<'env>(&'call mut silk/buffered_duplex.BufferedDuplex<'call, P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withBufferedCapacity<'env, A, E, ?CallbackRequirements, P: 'env>(transport: &'env mut P, inputCapacity: usize, outputCapacity: usize, callback: for<'call> once fn<'env>(&'call mut silk/buffered_duplex.BufferedDuplex<'call, P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Runs one callback with explicitly bounded direction capacities.
@@ -260,7 +260,7 @@ Runs one callback with explicitly bounded direction capacities.
 ## `withBufferedCapacityContext`
 
 ```silk
-pub effect<'env1> fn withBufferedCapacityContext<'env: 'env1, A, E, ?CallbackRequirements, P: 'env1, C: 'env1, 'env1>(transport: &'env mut P, inputCapacity: usize, outputCapacity: usize, context: C) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withBufferedCapacityContext<'env, A, E, ?CallbackRequirements, P: 'env, C: 'env>(transport: &'env mut P, inputCapacity: usize, outputCapacity: usize, context: C) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Runs one compile-time-selected context adapter with explicit direction capacities.
@@ -276,7 +276,7 @@ which cannot escape through the context or result.
 ## `withBufferedPairCapacity`
 
 ```silk
-pub effect<'env1> fn withBufferedPairCapacity<'env: 'env1, A, E, ?CallbackRequirements, SP: 'env1, DP: 'env1, 'env1>(source: &'env mut SP, sourceInputCapacity: usize, sourceOutputCapacity: usize, destination: &'env mut DP, destinationInputCapacity: usize, destinationOutputCapacity: usize, callback: for<'sourceCall, 'destinationCall> once fn<'env>(&'sourceCall mut silk/buffered_duplex.BufferedDuplex<'sourceCall, SP>, &'destinationCall mut silk/buffered_duplex.BufferedDuplex<'destinationCall, DP>) -> once Effect<'sourceCall & 'destinationCall; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut SP provides &ByteDuplex from &mut ByteDuplex, &mut DP provides &ByteDuplex from &mut ByteDuplex, &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withBufferedPairCapacity<'env, A, E, ?CallbackRequirements, SP: 'env, DP: 'env>(source: &'env mut SP, sourceInputCapacity: usize, sourceOutputCapacity: usize, destination: &'env mut DP, destinationInputCapacity: usize, destinationOutputCapacity: usize, callback: for<'sourceCall, 'destinationCall> once fn<'env>(&'sourceCall mut silk/buffered_duplex.BufferedDuplex<'sourceCall, SP>, &'destinationCall mut silk/buffered_duplex.BufferedDuplex<'destinationCall, DP>) -> once Effect<'sourceCall & 'destinationCall; A ! E ? CallbackRequirements>) -> A ! E | BufferError | OutOfMemoryError ? CallbackRequirements | &mut Allocator where &mut SP provides &ByteDuplex from &mut ByteDuplex, &mut DP provides &ByteDuplex from &mut ByteDuplex, &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, &mut DP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Runs one callback with two explicitly bounded buffered sessions.

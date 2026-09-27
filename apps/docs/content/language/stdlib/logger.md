@@ -167,7 +167,7 @@ owns those choices and applies the shared `silk.format` contract.
 ### Operation `log`
 
 ```silk
-effect<'env> fn log<Args: 'env, 'life1: 'env, 'env>(level: LogLevel, static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
+effect<'life1> fn log<Args: 'life1, 'life1>(level: LogLevel, static template: string<'static>, args: &'life1 Args) -> () ! LogError ? &mut Logger
 ```
 
 Formats and submits one complete UTF-8 message at one severity to the active provider.

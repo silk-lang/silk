@@ -1,4 +1,4 @@
-import type * as Location from './Location.js'
+import * as Location from './Location.js'
 import type * as MachineFunction from './MachineFunction.js'
 import type * as NativeRequirement from './NativeRequirement.js'
 import type * as ForeignContract from './ForeignContract.js'
@@ -11,7 +11,7 @@ import * as CallableContract from './CallableContract.js'
 import type * as ConformanceHead from './ConformanceHead.js'
 import type * as Constraint from './Constraint.js'
 import type { Index } from './DeclarationIndex.js'
-import type * as Diagnostic from './Diagnostic.js'
+import * as Diagnostic from './Diagnostic.js'
 import * as TypeInference from './internal/TypeInference.js'
 import * as Presentation from './SemanticDisplay.js'
 import type * as Operator from './Operator.js'
@@ -1005,11 +1005,6 @@ const computeExecutableLifetimes = (
       ? [Lifetime.bound(parameter.type.owner, parameter.type.ordinal, parameter.type.name)]
       : [],
   )
-  const owner = declaration.lifetimeElaboration?.owner ??
-    lifetimeBinders.at(0)?.owner ?? {
-      module: declaration.id.sourceId,
-      name: `function#${declaration.id.ordinal}`,
-    }
   const lifetimeBounds: Array<Lifetime.Outlives> = []
   const typeOutlives: Array<Type.TypeOutlives> = []
   for (const parameter of declaration.typeParameters)
@@ -1023,63 +1018,62 @@ const computeExecutableLifetimes = (
         if (type !== undefined) typeOutlives.push({ type, lifetime: shorter })
       }
     }
-  const explicitEnvironment =
-    declaration.functionKind === 'Effect'
-      ? declaration.lifetimeElaboration?.explicitEnvironment
-      : undefined
+  // An ordinary function retains nothing. An `effect fn` captures every input, so an omitted
+  // environment is the intersection of the regions they retain. Unknown generic contents leave it
+  // undetermined; `omittedEnvironmentDiagnostics` rejects that, and no obligation is invented.
+  const explicitEnvironment = declaration.lifetimeElaboration?.explicitEnvironment
+  const retention = inputs.map(Type.retention)
   let environment: Lifetime.Lifetime = Lifetime.staticLifetime
-  const sole = retained.at(0)
-  let synthesized = false
-  if (explicitEnvironment !== undefined) environment = explicitEnvironment
-  else if (retained.length === 1 && sole !== undefined && genericStorage.length === 0)
-    environment = sole
-  else if (retained.length > 1 || genericStorage.length > 0) {
-    const assumptions = Lifetime.assumptions(lifetimeBounds)
-    const proves = (longer: Lifetime.Lifetime, shorter: Lifetime.Lifetime): boolean =>
-      Lifetime.outlives(assumptions, longer, shorter)
-    const candidates = [
-      ...new Map(
-        [...retained, ...lifetimeBinders, ...typeOutlives.map((bound) => bound.lifetime)].map(
-          (candidate) => [Lifetime.key(candidate), candidate],
-        ),
-      ).values(),
-    ].filter(
-      (candidate) =>
-        retained.every((source) => proves(source, candidate)) &&
-        genericStorage.every((type) =>
-          Type.satisfiesOutlives(type, candidate, typeOutlives, proves),
-        ),
-    )
-    const common = candidates.filter((candidate) =>
-      candidates.every((other) => proves(other, candidate)),
-    )
-    const selected = common.length === 1 ? common.at(0) : undefined
-    if (selected !== undefined) environment = selected
-    else {
-      const names = new Set(
-        declaration.typeParameters.map((parameter) => parameter.type.name.replace(/^'/, '')),
-      )
-      let name = 'env'
-      let suffix = 1
-      while (names.has(name)) name = `env${suffix++}`
-      environment = Lifetime.bound(
-        owner,
-        Math.max(-1, ...declaration.typeParameters.map((parameter) => parameter.type.ordinal)) + 1,
-        name,
-      )
-      lifetimeBinders.push(environment)
-      synthesized = true
+  if (declaration.functionKind === 'Effect') {
+    environment =
+      explicitEnvironment ?? Lifetime.intersection(retention.flatMap((input) => input.regions))
+    if (
+      explicitEnvironment !== undefined ||
+      retention.every((input) => input.unknown.length === 0)
+    ) {
+      // Stored data below a borrow is bounded by that borrow, so these hold for an omitted
+      // environment. A constituent of the environment outlives it trivially.
+      const members = new Set(Lifetime.atoms(environment).map(Lifetime.key))
+      for (const longer of retained)
+        if (!members.has(Lifetime.key(longer)))
+          lifetimeBounds.push({ longer, shorter: environment })
+      typeOutlives.push(...genericStorage.map((type) => ({ type, lifetime: environment })))
     }
   }
-  if (synthesized || explicitEnvironment !== undefined)
-    lifetimeBounds.push(...retained.map((longer) => ({ longer, shorter: environment })))
-  typeOutlives.push(...genericStorage.map((type) => ({ type, lifetime: environment })))
   return {
     environment,
     lifetimeBinders: lifetimeBinders,
     lifetimeBounds: Lifetime.assumptions(lifetimeBounds).bounds,
     typeOutlives: Type.normalizeTypeOutlives(typeOutlives),
   }
+}
+
+/**
+ * Rejects an omitted Effect environment that the inputs do not determine (LIFE-004): an `effect fn`
+ * input whose stored contents involve a type parameter, or an ordinary function's elided `'static`
+ * result environment when some input retains a region.
+ */
+export const omittedEnvironmentDiagnostics = (
+  declaration: DeclarationFact | ServiceOperationFact,
+): ReadonlyArray<Diagnostic.Located> => {
+  const elaboration = declaration.lifetimeElaboration
+  if (elaboration === undefined) return []
+  const inputs = declaration.parameters.flatMap((parameter) =>
+    parameter.declaredType._tag === 'Resolved'
+      ? [{ anchor: parameter.declaredType.anchor, ...Type.retention(parameter.declaredType.type) }]
+      : [],
+  )
+  if (declaration.functionKind === 'Effect') {
+    const unknown = inputs.find((input) => input.unknown.length > 0)
+    return elaboration.explicitEnvironment !== undefined || unknown === undefined
+      ? []
+      : [Diagnostic.ambiguousLifetimeElision(Location.at(unknown.anchor))]
+  }
+  const result = elaboration.closedEffectResult
+  return result !== undefined &&
+    inputs.some((input) => input.regions.length > 0 || input.unknown.length > 0)
+    ? [Diagnostic.ambiguousLifetimeElision(Location.at(result))]
+    : []
 }
 
 /** Row normalization has no stored values and therefore no retained environment. */

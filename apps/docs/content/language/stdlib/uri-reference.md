@@ -333,7 +333,7 @@ bracketed literals or reg-names, never userinfo or a port. Empty ports and hosts
 ### Method `UriReference.copy`
 
 ```silk
-pub effect<'env> fn copy<'text: 'env, 'life1: 'env, 'env>(self: &'life1 UriReference<'text>) -> OwnedUriReference ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'text: 'life1, 'life1>(self: &'life1 UriReference<'text>) -> OwnedUriReference ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies a parsed reference into independent owned storage with one allocation for nonempty input.

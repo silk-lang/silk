@@ -255,7 +255,7 @@ Reports whether a presentation may emit balanced ANSI styling.
 ### Associated function `Format.write`
 
 ```silk
-pub effect<'env> fn write<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut silk/format.Formatter, bytes: &'life1 [u8]) -> () ! WriterError ? &mut Writer
+pub effect<'life0 & 'life1> fn write<'life0, 'life1>(self: &'life0 mut silk/format.Formatter, bytes: &'life1 [u8]) -> () ! WriterError ? &mut Writer
 ```
 
 Writes one byte sequence through the ambient Writer.
@@ -270,7 +270,7 @@ remains written.
 ### Associated function `Format.writeText`
 
 ```silk
-pub effect<'env> fn writeText<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut silk/format.Formatter, text: string<'life1>) -> () ! WriterError ? &mut Writer
+pub effect<'life0 & 'life1> fn writeText<'life0, 'life1>(self: &'life0 mut silk/format.Formatter, text: string<'life1>) -> () ! WriterError ? &mut Writer
 ```
 
 Writes valid UTF-8 content without applying width policy.
@@ -368,7 +368,7 @@ failure remains written.
 ### Associated function `Format.display`
 
 ```silk
-pub effect<'env> fn display<T: 'env, 'life1: 'env, 'env>(value: &'life1 T) -> () ! WriterError ? &mut Writer
+pub effect<'life1> fn display<T: 'life1, 'life1>(value: &'life1 T) -> () ! WriterError ? &mut Writer
 ```
 
 Displays one value with canonical defaults through the ambient mutable Writer.
@@ -383,7 +383,7 @@ accepted prefix remains written and the original `WriterError` is preserved.
 ### Associated function `Format.displayWith`
 
 ```silk
-pub effect<'env> fn displayWith<T: 'env, 'life1: 'env, 'env>(value: &'life1 T, options: FormatOptions) -> () ! WriterError ? &mut Writer
+pub effect<'life1> fn displayWith<T: 'life1, 'life1>(value: &'life1 T, options: FormatOptions) -> () ! WriterError ? &mut Writer
 ```
 
 Displays one value with explicit options through the ambient mutable Writer.
@@ -402,7 +402,7 @@ original `WriterError` is preserved.
 ### Associated function `Format.format`
 
 ```silk
-pub effect<'env> fn format<Args: 'env, 'life1: 'env, 'env>(static template: string<'static>, args: &'life1 Args) -> () ! WriterError ? &mut Writer
+pub effect<'life1> fn format<Args: 'life1, 'life1>(static template: string<'static>, args: &'life1 Args) -> () ! WriterError ? &mut Writer
 ```
 
 Writes a statically validated template with values from one borrowed tuple or record.
@@ -860,7 +860,7 @@ remains written and the original `WriterError` is preserved.
 ### Operation `display`
 
 ```silk
-effect<'env> fn display<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 Self, formatter: &'life1 mut silk/format.Formatter) -> () ! WriterError ? &mut Writer
+effect<'life0 & 'life1> fn display<'life0, 'life1>(self: &'life0 Self, formatter: &'life1 mut silk/format.Formatter) -> () ! WriterError ? &mut Writer
 ```
 
 Emits one presentation through the ambient mutable Writer.

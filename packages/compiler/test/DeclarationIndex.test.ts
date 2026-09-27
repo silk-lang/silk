@@ -23,6 +23,7 @@ import type * as Scalar from '../src/Scalar.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
+import { unreachable } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -426,7 +427,7 @@ it.effect('indexes source services and their operation contracts as distinct can
         'root',
         `pub struct WriteFailure {}
 pub service Logger<T> {
-  effect fn log(static template: string<'static>, message: &[u8], value: T) -> () ! WriteFailure ? &mut Logger<T> with Intrinsic.nonParking()
+  effect<'env> fn log<'env>(static template: string<'static>, message: &[u8], value: T) -> () ! WriteFailure ? &mut Logger<T> with Intrinsic.nonParking()
   fn enabled() -> bool
 }`,
       ],
@@ -465,7 +466,7 @@ pub service Logger<T> {
           state: 'Unique',
           kind: 'Effect',
           properties: ['Intrinsic.NonParking'],
-          parameters: ["string<'static>", "&'life1 [u8]", 'T'],
+          parameters: ["string<'static>", "&'life2 [u8]", 'T'],
           result: '()',
           failures: ['root.WriteFailure'],
           requirements: [{ type: 'root.Logger<T>', access: 'Exclusive' }],
@@ -485,7 +486,7 @@ pub service Logger<T> {
     const log = service?.operations.at(0)
     assert.strictEqual(
       log === undefined ? undefined : SemanticDisplay.serviceOperation(log).text,
-      "effect<'env> fn log<'life1: 'env, 'env>(static template: string<'static>, message: &'life1 [u8], value: T) -> () ! WriteFailure ? &mut root.Logger<T> with Intrinsic.nonParking()",
+      "effect<'env> fn log<'env, 'life2: 'env>(static template: string<'static>, message: &'life2 [u8], value: T) -> () ! WriteFailure ? &mut root.Logger<T> with Intrinsic.nonParking()",
     )
     assert.deepEqual(index.published, [])
   }),
@@ -631,7 +632,7 @@ it.effect('substitutes concrete generic service contracts during conformance', (
       [
         'root',
         `pub service Store<T> {
-  effect fn load(fallback: T) -> T ? &Store<T>
+  effect<'env> fn load<'env>(fallback: T) -> T ? &Store<T>
 }
 pub struct IntStore {}
 effect fn load(self: &IntStore, fallback: i32) -> i32 { return fallback }
@@ -940,7 +941,7 @@ it.effect('indexes failure payloads as values and requirements as row binders', 
     const index = yield* collect('root', [
       [
         'root',
-        "effect fn transform<A, E, ?R>(self: Effect<'static; A ! E ? R>, value: A) -> Effect<'static; A ! E ? R> ! E ? R { return self }",
+        "effect<'env> fn transform<A: 'env, E, ?R, 'env>(self: Effect<'static; A ! E ? R>, value: A) -> Effect<'static; A ! E ? R> ! E ? R { return self }",
       ],
     ])
     const declaration = index.modules.at(0)?.declarations.at(0)
@@ -954,6 +955,7 @@ it.effect('indexes failure payloads as values and requirements as row binders', 
         { name: 'A', kind: 'Value' },
         { name: 'E', kind: 'Value' },
         { name: 'R', kind: 'RequirementRow' },
+        { name: "'env", kind: 'Lifetime' },
       ],
     )
     assert.deepEqual(declaration?.failureRow.parameters, [])
@@ -991,7 +993,7 @@ it.effect('diagnoses generic row binders used in the wrong channel and unbound r
     const index = yield* collect('root', [
       [
         'root',
-        `effect fn bad<E, ?R>(left: E, right: R) -> E ! R ? E { return left }
+        `effect<'env> fn bad<E: 'env, ?R, 'env>(left: E, right: R) -> E ! R ? E { return left }
 effect fn unbound() -> i32 ? MissingRow { return 0 }`,
       ],
     ])
@@ -1014,7 +1016,7 @@ effect fn unbound() -> i32 ? MissingRow { return 0 }`,
 it.effect('keeps cross-kind duplicate binders attached to the first canonical identity', () =>
   Effect.gen(function* () {
     const index = yield* collect('root', [
-      ['root', 'effect fn duplicate<A, A, ?A>(value: A) -> A { return value }'],
+      ['root', "effect<'env> fn duplicate<A: 'env, A, ?A, 'env>(value: A) -> A { return value }"],
     ])
     const parameters = index.modules.at(0)?.declarations.at(0)?.typeParameters ?? []
 
@@ -2513,11 +2515,159 @@ fn apply<T>(value: &T, callback: fn(&T) -> &T) -> &T { return value }`
   }),
 )
 
+it.effect('elaborates omitted Effect environments from the regions inputs retain', () =>
+  Effect.gen(function* () {
+    const source = `struct Held<'a> { value: &'a i32 }
+effect fn owned(input: i32) -> i32 { return input }
+effect fn two(left: &i32, right: &i32) -> i32 { return left.* + right.* }
+effect fn held<'a>(value: Held<'a>) -> i32 { return value.value.* }
+effect fn pending<A>(value: once Effect<A>) -> A { return run move value }
+effect fn view<T>(value: &T) -> i32 { return 0 }
+effect fn keep<T>(value: T) -> i32 { drop value return 0 }
+effect<'env> fn keepNamed<T: 'env, 'env>(value: T) -> i32 { drop value return 0 }
+fn closed() -> Effect<i32> { return effect { return 42 } }
+fn later(value: i32) -> Effect<i32> { return effect { return value } }
+fn heldLater<'a>(value: Held<'a>) -> Effect<i32> { return effect { return 1 } }
+fn twoLater(left: &i32, right: &i32) -> Effect<i32> { return effect { return 1 } }
+effect fn nested() -> Effect<i32> { return owned(1) }
+fn borrowedLater(value: &i32) -> Effect<i32> { return effect { return value.* } }
+fn heldBorrowedLater<'a>(value: &i32, held: Held<'a>) -> Effect<i32> { return effect { return value.* } }
+effect fn borrowedSuccess(value: &i32) -> Effect<i32> { return owned(value.*) }
+effect fn callback<F: fn(i32) -> i32>(f: F) -> i32 { return f(1) }
+effect fn staticCallback<F: fn<'static>(i32) -> i32 + Intrinsic.Detached>(f: F) -> i32 { return f(1) }
+effect fn detached<T: Intrinsic.Detached>(value: T) -> i32 { drop value return 0 }`
+    const index = yield* collect('root', [['root', source]])
+    const declarations = index.modules.at(0)?.declarations ?? []
+    const named = (name: string) =>
+      declarations.find(
+        (declaration) => declaration.name._tag === 'Present' && declaration.name.spelling === name,
+      ) ?? unreachable(`expected ${name}`)
+    const environment = (name: string) =>
+      Lifetime.display(DeclarationFacts.executableLifetimes(named(name)).environment)
+    const resultEnvironment = (name: string) => {
+      const result = named(name).returnType
+      return result._tag === 'Resolved' && Type.isEffect(result.type)
+        ? Lifetime.display(result.type.environment)
+        : undefined
+    }
+    assert.strictEqual(environment('owned'), "'static")
+    assert.strictEqual(
+      Lifetime.key(DeclarationFacts.executableLifetimes(named('two')).environment),
+      Lifetime.key(
+        Lifetime.intersection(
+          named('two').parameters.flatMap((parameter) =>
+            parameter.declaredType._tag === 'Resolved' &&
+            Type.isReference(parameter.declaredType.type)
+              ? [parameter.declaredType.type.lifetime]
+              : [],
+          ),
+        ),
+      ),
+    )
+    assert.strictEqual(environment('held'), "'a")
+    assert.notStrictEqual(environment('pending'), "'static")
+    assert.notStrictEqual(environment('view'), "'static")
+    assert.strictEqual(environment('keepNamed'), "'env")
+    assert.strictEqual(resultEnvironment('closed'), "'static")
+    assert.strictEqual(resultEnvironment('later'), "'static")
+    // LIFE-003 keeps supplying a sole borrowed input's region, also for an effect fn success.
+    const borrowedRegion = (name: string) => {
+      const parameter = named(name).parameters.at(0)?.declaredType
+      return parameter?._tag === 'Resolved' && Type.isReference(parameter.type)
+        ? Lifetime.display(parameter.type.lifetime)
+        : unreachable(`expected a borrowed input of ${name}`)
+    }
+    assert.strictEqual(resultEnvironment('borrowedLater'), borrowedRegion('borrowedLater'))
+    assert.strictEqual(resultEnvironment('heldBorrowedLater'), borrowedRegion('heldBorrowedLater'))
+    assert.strictEqual(resultEnvironment('borrowedSuccess'), borrowedRegion('borrowedSuccess'))
+    // A representation parameter retains its contract's environment, nothing when detached. A
+    // plain detached value parameter still has unknown contents, as the reference states.
+    assert.notStrictEqual(environment('callback'), "'static")
+    assert.strictEqual(environment('staticCallback'), "'static")
+    assert.deepEqual(
+      index.published.map((diagnostic) => [
+        diagnostic.code,
+        source.slice(diagnostic.span.start, diagnostic.span.end),
+        source.slice(0, diagnostic.span.start).split('\n').length,
+      ]),
+      [
+        ['SEM0210', 'T', 7],
+        ['SEM0210', 'Effect<i32>', 11],
+        ['SEM0210', 'Effect<i32>', 12],
+        ['SEM0210', 'Effect<i32>', 13],
+        ['SEM0210', 'T', 19],
+      ],
+    )
+  }),
+)
+
+it.effect('infers a witness binder that names only its written Effect environment', () =>
+  Effect.gen(function* () {
+    const source = `interface Consume<T> { effect<'env> fn consume<'env>(self: &Self, value: T) -> i32 }
+struct Counter {}
+impl<T> Consume<T> for Counter {
+  effect<'env> fn consume<'env>(self: &Self, value: T) -> i32 { drop value return 1 }
+}
+struct Split {}
+impl<T> Consume<T> for Split {
+  effect<'a & 'b> fn consume<'a, 'b>(self: &Self, value: T) -> i32 { drop value return 1 }
+}
+struct Held<'a> { value: &'a i32 }
+interface Tick { effect<'static> fn tick(self: Self) -> i32 }
+impl<'a> Tick for Held<'a> { effect<'a> fn tick(self: Self) -> i32 { return self.value.* } }
+struct Plain {}
+impl Tick for Plain { effect fn tick(self: Self) -> i32 { drop self return 0 } }`
+    const index = yield* collect('root', [['root', source]])
+    // One promised region cannot choose between two otherwise unconstrained witness binders.
+    assert.deepEqual(
+      index.published.map((diagnostic) => [
+        diagnostic.code,
+        source.slice(diagnostic.span.start, diagnostic.span.end).split('(')[0],
+      ]),
+      [
+        ['SEM0083', "effect<'a & 'b> fn consume<'a, 'b>"],
+        // A witness environment shorter than the promised one is rejected.
+        ['SEM0083', "effect<'a> fn tick"],
+      ],
+    )
+  }),
+)
+
+it.effect('keeps an owned operand lent to a witness from escaping through its success', () =>
+  Effect.gen(function* () {
+    const source = `struct Token { value: i32 }
+interface Decode { effect<'env> fn decode<'env>(value: Self) -> i32 }
+effect fn decode(value: &Token) -> i32 { return value.value }
+impl Decode for Token { decode: Token.decode }
+struct Peeked { value: i32 }
+interface Peek { effect<'env> fn peek<'env>(value: Self) -> &'static i32 }
+effect fn peek(value: &Peeked) -> &i32 { return &value.value }
+impl Peek for Peeked { peek: Peeked.peek }
+struct Deferred { value: i32 }
+interface Later { fn later(value: Self) -> Effect<'static; i32> }
+fn later(value: &Deferred) -> Effect<i32> { return effect { return value.value } }
+impl Later for Deferred { later: Deferred.later }`
+    const index = yield* collect('root', [['root', source]])
+    // The lent borrow may stay inside the adapter's Effect, but never in the promised success.
+    assert.deepEqual(
+      index.published.map((diagnostic) => [
+        diagnostic.code,
+        source.slice(0, diagnostic.span.start).split('\n').length,
+      ]),
+      [
+        ['SEM0083', 8],
+        ['SEM0083', 12],
+      ],
+    )
+  }),
+)
+
 it.effect('makes retained Effect environments explicit without strengthening the contract', () =>
   Effect.gen(function* () {
-    const source = `effect fn retain<T>(value: T) -> i32 { return 0 }
+    const source = `struct Held<'a> { value: &'a i32 }
+effect fn owned(value: i32) -> i32 { return value }
 effect fn combine<'a, 'b>(left: &'a i32, right: &'b i32) -> i32 { return left.* + right.* }
-effect fn bounded<'a, 'b, T: 'a + 'b>(value: T) -> i32 { return 0 }
+effect fn held<'a>(value: Held<'a>) -> i32 { return value.value.* }
 service Work { effect<'static> fn tick() -> i32 }`
     const collected = yield* collectWithClosure('root', [['root', source]])
     const original = collected.index
@@ -2545,9 +2695,9 @@ service Work { effect<'static> fn tick() -> i32 }`
         `${text.slice(0, edit.span.start)}${edit.replacement}${text.slice(edit.span.end)}`,
       source,
     )
-    assert.include(expanded, "effect<'env> fn retain<T: 'env, 'env>")
-    assert.include(expanded, "effect<'env> fn combine<'a: 'env, 'b: 'env, 'env>")
-    assert.include(expanded, "effect<'env> fn bounded<'a, 'b, T: 'a + 'b + 'env, 'env>")
+    assert.include(expanded, "effect<'static> fn owned(")
+    assert.include(expanded, "effect<'a & 'b> fn combine<'a, 'b>(")
+    assert.include(expanded, "effect<'a> fn held<'a>(")
     const reparsed = yield* collectWithClosure('root', [['root', expanded]])
     const explicit = reparsed.index
     const explicitSyntax = rootSyntax(reparsed.closure)

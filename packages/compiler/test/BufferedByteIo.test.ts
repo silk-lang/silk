@@ -35,7 +35,7 @@ impl<A, E, ?R> BufferedContext<MemoryByteDuplex, A, E ? R> for ServerContext<A, 
   use: ServerContext.use
 }
 
-effect fn realizeServerContext<'env, A, E, ?R>(
+effect<'env> fn realizeServerContext<'env, A: 'env, E: 'env, ?R>(
   transport: &'env mut MemoryByteDuplex,
   context: ServerContext<A, E, R>,
 ) -> A

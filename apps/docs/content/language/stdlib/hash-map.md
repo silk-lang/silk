@@ -180,7 +180,7 @@ Reports whether one bucket holds an entry. Out-of-range buckets hold nothing.
 ### Method `HashMap.insert`
 
 ```silk
-pub effect<'env> fn insert<K: 'env, V: 'env, 'life2: 'env, 'env>(self: &'life2 mut HashMap<K, V>, key: K, value: V) -> silk/option.Option<V> ! OutOfMemoryError ? &mut Allocator
+pub effect<'env> fn insert<K: 'env, V: 'env, 'env, 'life4: 'env>(self: &'life4 mut HashMap<K, V>, key: K, value: V) -> silk/option.Option<V> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Inserts one owned key and value, answering with the value an equivalent key already held.

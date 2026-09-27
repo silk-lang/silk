@@ -25,6 +25,7 @@ import type {
 } from './DeclarationFacts.js'
 import {
   closeConformanceSelf,
+  omittedEnvironmentDiagnostics,
   providerOperation,
   interfaceApplication,
   interfaceOperationContracts,
@@ -684,6 +685,7 @@ export const complete = (
               foreignFunctionPointerAdmission(spanOf, parameter.declaredType),
             ),
             ...foreignFunctionPointerAdmission(spanOf, result.fact),
+            ...omittedEnvironmentDiagnostics({ ...operation, parameters }),
           )
           return {
             ...operation,
@@ -1092,6 +1094,10 @@ export const complete = (
         },
       }
     })
+    // A conformance or inherent `Self` is closed only here, so environments are judged after it.
+    for (const member of closedMembers)
+      if (member._tag === 'FunctionDeclaration')
+        diagnostics.push(...omittedEnvironmentDiagnostics(member))
     return {
       ...module,
       inherentImpls: inherentImpls,

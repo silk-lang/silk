@@ -295,7 +295,7 @@ Serialization with `Full` preserves the original text when no fields have change
 ### Associated function `UriComponents.serializeInto`
 
 ```silk
-pub effect<'env> fn serializeInto<'text: 'env, 'life1: 'env, 'life2: 'env, 'env>(output: &'life1 mut silk/bytes.Bytes, self: &'life2 UriComponents<'text>, selection: Serialization) -> silk/result.Result<(), silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1 & 'life2> fn serializeInto<'text: 'life1 & 'life2, 'life1, 'life2>(output: &'life1 mut silk/bytes.Bytes, self: &'life2 UriComponents<'text>, selection: Serialization) -> silk/result.Result<(), silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Replaces reusable output with validated selected components.
@@ -317,7 +317,7 @@ text that is not a complete URI reference. Omitted components are still validate
 ### Method `UriComponents.serializeOwned`
 
 ```silk
-pub effect<'env> fn serializeOwned<'text: 'env, 'life1: 'env, 'env>(self: &'life1 UriComponents<'text>, selection: Serialization) -> silk/result.Result<silk/string.String, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn serializeOwned<'text: 'life1, 'life1>(self: &'life1 UriComponents<'text>, selection: Serialization) -> silk/result.Result<silk/string.String, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Serializes selected components into independent text with one exact allocation for nonempty output.
@@ -331,7 +331,7 @@ Validation errors return ordinary result data. Allocation and size overflow use 
 ### Method `UriComponents.buildOwned`
 
 ```silk
-pub effect<'env> fn buildOwned<'text: 'env, 'life1: 'env, 'env>(self: &'life1 UriComponents<'text>) -> silk/result.Result<silk/uri_reference.OwnedUriReference, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn buildOwned<'text: 'life1, 'life1>(self: &'life1 UriComponents<'text>) -> silk/result.Result<silk/uri_reference.OwnedUriReference, silk/uri_reference.ParseError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Builds an owned URI reference from every component without copying the completed output.

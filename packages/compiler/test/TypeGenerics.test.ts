@@ -49,10 +49,10 @@ const descendants = (node: SyntaxTree.Node): ReadonlyArray<SyntaxTree.Node> =>
 it.effect('admits detached generic nominal failure payloads', () =>
   Effect.gen(function* () {
     const source = `struct Failure<E> { error: E }
-effect fn wrap<E: Intrinsic.Detached, F>(error: E) -> () ! Failure<E> | F {
+effect<'env> fn wrap<E: Intrinsic.Detached + 'env, F, 'env>(error: E) -> () ! Failure<E> | F {
   fail Failure<E> { error: move error }
 }
-effect fn reject<E>(error: E) -> () ! Failure<E> {
+effect<'env> fn reject<E: 'env, 'env>(error: E) -> () ! Failure<E> {
   fail Failure<E> { error: move error }
 }`
     const snapshot = yield* Analysis.ofSource(
@@ -65,7 +65,7 @@ effect fn reject<E>(error: E) -> () ! Failure<E> {
     )
     assert.isTrue(
       Analysis.diagnostics(snapshot).every(
-        (diagnostic) => diagnostic.span.start >= source.indexOf('effect fn reject'),
+        (diagnostic) => diagnostic.span.start >= source.indexOf("effect<'env> fn reject<"),
       ),
     )
     const wrap =
@@ -137,10 +137,10 @@ struct Response<'policy, A> {
   policy: &'policy i32
 }
 service Dispatch<'policy, H, A, E, ?R> {
-  effect fn use(value: Request<'policy>, handler: H) -> A ! E ? R | &mut Dispatch<'policy, H, A, E, R>
+  effect<'env> fn use<'env>(value: Request<'policy>, handler: H) -> A ! E ? R | &mut Dispatch<'policy, H, A, E, R>
 }
 fn prepare<'policy>(value: Request<'policy>) -> Request<'policy> { return move value }
-effect fn forward<'policy, A, E, ?R>(value: Request<'policy>, handler: Handler<'policy, E, R>) -> Response<'policy, A>
+effect<'env> fn forward<'policy, A, E: 'env, ?R, 'env>(value: Request<'policy>, handler: Handler<'policy, E, R>) -> Response<'policy, A>
 ! E ? R | &mut Dispatch<'policy, Handler<'policy, E, R>, Response<'policy, A>, E, R> {
   let prepared = prepare(move value)
   return run Dispatch.use<'policy, Handler<'policy, E, R>, Response<'policy, A>, E, R>(move prepared, move handler)
@@ -233,8 +233,8 @@ it.effect('keeps operation-local lifetime bounds out of nominal contract applica
     const snapshot = yield* Analysis.ofSource(
       module,
       new TextEncoder().encode(`
-service Context<P> { effect fn use(value: P) -> () ? &mut Context<P> }
-interface Handler<P> { effect fn handle(handler: Self, value: P) -> () }
+service Context<P> { effect<'env> fn use<'env>(value: P) -> () ? &mut Context<P> }
+interface Handler<P> { effect<'env> fn handle<'env>(handler: Self, value: P) -> () }
 service Bounded<'data, P: 'data> {}
 struct Holder<'data, P> { value: &'data P }
 pub fn main() -> i32 { return 0 }

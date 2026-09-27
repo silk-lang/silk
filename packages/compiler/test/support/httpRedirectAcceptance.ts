@@ -487,28 +487,28 @@ fn redirectOrigin(text: string) -> Option<Origin> {
   }
 }
 
-effect fn redirectTakeValue<T>(result: Result<T, ValueError>) -> T ! ValueError {
+effect<'env> fn redirectTakeValue<T: 'env, 'env>(result: Result<T, ValueError>) -> T ! ValueError {
   return match move result {
     Result.Failure {error} => { fail move error }
     Result.Success {value} => move value
   }
 }
 
-effect fn redirectTakeRedirect<T>(result: Result<T, RedirectError>) -> T ! RedirectError {
+effect<'env> fn redirectTakeRedirect<T: 'env, 'env>(result: Result<T, RedirectError>) -> T ! RedirectError {
   return match move result {
     Result.Failure {error} => { fail move error }
     Result.Success {value} => move value
   }
 }
 
-effect fn redirectTakeParse<T>(result: Result<T, RedirectParseError>) -> T ! RedirectParseError {
+effect<'env> fn redirectTakeParse<T: 'env, 'env>(result: Result<T, RedirectParseError>) -> T ! RedirectParseError {
   return match move result {
     Result.Failure {error} => { fail move error }
     Result.Success {value} => move value
   }
 }
 
-effect fn redirectTakeOrigin<T>(result: Result<T, RedirectOriginError>) -> T ! RedirectOriginError {
+effect<'env> fn redirectTakeOrigin<T: 'env, 'env>(result: Result<T, RedirectOriginError>) -> T ! RedirectOriginError {
   return match move result {
     Result.Failure {error} => { fail move error }
     Result.Success {value} => move value

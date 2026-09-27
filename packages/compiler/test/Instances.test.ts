@@ -584,7 +584,7 @@ fn section<T>(value: T) -> i32 {
   let plusOne = add(1)
   return plusOne(41)
 }
-effect fn deferred<T>(value: T) -> T { return move value }
+effect<'env> fn deferred<T: 'env, 'env>(value: T) -> T { return move value }
 pub fn main() -> i32 {
   let left = section<i32>(1)
   let right = section<bool>(true)

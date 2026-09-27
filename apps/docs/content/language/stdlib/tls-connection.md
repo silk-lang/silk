@@ -101,7 +101,7 @@ effect fn inspect(
   return 0
 }
 
-effect fn failed<E>(error: E) -> i32 { drop error return 1 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 1 }
 
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -340,7 +340,7 @@ Borrows the authenticated session evidence retained by this connection.
 ### Method `OwnedConnection.readSome`
 
 ```silk
-pub effect<'env> fn readSome<P: 'env, 'connection: 'env, 'life2: 'env, 'env>(self: &'connection mut OwnedConnection<P>, output: &'life2 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'connection & 'life2> fn readSome<P: 'connection & 'life2, 'connection, 'life2>(self: &'connection mut OwnedConnection<P>, output: &'life2 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> ReadTransfer ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Reads one verified plaintext prefix or clean authenticated peer end.
@@ -354,7 +354,7 @@ Mandatory TLS output is sent first. Underlying end without `close_notify` is tru
 ### Method `OwnedConnection.writeSome`
 
 ```silk
-pub effect<'env> fn writeSome<P: 'env, 'connection: 'env, 'life2: 'env, 'env>(self: &'connection mut OwnedConnection<P>, input: &'life2 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'connection & 'life2> fn writeSome<P: 'connection & 'life2, 'connection, 'life2>(self: &'connection mut OwnedConnection<P>, input: &'life2 [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> usize ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Encrypts and transmits one positive application prefix.
@@ -364,7 +364,7 @@ Encrypts and transmits one positive application prefix.
 ### Method `OwnedConnection.flush`
 
 ```silk
-pub effect<'env> fn flush<P: 'env, 'connection: 'env, 'env>(self: &'connection mut OwnedConnection<P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'connection> fn flush<P: 'connection, 'connection>(self: &'connection mut OwnedConnection<P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Drains mandatory TLS output and flushes the underlying byte boundary.
@@ -374,7 +374,7 @@ Drains mandatory TLS output and flushes the underlying byte boundary.
 ### Method `OwnedConnection.shutdownWrite`
 
 ```silk
-pub effect<'env> fn shutdownWrite<P: 'env, 'connection: 'env, 'env>(self: &'connection mut OwnedConnection<P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'connection> fn shutdownWrite<P: 'connection, 'connection>(self: &'connection mut OwnedConnection<P>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! ConnectionError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Sends and flushes TLS `close_notify`, then closes only the transport write direction.
@@ -384,7 +384,7 @@ Sends and flushes TLS `close_notify`, then closes only the transport write direc
 ### Method `OwnedConnection.close`
 
 ```silk
-pub effect<'env> fn close<P: 'env, 'life1: 'env, 'env>(self: &'life1 mut OwnedConnection<P>) -> () ! ConnectionError ? Without<&mut ByteDuplex, &ByteDuplex> where &mut P provides &ByteDuplex from &mut ByteDuplex
+pub effect<'life1> fn close<P: 'life1, 'life1>(self: &'life1 mut OwnedConnection<P>) -> () ! ConnectionError ? Without<&mut ByteDuplex, &ByteDuplex> where &mut P provides &ByteDuplex from &mut ByteDuplex
 ```
 
 Terminally closes the exact provider without TLS grace or retry.
@@ -399,7 +399,7 @@ successful; a first provider close failure remains observable while later I/O st
 ## `authenticateOwned`
 
 ```silk
-pub effect<'env> fn authenticateOwned<P: 'env, 'life1: 'env, 'life2: 'env, 'env>(provider: P, config: &'life1 silk/tls_client.ClientConfig<'life2>, trust: TrustSnapshot, options: ConnectionOptions) -> silk/tls_connection.OwnedConnection<P> ! ConnectionError | OutOfMemoryError ? &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
+pub effect<'env> fn authenticateOwned<P: 'env, 'env, 'life2: 'env, 'life3: 'env>(provider: P, config: &'life2 silk/tls_client.ClientConfig<'life3>, trust: TrustSnapshot, options: ConnectionOptions) -> silk/tls_connection.OwnedConnection<P> ! ConnectionError | OutOfMemoryError ? &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Consumes a provider and prepared trust snapshot and returns one authenticated affine owner.
@@ -415,7 +415,7 @@ and structured cancellation close an unpublished provider exactly once.
 ## `withClient`
 
 ```silk
-pub effect<'env1> fn withClient<'env: 'env1, A, E, ?CallbackRequirements, P: 'env1, 'life5: 'env1, 'life6: 'env1, 'env1>(provider: P, config: &'life5 silk/tls_client.ClientConfig<'life6>, trust: TrustSnapshot, options: ConnectionOptions, callback: for<'call> once fn<'env>(&'call mut silk/tls_connection.OwnedConnection<P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | ConnectionError | OutOfMemoryError ? CallbackRequirements | &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
+pub effect<'env> fn withClient<'env, A, E, ?CallbackRequirements, P: 'env, 'life5: 'env, 'life6: 'env>(provider: P, config: &'life5 silk/tls_client.ClientConfig<'life6>, trust: TrustSnapshot, options: ConnectionOptions, callback: for<'call> once fn<'env>(&'call mut silk/tls_connection.OwnedConnection<P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>) -> A ! E | ConnectionError | OutOfMemoryError ? CallbackRequirements | &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random, CallbackRequirements in Without<CallbackRequirements, &ByteDuplex>
 ```
 
 Authenticates, lends, and terminally closes the same authoritative owned connection.

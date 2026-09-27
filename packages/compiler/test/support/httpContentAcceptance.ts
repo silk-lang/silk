@@ -2300,7 +2300,7 @@ effect fn portableProgram() -> i32 ! BufferError | OutOfMemoryError {
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn failed<E>(error: E) -> i32 { drop error return 99 }
+effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 99 }
 
 effect fn ownedIncrementalCore() -> i32 ! OutOfMemoryError ? &mut Allocator {
   let parsed = match move run parseResponse(b"HTTP/1.1 200 OK\\r\\nContent-Length: 1\\r\\n\\r\\n", headLimits()) {

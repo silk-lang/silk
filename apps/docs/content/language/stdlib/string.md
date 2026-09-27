@@ -240,7 +240,7 @@ Effect failure channel. No owned string is returned in either failure case.
 ### Method `String.append`
 
 ```silk
-pub effect<'env> fn append<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut String, value: string<'life1>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn append<'life0, 'life1>(self: &'life0 mut String, value: string<'life1>) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends complete valid text atomically with respect to allocation failure.

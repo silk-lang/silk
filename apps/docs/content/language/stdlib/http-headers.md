@@ -193,7 +193,7 @@ Returns an absent or unique matching field and rejects a second match.
 ### Method `Headers.copy`
 
 ```silk
-pub effect<'env> fn copy<'value: 'env, 'life1: 'env, 'env>(self: &'life1 Headers<'value>, limits: Limits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'life1> fn copy<'value: 'life1, 'life1>(self: &'life1 Headers<'value>, limits: Limits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies fields into independent byte and index storage under `maxOwnedBytes`.
@@ -203,7 +203,7 @@ Copies fields into independent byte and index storage under `maxOwnedBytes`.
 ### Method `Headers.copyMatching`
 
 ```silk
-pub effect<'env> fn copyMatching<'value: 'env, 'life1: 'env, 'env>(self: &'life1 Headers<'value>, name: string<'value>, limits: Limits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
+pub effect<'value & 'life1> fn copyMatching<'value, 'life1>(self: &'life1 Headers<'value>, name: string<'value>, limits: Limits) -> silk/result.Result<silk/http_headers.OwnedHeaders, silk/http.ValueError> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Copies only case-insensitively matching fields in their original order.

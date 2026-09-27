@@ -27,20 +27,20 @@ it.effect('provides a conditional generic callback context with extended rows', 
     const source = `import silk.effect {Effect}
 struct Problem {}
 service Audit { effect fn record() -> () ? &mut Audit }
-service Context<P, A, E, ?R> { effect fn use(provider: P) -> A ! E ? R | &mut Context<P, A, E, R> }
-interface Handler<P, A, E, ?R> { effect fn handle(handler: Self, provider: P) -> A ! E ? R }
+service Context<P, A, E, ?R> { effect<'env> fn use<'env>(provider: P) -> A ! E ? R | &mut Context<P, A, E, R> }
+interface Handler<P, A, E, ?R> { effect<'env> fn handle<'env>(handler: Self, provider: P) -> A ! E ? R }
 struct Consumer<P, A, E, ?R, H> { handler: H }
 effect fn unavailable<A>() -> A { return run unavailable<A>() }
-effect fn acquire<P,A,E,?R>(provider: P) -> A ! E ? R | &mut Context<P,A,E,R> { drop provider return run unavailable<A>() }
+effect<'env> fn acquire<P: 'env,A,E,?R, 'env>(provider: P) -> A ! E ? R | &mut Context<P,A,E,R> { drop provider return run unavailable<A>() }
 impl<P, A, E, ?R, H: Handler<P, A, E ? R>> Context<P, A, E | Problem ? R | &mut Audit> for Consumer<P, A, E, R, H> {
-  effect fn use(self: &mut Self, provider: P) -> A ! E | Problem ? R | &mut Audit { drop provider return run unavailable<A>() }
+  effect<'env> fn use<'env>(self: &mut Self, provider: P) -> A ! E | Problem ? R | &mut Audit { drop provider return run unavailable<A>() }
 }
-effect fn invoke<P, A, E, ?R, H: Handler<P, A, E ? R>>(provider: P, handler: H) -> A ! E | Problem ? R | &mut Audit {
+effect<'env> fn invoke<P: 'env, A, E, ?R, H: Handler<P, A, E ? R> + 'env, 'env>(provider: P, handler: H) -> A ! E | Problem ? R | &mut Audit {
   let mut context = Consumer<P, A, E, R, H> {handler: move handler}
   return run acquire<P, A, E | Problem, R | &mut Audit>(move provider)
     |> Effect.provideMut<Context<P, A, E | Problem ? R | &mut Audit>>(&mut context)
 }
-effect fn unproven<P, A, E, ?R, H>(provider: P, handler: H) -> A ! E | Problem ? R | &mut Audit {
+effect<'env> fn unproven<P: 'env, A, E, ?R, H: 'env, 'env>(provider: P, handler: H) -> A ! E | Problem ? R | &mut Audit {
   let mut context = Consumer<P, A, E, R, H> {handler: move handler}
   return run acquire<P, A, E | Problem, R | &mut Audit>(move provider)
     |> Effect.provideMut<Context<P, A, E | Problem ? R | &mut Audit>>(&mut context)

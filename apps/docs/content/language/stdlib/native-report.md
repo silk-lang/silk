@@ -49,7 +49,7 @@ Construction allocates nothing. Limits apply across the primary report and its c
 ### Method `NativeReport.unhandled`
 
 ```silk
-pub effect<'env> fn unhandled<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(self: &'life0 mut NativeReport, identity: string<'life1>, source: string<'life2>) -> bool
+pub effect<'life0 & 'life1 & 'life2> fn unhandled<'life0, 'life1, 'life2>(self: &'life0 mut NativeReport, identity: string<'life1>, source: string<'life2>) -> bool
 ```
 
 Writes the primary typed-failure classification, canonical identity and known source origin.
@@ -63,7 +63,7 @@ The selected runtime must complete failure-payload cleanup before calling this o
 ### Method `NativeReport.fatal`
 
 ```silk
-pub effect<'env> fn fatal<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(self: &'life0 mut NativeReport, reason: string<'life1>, source: string<'life2>) -> bool
+pub effect<'life0 & 'life1 & 'life2> fn fatal<'life0, 'life1, 'life2>(self: &'life0 mut NativeReport, reason: string<'life1>, source: string<'life2>) -> bool
 ```
 
 Writes a distinct best-effort fatal classification, reason and known origin.
@@ -77,7 +77,7 @@ Returning from this formatter grants neither trap recovery nor structured cleanu
 ### Method `NativeReport.frame`
 
 ```silk
-pub effect<'env> fn frame<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut NativeReport, label: string<'life1>) -> bool
+pub effect<'life0 & 'life1> fn frame<'life0, 'life1>(self: &'life0 mut NativeReport, label: string<'life1>) -> bool
 ```
 
 Appends an outward logical caller frame, excluding the already written origin.
@@ -107,7 +107,7 @@ suppresses the marker; repeating this operation writes nothing further.
 ### Method `NativeReport.cause`
 
 ```silk
-pub effect<'env> fn cause<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(self: &'life0 mut NativeReport, identity: string<'life1>, source: string<'life2>) -> bool
+pub effect<'life0 & 'life1 & 'life2> fn cause<'life0, 'life1, 'life2>(self: &'life0 mut NativeReport, identity: string<'life1>, source: string<'life2>) -> bool
 ```
 
 Appends a retained recovery cause after the primary failure and its logical callers.

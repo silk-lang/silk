@@ -62,9 +62,8 @@ Each entry records:
     [EFF-008](apps/docs/content/reference/effect-contracts.md#eff-008--an-effect-function-declares-the-contract-of-its-returned-effect)
     links its equivalence to them.
   - **Native:** implemented and verified at the signature level on draft PR #517.
-  - **Bootstrap:** on this branch it does not implement the ordinary-function `'static` result
-    default, and does not reject generic stored `effect fn` inputs. The alignment is pending on
-    main (the prerequisite below) and reaches this branch only through a reviewed sync.
+  - **Bootstrap:** implemented on main by PR #522 (merge `263d9c30`) and synced here through
+    PR #524 (merge `106d821e`).
 - **Rule:**
   - **Retained regions:** an input retains the regions of its borrows, its non-`'static` nominal
     lifetime arguments, and its callable or Effect environments. The parameter and channel types
@@ -92,7 +91,9 @@ Each entry records:
 
 - **Scope limits:**
   - Generic stored contents are never treated as closed. The declaration writes the environment,
-    for example `effect<'env> fn`, together with bounds such as `T: 'env`.
+    for example `effect<'env> fn`. The written environment carries the obligation that every
+    captured value outlives it; calls and interface or service witnesses must satisfy it. A
+    `T: 'env` bound states that obligation explicitly and is optional.
   - The default covers only the result's own environment. `fn f() -> Effect<'static; Effect<i32>>`
     gives the inner Effect none. Callables and Effects nested inside a callable contract, and
     anonymous callables, get no default.
@@ -110,34 +111,26 @@ Each entry records:
     - A representation parameter retains its contract's environment, looked up from the
       declaration's own `Represents` bounds: `F: fn<'a>(i32) -> i32` gives `'a`, and
       `F: once Effect<'static; A>` gives `'static`. An interface-bounded `T: Hash` stays unknown.
-  - **TypeScript bootstrap:** checked 2026-09-26 with the CLI built from this checkout.
-    - The explicit `Effect<'static; i32>` compiles and runs.
-    - `effect fn` forms with no, owned, several borrowed, or generic stored inputs compile. Whether
-      their capture environments follow this rule has not been verified.
-    - On main (PR #522, not yet synced here), a representation parameter also retains its bound
-      contract's environment, so native matches it. One asymmetry remains there: a representation
-      parameter bounded by `Intrinsic.Detached` retains nothing, while a plain `T: Detached` value
-      parameter stays unknown. Native keeps every non-representation parameter unknown and does
-      not special-case `Detached`.
-  - **Divergences (bootstrap vs native):**
-    - Ordinary function with no retaining input: `fn closed() -> Effect<i32>` and
-      `fn later(value: i32) -> Effect<i32>` report `SEM0210 The omitted output lifetime has no
-unique input` at the result in the bootstrap; native resolves them to `Effect<'static; i32>`.
-    - `effect fn` with generic stored inputs and an omitted capture environment: the bootstrap
-      accepts it; native rejects it. Affected standard-library declarations include
-      `Effect.of(value: A)`, `raise(error: E)`, `HashMap.insert(key: K, ...)` and handler-taking
-      `with*` functions. A rough 2026-09-26 text scan suggested several dozen; the authoritative
-      inventory has not been taken.
-  - **Shared rejection, not a divergence:** a parameterless `effect fn outer() -> Effect<i32>`
-    reports SEM0210 in the bootstrap (reviewer-verified 2026-09-26) and `AmbiguousLifetime` in
-    native, because its success Effect has no borrowed input to supply the output lifetime.
-  - **Prerequisite:** aligning the bootstrap and migrating the generic stored-input declarations
-    to `effect<'env> fn` with the storage bounds LIFE-004 requires is required main-first work, tracked as the
-    in-progress prerequisite task "Fix · Bootstrap Effect environments & source coherence" (note
-    `814eae87-839e-4644-bd0f-5a1f38e52deb`). The native frontend does not check the standard
-    library until it lands. Its LIFE-004 wording on implied storage obligations for enclosing
-    `impl`, interface, and service parameters replaces this branch's text at the reviewed sync;
-    this branch does not duplicate it.
+  - **TypeScript bootstrap (`packages/compiler`, from main PR #522):**
+    - Implements the rules above. It reports SEM0210 at the first parameter type whose stored
+      contents involve a type parameter, and at an ordinary function's result when an input
+      retains something and LIFE-003 supplies no default.
+    - A written environment's storage obligations are checked at direct, inherent, and interface
+      or service operation calls. A witness whose Effect environment is shorter than the promised
+      one is rejected. An owned operand lent to a witness by its adapter is exempt, and that
+      borrow still cannot escape through the success value.
+    - A witness binder that occurs only in the witness's written environment is inferred from the
+      promised environment. An intersection of free binders against one promised region is
+      rejected, not guessed.
+  - **Remaining native gap:** an `Intrinsic.Detached`-bounded representation parameter is not
+    supported natively, because the native semantic queries have no `Intrinsic` handling. The
+    bootstrap gives such a parameter no retained region, so its contribution is `'static`. The
+    bootstrap treats a plain `T: Intrinsic.Detached` value parameter as unknown, like any stored
+    generic. Native does not yet check the standard library, so this entry claims agreement only
+    for the cases listed here.
+  - **Shared rejection:** a parameterless `effect fn outer() -> Effect<i32>` reports SEM0210 in the
+    bootstrap and `AmbiguousLifetime` in native, because its success Effect has no borrowed input
+    to supply the output lifetime.
 - **Source migration:**
   - Omitting an environment is the approved form where the rules above give it a value:
     - an ordinary function's Effect result whose inputs retain nothing, or that has one borrowed
@@ -146,11 +139,21 @@ unique input` at the result in the bootstrap; native resolves them to `Effect<'s
       representation parameters;
     - an `effect fn` success Effect's environment when a single borrowed input supplies it under
       LIFE-003.
-  - Otherwise source writes it. An `effect fn` with generic stored inputs writes `effect<'env> fn`
-    with `T: 'env` bounds. An `effect fn` whose success type is an Effect, with no single borrowed
-    input, writes that Effect's environment, for example `Effect<'static; A>`; the parameterless
-    omission is already a shared rejection. Existing source that omits a required environment
-    needs migration.
+  - Otherwise source writes it. An `effect fn` with generic stored inputs writes `effect<'env> fn`,
+    optionally with `T: 'env` bounds. An `effect fn` whose success type is an Effect, with no single
+    borrowed input, writes that Effect's environment, for example `Effect<'static; A>`; the
+    parameterless omission is already a shared rejection.
+  - **Migration done on main (PR #522):**
+    - All 172 standard-library modules were checked on the host, x86_64 and aarch64 Linux, and
+      wasm32 targets. The bootstrap's pre-migration SEM0210 inventory had 101 declarations: 97
+      on host and Linux, plus 4 wasm-only. All are migrated.
+    - Afterwards, every target's diagnostics are byte-identical to base `be390ddc`: none on host
+      and Linux, 21 pre-existing on wasm32 from native-only imports.
+    - Also migrated: `compiler/src/semantic/Query.silk` `demand`, the reference examples, and the
+      test fixtures. The native acceptance corpus's analysis diagnostics are identical to base.
+    - Receipts with provenance, recorded in task note `814eae87`: sha256
+      `4c430583c4c23a5532c1cf9b403da821effc2ccef690ee7dee3c655871ddf8c7`, captured at head
+      `368c3675`.
   - The explicit spelling `Effect<'static; A>` is equivalent valid syntax, not a compatibility shim.
     Source may choose it intentionally, for example to compile with the current bootstrap.
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
@@ -169,6 +172,12 @@ unique input` at the result in the bootstrap; native resolves them to `Effect<'s
   - `representedBorrowed` (`F: fn<'a>(i32) -> i32`) has one region, `representedStatic`
     (`F: once Effect<'static; A>`) is `'static`, and `conformedStored` (`T: Hash`) rejects as
     `AmbiguousLifetime`.
+
+  In the bootstrap, `packages/compiler/test/DeclarationIndex.test.ts` covers environment
+  elaboration and diagnostic spans, witness binder inference with its ambiguous and
+  shorter-environment rejections, and lent-operand escape. `Type.test.ts` covers call
+  obligations through inherent and interface operations, and `UserServices.test.ts` covers
+  lowering a generic service witness that names its environment.
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 

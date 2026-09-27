@@ -32,6 +32,12 @@ export interface Context {
   readonly implicit: ReadonlyArray<ImplicitBinder>
   readonly diagnostics: ReadonlyArray<Diagnostic.Located>
   readonly explicitEnvironment?: Lifetime.Lifetime
+  /**
+   * An ordinary named function's top-level `Effect` result whose omitted environment has no
+   * borrowed-input default and elaborated as `'static`. Declaration completion rejects it when
+   * some input retains a region or unknown generic contents.
+   */
+  readonly closedEffectResult?: AuthoredHir.Anchor
 }
 
 /** The region assigned to one authored position, if elaboration reached it. */
@@ -381,6 +387,7 @@ export const forHeader = (
     defaultOutput: Lifetime.Lifetime | undefined,
     allocate: (anchor: AuthoredHir.Anchor) => Lifetime.Lifetime | undefined,
     quantified: boolean,
+    closedEnvironment?: Lifetime.Lifetime,
   ): void => {
     const target = type.target
     const targetSegment = soleSegment(target)
@@ -391,10 +398,12 @@ export const forHeader = (
       const writtenLifetime = type.arguments.arguments.find(
         (argument): argument is AuthoredHir.Lifetime => argument._tag === 'Lifetime',
       )
-      const value =
-        environment !== undefined && environment.length > 0
-          ? resolveEnvironment(type.anchor, environment, scope)
-          : region(type.anchor, writtenLifetime, scope, output, defaultOutput, allocate)
+      let value: Lifetime.Lifetime | undefined
+      if (environment !== undefined && environment.length > 0)
+        value = resolveEnvironment(type.anchor, environment, scope)
+      else if (writtenLifetime === undefined && closedEnvironment !== undefined)
+        value = closedEnvironment
+      else value = region(type.anchor, writtenLifetime, scope, output, defaultOutput, allocate)
       if (value !== undefined) setRegion(type.anchor, value)
       for (const argument of type.arguments.arguments)
         if (argument !== writtenLifetime)
@@ -540,6 +549,18 @@ export const forHeader = (
       })
   }
 
+  /** An `Effect` application that writes neither an environment nor a lifetime. */
+  const isOmittedEffect = (type: Extract<AuthoredHir.Type, { readonly _tag: 'AppliedType' }>) => {
+    const segment = soleSegment(type.target)
+    return (
+      segment !== undefined &&
+      nameText(context, segment) === 'Effect' &&
+      (type.arguments.environment === undefined || type.arguments.environment.length === 0) &&
+      !type.arguments.arguments.some((argument) => argument._tag === 'Lifetime')
+    )
+  }
+  let closedEffectResult: AuthoredHir.Anchor | undefined
+
   /** A position that can supply the elided output region. */
   const isCandidate = (type: AuthoredHir.Type): boolean =>
     type._tag === 'ReferenceType' ||
@@ -585,7 +606,20 @@ export const forHeader = (
         receiver = value
     }
     const defaultOutput = receiver ?? (candidates.length === 1 ? candidates.at(0) : undefined)
-    if (contract.result !== undefined) walkType(contract.result, bindings, true, defaultOutput)
+    const result = contract.result
+    // LIFE-004: with no borrowed-input default, an ordinary named function's own result Effect is
+    // provisionally `'static`; completion confirms that no input retains anything.
+    if (
+      result?._tag === 'AppliedType' &&
+      !contract.effect &&
+      'name' in declaration.header &&
+      declaration.header.name._tag === 'Name' &&
+      defaultOutput === undefined &&
+      isOmittedEffect(result)
+    ) {
+      closedEffectResult = result.anchor
+      walkApplied(result, bindings, true, defaultOutput, fresh, false, Lifetime.staticLifetime)
+    } else if (result !== undefined) walkType(result, bindings, true, defaultOutput)
     if (contract.failures !== undefined) walkType(contract.failures, bindings, true, defaultOutput)
     if (contract.requirements !== undefined)
       for (const member of contract.requirements.members)
@@ -601,6 +635,7 @@ export const forHeader = (
   return {
     owner,
     ...(explicitEnvironment === undefined ? {} : { explicitEnvironment }),
+    ...(closedEffectResult === undefined ? {} : { closedEffectResult }),
     parameters: new Map(parameters),
     nominalArguments,
     regions,

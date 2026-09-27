@@ -167,7 +167,7 @@ A length greater than or equal to the current length leaves the value unchanged.
 ### Method `Bytes.append`
 
 ```silk
-pub effect<'env> fn append<'life0: 'env, 'life1: 'env, 'env>(self: &'life0 mut Bytes, values: &'life1 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect<'life0 & 'life1> fn append<'life0, 'life1>(self: &'life0 mut Bytes, values: &'life1 [u8]) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Appends a complete borrowed byte sequence in source order.

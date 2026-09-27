@@ -1150,7 +1150,7 @@ Returns the current public lifecycle state without performing I/O.
 ## `readEvent`
 
 ```silk
-pub effect<'env> fn readEvent<'channel: 'env, 'transport: 'env, P: 'env, 'life3: 'env, 'life4: 'env, 'env>(socket: &'life3 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, output: &'life4 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> Event ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life3 & 'life4> fn readEvent<'channel: 'life3 & 'life4, 'transport: 'life3 & 'life4, P: 'life3 & 'life4, 'life3, 'life4>(socket: &'life3 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, output: &'life4 mut [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> Event ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Reads and validates exactly one peer event.
@@ -1171,7 +1171,7 @@ without reading the payload. Fragmented messages are not supported.
 ## `writeText`
 
 ```silk
-pub effect<'env> fn writeText<'message: 'env, 'channel: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: string<'message>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'message & 'life4> fn writeText<'message, 'channel: 'message & 'life4, 'transport: 'message & 'life4, P: 'message & 'life4, 'life4>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: string<'message>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Writes and flushes one final unmasked Text frame.
@@ -1181,7 +1181,7 @@ Writes and flushes one final unmasked Text frame.
 ## `writeBinary`
 
 ```silk
-pub effect<'env> fn writeBinary<'message: 'env, 'channel: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'message & 'life4> fn writeBinary<'message, 'channel: 'message & 'life4, 'transport: 'message & 'life4, P: 'message & 'life4, 'life4>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Writes and flushes one final unmasked Binary frame.
@@ -1191,7 +1191,7 @@ Writes and flushes one final unmasked Binary frame.
 ## `writePing`
 
 ```silk
-pub effect<'env> fn writePing<'message: 'env, 'channel: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'message & 'life4> fn writePing<'message, 'channel: 'message & 'life4, 'transport: 'message & 'life4, P: 'message & 'life4, 'life4>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Writes and flushes one final unmasked Ping frame with at most 125 payload bytes.
@@ -1201,7 +1201,7 @@ Writes and flushes one final unmasked Ping frame with at most 125 payload bytes.
 ## `writePong`
 
 ```silk
-pub effect<'env> fn writePong<'message: 'env, 'channel: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'message & 'life4> fn writePong<'message, 'channel: 'message & 'life4, 'transport: 'message & 'life4, P: 'message & 'life4, 'life4>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, message: &'message [u8], deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Writes and flushes one final unmasked Pong frame with at most 125 payload bytes.
@@ -1211,7 +1211,7 @@ Writes and flushes one final unmasked Pong frame with at most 125 payload bytes.
 ## `sendClose`
 
 ```silk
-pub effect<'env> fn sendClose<'close: 'env, 'channel: 'env, 'transport: 'env, P: 'env, 'life4: 'env, 'env>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, data: silk/option.Option<&'close silk/websocket_server.CloseData>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'close & 'life4> fn sendClose<'close, 'channel: 'close & 'life4, 'transport: 'close & 'life4, P: 'close & 'life4, 'life4>(socket: &'life4 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, data: silk/option.Option<&'close silk/websocket_server.CloseData>, deadline: silk/option.Option<silk/system_clock.Instant>) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Sends and flushes the local Close frame once.
@@ -1227,7 +1227,7 @@ enters `CloseSent`. Repeated calls in `CloseSent` or `Closed` succeed locally wi
 ## `finishClose`
 
 ```silk
-pub effect<'env> fn finishClose<'channel: 'env, 'transport: 'env, P: 'env, 'life3: 'env, 'env>(socket: &'life3 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, deadline: Instant) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+pub effect<'life3> fn finishClose<'channel: 'life3, 'transport: 'life3, P: 'life3, 'life3>(socket: &'life3 mut silk/websocket_server.ServerWebSocket<'channel, 'transport, P>, deadline: Instant) -> () ! WebSocketError ? &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
 Pumps a bounded peer close handshake until a valid peer Close arrives.
@@ -1249,7 +1249,7 @@ complete inbound wire bytes: header, extended length, mask, and payload.
 ## `withServer`
 
 ```silk
-pub effect<'env> fn withServer<'callback: 'env, 'channel: 'env, 'transport: 'channel + 'env, A, E, ?R, P: 'env, 'env>(channel: &'channel mut silk/buffered_duplex.BufferedDuplex<'transport, P>, limits: Limits, use: for<'call, 'channelView: 'call, 'transportView: 'channelView> once fn<'callback>(&'call mut silk/websocket_server.ServerWebSocket<'channelView, 'transportView, P>) -> once Effect<'call; A ! E ? R>) -> A ! E | WebSocketError ? R | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, R in Without<R, &ByteDuplex>
+pub effect<'callback & 'channel> fn withServer<'callback, 'channel, 'transport: 'channel + 'callback & 'channel, A, E, ?R, P: 'callback & 'channel>(channel: &'channel mut silk/buffered_duplex.BufferedDuplex<'transport, P>, limits: Limits, use: for<'call, 'channelView: 'call, 'transportView: 'channelView> once fn<'callback>(&'call mut silk/websocket_server.ServerWebSocket<'channelView, 'transportView, P>) -> once Effect<'call; A ! E ? R>) -> A ! E | WebSocketError ? R | &mut MonotonicClock where &mut P provides &ByteDuplex from &mut ByteDuplex, &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock, R in Without<R, &ByteDuplex>
 ```
 
 Lends one affine server WebSocket over the exact upgraded buffered channel.
