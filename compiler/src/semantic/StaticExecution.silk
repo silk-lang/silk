@@ -1,0 +1,854 @@
+//! Demand-driven execution of static function bodies and evaluator-local control flow.
+
+import hir.Hir {HirId, InfixOperator, Module, Node, PrefixOperator, Sign}
+import lexer.Span {Span}
+import semantic.ModuleIndex {ModuleIndex}
+import semantic.SourceUnit {SourceUnit}
+import semantic.StaticFunction
+import semantic.StaticFunction {
+  StaticFunction as SelectedStaticFunction,
+  Rejection as StaticHeaderRejection,
+  HeaderFault as StaticHeaderFault,
+}
+import semantic.StaticValue
+import semantic.StaticValue {
+  Fault as StaticFault,
+  IntegerType as StaticIntegerType,
+  Sign as StaticSign,
+  Value as StaticData,
+}
+import semantic.Target {Target as MachineTarget}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.format {ParseError}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.u8
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+/// Deterministic work limits for one demand graph.
+pub struct Limits {
+  pub steps: usize
+  pub depth: usize
+  pub valueBytes: usize
+}
+
+/// A source-defined failure; related calls are ordered from the root to the failing frame.
+pub enum Fault {
+  InvalidHeader,
+  Unavailable,
+  InvalidValue,
+  InvalidControl,
+  CompileError,
+  Cycle,
+  StepLimit,
+  DepthLimit,
+  ValueLimit,
+}
+
+pub struct TraceStep {
+  pub name: Bytes
+  pub arguments: Vector<Shared<StaticData>>
+  pub span: Span
+}
+
+pub struct Diagnostic {
+  pub fault: Fault
+  pub span: Span
+  pub message: Option<Bytes>
+  pub origin: Option<Span>
+  pub needed: Option<HirId>
+  pub trace: Vector<TraceStep>
+}
+
+/// One immutable static value made available at an authored binder.
+pub struct Binding {
+  pub binder: HirId
+  pub value: Shared<StaticData>
+}
+
+struct Local {
+  binder: HirId
+  mutable: bool
+  value: Shared<StaticData>
+}
+
+struct Frame {
+  name: Bytes
+  arguments: Vector<Shared<StaticData>>
+  span: Span
+}
+
+struct Complete {
+  name: Bytes
+  arguments: Vector<Shared<StaticData>>
+  value: Shared<StaticData>
+}
+
+struct FrameReservation<'a, 'source> {
+  machine: &'a mut Machine<'source>
+}
+
+union Flow {
+  Next,
+  Break,
+  Continue,
+  Return {value: Shared<StaticData>},
+}
+
+/// One held source and target for static applications. No body executes during construction.
+pub struct Machine<'source> {
+  unit: &'source SourceUnit
+  index: ModuleIndex
+  target: MachineTarget
+  limits: Limits
+  steps: usize
+  retainedBytes: usize
+  active: Vector<Frame>
+  complete: Vector<Complete>
+}
+
+/// Prepares declarations without demanding any static body.
+pub effect fn make<'source>(unit: &'source SourceUnit, target: MachineTarget, limits: Limits) -> Machine<
+  'source,
+> ! OutOfMemoryError ? &mut Allocator {
+  let index = run ModuleIndex.build(unit)
+  return Machine {
+    unit: unit,
+    index: move index,
+    target: target,
+    limits: move limits,
+    steps: usize.ZERO,
+    retainedBytes: usize.ZERO,
+    active: Vector.make<Frame>(),
+    complete: Vector.make<Complete>(),
+  }
+}
+
+/// Borrows the exact parsed source whose HIR identities this machine evaluates.
+pub fn source<'source>(machine: &Machine<'source>) -> &'source SourceUnit {
+  return machine.unit
+}
+
+/// Reports consumed work so a caller can preserve the budget across dependency retries.
+pub fn steps<'source>(machine: &Machine<'source>) -> usize {
+  return machine.steps
+}
+
+effect fn diagnostic<'source>(machine: &Machine<'source>, fault: Fault, span: Span) -> Diagnostic
+! OutOfMemoryError
+? &mut Allocator {
+  let mut trace = Vector.make<TraceStep>()
+  let active = Vector.asSlice<Frame>(&machine.active)
+  let mut at = usize.ZERO
+  while at < active.length {
+    run Vector.append<TraceStep>(
+      &mut trace,
+      TraceStep {
+        name: run Bytes.copy(Bytes.asSlice(&active[at].name)),
+        arguments: run copyArguments(Vector.asSlice<Shared<StaticData>>(&active[at].arguments)),
+        span: active[at].span,
+      },
+    )
+    at = at + usize.ONE
+  }
+  return Diagnostic {
+    fault: fault,
+    span: span,
+    message: Option.none<Bytes>(),
+    origin: Option.none<Span>(),
+    needed: Option.none<HirId>(),
+    trace: move trace,
+  }
+}
+
+effect fn reject<'source>(machine: &Machine<'source>, fault: Fault, span: Span) -> never
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  let failure = run diagnostic(machine, fault, span)
+  fail move failure
+}
+
+effect fn unresolved<'source>(machine: &Machine<'source>, id: HirId) -> never
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  let mut failure = run diagnostic(machine, Fault.Unavailable, Module.span(&machine.unit.authored, id))
+  failure.needed = Option.some<HirId>(id)
+  fail move failure
+}
+
+effect fn step<'source>(machine: &mut Machine<'source>, id: HirId) -> ()
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  if machine.steps >= machine.limits.steps {
+    return run reject(&machine.*, Fault.StepLimit, Module.span(&machine.unit.authored, id))
+  }
+  machine.steps = machine.steps + usize.ONE
+  return ()
+}
+
+effect fn retain<'source>(machine: &mut Machine<'source>, value: StaticData, span: Span) -> Shared<
+  StaticData,
+> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  if StaticValue.size(&value) > machine.limits.valueBytes {
+    return run reject(&machine.*, Fault.ValueLimit, span)
+  }
+  return run Shared.make<StaticData>(move value)
+}
+
+effect fn sameArguments(left: &[Shared<StaticData>], right: &[Shared<StaticData>]) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !run StaticValue.equals(&left[at], &right[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn copyArguments(args: &[Shared<StaticData>]) -> Vector<Shared<StaticData>>
+! OutOfMemoryError
+? &mut Allocator {
+  let mut copied = Vector.make<Shared<StaticData>>()
+  let mut at = usize.ZERO
+  while at < args.length {
+    run Vector.append<Shared<StaticData>>(&mut copied, StaticValue.copy(&args[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn completed<'source>(
+  machine: &Machine<'source>,
+  selectedName: &[u8],
+  args: &[Shared<StaticData>],
+) -> Option<Shared<StaticData>> ! OutOfMemoryError ? &mut Allocator {
+  let entries = Vector.asSlice<Complete>(&machine.complete)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if equal(Bytes.asSlice(&entries[at].name), selectedName) && run sameArguments(
+      Vector.asSlice<Shared<StaticData>>(&entries[at].arguments),
+      args,
+    ) {
+      return Option.some<Shared<StaticData>>(StaticValue.copy(&entries[at].value))
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Shared<StaticData>>()
+}
+
+effect fn publish<'source>(
+  machine: &mut Machine<'source>,
+  selectedName: &[u8],
+  args: &[Shared<StaticData>],
+  value: &Shared<StaticData>,
+  span: Span,
+) -> () ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Shared.with<StaticData, usize>(value, StaticValue.size)
+  let mut at = usize.ZERO
+  while at < args.length {
+    let argumentBytes = Shared.with<StaticData, usize>(&args[at], StaticValue.size)
+    bytes = match move usize.checkedAdd(bytes, argumentBytes) {
+      Option<usize>.Some {value: total} => total
+      Option<usize>.None => {
+        return run reject(&machine.*, Fault.ValueLimit, span)
+      }
+    }
+    at = at + usize.ONE
+  }
+  if machine.retainedBytes > machine.limits.valueBytes || bytes > machine.limits.valueBytes - machine.retainedBytes {
+    return run reject(&machine.*, Fault.ValueLimit, span)
+  }
+  let entry = Complete {
+    name: run Bytes.copy(selectedName),
+    arguments: run copyArguments(args),
+    value: StaticValue.copy(value),
+  }
+  run Vector.append<Complete>(&mut machine.complete, move entry)
+  machine.retainedBytes = machine.retainedBytes + bytes
+  return ()
+}
+
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn name(module: &Module, id: HirId) -> Option<&[u8]> {
+  return match Module.node(module, id) {
+    Node.Name {text} => Option.some<&[u8]>(Module.text(module, text))
+    _ => Option.none<&[u8]>()
+  }
+}
+
+fn integerType(text: &[u8]) -> Option<StaticIntegerType> {
+  if equal(text, b"u8") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.U8)
+  }
+  if equal(text, b"u16") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.U16)
+  }
+  if equal(text, b"u32") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.U32)
+  }
+  if equal(text, b"u64") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.U64)
+  }
+  if equal(text, b"usize") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.Usize)
+  }
+  if equal(text, b"i8") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.I8)
+  }
+  if equal(text, b"i16") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.I16)
+  }
+  if equal(text, b"i32") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.I32)
+  }
+  if equal(text, b"i64") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.I64)
+  }
+  if equal(text, b"isize") {
+    return Option.some<StaticIntegerType>(StaticIntegerType.Isize)
+  }
+  return Option.none<StaticIntegerType>()
+}
+
+fn annotationType(module: &Module, id: HirId) -> Option<StaticIntegerType> {
+  if let Node.NamedType {path, ..} = Module.node(module, id) {
+    if let Node.Path {segments} = Module.node(module, path) {
+      if segments.length == usize.ONE {
+        let item = Module.child(module, segments, usize.ZERO)
+        if let Option<&[u8]>.Some {value} = move name(module, item) {
+          return integerType(value)
+        }
+      }
+    }
+  }
+  return Option.none<StaticIntegerType>()
+}
+
+fn parseMagnitude(digits: &[u8]) -> Option<u64> {
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < digits.length {
+    let digit = digits[at]
+    if digit < 48 || digit > 57 {
+      return Option.none<u64>()
+    }
+    let scaled = match move u64.checkedMultiply(value, 10) {
+      Option<u64>.Some {value: next} => next
+      Option<u64>.None => {
+        return Option.none<u64>()
+      }
+    }
+    value = match move u64.checkedAdd(scaled, u8.toU64(digit - 48)) {
+      Option<u64>.Some {value: next} => next
+      Option<u64>.None => {
+        return Option.none<u64>()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<u64>(value)
+}
+
+fn boolean(value: &StaticData) -> Option<bool> {
+  return match & value.* {
+    StaticData.Boolean {value: selected} => Option.some<bool>(selected)
+    _ => Option.none<bool>()
+  }
+}
+
+fn infixRight(
+  left: &StaticData,
+  right: &Shared<StaticData>,
+  operator: InfixOperator,
+  pointerBits: u32,
+) -> Result<StaticData, StaticFault> {
+  return Shared.with<StaticData, Result<StaticData, StaticFault>>(
+    right,
+    fn(value: &StaticData) -> Result<StaticData, StaticFault> {
+      return StaticValue.infix(operator, left, value, pointerBits)
+    },
+  )
+}
+
+effect fn evaluatedBoolean<'source>(
+  machine: &mut Machine<'source>,
+  local: &mut Vector<Local>,
+  id: HirId,
+) -> bool ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let value = run expression(&mut machine.*, &mut local.*, id)
+  let selected = Shared.with<StaticData, Option<bool>>(&value, boolean)
+  return match move selected {
+    Option<bool>.Some {value: chosen} => chosen
+    Option<bool>.None => run reject(
+      &machine.*,
+      Fault.InvalidValue,
+      Module.span(&machine.unit.authored, id),
+    )
+  }
+}
+
+effect fn expression<'source>(machine: &mut Machine<'source>, local: &mut Vector<Local>, id: HirId) -> Shared<
+  StaticData,
+> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  run step(&mut machine.*, id)
+  let node = Module.node(&machine.unit.authored, id)
+  let span = Module.span(&machine.unit.authored, id)
+  return match node {
+    Node.BooleanLiteral {value} => run retain(
+      &mut machine.*,
+      StaticData.Boolean {value: value},
+      span,
+    )
+    Node.UnitLiteral => run retain(&mut machine.*, StaticData.Unit, span)
+    Node.CharacterLiteral {scalar} => {
+      let selected = match move StaticValue.character(scalar) {
+        Option<StaticData>.Some {value} => value
+        Option<StaticData>.None => {
+          return run reject(&machine.*, Fault.InvalidValue, span)
+        }
+      }
+      return run retain(&mut machine.*, move selected, span)
+    }
+    Node.TextLiteral {value} => {
+      let bytes = run Bytes.copy(Module.text(&machine.unit.authored, value))
+      let selected = match move StaticValue.text(move bytes) {
+        Option<StaticData>.Some {value: textValue} => textValue
+        Option<StaticData>.None => {
+          return run reject(&machine.*, Fault.InvalidValue, span)
+        }
+      }
+      return run retain(&mut machine.*, move selected, span)
+    }
+    Node.FloatingLiteral {spelling, suffix} => {
+      let mut f32Width = false
+      if suffix.present {
+        let written = Module.text(&machine.unit.authored, suffix.symbol)
+        if equal(written, b"f32") {
+          f32Width = true
+        } else if !equal(written, b"f64") {
+          return run reject(&machine.*, Fault.InvalidValue, span)
+        }
+      }
+      let mut rounded = StaticValue.f64Literal(&machine.unit.authored, spelling)
+      if f32Width {
+        rounded = StaticValue.f32Literal(&machine.unit.authored, spelling)
+      }
+      return match move rounded {
+        Result<StaticData, ParseError>.Success {value: selected} => run retain(
+          &mut machine.*,
+          move selected,
+          span,
+        )
+        Result<StaticData, ParseError>.Failure {error: _} => run reject(
+          &machine.*,
+          Fault.InvalidValue,
+          span,
+        )
+      }
+    }
+    Node.IntegerLiteral {sign, magnitude, suffix, ..} => {
+      let digits = Module.text(&machine.unit.authored, magnitude)
+      let number = match move parseMagnitude(digits) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => {
+          return run reject(&machine.*, Fault.InvalidValue, span)
+        }
+      }
+      let mut ty = StaticIntegerType.U32
+      if suffix.present {
+        ty = match move integerType(Module.text(&machine.unit.authored, suffix.symbol)) {
+          Option<StaticIntegerType>.Some {value} => value
+          Option<StaticIntegerType>.None => {
+            return run reject(&machine.*, Fault.InvalidValue, span)
+          }
+        }
+      }
+      let mut signed = StaticSign.Positive
+      if sign == Sign.Negative {
+        signed = StaticSign.Negative
+      }
+      let selected = match move StaticValue.integer(ty, signed, number, machine.target.pointerBits()) {
+        Option<StaticData>.Some {value} => value
+        Option<StaticData>.None => {
+          return run reject(&machine.*, Fault.InvalidValue, span)
+        }
+      }
+      return run retain(&mut machine.*, move selected, span)
+    }
+    Node.IdentifierExpression {binding, ..} => {
+      let mut target = id
+      if binding.present {
+        target = binding.id
+      }
+      let bindings = Vector.asSlice<Local>(&local.*)
+      let mut at = bindings.length
+      while at > usize.ZERO {
+        at = at - usize.ONE
+        if bindings[at].binder.index == target.index {
+          return Shared.clone<StaticData>(&bindings[at].value)
+        }
+      }
+      return run unresolved(&machine.*, id)
+    }
+    Node.FieldExpression {..} => {
+      let bindings = Vector.asSlice<Local>(&local.*)
+      let mut at = bindings.length
+      while at > usize.ZERO {
+        at = at - usize.ONE
+        if bindings[at].binder.index == id.index {
+          return Shared.clone<StaticData>(&bindings[at].value)
+        }
+      }
+      return run unresolved(&machine.*, id)
+    }
+    Node.MoveExpression {operand} => run expression(&mut machine.*, &mut local.*, operand)
+    Node.CompileErrorExpression {message} => {
+      let value = run expression(&mut machine.*, &mut local.*, message)
+      let reported = run StaticValue.textBytes(&value)
+      let text = match move reported {
+        Option<Bytes>.Some {value: copied} => copied
+        Option<Bytes>.None => {
+          return run reject(
+            &machine.*,
+            Fault.InvalidValue,
+            Module.span(&machine.unit.authored, message),
+          )
+        }
+      }
+      let mut failure = run diagnostic(&machine.*, Fault.CompileError, span)
+      failure.message = Option.some<Bytes>(move text)
+      failure.origin = Option.some<Span>(Module.span(&machine.unit.authored, message))
+      fail move failure
+    }
+    Node.PrefixExpression {operator, operand, ..} => {
+      let value = run expression(&mut machine.*, &mut local.*, operand)
+      let result = Shared.with<StaticData, Result<StaticData, StaticFault>>(
+        &value,
+        fn(input: &StaticData) -> Result<StaticData, StaticFault> {
+          return StaticValue.prefix(operator, input, machine.target.pointerBits())
+        },
+      )
+      return match move result {
+        Result<StaticData, StaticFault>.Success {value: selected} => run retain(
+          &mut machine.*,
+          move selected,
+          span,
+        )
+        Result<StaticData, StaticFault>.Failure {error: _} => run reject(
+          &machine.*,
+          Fault.InvalidValue,
+          span,
+        )
+      }
+    }
+    Node.InfixExpression {operator, left, right, ..} => {
+      let first = run expression(&mut machine.*, &mut local.*, left)
+      if operator == InfixOperator.And || operator == InfixOperator.Or {
+        let chosen = Shared.with<StaticData, Option<bool>>(&first, boolean)
+        let firstBool = match move chosen {
+          Option<bool>.Some {value} => value
+          Option<bool>.None => {
+            return run reject(&machine.*, Fault.InvalidValue, span)
+          }
+        }
+        if (operator == InfixOperator.And && !firstBool) || (operator == InfixOperator.Or && firstBool) {
+          return move first
+        }
+      }
+      let second = run expression(&mut machine.*, &mut local.*, right)
+      let pointerBits = machine.target.pointerBits()
+      let result = Shared.with<StaticData, Result<StaticData, StaticFault>>(
+        &first,
+        fn(firstValue: &StaticData) -> Result<StaticData, StaticFault> {
+          return infixRight(firstValue, &second, operator, pointerBits)
+        },
+      )
+      return match move result {
+        Result<StaticData, StaticFault>.Success {value: selected} => run retain(
+          &mut machine.*,
+          move selected,
+          span,
+        )
+        Result<StaticData, StaticFault>.Failure {error: _} => run reject(
+          &machine.*,
+          Fault.InvalidValue,
+          span,
+        )
+      }
+    }
+    Node.CallExpression {callee, arguments, generics} => {
+      if generics.present {
+        return run reject(&machine.*, Fault.Unavailable, span)
+      }
+      let called = Module.node(&machine.unit.authored, callee)
+      if let Node.IdentifierExpression {name: calledName, binding} = called {
+        if binding.present {
+          if let Node.Declaration {..} = Module.node(&machine.unit.authored, binding.id) {} else {
+            return run reject(&machine.*, Fault.Unavailable, span)
+          }
+        }
+        let spelling = match move name(&machine.unit.authored, calledName) {
+          Option<&[u8]>.Some {value} => run Bytes.copy(value)
+          Option<&[u8]>.None => {
+            return run reject(&machine.*, Fault.Unavailable, span)
+          }
+        }
+        let mut values = Vector.make<Shared<StaticData>>()
+        let mut at = usize.ZERO
+        while at < arguments.length {
+          let argument = Module.child(&machine.unit.authored, arguments, at)
+          run Vector.append<Shared<StaticData>>(
+            &mut values,
+            run expression(&mut machine.*, &mut local.*, argument),
+          )
+          at = at + usize.ONE
+        }
+        return run demand(
+          &mut machine.*,
+          Bytes.asSlice(&spelling),
+          Vector.asSlice<Shared<StaticData>>(&values),
+          span,
+        )
+      }
+      return run reject(&machine.*, Fault.Unavailable, span)
+    }
+    _ => run reject(&machine.*, Fault.Unavailable, span)
+  }
+}
+
+/// Evaluates one demanded HIR expression with immutable static binders and the machine's limits.
+pub effect<'owner & 'env> fn evaluate<'owner, 'env, 'source>(
+  machine: &'owner mut Machine<'source>,
+  bindings: &'env [Binding],
+  id: HirId,
+) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let mut local = Vector.make<Local>()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    run Vector.append<Local>(
+      &mut local,
+      Local {
+        binder: bindings[at].binder,
+        mutable: false,
+        value: StaticValue.copy(&bindings[at].value),
+      },
+    )
+    at = at + usize.ONE
+  }
+  let value = run expression(&mut machine.*, &mut local, id)
+  let bytes = Shared.with<StaticData, usize>(&value, StaticValue.size)
+  if machine.retainedBytes > machine.limits.valueBytes || bytes > machine.limits.valueBytes - machine.retainedBytes {
+    return run reject(&machine.*, Fault.ValueLimit, Module.span(&machine.unit.authored, id))
+  }
+  machine.retainedBytes = machine.retainedBytes + bytes
+  return move value
+}
+
+effect fn statement<'source>(machine: &mut Machine<'source>, local: &mut Vector<Local>, id: HirId) -> Flow
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  run step(&mut machine.*, id)
+  let node = Module.node(&machine.unit.authored, id)
+  let span = Module.span(&machine.unit.authored, id)
+  return match node {
+    Node.Block {statements} => {
+      let base = Vector.length<Local>(&local.*)
+      let mut at = usize.ZERO
+      while at < statements.length {
+        let child = Module.child(&machine.unit.authored, statements, at)
+        let next = run statement(&mut machine.*, &mut local.*, child)
+        match move next {
+          Flow.Next => {}
+          Flow.Break => {
+            Vector.truncate<Local>(&mut local.*, base)
+            return Flow.Break
+          }
+          Flow.Continue => {
+            Vector.truncate<Local>(&mut local.*, base)
+            return Flow.Continue
+          }
+          Flow.Return {value} => {
+            Vector.truncate<Local>(&mut local.*, base)
+            return Flow.Return {value: move value}
+          }
+        }
+        at = at + usize.ONE
+      }
+      Vector.truncate<Local>(&mut local.*, base)
+      return Flow.Next
+    }
+    Node.ExpressionStatement {expression: value} => {
+      let ignored = run expression(&mut machine.*, &mut local.*, value)
+      drop ignored
+      return Flow.Next
+    }
+    Node.BindingStatement {mutable, isStatic, initializer, ..} => {
+      if isStatic {
+        return run reject(&machine.*, Fault.Unavailable, span)
+      }
+      let value = run expression(&mut machine.*, &mut local.*, initializer)
+      run Vector.append<Local>(
+        &mut local.*,
+        Local {binder: id, mutable: mutable, value: move value},
+      )
+      return Flow.Next
+    }
+    Node.AssignmentStatement {target, value} => {
+      let selected = Module.node(&machine.unit.authored, target)
+      if let Node.IdentifierExpression {binding, ..} = selected {
+        if binding.present {
+          let replacement = run expression(&mut machine.*, &mut local.*, value)
+          let slots = Vector.asMutSlice<Local>(&mut local.*)
+          let mut at = slots.length
+          while at > usize.ZERO {
+            at = at - usize.ONE
+            if slots[at].binder.index == binding.id.index && slots[at].mutable {
+              slots[at].value = move replacement
+              return Flow.Next
+            }
+          }
+        }
+      }
+      return run reject(&machine.*, Fault.Unavailable, Module.span(&machine.unit.authored, target))
+    }
+    Node.ConditionalStatement {condition, thenBranch, elseBranch} => {
+      if run evaluatedBoolean(&mut machine.*, &mut local.*, condition) {
+        return run statement(&mut machine.*, &mut local.*, thenBranch)
+      }
+      if elseBranch.present {
+        return run statement(&mut machine.*, &mut local.*, elseBranch.id)
+      }
+      return Flow.Next
+    }
+    Node.WhileStatement {condition, body} => {
+      while run evaluatedBoolean(&mut machine.*, &mut local.*, condition) {
+        let next = run statement(&mut machine.*, &mut local.*, body)
+        match move next {
+          Flow.Next => {}
+          Flow.Continue => {}
+          Flow.Break => {
+            return Flow.Next
+          }
+          Flow.Return {value} => {
+            return Flow.Return {value: move value}
+          }
+        }
+      }
+      return Flow.Next
+    }
+    Node.BreakStatement => Flow.Break
+    Node.ContinueStatement => Flow.Continue
+    Node.ReturnStatement {value} => {
+      if value.present {
+        return Flow.Return {value: run expression(&mut machine.*, &mut local.*, value.id)}
+      }
+      return Flow.Return {value: run retain(&mut machine.*, StaticData.Unit, span)}
+    }
+    _ => run reject(&machine.*, Fault.Unavailable, span)
+  }
+}
+
+effect fn execute<'source>(
+  machine: &mut Machine<'source>,
+  selected: &SelectedStaticFunction,
+  args: &[Shared<StaticData>],
+) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let parameters = Vector.asSlice<HirId>(&selected.parameters)
+  if parameters.length != args.length {
+    return run reject(&machine.*, Fault.InvalidHeader, selected.span)
+  }
+  let mut local = Vector.make<Local>()
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    run Vector.append<Local>(
+      &mut local,
+      Local {binder: parameters[at], mutable: false, value: Shared.clone<StaticData>(&args[at])},
+    )
+    at = at + usize.ONE
+  }
+  let flow = run statement(&mut machine.*, &mut local, selected.block)
+  return match move flow {
+    Flow.Return {value} => move value
+    Flow.Next => run retain(&mut machine.*, StaticData.Unit, selected.span)
+    _ => run reject(&machine.*, Fault.InvalidControl, selected.span)
+  }
+}
+
+/// Demands a static function. A typed interruption unwinds the active trace so a later demand can retry.
+pub effect<'owner & 'env> fn demand<'owner, 'env, 'source>(
+  machine: &'owner mut Machine<'source>,
+  selectedName: &'env [u8],
+  args: &'env [Shared<StaticData>],
+  callSpan: Span,
+) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let cached = run completed(&machine.*, selectedName, args)
+  if let Option<Shared<StaticData>>.Some {value} = move cached {
+    return move value
+  }
+  let selected = match move run StaticFunction.select(machine.unit, &machine.index, selectedName) {
+    Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value} => value
+    Result<SelectedStaticFunction, StaticHeaderRejection>.Failure {error} => {
+      if error.fault == StaticHeaderFault.RuntimeFunction || error.fault == StaticHeaderFault.UnknownName {
+        return run reject(&machine.*, Fault.Unavailable, callSpan)
+      }
+      return run reject(&machine.*, Fault.InvalidHeader, error.span)
+    }
+  }
+  let active = Vector.asSlice<Frame>(&machine.active)
+  let mut at = usize.ZERO
+  while at < active.length {
+    if equal(Bytes.asSlice(&active[at].name), selectedName) && run sameArguments(
+      Vector.asSlice<Shared<StaticData>>(&active[at].arguments),
+      args,
+    ) {
+      return run reject(&machine.*, Fault.Cycle, callSpan)
+    }
+    at = at + usize.ONE
+  }
+  if Vector.length<Frame>(&machine.active) >= machine.limits.depth {
+    return run reject(&machine.*, Fault.DepthLimit, callSpan)
+  }
+  run Vector.append<Frame>(
+    &mut machine.active,
+    Frame {name: run Bytes.copy(selectedName), arguments: run copyArguments(args), span: callSpan},
+  )
+  let reservation = FrameReservation {machine: move machine}
+  let use = effect fn(resource: &mut FrameReservation<'owner, 'source>) -> Shared<StaticData>
+  ! Diagnostic | OutOfMemoryError
+  ? &mut Allocator {
+    let value = run execute(&mut resource.machine.*, &selected, args)
+    run publish(&mut resource.machine.*, selectedName, args, &value, callSpan)
+    return move value
+  }
+  let release = effect fn(resource: &mut FrameReservation<'owner, 'source>) -> () {
+    let last = Vector.length<Frame>(&resource.machine.*.active) - usize.ONE
+    let removed = Vector.remove<Frame>(&mut resource.machine.*.active, last)
+    drop removed
+    return ()
+  }
+  return run Effect.useReleaseNonParking(move reservation, move use, move release)
+}
