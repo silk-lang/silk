@@ -6817,6 +6817,25 @@ export const httpRedirectCorpusProgram = Object.freeze({
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
+    // A borrowed variant field must reach a concrete helper body for native enum equality.
+    name: 'scalar-enum-equality-from-borrowed-variant',
+    source: `import silk.option { Option }
+enum Mode { Read, Write }
+struct Payload { mode: Option<Mode> }
+fn sameMode(payload: &Payload, expected: Mode) -> bool {
+  if let Option<Mode>.Some {value} = &payload.mode {
+    return value == expected && expected == value
+  }
+  return false
+}
+pub fn main() -> i32 {
+  let payload = Payload { mode: Option.some<Mode>(Mode.Write) }
+  if sameMode(&payload, Mode.Write) { return 42 }
+  return 1
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'nested-moved-shared-options-drop-once',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
