@@ -1091,6 +1091,12 @@ interface ClosureIndex {
   readonly instances: ReadonlyMap<string, Instance>
   readonly byOwner: ReadonlyMap<string, ReadonlyArray<ExecutionEdge>>
   readonly residuals: ReadonlyMap<string, Residualization.Observation>
+  /** Callables and Effects in closure order, each with its owner's key text. */
+  readonly callables: ReadonlyArray<{ readonly owner: string; readonly value: CallableInstance }>
+  readonly effects: ReadonlyArray<{ readonly owner: string; readonly value: EffectInstance }>
+  /** Intrinsic and foreign calls with the source span key that selects them. */
+  readonly intrinsics: ReadonlyArray<{ readonly span: string; readonly value: IntrinsicCall }>
+  readonly foreignCalls: ReadonlyArray<{ readonly span: string; readonly value: ForeignCall }>
 }
 
 // Test identity computes one closure per test over the same discovery; index it once.
@@ -1110,6 +1116,18 @@ const closureIndex = (self: Discovery): ClosureIndex => {
       instances: new Map(self.instances.map((instance) => [keyText(instance.key), instance])),
       byOwner,
       residuals: new Map(self.residualBodies.map((body) => [body.application, body])),
+      // Sorted once: filtering a stably sorted list keeps the order each closure sorted into.
+      callables: self.callables
+        .toSorted((left, right) => callableIdentity(left).localeCompare(callableIdentity(right)))
+        .map((value) => ({ owner: keyText(value.owner), value })),
+      effects: self.effects
+        .toSorted((left, right) => left.identity.localeCompare(right.identity))
+        .map((value) => ({ owner: keyText(value.owner), value })),
+      intrinsics: self.intrinsics.map((value) => ({ span: SourceSpan.key(value.span), value })),
+      foreignCalls: self.foreignCalls.map((value) => ({
+        span: SourceSpan.key(value.callSpan),
+        value,
+      })),
     }
     closureIndices.set(self, index)
   }
@@ -1135,13 +1153,14 @@ export const executionClosure = (
   root: InstanceKey,
   excludedDeclarations: ReadonlySet<string> = new Set(),
 ): ExecutionClosure => {
-  const { instances, byOwner, residuals } = closureIndex(self)
+  const index = closureIndex(self)
+  const { instances, byOwner, residuals } = index
   const selected = new Map<string, Instance>()
   const selectedEdges = new Map<string, ExecutionEdge>()
   const gaps: Array<ExecutionGap> = []
   const pending = [root]
-  while (pending.length > 0) {
-    const key = pending.shift()
+  for (let cursor = 0; cursor < pending.length; cursor += 1) {
+    const key = pending[cursor]
     if (key === undefined) continue
     const encoded = keyText(key)
     if (selected.has(encoded)) continue
@@ -1186,14 +1205,12 @@ export const executionClosure = (
       const target = compareInstanceKeys(left.target, right.target)
       return target !== 0 ? target : left.kind.localeCompare(right.kind)
     }),
-    callables: self.callables
-      .filter((callable) => owners.has(keyText(callable.owner)))
-      .sort((left, right) => callableIdentity(left).localeCompare(callableIdentity(right))),
-    effects: self.effects
-      .filter((effect) => owners.has(keyText(effect.owner)))
-      .sort((left, right) => left.identity.localeCompare(right.identity)),
-    intrinsics: self.intrinsics.filter((call) => spans.has(SourceSpan.key(call.span))),
-    foreignCalls: self.foreignCalls.filter((call) => spans.has(SourceSpan.key(call.callSpan))),
+    callables: index.callables.flatMap((entry) => (owners.has(entry.owner) ? [entry.value] : [])),
+    effects: index.effects.flatMap((entry) => (owners.has(entry.owner) ? [entry.value] : [])),
+    intrinsics: index.intrinsics.flatMap((entry) => (spans.has(entry.span) ? [entry.value] : [])),
+    foreignCalls: index.foreignCalls.flatMap((entry) =>
+      spans.has(entry.span) ? [entry.value] : [],
+    ),
     residualBodies,
     gaps,
   }
