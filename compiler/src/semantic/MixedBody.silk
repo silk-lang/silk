@@ -1,0 +1,483 @@
+//! Selected runtime work from one application of an ordinary function with static inputs.
+//!
+//! The source unit retained by `Machine` owns every HIR identity in a successful body. A
+//! failed selection publishes no body, runtime call, or embedded value.
+
+import hir.Hir {HirId, HirRef, Module, Node, ParameterMode}
+import lexer.Span {Span}
+import parser.Diagnostic {Diagnostic as SyntaxDiagnostic}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleIndex {CandidateKind, ModuleIndex}
+import semantic.SourceUnit {SourceUnit}
+import semantic.StaticExecution
+import semantic.StaticExecution {Binding as StaticBinding, Diagnostic as StaticDiagnostic, Machine as StaticMachine}
+import semantic.StaticValue
+import semantic.StaticValue {FloatType as StaticFloatType, IntegerType as StaticIntegerType, Value as StaticData}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// A source error in an ordinary function's selected static path.
+pub enum Fault {
+  InvalidSyntax,
+  UnknownFunction,
+  InvalidHeader,
+  StaticArity,
+  InvalidStaticValue,
+  ConditionNotBool,
+  StaticCallableEscape,
+  UnknownName,
+  ResidualGrowth,
+}
+
+pub struct Diagnostic {
+  pub fault: Fault
+  pub span: Span
+}
+
+/// Static values substituted into selected runtime expressions.
+pub struct Embedded {
+  pub syntax: HirId
+  pub value: Shared<StaticData>
+}
+
+/// M2.5 checks these selected source expressions for types, ownership, Effects, and cleanup.
+pub union Obligation {
+  Expression {pub syntax: HirId},
+  RuntimeCall {pub syntax: HirId},
+}
+
+/// A selected tree. Runtime control remains control; a static conditional contributes only its
+/// chosen arm. `Source` contains a runtime statement without nested static source.
+pub union Residual {
+  Source {pub syntax: HirId},
+  Block {pub statements: Vector<Residual>},
+  Branch {
+    pub condition: HirId,
+    pub thenBranch: Shared<Residual>,
+    pub elseBranch: Option<Shared<Residual>>,
+  },
+  Loop {pub condition: HirId, pub body: Shared<Residual>},
+}
+
+/// A complete selected application; static parameters and `let static` have no runtime lane.
+pub struct Body {
+  pub declaration: DeclarationId
+  pub runtimeParameters: Vector<HirId>
+  pub staticBindings: Vector<StaticBinding>
+  pub embedded: Vector<Embedded>
+  pub obligations: Vector<Obligation>
+  pub root: Residual
+}
+
+/// One frozen source and evaluator with a separate bound on residual growth.
+pub struct Machine {
+  execution: StaticMachine
+  index: ModuleIndex
+  residualLimit: usize
+}
+
+struct Selection {
+  declaration: DeclarationId
+  parameters: Vector<HirId>
+  block: HirId
+  span: Span
+}
+
+struct Draft {
+  bindings: Vector<StaticBinding>
+  embedded: Vector<Embedded>
+  obligations: Vector<Obligation>
+  nodes: usize
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn source(machine: &Machine) -> &SourceUnit {
+  return StaticExecution.source(&machine.execution)
+}
+
+fn hir(machine: &Machine) -> &Module {
+  return &source(machine).authored
+}
+
+effect fn reject(fault: Fault, span: Span) -> never ! Diagnostic {
+  fail Diagnostic {fault: fault, span: span}
+}
+
+/// Parses and indexes one source once. No ordinary or static body is demanded here.
+pub effect fn make(unit: SourceUnit, pointerBits: u32, limits: StaticExecution.Limits, residualLimit: usize) -> Machine
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  let syntaxErrors = Vector.asSlice<SyntaxDiagnostic>(&unit.syntax.diagnostics)
+  if syntaxErrors.length > usize.ZERO {
+    let first = match syntaxErrors[0] {
+      SyntaxDiagnostic.MissingToken {span, ..} => span
+      SyntaxDiagnostic.UnexpectedToken {span, ..} => span
+      SyntaxDiagnostic.NestingLimit {span, ..} => span
+    }
+    return run reject(Fault.InvalidSyntax, first)
+  }
+  if SourceUnit.diagnosticCount(&unit) > usize.ZERO {
+    return run reject(Fault.InvalidSyntax, SourceUnit.diagnostic(&unit, usize.ZERO).span)
+  }
+  let execution = run StaticExecution.make(move unit, pointerBits, move limits)
+  let index = run ModuleIndex.build(StaticExecution.source(&execution))
+  return Machine {execution: move execution, index: move index, residualLimit: residualLimit}
+}
+
+fn declaration(machine: &Machine, name: &[u8]) -> Option<usize> {
+  let candidates = ModuleIndex.listCandidates(&machine.index)
+  let mut found = Option.none<usize>()
+  let mut at = usize.ZERO
+  while at < candidates.length {
+    if candidates[at].kind == CandidateKind.Declaration && same(Bytes.asSlice(&candidates[at].name), name) {
+      if let Option<usize>.Some {value: _} = &found { return Option.none<usize>() }
+      found = Option.some<usize>(candidates[at].declaration)
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+fn callableIsStatic(machine: &Machine, ordinal: usize) -> bool {
+  let declarations = ModuleIndex.listDeclarations(&machine.index)
+  if ordinal >= declarations.length { return false }
+  if let Node.FunctionHeader {contract, ..} = Module.node(hir(machine), declarations[ordinal].header) {
+    if let Node.CallableContract {isStatic, ..} = Module.node(hir(machine), contract) {
+      return isStatic
+    }
+  }
+  return false
+}
+
+fn annotationName(machine: &Machine, annotation: HirId) -> Option<&[u8]> {
+  if let Node.NamedType {path, ..} = Module.node(hir(machine), annotation) {
+    if let Node.Path {segments} = Module.node(hir(machine), path) {
+      if segments.length == usize.ONE {
+        let part = Module.child(hir(machine), segments, usize.ZERO)
+        if let Node.Name {text} = Module.node(hir(machine), part) {
+          return Option.some<&[u8]>(Module.text(hir(machine), text))
+        }
+      }
+    }
+  }
+  return Option.none<&[u8]>()
+}
+
+fn matchesAnnotation(machine: &Machine, annotation: HirId, value: &StaticData) -> bool {
+  let named = annotationName(machine, annotation)
+  return match move named {
+    Option<&[u8]>.Some {value: spelling} => match &value.* {
+      StaticData.Unit => same(spelling, b"unit")
+      StaticData.Boolean {..} => same(spelling, b"bool")
+      StaticData.Character {..} => same(spelling, b"char")
+      StaticData.Text {..} => same(spelling, b"string")
+      StaticData.Float {ty, ..} => (ty == StaticFloatType.F32 && same(spelling, b"f32")) || (ty == StaticFloatType.F64 && same(spelling, b"f64"))
+      StaticData.Integer {ty, ..} => match ty {
+        StaticIntegerType.U8 => same(spelling, b"u8")
+        StaticIntegerType.U16 => same(spelling, b"u16")
+        StaticIntegerType.U32 => same(spelling, b"u32")
+        StaticIntegerType.U64 => same(spelling, b"u64")
+        StaticIntegerType.Usize => same(spelling, b"usize")
+        StaticIntegerType.I8 => same(spelling, b"i8")
+        StaticIntegerType.I16 => same(spelling, b"i16")
+        StaticIntegerType.I32 => same(spelling, b"i32")
+        StaticIntegerType.I64 => same(spelling, b"i64")
+        StaticIntegerType.Isize => same(spelling, b"isize")
+      }
+      _ => false
+    }
+    Option<&[u8]>.None => false
+  }
+}
+
+effect fn select(machine: &Machine, name: &[u8]) -> Selection
+! Diagnostic | OutOfMemoryError
+? &mut Allocator {
+  let ordinal = match move declaration(machine, name) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => return run reject(Fault.UnknownFunction, Span.make(usize.ZERO, usize.ZERO))
+  }
+  let declarations = ModuleIndex.listDeclarations(&machine.index)
+  let selected = &declarations[ordinal]
+  let span = Module.span(hir(machine), selected.header)
+  if let Option<usize>.Some {value: _} = &selected.parent {
+    return run reject(Fault.InvalidHeader, span)
+  }
+  if let Node.Declaration {header, body, ..} = Module.node(hir(machine), selected.local) {
+    if let Node.FunctionHeader {contract, ..} = Module.node(hir(machine), header) {
+      if let Node.CallableContract {parameters, isStatic, ..} = Module.node(hir(machine), contract) {
+        if isStatic { return run reject(Fault.InvalidHeader, span) }
+        if let Node.CallableBody {block} = Module.node(hir(machine), body) {
+          if block.present {
+            let mut selectedParameters = Vector.make<HirId>()
+            let mut at = usize.ZERO
+            while at < parameters.length {
+              run Vector.append<HirId>(&mut selectedParameters, Module.child(hir(machine), parameters, at))
+              at = at + usize.ONE
+            }
+            return Selection {
+              declaration: run DeclarationId.copy(&selected.identity),
+              parameters: move selectedParameters,
+              block: block.id,
+              span: span,
+            }
+          }
+        }
+      }
+    }
+  }
+  return run reject(Fault.InvalidHeader, span)
+}
+
+effect fn count(machine: &Machine, draft: &mut Draft, syntax: HirId) -> () ! Diagnostic {
+  if draft.nodes >= machine.residualLimit {
+    return run reject(Fault.ResidualGrowth, Module.span(hir(machine), syntax))
+  }
+  draft.nodes = draft.nodes + usize.ONE
+  return ()
+}
+
+effect fn evaluate(machine: &mut Machine, draft: &Draft, expression: HirId) -> Shared<StaticData>
+! StaticDiagnostic | OutOfMemoryError
+? &mut Allocator {
+  return run StaticExecution.evaluate(
+    &mut machine.execution,
+    Vector.asSlice<StaticBinding>(&draft.bindings),
+    expression,
+  )
+}
+
+effect fn condition(machine: &mut Machine, draft: &Draft, expression: HirId) -> bool
+! Diagnostic | StaticDiagnostic | OutOfMemoryError
+? &mut Allocator {
+  let value = run evaluate(&mut machine.*, draft, expression)
+  let selected = Shared.with<StaticData, Option<bool>>(&value, fn(data: &StaticData) -> Option<bool> {
+    return match &data.* {
+      StaticData.Boolean {value: answer} => Option.some<bool>(answer)
+      _ => Option.none<bool>()
+    }
+  })
+  return match move selected {
+    Option<bool>.Some {value: answer} => answer
+    Option<bool>.None => run reject(Fault.ConditionNotBool, Module.span(hir(machine), expression))
+  }
+}
+
+fn staticBinder(draft: &Draft, binder: HirId) -> Option<Shared<StaticData>> {
+  let bindings = Vector.asSlice<StaticBinding>(&draft.bindings)
+  let mut at = bindings.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if bindings[at].binder.index == binder.index {
+      return Option.some<Shared<StaticData>>(StaticValue.copy(&bindings[at].value))
+    }
+  }
+  return Option.none<Shared<StaticData>>()
+}
+
+effect fn inspect(machine: &mut Machine, draft: &mut Draft, expression: HirId) -> ()
+! Diagnostic | StaticDiagnostic | OutOfMemoryError
+? &mut Allocator {
+  let node = Module.node(hir(machine), expression)
+  match node {
+    Node.CompileErrorExpression {..} => {
+      let ignored = run evaluate(&mut machine.*, &draft.*, expression)
+      drop ignored
+    }
+    Node.IdentifierExpression {name, binding} => {
+      if binding.present {
+        if let Option<Shared<StaticData>>.Some {value} = move staticBinder(&draft.*, binding.id) {
+          run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move value})
+        }
+      } else if let Node.Name {text} = Module.node(hir(machine), name) {
+        let spelling = Module.text(hir(machine), text)
+        if let Option<usize>.Some {value: ordinal} = move declaration(&machine.*, spelling) {
+          if callableIsStatic(&machine.*, ordinal) {
+            return run reject(Fault.StaticCallableEscape, Module.span(hir(machine), expression))
+          }
+        } else {
+          return run reject(Fault.UnknownName, Module.span(hir(machine), expression))
+        }
+      }
+    }
+    Node.CallExpression {callee, arguments, ..} => {
+      if let Node.IdentifierExpression {name, binding} = Module.node(hir(machine), callee) {
+        if !binding.present {
+          if let Node.Name {text} = Module.node(hir(machine), name) {
+            if let Option<usize>.Some {value: ordinal} = move declaration(&machine.*, Module.text(hir(machine), text)) {
+              if callableIsStatic(&machine.*, ordinal) {
+                let value = run evaluate(&mut machine.*, &draft.*, expression)
+                run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move value})
+                return ()
+              }
+            }
+          }
+        }
+      }
+      run inspect(&mut machine.*, &mut draft.*, callee)
+      let mut at = usize.ZERO
+      while at < arguments.length {
+        run inspect(&mut machine.*, &mut draft.*, Module.child(hir(machine), arguments, at))
+        at = at + usize.ONE
+      }
+      run Vector.append<Obligation>(&mut draft.obligations, Obligation.RuntimeCall {syntax: expression})
+    }
+    Node.MoveExpression {operand} => run inspect(&mut machine.*, &mut draft.*, operand)
+    Node.PrefixExpression {operand, ..} => run inspect(&mut machine.*, &mut draft.*, operand)
+    Node.InfixExpression {left, right, ..} => {
+      run inspect(&mut machine.*, &mut draft.*, left)
+      run inspect(&mut machine.*, &mut draft.*, right)
+    }
+    Node.FieldExpression {subject, ..} => run inspect(&mut machine.*, &mut draft.*, subject)
+    Node.IndexExpression {subject, index} => {
+      run inspect(&mut machine.*, &mut draft.*, subject)
+      run inspect(&mut machine.*, &mut draft.*, index)
+    }
+    _ => ()
+  }
+  run Vector.append<Obligation>(&mut draft.obligations, Obligation.Expression {syntax: expression})
+  return ()
+}
+
+effect fn residual(machine: &mut Machine, draft: &mut Draft, statement: HirId) -> Residual
+! Diagnostic | StaticDiagnostic | OutOfMemoryError
+? &mut Allocator {
+  let node = Module.node(hir(machine), statement)
+  match node {
+    Node.Block {statements} => {
+      let mut retained = Vector.make<Residual>()
+      let mut at = usize.ZERO
+      while at < statements.length {
+        let syntax = Module.child(hir(machine), statements, at)
+        if let Node.BindingStatement {mutable, isStatic, annotation, initializer, ..} = Module.node(hir(machine), syntax) {
+          if isStatic {
+            if mutable { return run reject(Fault.InvalidHeader, Module.span(hir(machine), syntax)) }
+            let value = run evaluate(&mut machine.*, &draft.*, initializer)
+            if annotation.present && !Shared.with<StaticData, bool>(&value, fn(data: &StaticData) -> bool {
+              return matchesAnnotation(&machine.*, annotation.id, data)
+            }) {
+              return run reject(Fault.InvalidStaticValue, Module.span(hir(machine), initializer))
+            }
+            run Vector.append<StaticBinding>(&mut draft.bindings, StaticBinding {binder: syntax, value: move value})
+            at = at + usize.ONE
+            continue
+          }
+        }
+        if let Node.StaticConditionalStatement {condition: selected, thenBranch, elseBranch} = Module.node(hir(machine), syntax) {
+          if run condition(&mut machine.*, &draft.*, selected) {
+            run Vector.append<Residual>(&mut retained, run residual(&mut machine.*, &mut draft.*, thenBranch))
+          } else if elseBranch.present {
+            run Vector.append<Residual>(&mut retained, run residual(&mut machine.*, &mut draft.*, elseBranch.id))
+          }
+          at = at + usize.ONE
+          continue
+        }
+        run Vector.append<Residual>(&mut retained, run residual(&mut machine.*, &mut draft.*, syntax))
+        at = at + usize.ONE
+      }
+      run count(&machine.*, &mut draft.*, statement)
+      return Residual.Block {statements: move retained}
+    }
+    Node.ConditionalStatement {condition: tested, thenBranch, elseBranch} => {
+      run inspect(&mut machine.*, &mut draft.*, tested)
+      let chosen = run Shared.make<Residual>(run residual(&mut machine.*, &mut draft.*, thenBranch))
+      let mut otherwise = Option.none<Shared<Residual>>()
+      if elseBranch.present {
+        otherwise = Option.some<Shared<Residual>>(run Shared.make<Residual>(run residual(&mut machine.*, &mut draft.*, elseBranch.id)))
+      }
+      run count(&machine.*, &mut draft.*, statement)
+      return Residual.Branch {condition: tested, thenBranch: move chosen, elseBranch: move otherwise}
+    }
+    Node.WhileStatement {condition: tested, body} => {
+      run inspect(&mut machine.*, &mut draft.*, tested)
+      let selected = run Shared.make<Residual>(run residual(&mut machine.*, &mut draft.*, body))
+      run count(&machine.*, &mut draft.*, statement)
+      return Residual.Loop {condition: tested, body: move selected}
+    }
+    Node.BindingStatement {initializer, ..} => run inspect(&mut machine.*, &mut draft.*, initializer)
+    Node.ReturnStatement {value} => {
+      if value.present { run inspect(&mut machine.*, &mut draft.*, value.id) }
+    }
+    Node.ExpressionStatement {expression} => run inspect(&mut machine.*, &mut draft.*, expression)
+    Node.AssignmentStatement {target, value} => {
+      run inspect(&mut machine.*, &mut draft.*, target)
+      run inspect(&mut machine.*, &mut draft.*, value)
+    }
+    Node.StaticConditionalStatement {condition: selected, thenBranch, elseBranch} => {
+      if run condition(&mut machine.*, &draft.*, selected) {
+        return run residual(&mut machine.*, &mut draft.*, thenBranch)
+      }
+      if elseBranch.present { return run residual(&mut machine.*, &mut draft.*, elseBranch.id) }
+      run count(&machine.*, &mut draft.*, statement)
+      return Residual.Block {statements: Vector.make<Residual>()}
+    }
+    _ => ()
+  }
+  run count(&machine.*, &mut draft.*, statement)
+  return Residual.Source {syntax: statement}
+}
+
+/// Specializes one ordinary function. Failure drops the draft before any body can be observed.
+pub effect fn specialize(machine: &mut Machine, name: &[u8], staticArguments: &[Shared<StaticData>]) -> Body
+! Diagnostic | StaticDiagnostic | OutOfMemoryError
+? &mut Allocator {
+  let selected = run select(&machine.*, name)
+  let mut runtimeParameters = Vector.make<HirId>()
+  let mut draft = Draft {
+    bindings: Vector.make<StaticBinding>(),
+    embedded: Vector.make<Embedded>(),
+    obligations: Vector.make<Obligation>(),
+    nodes: usize.ZERO,
+  }
+  let parameters = Vector.asSlice<HirId>(&selected.parameters)
+  let mut supplied = usize.ZERO
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let parameter = parameters[at]
+    if let Node.Parameter {mode, annotation, ..} = Module.node(hir(machine), parameter) {
+      if mode == ParameterMode.Static {
+        if supplied >= staticArguments.length {
+          return run reject(Fault.StaticArity, selected.span)
+        }
+        if !Shared.with<StaticData, bool>(&staticArguments[supplied], fn(data: &StaticData) -> bool {
+          return StaticValue.pure(data) && matchesAnnotation(&machine.*, annotation, data)
+        }) {
+          return run reject(Fault.InvalidStaticValue, Module.span(hir(machine), parameter))
+        }
+        run Vector.append<StaticBinding>(
+          &mut draft.bindings,
+          StaticBinding {binder: parameter, value: StaticValue.copy(&staticArguments[supplied])},
+        )
+        supplied = supplied + usize.ONE
+      } else {
+        run Vector.append<HirId>(&mut runtimeParameters, parameter)
+      }
+    } else {
+      return run reject(Fault.InvalidHeader, Module.span(hir(machine), parameter))
+    }
+    at = at + usize.ONE
+  }
+  if supplied != staticArguments.length { return run reject(Fault.StaticArity, selected.span) }
+  let root = run residual(&mut machine.*, &mut draft, selected.block)
+  return Body {
+    declaration: move selected.declaration,
+    runtimeParameters: move runtimeParameters,
+    staticBindings: move draft.bindings,
+    embedded: move draft.embedded,
+    obligations: move draft.obligations,
+    root: move root,
+  }
+}
