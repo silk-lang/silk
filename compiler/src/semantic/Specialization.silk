@@ -7,10 +7,16 @@
 
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
+import semantic.ModuleId {InvalidModulePath}
+import semantic.Query {Cycle}
+import semantic.Semantic {Answer, Outcome, Request, Semantic, Value}
+import semantic.SourceIndex {NoRejection, RevisionMismatch}
 import semantic.Type {Argument, Row, Type}
 import semantic.TypedBody {Expression}
+import hir.Hir {OwnerKind}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.option {Option}
+import silk.result {Result}
 import silk.shared {Shared}
 import silk.usize
 import silk.vector {Vector}
@@ -54,7 +60,20 @@ pub struct Admission {
 
 struct Step {
   application: Application
-  viaWitness: bool
+  edge: Edge
+}
+
+/// A concrete struct field selected and resolved under its owning nominal application.
+pub struct FieldDescent {
+  owner: Shared<Type>
+  field: Shared<Type>
+}
+
+/// How a requested application was reached from its parent on the active path.
+pub union Edge {
+  Direct,
+  Witness,
+  FieldWitness {pub field: FieldDescent},
 }
 
 /// A finite request, a repeated runtime identity, or the exact path that grows recursively.
@@ -227,12 +246,78 @@ fn opaqueEffect(value: &Type) -> bool {
   }
 }
 
+fn selectedField(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let selected = Vector.asSlice<Shared<Type>>(&types)
+        if selected.length == usize.ONE {
+          return Option.some<Shared<Type>>(Shared.clone<Type>(&selected[0]))
+        }
+        return Option.none<Shared<Type>>()
+      }
+      _ => Option.none<Shared<Type>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Type>>()
+  }
+}
+
+fn witnesses(edge: &Edge) -> bool {
+  return match & edge.* {
+    Edge.Direct => false
+    Edge.Witness => true
+    Edge.FieldWitness {..} => true
+  }
+}
+
+effect fn provesField(edge: &Edge, outer: &Shared<Type>, inner: &Shared<Type>) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  if let Edge.FieldWitness {field} = &edge.* {
+    if !run Type.runtimeEqualsShared(outer, &field.owner) {
+      return false
+    }
+    if run Type.runtimeEqualsShared(outer, inner) {
+      return false
+    }
+    if run Type.runtimeEqualsShared(inner, &field.field) {
+      return true
+    }
+    return run Type.strictRuntimeSubterm(inner, &field.field)
+  }
+  return false
+}
+
+effect fn fieldOnPath(
+  active: &[Step],
+  ancestor: usize,
+  edge: &Edge,
+  outer: &Shared<Type>,
+  inner: &Shared<Type>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if run provesField(edge, outer, inner) {
+    return true
+  }
+  let mut at = ancestor + usize.ONE
+  while at < active.length {
+    if run provesField(&active[at].edge, outer, inner) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // A concrete witness may move through a bounded helper to a strictly smaller structural type.
 // Other type arguments must stay fixed or descend; hidden Effect families may change when some
 // concrete argument strictly descends. Rows and exact named representations never grant descent.
-effect fn witnessDescent(ancestor: &Application, requested: &Application) -> bool
-! OutOfMemoryError
-? &mut Allocator {
+effect fn witnessDescent(
+  ancestor: &Application,
+  requested: &Application,
+  active: &[Step],
+  ancestorAt: usize,
+  edge: &Edge,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
   let first = Vector.asSlice<Argument>(&ancestor.arguments)
   let second = Vector.asSlice<Argument>(&requested.arguments)
   if first.length != second.length {
@@ -248,6 +333,11 @@ effect fn witnessDescent(ancestor: &Application, requested: &Application) -> boo
     if let Argument.Type {value: outer} = &first[at] {
       if let Argument.Type {value: inner} = &second[at] {
         if run Type.strictRuntimeSubterm(&inner, &outer) {
+          strict = true
+          at = at + usize.ONE
+          continue
+        }
+        if run fieldOnPath(active, ancestorAt, edge, &outer, &inner) {
           strict = true
           at = at + usize.ONE
           continue
@@ -351,13 +441,60 @@ impl Pool {
   }
 }
 
+impl FieldDescent {
+  /// Resolves one actual struct field under its concrete owner application. No unrelated nominal
+  /// type can provide a field edge, and a failed member demand supplies no evidence.
+  pub effect fn fromMember(
+    semantic: &mut Semantic,
+    request: &mut Request,
+    declaration: &DeclarationId,
+    owner: &Shared<Type>,
+    member: usize,
+  ) -> Option<FieldDescent>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    if DeclarationId.kind(declaration) != OwnerKind.Struct || !Shared.with<Type, bool>(
+      owner,
+      fn(value: &Type) -> bool {
+        return match & value.* {
+          Type.Nominal {declaration: selected, ..} => DeclarationId.equals(&selected, declaration)
+          _ => false
+        }
+      },
+    ) {
+      return Option.none<FieldDescent>()
+    }
+    let answer = run Semantic.demandMemberShape(
+      semantic,
+      request,
+      DeclarationId.moduleId(declaration),
+      DeclarationId.spelling(declaration),
+      member,
+      owner,
+    )
+    let field = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &answer,
+      selectedField,
+    )
+    if let Option<Shared<Type>>.Some {value: selected} = move field {
+      if run Type.runtimeEqualsShared(owner, &selected) {
+        return Option.none<FieldDescent>()
+      }
+      return Option.some<FieldDescent>(
+        FieldDescent {owner: Shared.clone<Type>(owner), field: move selected},
+      )
+    }
+    return Option.none<FieldDescent>()
+  }
+}
+
 impl Admission {
   pub fn make() -> Admission {
     return Admission {active: Vector.make<Step>()}
   }
-  /// Checks the active path before following this application's body. `viaWitness` marks a
-  /// concrete witness delegation edge; direct calls alone cannot change recursive arguments.
-  pub effect fn enter(self: &mut Self, application: &Application, viaWitness: bool) -> Decision
+  /// Checks the active path before following this application's body. Field descent requires an
+  /// actual resolved member edge; direct calls alone cannot change recursive arguments.
+  pub effect fn enter(self: &mut Self, application: &Application, edge: Edge) -> Decision
   ! OutOfMemoryError
   ? &mut Allocator {
     if !closed(application) {
@@ -373,21 +510,21 @@ impl Admission {
         if run sameApplication(&active[at].application, application, true) {
           return Decision.Reused {ancestor: at}
         }
-        let mut witness = viaWitness
-        let mut edge = at + usize.ONE
-        while edge < active.length {
-          witness = witness || active[edge].viaWitness
-          edge = edge + usize.ONE
+        let mut witness = witnesses(&edge)
+        let mut pathAt = at + usize.ONE
+        while pathAt < active.length {
+          witness = witness || witnesses(&active[pathAt].edge)
+          pathAt = pathAt + usize.ONE
         }
-        if !witness || !run witnessDescent(&active[at].application, application) {
+        if !witness || !run witnessDescent(&active[at].application, application, active, at, &edge) {
           let mut path = Vector.make<Application>()
-          edge = at
-          while edge < active.length {
+          pathAt = at
+          while pathAt < active.length {
             run Vector.append<Application>(
               &mut path,
-              run copyApplication(&active[edge].application),
+              run copyApplication(&active[pathAt].application),
             )
-            edge = edge + usize.ONE
+            pathAt = pathAt + usize.ONE
           }
           run Vector.append<Application>(&mut path, run copyApplication(application))
           return Decision.Rejected {path: move path}
@@ -396,7 +533,7 @@ impl Admission {
     }
     run Vector.append<Step>(
       &mut self.active,
-      Step {application: run copyApplication(application), viaWitness: viaWitness},
+      Step {application: run copyApplication(application), edge: move edge},
     )
     return Decision.Entered
   }
