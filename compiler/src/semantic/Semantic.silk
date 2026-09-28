@@ -9,6 +9,7 @@ import hir.Hir {
   CallableMode,
   HirId,
   HirRef,
+  InfixOperator,
   Module,
   Node,
   OwnerKind,
@@ -20,11 +21,15 @@ import hir.Hir {
 import hir.Fingerprint
 import hir.Intern {Symbol}
 import lexer.Span {Span}
+import semantic.CallSelection {CallSelection}
 import semantic.DeclarationId {DeclarationId}
 import semantic.CallSelection {CallSelection}
 import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, CandidateKind, IndexedDeclaration, ModuleIndex, NameObservation}
+import semantic.Operator
+import semantic.Operator {ResultType as OperatorResultType}
+import semantic.Operator {Spelling as OperatorSpelling}
 import semantic.Query {Cycle, Query}
 import semantic.Rejection {GenericKind, Rejection, RejectionCode, TerminationStep, WitnessProblem}
 import semantic.SourceIndex {
@@ -608,6 +613,52 @@ struct OperationCall {
   signature: Shared<Result<Answer, NoRejection>>
   proof: ConformanceProof
   receiver: Option<ReceiverPosition>
+}
+
+struct OperatorCandidate {
+  contract: Shared<Type>
+  provider: Shared<Type>
+  operationModule: usize
+  operationOrdinal: usize
+}
+
+struct SelectedOperator {
+  contract: Shared<Type>
+  provider: Shared<Type>
+  call: OperationCall
+}
+
+// Duplicate bound spellings or the same head observed from two permitted owner buckets still
+// name one supplier. Coherence of that exact goal is checked by the common proof after selection.
+effect fn addOperatorCandidate(
+  suppliers: &mut Vector<OperatorCandidate>,
+  choice: &mut CallSelection,
+  contract: &Shared<Type>,
+  provider: &Shared<Type>,
+  operationModule: usize,
+  operationOrdinal: usize,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector.asSlice<OperatorCandidate>(&suppliers.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].operationModule == operationModule && listed[at].operationOrdinal == operationOrdinal {
+      let sameContract = run Type.equalsShared(&listed[at].contract, contract)
+      let sameProvider = run Type.equalsShared(&listed[at].provider, provider)
+      if sameContract && sameProvider {
+        return ()
+      }
+    }
+    at = at + usize.ONE
+  }
+  let ordinal = Vector.length<OperatorCandidate>(&suppliers.*)
+  run Vector.append<OperatorCandidate>(&mut suppliers.*, OperatorCandidate {
+    contract: Shared.clone<Type>(contract),
+    provider: Shared.clone<Type>(provider),
+    operationModule: operationModule,
+    operationOrdinal: operationOrdinal,
+  })
+  CallSelection.add(&mut choice.*, ordinal)
+  return ()
 }
 
 struct ReceiverPosition {
@@ -7580,6 +7631,66 @@ fn writesBody(hir: &Module, declaration: HirId) -> bool {
   return false
 }
 
+// Services are dependency contracts and cannot publish operator markers.
+fn validOperatorMarker(hir: &Module, marker: HirId, contract: HirId, isInterface: bool) -> bool {
+  if !isInterface {
+    return false
+  }
+  if let Node.Name {text} = Module.node(hir, marker) {
+    let spelling = Module.text(hir, text)
+    if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
+      return Operator.validMarker(spelling, parameters.length)
+    }
+  }
+  return false
+}
+
+// A marker is checked as part of the contract's Operations answer. A matched operation also
+// reports whether operator syntax can supply its parameter modes without an adaptation.
+effect fn operationMarks(
+  resolver: &mut Resolver,
+  module: &ModuleId,
+  operation: &Shared<DeclarationId>,
+  requested: &Operator.Spelling,
+) -> Option<bool> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let hir = IndexedSource.authored(indexed)
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      if Shared.with<DeclarationId, bool>(operation, fn(identity: &DeclarationId) -> bool {
+        return DeclarationId.equals(&declarations[at].identity, identity)
+      }) {
+        if let Node.OperationHeader {operator, contract, ..} = Module.node(hir, declarations[at].header) {
+          if operator.present {
+            if let Node.Name {text} = Module.node(hir, operator.id) {
+              if Operator.matches(Module.text(hir, text), requested) {
+                if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
+                  let mut parameterAt = usize.ZERO
+                  while parameterAt < parameters.length {
+                    let parameter = Module.child(hir, parameters, parameterAt)
+                    if let Node.Parameter {mode, ..} = Module.node(hir, parameter) {
+                      if mode != ParameterMode.Value {
+                        return Option.some<bool>(false)
+                      }
+                    }
+                    parameterAt = parameterAt + usize.ONE
+                  }
+                  return Option.some<bool>(true)
+                }
+              }
+            }
+          }
+        }
+        return Option.none<bool>()
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Option.none<bool>()
+}
+
 effect fn resolveOperations(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -7593,7 +7704,8 @@ effect fn resolveOperations(
     if key.declaration < declarations.length {
       let hir = IndexedSource.authored(value)
       let contractHeader = declarations[key.declaration].header
-      if !isContractHeader(Module.node(hir, contractHeader)) {
+      let enclosing = Module.node(hir, contractHeader)
+      if !isContractHeader(enclosing) {
         return memberRejected(
           run reject(&resolver.*, &module, RejectionCode.Unsupported, Module.span(hir, contractHeader)),
           move dependencies,
@@ -7607,8 +7719,20 @@ effect fn resolveOperations(
           let memberHeader = declarations[at].header
           let span = Module.span(hir, memberHeader)
           let mut spelling = Option.none<Bytes>()
-          if let Node.OperationHeader {name, isPublic, ..} = Module.node(hir, memberHeader) {
+          if let Node.OperationHeader {name, isPublic, contract, operator, ..} = Module.node(hir, memberHeader) {
             if !isPublic && !writesBody(hir, declarations[at].local) {
+              if operator.present {
+                let isInterface = match enclosing {
+                  Node.InterfaceHeader {..} => true
+                  _ => false
+                }
+                if !validOperatorMarker(hir, operator.id, contract, isInterface) {
+                  return memberRejected(
+                    run reject(&resolver.*, &module, RejectionCode.InvalidOperatorContract, Module.span(hir, operator.id)),
+                    move dependencies,
+                  )
+                }
+              }
               if let Node.Name {text} = Module.node(hir, name) {
                 spelling = Option.some<Bytes>(run Bytes.copy(Module.text(hir, text)))
               }
@@ -11217,6 +11341,27 @@ fn operationIndex(answer: &Result<Answer, NoRejection>, operation: &DeclarationI
   return usize.MAX
 }
 
+fn listedOperation(answer: &Result<Answer, NoRejection>, ordinal: usize) -> Option<Shared<DeclarationId>> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Operations {operations}} = &value.outcome {
+      let listed = Vector.asSlice<Shared<DeclarationId>>(&operations)
+      if ordinal < listed.length {
+        return Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&listed[ordinal]))
+      }
+    }
+  }
+  return Option.none<Shared<DeclarationId>>()
+}
+
+fn listedOperationCount(answer: &Result<Answer, NoRejection>) -> usize {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Operations {operations}} = &value.outcome {
+      return Vector.length<Shared<DeclarationId>>(&operations)
+    }
+  }
+  return usize.ZERO
+}
+
 // Re-resolves one operation under a known interface application and provider. This is the shared
 // call contract for qualified, receiver, and operator spellings. The selected witness is a
 // separate proof result: neither arguments nor expected result may choose one here.
@@ -13942,6 +14087,19 @@ fn signatureConstraint(answer: &Result<Answer, NoRejection>, at: usize) -> Optio
   }
 }
 
+fn contractProvider(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => match &value.outcome {
+      Outcome.Success {value: Value.Contract {contract}} => match &contract.provider {
+        Option<Shared<Type>>.Some {value: provider} => Option.some<Shared<Type>>(Shared.clone<Type>(&provider))
+        Option<Shared<Type>>.None => Option.none<Shared<Type>>()
+      }
+      _ => Option.none<Shared<Type>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Type>>()
+  }
+}
+
 effect fn inferenceArgumentOpen(argument: &Argument) -> bool ! OutOfMemoryError ? &mut Allocator {
   return match &argument.* {
     Argument.Type {value} => Type.hasOpenParameters(&value)
@@ -14309,6 +14467,10 @@ fn fixedIntegerName(name: &[u8]) -> bool {
   ) || same(name, b"u16") || same(name, b"u32") || same(name, b"u64")
 }
 
+fn pointerSizedIntegerName(name: &[u8]) -> bool {
+  return same(name, b"isize") || same(name, b"usize")
+}
+
 fn scalarType(typeValue: &Type) -> bool {
   return match & typeValue.* {
     Type.Unit => true
@@ -14322,6 +14484,13 @@ fn scalarType(typeValue: &Type) -> bool {
 fn fixedIntegerType(typeValue: &Type) -> bool {
   return match & typeValue.* {
     Type.Primitive {name} => fixedIntegerName(Bytes.asSlice(&name))
+    _ => false
+  }
+}
+
+fn pointerSizedIntegerType(typeValue: &Type) -> bool {
+  return match & typeValue.* {
+    Type.Primitive {name} => pointerSizedIntegerName(Bytes.asSlice(&name))
     _ => false
   }
 }
@@ -14362,6 +14531,33 @@ fn scalarCode(typeValue: &Type) -> usize {
     }
     _ => usize.ZERO
   }
+}
+
+// An enum participates in the closed equality contract only when the canonical nominal type
+// resolves to a scalar enum declaration. A struct with the same representation has no privilege.
+effect fn operatorFamily(resolver: &mut Resolver, ty: &Shared<Type>) -> Operator.Family
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let declaring = declaringModuleOrdinal(&resolver.*, ty)
+  let mut isScalarEnum = false
+  if declaring != usize.MAX {
+    let module = run resolvedModule(&resolver.*, declaring)
+    let ordinal = run ordinalOfProvider(&mut resolver.*, &module, ty)
+    if let Option<usize>.Some {value} = move ordinal {
+      let written = run header(&mut resolver.*, &module, value)
+      if let Option<HeaderSyntax>.Some {value: syntax} = move written {
+        if let Node.EnumHeader {..} = syntax.header {
+          isScalarEnum = true
+        }
+      }
+    }
+  }
+  return Shared.with<Type, Operator.Family>(
+    ty,
+    fn(value: &Type) -> Operator.Family {
+      return Operator.family(value, isScalarEnum)
+    },
+  )
 }
 
 fn fitsMagnitude(magnitude: &[u8], maximum: &[u8]) -> bool {
@@ -14440,6 +14636,15 @@ effect fn collectCall(hir: &Module, expression: HirId, calls: &mut Vector<CallSy
 ? &mut Allocator {
   if let Node.MoveExpression {operand} = Module.node(hir, expression) {
     run collectCall(hir, operand, &mut calls.*)
+    return ()
+  }
+  if let Node.PrefixExpression {operand, ..} = Module.node(hir, expression) {
+    run collectCall(hir, operand, &mut calls.*)
+    return ()
+  }
+  if let Node.InfixExpression {left, right, ..} = Module.node(hir, expression) {
+    run collectCall(hir, left, &mut calls.*)
+    run collectCall(hir, right, &mut calls.*)
     return ()
   }
   if let Node.IdentifierExpression {name, binding} = Module.node(hir, expression) {
@@ -15579,6 +15784,173 @@ effect fn checkQualifiedInterfaceCall(
   return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
 }
 
+fn bodyExpressionType(nodes: &[BodyNode], node: &BodyNodeId) -> Option<Shared<Type>> {
+  return match &nodes[node.index].kind {
+    BodyNodeKind.Expression {ty, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&ty))
+    _ => Option.none<Shared<Type>>()
+  }
+}
+
+struct CheckedOperand {
+  node: BodyNodeId
+  ty: Shared<Type>
+}
+
+struct CheckedOperands {
+  leftNode: BodyNodeId
+  leftType: Shared<Type>
+  rightNode: BodyNodeId
+  rightType: Shared<Type>
+}
+
+struct CheckedOperatorCall {
+  ty: Shared<Type>
+  form: BodyExpression
+}
+
+fn orderCheckedOperands(
+  leftLiteral: bool,
+  first: CheckedOperand,
+  second: CheckedOperand,
+) -> CheckedOperands {
+  let CheckedOperand {node: firstNode, ty: firstType} = move first
+  let CheckedOperand {node: secondNode, ty: secondType} = move second
+  if leftLiteral {
+    return CheckedOperands {
+      leftNode: secondNode, leftType: move secondType,
+      rightNode: firstNode, rightType: move firstType,
+    }
+  }
+  return CheckedOperands {
+    leftNode: firstNode, leftType: move firstType,
+    rightNode: secondNode, rightType: move secondType,
+  }
+}
+
+effect fn checkedOperatorCall(
+  resolver: &mut Resolver,
+  selected: SelectedOperator,
+  arguments: Vector<BodyNodeId>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  module: &ModuleId,
+  span: Span,
+) -> Result<CheckedOperatorCall, Shared<Rejection>>
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let SelectedOperator {contract, provider, call} = move selected
+  let OperationCall {operation, implementation, signature, proof: unusedProof, receiver: unusedReceiver} = move call
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &signature,
+    signatureResult,
+  )
+  let ty = match move result {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return Result.failResult<CheckedOperatorCall, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, span),
+      )
+    }
+  }
+  run Vector.append<SignatureDependency>(
+    &mut signatures.*,
+    SignatureDependency {declaration: run DeclarationId.copy(&operation)},
+  )
+  if let Option<Shared<DeclarationId>>.Some {value: witness} = &implementation {
+    let moduleOrdinal = Shared.with<DeclarationId, usize>(
+      &witness,
+      fn(value: &DeclarationId) -> usize {
+        return knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(value))
+      },
+    )
+    if moduleOrdinal == usize.MAX {
+      return Result.failResult<CheckedOperatorCall, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, span),
+      )
+    }
+    let witnessModule = run resolvedModule(&resolver.*, moduleOrdinal)
+    let found = run ordinalOfIdentity(&mut resolver.*, &witnessModule, &witness)
+    let ordinal = match move found {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => {
+        return Result.failResult<CheckedOperatorCall, Shared<Rejection>>(
+          run reject(&resolver.*, module, RejectionCode.Unsupported, span),
+        )
+      }
+    }
+    let declaration = run declarationAt(&mut resolver.*, &witnessModule, ordinal)
+    if let Option<DeclarationId>.Some {value} = move declaration {
+      run Vector.append<DeclarationId>(&mut requiredBodies.*, move value)
+    } else {
+      return Result.failResult<CheckedOperatorCall, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, span),
+      )
+    }
+  }
+  return Result.succeed<CheckedOperatorCall, Shared<Rejection>>(CheckedOperatorCall {
+    ty: move ty,
+    form: BodyExpression.InterfaceCall {
+      contract: move contract,
+      provider: move provider,
+      operation: move operation,
+      implementation: move implementation,
+      receiverPass: Option.none<BodyReceiverPass>(),
+      arguments: move arguments,
+    },
+  })
+}
+
+effect fn checkOperatorOperand(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  cursor: &AuthoredCursor,
+  locals: &[BodyLocal],
+  calls: &[ResolvedCall],
+  nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  expression: HirId,
+  expected: &Option<Shared<Type>>,
+  constraints: &[Constraint],
+  contractBody: bool,
+) -> Result<CheckedOperand, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let checked = run checkExpression(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut request.*,
+    &mut dependencies.*,
+    module,
+    cursor,
+    locals,
+    calls,
+    &mut nodes.*,
+    &mut signatures.*,
+    &mut requiredBodies.*,
+    expression,
+    expected,
+    constraints,
+    contractBody,
+  )
+  let node = match move checked {
+    Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+    Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<CheckedOperand, Shared<Rejection>>(move error)
+    }
+  }
+  let ty = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &node) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return Result.failResult<CheckedOperand, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, expression)),
+      )
+    }
+  }
+  return Result.succeed<CheckedOperand, Shared<Rejection>>(CheckedOperand {node: node, ty: move ty})
+}
+
 // Receiver spelling evaluates the subject once, selects its owner name before interfaces, and
 // only then checks supplied arguments. The selected signature determines any receiver loan.
 effect fn checkReceiverCall(
@@ -15950,7 +16322,9 @@ effect fn checkExpression(
       if suffix.present {
         writtenSuffix = Option.some<Bytes>(run bodyText(&resolver.source, cursor, suffix.symbol))
       } else if let Option<Shared<Type>>.Some {value} = &expected.* {
-        if Shared.with<Type, bool>(&value, fixedIntegerType) {
+        if Shared.with<Type, bool>(&value, fn(ty: &Type) -> bool {
+          return fixedIntegerType(ty) || pointerSizedIntegerType(ty)
+        }) {
           contextual = true
         }
       }
@@ -15959,6 +16333,10 @@ effect fn checkExpression(
       }
       if contextual {
         if let Option<Shared<Type>>.Some {value} = &expected.* {
+          if Shared.with<Type, bool>(&value, pointerSizedIntegerType) {
+            // The source-level body has no selected target width; M2.4 owns this range check.
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+          }
           let fits = Shared.with<Type, bool>(
             &value,
             fn(resolved: &Type) -> bool {
@@ -15978,6 +16356,10 @@ effect fn checkExpression(
           ty = Shared.clone<Type>(&value)
         }
       } else {
+        if pointerSizedIntegerName(selected) {
+          // A written pointer-sized suffix also needs M2.4's selected target width.
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
         if !fixedIntegerName(selected) {
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
@@ -16066,6 +16448,204 @@ effect fn checkExpression(
         }
       }
       form = BodyExpression.Move {value: operandNode}
+    }
+    Node.PrefixExpression {operator, operatorAnchor, operand} => {
+      let checked = run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        operand,
+        &Option.none<Shared<Type>>(),
+        constraints,
+        contractBody,
+      )
+      let operandNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let operandType = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &operandNode) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, operatorAnchor)
+        }
+      }
+      let family = run operatorFamily(&mut resolver.*, &operandType)
+      let concrete = Operator.prefix(operator, family)
+      let closed = match &concrete {
+        Option<Operator.ResultType>.Some {value: _} => true
+        Option<Operator.ResultType>.None => false
+      }
+      let mut operands = Vector.make<Shared<Type>>()
+      run Vector.append<Shared<Type>>(&mut operands, Shared.clone<Type>(&operandType))
+      let spelling = OperatorSpelling.Prefix {operator: operator}
+      let operandSlice = Vector.asSlice<Shared<Type>>(&operands)
+      let selected = run selectOperator(
+        &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+        &spelling, operandSlice, constraints, closed,
+        module, operatorAnchor,
+      )
+      match move selected {
+        Result<Option<SelectedOperator>, Shared<Rejection>>.Success {value: available} => match move available {
+          Option<SelectedOperator>.Some {value: chosen} => {
+            let mut arguments = Vector.make<BodyNodeId>()
+            run Vector.append<BodyNodeId>(&mut arguments, operandNode)
+            let typed = run checkedOperatorCall(
+              &mut resolver.*, move chosen, move arguments,
+              &mut signatures.*, &mut requiredBodies.*, module, operatorAnchor,
+            )
+            match move typed {
+              Result<CheckedOperatorCall, Shared<Rejection>>.Success {value: accepted} => {
+                let CheckedOperatorCall {ty: resultType, form: selectedForm} = move accepted
+                ty = move resultType
+                form = move selectedForm
+              }
+              Result<CheckedOperatorCall, Shared<Rejection>>.Failure {error} => {
+                return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+              }
+            }
+          }
+          Option<SelectedOperator>.None => match move concrete {
+            Option<Operator.ResultType>.Some {value: result} => {
+              ty = match result {
+                OperatorResultType.Operand => Shared.clone<Type>(&operandType)
+                OperatorResultType.Boolean => run primitiveType(b"bool")
+              }
+              form = BodyExpression.ConcretePrefix {operator: operator, operand: operandNode}
+            }
+            Option<Operator.ResultType>.None => {
+              return run bodyRejection(&resolver.*, module, RejectionCode.MissingOperator, operatorAnchor)
+            }
+          }
+        }
+        Result<Option<SelectedOperator>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    Node.InfixExpression {operator, operatorAnchor, left, right} => {
+      if operator == InfixOperator.And || operator == InfixOperator.Or {
+        // Conditional right-hand evaluation belongs to the control-flow body wave.
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, operatorAnchor)
+      }
+      let leftLiteral = match run bodyNode(&resolver.source, cursor, left) {
+        Node.IntegerLiteral {suffix, ..} => !suffix.present
+        _ => false
+      }
+      // A bare literal has no fixed type before its other operand is known. Checking that
+      // operand first only selects a literal type; the retained pair preserves runtime order.
+      let mut firstExpression = left
+      let mut secondExpression = right
+      if leftLiteral {
+        firstExpression = right
+        secondExpression = left
+      }
+      let first = run checkOperatorOperand(
+        &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+        module, cursor, locals, calls, &mut nodes.*, &mut signatures.*,
+        &mut requiredBodies.*, firstExpression, &Option.none<Shared<Type>>(), constraints, contractBody,
+      )
+      let firstOperand = match move first {
+        Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
+        Result<CheckedOperand, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let CheckedOperand {node: firstNode, ty: firstType} = move firstOperand
+      let secondLiteral = match run bodyNode(&resolver.source, cursor, secondExpression) {
+        Node.IntegerLiteral {suffix, ..} => !suffix.present
+        _ => false
+      }
+      let mut secondExpected = Option.none<Shared<Type>>()
+      if secondLiteral && Shared.with<Type, bool>(&firstType, fn(ty: &Type) -> bool {
+        return fixedIntegerType(ty) || pointerSizedIntegerType(ty)
+      }) {
+        secondExpected = Option.some<Shared<Type>>(Shared.clone<Type>(&firstType))
+      }
+      let second = run checkOperatorOperand(
+        &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+        module, cursor, locals, calls, &mut nodes.*, &mut signatures.*,
+        &mut requiredBodies.*, secondExpression, &secondExpected, constraints, contractBody,
+      )
+      let secondOperand = match move second {
+        Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
+        Result<CheckedOperand, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let pair = orderCheckedOperands(
+        leftLiteral,
+        CheckedOperand {node: firstNode, ty: move firstType},
+        move secondOperand,
+      )
+      let CheckedOperands {leftNode, leftType, rightNode, rightType} = move pair
+      let leftFamily = run operatorFamily(&mut resolver.*, &leftType)
+      let rightFamily = run operatorFamily(&mut resolver.*, &rightType)
+      let sameType = run Type.equalsShared(&leftType, &rightType)
+      let concrete = Operator.infix(operator, leftFamily, rightFamily, sameType)
+      let closed = match &concrete {
+        Option<Operator.ResultType>.Some {value: _} => true
+        Option<Operator.ResultType>.None => false
+      }
+      let mut operands = Vector.make<Shared<Type>>()
+      run Vector.append<Shared<Type>>(&mut operands, Shared.clone<Type>(&leftType))
+      run Vector.append<Shared<Type>>(&mut operands, Shared.clone<Type>(&rightType))
+      let spelling = OperatorSpelling.Infix {operator: operator}
+      let operandSlice = Vector.asSlice<Shared<Type>>(&operands)
+      let selected = run selectOperator(
+        &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+        &spelling, operandSlice, constraints, closed,
+        module, operatorAnchor,
+      )
+      match move selected {
+        Result<Option<SelectedOperator>, Shared<Rejection>>.Success {value: available} => match move available {
+          Option<SelectedOperator>.Some {value: chosen} => {
+            let mut arguments = Vector.make<BodyNodeId>()
+            run Vector.append<BodyNodeId>(&mut arguments, leftNode)
+            run Vector.append<BodyNodeId>(&mut arguments, rightNode)
+            let typed = run checkedOperatorCall(
+              &mut resolver.*, move chosen, move arguments,
+              &mut signatures.*, &mut requiredBodies.*, module, operatorAnchor,
+            )
+            match move typed {
+              Result<CheckedOperatorCall, Shared<Rejection>>.Success {value: accepted} => {
+                let CheckedOperatorCall {ty: resultType, form: selectedForm} = move accepted
+                ty = move resultType
+                form = move selectedForm
+              }
+              Result<CheckedOperatorCall, Shared<Rejection>>.Failure {error} => {
+                return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+              }
+            }
+          }
+          Option<SelectedOperator>.None => match move concrete {
+            Option<Operator.ResultType>.Some {value: result} => {
+              ty = match result {
+                OperatorResultType.Operand => Shared.clone<Type>(&leftType)
+                OperatorResultType.Boolean => run primitiveType(b"bool")
+              }
+              form = BodyExpression.ConcreteInfix {
+                operator: operator, left: leftNode, right: rightNode,
+              }
+            }
+            Option<Operator.ResultType>.None => {
+              return run bodyRejection(&resolver.*, module, RejectionCode.MissingOperator, operatorAnchor)
+            }
+          }
+        }
+        Result<Option<SelectedOperator>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
     }
     Node.CallExpression {callee, generics, arguments} => {
       let qualified = run bodyQualifiedName(&resolver.source, cursor, callee)
@@ -16258,6 +16838,9 @@ effect fn checkExpression(
                 _ => {
                   return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
                 }
+              }
+              if !contractBody && !Shared.with<Type, bool>(&evidence, scalarType) {
+                return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
               }
               let matched = run Type.unify(
                 &parameterType,
@@ -19811,6 +20394,134 @@ fn witnessFor(answer: &Result<Answer, NoRejection>, operation: &DeclarationId) -
   return Option.none<Shared<DeclarationId>>()
 }
 
+// Eligibility reads only written operand slots. In particular the result, witness, and expected
+// expression type cannot narrow this comparison after two suppliers accept identical operands.
+effect fn matchesOperatorOperands(
+  signature: &Shared<Result<Answer, NoRejection>>,
+  operands: &[Shared<Type>],
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(&signature.*, signatureParameterCount)
+  if count != operands.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < count {
+    let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &signature.*,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    let parameterType = match move parameter {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return false }
+    }
+    if !run Type.equalsShared(&parameterType, &operands[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// An open implementation head is outside this concrete candidate path. Only retain an
+// Unsupported boundary if its operand pattern can actually accept the written operands.
+effect fn openOperatorCouldMatch(
+  signature: &Shared<Result<Answer, NoRejection>>,
+  operands: &[Shared<Type>],
+  head: &Shared<ImplementationHead>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(&signature.*, signatureParameterCount)
+  if count != operands.length {
+    return false
+  }
+  let mut parameters = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &signature.*,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    if let Option<Shared<Type>>.Some {value} = move parameter {
+      run Vector.append<Shared<Type>>(&mut parameters, move value)
+    } else {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  let identity = Shared.with<ImplementationHead, Shared<DeclarationId>>(
+    head,
+    fn(value: &ImplementationHead) -> Shared<DeclarationId> {
+      return Shared.clone<DeclarationId>(&value.declaration)
+    },
+  )
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut variables, move identity)
+  let mut bindings = Vector.make<Binding>()
+  let compared = run Type.unifyAll(
+    Vector.asSlice<Shared<Type>>(&parameters), operands,
+    Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut bindings,
+  )
+  return match move compared {
+    Unification.Distinct => false
+    _ => true
+  }
+}
+
+// Without a provider-owned operand, a provider-only implementation module cannot be found from
+// an unqualified expression. Keep that unsettled shape explicit when its operand pattern fits.
+effect fn unanchoredOperatorCouldMatch(
+  signature: &Shared<Result<Answer, NoRejection>>,
+  operands: &[Shared<Type>],
+  contract: &Shared<DeclarationId>,
+  operation: &Shared<DeclarationId>,
+  selfOrdinal: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(&signature.*, signatureParameterCount)
+  if count != operands.length {
+    return false
+  }
+  let mut parameters = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &signature.*,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    let parameterType = match move parameter {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return false }
+    }
+    let owns = Shared.with<DeclarationId, bool>(
+      contract,
+      fn(identity: &DeclarationId) -> bool {
+        return Type.occurrences(&parameterType, identity, selfOrdinal) > usize.ZERO
+      },
+    )
+    if owns {
+      return false
+    }
+    run Vector.append<Shared<Type>>(&mut parameters, move parameterType)
+    at = at + usize.ONE
+  }
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(contract))
+  run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(operation))
+  let mut bindings = Vector.make<Binding>()
+  let compared = run Type.unifyAll(
+    Vector.asSlice<Shared<Type>>(&parameters), operands,
+    Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut bindings,
+  )
+  return match move compared {
+    Unification.Distinct => false
+    _ => true
+  }
+}
+
 // The supplier is already fixed before this call. Prove its exact application, then demand the
 // same substituted operation signature for qualified, receiver, and operator syntax. A concrete
 // proof names the checked witness body; a declared proof leaves that choice to specialization.
@@ -19999,6 +20710,590 @@ effect fn selectOperationCall(
     proof: ConformanceProof {steps: move steps},
     receiver: Option.none<ReceiverPosition>(),
   })
+}
+
+effect fn appendVisibleOperatorInterface(
+  resolver: &mut Resolver,
+  location: SelectedDeclaration,
+  visible: &mut Vector<DeclarationId>,
+) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let target = run resolvedModule(&resolver.*, location.module)
+  let written = run header(&mut resolver.*, &target, location.ordinal)
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    if let Node.InterfaceHeader {..} = value.header {
+      let found = run declarationAt(&mut resolver.*, &target, location.ordinal)
+      if let Option<DeclarationId>.Some {value: identity} = move found {
+        let prior = Vector.asSlice<DeclarationId>(&visible.*)
+        let mut before = usize.ZERO
+        while before < prior.length {
+          if DeclarationId.equals(&prior[before], &identity) {
+            return ()
+          }
+          before = before + usize.ONE
+        }
+        run Vector.append<DeclarationId>(&mut visible.*, move identity)
+      }
+    }
+  }
+  return ()
+}
+
+// Operator syntax has no written interface name. Local interfaces, selected imports, and public
+// interfaces reachable through an imported module namespace are all statically nameable.
+effect fn visibleOperatorInterfaces(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  span: Span,
+) -> Result<Vector<DeclarationId>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let sourceAnswer = run source(&mut resolver.*, module)
+  let mut names = Vector.make<Bytes>()
+  let mut namespaces = Vector.make<Bytes>()
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+    let candidates = ModuleIndex.listCandidates(IndexedSource.moduleIndex(indexed))
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let hir = IndexedSource.authored(indexed)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      if candidate.kind == CandidateKind.ImportMember {
+        run Vector.append<Bytes>(&mut names, run Bytes.copy(Bytes.asSlice(&candidate.name)))
+      } else if candidate.kind == CandidateKind.ImportModule {
+        run Vector.append<Bytes>(&mut namespaces, run Bytes.copy(Bytes.asSlice(&candidate.name)))
+      } else if candidate.kind == CandidateKind.Declaration && candidate.declaration < declarations.length {
+        if let Node.InterfaceHeader {..} = Module.node(hir, declarations[candidate.declaration].header) {
+          run Vector.append<Bytes>(&mut names, run Bytes.copy(Bytes.asSlice(&candidate.name)))
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  let moduleOrdinal = run internModule(&mut resolver.*, module)
+  let mut visible = Vector.make<DeclarationId>()
+  let listed = Vector.asSlice<Bytes>(&names)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let selected = run selectDeclaration(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module,
+      Bytes.asSlice(&listed[at]), false, span, RejectionCode.NotType,
+    )
+    let location = match move selected {
+      Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => value
+      Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<Vector<DeclarationId>, Shared<Rejection>>(move error)
+      }
+    }
+    run appendVisibleOperatorInterface(&mut resolver.*, move location, &mut visible)
+    at = at + usize.ONE
+  }
+  let imported = Vector.asSlice<Bytes>(&namespaces)
+  let mut namespaceAt = usize.ZERO
+  while namespaceAt < imported.length {
+    let selected = run select(&mut resolver.*, module, Bytes.asSlice(&imported[namespaceAt]), false)
+    if selected.count != usize.ONE || selected.kind != CandidateKind.ImportModule {
+      namespaceAt = namespaceAt + usize.ONE
+      continue
+    }
+    let binding = run demandChild(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+      Key {
+        family: Family.Import, module: moduleOrdinal, name: usize.ZERO,
+        declaration: selected.declaration, member: usize.MAX, external: false,
+      },
+      span,
+    )
+    let importSelection = Shared.with<Result<Answer, NoRejection>, ImportSelection>(&binding, selectedImport)
+    if let Option<Shared<Rejection>>.Some {value} = move importSelection.rejected {
+      return Result.failResult<Vector<DeclarationId>, Shared<Rejection>>(move value)
+    }
+    if let Option<usize>.Some {value: targetOrdinal} = move importSelection.module {
+      let target = run resolvedModule(&resolver.*, targetOrdinal)
+      let targetSource = run source(&mut resolver.*, &target)
+      let mut publicNames = Vector.make<Bytes>()
+      if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &targetSource, &target) {
+        let candidates = ModuleIndex.listCandidates(IndexedSource.moduleIndex(indexed))
+        let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+        let hir = IndexedSource.authored(indexed)
+        let mut candidateAt = usize.ZERO
+        while candidateAt < candidates.length {
+          let candidate = &candidates[candidateAt]
+          if candidate.isPublic {
+            if candidate.kind == CandidateKind.ImportMember {
+              run Vector.append<Bytes>(&mut publicNames, run Bytes.copy(Bytes.asSlice(&candidate.name)))
+            } else if candidate.kind == CandidateKind.Declaration && candidate.declaration < declarations.length {
+              if let Node.InterfaceHeader {..} = Module.node(hir, declarations[candidate.declaration].header) {
+                run Vector.append<Bytes>(&mut publicNames, run Bytes.copy(Bytes.asSlice(&candidate.name)))
+              }
+            }
+          }
+          candidateAt = candidateAt + usize.ONE
+        }
+      }
+      let public = Vector.asSlice<Bytes>(&publicNames)
+      let mut publicAt = usize.ZERO
+      while publicAt < public.length {
+        let found = run selectDeclaration(
+          &mut resolver.*, &mut owner.*, &mut dependencies.*, targetOrdinal, &target,
+          Bytes.asSlice(&public[publicAt]), true, span, RejectionCode.NotType,
+        )
+        let location = match move found {
+          Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => value
+          Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<Vector<DeclarationId>, Shared<Rejection>>(move error)
+          }
+        }
+        run appendVisibleOperatorInterface(&mut resolver.*, move location, &mut visible)
+        publicAt = publicAt + usize.ONE
+      }
+    }
+    namespaceAt = namespaceAt + usize.ONE
+  }
+  return Result.succeed<Vector<DeclarationId>, Shared<Rejection>>(move visible)
+}
+
+fn concreteOperatorGoal(head: &ImplementationHead, contractIdentity: &DeclarationId) -> Option<ConformanceGoal> {
+  return match &head.kind {
+    ImplementationKind.Conformance => {
+      if let Option<Shared<Type>>.Some {value: contract} = &head.contract {
+        if Shared.with<Type, bool>(&contract, fn(value: &Type) -> bool {
+          return applicationMatches(value, contractIdentity)
+        }) {
+          return Option.some<ConformanceGoal>(ConformanceGoal {
+            contract: Shared.clone<Type>(&contract),
+            provider: Shared.clone<Type>(&head.provider),
+          })
+        }
+      }
+      return Option.none<ConformanceGoal>()
+    }
+    _ => Option.none<ConformanceGoal>()
+  }
+}
+
+effect fn appendOperatorModule(modules: &mut Vector<usize>, ordinal: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if ordinal == usize.MAX {
+    return ()
+  }
+  let listed = Vector.asSlice<usize>(&modules.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == ordinal {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run Vector.append<usize>(&mut modules.*, ordinal)
+  return ()
+}
+
+effect fn gatherBoundOperator(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  suppliers: &mut Vector<OperatorCandidate>,
+  choice: &mut CallSelection,
+  requested: &Operator.Spelling,
+  operands: &[Shared<Type>],
+  declared: &[Constraint],
+  siteModule: &ModuleId,
+  siteSpan: Span,
+) -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut boundAt = usize.ZERO
+  while boundAt < declared.length {
+    if let Constraint.Conforms {provider, contract} = &declared[boundAt] {
+      if !Type.hasOpenParameters(&provider) && !Type.hasOpenParameters(&contract) {
+        boundAt = boundAt + usize.ONE
+        continue
+      }
+      let moduleOrdinal = declaringModuleOrdinal(&resolver.*, &contract)
+      if moduleOrdinal != usize.MAX {
+        let contractModule = run resolvedModule(&resolver.*, moduleOrdinal)
+        let found = run ordinalOfProvider(&mut resolver.*, &contractModule, &contract)
+        if let Option<usize>.Some {value: contractOrdinal} = move found {
+          let listed = run demandChild(
+            &mut resolver.*,
+            &mut owner.*,
+            &mut dependencies.*,
+            Key {
+              family: Family.Operations,
+              module: moduleOrdinal,
+              name: usize.ZERO,
+              declaration: contractOrdinal,
+              member: usize.ZERO,
+              external: false,
+            },
+            siteSpan,
+          )
+          let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+            &listed, answerRejection,
+          )
+          if let Option<Shared<Rejection>>.Some {value} = move rejected {
+            return Result.failResult<(), Shared<Rejection>>(move value)
+          }
+          let count = Shared.with<Result<Answer, NoRejection>, usize>(&listed, listedOperationCount)
+          let mut at = usize.ZERO
+          while at < count {
+            let supplied = Shared.with<Result<Answer, NoRejection>, Option<Shared<DeclarationId>>>(
+              &listed,
+              fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
+                return listedOperation(answer, at)
+              },
+            )
+            if let Option<Shared<DeclarationId>>.Some {value: operation} = move supplied {
+              let marker = run operationMarks(&mut resolver.*, &contractModule, &operation, requested)
+              if let Option<bool>.Some {value: valueOnly} = move marker {
+                let foundOrdinal = run ordinalOfIdentity(&mut resolver.*, &contractModule, &operation)
+                if let Option<usize>.Some {value: operationOrdinal} = move foundOrdinal {
+                  let contractKey = run internApplication(&mut resolver.*, &contract)
+                  let providerKey = run internApplication(&mut resolver.*, &provider)
+                  let signature = run demandChild(
+                    &mut resolver.*,
+                    &mut owner.*,
+                    &mut dependencies.*,
+                    Key {
+                      family: Family.AppliedOperation,
+                      module: moduleOrdinal,
+                      name: contractKey,
+                      declaration: operationOrdinal,
+                      member: providerKey,
+                      external: false,
+                    },
+                    siteSpan,
+                  )
+                  let invalid = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+                    &signature, answerRejection,
+                  )
+                  if let Option<Shared<Rejection>>.Some {value} = move invalid {
+                    return Result.failResult<(), Shared<Rejection>>(move value)
+                  }
+                  if run matchesOperatorOperands(&signature, operands) {
+                    if !valueOnly {
+                      return Result.failResult<(), Shared<Rejection>>(
+                        run reject(&resolver.*, siteModule, RejectionCode.Unsupported, siteSpan),
+                      )
+                    }
+                    run addOperatorCandidate(
+                      &mut suppliers.*, &mut choice.*, &contract, &provider,
+                      moduleOrdinal, operationOrdinal,
+                    )
+                  }
+                }
+              }
+            }
+            at = at + usize.ONE
+          }
+        }
+      }
+    }
+    boundAt = boundAt + usize.ONE
+  }
+  return Result.succeed<(), Shared<Rejection>>(())
+}
+
+// Concrete candidates come only from the operator interface's own bucket and the operands'
+// owner buckets. Their complete conformance proof still runs after one supplier is selected.
+effect fn gatherConcreteOperator(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  suppliers: &mut Vector<OperatorCandidate>,
+  choice: &mut CallSelection,
+  requested: &Operator.Spelling,
+  operands: &[Shared<Type>],
+  siteModule: &ModuleId,
+  siteSpan: Span,
+) -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let discovered = run visibleOperatorInterfaces(
+    &mut resolver.*, &mut owner.*, &mut dependencies.*, siteModule, siteSpan,
+  )
+  let visible = match move discovered {
+    Result<Vector<DeclarationId>, Shared<Rejection>>.Success {value} => value
+    Result<Vector<DeclarationId>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<(), Shared<Rejection>>(move error)
+    }
+  }
+  let mut openCandidate = false
+  let interfaces = Vector.asSlice<DeclarationId>(&visible)
+  let mut interfaceAt = usize.ZERO
+  while interfaceAt < interfaces.length {
+    let contractIdentity = &interfaces[interfaceAt]
+    let moduleOrdinal = knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(contractIdentity))
+    if moduleOrdinal == usize.MAX {
+      fail InvalidModulePath {}
+    }
+    let contractModule = run resolvedModule(&resolver.*, moduleOrdinal)
+    let sharedIdentity = run Shared.make<DeclarationId>(run DeclarationId.copy(contractIdentity))
+    let position = run ordinalOfIdentity(&mut resolver.*, &contractModule, &sharedIdentity)
+    let interfaceOrdinal = match move position {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { fail InvalidModulePath {} }
+    }
+    let contractAnswer = run demandChild(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+      Key {
+        family: Family.Contract, module: moduleOrdinal, name: usize.ZERO,
+        declaration: interfaceOrdinal, member: usize.ZERO, external: false,
+      },
+      siteSpan,
+    )
+    let contractFailure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+      &contractAnswer, answerRejection,
+    )
+    if let Option<Shared<Rejection>>.Some {value} = move contractFailure {
+      return Result.failResult<(), Shared<Rejection>>(move value)
+    }
+    let providerParameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &contractAnswer, contractProvider,
+    )
+    let selfOrdinal = match move providerParameter {
+      Option<Shared<Type>>.Some {value} => Shared.with<Type, usize>(
+        &value,
+        fn(ty: &Type) -> usize { return Type.parameterOrdinalOf(ty, contractIdentity) },
+      )
+      Option<Shared<Type>>.None => usize.MAX
+    }
+    let listed = run demandChild(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+      Key {
+        family: Family.Operations, module: moduleOrdinal, name: usize.ZERO,
+        declaration: interfaceOrdinal, member: usize.ZERO, external: false,
+      },
+      siteSpan,
+    )
+    let invalid = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+      &listed, answerRejection,
+    )
+    if let Option<Shared<Rejection>>.Some {value} = move invalid {
+      return Result.failResult<(), Shared<Rejection>>(move value)
+    }
+    let mut modules = Vector.make<usize>()
+    run appendOperatorModule(&mut modules, moduleOrdinal)
+    let mut operandAt = usize.ZERO
+    while operandAt < operands.length {
+      run appendOperatorModule(&mut modules, declaringModuleOrdinal(&resolver.*, &operands[operandAt]))
+      operandAt = operandAt + usize.ONE
+    }
+    let count = Shared.with<Result<Answer, NoRejection>, usize>(&listed, listedOperationCount)
+    let mut operationAt = usize.ZERO
+    while operationAt < count {
+      let found = Shared.with<Result<Answer, NoRejection>, Option<Shared<DeclarationId>>>(
+        &listed,
+        fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
+          return listedOperation(answer, operationAt)
+        },
+      )
+      if let Option<Shared<DeclarationId>>.Some {value: operation} = move found {
+        let marker = run operationMarks(&mut resolver.*, &contractModule, &operation, requested)
+        if let Option<bool>.Some {value: valueOnly} = move marker {
+          let operationPosition = run ordinalOfIdentity(&mut resolver.*, &contractModule, &operation)
+          if let Option<usize>.Some {value: operationOrdinal} = move operationPosition {
+            if selfOrdinal != usize.MAX {
+              let rawSignature = run demandChild(
+                &mut resolver.*, &mut owner.*, &mut dependencies.*,
+                Key {
+                  family: Family.Signature, module: moduleOrdinal, name: usize.ZERO,
+                  declaration: operationOrdinal, member: usize.ZERO, external: false,
+                },
+                siteSpan,
+              )
+              let rawFailure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+                &rawSignature, answerRejection,
+              )
+              if let Option<Shared<Rejection>>.Some {value} = move rawFailure {
+                return Result.failResult<(), Shared<Rejection>>(move value)
+              }
+              if run unanchoredOperatorCouldMatch(
+                &rawSignature, operands, &sharedIdentity, &operation, selfOrdinal,
+              ) {
+                return Result.failResult<(), Shared<Rejection>>(
+                  run reject(&resolver.*, siteModule, RejectionCode.Unsupported, siteSpan),
+                )
+              }
+            }
+            let owners = Vector.asSlice<usize>(&modules)
+            let mut ownerAt = usize.ZERO
+            while ownerAt < owners.length {
+              let heads = run demandChild(
+                &mut resolver.*, &mut owner.*, &mut dependencies.*,
+                Key {
+                  family: Family.Implementations, module: owners[ownerAt], name: usize.ZERO,
+                  declaration: usize.ZERO, member: usize.ZERO, external: false,
+                },
+                siteSpan,
+              )
+              let failed = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+                &heads, answerRejection,
+              )
+              if let Option<Shared<Rejection>>.Some {value} = move failed {
+                return Result.failResult<(), Shared<Rejection>>(move value)
+              }
+              let headCount = Shared.with<Result<Answer, NoRejection>, usize>(&heads, implementationCount)
+              let mut headAt = usize.ZERO
+              while headAt < headCount {
+                let candidate = Shared.with<Result<Answer, NoRejection>, Option<Shared<ImplementationHead>>>(
+                  &heads,
+                  fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<ImplementationHead>> {
+                    return implementationAt(answer, headAt)
+                  },
+                )
+                if let Option<Shared<ImplementationHead>>.Some {value: head} = move candidate {
+                  let goal = Shared.with<ImplementationHead, Option<ConformanceGoal>>(
+                    &head,
+                    fn(value: &ImplementationHead) -> Option<ConformanceGoal> {
+                      return concreteOperatorGoal(value, contractIdentity)
+                    },
+                  )
+                  if let Option<ConformanceGoal>.Some {value: applied} = move goal {
+                    let contractKey = run internApplication(&mut resolver.*, &applied.contract)
+                    let providerKey = run internApplication(&mut resolver.*, &applied.provider)
+                    let signature = run demandChild(
+                      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+                      Key {
+                        family: Family.AppliedOperation, module: moduleOrdinal,
+                        name: contractKey, declaration: operationOrdinal,
+                        member: providerKey, external: false,
+                      },
+                      siteSpan,
+                    )
+                    let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+                      &signature, answerRejection,
+                    )
+                    if let Option<Shared<Rejection>>.Some {value} = move rejected {
+                      return Result.failResult<(), Shared<Rejection>>(move value)
+                    }
+                    if Type.hasOpenParameters(&applied.contract) || Type.hasOpenParameters(&applied.provider) {
+                      if run openOperatorCouldMatch(&signature, operands, &head) {
+                        openCandidate = true
+                      }
+                    } else if run matchesOperatorOperands(&signature, operands) {
+                      if !valueOnly {
+                        return Result.failResult<(), Shared<Rejection>>(
+                          run reject(&resolver.*, siteModule, RejectionCode.Unsupported, siteSpan),
+                        )
+                      }
+                      run addOperatorCandidate(
+                        &mut suppliers.*, &mut choice.*, &applied.contract, &applied.provider,
+                        moduleOrdinal, operationOrdinal,
+                      )
+                    }
+                  }
+                }
+                headAt = headAt + usize.ONE
+              }
+              ownerAt = ownerAt + usize.ONE
+            }
+          }
+        }
+      }
+      operationAt = operationAt + usize.ONE
+    }
+    interfaceAt = interfaceAt + usize.ONE
+  }
+  if openCandidate {
+    // Generic heads need operand-derived application before candidate comparison (unit 5).
+    return Result.failResult<(), Shared<Rejection>>(
+      run reject(&resolver.*, siteModule, RejectionCode.Unsupported, siteSpan),
+    )
+  }
+  return Result.succeed<(), Shared<Rejection>>(())
+}
+
+// All interface suppliers are collected before proof. The closed scalar table is another
+// supplier, so an identical marked operation is ambiguous rather than silently shadowed.
+effect fn selectOperator(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
+  requested: &Operator.Spelling,
+  operands: &[Shared<Type>],
+  declared: &[Constraint],
+  closed: bool,
+  siteModule: &ModuleId,
+  siteSpan: Span,
+) -> Result<Option<SelectedOperator>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut suppliers = Vector.make<OperatorCandidate>()
+  let mut choice = CallSelection.make()
+  let bound = run gatherBoundOperator(
+    &mut resolver.*, &mut owner.*, &mut dependencies.*,
+    &mut suppliers, &mut choice, requested, operands, declared, siteModule, siteSpan,
+  )
+  if let Result<(), Shared<Rejection>>.Failure {error} = move bound {
+    return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(move error)
+  }
+  let mut concreteOperands = true
+  let mut operandAt = usize.ZERO
+  while operandAt < operands.length {
+    if Type.hasOpenParameters(&operands[operandAt]) {
+      concreteOperands = false
+      break
+    }
+    operandAt = operandAt + usize.ONE
+  }
+  if concreteOperands {
+    let concrete = run gatherConcreteOperator(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+      &mut suppliers, &mut choice, requested, operands, siteModule, siteSpan,
+    )
+    if let Result<(), Shared<Rejection>>.Failure {error} = move concrete {
+      return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(move error)
+    }
+  }
+  if closed && Vector.length<OperatorCandidate>(&suppliers) > usize.ZERO {
+    return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(
+      run reject(&resolver.*, siteModule, RejectionCode.AmbiguousOperator, siteSpan),
+    )
+  }
+  if CallSelection.ambiguous(&choice) {
+    return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(
+      run reject(&resolver.*, siteModule, RejectionCode.AmbiguousOperator, siteSpan),
+    )
+  }
+  let selected = match move CallSelection.unique(&choice) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => {
+      return Result.succeed<Option<SelectedOperator>, Shared<Rejection>>(Option.none<SelectedOperator>())
+    }
+  }
+  let candidate = Vector.remove<OperatorCandidate>(&mut suppliers, selected)
+  let module = run resolvedModule(&resolver.*, candidate.operationModule)
+  let operation = run declarationAt(&mut resolver.*, &module, candidate.operationOrdinal)
+  let identity = match move operation {
+    Option<DeclarationId>.Some {value} => value
+    Option<DeclarationId>.None => {
+      return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(
+        run reject(&resolver.*, siteModule, RejectionCode.MissingOperator, siteSpan),
+      )
+    }
+  }
+  let chosen = run selectOperationCall(
+    &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, true,
+    &candidate.contract, &candidate.provider, &identity, declared, siteModule, siteSpan,
+  )
+  match move chosen {
+    Result<OperationCall, Shared<Rejection>>.Success {value} => {
+      return Result.succeed<Option<SelectedOperator>, Shared<Rejection>>(
+        Option.some<SelectedOperator>(SelectedOperator {
+          contract: move candidate.contract,
+          provider: move candidate.provider,
+          call: move value,
+        }),
+      )
+    }
+    Result<OperationCall, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<Option<SelectedOperator>, Shared<Rejection>>(move error)
+    }
+  }
 }
 
 // A type application or checked call is already inside a semantic query. Proof facts must be
