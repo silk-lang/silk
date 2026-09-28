@@ -38,6 +38,17 @@ Consequences:
 - Do not change the bootstrap merely to mirror native behavior, or the reverse. Change either one
   only toward the approved rule, through that compiler's normal branch and review path.
 
+The native frontend's completed M2.3 scope is contract-level semantic analysis: interface and
+service scopes, coherent implementation heads, conditional conformance, witnesses, generic
+application and abstract body typing, method and eligible operator selection, and validated reuse
+across held source revisions. A fresh per-request specialization Pool builds identities from those
+validated facts; cached Pool or instance answers are outside M2.3. See
+[compiler/README.md](compiler/README.md#semantic-scope-and-later-waves) and the reconciled M2
+coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped`
+body still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This
+does not claim native CLI integration, persistent caching, MIR, LLVM, or executable output; the
+TypeScript bootstrap still builds the source programs named above.
+
 ## Entry format
 
 Each entry records:
