@@ -1,5 +1,32 @@
 # Compiler findings
 
+## Scalar enum equality can leave a native call target unresolved
+
+**Status:** open bootstrap native-emission bug, observed on 2026-09-28. The method-selection
+test now uses explicit variant patterns; this does not fix the bootstrap compiler.
+
+At selfhost method head `08d5ce8aa2fe12f7760d1ed87ee831d00333fc7c`,
+`SemanticCases.silk` defines `bodyRetainsReceiverPass(body, mode)` and calls it from a
+`Shared.with` callback. The helper compares `TypedBody.ReceiverPass` scalar-enum values with
+`value == mode` and `retained == mode`. The TypeScript bootstrap accepts the source and reaches
+native emission, then fails with `RangeError: Backend cannot resolve call target
+bodyRetainsReceiverPass` in `NativeCallOperation.js:193`. A previous `Type.equals` scalar-enum
+comparison produced the same unresolved-target failure (see `PAPERCUTS.md`, 2026-09-26).
+
+Reproduce the observed failure on that exact head with Node 24 and LLVM 22:
+
+```sh
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test \
+  --manifest-path compiler/silk.toml \
+  --root src/semantic/SemanticCases.silk --no-cache
+```
+
+The [Focused Linux run](https://github.com/julia-script/silk/actions/runs/36417381326)
+records the failure before any native test executes. The intended behavior is a resolved helper
+call and a boolean comparison of the enum variants. A small standalone repro and main-first
+bootstrap repair remain to be done; this entry records the exact source-written reproducer rather
+than claiming a smaller fixture has been verified.
+
 ## Instance discovery multiplies call-path contexts for the full parser
 
 **Status:** repaired in bootstrap instance discovery; the full self-hosted parser now checks,
