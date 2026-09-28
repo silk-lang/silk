@@ -18,6 +18,7 @@ import hir.Hir {
   Sign,
 }
 import hir.Fingerprint
+import hir.Intern {Symbol}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember}
@@ -26,6 +27,7 @@ import semantic.ModuleIndex {Candidate, CandidateKind, IndexedDeclaration, Modul
 import semantic.Query {Cycle, Query}
 import semantic.Rejection {GenericKind, Rejection, RejectionCode, TerminationStep, WitnessProblem}
 import semantic.SourceIndex {
+  AuthoredCursor,
   Event as SourceEvent,
   IndexedSource,
   NoRejection,
@@ -43,7 +45,9 @@ import semantic.TypedBody {
   NodeId as BodyNodeId,
   NodeKind as BodyNodeKind,
   Origin as BodyOrigin,
+  SafetyObligation as BodySafetyObligation,
   SignatureDependency,
+  Stage as BodyStage,
   TypedBody,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -621,6 +625,19 @@ struct CallSyntax {
 struct ResolvedCall {
   id: HirId
   result: Result<CallTarget, Shared<Rejection>>
+}
+
+struct PreparedBody {
+  block: HirId
+  identity: DeclarationId
+  locals: Vector<BodyLocal>
+  contractBody: bool
+}
+
+struct QualifiedBodyName {
+  namespace: Bytes
+  member: Bytes
+  subjectSpan: Span
 }
 
 struct CheckedControl {
@@ -13659,19 +13676,6 @@ fn signatureParameterCount(answer: &Result<Answer, NoRejection>) -> usize {
   }
 }
 
-// Type and row binders make a generic contract; lifetime-only binders do not.
-fn signatureGenericCount(answer: &Result<Answer, NoRejection>) -> usize {
-  return match & answer.* {
-    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
-      Outcome.Success {value: Value.Signature {signature}} => Vector.length<Shared<Type>>(
-        &signature.typeParameters,
-      ) + Vector.length<RowParameter>(&signature.rowParameters)
-      _ => usize.ZERO
-    }
-    Result<Answer, NoRejection>.Failure {error: _} => usize.ZERO
-  }
-}
-
 fn signatureBinderCount(answer: &Result<Answer, NoRejection>) -> usize {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
@@ -13735,6 +13739,22 @@ fn signatureParameter(answer: &Result<Answer, NoRejection>, at: usize) -> Option
   }
 }
 
+fn signatureConstraint(answer: &Result<Answer, NoRejection>, at: usize) -> Option<Constraint> {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => match &value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => {
+        let constraints = Vector.asSlice<Constraint>(&signature.constraints)
+        if at < constraints.length {
+          return Option.some<Constraint>(copyConstraint(&constraints[at]))
+        }
+        return Option.none<Constraint>()
+      }
+      _ => Option.none<Constraint>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Constraint>()
+  }
+}
+
 // Effect construction and unsafe acknowledgement are outside the scalar body subset.
 fn signatureOutsideScalarBodies(answer: &Result<Answer, NoRejection>) -> bool {
   return match & answer.* {
@@ -13780,10 +13800,6 @@ fn fixedIntegerType(typeValue: &Type) -> bool {
     Type.Primitive {name} => fixedIntegerName(Bytes.asSlice(&name))
     _ => false
   }
-}
-
-fn sameSharedType(left: &Shared<Type>, right: &Shared<Type>) -> bool {
-  return Shared.with<Type, usize>(left, scalarCode) == Shared.with<Type, usize>(right, scalarCode)
 }
 
 fn scalarCode(typeValue: &Type) -> usize {
@@ -13898,6 +13914,10 @@ effect fn bodyRejection(resolver: &Resolver, module: &ModuleId, code: RejectionC
 effect fn collectCall(hir: &Module, expression: HirId, calls: &mut Vector<CallSyntax>) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
+  if let Node.MoveExpression {operand} = Module.node(hir, expression) {
+    run collectCall(hir, operand, &mut calls.*)
+    return ()
+  }
   if let Node.IdentifierExpression {name, binding} = Module.node(hir, expression) {
     if !binding.present {
       if let Node.Name {text} = Module.node(hir, name) {
@@ -14627,10 +14647,327 @@ effect fn resolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<
   return Option.none<Result<CallTarget, Shared<Rejection>>>()
 }
 
-effect fn checkExpression(
-  resolver: &Resolver,
+// A written interface qualifier fixes the contract declaration. Its unique declared bound fixes
+// the application and provider; without a bound, the leading operand supplies an open provider
+// whose conformance must still be proved rather than assumed from a concrete caller.
+effect fn checkQualifiedInterfaceCall(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
   module: &ModuleId,
-  hir: &Module,
+  cursor: &AuthoredCursor,
+  locals: &[BodyLocal],
+  calls: &[ResolvedCall],
+  nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>,
+  requiredBodies: &mut Vector<DeclarationId>,
+  expression: HirId,
+  arguments: Range,
+  expected: &Option<Shared<Type>>,
+  constraints: &[Constraint],
+  contractBody: bool,
+  qualifier: &QualifiedBodyName,
+  selected: SelectedDeclaration,
+  isPublic: bool,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let span = run bodySpan(&resolver.source, cursor, expression)
+  let contractModule = run resolvedModule(&resolver.*, selected.module)
+  let identity = run declarationAt(&mut resolver.*, &contractModule, selected.ordinal)
+  let interfaceId = match move identity {
+    Option<DeclarationId>.Some {value} => value
+    Option<DeclarationId>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+  }
+  let mut chosenContract = Option.none<Shared<Type>>()
+  let mut chosenProvider = Option.none<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < constraints.length {
+    if let Constraint.Conforms {provider, contract} = &constraints[at] {
+      let matches = Shared.with<Type, bool>(&contract, fn(value: &Type) -> bool {
+        return match &value.* {
+          Type.Nominal {declaration, ..} => DeclarationId.equals(&declaration, &interfaceId)
+          _ => false
+        }
+      })
+      if matches {
+        if let Option<Shared<Type>>.Some {value: unused} = &chosenContract {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+        chosenContract = Option.some<Shared<Type>>(Shared.clone<Type>(&contract))
+        chosenProvider = Option.some<Shared<Type>>(Shared.clone<Type>(&provider))
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut firstArgument = Option.none<BodyNodeId>()
+  let needsInference = match &chosenContract {
+    Option<Shared<Type>>.Some {..} => false
+    Option<Shared<Type>>.None => true
+  }
+  if needsInference {
+    if arguments.length == usize.ZERO {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+    let firstId = run bodyChild(&resolver.source, cursor, arguments, usize.ZERO)
+    let checked = run checkExpression(
+      &mut resolver.*,
+      &mut owner.*,
+      &mut request.*,
+      &mut dependencies.*,
+      module,
+      cursor,
+      locals,
+      calls,
+      &mut nodes.*,
+      &mut signatures.*,
+      &mut requiredBodies.*,
+      firstId,
+      &Option.none<Shared<Type>>(),
+      constraints,
+      contractBody,
+    )
+    let node = match move checked {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+      }
+    }
+    let inferred = match &Vector.asSlice<BodyNode>(&nodes.*)[node.index].kind {
+      BodyNodeKind.Expression {ty, ..} => Shared.clone<Type>(&ty)
+      _ => {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+    }
+    firstArgument = Option.some<BodyNodeId>(node)
+    chosenProvider = Option.some<Shared<Type>>(move inferred)
+    chosenContract = Option.some<Shared<Type>>(run Shared.make<Type>(Type.Nominal {
+      declaration: run DeclarationId.copy(&interfaceId),
+      isPublic: isPublic,
+      arguments: Vector.make<Argument>(),
+    }))
+  }
+  let contract = match move chosenContract {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+  }
+  let provider = match move chosenProvider {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+  }
+  let listed = run proofDemand(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut request.*,
+    &mut dependencies.*,
+    Key {
+      family: Family.Operations,
+      module: selected.module,
+      name: usize.ZERO,
+      declaration: selected.ordinal,
+      member: usize.ZERO,
+      external: false,
+    },
+    span,
+    true,
+  )
+  let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &listed,
+    answerRejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move failure {
+    return Result.failResult<BodyNodeId, Shared<Rejection>>(move value)
+  }
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(&listed, operationCount)
+  let mut operation = Option.none<DeclarationId>()
+  at = usize.ZERO
+  while at < count {
+    let found = Shared.with<Result<Answer, NoRejection>, Option<Shared<DeclarationId>>>(
+      &listed,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
+        return operationAt(answer, at)
+      },
+    )
+    if let Option<Shared<DeclarationId>>.Some {value: candidate} = move found {
+      let named = Shared.with<DeclarationId, bool>(&candidate, fn(value: &DeclarationId) -> bool {
+        return DeclarationId.named(value, Bytes.asSlice(&qualifier.member))
+      })
+      if named {
+        let ordinal = run ordinalOfIdentity(&mut resolver.*, &contractModule, &candidate)
+        if let Option<usize>.Some {value: position} = move ordinal {
+          operation = run declarationAt(&mut resolver.*, &contractModule, position)
+        }
+        break
+      }
+    }
+    at = at + usize.ONE
+  }
+  let operationId = match move operation {
+    Option<DeclarationId>.Some {value} => value
+    Option<DeclarationId>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.UnknownMember, span)
+    }
+  }
+  let selectedCall = run selectOperationCall(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut request.*,
+    &mut dependencies.*,
+    true,
+    &contract,
+    &provider,
+    &operationId,
+    constraints,
+    module,
+    span,
+  )
+  let selectedOperation = match move selectedCall {
+    Result<OperationCall, Shared<Rejection>>.Success {value} => value
+    Result<OperationCall, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+    }
+  }
+  let OperationCall {operation: chosenOperation, implementation, signature, proof} = move selectedOperation
+  drop proof
+  let hasImplementation = match &implementation {
+    Option<Shared<DeclarationId>>.Some {..} => true
+    Option<Shared<DeclarationId>>.None => false
+  }
+  if hasImplementation {
+    // Runtime body closure for a concrete qualified witness belongs to the later call expansion.
+    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
+  let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureParameterCount)
+  if arguments.length > parameterCount {
+    return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
+  }
+  if arguments.length == usize.ZERO && parameterCount > usize.ZERO {
+    return run bodyRejection(&resolver.*, module, RejectionCode.RedundantCall, span)
+  }
+  if arguments.length < parameterCount || Shared.with<Result<Answer, NoRejection>, bool>(
+    &signature,
+    signatureOutsideScalarBodies,
+  ) || Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureBinderCount) > usize.ZERO {
+    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
+  let mut typedArguments = Vector.make<BodyNodeId>()
+  at = usize.ZERO
+  while at < arguments.length {
+    let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    let parameterType = match move parameter {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+    }
+    let mut already = false
+    let mut argumentNode = BodyNodeId {index: usize.ZERO}
+    if at == usize.ZERO {
+      if let Option<BodyNodeId>.Some {value} = &firstArgument {
+        already = true
+        argumentNode = BodyNodeId {index: value.index}
+      }
+    }
+    if !already {
+      let mut context = Option.none<Shared<Type>>()
+      if Shared.with<Type, bool>(&parameterType, scalarType) {
+        context = Option.some<Shared<Type>>(Shared.clone<Type>(&parameterType))
+      }
+      let argumentId = run bodyChild(&resolver.source, cursor, arguments, at)
+      let checked = run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        argumentId,
+        &context,
+        constraints,
+        contractBody,
+      )
+      argumentNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    let argumentType = match &Vector.asSlice<BodyNode>(&nodes.*)[argumentNode.index].kind {
+      BodyNodeKind.Expression {ty, ..} => Shared.clone<Type>(&ty)
+      _ => {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+    }
+    if !run Type.equalsShared(&argumentType, &parameterType) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+    }
+    run Vector.append<BodyNodeId>(&mut typedArguments, argumentNode)
+    at = at + usize.ONE
+  }
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&signature, signatureResult)
+  let ty = match move result {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+  }
+  if !contractBody && !Shared.with<Type, bool>(&ty, scalarType) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
+  if let Option<Shared<Type>>.Some {value} = &expected.* {
+    if !run Type.equalsShared(&ty, &value) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+    }
+  }
+  run Vector.append<SignatureDependency>(
+    &mut signatures.*,
+    SignatureDependency {declaration: run DeclarationId.copy(&chosenOperation)},
+  )
+  let index = Vector.length<BodyNode>(&nodes.*)
+  run Vector.append<BodyNode>(
+    &mut nodes.*,
+    BodyNode {
+      origin: BodyOrigin {syntax: expression, span: span},
+      kind: BodyNodeKind.Expression {
+        ty: move ty,
+        form: BodyExpression.InterfaceCall {
+          contract: move contract,
+          provider: move provider,
+          operation: move chosenOperation,
+          implementation: move implementation,
+          arguments: move typedArguments,
+        },
+      },
+    },
+  )
+  return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
+}
+
+effect fn checkExpression(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  cursor: &AuthoredCursor,
   locals: &[BodyLocal],
   calls: &[ResolvedCall],
   nodes: &mut Vector<BodyNode>,
@@ -14638,20 +14975,27 @@ effect fn checkExpression(
   requiredBodies: &mut Vector<DeclarationId>,
   expression: HirId,
   expected: &Option<Shared<Type>>,
-) -> Result<BodyNodeId, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
-  let span = Module.span(hir, expression)
+  constraints: &[Constraint],
+  contractBody: bool,
+) -> Result<BodyNodeId, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let span = run bodySpan(&resolver.source, cursor, expression)
   let mut ty = run Shared.make<Type>(Type.Unit)
   let mut form = BodyExpression.Unit
-  match Module.node(hir, expression) {
+  match run bodyNode(&resolver.source, cursor, expression) {
     Node.IntegerLiteral {sign, magnitude, suffix, ..} => {
+      let digits = run bodyText(&resolver.source, cursor, magnitude)
+      let mut writtenSuffix = Option.none<Bytes>()
       let mut selected = b"i32"
       let mut contextual = false
       if suffix.present {
-        selected = Module.text(hir, suffix.symbol)
+        writtenSuffix = Option.some<Bytes>(run bodyText(&resolver.source, cursor, suffix.symbol))
       } else if let Option<Shared<Type>>.Some {value} = &expected.* {
         if Shared.with<Type, bool>(&value, fixedIntegerType) {
           contextual = true
         }
+      }
+      if let Option<Bytes>.Some {value} = &writtenSuffix {
+        selected = Bytes.asSlice(&value)
       }
       if contextual {
         if let Option<Shared<Type>>.Some {value} = &expected.* {
@@ -14662,7 +15006,7 @@ effect fn checkExpression(
                 Type.Primitive {name} => fitsInteger(
                   Bytes.asSlice(&name),
                   sign,
-                  Module.text(hir, magnitude),
+                  Bytes.asSlice(&digits),
                 )
                 _ => false
               }
@@ -14677,7 +15021,7 @@ effect fn checkExpression(
         if !fixedIntegerName(selected) {
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
-        if !fitsInteger(selected, sign, Module.text(hir, magnitude)) {
+        if !fitsInteger(selected, sign, Bytes.asSlice(&digits)) {
           return run bodyRejection(&resolver.*, module, RejectionCode.IntegerOutOfRange, span)
         }
         ty = run primitiveType(selected)
@@ -14701,10 +15045,10 @@ effect fn checkExpression(
           }
         }
         return run bodyRejection(
-          resolver,
+          &resolver.*,
           module,
           RejectionCode.UnknownName,
-          Module.span(hir, name),
+          run bodySpan(&resolver.source, cursor, name),
         )
       }
       let mut at = usize.ZERO
@@ -14722,7 +15066,95 @@ effect fn checkExpression(
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
     }
-    Node.CallExpression {callee: unusedCallee, generics: unusedGenerics, arguments} => {
+    Node.MoveExpression {operand} => {
+      // The first abstract-body subset moves a named local as a whole. A later safety stage
+      // checks that it is still owned here and that cleanup follows the resulting control flow.
+      if let Node.IdentifierExpression {binding, ..} = run bodyNode(&resolver.source, cursor, operand) {
+        if !binding.present {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      } else {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+      let checked = run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        operand,
+        expected,
+        constraints,
+        contractBody,
+      )
+      let operandNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      ty = match & Vector.asSlice<BodyNode>(&nodes.*)[operandNode.index].kind {
+        BodyNodeKind.Expression {ty: operandType, ..} => Shared.clone<Type>(&operandType)
+        _ => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      }
+      form = BodyExpression.Move {value: operandNode}
+    }
+    Node.CallExpression {callee, generics: unusedGenerics, arguments} => {
+      let qualified = run bodyQualifiedName(&resolver.source, cursor, callee)
+      if let Option<QualifiedBodyName>.Some {value: name} = move qualified {
+        let moduleOrdinal = knownModuleOrdinal(&resolver.*, module)
+        if moduleOrdinal == usize.MAX {
+          fail InvalidModulePath {}
+        }
+        let selection = run selectDeclaration(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut dependencies.*,
+          moduleOrdinal,
+          module,
+          Bytes.asSlice(&name.namespace),
+          false,
+          name.subjectSpan,
+          RejectionCode.NotCallable,
+        )
+        if let Result<SelectedDeclaration, Shared<Rejection>>.Success {value: target} = move selection {
+          let declaredModule = run resolvedModule(&resolver.*, target.module)
+          let written = run header(&mut resolver.*, &declaredModule, target.ordinal)
+          if let Option<HeaderSyntax>.Some {value: named} = move written {
+            if let Node.InterfaceHeader {isPublic, ..} = named.header {
+              return run checkQualifiedInterfaceCall(
+                &mut resolver.*,
+                &mut owner.*,
+                &mut request.*,
+                &mut dependencies.*,
+                module,
+                cursor,
+                locals,
+                calls,
+                &mut nodes.*,
+                &mut signatures.*,
+                &mut requiredBodies.*,
+                expression,
+                arguments,
+                expected,
+                constraints,
+                contractBody,
+                &name,
+                move target,
+                isPublic,
+              )
+            }
+          }
+        }
+      }
       let found = run resolvedCall(calls, expression)
       let target = match move found {
         Option<Result<CallTarget, Shared<Rejection>>>.Some {value} => match move value {
@@ -14732,7 +15164,7 @@ effect fn checkExpression(
           }
         }
         Option<Result<CallTarget, Shared<Rejection>>>.None => {
-          return run bodyRejection(resolver, module, RejectionCode.Unsupported, span)
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
       }
       let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
@@ -14762,9 +15194,9 @@ effect fn checkExpression(
         &target.signature,
         signatureBinderCount,
       )
-      let owner = run Shared.make<DeclarationId>(run DeclarationId.copy(&target.declaration))
+      let callOwner = run Shared.make<DeclarationId>(run DeclarationId.copy(&target.declaration))
       let mut variables = Vector.make<Shared<DeclarationId>>()
-      run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(&owner))
+      run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(&callOwner))
       let mut inferred = Vector.make<Binding>()
       let explicit = Vector.asSlice<Argument>(&target.explicit)
       let mut binderAt = usize.ZERO
@@ -14777,7 +15209,7 @@ effect fn checkExpression(
         run Vector.append<Binding>(
           &mut inferred,
           Binding {
-            declaration: Shared.clone<DeclarationId>(&owner),
+            declaration: Shared.clone<DeclarationId>(&callOwner),
             ordinal: binderAt,
             value: move value,
           },
@@ -14818,17 +15250,23 @@ effect fn checkExpression(
               }
             }
           }
+          let argumentId = run bodyChild(&resolver.source, cursor, arguments, at)
           let argument = run checkExpression(
-            resolver,
+            &mut resolver.*,
+            &mut owner.*,
+            &mut request.*,
+            &mut dependencies.*,
             module,
-            hir,
+            cursor,
             locals,
             calls,
             &mut nodes.*,
             &mut signatures.*,
             &mut requiredBodies.*,
-            Module.child(hir, arguments, at),
+            argumentId,
             &argumentContext,
+            constraints,
+            contractBody,
           )
           match move argument {
             Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
@@ -14878,48 +15316,6 @@ effect fn checkExpression(
         }
         unresolvedAt = unresolvedAt + usize.ONE
       }
-      let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
-        &target.signature,
-        signatureResult,
-      )
-      if let Option<Shared<Type>>.Some {value: callResult} = move result {
-        let resultOrdinal = Shared.with<Type, usize>(
-          &callResult,
-          fn(value: &Type) -> usize {
-            return Type.parameterOrdinalOf(value, &target.declaration)
-          },
-        )
-        if resultOrdinal != usize.MAX {
-          if resultOrdinal >= binderCount {
-            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-          }
-          let specialized = bindingArgumentAt(Vector.asSlice<Binding>(&inferred), resultOrdinal)
-          if let Option<Argument>.Some {value: supplied} = move specialized {
-            if let Argument.Type {value: resultType} = move supplied {
-              ty = move resultType
-            } else {
-              return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
-            }
-          } else {
-            return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
-          }
-        } else {
-          ty = move callResult
-        }
-        if !Shared.with<Type, bool>(&ty, scalarType) {
-          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-        }
-      } else {
-        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-      }
-      run Vector.append<SignatureDependency>(
-        &mut signatures.*,
-        SignatureDependency {declaration: run DeclarationId.copy(&target.declaration)},
-      )
-      run Vector.append<DeclarationId>(
-        &mut requiredBodies.*,
-        run DeclarationId.copy(&target.declaration),
-      )
       let mut specialized = run copyArguments(Vector.asSlice<Argument>(&target.explicit))
       let mut specializeAt = Vector.length<Argument>(&specialized)
       while specializeAt < binderCount {
@@ -14932,6 +15328,88 @@ effect fn checkExpression(
         }
         specializeAt = specializeAt + usize.ONE
       }
+      let mut result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+        &target.signature,
+        signatureResult,
+      )
+      if binderCount > usize.ZERO {
+        let targetModuleOrdinal = knownModuleOrdinal(
+          &resolver.*,
+          DeclarationId.moduleId(&target.declaration),
+        )
+        if targetModuleOrdinal == usize.MAX {
+          fail InvalidModulePath {}
+        }
+        let targetModule = run resolvedModule(&resolver.*, targetModuleOrdinal)
+        let declaration = run ordinalOfIdentity(&mut resolver.*, &targetModule, &callOwner)
+        let targetOrdinal = match move declaration {
+          Option<usize>.Some {value} => value
+          Option<usize>.None => {
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+          }
+        }
+        let mut applied = run resolveSignatureUnder(
+          &mut resolver.*,
+          &mut owner.*,
+          Key {
+            family: Family.Signature,
+            module: targetModuleOrdinal,
+            name: usize.ZERO,
+            declaration: targetOrdinal,
+            member: usize.ZERO,
+            external: false,
+          },
+          Vector.make<Dependency>(),
+          Option.none<Vector<Argument>>(),
+          Option.some<Vector<Argument>>(run copyArguments(Vector.asSlice<Argument>(&specialized))),
+        )
+        while Vector.length<Dependency>(&applied.dependencies) > usize.ZERO {
+          let edge = Vector.remove<Dependency>(&mut applied.dependencies, usize.ZERO)
+          run Vector.append<Dependency>(&mut dependencies.*, move edge)
+        }
+        result = match &applied.outcome {
+          Outcome.Success {value: Value.Signature {signature}} => Option.some<Shared<Type>>(
+            Shared.clone<Type>(&signature.result),
+          )
+          Outcome.Rejected {diagnostic} => {
+            return Result.failResult<BodyNodeId, Shared<Rejection>>(
+              Shared.clone<Rejection>(&diagnostic),
+            )
+          }
+          _ => Option.none<Shared<Type>>()
+        }
+      }
+      let callResult = match move result {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      }
+      let mut ownedTypes = Vector.make<usize>()
+      let mut ownedLifetimes = Vector.make<usize>()
+      let mut ownedRows = Vector.make<usize>()
+      run Type.collectOwned(
+        &callResult,
+        &target.declaration,
+        &mut ownedTypes,
+        &mut ownedLifetimes,
+        &mut ownedRows,
+      )
+      if Vector.length<usize>(&ownedTypes) > usize.ZERO || Vector.length<usize>(&ownedLifetimes) > usize.ZERO || Vector.length<usize>(&ownedRows) > usize.ZERO {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+      ty = move callResult
+      if !contractBody && !Shared.with<Type, bool>(&ty, scalarType) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+      run Vector.append<SignatureDependency>(
+        &mut signatures.*,
+        SignatureDependency {declaration: run DeclarationId.copy(&target.declaration)},
+      )
+      run Vector.append<DeclarationId>(
+        &mut requiredBodies.*,
+        run DeclarationId.copy(&target.declaration),
+      )
       form = BodyExpression.DirectCall {
         declaration: run DeclarationId.copy(&target.declaration),
         genericArguments: move specialized,
@@ -14943,7 +15421,7 @@ effect fn checkExpression(
     }
   }
   if let Option<Shared<Type>>.Some {value} = &expected.* {
-    if !sameSharedType(&ty, &value) {
+    if !run Type.equalsShared(&ty, &value) {
       return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
     }
   }
@@ -14956,6 +15434,68 @@ effect fn checkExpression(
     },
   )
   return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
+}
+
+// Contract typing retains the source places whose ownership, lifetime, and cleanup safety must
+// be discharged later. A successful contract-typed body is not a full safety result.
+effect fn bodySafetyObligations(locals: &[BodyLocal], nodes: &[BodyNode]) -> Vector<BodySafetyObligation>
+! OutOfMemoryError
+? &mut Allocator {
+  let mut obligations = Vector.make<BodySafetyObligation>()
+  let mut localAt = usize.ZERO
+  while localAt < locals.length {
+    let local = &locals[localAt]
+    if !Shared.with<Type, bool>(&local.ty, scalarType) {
+      run Vector.append<BodySafetyObligation>(
+        &mut obligations,
+        BodySafetyObligation.WholeValue {
+          origin: BodyOrigin {syntax: local.origin.syntax, span: local.origin.span},
+          ty: Shared.clone<Type>(&local.ty),
+        },
+      )
+    }
+    localAt = localAt + usize.ONE
+  }
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    let node = &nodes[at]
+    if let BodyNodeKind.Expression {ty, form} = &node.kind {
+      match & form {
+        BodyExpression.Local {..} => {
+          if !Shared.with<Type, bool>(&ty, scalarType) {
+            run Vector.append<BodySafetyObligation>(
+              &mut obligations,
+              BodySafetyObligation.WholeValue {
+                origin: BodyOrigin {syntax: node.origin.syntax, span: node.origin.span},
+                ty: Shared.clone<Type>(&ty),
+              },
+            )
+          }
+        }
+        BodyExpression.DirectCall {declaration, ..} => {
+          run Vector.append<BodySafetyObligation>(
+            &mut obligations,
+            BodySafetyObligation.Invocation {
+              origin: BodyOrigin {syntax: node.origin.syntax, span: node.origin.span},
+              declaration: run DeclarationId.copy(&declaration),
+            },
+          )
+        }
+        BodyExpression.InterfaceCall {operation, ..} => {
+          run Vector.append<BodySafetyObligation>(
+            &mut obligations,
+            BodySafetyObligation.Invocation {
+              origin: BodyOrigin {syntax: node.origin.syntax, span: node.origin.span},
+              declaration: run DeclarationId.copy(&operation),
+            },
+          )
+        }
+        _ => ()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move obligations
 }
 
 fn rejectedBody(diagnostic: Shared<Rejection>, dependencies: Vector<Dependency>) -> Answer {
@@ -14979,10 +15519,222 @@ fn sameBinderName(hir: &Module, left: HirId, right: HirId) -> bool {
   return false
 }
 
-effect fn checkBlock(
+effect fn bodyNode(source: &SourceIndex, cursor: &AuthoredCursor, id: HirId) -> Node ! RevisionMismatch {
+  if let Option<Node>.Some {value} = move SourceIndex.authoredNode(source, cursor, id) {
+    return value
+  }
+  fail RevisionMismatch {}
+}
+
+effect fn bodySpan(source: &SourceIndex, cursor: &AuthoredCursor, id: HirId) -> Span ! RevisionMismatch {
+  if let Option<Span>.Some {value} = move SourceIndex.authoredSpan(source, cursor, id) {
+    return value
+  }
+  fail RevisionMismatch {}
+}
+
+effect fn bodyChild(source: &SourceIndex, cursor: &AuthoredCursor, range: Range, at: usize) -> HirId ! RevisionMismatch {
+  if let Option<HirId>.Some {value} = move SourceIndex.authoredChild(source, cursor, range, at) {
+    return value
+  }
+  fail RevisionMismatch {}
+}
+
+effect fn bodyText(source: &SourceIndex, cursor: &AuthoredCursor, symbol: Symbol) -> Bytes
+! RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  if let Option<&[u8]>.Some {value} = move SourceIndex.authoredText(source, cursor, symbol) {
+    return run Bytes.copy(value)
+  }
+  fail RevisionMismatch {}
+}
+
+effect fn bodySameBinderName(source: &SourceIndex, cursor: &AuthoredCursor, left: HirId, right: HirId) -> bool
+! RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  if let Node.Name {text: leftName} = run bodyNode(source, cursor, left) {
+    if let Node.Name {text: rightName} = run bodyNode(source, cursor, right) {
+      let first = run bodyText(source, cursor, leftName)
+      let second = run bodyText(source, cursor, rightName)
+      return same(Bytes.asSlice(&first), Bytes.asSlice(&second))
+    }
+  }
+  return false
+}
+
+effect fn bodyQualifiedName(source: &SourceIndex, cursor: &AuthoredCursor, callee: HirId) -> Option<QualifiedBodyName>
+! RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  if let Node.FieldExpression {subject, field} = run bodyNode(source, cursor, callee) {
+    if let Node.IdentifierExpression {name, binding} = run bodyNode(source, cursor, subject) {
+      if !binding.present {
+        if let Node.Name {text: namespaceSymbol} = run bodyNode(source, cursor, name) {
+          if let Node.Name {text: memberSymbol} = run bodyNode(source, cursor, field) {
+            return Option.some<QualifiedBodyName>(QualifiedBodyName {
+              namespace: run bodyText(source, cursor, namespaceSymbol),
+              member: run bodyText(source, cursor, memberSymbol),
+              subjectSpan: run bodySpan(source, cursor, subject),
+            })
+          }
+        }
+      }
+    }
+  }
+  return Option.none<QualifiedBodyName>()
+}
+
+// Copy only the declaration-owned facts needed by the effectful checker. The source-index HIR
+// loan ends with this preparation, so later semantic demands can borrow the resolver mutably.
+effect fn prepareBody(
   resolver: &Resolver,
   module: &ModuleId,
-  hir: &Module,
+  indexed: &IndexedSource,
+  ordinal: usize,
+  signature: &Shared<Result<Answer, NoRejection>>,
+  parameterCount: usize,
+  restricted: bool,
+  contractBody: bool,
+) -> Result<PreparedBody, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  if ordinal >= declarations.length {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+    )
+  }
+  let declaration = &declarations[ordinal]
+  let hir = IndexedSource.authored(indexed)
+  let headerSpan = Module.span(hir, declaration.header)
+  if restricted {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+    )
+  }
+  let writtenParameters = match Module.node(hir, declaration.header) {
+    Node.FunctionHeader {contract, ..} => match Module.node(hir, contract) {
+      Node.CallableContract {parameters, ..} => parameters
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    _ => {
+      return Result.failResult<PreparedBody, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+      )
+    }
+  }
+  if writtenParameters.length != parameterCount {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+    )
+  }
+  let mut locals = Vector.make<BodyLocal>()
+  let mut abstractBody = contractBody
+  let mut at = usize.ZERO
+  while at < parameterCount {
+    let parameterId = Module.child(hir, writtenParameters, at)
+    let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    let parameterType = match move selected {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    if !Shared.with<Type, bool>(&parameterType, scalarType) {
+      abstractBody = true
+    }
+    let mut name = parameterId
+    match Module.node(hir, parameterId) {
+      Node.Parameter {name: writtenName, mode, ..} => {
+        if mode != ParameterMode.Value {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(&resolver.*, module, RejectionCode.Unsupported, Module.span(hir, parameterId)),
+          )
+        }
+        name = writtenName
+      }
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(&resolver.*, module, RejectionCode.Unsupported, Module.span(hir, parameterId)),
+        )
+      }
+    }
+    let mut prior = usize.ZERO
+    while prior < Vector.length<BodyLocal>(&locals) {
+      let earlierId = Vector.asSlice<BodyLocal>(&locals)[prior].origin.syntax
+      if let Node.Parameter {name: earlier, ..} = Module.node(hir, earlierId) {
+        if sameBinderName(hir, name, earlier) {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(&resolver.*, module, RejectionCode.Collision, Module.span(hir, name)),
+          )
+        }
+      }
+      prior = prior + usize.ONE
+    }
+    run Vector.append<BodyLocal>(
+      &mut locals,
+      BodyLocal {
+        origin: BodyOrigin {syntax: parameterId, span: Module.span(hir, name)},
+        ty: move parameterType,
+      },
+    )
+    at = at + usize.ONE
+  }
+  let mut block = declaration.local
+  match Module.node(hir, declaration.local) {
+    Node.Declaration {body, ..} => match Module.node(hir, body) {
+      Node.CallableBody {block: writtenBlock} => {
+        if writtenBlock.present {
+          if let Node.Block {..} = Module.node(hir, writtenBlock.id) {
+            block = writtenBlock.id
+          } else {
+            return Result.failResult<PreparedBody, Shared<Rejection>>(
+              run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+            )
+          }
+        } else {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+          )
+        }
+      }
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    _ => {
+      return Result.failResult<PreparedBody, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.Unsupported, headerSpan),
+      )
+    }
+  }
+  return Result.succeed<PreparedBody, Shared<Rejection>>(
+    PreparedBody {
+      block: block,
+      identity: run DeclarationId.copy(&declaration.identity),
+      locals: move locals,
+      contractBody: abstractBody,
+    },
+  )
+}
+
+effect fn checkBlock(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  cursor: &AuthoredCursor,
   locals: &mut Vector<BodyLocal>,
   annotations: &[ResolvedAnnotation],
   calls: &[ResolvedCall],
@@ -14991,14 +15743,19 @@ effect fn checkBlock(
   requiredBodies: &mut Vector<DeclarationId>,
   block: HirId,
   resultType: &Shared<Type>,
-) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
-  if let Node.Block {statements: written} = Module.node(hir, block) {
+  constraints: &[Constraint],
+  contractBody: bool,
+) -> Result<CheckedControl, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Node.Block {statements: written} = run bodyNode(&resolver.source, cursor, block) {
     let mut bindings = Vector.make<HirId>()
     let mut statements = Vector.make<BodyNodeId>()
     let checked = run checkStatements(
-      resolver,
+      &mut resolver.*,
+      &mut owner.*,
+      &mut request.*,
+      &mut dependencies.*,
       module,
-      hir,
+      cursor,
       &mut locals.*,
       &mut bindings,
       annotations,
@@ -15009,6 +15766,8 @@ effect fn checkBlock(
       &mut statements,
       written,
       resultType,
+      constraints,
+      contractBody,
     )
     let canComplete = match move checked {
       Result<bool, Shared<Rejection>>.Success {value} => value
@@ -15020,7 +15779,7 @@ effect fn checkBlock(
     run Vector.append<BodyNode>(
       &mut nodes.*,
       BodyNode {
-        origin: BodyOrigin {syntax: block, span: Module.span(hir, block)},
+        origin: BodyOrigin {syntax: block, span: run bodySpan(&resolver.source, cursor, block)},
         kind: BodyNodeKind.Block {statements: move statements, canComplete: canComplete},
       },
     )
@@ -15029,14 +15788,17 @@ effect fn checkBlock(
     )
   }
   return Result.failResult<CheckedControl, Shared<Rejection>>(
-    run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, block)),
+    run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, block)),
   )
 }
 
 effect fn checkConditional(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
   module: &ModuleId,
-  hir: &Module,
+  cursor: &AuthoredCursor,
   locals: &mut Vector<BodyLocal>,
   annotations: &[ResolvedAnnotation],
   calls: &[ResolvedCall],
@@ -15045,12 +15807,17 @@ effect fn checkConditional(
   requiredBodies: &mut Vector<DeclarationId>,
   statement: HirId,
   resultType: &Shared<Type>,
-) -> Result<CheckedControl, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
-  if let Node.ConditionalStatement {condition, thenBranch, elseBranch} = Module.node(hir, statement) {
+  constraints: &[Constraint],
+  contractBody: bool,
+) -> Result<CheckedControl, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Node.ConditionalStatement {condition, thenBranch, elseBranch} = run bodyNode(&resolver.source, cursor, statement) {
     let checkedCondition = run checkExpression(
-      resolver,
+      &mut resolver.*,
+      &mut owner.*,
+      &mut request.*,
+      &mut dependencies.*,
       module,
-      hir,
+      cursor,
       Vector.asSlice<BodyLocal>(&locals.*),
       calls,
       &mut nodes.*,
@@ -15058,6 +15825,8 @@ effect fn checkConditional(
       &mut requiredBodies.*,
       condition,
       &Option.none<Shared<Type>>(),
+      constraints,
+      contractBody,
     )
     let conditionNode = match move checkedCondition {
       Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -15070,19 +15839,22 @@ effect fn checkConditional(
       BodyNodeKind.Expression {ty, ..} => Shared.clone<Type>(&ty)
       _ => {
         return Result.failResult<CheckedControl, Shared<Rejection>>(
-          run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, condition)),
+          run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, condition)),
         )
       }
     }
-    if !sameSharedType(&conditionType, &boolType) {
+    if !run Type.equalsShared(&conditionType, &boolType) {
       return Result.failResult<CheckedControl, Shared<Rejection>>(
-        run reject(resolver, module, RejectionCode.ConditionNotBool, Module.span(hir, condition)),
+        run reject(&resolver.*, module, RejectionCode.ConditionNotBool, run bodySpan(&resolver.source, cursor, condition)),
       )
     }
     let checkedThen = run checkBlock(
-      resolver,
+      &mut resolver.*,
+      &mut owner.*,
+      &mut request.*,
+      &mut dependencies.*,
       module,
-      hir,
+      cursor,
       &mut locals.*,
       annotations,
       calls,
@@ -15091,6 +15863,8 @@ effect fn checkConditional(
       &mut requiredBodies.*,
       thenBranch,
       resultType,
+      constraints,
+      contractBody,
     )
     let thenControl = match move checkedThen {
       Result<CheckedControl, Shared<Rejection>>.Success {value} => value
@@ -15101,11 +15875,14 @@ effect fn checkConditional(
     let mut checkedElse = Option.none<BodyNodeId>()
     let mut elseCanComplete = true
     if elseBranch.present {
-      let otherwise = match Module.node(hir, elseBranch.id) {
+      let otherwise = match run bodyNode(&resolver.source, cursor, elseBranch.id) {
         Node.Block {..} => run checkBlock(
-          resolver,
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
           module,
-          hir,
+          cursor,
           &mut locals.*,
           annotations,
           calls,
@@ -15114,11 +15891,16 @@ effect fn checkConditional(
           &mut requiredBodies.*,
           elseBranch.id,
           resultType,
+          constraints,
+          contractBody,
         )
         Node.ConditionalStatement {..} => run checkConditional(
-          resolver,
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
           module,
-          hir,
+          cursor,
           &mut locals.*,
           annotations,
           calls,
@@ -15127,9 +15909,11 @@ effect fn checkConditional(
           &mut requiredBodies.*,
           elseBranch.id,
           resultType,
+          constraints,
+          contractBody,
         )
         _ => Result.failResult<CheckedControl, Shared<Rejection>>(
-          run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, elseBranch.id)),
+          run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, elseBranch.id)),
         )
       }
       match move otherwise {
@@ -15147,7 +15931,7 @@ effect fn checkConditional(
     run Vector.append<BodyNode>(
       &mut nodes.*,
       BodyNode {
-        origin: BodyOrigin {syntax: statement, span: Module.span(hir, statement)},
+        origin: BodyOrigin {syntax: statement, span: run bodySpan(&resolver.source, cursor, statement)},
         kind: BodyNodeKind.Branch {
           condition: conditionNode,
           thenBranch: thenControl.node,
@@ -15161,14 +15945,17 @@ effect fn checkConditional(
     )
   }
   return Result.failResult<CheckedControl, Shared<Rejection>>(
-    run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, statement)),
+    run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, statement)),
   )
 }
 
 effect fn checkStatements(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut Vector<Dependency>,
   module: &ModuleId,
-  hir: &Module,
+  cursor: &AuthoredCursor,
   locals: &mut Vector<BodyLocal>,
   bindings: &mut Vector<HirId>,
   annotations: &[ResolvedAnnotation],
@@ -15179,18 +15966,23 @@ effect fn checkStatements(
   statements: &mut Vector<BodyNodeId>,
   written: Range,
   resultType: &Shared<Type>,
-) -> Result<bool, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  constraints: &[Constraint],
+  contractBody: bool,
+) -> Result<bool, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut reachable = true
   let mut at = usize.ZERO
   while at < written.length {
-    let statement = Module.child(hir, written, at)
-    let span = Module.span(hir, statement)
-    match Module.node(hir, statement) {
+    let statement = run bodyChild(&resolver.source, cursor, written, at)
+    let span = run bodySpan(&resolver.source, cursor, statement)
+    match run bodyNode(&resolver.source, cursor, statement) {
       Node.ConditionalStatement {..} => {
         let checked = run checkConditional(
-          resolver,
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
           module,
-          hir,
+          cursor,
           &mut locals.*,
           annotations,
           calls,
@@ -15199,6 +15991,8 @@ effect fn checkStatements(
           &mut requiredBodies.*,
           statement,
           resultType,
+          constraints,
+          contractBody,
         )
         match move checked {
           Result<CheckedControl, Shared<Rejection>>.Success {value} => {
@@ -15212,7 +16006,7 @@ effect fn checkStatements(
       }
       Node.ReturnStatement {value: returned} => {
         if span.start == span.end && returned.present {
-          match Module.node(hir, returned.id) {
+          match run bodyNode(&resolver.source, cursor, returned.id) {
             Node.UnitLiteral => {
               at = at + usize.ONE
               continue
@@ -15224,9 +16018,12 @@ effect fn checkStatements(
         if returned.present {
           let expected = Option.some<Shared<Type>>(Shared.clone<Type>(resultType))
           let expression = run checkExpression(
-            resolver,
+            &mut resolver.*,
+            &mut owner.*,
+            &mut request.*,
+            &mut dependencies.*,
             module,
-            hir,
+            cursor,
             Vector.asSlice<BodyLocal>(&locals.*),
             calls,
             &mut nodes.*,
@@ -15234,6 +16031,8 @@ effect fn checkStatements(
             &mut requiredBodies.*,
             returned.id,
             &expected,
+            constraints,
+            contractBody,
           )
           match move expression {
             Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
@@ -15261,9 +16060,12 @@ effect fn checkStatements(
       }
       Node.ExpressionStatement {expression} => {
         let checked = run checkExpression(
-          resolver,
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
           module,
-          hir,
+          cursor,
           Vector.asSlice<BodyLocal>(&locals.*),
           calls,
           &mut nodes.*,
@@ -15271,6 +16073,8 @@ effect fn checkStatements(
           &mut requiredBodies.*,
           expression,
           &Option.none<Shared<Type>>(),
+          constraints,
+          contractBody,
         )
         match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
@@ -15290,9 +16094,9 @@ effect fn checkStatements(
         let known = Vector.asSlice<HirId>(&bindings.*)
         let mut prior = usize.ZERO
         while prior < known.length {
-          if sameBinderName(hir, name, known[prior]) {
+          if run bodySameBinderName(&resolver.source, cursor, name, known[prior]) {
             return Result.failResult<bool, Shared<Rejection>>(
-              run reject(&resolver.*, module, RejectionCode.Collision, Module.span(hir, name)),
+              run reject(&resolver.*, module, RejectionCode.Collision, run bodySpan(&resolver.source, cursor, name)),
             )
           }
           prior = prior + usize.ONE
@@ -15306,13 +16110,13 @@ effect fn checkStatements(
               found = true
               match & annotations[selected].result {
                 Result<Shared<Type>, Shared<Rejection>>.Success {value} => {
-                  if !Shared.with<Type, bool>(&value, scalarType) {
+                  if !contractBody && !Shared.with<Type, bool>(&value, scalarType) {
                     return Result.failResult<bool, Shared<Rejection>>(
                       run reject(
                         &resolver.*,
                         module,
                         RejectionCode.Unsupported,
-                        Module.span(hir, annotation.id),
+                        run bodySpan(&resolver.source, cursor, annotation.id),
                       ),
                     )
                   }
@@ -15332,15 +16136,18 @@ effect fn checkStatements(
                 &resolver.*,
                 module,
                 RejectionCode.Unsupported,
-                Module.span(hir, annotation.id),
+                run bodySpan(&resolver.source, cursor, annotation.id),
               ),
             )
           }
         }
         let checked = run checkExpression(
-          resolver,
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
           module,
-          hir,
+          cursor,
           Vector.asSlice<BodyLocal>(&locals.*),
           calls,
           &mut nodes.*,
@@ -15348,6 +16155,8 @@ effect fn checkStatements(
           &mut requiredBodies.*,
           initializer,
           &expected,
+          constraints,
+          contractBody,
         )
         let initializerNode = match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -15368,7 +16177,7 @@ effect fn checkStatements(
         run Vector.append<BodyLocal>(
           &mut locals.*,
           BodyLocal {
-            origin: BodyOrigin {syntax: statement, span: Module.span(hir, name)},
+            origin: BodyOrigin {syntax: statement, span: run bodySpan(&resolver.source, cursor, name)},
             ty: move ty,
           },
         )
@@ -15996,18 +16805,28 @@ effect fn resolveBody(
     &signatureAnswer,
     signatureParameterCount,
   )
-  let typeParameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
+  let binderCount = Shared.with<Result<Answer, NoRejection>, usize>(
     &signatureAnswer,
-    signatureGenericCount,
+    signatureBinderCount,
   )
-  if typeParameterCount > usize.ZERO {
-    let written = run header(&mut resolver.*, &module, key.declaration)
-    if let Option<HeaderSyntax>.Some {value} = move written {
-      return rejectedBody(
-        run reject(&resolver.*, &module, RejectionCode.Unsupported, value.span),
-        move dependencies,
-      )
+  let mut contractBody = binderCount > usize.ZERO || !Shared.with<Type, bool>(&resultType, scalarType)
+  let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(
+    &signatureAnswer,
+    signatureConstraintCount,
+  )
+  let mut constraints = Vector.make<Constraint>()
+  let mut boundAt = usize.ZERO
+  while boundAt < boundCount {
+    let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(
+      &signatureAnswer,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> {
+        return signatureConstraint(answer, boundAt)
+      },
+    )
+    if let Option<Constraint>.Some {value} = move bound {
+      run Vector.append<Constraint>(&mut constraints, move value)
     }
+    boundAt = boundAt + usize.ONE
   }
   let restricted = Shared.with<Result<Answer, NoRejection>, bool>(
     &signatureAnswer,
@@ -16036,10 +16855,16 @@ effect fn resolveBody(
     }
   }
   let mut annotations = Vector.make<ResolvedAnnotation>()
-  let noBinders = Vector.make<Binder>()
+  let template = run templateBinders(&mut resolver.*, &module, key.declaration)
+  let binders = match move template {
+    Result<Vector<Binder>, Shared<Rejection>>.Success {value} => move value
+    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+      return rejectedBody(move error, move dependencies)
+    }
+  }
   let mut noElision = LifetimeElision {
-    owner: Option.none<DeclarationId>(),
-    nextOrdinal: usize.ZERO,
+    owner: run declarationAt(&mut resolver.*, &module, key.declaration),
+    nextOrdinal: Vector.length<Binder>(&binders),
     output: false,
     resultDefault: Option.none<Shared<Lifetime>>(),
     generated: Vector.make<Shared<Lifetime>>(),
@@ -16060,7 +16885,7 @@ effect fn resolveBody(
       &mut dependencies,
       key.module,
       id,
-      Vector.asSlice<Binder>(&noBinders),
+      Vector.asSlice<Binder>(&binders),
       &mut noElision,
     )
     run Vector.append<ResolvedAnnotation>(
@@ -16071,7 +16896,6 @@ effect fn resolveBody(
   }
   let mut resolvedCalls = Vector.make<ResolvedCall>()
   let callSyntax = Vector.asSlice<CallSyntax>(&writtenCalls)
-  let noCallBinders = Vector.make<Binder>()
   let mut callAt = usize.ZERO
   while callAt < callSyntax.length {
     let result = run callTarget(
@@ -16081,7 +16905,7 @@ effect fn resolveBody(
       &module,
       key.module,
       &callSyntax[callAt],
-      Vector.asSlice<Binder>(&noCallBinders),
+      Vector.asSlice<Binder>(&binders),
     )
     run Vector.append<ResolvedCall>(
       &mut resolvedCalls,
@@ -16089,177 +16913,139 @@ effect fn resolveBody(
     )
     callAt = callAt + usize.ONE
   }
+  let prepared = match move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    &module,
+  ) {
+    Option<&IndexedSource>.Some {value: indexed} => run prepareBody(
+      &resolver.*,
+      &module,
+      indexed,
+      key.declaration,
+      &signatureAnswer,
+      parameterCount,
+      restricted,
+      contractBody,
+    )
+    Option<&IndexedSource>.None => Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+    )
+  }
+  let preparedBody = match move prepared {
+    Result<PreparedBody, Shared<Rejection>>.Success {value} => value
+    Result<PreparedBody, Shared<Rejection>>.Failure {error} => {
+      return rejectedBody(move error, move dependencies)
+    }
+  }
+  let PreparedBody {block, identity, locals: preparedLocals, contractBody: abstractBody} = move preparedBody
+  let mut locals = move preparedLocals
+  let mut nodes = Vector.make<BodyNode>()
+  let mut signatureDependencies = Vector.make<SignatureDependency>()
+  run Vector.append<SignatureDependency>(
+    &mut signatureDependencies,
+    SignatureDependency {declaration: move identity},
+  )
+  let mut requiredBodies = Vector.make<DeclarationId>()
+  let available = run SourceIndex.authoredCursor(
+    &mut resolver.source,
+    &sourceAnswer,
+    &module,
+  )
+  let cursor = match move available {
+    Option<AuthoredCursor>.Some {value} => value
+    Option<AuthoredCursor>.None => {
+      return rejectedBody(
+        run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+        move dependencies,
+      )
+    }
+  }
+  let mut operationRequest = Request.make()
+  let checked = run checkBlock(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut operationRequest,
+    &mut dependencies,
+    &module,
+    &cursor,
+    &mut locals,
+    Vector.asSlice<ResolvedAnnotation>(&annotations),
+    Vector.asSlice<ResolvedCall>(&resolvedCalls),
+    &mut nodes,
+    &mut signatureDependencies,
+    &mut requiredBodies,
+    block,
+    &resultType,
+    Vector.asSlice<Constraint>(&constraints),
+    abstractBody,
+  )
+  let control = match move checked {
+    Result<CheckedControl, Shared<Rejection>>.Success {value} => value
+    Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+      return rejectedBody(move error, move dependencies)
+    }
+  }
+  if control.canComplete && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+      &resolver.*,
+      &sourceAnswer,
+      &module,
+    ) {
+      let hir = IndexedSource.authored(indexed)
+      let mut returnSpan = Module.span(hir, block)
+      if Module.causeRange(hir, block).length == usize.ZERO && returnSpan.end > returnSpan.start {
+        returnSpan = Span.make(returnSpan.end - usize.ONE, returnSpan.end)
+      }
+      return rejectedBody(
+        run reject(&resolver.*, &module, RejectionCode.MissingReturn, returnSpan),
+        move dependencies,
+      )
+    }
+    return rejectedBody(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+      move dependencies,
+    )
+  }
+  let mut stage = BodyStage.FullyChecked
+  if abstractBody {
+    stage = BodyStage.ContractTyped {
+      obligations: run bodySafetyObligations(
+        Vector.asSlice<BodyLocal>(&locals),
+        Vector.asSlice<BodyNode>(&nodes),
+      ),
+    }
+  }
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
     &resolver.*,
     &sourceAnswer,
     &module,
   ) {
-    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if key.declaration < declarations.length {
-      let declaration = &declarations[key.declaration]
-      let hir = IndexedSource.authored(indexed)
-      let headerId = declaration.header
-      let headerSpan = Module.span(hir, headerId)
-      if restricted || !Shared.with<Type, bool>(&resultType, scalarType) {
-        return rejectedBody(
-          run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-          move dependencies,
-        )
-      }
-      if let Node.FunctionHeader {contract, ..} = Module.node(hir, headerId) {
-        if let Node.CallableContract {parameters: writtenParameters, ..} = Module.node(
-          hir,
-          contract,
-        ) {
-          if writtenParameters.length != parameterCount {
-            return rejectedBody(
-              run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-              move dependencies,
-            )
-          }
-          let mut locals = Vector.make<BodyLocal>()
-          let mut at = usize.ZERO
-          while at < parameterCount {
-            let parameterId = Module.child(hir, writtenParameters, at)
-            let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
-              &signatureAnswer,
-              fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
-                return signatureParameter(answer, at)
-              },
-            )
-            if let Option<Shared<Type>>.Some {value: parameterType} = move selected {
-              if let Node.Parameter {name, mode, ..} = Module.node(hir, parameterId) {
-                if mode == ParameterMode.Value {
-                  let mut prior = usize.ZERO
-                  while prior < Vector.length<BodyLocal>(&locals) {
-                    let earlierId = Vector.asSlice<BodyLocal>(&locals)[prior].origin.syntax
-                    if let Node.Parameter {name: earlier, ..} = Module.node(hir, earlierId) {
-                      if sameBinderName(hir, name, earlier) {
-                        return rejectedBody(
-                          run reject(
-                            &resolver.*,
-                            &module,
-                            RejectionCode.Collision,
-                            Module.span(hir, name),
-                          ),
-                          move dependencies,
-                        )
-                      }
-                    }
-                    prior = prior + usize.ONE
-                  }
-                  run Vector.append<BodyLocal>(
-                    &mut locals,
-                    BodyLocal {
-                      origin: BodyOrigin {syntax: parameterId, span: Module.span(hir, name)},
-                      ty: move parameterType,
-                    },
-                  )
-                } else {
-                  return rejectedBody(
-                    run reject(
-                      &resolver.*,
-                      &module,
-                      RejectionCode.Unsupported,
-                      Module.span(hir, parameterId),
-                    ),
-                    move dependencies,
-                  )
-                }
-              } else {
-                return rejectedBody(
-                  run reject(
-                    &resolver.*,
-                    &module,
-                    RejectionCode.Unsupported,
-                    Module.span(hir, parameterId),
-                  ),
-                  move dependencies,
-                )
-              }
-            } else {
-              return rejectedBody(
-                run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-                move dependencies,
-              )
-            }
-            at = at + usize.ONE
-          }
-          if let Node.Declaration {body, ..} = Module.node(hir, declaration.local) {
-            if let Node.CallableBody {block} = Module.node(hir, body) {
-              if block.present {
-                if let Node.Block {..} = Module.node(hir, block.id) {
-                  let mut nodes = Vector.make<BodyNode>()
-                  let mut signatureDependencies = Vector.make<SignatureDependency>()
-                  run Vector.append<SignatureDependency>(
-                    &mut signatureDependencies,
-                    SignatureDependency {declaration: run DeclarationId.copy(&declaration.identity)},
-                  )
-                  let mut requiredBodies = Vector.make<DeclarationId>()
-                  let checked = run checkBlock(
-                    &resolver.*,
-                    &module,
-                    hir,
-                    &mut locals,
-                    Vector.asSlice<ResolvedAnnotation>(&annotations),
-                    Vector.asSlice<ResolvedCall>(&resolvedCalls),
-                    &mut nodes,
-                    &mut signatureDependencies,
-                    &mut requiredBodies,
-                    block.id,
-                    &resultType,
-                  )
-                  let control = match move checked {
-                    Result<CheckedControl, Shared<Rejection>>.Success {value} => value
-                    Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
-                      return rejectedBody(move error, move dependencies)
-                    }
-                  }
-                  if control.canComplete && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
-                    let mut returnSpan = Module.span(hir, block.id)
-                    if Module.causeRange(hir, block.id).length == usize.ZERO && returnSpan.end > returnSpan.start {
-                      returnSpan = Span.make(returnSpan.end - usize.ONE, returnSpan.end)
-                    }
-                    return rejectedBody(
-                      run reject(&resolver.*, &module, RejectionCode.MissingReturn, returnSpan),
-                      move dependencies,
-                    )
-                  }
-                  let body = run TypedBody.make(
-                    indexed,
-                    key.declaration,
-                    move locals,
-                    move nodes,
-                    control.node,
-                    move signatureDependencies,
-                    move requiredBodies,
-                  )
-                  return Answer {
-                    outcome: Outcome.Success {
-                      value: Value.Body {
-                        body: run Shared.make<TypedBody>(move body),
-                        source: run Shared.make<Observation>(
-                          run Observation.copy(IndexedSource.sourceObservation(indexed)),
-                        ),
-                      },
-                    },
-                    dependencies: move dependencies,
-                    sources: Vector.make<Shared<Observation>>(),
-                    footprint: Vector.make<Shared<DemandFootprint>>(),
-                    answerId: usize.ZERO,
-                    identity: Option.none<Shared<Value>>(),
-                    bodyEvidence: Option.none<Shared<BodyEvidence>>(),
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-      return rejectedBody(
-        run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-        move dependencies,
-      )
+    let body = run TypedBody.make(
+      indexed,
+      key.declaration,
+      move locals,
+      move nodes,
+      control.node,
+      move signatureDependencies,
+      move requiredBodies,
+      move stage,
+    )
+    return Answer {
+      outcome: Outcome.Success {
+        value: Value.Body {
+          body: run Shared.make<TypedBody>(move body),
+          source: run Shared.make<Observation>(
+            run Observation.copy(IndexedSource.sourceObservation(indexed)),
+          ),
+        },
+      },
+      dependencies: move dependencies,
+      sources: Vector.make<Shared<Observation>>(),
+      footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
+      bodyEvidence: Option.none<Shared<BodyEvidence>>(),
     }
   }
   return rejectedBody(
@@ -18091,20 +18877,21 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Initializer, module, name, &answer)
     return move answer
   }
-  /// Checks one demanded ordinary function body with fixed-width integer, Boolean, or unit types.
+  /// Types one demanded ordinary function body against its written signature.
   ///
   /// # Details
   ///
-  /// The body accepts exact literals, immutable locals, full direct calls, returns, and unit
-  /// fallthrough. A direct call reads the callee signature and records its required runtime body.
-  /// It does not check the callee body. A completed answer replays its current source and
-  /// signature evidence into each request that demands it. A validated body reuse records a
-  /// `Reuse` event after the query starts; it does not record a cache hit.
+  /// Scalar bodies retain the existing fully checked result. A generic body is typed once with
+  /// symbolic parameters; its `TypedBody.Stage.ContractTyped` result retains safety obligations
+  /// for later ownership, lifetime, cleanup, and Effect checking. A direct ordinary call reads
+  /// the callee signature and records its required runtime body without checking that body.
+  /// Completed answers replay current source and signature evidence into each request. Validated
+  /// reuse records a `Reuse` event after the query starts rather than a cache hit.
   ///
   /// # Gotchas
   ///
-  /// An unsupported expression or statement produces an anchored rejection. A checked body does
-  /// not execute the function or prove that all functions in a program are valid.
+  /// An unsupported expression or statement produces an anchored rejection. Contract typing does
+  /// not establish executable readiness or full body safety.
   pub effect fn demandBody(self: &mut Self, request: &mut Request, module: &ModuleId, name: &[u8]) -> Shared<
     Result<Answer, NoRejection>,
   > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
