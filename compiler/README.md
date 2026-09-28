@@ -737,6 +737,10 @@ rollback. The cancellation proof combines the executed nested query case with re
 publication boundaries; it does not claim an executed full-semantic cancellation fixture.
 
 Keep this loop lean: each new case needs behavioral evidence that its neighbors cannot provide.
+Until the self-hosted compiler is functional, each test must finish within 1 s on Linux CI;
+target under 500 ms. The focused workflow checks the runner's per-test times. Shorten fixture
+programs, share a parsed revision across assertions, and avoid repeated whole-module demands;
+split only independent claims and retain their distinct checks.
 Use the existing source-written roots, shared runners and fixtures, and the cheapest assertions
 that can falsify the claim. Cover representative integration and failure boundaries rather than
 adding per-feature native recompilations or exhaustive matrices. Run broader parser, HIR, corpus,
