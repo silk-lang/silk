@@ -189,10 +189,10 @@ Only services may appear in a requirement row, and an `at` path must name a role
 services are both valid bounds; a bound records the requirement and proves no conformance.
 Requirement and bound errors, a failure or requirement channel on an ordinary function, a `?R`
 binder used as an ordinary type, an ambiguous or nested callable quantifier, and a borrow or bare
-callable or Effect inside a structural union have anchored rejections. These contracts do not
-solve conformances, select providers, check captures, or run Effects. The scalar body checker still
-rejects effect bodies, generic bodies, and calls to effect or `unsafe` functions as `Unsupported`,
-even when their signatures resolve.
+callable or Effect inside a structural union have anchored rejections. A demanded generic body can
+use its written bounds while checking ordinary values and calls. This contract-typing result does
+not check captures, run Effects, or discharge ownership and lifetime safety. Effect bodies and
+calls to effect or `unsafe` functions remain `Unsupported` even when their signatures resolve.
 
 `Semantic.demandOperations` lists an interface's or service's operations; each operation resolves
 under its contract's binders and an implicit `Self`. `demandImplementations` returns a module's
@@ -251,7 +251,7 @@ the import, and different bindings have separate query identities. Its imported 
 usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
-Generic bodies, bounded calls, non-scalar call results, body-sensitive representation-property proofs, row subtraction such as
+Unproved bounded ordinary calls, body-sensitive representation-property proofs, row subtraction such as
 `Without<R, K>` (which belongs to the later provision and requirement-algebra work), requirements
 on type parameters, provider-derived inference of missing interface arguments (Unit5 follow-up),
 variadic functions, static parameters, and other nonstandard callable header modifiers currently
@@ -325,10 +325,11 @@ data, and package parameters are later work. Array extents do not read constants
 body that names a module declaration without a local binding, such as `return limit`, looks the name
 up and rejects `Unsupported` at the use; only an absent name is `UnknownName`.
 
-`Semantic.demandBody`
-checks one requested ordinary function body with fixed-width integer, `bool`, or unit parameters
-and result. It accepts exact integer, Boolean, and unit literals, parameter reads, immutable scalar
-and unit locals, explicit returns, and unit fallthrough. An immediate return or local annotation
+`Semantic.demandBody` checks one requested ordinary function body against its written signature.
+It accepts fixed-width integer, `bool`, and unit literals, by-value parameter reads and whole-value
+moves, immutable locals, explicit returns, and unit fallthrough. Generic parameters remain symbolic;
+admitted nominal and other non-scalar by-value types are typed without claiming their ownership
+safety. An immediate return or local annotation
 selects an exact integer literal's type, including through a resolved alias. Without context, an
 integer literal defaults to `i32`. For example, demanding
 `answer` succeeds without checking `broken`; demanding `broken` rejects the unknown name at its
@@ -362,6 +363,26 @@ that declaration. Thus `fn caller() -> i32 { return leaf() }` can check successf
 signatures do not force a body-query cycle. A body demand does not execute user code or prove that
 the whole program is valid. Imported calls retain positive and negative name, import, and source
 observations on fresh request hits.
+
+A body answer distinguishes `FullyChecked` for the existing scalar subset from `ContractTyped`
+for generic or non-scalar bodies. The latter retains source places that still need ownership,
+lifetime, cleanup, and Effect safety checks. `ContractTyped` is a type result, not a proof that
+those obligations have been discharged; consumers must not treat it as a safe executable body.
+A written generic callee signature can type a call, including a nested result such as `Box<T>`,
+without demanding the callee body, and both runtime branches are checked. Unsupported expressions
+reject rather than leaving an untyped node in a successful body.
+
+A demanded generic body uses its own declared bounds, even when a concrete caller supplies a
+provider that implements the interface:
+
+```silk,ignore
+interface Read { fn read(value: Self) -> i32 }
+fn bounded<T: Read>(value: T) -> i32 { return Read.read(move value) }
+fn without<T>(value: T) -> i32 { return Read.read(move value) }
+```
+
+`bounded` has a `ContractTyped` body. Demanding `without` rejects for missing conformance,
+regardless of its callers. Its body cannot gain a proof from a caller's concrete argument.
 
 For example, after checking `caller`, changing only `leaf` from `return 1` to `return 2`
 keeps the caller's checked payload, including when both functions share a file:
@@ -441,7 +462,7 @@ nodes and whether each block can complete. Source after a return is still checke
 cannot make a completed path reachable again.
 
 This native semantic API is not wired into the inspection executable above. Function values,
-sections, methods, operators, pointer-sized types, effects, generic bodies, static evaluation,
+sections, methods, operators, pointer-sized literal ranges, effects, full generic-body safety, static evaluation,
 conformance, layout, and code emission are outside the current body subset. For example,
 `fn selected() -> i32 { static if true { return 1 } else { return 2 } }` produces `Unsupported`
 when demanded; static selection does not use runtime branch checking. Unused declarations with
@@ -461,12 +482,12 @@ Effect signature contracts with written channels and recorded bounds; constant t
 constant-to-constant values; and revision validation for each of these facts. A form outside that
 vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
 
-- **M2.3, remaining generic contracts:** generic bodies and body-sensitive property proofs remain
-  pending, as do bounded calls and provider-derived inference of missing interface arguments
+- **M2.3, remaining generic contracts:** body-sensitive property proofs remain pending, as do
+  some bounded ordinary calls and provider-derived inference of missing interface arguments
   (Unit5 follow-up after the authored cursor).
   Ordered multi-row applications, declaration-bound lifetime completion, generated
   field-lifetime substitution, and concrete interface-bound applications are supported in the
-  current semantic layer. Requirements on type parameters still await their abstract-body work.
+  current semantic layer. Abstract generic bodies retain later safety obligations.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
