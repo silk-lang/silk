@@ -366,9 +366,23 @@ observations on fresh request hits.
 
 A body answer distinguishes `FullyChecked` for the existing scalar subset from `ContractTyped`
 for generic or non-scalar bodies. The latter retains source places that still need ownership,
-lifetime, cleanup, and Effect safety checks. A written generic callee signature can type a call
+lifetime, cleanup, and Effect safety checks. `ContractTyped` is a type result, not a proof that
+those obligations have been discharged; consumers must not treat it as a safe executable body.
+A written generic callee signature can type a call, including a nested result such as `Box<T>`,
 without demanding the callee body, and both runtime branches are checked. Unsupported expressions
 reject rather than leaving an untyped node in a successful body.
+
+A demanded generic body uses its own declared bounds, even when a concrete caller supplies a
+provider that implements the interface:
+
+```silk,ignore
+interface Read { fn read(value: Self) -> i32 }
+fn bounded<T: Read>(value: T) -> i32 { return Read.read(move value) }
+fn without<T>(value: T) -> i32 { return Read.read(move value) }
+```
+
+`bounded` has a `ContractTyped` body. Demanding `without` rejects for missing conformance,
+regardless of its callers. Its body cannot gain a proof from a caller's concrete argument.
 
 For example, after checking `caller`, changing only `leaf` from `return 1` to `return 2`
 keeps the caller's checked payload, including when both functions share a file:
