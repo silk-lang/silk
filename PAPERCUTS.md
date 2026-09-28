@@ -2,6 +2,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-28 · Codebase-memory indexing failed with "a pre-coordination or unverified CBM generation is active" in both the shared checkout and an isolated worktree · Read the worker log, then use scoped `rg` until the index service can coordinate · self-hosted compiler
+
 - 2026-09-28 · `silk format --check` reported only PAR0001/PAR0002 for a damaged large source file, without a location; a one-line `match` in an added test hid the actual parse failure · Slice the new test into temporary complete source prefixes and format-check each to locate the first invalid statement; write match arms on separate lines · self-hosted compiler
 
 - 2026-09-26 · The combined M1 native test root reached JavaScript heap OOM in focused CI before any case ran, and `--filter` could not reduce compilation because it selects only at runtime · Run the query/source-index root and semantic root sequentially in the same job; all 27 cases pass uncached within the existing heap limit · self-hosted compiler

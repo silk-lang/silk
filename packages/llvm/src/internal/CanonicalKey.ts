@@ -13,8 +13,9 @@ const hexadecimalBytes = Array.from({ length: 256 }, (_, byte) =>
 export const bytes = (value: ByteString.ByteString): CanonicalKey => {
   const cached = byteKeys.get(value.bytes)
   if (cached !== undefined) return cached
-  let hexadecimal = ''
-  for (const byte of value.bytes) hexadecimal += hexadecimalBytes[byte]
+  // One join builds a flat string; appending per byte built a rope of one ~32-byte node per byte,
+  // and these keys stay cached for every live byte string of the module.
+  const hexadecimal = Array.from(value.bytes, (byte) => hexadecimalBytes[byte] ?? '').join('')
   const key = `${value.bytes.length}:${hexadecimal}`
   byteKeys.set(value.bytes, key)
   return key

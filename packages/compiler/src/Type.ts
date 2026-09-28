@@ -4335,18 +4335,43 @@ const runtimeOwnerKey = (self: ExecutableSpecializationOwner): string =>
     Canonical.array(self.staticArgumentKeys),
   ])
 
+/** Runtime keys of identity arguments and callable environments, memoized on each object. */
+const cachedRuntimeArgumentKey: unique symbol = Symbol('Type.runtimeGenericArgumentKey')
+const cachedRuntimeEnvironmentKey: unique symbol = Symbol('Type.runtimeCallableEnvironmentKey')
+
 /** Erases proof-only owner arguments from a physical callable environment identity. */
-export const runtimeCallableEnvironmentIdentityKey = (self: CallableEnvironmentIdentity): string =>
-  Canonical.record('Environment', [
+export const runtimeCallableEnvironmentIdentityKey = (
+  self: CallableEnvironmentIdentity,
+): string => {
+  const cached: unknown = Reflect.get(self, cachedRuntimeEnvironmentKey)
+  if (typeof cached === 'string') return cached
+  const computed = Canonical.record('Environment', [
     callableEnvironmentSiteKey(self.site),
     runtimeOwnerKey(self.owner),
   ])
+  if (Object.isExtensible(self))
+    Object.defineProperty(self, cachedRuntimeEnvironmentKey, { value: computed })
+  return computed
+}
 
 /**
  * Encodes runtime-relevant generic identity. A bare lifetime returns the empty marker; enclosing
  * argument lists omit those entries entirely. This key never participates in semantic equality.
  */
 export const runtimeGenericArgumentKey = (self: GenericArgument): string => {
+  if (Lifetime.isLifetime(self)) return ''
+  if (isTypeArgument(self)) return runtimeKey(self)
+  // Identity and representation arguments are rebuilt by every owner key that mentions them;
+  // memoize their keys on the argument like type keys.
+  const cached: unknown = Reflect.get(self, cachedRuntimeArgumentKey)
+  if (typeof cached === 'string') return cached
+  const computed = computeRuntimeGenericArgumentKey(self)
+  if (Object.isExtensible(self))
+    Object.defineProperty(self, cachedRuntimeArgumentKey, { value: computed })
+  return computed
+}
+
+const computeRuntimeGenericArgumentKey = (self: GenericArgument): string => {
   if (Lifetime.isLifetime(self)) return ''
   if (isUnavailableGenericArgument(self)) return genericArgumentKey(self)
   if (isRepresentationParameterArgument(self))
