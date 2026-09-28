@@ -2,6 +2,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-28 · The shared checkout's CLI dependency links pointed into another unit's worktree and became dangling during parallel setup · Run frontend checks with the intact main checkout's CLI, then build and test from an isolated worktree after acquiring the shared build slot · self-hosted compiler
+- 2026-09-28 · Importing the large semantic test root for a few target assertions exhausted a 6 GiB frontend heap before diagnostics · Keep these independent target assertions in a small focused root and run that root directly · self-hosted compiler
 - 2026-09-28 · Codebase-memory indexing failed with "a pre-coordination or unverified CBM generation is active" in both the shared checkout and an isolated worktree · Read the worker log, then use scoped `rg` until the index service can coordinate · self-hosted compiler
 
 - 2026-09-28 · `silk format --check` reported only PAR0001/PAR0002 for a damaged large source file, without a location; a one-line `match` in an added test hid the actual parse failure · Slice the new test into temporary complete source prefixes and format-check each to locate the first invalid statement; write match arms on separate lines · self-hosted compiler
