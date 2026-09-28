@@ -251,9 +251,8 @@ the import, and different bindings have separate query identities. Its imported 
 usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
-Unproved bounded ordinary calls, body-sensitive representation-property proofs, row subtraction such as
-`Without<R, K>` (which belongs to the later provision and requirement-algebra work), requirements
-on type parameters, provider-derived inference of missing interface arguments (Unit5 follow-up),
+Body-sensitive representation-property proofs, row subtraction such as `Without<R, K>` (which
+belongs to the later provision and requirement-algebra work), requirements on type parameters,
 variadic functions, static parameters, and other nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
@@ -264,7 +263,11 @@ arguments. The exact matcher infers ordinary, lifetime, and row parameters from 
 including nested nominal types and multiple rows fixed by independent evidence. Conflicting
 evidence and binders present only in the result reject without using the expected result. The
 typed call retains its completed generic application. Non-scalar parameter locals and their call
-arguments retain resolved types; unsupported body forms still reject. `typeof(item)` in a type
+arguments retain resolved types; unsupported body forms still reject. Once operands fix a provider,
+one uniquely matching coherent conformance or direct bound declared by the caller may fill
+remaining interface arguments. It cannot override explicit or operand-derived arguments, choose
+among multiple conformances, or infer an unknown provider. A checked scalar direct call proves the
+completed signature's interface bounds before retaining its typed result. `typeof(item)` in a type
 position names one visible, fully specialized named callable representation. Identical callable
 use signatures do not make two named items identical. A public
 signature cannot expose a private item. A `some` result records one producer-owned opaque
@@ -272,8 +275,7 @@ representation and its executable use contract. Checking its concrete realizatio
 remains part of the later complete-body work.
 An omitted lifetime inside a declaration bound is recorded as a generated declaration binder.
 Bounded nominal and alias applications prove their concrete interface goals; an abstract use may
-rely only on an identical bound declared by its enclosing generic declaration. Bounded calls remain
-`Unsupported` until the Unit5 follow-up can query proofs during body checking without copying HIR.
+rely only on an identical bound declared by its enclosing generic declaration.
 
 An omitted callable or Effect environment elides like a borrow. An input retains the regions of its
 borrows, non-`'static` nominal lifetime arguments, and callable or Effect environments; the
@@ -468,9 +470,7 @@ Effect signature contracts with written channels and recorded bounds; constant t
 constant-to-constant values; and revision validation for each of these facts. A form outside that
 vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
 
-- **M2.3, remaining generic contracts:** body-sensitive property proofs remain pending, as do
-  some bounded ordinary calls and provider-derived inference of missing interface arguments
-  (Unit5 follow-up after the authored cursor).
+- **M2.3, remaining generic contracts:** body-sensitive property proofs remain pending.
   Ordered multi-row applications, declaration-bound lifetime completion, generated
   field-lifetime substitution, and concrete interface-bound applications are supported in the
   current semantic layer. Abstract generic bodies retain later safety obligations.
