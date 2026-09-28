@@ -675,6 +675,13 @@ struct ResolvedCall {
   result: Result<CallTarget, Shared<Rejection>>
 }
 
+struct PreparedBody {
+  block: HirId
+  identity: DeclarationId
+  locals: Vector<BodyLocal>
+  contractBody: bool
+}
+
 struct CheckedControl {
   node: BodyNodeId
   canComplete: bool
@@ -13805,21 +13812,6 @@ fn signatureParameterCount(answer: &Result<Answer, NoRejection>) -> usize {
   }
 }
 
-// Type and row binders make a generic contract; lifetime-only binders do not.
-fn signatureGenericCount(answer: &Result<Answer, NoRejection>) -> usize {
-  return match & answer.* {
-    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
-      Outcome.Success {value: Value.Signature {signature}} => Vector.length<Shared<Type>>(
-        &signature.typeParameters,
-      ) + Vector.length<Shared<Lifetime>>(&signature.lifetimeParameters) + Vector.length<RowParameter>(
-        &signature.rowParameters,
-      )
-      _ => usize.ZERO
-    }
-    Result<Answer, NoRejection>.Failure {error: _} => usize.ZERO
-  }
-}
-
 fn signatureBinderCount(answer: &Result<Answer, NoRejection>) -> usize {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
@@ -15267,10 +15259,6 @@ effect fn checkExpression(
           },
         )
         if let Option<Shared<Type>>.Some {value: parameterType} = move parameter {
-          if !contractBody && !Type.hasOpenParameters(&parameterType) &&
-            !Shared.with<Type, bool>(&parameterType, scalarType) {
-            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-          }
           let ordinal = Shared.with<Type, usize>(
             &parameterType,
             fn(value: &Type) -> usize {
@@ -15520,6 +15508,151 @@ fn sameBinderName(hir: &Module, left: HirId, right: HirId) -> bool {
     }
   }
   return false
+}
+
+// Copy only the declaration-owned facts needed by the effectful checker. The source-index HIR
+// loan ends with this preparation, so later semantic demands can borrow the resolver mutably.
+effect fn prepareBody(
+  resolver: &Resolver,
+  module: &ModuleId,
+  indexed: &IndexedSource,
+  ordinal: usize,
+  signature: &Shared<Result<Answer, NoRejection>>,
+  parameterCount: usize,
+  restricted: bool,
+  contractBody: bool,
+) -> Result<PreparedBody, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  if ordinal >= declarations.length {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(resolver, module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+    )
+  }
+  let declaration = &declarations[ordinal]
+  let hir = IndexedSource.authored(indexed)
+  let headerSpan = Module.span(hir, declaration.header)
+  if restricted {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+    )
+  }
+  let writtenParameters = match Module.node(hir, declaration.header) {
+    Node.FunctionHeader {contract, ..} => match Module.node(hir, contract) {
+      Node.CallableContract {parameters, ..} => parameters
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    _ => {
+      return Result.failResult<PreparedBody, Shared<Rejection>>(
+        run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+      )
+    }
+  }
+  if writtenParameters.length != parameterCount {
+    return Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+    )
+  }
+  let mut locals = Vector.make<BodyLocal>()
+  let mut abstractBody = contractBody
+  let mut at = usize.ZERO
+  while at < parameterCount {
+    let parameterId = Module.child(hir, writtenParameters, at)
+    let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameter(answer, at)
+      },
+    )
+    let parameterType = match move selected {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    if !Shared.with<Type, bool>(&parameterType, scalarType) {
+      abstractBody = true
+    }
+    let mut name = parameterId
+    match Module.node(hir, parameterId) {
+      Node.Parameter {name: writtenName, mode, ..} => {
+        if mode != ParameterMode.Value {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, parameterId)),
+          )
+        }
+        name = writtenName
+      }
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, Module.span(hir, parameterId)),
+        )
+      }
+    }
+    let mut prior = usize.ZERO
+    while prior < Vector.length<BodyLocal>(&locals) {
+      let earlierId = Vector.asSlice<BodyLocal>(&locals)[prior].origin.syntax
+      if let Node.Parameter {name: earlier, ..} = Module.node(hir, earlierId) {
+        if sameBinderName(hir, name, earlier) {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(resolver, module, RejectionCode.Collision, Module.span(hir, name)),
+          )
+        }
+      }
+      prior = prior + usize.ONE
+    }
+    run Vector.append<BodyLocal>(
+      &mut locals,
+      BodyLocal {
+        origin: BodyOrigin {syntax: parameterId, span: Module.span(hir, name)},
+        ty: move parameterType,
+      },
+    )
+    at = at + usize.ONE
+  }
+  let mut block = declaration.local
+  match Module.node(hir, declaration.local) {
+    Node.Declaration {body, ..} => match Module.node(hir, body) {
+      Node.CallableBody {block: writtenBlock} => {
+        if writtenBlock.present {
+          if let Node.Block {..} = Module.node(hir, writtenBlock.id) {
+            block = writtenBlock.id
+          } else {
+            return Result.failResult<PreparedBody, Shared<Rejection>>(
+              run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+            )
+          }
+        } else {
+          return Result.failResult<PreparedBody, Shared<Rejection>>(
+            run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+          )
+        }
+      }
+      _ => {
+        return Result.failResult<PreparedBody, Shared<Rejection>>(
+          run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+        )
+      }
+    }
+    _ => {
+      return Result.failResult<PreparedBody, Shared<Rejection>>(
+        run reject(resolver, module, RejectionCode.Unsupported, headerSpan),
+      )
+    }
+  }
+  return Result.succeed<PreparedBody, Shared<Rejection>>(
+    PreparedBody {
+      block: block,
+      identity: run DeclarationId.copy(&declaration.identity),
+      locals: move locals,
+      contractBody: abstractBody,
+    },
+  )
 }
 
 effect fn checkBlock(
@@ -16563,11 +16696,11 @@ effect fn resolveBody(
     &signatureAnswer,
     signatureParameterCount,
   )
-  let typeParameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
+  let binderCount = Shared.with<Result<Answer, NoRejection>, usize>(
     &signatureAnswer,
-    signatureGenericCount,
+    signatureBinderCount,
   )
-  let mut contractBody = typeParameterCount > usize.ZERO || !Shared.with<Type, bool>(&resultType, scalarType)
+  let mut contractBody = binderCount > usize.ZERO || !Shared.with<Type, bool>(&resultType, scalarType)
   let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(
     &signatureAnswer,
     signatureConstraintCount,
@@ -16654,7 +16787,6 @@ effect fn resolveBody(
   }
   let mut resolvedCalls = Vector.make<ResolvedCall>()
   let callSyntax = Vector.asSlice<CallSyntax>(&writtenCalls)
-  let noCallBinders = Vector.make<Binder>()
   let mut callAt = usize.ZERO
   while callAt < callSyntax.length {
     let result = run callTarget(
@@ -16664,7 +16796,7 @@ effect fn resolveBody(
       &module,
       key.module,
       &callSyntax[callAt],
-      Vector.asSlice<Binder>(&noCallBinders),
+      Vector.asSlice<Binder>(&binders),
     )
     run Vector.append<ResolvedCall>(
       &mut resolvedCalls,
@@ -16672,192 +16804,130 @@ effect fn resolveBody(
     )
     callAt = callAt + usize.ONE
   }
+  let prepared = match move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    &module,
+  ) {
+    Option<&IndexedSource>.Some {value: indexed} => run prepareBody(
+      &resolver.*,
+      &module,
+      indexed,
+      key.declaration,
+      &signatureAnswer,
+      parameterCount,
+      restricted,
+      contractBody,
+    )
+    Option<&IndexedSource>.None => Result.failResult<PreparedBody, Shared<Rejection>>(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+    )
+  }
+  let preparedBody = match move prepared {
+    Result<PreparedBody, Shared<Rejection>>.Success {value} => value
+    Result<PreparedBody, Shared<Rejection>>.Failure {error} => {
+      return rejectedBody(move error, move dependencies)
+    }
+  }
+  let PreparedBody {block, identity, locals: preparedLocals, contractBody: abstractBody} = move preparedBody
+  let mut locals = move preparedLocals
+  let mut nodes = Vector.make<BodyNode>()
+  let mut signatureDependencies = Vector.make<SignatureDependency>()
+  run Vector.append<SignatureDependency>(
+    &mut signatureDependencies,
+    SignatureDependency {declaration: move identity},
+  )
+  let mut requiredBodies = Vector.make<DeclarationId>()
+  let checked = match move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    &module,
+  ) {
+    Option<&IndexedSource>.Some {value: indexed} => run checkBlock(
+      &resolver.*,
+      &module,
+      IndexedSource.authored(indexed),
+      &mut locals,
+      Vector.asSlice<ResolvedAnnotation>(&annotations),
+      Vector.asSlice<ResolvedCall>(&resolvedCalls),
+      &mut nodes,
+      &mut signatureDependencies,
+      &mut requiredBodies,
+      block,
+      &resultType,
+      Vector.asSlice<Constraint>(&constraints),
+      abstractBody,
+    )
+    Option<&IndexedSource>.None => Result.failResult<CheckedControl, Shared<Rejection>>(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+    )
+  }
+  let control = match move checked {
+    Result<CheckedControl, Shared<Rejection>>.Success {value} => value
+    Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+      return rejectedBody(move error, move dependencies)
+    }
+  }
+  if control.canComplete && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+      &resolver.*,
+      &sourceAnswer,
+      &module,
+    ) {
+      let hir = IndexedSource.authored(indexed)
+      let mut returnSpan = Module.span(hir, block)
+      if Module.causeRange(hir, block).length == usize.ZERO && returnSpan.end > returnSpan.start {
+        returnSpan = Span.make(returnSpan.end - usize.ONE, returnSpan.end)
+      }
+      return rejectedBody(
+        run reject(&resolver.*, &module, RejectionCode.MissingReturn, returnSpan),
+        move dependencies,
+      )
+    }
+    return rejectedBody(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+      move dependencies,
+    )
+  }
+  let mut stage = BodyStage.FullyChecked
+  if abstractBody {
+    stage = BodyStage.ContractTyped {
+      obligations: run bodySafetyObligations(
+        Vector.asSlice<BodyLocal>(&locals),
+        Vector.asSlice<BodyNode>(&nodes),
+      ),
+    }
+  }
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
     &resolver.*,
     &sourceAnswer,
     &module,
   ) {
-    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if key.declaration < declarations.length {
-      let declaration = &declarations[key.declaration]
-      let hir = IndexedSource.authored(indexed)
-      let headerId = declaration.header
-      let headerSpan = Module.span(hir, headerId)
-      if restricted {
-        return rejectedBody(
-          run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-          move dependencies,
-        )
-      }
-      if let Node.FunctionHeader {contract, ..} = Module.node(hir, headerId) {
-        if let Node.CallableContract {parameters: writtenParameters, ..} = Module.node(
-          hir,
-          contract,
-        ) {
-          if writtenParameters.length != parameterCount {
-            return rejectedBody(
-              run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-              move dependencies,
-            )
-          }
-          let mut locals = Vector.make<BodyLocal>()
-          let mut at = usize.ZERO
-          while at < parameterCount {
-            let parameterId = Module.child(hir, writtenParameters, at)
-            let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
-              &signatureAnswer,
-              fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
-                return signatureParameter(answer, at)
-              },
-            )
-            if let Option<Shared<Type>>.Some {value: parameterType} = move selected {
-              if !Shared.with<Type, bool>(&parameterType, scalarType) {
-                contractBody = true
-              }
-              if let Node.Parameter {name, mode, ..} = Module.node(hir, parameterId) {
-                if mode == ParameterMode.Value {
-                  let mut prior = usize.ZERO
-                  while prior < Vector.length<BodyLocal>(&locals) {
-                    let earlierId = Vector.asSlice<BodyLocal>(&locals)[prior].origin.syntax
-                    if let Node.Parameter {name: earlier, ..} = Module.node(hir, earlierId) {
-                      if sameBinderName(hir, name, earlier) {
-                        return rejectedBody(
-                          run reject(
-                            &resolver.*,
-                            &module,
-                            RejectionCode.Collision,
-                            Module.span(hir, name),
-                          ),
-                          move dependencies,
-                        )
-                      }
-                    }
-                    prior = prior + usize.ONE
-                  }
-                  run Vector.append<BodyLocal>(
-                    &mut locals,
-                    BodyLocal {
-                      origin: BodyOrigin {syntax: parameterId, span: Module.span(hir, name)},
-                      ty: move parameterType,
-                    },
-                  )
-                } else {
-                  return rejectedBody(
-                    run reject(
-                      &resolver.*,
-                      &module,
-                      RejectionCode.Unsupported,
-                      Module.span(hir, parameterId),
-                    ),
-                    move dependencies,
-                  )
-                }
-              } else {
-                return rejectedBody(
-                  run reject(
-                    &resolver.*,
-                    &module,
-                    RejectionCode.Unsupported,
-                    Module.span(hir, parameterId),
-                  ),
-                  move dependencies,
-                )
-              }
-            } else {
-              return rejectedBody(
-                run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-                move dependencies,
-              )
-            }
-            at = at + usize.ONE
-          }
-          if let Node.Declaration {body, ..} = Module.node(hir, declaration.local) {
-            if let Node.CallableBody {block} = Module.node(hir, body) {
-              if block.present {
-                if let Node.Block {..} = Module.node(hir, block.id) {
-                  let mut nodes = Vector.make<BodyNode>()
-                  let mut signatureDependencies = Vector.make<SignatureDependency>()
-                  run Vector.append<SignatureDependency>(
-                    &mut signatureDependencies,
-                    SignatureDependency {declaration: run DeclarationId.copy(&declaration.identity)},
-                  )
-                  let mut requiredBodies = Vector.make<DeclarationId>()
-                  let checked = run checkBlock(
-                    &mut resolver.*,
-                    &module,
-                    hir,
-                    &mut locals,
-                    Vector.asSlice<ResolvedAnnotation>(&annotations),
-                    Vector.asSlice<ResolvedCall>(&resolvedCalls),
-                    &mut nodes,
-                    &mut signatureDependencies,
-                    &mut requiredBodies,
-                    block.id,
-                    &resultType,
-                    Vector.asSlice<Constraint>(&constraints),
-                    contractBody,
-                  )
-                  let control = match move checked {
-                    Result<CheckedControl, Shared<Rejection>>.Success {value} => value
-                    Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
-                      return rejectedBody(move error, move dependencies)
-                    }
-                  }
-                  if control.canComplete && Shared.with<Type, usize>(&resultType, scalarCode) != 1 {
-                    let mut returnSpan = Module.span(hir, block.id)
-                    if Module.causeRange(hir, block.id).length == usize.ZERO && returnSpan.end > returnSpan.start {
-                      returnSpan = Span.make(returnSpan.end - usize.ONE, returnSpan.end)
-                    }
-                    return rejectedBody(
-                      run reject(&resolver.*, &module, RejectionCode.MissingReturn, returnSpan),
-                      move dependencies,
-                    )
-                  }
-                  let mut stage = BodyStage.FullyChecked
-                  if contractBody {
-                    stage = BodyStage.ContractTyped {
-                      obligations: run bodySafetyObligations(
-                        Vector.asSlice<BodyLocal>(&locals),
-                        Vector.asSlice<BodyNode>(&nodes),
-                      ),
-                    }
-                  }
-                  let body = run TypedBody.make(
-                    indexed,
-                    key.declaration,
-                    move locals,
-                    move nodes,
-                    control.node,
-                    move signatureDependencies,
-                    move requiredBodies,
-                    move stage,
-                  )
-                  return Answer {
-                    outcome: Outcome.Success {
-                      value: Value.Body {
-                        body: run Shared.make<TypedBody>(move body),
-                        source: run Shared.make<Observation>(
-                          run Observation.copy(IndexedSource.sourceObservation(indexed)),
-                        ),
-                      },
-                    },
-                    dependencies: move dependencies,
-                    sources: Vector.make<Shared<Observation>>(),
-                    footprint: Vector.make<Shared<DemandFootprint>>(),
-                    answerId: usize.ZERO,
-                    identity: Option.none<Shared<Value>>(),
-                    bodyEvidence: Option.none<Shared<BodyEvidence>>(),
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-      return rejectedBody(
-        run reject(&resolver.*, &module, RejectionCode.Unsupported, headerSpan),
-        move dependencies,
-      )
+    let body = run TypedBody.make(
+      indexed,
+      key.declaration,
+      move locals,
+      move nodes,
+      control.node,
+      move signatureDependencies,
+      move requiredBodies,
+      move stage,
+    )
+    return Answer {
+      outcome: Outcome.Success {
+        value: Value.Body {
+          body: run Shared.make<TypedBody>(move body),
+          source: run Shared.make<Observation>(
+            run Observation.copy(IndexedSource.sourceObservation(indexed)),
+          ),
+        },
+      },
+      dependencies: move dependencies,
+      sources: Vector.make<Shared<Observation>>(),
+      footprint: Vector.make<Shared<DemandFootprint>>(),
+      answerId: usize.ZERO,
+      identity: Option.none<Shared<Value>>(),
+      bodyEvidence: Option.none<Shared<BodyEvidence>>(),
     }
   }
   return rejectedBody(
