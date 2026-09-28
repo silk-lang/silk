@@ -16,11 +16,11 @@ for (const line of lines) {
     pendingName = name[1]
     continue
   }
-  const result = /^\s+(?:PASS|FAIL)\s+(\d+)\s+ms\s*$/.exec(line)
+  const result = /^\s+(?:PASS|FAIL)\s+(\d+)\s+(ms|us)\s*$/.exec(line)
   if (!result || !pendingName) continue
-  const milliseconds = Number(result[1])
+  const milliseconds = result[2] === 'us' ? Number(result[1]) / 1000 : Number(result[1])
   measured += 1
-  if (milliseconds > 1000) slow.push(`${pendingName}: ${milliseconds} ms`)
+  if (milliseconds >= 1000) slow.push(`${pendingName}: ${milliseconds} ms`)
   pendingName = undefined
 }
 
@@ -28,6 +28,6 @@ if (measured === 0) {
   throw new Error('No per-test timings found in the test runner log')
 }
 if (slow.length > 0) {
-  throw new Error(`Selfhost tests exceeded 1 s:\n${slow.join('\n')}`)
+  throw new Error(`Selfhost tests took 1 s or longer:\n${slow.join('\n')}`)
 }
-console.log(`All ${measured} selfhost tests finished within 1 s`)
+console.log(`All ${measured} selfhost tests finished under 1 s`)
