@@ -217,9 +217,12 @@ referent, region, and result match exactly. Failures and requirements may only n
 still see the operation's header. An `effect fn` member's environment must be a promised region, a
 region the operation's inputs retain, or one with a written bound to a promised region; a written
 member environment must also be kept by its stored inputs. No member body is read, and a
-successful answer proves no conformance. A member that binds parameters of its own, including an
-elided borrow, and an environment covered only through a chain of bounds are `Unsupported` until
-exact matching and bound entailment exist.
+successful answer proves no conformance. Member-owned type, lifetime, and row binders receive
+exact evidence from the substituted operation; an owned contract operand may be lent to an elided
+member borrow without letting that borrow escape. A fixed requirement beside one open member row
+is covered by the operation's fixed row before the open member row binds to its rigid parameters;
+the resolved member row must still be covered by the operation row. Ambiguous environment
+intersections and an environment covered only through a chain of bounds remain `Unsupported`.
 `demandCoherence` decides a conformance head before any applicability or bound proof. Every written
 parameter must occur in the interface application or provider (`UnconstrainedImplParameter`), and
 every bound must name a parameter inside the provider without repeating an open parameter or
@@ -233,24 +236,44 @@ conflicting head. Two unbounded heads that rename each other exactly, lifetimes 
 `DuplicateConformance`; every other conflict is `OverlappingConformance`. Unions and requirement
 rows are sets: `Box<T | i32>` and `Box<bool>` stay distinct, and `? &Clock | R` covers
 `? &mut Clock` but `? &mut Clock | R` never covers `? &Clock`. A union member or row entry that
-nests a parameter, or a set parameter used elsewhere in the head, is `Unsupported` until shared
-matching decides it; it is never reported as a conflict. Sealed-property and inherent heads have no
-coherence answer yet.
+nests a parameter is matched against closed peers under one shared assignment; a successful
+pairing is a conflict, and contradictory fixed evidence is distinct. Closed row keys compare after
+lifetime projection and retain the strongest access when keys collapse. Set parameters used
+elsewhere in the head and pairings whose normalized cardinality may change remain `Unsupported`
+until matching can decide them. Sealed-property and inherent heads have no coherence answer yet.
 
 `Intrinsic` is the sealed compiler namespace. It needs no import, and a declaration or import
 binding named `Intrinsic` collides with it wherever that binding is looked up. `Intrinsic.Detached`
 and `Intrinsic.NonParking` are witness-free properties recorded on generic bounds, and a Detached
-representation parameter retains no region. Other intrinsic families, `impl Intrinsic`, and calls
+representation parameter retains no region. An `Intrinsic.application` import selects the canonical
+module explicitly bound to the semantic request; an active import without that binding rejects at
+the import, and different bindings have separate query identities. Its imported members obey the
+usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
 such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
 
-Generic calls and demanded generic bodies, type inference, applications of declarations with
-interface or representation bounds, a declaration with more than one `?R` binder when applied, a
-lifetime omitted inside a type declaration's bound, row subtraction such as `Without<R, K>` (which
-belongs to the later provision and requirement-algebra work), requirements on type parameters,
+Generic bodies, bounded calls, non-scalar call results, body-sensitive representation-property proofs, row subtraction such as
+`Without<R, K>` (which belongs to the later provision and requirement-algebra work), requirements
+on type parameters, provider-derived inference of missing interface arguments (Unit5 follow-up),
 variadic functions, static parameters, and other nonstandard callable header modifiers currently
 return `Unsupported` rather than a provisional type. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
+
+Calls with scalar results accept a contiguous ordered prefix of type, lifetime, and positional row
+arguments. The exact matcher infers ordinary, lifetime, and row parameters from typed operands,
+including nested nominal types and multiple rows fixed by independent evidence. Conflicting
+evidence and binders present only in the result reject without using the expected result. The
+typed call retains its completed generic application. Non-scalar parameter locals and their call
+arguments retain resolved types; unsupported body forms still reject. `typeof(item)` in a type
+position names one visible, fully specialized named callable representation. Identical callable
+use signatures do not make two named items identical. A public
+signature cannot expose a private item. A `some` result records one producer-owned opaque
+representation and its executable use contract. Checking its concrete realization in a body
+remains part of the later complete-body work.
+An omitted lifetime inside a declaration bound is recorded as a generated declaration binder.
+Bounded nominal and alias applications prove their concrete interface goals; an abstract use may
+rely only on an identical bound declared by its enclosing generic declaration. Bounded calls remain
+`Unsupported` until the Unit5 follow-up can query proofs during body checking without copying HIR.
 
 An omitted callable or Effect environment elides like a borrow. An input retains the regions of its
 borrows, non-`'static` nominal lifetime arguments, and callable or Effect environments; the
@@ -321,7 +344,7 @@ exact out-of-range value. `fn inferred() -> u8 { let value = 255 return value }`
 `value` is already `i32`; `fn annotated() -> u8 { let value: u8 = 255 return value }` succeeds.
 Initializers see preceding locals and parameters, but not the binding they initialize. A local
 may shadow a parameter in the function body; a second local with the same name in that block
-rejects. A full direct call to a same-module or imported ordinary nongeneric function checks each
+rejects. A full direct call to a same-module or imported ordinary function checks each
 argument against its written parameter type in source order. An exact integer literal uses that
 parameter as its immediate type context; an already typed local keeps its fixed type. For example,
 `fn pair(first: u8, second: i32) -> i32 { return second }` accepts `pair(255, 1)`, but rejects
@@ -438,11 +461,12 @@ Effect signature contracts with written channels and recorded bounds; constant t
 constant-to-constant values; and revision validation for each of these facts. A form outside that
 vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
 
-- **M2.3, generic contracts:** type inference, generic calls and bodies, conformance solving, and
-  applications of declarations with interface, service, or representation bounds, such as
-  `Sorted<i32>`. This also covers applying more than one `?R` binder, requirements on type
-  parameters, lifetimes omitted inside a type declaration's bound, and substituting generated field
-  lifetimes into requested member types.
+- **M2.3, remaining generic contracts:** generic bodies and body-sensitive property proofs remain
+  pending, as do bounded calls and provider-derived inference of missing interface arguments
+  (Unit5 follow-up after the authored cursor).
+  Ordered multi-row applications, declaration-bound lifetime completion, generated
+  field-lifetime substitution, and concrete interface-bound applications are supported in the
+  current semantic layer. Requirements on type parameters still await their abstract-body work.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
