@@ -13,12 +13,15 @@ import semantic.ModuleIndex {ModuleIndex, NameObservation}
 import semantic.Query {Cycle, Query}
 import semantic.SourceRevision {Observation, Revision}
 import semantic.SourceUnit {SourceUnit}
-import hir.Hir {Module}
+import hir.Hir {HirId, Module, Node, Range}
+import hir.Intern {StringTable, Symbol}
+import lexer.Span {Span}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
 import silk.hash {Hash, Word}
 import silk.option {Option}
+import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
 import silk.usize
@@ -29,6 +32,32 @@ pub struct IndexedSource {
   observation: Observation
   unit: SourceUnit
   index: ModuleIndex
+}
+
+/// An owned address for short reads of one exact parsed source observation.
+///
+/// Keeping this address does not borrow the source index, so a body checker can request more
+/// semantic facts between HIR reads. The exact source is authenticated once at creation; later
+/// reads check a constant-time store identity and generation before borrowing its original HIR.
+pub struct AuthoredCursor {
+  token: Shared<CursorStamp>
+  generation: usize
+  slot: usize
+}
+
+struct CursorStamp {
+  generation: usize
+}
+
+fn stampAddress(value: &CursorStamp) -> usize {
+  return Pointer.address<CursorStamp>(Pointer.fromRef<CursorStamp>(value))
+}
+
+fn authenticatedSource(store: &SourceIndex, answer: &Shared<Result<SourceResult, NoRejection>>, id: &ModuleId) -> bool {
+  return match move SourceIndex.source(store, answer, id) {
+    Option<&IndexedSource>.Some {value: ignored} => true
+    Option<&IndexedSource>.None => false
+  }
 }
 
 /// An absent or present source result with its exact held source observation.
@@ -190,6 +219,7 @@ pub struct SourceIndex {
   revision: Revision
   keys: Vector<ModuleId>
   sources: Vector<IndexedSource>
+  cursorToken: Option<Shared<CursorStamp>>
   query: Query<Word, SourceResult, NoRejection>
   events: Vector<Event>
 }
@@ -340,6 +370,7 @@ impl SourceIndex {
       revision: move revision,
       keys: Vector.make<ModuleId>(),
       sources: Vector.make<IndexedSource>(),
+      cursorToken: Option.none<Shared<CursorStamp>>(),
       query: Query.make<Word, SourceResult, NoRejection>(),
       events: Vector.make<Event>(),
     }
@@ -351,6 +382,12 @@ impl SourceIndex {
   /// Semantic answers can be validated separately against this revision. A source demand in
   /// the new revision parses its own retained bytes; no old source slot crosses the boundary.
   pub fn revise(self: &mut Self, revision: Revision) -> () {
+    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
+      Shared.withMut<CursorStamp, ()>(&value, fn(stamp: &mut CursorStamp) -> () {
+        stamp.generation = stamp.generation + usize.ONE
+        return ()
+      })
+    }
     self.revision = move revision
     self.keys = Vector.make<ModuleId>()
     self.sources = Vector.make<IndexedSource>()
@@ -484,4 +521,104 @@ impl SourceIndex {
     }
     return Option.some<&IndexedSource>(&sources[selected.slot])
   }
+  /// Authenticates an exact present source once, then retains a zero-copy cursor to its HIR.
+  pub effect fn authoredCursor(
+    self: &mut Self,
+    answer: &Shared<Result<SourceResult, NoRejection>>,
+    id: &ModuleId,
+  ) -> Option<AuthoredCursor> ! OutOfMemoryError ? &mut Allocator {
+    if !authenticatedSource(&self.*, answer, id) {
+      return Option.none<AuthoredCursor>()
+    }
+    let slot = Shared.with<Result<SourceResult, NoRejection>, usize>(answer, fn(value: &Result<SourceResult, NoRejection>) -> usize {
+      return match &value.* {
+        Result<SourceResult, NoRejection>.Success {value: SourceResult.Present {slot, ..}} => slot
+        _ => usize.MAX
+      }
+    })
+    if slot == usize.MAX {
+      return Option.none<AuthoredCursor>()
+    }
+    let needsToken = match &self.cursorToken {
+      Option<Shared<CursorStamp>>.None => true
+      Option<Shared<CursorStamp>>.Some {value: ignored} => false
+    }
+    if needsToken {
+      self.cursorToken = Option.some<Shared<CursorStamp>>(
+        run Shared.make<CursorStamp>(CursorStamp {generation: usize.ZERO}),
+      )
+    }
+    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
+      return Option.some<AuthoredCursor>(AuthoredCursor {
+        token: Shared.clone<CursorStamp>(&value),
+        generation: Shared.with<CursorStamp, usize>(&value, fn(stamp: &CursorStamp) -> usize {
+          return stamp.generation
+        }),
+        slot: slot,
+      })
+    }
+    return Option.none<AuthoredCursor>()
+  }
+  /// Reads one Copy HIR node through a short, constant-time authenticated borrow.
+  pub fn authoredNode(self: &Self, cursor: &AuthoredCursor, id: HirId) -> Option<Node> {
+    if let Option<&IndexedSource>.Some {value} = move cursorSource(self, cursor) {
+      let hir = IndexedSource.authored(value)
+      if id.index < Module.length(hir) {
+        return Option.some<Node>(Module.node(hir, id))
+      }
+    }
+    return Option.none<Node>()
+  }
+  /// Reads one source span through a short, constant-time authenticated borrow.
+  pub fn authoredSpan(self: &Self, cursor: &AuthoredCursor, id: HirId) -> Option<Span> {
+    if let Option<&IndexedSource>.Some {value} = move cursorSource(self, cursor) {
+      let hir = IndexedSource.authored(value)
+      if id.index < Module.length(hir) {
+        return Option.some<Span>(Module.span(hir, id))
+      }
+    }
+    return Option.none<Span>()
+  }
+  /// Reads one child identity through a short, constant-time authenticated borrow.
+  pub fn authoredChild(self: &Self, cursor: &AuthoredCursor, range: Range, at: usize) -> Option<HirId> {
+    if let Option<&IndexedSource>.Some {value} = move cursorSource(self, cursor) {
+      if at < range.length {
+        return Option.some<HirId>(Module.child(IndexedSource.authored(value), range, at))
+      }
+    }
+    return Option.none<HirId>()
+  }
+  /// Borrows interned text only until the next mutable resolver demand.
+  pub fn authoredText(self: &Self, cursor: &AuthoredCursor, symbol: Symbol) -> Option<&[u8]> {
+    if let Option<&IndexedSource>.Some {value} = move cursorSource(self, cursor) {
+      let hir = IndexedSource.authored(value)
+      if symbol.index < StringTable.length(&hir.strings) {
+        return Option.some<&[u8]>(Module.text(hir, symbol))
+      }
+    }
+    return Option.none<&[u8]>()
+  }
+}
+
+// A cloned token keeps its allocation live, so its payload address is an exact store identity
+// without an ABA reuse. Revising the store advances the generation before releasing old sources.
+fn cursorSource(self: &SourceIndex, cursor: &AuthoredCursor) -> Option<&IndexedSource> {
+  if let Option<Shared<CursorStamp>>.Some {value: held} = &self.cursorToken {
+    let owner = Shared.with<CursorStamp, usize>(&held, stampAddress)
+    let supplied = Shared.with<CursorStamp, usize>(&cursor.token, stampAddress)
+    if owner != supplied {
+      return Option.none<&IndexedSource>()
+    }
+    let generation = Shared.with<CursorStamp, usize>(&held, fn(stamp: &CursorStamp) -> usize {
+      return stamp.generation
+    })
+    if generation != cursor.generation {
+      return Option.none<&IndexedSource>()
+    }
+    let sources = Vector.asSlice<IndexedSource>(&self.sources)
+    if cursor.slot < sources.length {
+      return Option.some<&IndexedSource>(&sources[cursor.slot])
+    }
+  }
+  return Option.none<&IndexedSource>()
 }
