@@ -400,9 +400,10 @@ and rejected. Adding or removing a previously missing imported declaration also 
 consumers. Reused bodies carry the current source observation and current dependency evidence.
 If a source edit moves the caller's syntax positions, changes its declaration, makes its owner
 mapping ambiguous, or changes a dependency whose semantic identity cannot be compared exactly,
-the checker runs again. Changed contract, proof, witness, inference, method/operator selection,
-and specialization facts invalidate their consumers; a witness implementation-body-only edit
-can retain a contract-typed caller after validation. These events prove only semantic-body reuse;
+the checker runs again. Changed contract, proof, witness, inference, and method/operator selection
+facts invalidate their consumers; a witness implementation-body-only edit can retain a
+contract-typed caller after validation. A fresh specialization Pool uses the current validated
+facts to distinguish a changed selected witness. These events prove only semantic-body reuse;
 they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
 
 Richer facts follow the same validation rule. A fact stays valid only while every present or absent
@@ -490,10 +491,11 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
 
 - **M2.3, contract facts:** canonical interface/service scopes, implementation coherence,
   conditional conformance proof, witnesses, type/row/representation inference, abstract contract
-  typing, method and eligible operator selection, and specialization identities are supported in
-  the current semantic layer. Their demand and revision answers retain complete observations.
-  Abstract generic bodies retain later safety obligations; body-sensitive property proofs belong
-  to M2.5.
+  typing, and method and eligible operator selection are supported in the current semantic layer.
+  Their demand and revision answers retain complete observations. A fresh per-request
+  specialization `Pool` builds closed semantic and runtime identities from those validated facts;
+  the Pool is not a revision-cached query answer. Retained instance answers belong to M3. Abstract
+  generic bodies retain later safety obligations; body-sensitive property proofs belong to M2.5.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
