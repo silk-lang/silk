@@ -110,6 +110,14 @@ fn staticSharedIntegerIs(value: &StaticData, expected: u64) -> bool {
   }
 }
 
+effect fn staticSemantic(id: &ModuleId, text: string, target: MachineTarget) -> Semantic
+! OutOfMemoryError
+? &mut Allocator {
+  let source = run present(text)
+  let revision = run Revision.publish(&Revision.make(), id, &source)
+  return Semantic.make(move revision, target)
+}
+
 test effect fn staticFunctionsExecuteLocalControlAndFiniteRecursion() -> ()
 ! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -118,7 +126,10 @@ test effect fn staticFunctionsExecuteLocalControlAndFiniteRecursion() -> ()
   let bytes = run Bytes.copy(String.utf8Bytes(source)) |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(SourceUnit.diagnosticCount(&unit) == usize.ZERO, "static control fixture parses without recovery")
-  let mut machine = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Aarch64AppleDarwin), StaticExecution.Limits {steps: 200, depth: 16, valueBytes: 1024})
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Aarch64AppleDarwin))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &id, StaticExecution.Limits {steps: 200, depth: 16, valueBytes: 1024})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let four = run Shared.make<StaticData>(StaticData.Integer {ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: 4})
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -191,6 +202,139 @@ fn staticExecutionSourceFault(
   }
 }
 
+fn staticExecutionCallFault(
+  answer: &Result<Shared<StaticData>, StaticDiagnostic | OutOfMemoryError>,
+  expected: StaticExecutionFault,
+  expectedCode: &[u8],
+  offset: usize,
+  width: usize,
+) -> bool {
+  return match &answer.* {
+    Result<Shared<StaticData>, StaticDiagnostic | OutOfMemoryError>.Failure {error} => match &error {
+      StaticDiagnostic {fault, code, span, ..} => fault == expected && sameBytes(code, expectedCode) && span.start == offset && span.end == offset + width
+      _ => false
+    }
+    _ => false
+  }
+}
+
+test effect fn staticCallsResolveImportedDeclarationsAndHeldEdits() -> ()
+! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("static-import-entry.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let helper = run module("helper.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let entryText = """import helper { value as selected, hidden, runtime }
+import helper as Helper
+static fn direct() -> u32 { return selected() }
+static fn qualified() -> u32 { return Helper.value() }
+static fn privateCall() -> u32 { return hidden() }
+static fn runtimeCall() -> u32 { return runtime() }
+"""
+  let entrySource = run present(entryText) |> Effect.provideMut<Allocator>(&mut allocator)
+  let helperSource = run present("""pub static fn value() -> u32 { return 7 }
+static fn hidden() -> u32 { return 1 }
+pub fn runtime() -> u32 { return 1 }
+""")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &entry, &entrySource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&first, &helper, &helperSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator))
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &entry, StaticExecution.Limits {steps: 64, depth: 8, valueBytes: 256})
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let args = Vector.make<Shared<StaticData>>()
+  let empty = Vector.asSlice<Shared<StaticData>>(&args)
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  let direct = run StaticExecution.demand(&mut machine, b"direct", empty, span)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let qualified = run StaticExecution.demand(&mut machine, b"qualified", empty, span)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Shared.with<StaticData, bool>(&direct, fn(value: &StaticData) -> bool {
+    return staticSharedIntegerIs(value, 7)
+  }) && Shared.with<StaticData, bool>(&qualified, fn(value: &StaticData) -> bool {
+    return staticSharedIntegerIs(value, 7)
+  }), "aliased and qualified imports select the helper's static body")
+  let hidden = run Effect.result(StaticExecution.demand(&mut machine, b"privateCall", empty, span))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let runtime = run Effect.result(StaticExecution.demand(&mut machine, b"runtimeCall", empty, span))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    staticExecutionCallFault(&hidden, StaticExecutionFault.Unavailable, b"SEM0176", offsetOf(entryText, "hidden()", usize.ZERO), 8) &&
+    staticExecutionCallFault(&runtime, StaticExecutionFault.Unavailable, b"SEM0176", offsetOf(entryText, "runtime()", usize.ZERO), 9),
+    "private and runtime callees reject at their authored call spans",
+  )
+  drop machine
+  let recorded = Vector.asSlice<Dependency>(&staticDependencies)
+  let mut reachedBody = false
+  let mut at = usize.ZERO
+  while at < recorded.length {
+    if recorded[at].family == Family.Body && ModuleId.equals(&recorded[at].module, &helper) {
+      if let Option<DeclarationId>.Some {value: declaration} = &recorded[at].declaration {
+        if sameBytes(DeclarationId.spelling(&declaration), b"value") {
+          reachedBody = true
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  run Testing.expect(reachedBody, "a reached imported static body has a canonical query dependency")
+  let changed = run present("""pub static fn value() -> u32 { return 9 }
+static fn hidden() -> u32 { return 1 }
+pub fn runtime() -> u32 { return 1 }
+""")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let updated = run Revision.publish(&revision, &helper, &changed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.revise(&mut semantic, move updated)
+  let mut freshDependencies = Vector.make<Dependency>()
+  let mut freshMachine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut freshDependencies), &entry, StaticExecution.Limits {steps: 64, depth: 8, valueBytes: 256})
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let replaced = run StaticExecution.demand(&mut freshMachine, b"direct", empty, span)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Shared.with<StaticData, bool>(&replaced, fn(value: &StaticData) -> bool {
+    return staticSharedIntegerIs(value, 9)
+  }), "a fresh demand reads the edited helper body")
+  return ()
+}
+
+test effect fn staticCallsDetectCrossModuleCycles() -> ()
+! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let alpha = run module("alpha.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let beta = run module("beta.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let alphaText = """import beta as Beta
+pub static fn ping() -> u32 { return Beta.pong() }
+"""
+  let betaText = """import alpha as Alpha
+pub static fn pong() -> u32 { return Alpha.ping() }
+"""
+  let alphaSource = run present(alphaText) |> Effect.provideMut<Allocator>(&mut allocator)
+  let betaSource = run present(betaText) |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &alpha, &alphaSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&first, &beta, &betaSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut dependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut dependencies), &alpha, StaticExecution.Limits {steps: 64, depth: 8, valueBytes: 256})
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let args = Vector.make<Shared<StaticData>>()
+  let attempted = run Effect.result(StaticExecution.demand(
+    &mut machine,
+    b"ping",
+    Vector.asSlice<Shared<StaticData>>(&args),
+    Span.make(usize.ZERO, usize.ZERO),
+  )) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    staticExecutionCallFault(&attempted, StaticExecutionFault.Cycle, b"SEM0178", offsetOf(betaText, "Alpha.ping()", usize.ZERO), 12) &&
+    staticExecutionTraceHas(&attempted, 2),
+    "cross-module recursion uses canonical callee identity and reports the authored call",
+  )
+  return ()
+}
+
 test effect fn staticArithmeticReportsOperationCodeAndSpan() -> ()
 ! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -198,7 +342,10 @@ test effect fn staticArithmeticReportsOperationCodeAndSpan() -> ()
   let source = "static fn add(value: u32) -> u32 { return value + 1 }\nstatic fn divide(value: u32) -> u32 { return value / 0 }\n"
   let bytes = run Bytes.copy(String.utf8Bytes(source)) |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut machine = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Aarch64AppleDarwin), StaticExecution.Limits {steps: 32, depth: 4, valueBytes: 512})
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Aarch64AppleDarwin))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &id, StaticExecution.Limits {steps: 32, depth: 4, valueBytes: 512})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let max = run Shared.make<StaticData>(StaticData.Integer {ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: 4294967295})
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -221,7 +368,10 @@ test effect fn staticCallsDistinguishCyclesLimitsAndUnavailableOperations() -> (
   let bytes = run Bytes.copy(String.utf8Bytes(source)) |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(SourceUnit.diagnosticCount(&unit) == usize.ZERO, "static failure fixture parses without recovery")
-  let mut machine = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Aarch64AppleDarwin), StaticExecution.Limits {steps: 100, depth: 2, valueBytes: 1024})
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Aarch64AppleDarwin))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &id, StaticExecution.Limits {steps: 100, depth: 2, valueBytes: 1024})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let input = run Shared.make<StaticData>(StaticData.Integer {ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: 1})
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -263,10 +413,14 @@ test effect fn staticRetainedValueLimitRejectsPublication() -> ()
 ! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let id = run module("static-value-limit.silk") |> Effect.provideMut<Allocator>(&mut allocator)
-  let bytes = run Bytes.copy(String.utf8Bytes("static fn identity(value: u32) -> u32 { return value }\n"))
+  let source = "static fn identity(value: u32) -> u32 { return value }\n"
+  let bytes = run Bytes.copy(String.utf8Bytes(source))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut machine = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Aarch64AppleDarwin), StaticExecution.Limits {steps: 20, depth: 4, valueBytes: 32})
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Aarch64AppleDarwin))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &id, StaticExecution.Limits {steps: 20, depth: 4, valueBytes: 32})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let input = run Shared.make<StaticData>(StaticData.Integer {ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: 1})
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -293,11 +447,13 @@ test effect fn staticCallCacheIncludesCheckedGenericApplication() -> ()
 ! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let id = run module("static-generic-key.silk") |> Effect.provideMut<Allocator>(&mut allocator)
-  let bytes = run Bytes.copy(String.utf8Bytes("static fn phantom<T>(value: u32) -> u32 { return value }\n"))
+  let source = "static fn phantom<T>(value: u32) -> u32 { return value }\n"
+  let bytes = run Bytes.copy(String.utf8Bytes(source))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
   let index = run ModuleIndex.build(&unit) |> Effect.provideMut<Allocator>(&mut allocator)
-  let header = run StaticFunction.select(&unit, &index, b"phantom")
+  let declarations = ModuleIndex.listDeclarations(&index)
+  let header = run StaticFunction.select(&unit, &index, &declarations[usize.ZERO].identity)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let selected = match move header {
     Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value} => value
@@ -312,7 +468,10 @@ test effect fn staticCallCacheIncludesCheckedGenericApplication() -> ()
     |> Effect.provideMut<Allocator>(&mut allocator)
   let otherApplication = run specializationOf(&selected.declaration, &boolean)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut machine = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Aarch64AppleDarwin), StaticExecution.Limits {steps: 20, depth: 4, valueBytes: 32})
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Aarch64AppleDarwin))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut staticDependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut staticDependencies), &id, StaticExecution.Limits {steps: 20, depth: 4, valueBytes: 32})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let input = run Shared.make<StaticData>(StaticData.Integer {ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: 1})
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -361,13 +520,20 @@ test effect fn staticUnsuffixedPointerLiteralsUseSelectedTarget() -> ()
 ! InvalidModulePath | OutOfMemoryError | StaticDiagnostic | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let id = run module("static-pointer-literals.silk") |> Effect.provideMut<Allocator>(&mut allocator)
-  let bytes = run Bytes.copy(String.utf8Bytes("static fn wideUnsigned() -> usize { return 4294967296 }\nstatic fn wideSigned() -> isize { return 2147483648 }\nstatic fn echo(value: usize) -> usize { return value }\nstatic fn callEcho() -> usize { return echo(4294967296) }\nstatic fn sumWord() -> usize { return 1 + 2 }\nstatic fn callSum() -> usize { return echo(1 + 2) }\n"))
+  let source = "static fn wideUnsigned() -> usize { return 4294967296 }\nstatic fn wideSigned() -> isize { return 2147483648 }\nstatic fn echo(value: usize) -> usize { return value }\nstatic fn callEcho() -> usize { return echo(4294967296) }\nstatic fn sumWord() -> usize { return 1 + 2 }\nstatic fn callSum() -> usize { return echo(1 + 2) }\n"
+  let bytes = run Bytes.copy(String.utf8Bytes(source))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(SourceUnit.diagnosticCount(&unit) == usize.ZERO, "pointer-width source fixture parses without recovery")
-  let mut native = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), StaticExecution.Limits {steps: 64, depth: 3, valueBytes: 256})
+  let mut nativeSemantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut wasm = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Wasm32UnknownUnknown), StaticExecution.Limits {steps: 64, depth: 3, valueBytes: 256})
+  let mut wasmSemantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.Wasm32UnknownUnknown))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut nativeDependencies = Vector.make<Dependency>()
+  let mut wasmDependencies = Vector.make<Dependency>()
+  let mut native = run StaticExecution.make(Semantic.staticPort(&mut nativeSemantic, &mut nativeDependencies), &id, StaticExecution.Limits {steps: 64, depth: 3, valueBytes: 256})
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut wasm = run StaticExecution.make(Semantic.staticPort(&mut wasmSemantic, &mut wasmDependencies), &id, StaticExecution.Limits {steps: 64, depth: 3, valueBytes: 256})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let args = Vector.make<Shared<StaticData>>()
   let span = Span.make(usize.ZERO, usize.ZERO)
@@ -442,27 +608,54 @@ test effect fn staticFunctionHeaderIsDemandedWithoutRunningItsBody() -> ()
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let index = run ModuleIndex.build(&unit) |> Effect.provideMut<Allocator>(&mut allocator)
-  let valid = run StaticFunction.select(&unit, &index, b"valid")
+  let declarations = ModuleIndex.listDeclarations(&index)
+  let valid = run StaticFunction.select(&unit, &index, &declarations[usize.ZERO].identity)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let selectedHeader = match move valid {
     Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value} => Vector.length<HirId>(&value.parameters) == usize.ONE
     _ => false
   }
   run Testing.expect(selectedHeader, "static header selects its body and parameter binder")
-  let broken = run StaticFunction.select(&unit, &index, b"broken")
+  let broken = run StaticFunction.select(&unit, &index, &declarations[2].identity)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let selectedBroken = match move broken {
     Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value: _} => true
     _ => false
   }
   run Testing.expect(selectedBroken, "uncalled body is not evaluated")
-  let runtime = run StaticFunction.select(&unit, &index, b"runtime")
+  let runtime = run StaticFunction.select(&unit, &index, &declarations[usize.ONE].identity)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let rejectedRuntime = match move runtime {
     Result<SelectedStaticFunction, StaticHeaderRejection>.Failure {error} => error.fault == StaticHeaderFault.RuntimeFunction
     _ => false
   }
   run Testing.expect(rejectedRuntime, "runtime function is not a static call target")
+  return ()
+}
+
+test effect fn staticCallRejectsCheckedBodyFailure() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("static-checked-body.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = """static fn invalid() -> u32 {
+  let value: bool = 7
+  return value
+}
+static fn caller() -> u32 { return invalid() }
+"""
+  let mut semantic = run staticSemantic(&id, source, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut dependencies = Vector.make<Dependency>()
+  let mut machine = run StaticExecution.make(Semantic.staticPort(&mut semantic, &mut dependencies), &id, StaticExecution.Limits {steps: 32, depth: 4, valueBytes: 64})
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let arguments = Vector.make<Shared<StaticData>>()
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  let attempted = run Effect.result(StaticExecution.demand(&mut machine, b"caller", Vector.asSlice<Shared<StaticData>>(&arguments), span))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    staticExecutionCallFault(&attempted, StaticExecutionFault.Unsupported, b"SEM0176", offsetOf(source, "invalid()", usize.ONE), 9),
+    "a rejected checked body never executes from raw HIR",
+  )
   return ()
 }
 
@@ -12462,9 +12655,26 @@ static fn splitText() -> string<'static> { return Intrinsic.staticTextSlice("é!
   let bytes = run Bytes.copy(String.utf8Bytes(source)) |> Effect.provideMut<Allocator>(&mut allocator)
   let unit = run SourceUnit.parse(&id, usize.ONE, move bytes) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(SourceUnit.diagnosticCount(&unit) == usize.ZERO, "intrinsic source wrapper parses without recovery")
-  let mut wasm = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.Wasm32UnknownUnknown), StaticExecution.Limits {steps: 100, depth: 8, valueBytes: 1024})
+  let held = run present(source) |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &id, &held) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut wasmSemantic = Semantic.make(
+    run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator),
+    MachineTarget.forId(TargetId.Wasm32UnknownUnknown),
+  )
+  let mut nativeSemantic = Semantic.make(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut wasmDependencies = Vector.make<Dependency>()
+  let mut nativeDependencies = Vector.make<Dependency>()
+  let mut wasm = run StaticExecution.make(
+    Semantic.staticPort(&mut wasmSemantic, &mut wasmDependencies),
+    &id,
+    StaticExecution.Limits {steps: 100, depth: 8, valueBytes: 1024},
+  )
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut native = run StaticExecution.make(&unit, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), StaticExecution.Limits {steps: 100, depth: 8, valueBytes: 1024})
+  let mut native = run StaticExecution.make(
+    Semantic.staticPort(&mut nativeSemantic, &mut nativeDependencies),
+    &id,
+    StaticExecution.Limits {steps: 100, depth: 8, valueBytes: 1024},
+  )
     |> Effect.provideMut<Allocator>(&mut allocator)
   let args = Vector.make<Shared<StaticData>>()
   let span = Span.make(usize.ZERO, usize.ZERO)
@@ -12491,6 +12701,122 @@ static fn splitText() -> string<'static> { return Intrinsic.staticTextSlice("é!
     staticByteFailureHas(&badByte, 3, offsetOf(source, "\"é!\"", usize.ZERO)) &&
       staticByteFailureHas(&split, 1, offsetOf(source, "\"é!\"", usize.ONE)),
     "static text faults retain the source text anchor and failing byte offset",
+  )
+  return ()
+}
+
+fn initializerHasBody(
+  answer: &Result<Answer, NoRejection>,
+  module: &ModuleId,
+  name: &[u8],
+) -> bool {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => {
+      let edges = Vector.asSlice<Dependency>(&value.dependencies)
+      let mut at = usize.ZERO
+      while at < edges.length {
+        if edges[at].family == Family.Body && ModuleId.equals(&edges[at].module, module) {
+          if let Option<DeclarationId>.Some {value: declaration} = &edges[at].declaration {
+            if sameBytes(DeclarationId.spelling(&declaration), name) { return true }
+          }
+        }
+        at = at + usize.ONE
+      }
+      return false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+test effect fn staticInitializerRecomputesAfterReachedImportedBodyEdit() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("static-constant-entry.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let helper = run module("helper.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let entrySource = run present("""import helper { value as selected, idle }
+const computed: u32 = selected()
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstBody = run present("""pub static fn value() -> u32 { return 7 }
+pub static fn idle() -> u32 { return 99 }
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &helper, &firstBody)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&first, &entry, &entrySource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(run Revision.copy(&revision)
+    |> Effect.provideMut<Allocator>(&mut allocator))
+  let mut request = Request.make()
+  let initial = run Semantic.demandInitializer(&mut semantic, &mut request, &entry, b"computed")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&initial, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantInteger(answer, b"7") && initializerHasBody(answer, &helper, b"value") &&
+        !initializerHasBody(answer, &helper, b"idle")
+    }),
+    "an active initializer records only its reached imported helper body",
+  )
+  let initializerStarts = starts(Semantic.eventLog(&semantic), Family.Initializer)
+  let changedBody = run present("""pub static fn value() -> u32 { return 9 }
+pub static fn idle() -> u32 { return 99 }
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let updated = run Revision.publish(&revision, &helper, &changedBody)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.revise(&mut semantic, move updated)
+  let mut again = Request.make()
+  let changed = run Semantic.demandInitializer(&mut semantic, &mut again, &entry, b"computed")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&changed, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantInteger(answer, b"9") && initializerHasBody(answer, &helper, b"value")
+    }) && starts(Semantic.eventLog(&semantic), Family.Initializer) == initializerStarts + usize.ONE,
+    "editing the reached imported body recomputes the active initializer",
+  )
+  return ()
+}
+
+test effect fn importedTargetConstantsUseTheFrozenSemanticTarget() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let target = run module("target.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let entry = run module("target-entry.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let targetSource = run present("""pub const pointerBits: u32 = Intrinsic.targetPointerBits()
+pub const architecture: string<'static> = Intrinsic.targetArchitecture()
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let entrySource = run present("""import target { pointerBits, architecture }
+const selectedBits: u32 = pointerBits
+const selectedArchitecture: string<'static> = architecture
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &target, &targetSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&first, &entry, &entrySource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut wasm = Semantic.make(
+    run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator),
+    MachineTarget.forId(TargetId.Wasm32UnknownUnknown),
+  )
+  let mut native = Semantic.make(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut wasmRequest = Request.make()
+  let mut nativeRequest = Request.make()
+  let wasmBits = run Semantic.demandInitializer(&mut wasm, &mut wasmRequest, &entry, b"selectedBits")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let wasmArchitecture = run Semantic.demandInitializer(&mut wasm, &mut wasmRequest, &entry, b"selectedArchitecture")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let nativeBits = run Semantic.demandInitializer(&mut native, &mut nativeRequest, &entry, b"selectedBits")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let nativeArchitecture = run Semantic.demandInitializer(&mut native, &mut nativeRequest, &entry, b"selectedArchitecture")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&wasmBits, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantInteger(answer, b"32")
+    }) && Shared.with<Result<Answer, NoRejection>, bool>(&nativeBits, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantInteger(answer, b"64")
+    }) && Shared.with<Result<Answer, NoRejection>, bool>(&wasmArchitecture, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantText(answer, b"wasm32")
+    }) && Shared.with<Result<Answer, NoRejection>, bool>(&nativeArchitecture, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return constantText(answer, b"x86_64")
+    }) && Request.hasDemand(&wasmRequest, Family.Initializer, &target) &&
+      Request.hasDemand(&nativeRequest, Family.Initializer, &target),
+    "ordinary imported target constants retain their selected target and value edges",
   )
   return ()
 }
