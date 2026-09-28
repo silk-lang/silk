@@ -16,6 +16,15 @@ const isAncestor = (ancestor, descendant) => {
   }
 }
 
+const blobAt = (commit, path) => {
+  try {
+    const object = git('rev-parse', '--verify', '--quiet', `${commit}:${path}`)
+    return git('cat-file', '-t', object) === 'blob' ? object : undefined
+  } catch {
+    return null
+  }
+}
+
 const guardedPaths = [
   'packages/',
   'scripts/',
@@ -44,8 +53,10 @@ for (const commit of commits) {
   )
   if (!firstParent) continue
 
-  const changed = git('diff', '--name-only', firstParent, commit, '--', ...guardedPaths)
-  if (!changed || isAncestor(commit, mainCommit)) continue
+  const changed = git('diff', '--name-only', '-z', firstParent, commit, '--', ...guardedPaths)
+    .split('\0')
+    .filter(Boolean)
+  if (changed.length === 0 || isAncestor(commit, mainCommit)) continue
 
   const mainParent = otherParents.find((parent) => isAncestor(parent, mainCommit))
   const isCleanMainSync =
@@ -59,8 +70,16 @@ for (const commit of commits) {
   )
   if (isCleanMainSync || isCleanBaseSync) continue
 
+  const containsOnlyLandedContent = changed.every((path) => {
+    const blob = blobAt(commit, path)
+    return (
+      blob !== undefined && (blob === blobAt(baseCommit, path) || blob === blobAt(mainCommit, path))
+    )
+  })
+  if (containsOnlyLandedContent) continue
+
   process.stderr.write(
-    `Bootstrap inputs changed outside main-first synchronization in ${commit}:\n${changed}\n`,
+    `Bootstrap inputs changed outside main-first synchronization in ${commit}:\n${changed.join('\n')}\n`,
   )
   process.stderr.write('Land the repair on main, then merge that main history into selfhost.\n')
   process.exit(1)

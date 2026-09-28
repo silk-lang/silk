@@ -2,6 +2,10 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-09-28 · The shared checkout's CLI dependency links pointed into another unit's worktree and became dangling during parallel setup · Run frontend checks with the intact main checkout's CLI, then build and test from an isolated worktree after acquiring the shared build slot · self-hosted compiler
+- 2026-09-28 · Importing the large semantic test root for a few target assertions exhausted a 6 GiB frontend heap before diagnostics · Keep these independent target assertions in a small focused root and run that root directly · self-hosted compiler
+- 2026-09-28 · Codebase-memory indexing failed with "a pre-coordination or unverified CBM generation is active" in both the shared checkout and an isolated worktree · Read the worker log, then use scoped `rg` until the index service can coordinate · self-hosted compiler
+
 - 2026-09-28 · `silk format --check` reported only PAR0001/PAR0002 for a damaged large source file, without a location; a one-line `match` in an added test hid the actual parse failure · Slice the new test into temporary complete source prefixes and format-check each to locate the first invalid statement; write match arms on separate lines · self-hosted compiler
 
 - 2026-09-26 · The combined M1 native test root reached JavaScript heap OOM in focused CI before any case ran, and `--filter` could not reduce compilation because it selects only at runtime · Run the query/source-index root and semantic root sequentially in the same job; all 27 cases pass uncached within the existing heap limit · self-hosted compiler
@@ -308,3 +312,6 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-28 · U7 codebase-memory indexing could not start because another generation held the coordination lock · Use scoped source reads while the graph worker is occupied and retry once it clears · self-hosted compiler
 - 2026-09-28 · Concurrent M2.4 agents initially edited one shared checkout and switched its branch during another unit's work · Move each unit's exact patch into its own named git worktree and reverse-apply only its own hunks in the shared checkout · self-hosted compiler
 - 2026-09-28 · U7's focused `SemanticCases` root exhausted Node 24's default 4 GiB heap after five minutes despite prior U7 cases and exact-head CI passing · Use smaller local roots where possible and exact-head Focused Linux CI for the full semantic root, per the existing 6144 MiB heap guard · self-hosted compiler
+- 2026-09-28 · Parallel M2.4 agents shared one checkout, so a branch switch collided with another unit's edits · Move each unit to its own Git worktree and register the secondary root for attributed commits · self-hosted compiler
+- 2026-09-28 · `silk format` on touched legacy semantic files rewrote thousands of unrelated lines · Format new actor modules only; keep legacy-file edits narrow until those files are formatted separately · self-hosted compiler
+- 2026-09-28 · A shared-value operator compiled in isolation but CI rejected its nested anonymous callback with SEM0199 · Move the inner Shared.with callback into a named helper and exercise the SemanticCases root in CI · self-hosted compiler
