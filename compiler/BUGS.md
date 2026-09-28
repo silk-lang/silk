@@ -1,9 +1,10 @@
 # Compiler findings
 
-## Scalar enum equality can leave a native call target unresolved
+## Scalar enum equality native call target (fixed)
 
-**Status:** open bootstrap native-emission bug, observed on 2026-09-28. The method-selection
-test now uses explicit variant patterns; this does not fix the bootstrap compiler.
+**Status:** fixed in the bootstrap by [#571](https://github.com/julia-script/silk/pull/571) and
+synced into selfhost by [#572](https://github.com/julia-script/silk/pull/572). The failure below
+was observed on 2026-09-28 before those fixes.
 
 At selfhost method head `08d5ce8aa2fe12f7760d1ed87ee831d00333fc7c`,
 `SemanticCases.silk` defines `bodyRetainsReceiverPass(body, mode)` and calls it from a
@@ -22,10 +23,9 @@ NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test \
 ```
 
 The [Focused Linux run](https://github.com/julia-script/silk/actions/runs/36417381326)
-records the failure before any native test executes. The intended behavior is a resolved helper
-call and a boolean comparison of the enum variants. A small standalone repro and main-first
-bootstrap repair remain to be done; this entry records the exact source-written reproducer rather
-than claiming a smaller fixture has been verified.
+records the historical failure before any native test executes. A worktree whose generated
+`packages/compiler/dist` predates #571 can reproduce it even after merging the fixed source;
+rebuild the bootstrap dependencies before interpreting a local native-emission result.
 
 ## Instance discovery multiplies call-path contexts for the full parser
 
