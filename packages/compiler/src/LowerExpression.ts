@@ -576,32 +576,49 @@ function lowerEnumEqualityExpression(
   expression: Extract<Tir.Expression, { readonly _tag: 'EnumEquality' }>,
   availableRequirements: FunctionLowering['providedRequirements'],
 ): LoweredExpression | undefined {
+  const readEnum = (
+    value: LoweredValue,
+  ):
+    | { readonly result: Mir.LocalId; readonly type: Extract<Mir.Type, { readonly _tag: 'Enum' }> }
+    | undefined => {
+    const sourceType = fn.localTypes.at(value.result.ordinal)
+    let type: Mir.Type | undefined
+    if (sourceType?._tag === 'Enum') type = sourceType
+    else if (sourceType?._tag === 'EnvironmentBorrow') type = fn.type(sourceType.type)
+    if (
+      type?._tag !== 'Enum' ||
+      type.representation.enum.module !== expression.enum.module ||
+      type.representation.enum.name !== expression.enum.name
+    )
+      return undefined
+    if (sourceType?._tag === 'Enum') return { result: value.result, type }
+    const destination = fn.alloc(type)
+    fn.emit({
+      _tag: 'ReadPlace',
+      destination,
+      root: value.result,
+      selectors: [],
+      type,
+      provenance: authored(expression.span),
+    })
+    return { result: destination, type }
+  }
   const left = lowerExpression(fn, expression.left, availableRequirements)
   if (left === 'Transferred') return left
+  const leftEnum = left === undefined ? undefined : readEnum(left)
   const right = lowerExpression(fn, expression.right, availableRequirements)
   if (right === 'Transferred') return right
-  const leftType = left === undefined ? undefined : fn.localTypes.at(left.result.ordinal)
-  const rightType = right === undefined ? undefined : fn.localTypes.at(right.result.ordinal)
-  if (
-    left === undefined ||
-    right === undefined ||
-    leftType?._tag !== 'Enum' ||
-    rightType?._tag !== 'Enum' ||
-    leftType.representation.enum.module !== expression.enum.module ||
-    leftType.representation.enum.name !== expression.enum.name ||
-    rightType.representation.enum.module !== expression.enum.module ||
-    rightType.representation.enum.name !== expression.enum.name
-  )
-    return undefined
+  const rightEnum = right === undefined ? undefined : readEnum(right)
+  if (leftEnum === undefined || rightEnum === undefined) return undefined
   const destination = fn.alloc(bool)
   fn.emit({
     _tag: 'EnumEquality',
     destination,
-    left: left.result,
-    right: right.result,
+    left: leftEnum.result,
+    right: rightEnum.result,
     enum: expression.enum,
     negated: expression.negated,
-    representation: leftType.representation,
+    representation: leftEnum.type.representation,
     type: bool,
     provenance: authored(expression.span),
   })

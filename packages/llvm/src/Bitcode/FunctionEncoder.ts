@@ -7,6 +7,7 @@ import type * as FunctionBodyDescription from '../internal/FunctionBodyDescripti
 import * as MemoryAccess from '../MemoryAccess.js'
 import { metadataNodeAt, writeFunctionAttachments } from './MetadataEncoder.js'
 import type { ConstantAdapter, GlobalOrder, MetadataAdapter } from './shared.js'
+import * as PackedBody from '../internal/PackedBody.js'
 
 /** @internal */
 const fastMathCode = (flags: FunctionBodyDescription.FastMath): number =>
@@ -481,8 +482,9 @@ export const writeFunctionBodies = (
   const moduleValues = order.entries.length + constants.local.length
   for (const { global, globalIndex } of order.entries) {
     if (global.kind !== 'Function') continue
-    const body = state.functions[global.actorIndex]?.body
-    if (body === undefined) continue
+    const packed = state.functions[global.actorIndex]?.body
+    if (packed === undefined) continue
+    const body = PackedBody.unpack(packed)
     const index = functionIndex(body, moduleValues)
     const block = Bitstream.enterBlock(
       module.writer,
@@ -540,9 +542,9 @@ export const writeOperandBundleTags = (
   const tags = new Map<string, { readonly index: number; readonly value: ByteString.ByteString }>()
   for (const { global } of order.entries) {
     if (global.kind !== 'Function') continue
-    const body = state.functions[global.actorIndex]?.body
-    if (body === undefined) continue
-    for (const instruction of body.instructions) {
+    const packed = state.functions[global.actorIndex]?.body
+    if (packed === undefined || !packed.hasOperandBundles) continue
+    for (const instruction of PackedBody.unpack(packed).instructions) {
       if (instruction._tag !== 'Call' && instruction._tag !== 'Invoke') continue
       for (const bundle of instruction.operandBundles) {
         const key = CanonicalKey.bytes(bundle.tag)

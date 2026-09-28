@@ -9,6 +9,7 @@ import { renderConstant, renderTypedConstant } from './ConstantRenderer.js'
 import { type MetadataRender, renderMetadataAttachments } from './MetadataRenderer.js'
 import { identifier, quoted } from './shared.js'
 import { renderType, typeAt } from './TypeRenderer.js'
+import * as PackedBody from '../internal/PackedBody.js'
 
 /** @internal */
 export const globalPrefix = (description: GlobalDescription.GlobalDescription): string => {
@@ -427,7 +428,7 @@ export const renderFunction = (
   if (type._tag !== 'Function') throw new Error('function declaration has non-function type')
   const attributes =
     fn.attributes === undefined ? undefined : state.functionAttributeSets[fn.attributes]
-  const body = fn.body
+  const body = fn.body === undefined ? undefined : PackedBody.unpack(fn.body)
   const returnAttributes =
     attributes === undefined ? '' : renderAttributeSet(state, attributes.returnAttributes)
   const parameters = type.parameters.map((parameter, index) => {
