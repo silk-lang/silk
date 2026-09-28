@@ -6,14 +6,19 @@
 //! Aggregate children are complete values, never addresses or mutable places. Source positions and
 //! text provenance belong to the evaluation result, not to value identity.
 
+import hir.Hir {InfixOperator, PrefixOperator}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Type {Type}
 import silk.bytes {Bytes}
+import silk.f32
+import silk.f64
 import silk.option {Option}
+import silk.result {Result}
 import silk.shared {Shared}
 import silk.u32
 import silk.u64
 import silk.usize
+import silk.utf8_decoder {Utf8Decoder, Utf8Step}
 import silk.vector {Vector}
 
 /// The exact integer type selected before static arithmetic. Pointer-sized kinds use the frozen
@@ -76,6 +81,14 @@ pub enum Invalid {
   FloatBits,
   AggregateShape,
   UnsupportedType,
+}
+
+/// A static scalar operation failed before it could publish a value. The caller attaches the
+/// authored operation's span and specialization trace to its diagnostic.
+pub enum Fault {
+  InvalidOperands,
+  Overflow,
+  DivisionByZero,
 }
 
 /// The number of bits in an integer type after the target has been frozen.
@@ -161,6 +174,58 @@ pub fn character(scalar: u32) -> Option<Value> {
   return Option.some<Value>(Value.Character {scalar: scalar})
 }
 
+/// Admit complete UTF-8 text without conflating it with a byte view. This checks a static text
+/// candidate again after concatenation or slicing, before it can enter the value domain.
+pub fn text(bytes: Bytes) -> Option<Value> {
+  let mut decoder = Utf8Decoder.make()
+  let data = Bytes.asSlice(&bytes)
+  let mut at = usize.ZERO
+  while at < data.length {
+    if let Utf8Step.Invalid {..} = Utf8Decoder.step(&mut decoder, data[at], at) {
+      return Option.none<Value>()
+    }
+    at = at + usize.ONE
+  }
+  if Utf8Decoder.pending(&decoder) {
+    return Option.none<Value>()
+  }
+  return Option.some<Value>(Value.Text {bytes: move bytes})
+}
+
+/// These type forms contain execution or an address even if their current payload looks inert.
+/// Nominal aggregate members are checked recursively by the evaluator as they are constructed.
+pub fn intrinsicallyForbidden(ty: &Type) -> bool {
+  return match &ty.* {
+    Type.Reference {..} => true
+    Type.Slice {..} => true
+    Type.Pointer {..} => true
+    Type.Callable {..} => true
+    Type.Effect {..} => true
+    Type.NamedRepresentation {..} => true
+    Type.OpaqueRepresentation {..} => true
+    _ => false
+  }
+}
+
+/// Construct an aggregate from already admitted child values. The evaluator supplies its checked
+/// nominal or array shape; no child address or mutable place is retained by the result.
+pub fn aggregate(ty: Shared<Type>, variant: Option<usize>, fields: Vector<Shared<Value>>) -> Option<Value> {
+  if Shared.with<Type, bool>(&ty, intrinsicallyForbidden) {
+    return Option.none<Value>()
+  }
+  let shape = Shared.with<Type, bool>(&ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.Nominal {..} => true
+      Type.Array {..} => true
+      _ => false
+    }
+  })
+  if !shape {
+    return Option.none<Value>()
+  }
+  return Option.some<Value>(Value.Aggregate {ty: move ty, variant: move variant, fields: move fields})
+}
+
 /// Admit a bit-exact float. An f32 value has no bits above its 32-bit representation.
 pub fn floating(ty: FloatType, bits: u64) -> Option<Value> {
   if ty == FloatType.F32 && bits > 0xffffffff {
@@ -190,5 +255,316 @@ pub fn field(value: &Value, ordinal: usize) -> Option<Shared<Value>> {
       return Option.some<Shared<Value>>(Shared.clone<Value>(&values[ordinal]))
     }
     _ => Option.none<Shared<Value>>()
+  }
+}
+
+fn success(value: Value) -> Result<Value, Fault> {
+  return Result.succeed<Value, Fault>(move value)
+}
+
+fn failure(reason: Fault) -> Result<Value, Fault> {
+  return Result.failResult<Value, Fault>(reason)
+}
+
+fn integerResult(ty: IntegerType, sign: Sign, magnitude: u64, pointerBits: u32) -> Result<Value, Fault> {
+  return match integer(ty, sign, magnitude, pointerBits) {
+    Option<Value>.Some {value} => success(move value)
+    Option<Value>.None => failure(Fault.Overflow)
+  }
+}
+
+fn opposite(sign: Sign) -> Sign {
+  if sign == Sign.Negative {
+    return Sign.Positive
+  }
+  return Sign.Negative
+}
+
+fn sum(
+  ty: IntegerType,
+  leftSign: Sign,
+  left: u64,
+  rightSign: Sign,
+  right: u64,
+  pointerBits: u32,
+) -> Result<Value, Fault> {
+  if leftSign == rightSign {
+    return match u64.checkedAdd(left, right) {
+      Option<u64>.Some {value} => integerResult(ty, leftSign, value, pointerBits)
+      Option<u64>.None => failure(Fault.Overflow)
+    }
+  }
+  if left >= right {
+    return integerResult(ty, leftSign, u64.subtract(left, right), pointerBits)
+  }
+  return integerResult(ty, rightSign, u64.subtract(right, left), pointerBits)
+}
+
+fn compareIntegers(leftSign: Sign, left: u64, rightSign: Sign, right: u64) -> i32 {
+  if leftSign != rightSign {
+    if leftSign == Sign.Negative {
+      return -1
+    }
+    return 1
+  }
+  if left == right {
+    return 0
+  }
+  if (left < right) == (leftSign == Sign.Positive) {
+    return -1
+  }
+  return 1
+}
+
+fn ordered(operator: InfixOperator, comparison: i32) -> Result<Value, Fault> {
+  let result = match operator {
+    InfixOperator.Equals => comparison == 0
+    InfixOperator.NotEquals => comparison != 0
+    InfixOperator.LessThan => comparison < 0
+    InfixOperator.LessOrEqual => comparison <= 0
+    InfixOperator.GreaterThan => comparison > 0
+    InfixOperator.GreaterOrEqual => comparison >= 0
+    _ => return failure(Fault.InvalidOperands)
+  }
+  return success(Value.Boolean {value: result})
+}
+
+fn integerPattern(sign: Sign, magnitude: u64) -> u64 {
+  if sign == Sign.Negative {
+    return u64.wrappingSubtract(0, magnitude)
+  }
+  return magnitude
+}
+
+fn fromPattern(ty: IntegerType, pattern: u64, pointerBits: u32) -> Result<Value, Fault> {
+  let bits = match integerBits(ty, pointerBits) {
+    Option<u32>.Some {value} => value
+    Option<u32>.None => return failure(Fault.InvalidOperands)
+  }
+  let mask = if bits == 64 { u64.MAX } else { u64.subtract(u64.shiftLeft(1, u32.toU64(bits)), 1) }
+  let truncated = u64.bitAnd(pattern, mask)
+  if signed(ty) && u64.bitAnd(truncated, u64.shiftLeft(1, u32.toU64(bits - 1))) != 0 {
+    return integerResult(ty, Sign.Negative, u64.bitAnd(u64.wrappingSubtract(0, truncated), mask), pointerBits)
+  }
+  return integerResult(ty, Sign.Positive, truncated, pointerBits)
+}
+
+fn integerPrefix(operator: PrefixOperator, ty: IntegerType, sign: Sign, magnitude: u64, pointerBits: u32) -> Result<Value, Fault> {
+  return match operator {
+    PrefixOperator.Negate => {
+      if !signed(ty) {
+        return failure(Fault.InvalidOperands)
+      }
+      return integerResult(ty, opposite(sign), magnitude, pointerBits)
+    }
+    PrefixOperator.BitwiseNot => fromPattern(ty, u64.bitNot(integerPattern(sign, magnitude)), pointerBits)
+    PrefixOperator.Not => failure(Fault.InvalidOperands)
+  }
+}
+
+fn integerInfix(
+  operator: InfixOperator,
+  ty: IntegerType,
+  leftSign: Sign,
+  left: u64,
+  rightSign: Sign,
+  right: u64,
+  pointerBits: u32,
+) -> Result<Value, Fault> {
+  match operator {
+    InfixOperator.Add => return sum(ty, leftSign, left, rightSign, right, pointerBits)
+    InfixOperator.Subtract => return sum(ty, leftSign, left, opposite(rightSign), right, pointerBits)
+    InfixOperator.Multiply => {
+      return match u64.checkedMultiply(left, right) {
+        Option<u64>.Some {value} => {
+          let sign = if leftSign == rightSign {Sign.Positive} else {Sign.Negative}
+          return integerResult(ty, sign, value, pointerBits)
+        }
+        Option<u64>.None => failure(Fault.Overflow)
+      }
+    }
+    InfixOperator.Divide => {
+      if right == 0 {
+        return failure(Fault.DivisionByZero)
+      }
+      let sign = if leftSign == rightSign {Sign.Positive} else {Sign.Negative}
+      return integerResult(ty, sign, u64.divide(left, right), pointerBits)
+    }
+    InfixOperator.Remainder => {
+      if right == 0 {
+        return failure(Fault.DivisionByZero)
+      }
+      // MIN % -1 traps alongside MIN / -1, even though the mathematical remainder is zero.
+      if signed(ty) && leftSign == Sign.Negative && rightSign == Sign.Negative && right == 1 {
+        if let Option<u64>.Some {value: minimumMagnitude} = integerLimit(ty, Sign.Negative, pointerBits) {
+          if left == minimumMagnitude {
+            return failure(Fault.Overflow)
+          }
+        }
+      }
+      return integerResult(ty, leftSign, u64.remainder(left, right), pointerBits)
+    }
+    InfixOperator.BitAnd => return fromPattern(ty, u64.bitAnd(integerPattern(leftSign, left), integerPattern(rightSign, right)), pointerBits)
+    InfixOperator.BitOr => return fromPattern(ty, u64.bitOr(integerPattern(leftSign, left), integerPattern(rightSign, right)), pointerBits)
+    InfixOperator.BitXor => return fromPattern(ty, u64.bitXor(integerPattern(leftSign, left), integerPattern(rightSign, right)), pointerBits)
+    _ => return ordered(operator, compareIntegers(leftSign, left, rightSign, right))
+  }
+}
+
+/// Evaluate a concrete unary scalar operator. The evaluator checks the typed operand contract
+/// before this call; the result here still rejects mismatched value forms defensively.
+pub fn prefix(operator: PrefixOperator, operand: &Value, pointerBits: u32) -> Result<Value, Fault> {
+  return match &operand.* {
+    Value.Integer {ty, sign, magnitude} => integerPrefix(operator, ty, sign, magnitude, pointerBits)
+    Value.Boolean {value} => {
+      if operator == PrefixOperator.Not {
+        return success(Value.Boolean {value: !value})
+      }
+      return failure(Fault.InvalidOperands)
+    }
+    Value.Float {ty, bits} => {
+      if operator != PrefixOperator.Negate {
+        return failure(Fault.InvalidOperands)
+      }
+      let signBit = if ty == FloatType.F32 {0x80000000} else {0x8000000000000000}
+      return match floating(ty, u64.bitXor(bits, signBit)) {
+        Option<Value>.Some {value} => success(move value)
+        Option<Value>.None => failure(Fault.InvalidOperands)
+      }
+    }
+    _ => failure(Fault.InvalidOperands)
+  }
+}
+
+fn float32Infix(operator: InfixOperator, leftBits: u64, rightBits: u64) -> Result<Value, Fault> {
+  let left = f32.fromBits(u64.toU32(leftBits))
+  let right = f32.fromBits(u64.toU32(rightBits))
+  let result = match operator {
+    InfixOperator.Add => f32.add(left, right)
+    InfixOperator.Subtract => f32.subtract(left, right)
+    InfixOperator.Multiply => f32.multiply(left, right)
+    InfixOperator.Divide => f32.divide(left, right)
+    InfixOperator.Remainder => f32.remainder(left, right)
+    InfixOperator.Equals => return success(Value.Boolean {value: left == right})
+    InfixOperator.NotEquals => return success(Value.Boolean {value: left != right})
+    InfixOperator.LessThan => return success(Value.Boolean {value: left < right})
+    InfixOperator.LessOrEqual => return success(Value.Boolean {value: left <= right})
+    InfixOperator.GreaterThan => return success(Value.Boolean {value: left > right})
+    InfixOperator.GreaterOrEqual => return success(Value.Boolean {value: left >= right})
+    _ => return failure(Fault.InvalidOperands)
+  }
+  return match floating(FloatType.F32, u32.toU64(f32.toBits(result))) {
+    Option<Value>.Some {value} => success(move value)
+    Option<Value>.None => failure(Fault.InvalidOperands)
+  }
+}
+
+fn float64Infix(operator: InfixOperator, leftBits: u64, rightBits: u64) -> Result<Value, Fault> {
+  let left = f64.fromBits(leftBits)
+  let right = f64.fromBits(rightBits)
+  let result = match operator {
+    InfixOperator.Add => f64.add(left, right)
+    InfixOperator.Subtract => f64.subtract(left, right)
+    InfixOperator.Multiply => f64.multiply(left, right)
+    InfixOperator.Divide => f64.divide(left, right)
+    InfixOperator.Remainder => f64.remainder(left, right)
+    InfixOperator.Equals => return success(Value.Boolean {value: left == right})
+    InfixOperator.NotEquals => return success(Value.Boolean {value: left != right})
+    InfixOperator.LessThan => return success(Value.Boolean {value: left < right})
+    InfixOperator.LessOrEqual => return success(Value.Boolean {value: left <= right})
+    InfixOperator.GreaterThan => return success(Value.Boolean {value: left > right})
+    InfixOperator.GreaterOrEqual => return success(Value.Boolean {value: left >= right})
+    _ => return failure(Fault.InvalidOperands)
+  }
+  return match floating(FloatType.F64, f64.toBits(result)) {
+    Option<Value>.Some {value} => success(move value)
+    Option<Value>.None => failure(Fault.InvalidOperands)
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Evaluate a concrete eager scalar or text operator. `&&` and `||` belong to the control-flow
+/// evaluator because their right operand must remain undemanded when the left decides the result.
+pub fn infix(operator: InfixOperator, left: &Value, right: &Value, pointerBits: u32) -> Result<Value, Fault> {
+  return match &left.* {
+    Value.Integer {ty: leftType, sign: leftSign, magnitude: leftMagnitude} => match &right.* {
+      Value.Integer {ty: rightType, sign: rightSign, magnitude: rightMagnitude} => {
+        if leftType != rightType {
+          return failure(Fault.InvalidOperands)
+        }
+        return integerInfix(operator, leftType, leftSign, leftMagnitude, rightSign, rightMagnitude, pointerBits)
+      }
+      _ => failure(Fault.InvalidOperands)
+    }
+    Value.Float {ty: leftType, bits: leftBits} => match &right.* {
+      Value.Float {ty: rightType, bits: rightBits} => {
+        if leftType != rightType {
+          return failure(Fault.InvalidOperands)
+        }
+        if leftType == FloatType.F32 {
+          return float32Infix(operator, leftBits, rightBits)
+        }
+        return float64Infix(operator, leftBits, rightBits)
+      }
+      _ => failure(Fault.InvalidOperands)
+    }
+    Value.Boolean {value: leftValue} => match &right.* {
+      Value.Boolean {value: rightValue} => {
+        if operator == InfixOperator.Equals {
+          return success(Value.Boolean {value: leftValue == rightValue})
+        }
+        if operator == InfixOperator.NotEquals {
+          return success(Value.Boolean {value: leftValue != rightValue})
+        }
+        return failure(Fault.InvalidOperands)
+      }
+      _ => failure(Fault.InvalidOperands)
+    }
+    Value.Character {scalar: leftScalar} => match &right.* {
+      Value.Character {scalar: rightScalar} => ordered(operator, if leftScalar < rightScalar {-1} else if leftScalar > rightScalar {1} else {0})
+      _ => failure(Fault.InvalidOperands)
+    }
+    Value.Text {bytes: leftBytes} => match &right.* {
+      Value.Text {bytes: rightBytes} => {
+        if operator != InfixOperator.Equals && operator != InfixOperator.NotEquals {
+          return failure(Fault.InvalidOperands)
+        }
+        let equal = sameBytes(Bytes.asSlice(&leftBytes), Bytes.asSlice(&rightBytes))
+        return success(Value.Boolean {value: if operator == InfixOperator.Equals {equal} else {!equal}})
+      }
+      _ => failure(Fault.InvalidOperands)
+    }
+    Value.Enum {declaration: leftDeclaration, member: leftMember, ..} => match &right.* {
+      Value.Enum {declaration: rightDeclaration, member: rightMember, ..} => {
+        if operator != InfixOperator.Equals && operator != InfixOperator.NotEquals {
+          return failure(Fault.InvalidOperands)
+        }
+        let sameDeclaration = Shared.with<DeclarationId, bool>(&leftDeclaration, fn(id: &DeclarationId) -> bool {
+          return Shared.with<DeclarationId, bool>(&rightDeclaration, fn(other: &DeclarationId) -> bool {
+            return DeclarationId.equals(id, other)
+          })
+        })
+        if !sameDeclaration {
+          return failure(Fault.InvalidOperands)
+        }
+        let equal = leftMember == rightMember
+        return success(Value.Boolean {value: if operator == InfixOperator.Equals {equal} else {!equal}})
+      }
+      _ => failure(Fault.InvalidOperands)
+    }
+    _ => failure(Fault.InvalidOperands)
   }
 }
