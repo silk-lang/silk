@@ -12,8 +12,10 @@ import * as Emitter from '../src/Emitter.js'
 import * as FunctionActor from '../src/Function.js'
 import * as FunctionBody from '../src/FunctionBody.js'
 import * as IrText from '../src/IrText.js'
+import type * as FunctionBodyDescription from '../src/internal/FunctionBodyDescription.js'
 import * as BodyState from '../src/internal/FunctionBodyState/primitives.js'
 import * as Handle from '../src/internal/Handle.js'
+import * as PackedBody from '../src/internal/PackedBody.js'
 import { invalidInput, LlvmError } from '../src/LlvmError.js'
 import * as Type from '../src/Type.js'
 import * as Value from '../src/Value.js'
@@ -645,3 +647,37 @@ it.effect('rejects unresolved and cyclic forward chains and releases the body re
     }
   }),
 )
+
+it('packs committed bodies without changing their data', () => {
+  const name = { _tag: 'ByteString' as const, bytes: [0, 104, 255] }
+  const snapshot: FunctionBodyDescription.Snapshot = {
+    arguments: [0],
+    blocks: [{ name, instructions: [0, 1], predecessors: [] }],
+    instructions: [
+      {
+        _tag: 'GetElementPtr',
+        result: 1,
+        name,
+        sourceType: 2 ** 40,
+        base: { _tag: 'Local', value: 0 },
+        indices: [{ _tag: 'Constant', constant: -3 }],
+        inbounds: true,
+        inrange: undefined,
+      },
+      { _tag: 'ReturnVoid', result: undefined, name: { _tag: 'ByteString', bytes: [] } },
+    ],
+    values: [
+      { type: 0, name, source: { _tag: 'Argument', index: 0 } },
+      { type: 1, name, source: { _tag: 'Forward', resolved: undefined } },
+    ],
+    metadata: [[], [{ kind: 'dbg', metadata: 7 }]],
+    debugLocations: [undefined, 3],
+  }
+  const packed = PackedBody.pack(snapshot)
+  assert.deepStrictEqual(PackedBody.unpack(packed), snapshot)
+  assert.strictEqual(packed.blockCount, 1)
+  assert.deepStrictEqual([...packed.metadataRoots], [7, 3])
+  assert.isFalse(packed.hasOperandBundles)
+  const unpacked = PackedBody.unpack(packed).instructions.at(0) ?? raise('expected an instruction')
+  assert.isTrue(Object.hasOwn(unpacked, 'inrange'))
+})
