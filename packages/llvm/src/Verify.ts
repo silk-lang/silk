@@ -4,6 +4,7 @@ import * as ByteString from './ByteString.js'
 import * as BuilderState from './internal/BuilderState.js'
 import * as FunctionBodyDescription from './internal/FunctionBodyDescription.js'
 import type { LlvmError } from './LlvmError.js'
+import * as PackedBody from './internal/PackedBody.js'
 
 /**
  * The module verifier: the in-process equivalent of `opt -passes=verify` over a {@link Builder}
@@ -583,7 +584,11 @@ export const verify = Effect.fnUntraced(function* (
     const global = state.globals[description.global]
     if (global === undefined || global.deleted) continue
     violations.push(
-      ...verifyFunction(identifier('@', global.name), description.body, description.personality),
+      ...verifyFunction(
+        identifier('@', global.name),
+        PackedBody.unpack(description.body),
+        description.personality,
+      ),
     )
   }
   return violations

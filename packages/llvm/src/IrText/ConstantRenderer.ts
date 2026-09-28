@@ -5,6 +5,7 @@ import type * as GlobalDescription from '../internal/GlobalDescription.js'
 import { blockIdentifier } from './FunctionRenderer.js'
 import { identifier, quoted } from './shared.js'
 import { renderType, typeAt } from './TypeRenderer.js'
+import * as PackedBody from '../internal/PackedBody.js'
 
 /** @internal */
 export const constantAt = (
@@ -151,7 +152,7 @@ export const renderConstant = (state: BuilderState.Snapshot, index: number): str
       const reference = state.constants[description.function]
       const global = reference?._tag === 'Global' ? state.globals[reference.global] : undefined
       const fn = global?.kind === 'Function' ? state.functions[global.actorIndex] : undefined
-      const body = fn?.body
+      const body = fn?.body === undefined ? undefined : PackedBody.unpack(fn.body)
       if (
         global === undefined ||
         body === undefined ||

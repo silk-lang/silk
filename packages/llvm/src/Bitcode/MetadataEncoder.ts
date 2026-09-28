@@ -52,11 +52,7 @@ export const writeMetadataKinds = (
 ): void => {
   const hasAttachments =
     state.globalMetadata.some((attachments) => attachments.length > 0) ||
-    state.functions.some(
-      (fn) =>
-        fn.body?.metadata.some((attachments) => attachments.length > 0) === true ||
-        fn.body?.debugLocations.some((location) => location !== undefined) === true,
-    )
+    state.functions.some((fn) => (fn.body?.metadataRoots.length ?? 0) > 0)
   if (metadata.entries.length === 0 && !hasAttachments) return
   const block = Bitstream.enterBlock(
     module.writer,

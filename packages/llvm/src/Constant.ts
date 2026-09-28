@@ -823,7 +823,7 @@ export const blockAddress = Effect.fnUntraced(function* (
         'Constant.blockAddress',
       )
       const body = state.globals.functions.descriptions[functionIndex]?.body
-      if (body !== undefined && block >= body.blocks.length) {
+      if (body !== undefined && block >= body.blockCount) {
         return yield* Result.fail(
           invalidInput({
             operation: 'Constant.blockAddress',

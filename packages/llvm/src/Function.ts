@@ -15,6 +15,7 @@ import type * as FunctionBodyDescription from './internal/FunctionBodyDescriptio
 import type * as GlobalDescription from './internal/GlobalDescription.js'
 import * as GlobalState from './internal/GlobalState.js'
 import * as Handle from './internal/Handle.js'
+import * as PackedBody from './internal/PackedBody.js'
 import * as ResolveActor from './internal/resolveActor.js'
 import type * as TypeDescription from './internal/TypeDescription.js'
 import { invalidInput, invalidState, type LlvmError } from './LlvmError.js'
@@ -551,7 +552,7 @@ export const commitBody = (
   }
   context.state.globals.functions.descriptions[build.functionIndex] = {
     ...description,
-    body: snapshot,
+    body: PackedBody.pack(snapshot),
   }
   return Result.void
 }

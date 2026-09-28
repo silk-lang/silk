@@ -1344,19 +1344,8 @@ export const reachable = (state: BuilderState.Snapshot, operation: string): Reac
     ...state.globalMetadata.flatMap((attachments) =>
       attachments.map((attachment) => attachment.metadata),
     ),
-    ...state.functions.flatMap((fn) => {
-      const body = fn.body
-      return body === undefined
-        ? []
-        : [
-            ...body.metadata.flatMap((attachments) =>
-              attachments.map((attachment) => attachment.metadata),
-            ),
-            ...body.debugLocations.flatMap((location) =>
-              location === undefined ? [] : [location],
-            ),
-          ]
-    }),
+    // A root repeated later is always visited already, so each body lists its roots once.
+    ...state.functions.flatMap((fn) => (fn.body === undefined ? [] : [...fn.body.metadataRoots])),
   ]
   const visited = new Set<number>()
   const resolved = new Map<number, number>()

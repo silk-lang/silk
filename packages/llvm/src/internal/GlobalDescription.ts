@@ -1,7 +1,7 @@
 import type * as AddrSpace from '../AddrSpace.js'
 import type * as Alignment from '../Alignment.js'
 import type * as ByteString from '../ByteString.js'
-import type * as FunctionBodyDescription from './FunctionBodyDescription.js'
+import type * as PackedBody from './PackedBody.js'
 
 export type Linkage =
   | 'external'
@@ -77,5 +77,5 @@ export interface FunctionDescription {
   readonly prologue: number | undefined
   readonly personality: number | undefined
   readonly addressSpace: AddrSpace.AddrSpace
-  readonly body: FunctionBodyDescription.Snapshot | undefined
+  readonly body: PackedBody.PackedBody | undefined
 }

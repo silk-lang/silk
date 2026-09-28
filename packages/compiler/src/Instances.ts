@@ -1873,11 +1873,23 @@ export const discover = (
     }
     return descended
   }
+  // Runtime keys are long nested texts; the cleanup memos key small ordinals of them instead, so
+  // their keys are short flat strings rather than ropes over whole type encodings.
+  const runtimeOrdinals = new Map<string, number>()
+  const runtimeOrdinal = (type: Type.Type): number => {
+    const key = Type.runtimeKey(type)
+    let ordinal = runtimeOrdinals.get(key)
+    if (ordinal === undefined) {
+      ordinal = runtimeOrdinals.size
+      runtimeOrdinals.set(key, ordinal)
+    }
+    return ordinal
+  }
   // Instance discovery asks the same cleanup-subterm questions for many instances; the answer
   // depends only on runtime identities, so top-level questions are memoized for the discovery.
   const strictCleanupSubtermCache = new Map<string, boolean>()
   const isStrictCleanupSubterm = (candidate: Type.Type, whole: Type.Type): boolean => {
-    const cacheKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
+    const cacheKey = `${runtimeOrdinal(candidate)},${runtimeOrdinal(whole)}`
     let cached = strictCleanupSubtermCache.get(cacheKey)
     if (cached === undefined) {
       cached = strictCleanupSubtermUnder(candidate, whole, new Map(), new Map())
@@ -1887,15 +1899,19 @@ export const discover = (
   }
   // A nested answer also depends on the unfolding path, which begins at the question's own root,
   // so it is rarely shared between questions. It is memoized only while one question is answered;
-  // retaining it for the whole discovery kept millions of path-keyed entries alive.
+  // retaining it for the whole discovery kept millions of path-keyed entries alive. The answer reads
+  // the path only as a declaration-to-nominal mapping, so the key is the sorted set of unfolded
+  // nominals: paths reaching the same mapping in another order share one entry.
   const strictCleanupSubtermUnder = (
     candidate: Type.Type,
     whole: Type.Type,
     unfolding: ReadonlyMap<string, Type.Nominal>,
     memo: Map<string, boolean>,
   ): boolean => {
-    let memoKey = `${Type.runtimeKey(candidate)}\u0001${Type.runtimeKey(whole)}`
-    for (const nominal of unfolding.values()) memoKey += `\u0001${Type.runtimeKey(nominal)}`
+    const unfolded = Array.from(unfolding.values(), runtimeOrdinal).sort(
+      (left, right) => left - right,
+    )
+    const memoKey = `${runtimeOrdinal(candidate)},${runtimeOrdinal(whole)}:${unfolded.join(',')}`
     let memoized = memo.get(memoKey)
     if (memoized === undefined) {
       memoized = computeStrictCleanupSubterm(candidate, whole, unfolding, memo)
