@@ -172,17 +172,17 @@ fn both<'a, 'b>(pending: Effect<'a & 'b; i32>) -> i32 { return 0 }
 `Semantic.demandContract` returns the binders and bounds of a type, alias, interface, or service
 declaration without demanding its identity or members. A `?R` binder of such a declaration takes
 its row from the `? Row` suffix of an application, and the row is spliced wherever the binder is
-used. A bound is recorded, not proved. An application of a declaration with an interface, service,
-or representation bound is `Unsupported` until conformance solving exists; lifetime bounds such as
-`T: 'a` are recorded without blocking applications. For example, `Sorted` has a contract,
-`Sorted<i32>` is `Unsupported`, and `Loaded<? &Clock>` resolves to an Effect requiring both
-`&Logger` and `&Clock`:
+used. A bound is recorded by the declaration fact and proved when a concrete application needs
+it; an abstract use may rely only on an identical bound declared by its enclosing generic
+declaration. Lifetime bounds such as `T: 'a` are also recorded. For example, `Sorted` has a
+contract, `Sorted<i32>` rejects without proof that `i32` implements `Hash`, and `Loaded<? &Clock>` resolves
+to an Effect requiring both `&Logger` and `&Clock`:
 
 ```silk,ignore
 struct Sorted<T: Hash> { value: T }
 interface Load<E, ?R> {}
 type Loaded<?R> = Effect<'static; i32 ? &Logger | R>
-fn loadable<T: Load<Missing ? &Clock>>(source: &T) -> i32 { return 0 }
+fn loadable<T: Load<i32 ? &Clock>>(source: &T) -> i32 { return 0 }
 ```
 
 Only services may appear in a requirement row, and an `at` path must name a role. Interfaces and
@@ -399,19 +399,21 @@ The edit leaves the called signature and the caller's declaration unchanged. Cha
 and rejected. Adding or removing a previously missing imported declaration also updates its actual
 consumers. Reused bodies carry the current source observation and current dependency evidence.
 If a source edit moves the caller's syntax positions, changes its declaration, makes its owner
-mapping ambiguous, or changes a dependency whose result cannot be compared exactly in this scalar
-wave, the checker runs again. A changed nominal type result takes that conservative path. These
-events prove only checked semantic-body reuse;
+mapping ambiguous, or changes a dependency whose semantic identity cannot be compared exactly,
+the checker runs again. Changed contract, proof, witness, inference, method/operator selection,
+and specialization facts invalidate their consumers; a witness implementation-body-only edit
+can retain a contract-typed caller after validation. These events prove only semantic-body reuse;
 they do not imply MIR, LLVM, object, link, or persistent-cache reuse.
 
 Richer facts follow the same validation rule. A fact stays valid only while every present or absent
 source it observed is unchanged, so an edit anywhere in a module restarts the facts that read that
 module, and a restarted fact may equal its earlier value. Facts that never read the edited module
-remain hits. Only a checked body compares the results it consumed. A nominal type, member list,
-member shape, contract, constant value, or signature with binders, bounds, channels, or an
-environment always compares as changed. No body in the scalar subset succeeds while depending on
-one of those results, and the comparison runs only after each consumed fact has been revalidated
-against current sources. For example, take `consumer.silk`:
+remain hits. A checked body compares its direct results only after each consumed fact has been
+revalidated against current sources. The comparison includes canonical type applications,
+contracts, signatures with bounds and channels, complete positive and negative head sets,
+coherence, proof bounds, operation and witness mappings, and the typed selection facts that depend
+on them. Changed or unsupported identities conservatively recheck the body. For example, take
+`consumer.silk`:
 
 ```silk,ignore
 import geometry as Geometry
@@ -463,9 +465,11 @@ in that arm; another arm or a later statement cannot read it. Checked bodies ret
 nodes and whether each block can complete. Source after a return is still checked, although it
 cannot make a completed path reachable again.
 
-This native semantic API is not wired into the inspection executable above. Function values,
-sections, methods, operators, pointer-sized literal ranges, effects, full generic-body safety, static evaluation,
-conformance, layout, and code emission are outside the current body subset. For example,
+This native semantic API is not wired into the inspection executable above. Contract-level
+conformance, method selection, and eligible closed scalar/string operator typing are available;
+their ownership, capture, cleanup, and Effect safety obligations remain for M2.5. Function values,
+sections, pointer-sized literal ranges, Effect execution, static evaluation, layout, and code
+emission are outside the current body subset. For example,
 `fn selected() -> i32 { static if true { return 1 } else { return 2 } }` produces `Unsupported`
 when demanded; static selection does not use runtime branch checking. Unused declarations with
 these forms remain indexed. The authored HIR keeps integer sign, radix, and exact decimal
@@ -484,10 +488,12 @@ Effect signature contracts with written channels and recorded bounds; constant t
 constant-to-constant values; and revision validation for each of these facts. A form outside that
 vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupported` until its wave:
 
-- **M2.3, remaining generic contracts:** body-sensitive property proofs remain pending.
-  Ordered multi-row applications, declaration-bound lifetime completion, generated
-  field-lifetime substitution, and concrete interface-bound applications are supported in the
-  current semantic layer. Abstract generic bodies retain later safety obligations.
+- **M2.3, contract facts:** canonical interface/service scopes, implementation coherence,
+  conditional conformance proof, witnesses, type/row/representation inference, abstract contract
+  typing, method and eligible operator selection, and specialization identities are supported in
+  the current semantic layer. Their demand and revision answers retain complete observations.
+  Abstract generic bodies retain later safety obligations; body-sensitive property proofs belong
+  to M2.5.
 - **M2.4, static and configuration execution:** array extents such as `[Node; COUNT]`; constant
   initializers with calls, operators, qualified names, or floating-point, text, or character values;
   pointer-sized ranges and other target selection; target constants; static parameters; and package
