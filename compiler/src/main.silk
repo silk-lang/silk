@@ -16,17 +16,27 @@ import parser.ParserCases
 import parser.SyntaxTree
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
+import silk.child_process {ChildProcess, ProcessError}
 import silk.effect {Effect}
 import silk.filesystem {FileError, FileSystem, Path}
 import silk.host_input {HostInput, HostInputError}
 import silk.option {Option}
 import silk.os_filesystem {OsFileSystem}
-import silk.os_writer {StdoutWriter}
+import silk.os_child_process {OsChildProcess}
+import silk.os_writer {StderrWriter, StdoutWriter}
 import silk.result {Result}
 import silk.string {InvalidUtf8, String}
 import silk.usize
 import silk.vector {Vector}
 import silk.writer {Writer, WriterError}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.Query {Cycle}
+import semantic.Revision {Revision}
+import semantic.Semantic {BackendBuild, Request as SemanticRequest, Semantic}
+import semantic.SourceIndex {RevisionMismatch}
+import semantic.Target {Id as TargetId, Target}
+import backend.Gap {Code as GapCode, Gap}
+import silk.shared {Shared}
 
 /// A command-line contract failure before source reading begins.
 pub union ApplicationError {
@@ -43,9 +53,9 @@ effect fn invalidWorkingDirectoryEncoding() -> never ! ApplicationError {
 }
 
 /// One parsed command line: the source file to read and which dump to print.
-struct Request {
-  source: Bytes
-  hir: bool
+union Request {
+  Dump {source: Bytes, hir: bool},
+  Build {source: Bytes, output: Bytes},
 }
 
 /// Reports whether `argument` spells the `hir` mode selector.
@@ -60,6 +70,20 @@ fn selectsHir(argument: &[u8]) -> bool {
       return false
     }
     index = index + usize.ONE
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
   }
   return true
 }
@@ -81,7 +105,17 @@ effect fn request() -> Request
   let count = run HostInput.argumentCount()
   if count == usize.add(0, 2) {
     let source = run argumentAt(usize.ONE, count)
-    return Request {source: move source, hir: false}
+    return Request.Dump {source: move source, hir: false}
+  }
+  if count == usize.add(0, 5) {
+    let mode = run argumentAt(usize.ONE, count)
+    let source = run argumentAt(usize.add(0, 2), count)
+    let selector = run argumentAt(usize.add(0, 3), count)
+    let output = run argumentAt(usize.add(0, 4), count)
+    if !same(Bytes.asSlice(&mode), b"build") || !same(Bytes.asSlice(&selector), b"-o") {
+      return run invalidArgumentCount(count)
+    }
+    return Request.Build {source: move source, output: move output}
   }
   if count != usize.add(0, 3) {
     return run invalidArgumentCount(count)
@@ -93,7 +127,7 @@ effect fn request() -> Request
   }
   drop mode
   let source = run argumentAt(usize.add(0, 2), count)
-  return Request {source: move source, hir: true}
+  return Request.Dump {source: move source, hir: true}
 }
 
 effect fn lex<'source>(lexer: &mut Lexer<'source>) -> Vector<Token>
@@ -111,11 +145,117 @@ effect fn lex<'source>(lexer: &mut Lexer<'source>) -> Vector<Token>
   return move tokens
 }
 
-effect fn program() -> ()
-! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError
+fn hostTarget() -> Target {
+  if Intrinsic.targetOperatingSystem() == "darwin" {
+    return Target.forId(TargetId.Aarch64AppleDarwin)
+  }
+  if Intrinsic.targetArchitecture() == "aarch64" {
+    return Target.forId(TargetId.Aarch64UnknownLinuxGnu)
+  }
+  return Target.forId(TargetId.X8664UnknownLinuxGnu)
+}
+
+effect fn gapSummary(gaps: &[Shared<Gap>]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut message = run Bytes.copy(b"SILK_UNSUPPORTED_JSON={\"gaps\":[")
+  let mut at = usize.ZERO
+  while at < gaps.length {
+    if at > usize.ZERO {
+      run Bytes.append(&mut message, b",")
+    }
+    let code = Shared.with<Gap, GapCode>(
+      &gaps[at],
+      fn(gap: &Gap) -> GapCode {
+        return gap.code
+      },
+    )
+    run Bytes.append(&mut message, b"{\"code\":\"")
+    run Bytes.append(&mut message, Gap.name(code))
+    run Bytes.append(&mut message, b"\",\"reason\":\"Reached unsupported scalar backend form\"}")
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut message, b"]}\n")
+  return move message
+}
+
+effect fn writeError(bytes: &[u8]) -> () ! WriterError {
+  let mut stderr = StderrWriter.make()
+  return run Writer.writeAll(bytes)
+    |> Effect.provideMut<Writer>(&mut stderr)
+}
+
+effect fn compileIr(ir: &Bytes, output: &Path) -> i32
+! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut intermediate = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut intermediate, b".silkc.ll")
+  let irPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
+  let cleanupPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
+  let configured = run HostInput.variableNamed("SILKC_CLANG")
+  let clang = match move configured {
+    Option<Bytes>.Some {value} => run Path.fromBytes(Bytes.asSlice(&value))
+    Option<Bytes>.None => run Path.make("/usr/bin/clang")
+  }
+  let mut process = run ChildProcess.request(&clang)
+  run ChildProcess.addArgument(&mut process, b"-x")
+  run ChildProcess.addArgument(&mut process, b"ir")
+  run ChildProcess.addArgument(&mut process, Path.rawBytes(&irPath))
+  run ChildProcess.addArgument(&mut process, b"-o")
+  run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
+  let use = effect fn() -> i32
+  ! FileError | ProcessError | OutOfMemoryError | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+    run FileSystem.writeFile(&irPath, Bytes.asSlice(ir))
+    let outcome = run ChildProcess.submit(&process)
+    return match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some {value} => {
+        if value == 0 {
+          return 0
+        }
+        run writeError(ChildProcess.errorBytes(&outcome))
+        return 1
+      }
+      Option<i32>.None => {
+        run writeError(ChildProcess.errorBytes(&outcome))
+        return 1
+      }
+    }
+  }
+  let release = effect fn() -> () ? &mut FileSystem {
+    let removed = run Effect.result(FileSystem.removeFile(&cleanupPath))
+    drop removed
+    return ()
+  }
+  return run Effect.ensuring(use(), release())
+}
+
+effect fn build(sourcePath: &Path, output: &Path) -> i32
+! FileError | ProcessError | HostInputError | InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let source = run FileSystem.readFile(sourcePath)
+  let identity = run ModuleId.make(b"file", b"executable", b"main.silk")
+  let content = Option.some<Bytes>(move source)
+  let revision = run Revision.publish(&Revision.make(), &identity, &content)
+  let mut store = Semantic.make(move revision, hostTarget())
+  let mut request = SemanticRequest.make()
+  let compiled = run Semantic.buildMain(&mut store, &mut request, &identity)
+  return match move compiled {
+    BackendBuild.Module {text} => run compileIr(&text, output)
+    BackendBuild.Unsupported {gaps} => {
+      let message = run gapSummary(Vector.asSlice<Shared<Gap>>(&gaps))
+      run writeError(Bytes.asSlice(&message))
+      return 2
+    }
+    BackendBuild.Rejected {diagnostic: _} => {
+      run writeError(b"SILK_BUILD_ERROR=semantic-rejection\n")
+      return 1
+    }
+  }
+}
+
+effect fn program() -> i32
+! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | Cycle | RevisionMismatch
 ? &mut HostInput | &mut Allocator | &mut Writer {
   let command = run request()
-  let Request {source: argument, hir: dumpHir} = move command
   let workingDirectory = run HostInput.workingDirectory()
   let validated = match move HostInput.text(Bytes.asSlice(&workingDirectory)) {
     Result<string, InvalidUtf8>.Success {value: _} => ()
@@ -123,25 +263,37 @@ effect fn program() -> ()
   }
   let mut files = run OsFileSystem.make(Bytes.asSlice(&workingDirectory))
   let root = run Path.root()
-  let path = run Path.joinUtf8(&root, Bytes.asSlice(&argument))
-  let source = run FileSystem.readFile(&path)
-    |> Effect.provideMut<FileSystem>(&mut files)
-  let mut lexer = Lexer.make(Bytes.asSlice(&source))
-  let tokens = run lex(&mut lexer)
-  let tree = run Parser.parse(move source, move tokens)
-  if dumpHir {
-    let module = run Lower.lower(&tree)
-    run Hir.write(&module)
-    run Fingerprint.writeFingerprints(&module)
-    let result = run Hir.writeViolations(&module)
-    drop module
-    return result
+  return match move command {
+    Request.Build {source, output} => {
+      let sourcePath = run Path.joinUtf8(&root, Bytes.asSlice(&source))
+      let outputPath = run Path.joinUtf8(&root, Bytes.asSlice(&output))
+      let mut process = OsChildProcess.make()
+      return run build(&sourcePath, &outputPath)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Dump {source: argument, hir: dumpHir} => {
+      let path = run Path.joinUtf8(&root, Bytes.asSlice(&argument))
+      let source = run FileSystem.readFile(&path)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      let mut lexer = Lexer.make(Bytes.asSlice(&source))
+      let tokens = run lex(&mut lexer)
+      let tree = run Parser.parse(move source, move tokens)
+      if dumpHir {
+        let module = run Lower.lower(&tree)
+        run Hir.write(&module)
+        run Fingerprint.writeFingerprints(&module)
+        run Hir.writeViolations(&module)
+        return 0
+      }
+      run SyntaxTree.write(&tree)
+      return 0
+    }
   }
-  return run SyntaxTree.write(&tree)
 }
 
-pub effect fn main() -> ()
-! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError
+pub effect fn main() -> i32
+! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | Cycle | RevisionMismatch
 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut output = StdoutWriter.make()
