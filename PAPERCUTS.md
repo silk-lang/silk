@@ -323,3 +323,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · A focused native SemanticCases build consumed one CPU and about 5.5 GiB for seven hours without output, holding the shared build slot · Stop the stalled process, release the slot, and use exact-head Linux CI for the diagnostic instead · self-hosted compiler
 
 - 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
+
+- 2026-09-29 · An inline effectful tuple copy inside a nested match argument reported PAR0001 in Linux CI even after simplifying its call · Use a statement-block arm with an explicit enclosing return, and verify the replacement head in CI · self-hosted compiler
