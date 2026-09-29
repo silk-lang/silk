@@ -27,30 +27,39 @@ types admitted as constant results are defined by [values and types](values-and-
 
 ## Static declarations and function phases
 
-### STATIC-001 — A static function is a top-level compile-time declaration
+### STATIC-001 — A static function is a compile-time declaration
 
 **Status:** Confirmed
 
-A static function is declared as `static fn` or `pub static fn`. It may be private or public, but it
-must be a top-level module declaration. Every call to it occurs during static evaluation, every
-argument must be statically available, and its result is one static value or one static diagnostic.
+A static function is declared as `static fn` or `pub static fn`. It may be private or public and
+may be a top-level module declaration or a method in an inherent `impl Type` block. Every call to
+it occurs during static evaluation, every argument must be statically available, and its result is
+one static value or one static diagnostic.
 
 ```silk
 pub static fn positive(value: i32) -> bool {
   return value > 0
+}
+
+struct Limits {}
+
+impl Limits {
+  pub static fn defaultSteps() -> u32 { return 64 }
 }
 ```
 
 A static function has no runtime function item, callable representation, parameter lanes, instance,
 symbol, or backend body.
 
-**Boundary:** `static` cannot combine with `unsafe`, `effect`, an implementation operation, or a
-service or interface operation. Nested static function declarations within executable bodies are
-unavailable. Module declaration groups may select static functions. A static function cannot be captured or passed as a runtime callable.
+**Boundary:** `static` cannot combine with `unsafe` or `effect`, and is forbidden on interface
+operations and operations in conformance `impl Contract for Type` blocks. Nested static function
+declarations within executable bodies are unavailable. Module declaration groups may select static
+functions. A static function cannot be captured or passed as a runtime callable.
 
 **Diagnostics:** An unsupported modifier combination or declaration position reports a syntax
 diagnostic at the conflicting modifier or declaration. A use requiring a runtime callable reports
-a static-phase violation at that use.
+a static-phase violation at that use. A static call that selects an interface or conformance
+operation reports `SEM0176` at the call.
 
 **Evidence:** [static syntax requirements](../../../../openspec/changes/add-static-evaluation-core/specs/bootstrap-syntax/spec.md),
 [static function requirements](../../../../openspec/changes/add-static-evaluation-core/specs/static-evaluation/spec.md).
