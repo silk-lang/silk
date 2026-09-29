@@ -3559,6 +3559,23 @@ export const make = (operations: Operations) => {
         diagnosticDependencies.set(owner, inherited)
       }
     }
+    // Callables by their runtime environment key, in `callables` order, so a callback resolves its
+    // captured callable from one bucket instead of rekeying every callable per argument.
+    let callablesByEnvironment: Map<string, Array<CallableInstance>> | undefined
+    const callablesInEnvironment = (key: string): ReadonlyArray<CallableInstance> => {
+      if (callablesByEnvironment === undefined) {
+        callablesByEnvironment = new Map()
+        for (const candidate of callables) {
+          const environment = Type.runtimeCallableEnvironmentIdentityKey(
+            operations.callableEnvironmentIdentity(candidate),
+          )
+          const group = callablesByEnvironment.get(environment)
+          if (group === undefined) callablesByEnvironment.set(environment, [candidate])
+          else group.push(candidate)
+        }
+      }
+      return callablesByEnvironment.get(key) ?? []
+    }
     const instancesByKey = new Map<string, Instance>()
     for (const instance of instances) {
       const identity = keyText(instance.key)
@@ -3689,11 +3706,8 @@ export const make = (operations: Operations) => {
         const captured =
           environment === undefined
             ? undefined
-            : callables.find(
+            : callablesInEnvironment(Type.runtimeCallableEnvironmentIdentityKey(environment)).find(
                 (candidate) =>
-                  Type.runtimeCallableEnvironmentIdentityKey(
-                    operations.callableEnvironmentIdentity(candidate),
-                  ) === Type.runtimeCallableEnvironmentIdentityKey(environment) &&
                   Tir.matchesCallableTargetIdentity(candidate.target, origin.target) &&
                   sameVisibleTypeArguments(candidate.typeArguments, arguments_),
               )
