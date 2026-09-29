@@ -328,3 +328,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
 
 - 2026-09-29 · An expanded C ABI assertion expected fneg for signed float literals, but HIR stores those literals as signed constants, causing a CI-only failure · Assert the exact emitted f32/f64 argument constants and keep foreign-header scans off ordinary signature queries · self-hosted backend
+
+- 2026-09-29 · A MIR assertion counted unique extern declarations even though repeated calls retain separate foreign edges · Assert foreign edge presence and an empty runtime-body worklist; declaration deduplication happens at final emission · self-hosted backend
