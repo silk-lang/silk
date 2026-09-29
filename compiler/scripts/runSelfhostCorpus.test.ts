@@ -86,12 +86,29 @@ it('fails the gate only for cases on the ordered selfhost track', () => {
   assert.deepStrictEqual(summarize(results, ['literal', 'later']).trackFailures, ['later'])
 })
 
-it('does not confuse stderr closure with ignored stderr', () => {
-  withStub(compiled, (silkc) => {
+it('passes native run arguments and closes stderr when requested', () => {
+  const argumentAndStderrStub = `while [ "$1" != "-o" ]; do shift; done
+output="$2"
+cat > "$output" <<'SCRIPT'
+#!/bin/sh
+if [ "$#" -ne 2 ] || [ "$1" != one ] || [ "$2" != two ]; then exit 1; fi
+if printf '' >&2; then exit 2; fi
+exit 42
+SCRIPT
+chmod +x "$output"`
+  withStub(argumentAndStderrStub, (silkc) => {
     const program: CorpusProgram = {
       ...literal,
       nativeRuns: [{ closeStderr: true, arguments: ['one', 'two'] }],
     }
     assert.strictEqual(runCase(silkc, program).status, 'pass')
+    assert.strictEqual(
+      runCase(silkc, { ...program, nativeRuns: [{ arguments: ['one', 'two'] }] }).status,
+      'fail',
+    )
+    assert.strictEqual(
+      runCase(silkc, { ...program, nativeRuns: [{ closeStderr: true }] }).status,
+      'fail',
+    )
   })
 })
