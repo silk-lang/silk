@@ -1957,6 +1957,38 @@ pub fn main() -> i32 { return run Effect.catchAll(check(), recover) }`
 
 export const corpus: ReadonlyArray<CorpusProgram> = [
   {
+    name: 'scalar-reference-read',
+    source: `fn read(value: &i32) -> i32 { return value.* }
+pub fn main() -> i32 {
+  let value: i32 = 42
+  return read(&value)
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'scalar-reference-write-through',
+    source: `fn store(value: &mut i32) -> () { value.* = 42 }
+pub fn main() -> i32 {
+  let mut value: i32 = 0
+  store(&mut value)
+  return value
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'scalar-reference-argument-order',
+    source: `fn change(value: &mut i32) -> i32 {
+  value.* = 7
+  return 22
+}
+fn add(first: i32, second: i32) -> i32 { return first + second }
+pub fn main() -> i32 {
+  let mut value: i32 = 20
+  return add(value, change(&mut value))
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'narrow-record-effect-success-lanes',
     source: narrowEffectRecord,
     expected: { _tag: 'Completes', result: 42 },
@@ -6816,6 +6848,35 @@ export const httpRedirectCorpusProgram = Object.freeze({
 } satisfies CorpusProgram)
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
+  {
+    name: 'foreign-libc-pointer-roundtrip',
+    source: `pub fn main() -> i32 {
+  return 42
+}`,
+    nativeSource: `unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+pub fn main() -> i32 {
+  let memory = unsafe malloc(16)
+  unsafe free(memory)
+  return 42
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'foreign-libc-floating',
+    source: `pub fn main() -> i32 {
+  return 42
+}`,
+    nativeSource: `unsafe extern "C" fn fabs(value: f64) -> f64
+unsafe extern "C" fn fabsf(value: f32) -> f32
+pub fn main() -> i32 {
+  if unsafe fabs(-42.0) != 42.0 { return 1 }
+  if unsafe fabsf(-7.0) != 7.0 { return 2 }
+  return 42
+}`,
+    nativeDynamicLibraries: ['m'],
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     // A borrowed variant field must reach a concrete helper body for native enum equality.
     name: 'scalar-enum-equality-from-borrowed-variant',
