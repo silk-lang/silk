@@ -7,17 +7,20 @@ import hir.Hir {HirId, HirRef, Node, ParameterMode, Range}
 import hir.Intern {Symbol}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.ModuleId {ModuleId}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, CandidateKind, IndexedDeclaration}
-import semantic.Semantic {StaticPort}
-import semantic.SourceIndex {AuthoredCursor}
+import semantic.Query {Cycle}
+import semantic.Semantic {Answer, StaticPort, StaticRootBinder, StaticRootExpectation}
+import semantic.SourceIndex {AuthoredCursor, NoRejection, RevisionMismatch}
 import semantic.StaticExecution
 import semantic.StaticExecution {Binding as StaticBinding, Diagnostic as StaticDiagnostic, Machine as StaticMachine}
 import semantic.StaticValue
 import semantic.StaticValue {FloatType as StaticFloatType, IntegerType as StaticIntegerType, Value as StaticData}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
+import silk.effect {Effect}
 import silk.option {Option}
+import silk.result {Result}
 import silk.shared {Shared}
 import silk.usize
 import silk.vector {Vector}
@@ -79,18 +82,22 @@ pub struct Body {
 pub struct Machine<'source> {
   execution: StaticMachine<'source>
   cursor: AuthoredCursor
+  module: ModuleId
   residualLimit: usize
 }
 
 struct Selection {
   declaration: DeclarationId
+  ordinal: usize
   parameters: Vector<HirId>
   block: HirId
   span: Span
 }
 
 struct Draft {
+  ordinal: usize
   bindings: Vector<StaticBinding>
+  checkedBinders: Vector<StaticRootBinder>
   embedded: Vector<Embedded>
   obligations: Vector<Obligation>
   nodes: usize
@@ -155,7 +162,7 @@ pub effect fn make<'source>(port: StaticPort<'source>, root: &ModuleId, limits: 
       return run reject(Fault.InvalidSyntax, first)
     }
   }
-  return Machine {execution: move execution, cursor: move cursor, residualLimit: residualLimit}
+  return Machine {execution: move execution, cursor: move cursor, module: run ModuleId.copy(root), residualLimit: residualLimit}
 }
 
 effect fn declaration<'source>(machine: &Machine<'source>, name: &[u8]) -> Option<usize>
@@ -283,6 +290,7 @@ effect fn select<'source>(machine: &Machine<'source>, name: &[u8]) -> Selection
             }
             return Selection {
               declaration: run DeclarationId.copy(&selected.identity),
+              ordinal: ordinal,
               parameters: move selectedParameters,
               block: block.id,
               span: span,
@@ -303,21 +311,54 @@ effect fn count<'source>(machine: &Machine<'source>, draft: &mut Draft, syntax: 
   return ()
 }
 
-effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId) -> Shared<StaticData>
-! StaticDiagnostic | OutOfMemoryError
+struct CheckedValue {
+  value: Shared<StaticData>
+  checked: Shared<Result<Answer, NoRejection>>
+}
+
+effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId, expectation: StaticRootExpectation) -> CheckedValue
+! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
-  return run StaticExecution.evaluate(
+  let module = run ModuleId.copy(&machine.module)
+  let attempted = run Effect.result(StaticPort.demandCheckedRoot(
+    StaticExecution.port(&mut machine.execution),
+    &module,
+    Option.some<usize>(draft.ordinal),
+    expression,
+    move expectation,
+    Vector.asSlice<StaticRootBinder>(&draft.checkedBinders),
+  ))
+  let answer = match move attempted {
+    Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => value
+    Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      Cycle {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
+      InvalidModulePath {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
+      RevisionMismatch {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
+    }
+  }
+  let checked = Shared.with<Result<Answer, NoRejection>, Option<StaticExecution.CheckedRoot>>(
+    &answer,
+    StaticExecution.checkedRoot,
+  )
+  let root = match move checked {
+    Option<StaticExecution.CheckedRoot>.Some {value} => value
+    Option<StaticExecution.CheckedRoot>.None => { return run reject(Fault.InvalidStaticValue, span(&machine.*, expression)) }
+  }
+  let value = run StaticExecution.evaluate(
     &mut machine.execution,
+    &root,
     Vector.asSlice<StaticBinding>(&draft.bindings),
     expression,
   )
+  return CheckedValue {value: move value, checked: move answer}
 }
 
 effect fn condition<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId) -> bool
 ! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
-  let value = run evaluate(&mut machine.*, draft, expression)
-  let selected = Shared.with<StaticData, Option<bool>>(&value, fn(data: &StaticData) -> Option<bool> {
+  let checked = run evaluate(&mut machine.*, draft, expression, StaticRootExpectation.Boolean)
+  let selected = Shared.with<StaticData, Option<bool>>(&checked.value, fn(data: &StaticData) -> Option<bool> {
     return match &data.* {
       StaticData.Boolean {value: answer} => Option.some<bool>(answer)
       _ => Option.none<bool>()
@@ -347,7 +388,7 @@ effect fn inspect<'source>(machine: &mut Machine<'source>, draft: &mut Draft, ex
   let node = run authoredNode(&machine.*, expression)
   match node {
     Node.CompileErrorExpression {..} => {
-      let ignored = run evaluate(&mut machine.*, &draft.*, expression)
+      let ignored = run evaluate(&mut machine.*, &draft.*, expression, StaticRootExpectation.Inferred)
       drop ignored
     }
     Node.IdentifierExpression {name, binding} => {
@@ -388,8 +429,8 @@ effect fn inspect<'source>(machine: &mut Machine<'source>, draft: &mut Draft, ex
             let declarationAnswer = run declaration(&machine.*, Bytes.asSlice(&spelling))
             if let Option<usize>.Some {value: ordinal} = move declarationAnswer {
               if run callableIsStatic(&machine.*, ordinal) {
-                let value = run evaluate(&mut machine.*, &draft.*, expression)
-                run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move value})
+                let checked = run evaluate(&mut machine.*, &draft.*, expression, StaticRootExpectation.Inferred)
+                run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move checked.value})
                 return ()
               }
             }
@@ -480,19 +521,21 @@ effect fn residual<'source>(machine: &mut Machine<'source>, draft: &mut Draft, s
         if let Node.BindingStatement {mutable, isStatic, annotation, initializer, ..} = run authoredNode(&machine.*, syntax) {
           if isStatic {
             if mutable { return run reject(Fault.InvalidHeader, span(&machine.*, syntax)) }
-            let value = run evaluate(&mut machine.*, &draft.*, initializer)
-            if annotation.present {
-              let written = run annotationName(&machine.*, annotation.id)
-              let spelling = match move written {
-                Option<Bytes>.Some {value: text} => text
-                Option<Bytes>.None => { return run reject(Fault.InvalidStaticValue, span(&machine.*, initializer)) }
-              }
-              let valid = Shared.with<StaticData, bool>(&value, fn(data: &StaticData) -> bool {
-                return matchesAnnotation(Bytes.asSlice(&spelling), data)
-              })
-              if !valid { return run reject(Fault.InvalidStaticValue, span(&machine.*, initializer)) }
+            let expectation = if annotation.present {
+              StaticRootExpectation.Annotation {syntax: annotation.id}
+            } else {
+              StaticRootExpectation.Inferred
             }
-            run Vector.append<StaticBinding>(&mut draft.bindings, StaticBinding {binder: syntax, value: move value})
+            let checked = run evaluate(&mut machine.*, &draft.*, initializer, move expectation)
+            run Vector.append<StaticRootBinder>(&mut draft.checkedBinders, StaticRootBinder.Binding {
+              syntax: syntax,
+              checked: move checked.checked,
+            })
+            run Vector.append<StaticBinding>(&mut draft.bindings, StaticBinding {
+              module: run ModuleId.copy(&machine.module),
+              binder: syntax,
+              value: move checked.value,
+            })
             at = at + usize.ONE
             continue
           }
@@ -558,7 +601,9 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, name: &[u8], s
   let selected = run select(&machine.*, name)
   let mut runtimeParameters = Vector.make<HirId>()
   let mut draft = Draft {
+    ordinal: selected.ordinal,
     bindings: Vector.make<StaticBinding>(),
+    checkedBinders: Vector.make<StaticRootBinder>(),
     embedded: Vector.make<Embedded>(),
     obligations: Vector.make<Obligation>(),
     nodes: usize.ZERO,
@@ -586,8 +631,13 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, name: &[u8], s
         }
         run Vector.append<StaticBinding>(
           &mut draft.bindings,
-          StaticBinding {binder: parameter, value: StaticValue.copy(&staticArguments[supplied])},
+          StaticBinding {
+            module: run ModuleId.copy(&machine.module),
+            binder: parameter,
+            value: StaticValue.copy(&staticArguments[supplied]),
+          },
         )
+        run Vector.append<StaticRootBinder>(&mut draft.checkedBinders, StaticRootBinder.Parameter {syntax: parameter})
         supplied = supplied + usize.ONE
       } else {
         run Vector.append<HirId>(&mut runtimeParameters, parameter)
