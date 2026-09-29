@@ -4164,10 +4164,33 @@ const substituteExecutableLifetimes = (
   })),
 })
 
-export const runtimeArgumentKeys = (self: ReadonlyArray<GenericArgument>): ReadonlyArray<string> =>
-  self.flatMap((argument) =>
+// Argument lists are built once and then only read; instance matching compares the same lists
+// against many candidates. The cached length guards a list that is still being filled.
+const cachedRuntimeArgumentKeys: unique symbol = Symbol('Type.runtimeArgumentKeys')
+
+export const runtimeArgumentKeys = (
+  self: ReadonlyArray<GenericArgument>,
+): ReadonlyArray<string> => {
+  const cached: unknown = Reflect.get(self, cachedRuntimeArgumentKeys)
+  if (
+    typeof cached === 'object' &&
+    cached !== null &&
+    'length' in cached &&
+    'keys' in cached &&
+    cached.length === self.length &&
+    Array.isArray(cached.keys)
+  )
+    return cached.keys
+  const keys = self.flatMap((argument) =>
     Lifetime.isLifetime(argument) ? [] : [runtimeGenericArgumentKey(argument)],
   )
+  if (Object.isExtensible(self))
+    Object.defineProperty(self, cachedRuntimeArgumentKeys, {
+      value: { length: self.length, keys },
+      writable: true,
+    })
+  return keys
+}
 
 const runtimeSubstitutionKey = (self: Substitution): string =>
   Canonical.array(
