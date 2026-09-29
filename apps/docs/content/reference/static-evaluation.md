@@ -11,7 +11,8 @@ types admitted as constant results are defined by [values and types](values-and-
 
 ## Terminology
 
-- A **static function** is a top-level `static fn` whose complete body executes during compilation.
+- A **static function** is a module-level or inherent `static fn` whose complete body executes
+  during compilation.
 - A **mixed function** is an ordinary function with static parameters, static local bindings, or
   static conditionals alongside runtime work.
 - A **static parameter** is an explicitly marked specialization input omitted from the runtime
