@@ -78,10 +78,13 @@ const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
       code: 'CORPUS_COMPONENT_INPUT',
       reason: 'the build CLI cannot supply native runtime components yet',
     })
-  if (program.nativeCSources !== undefined || program.nativeDynamicLibraries !== undefined)
+  if (
+    program.nativeCSources !== undefined ||
+    program.nativeDynamicLibraries?.some((library) => library !== 'c' && library !== 'm')
+  )
     gaps.push({
       code: 'CORPUS_NATIVE_LINK_INPUT',
-      reason: 'the build CLI cannot link corpus C objects or dynamic libraries yet',
+      reason: 'the build CLI cannot link corpus C objects or libraries beyond libc/libm yet',
     })
   if (program.nativeProfiles?.some((profile) => profile.optimization !== 'speed' || profile.debug))
     gaps.push({
