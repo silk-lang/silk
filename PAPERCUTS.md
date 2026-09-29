@@ -331,3 +331,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-29 · A MIR assertion counted unique extern declarations even though repeated calls retain separate foreign edges · Assert foreign edge presence and an empty runtime-body worklist; declaration deduplication happens at final emission · self-hosted backend
 - 2026-09-29 · An inline effectful tuple copy inside a nested match argument reported PAR0001 in Linux CI even after simplifying its call · Use a statement-block arm with an explicit enclosing return, and verify the replacement head in CI · self-hosted compiler
+
+- 2026-09-29 · A direct-call test passed all assertions but exceeded the 1 s CI gate after B6 added repeated declaration/header queries and whole-source unsafe-prefix scans to ordinary calls · Retain foreign facts on the resolved call target and direct-prefix evidence during the existing syntax traversal; verify timing in exact-head Linux CI without dropping assertions · self-hosted backend
