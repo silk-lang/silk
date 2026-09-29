@@ -1005,17 +1005,26 @@ export const callableIdentity = (self: CallableInstance): string =>
   `${keyText(self.owner)}\u0001${Tir.executableSiteKey(self.site)}\u0001${Type.runtimeArgumentKeys(self.typeArguments).join('\u0000')}`
 
 /** Returns the canonical specialized identity of one discovered callable environment. */
+// One identity object per callable, so its memoized runtime environment key is computed once.
+const environmentIdentities = new WeakMap<CallableInstance, Type.CallableEnvironmentIdentity>()
+
 export const callableEnvironmentIdentity = (
   self: CallableInstance,
-): Type.CallableEnvironmentIdentity =>
-  Tir.callableEnvironmentIdentity(self.site, {
-    declaration: {
-      module: self.owner.declaration.module,
-      name: self.owner.declaration.name,
-    },
-    typeArguments: self.owner.typeArguments,
-    staticArgumentKeys: self.owner.staticArguments.map(StaticValue.key),
-  })
+): Type.CallableEnvironmentIdentity => {
+  let identity = environmentIdentities.get(self)
+  if (identity === undefined) {
+    identity = Tir.callableEnvironmentIdentity(self.site, {
+      declaration: {
+        module: self.owner.declaration.module,
+        name: self.owner.declaration.name,
+      },
+      typeArguments: self.owner.typeArguments,
+      staticArgumentKeys: self.owner.staticArguments.map(StaticValue.key),
+    })
+    environmentIdentities.set(self, identity)
+  }
+  return identity
+}
 
 const {
   functionByKey,
@@ -1058,6 +1067,13 @@ const {
 
 type CallTarget = ExecutableOrigin.CallTarget
 
+const compareExecutionEdges = (left: ExecutionEdge, right: ExecutionEdge): number => {
+  const owner = compareInstanceKeys(left.owner, right.owner)
+  if (owner !== 0) return owner
+  const target = compareInstanceKeys(left.target, right.target)
+  return target !== 0 ? target : left.kind.localeCompare(right.kind)
+}
+
 const compareInstanceKeys = (left: InstanceKey, right: InstanceKey): number => {
   const leftText = keyText(left)
   const rightText = keyText(right)
@@ -1091,6 +1107,10 @@ interface ClosureIndex {
   readonly instances: ReadonlyMap<string, Instance>
   readonly byOwner: ReadonlyMap<string, ReadonlyArray<ExecutionEdge>>
   readonly residuals: ReadonlyMap<string, Residualization.Observation>
+  /** Discovery instances in closure order (by key text). */
+  readonly sortedInstances: ReadonlyArray<{ readonly text: string; readonly value: Instance }>
+  /** Execution edges in closure order. */
+  readonly sortedEdges: ReadonlyArray<ExecutionEdge>
   /** Callables and Effects in closure order, each with its owner's key text. */
   readonly callables: ReadonlyArray<{ readonly owner: string; readonly value: CallableInstance }>
   readonly effects: ReadonlyArray<{ readonly owner: string; readonly value: EffectInstance }>
@@ -1112,10 +1132,15 @@ const closureIndex = (self: Discovery): ClosureIndex => {
       if (owned === undefined) byOwner.set(key, [edge])
       else owned.push(edge)
     }
+    const instances = new Map(self.instances.map((instance) => [keyText(instance.key), instance]))
     index = {
-      instances: new Map(self.instances.map((instance) => [keyText(instance.key), instance])),
+      instances,
       byOwner,
       residuals: new Map(self.residualBodies.map((body) => [body.application, body])),
+      sortedInstances: [...instances]
+        .map(([text, value]) => ({ text, value }))
+        .sort((left, right) => compareInstanceKeys(left.value.key, right.value.key)),
+      sortedEdges: self.executionEdges.toSorted(compareExecutionEdges),
       // Sorted once: filtering a stably sorted list keeps the order each closure sorted into.
       callables: self.callables
         .toSorted((left, right) => callableIdentity(left).localeCompare(callableIdentity(right)))
@@ -1156,7 +1181,6 @@ export const executionClosure = (
   const index = closureIndex(self)
   const { instances, byOwner, residuals } = index
   const selected = new Map<string, Instance>()
-  const selectedEdges = new Map<string, ExecutionEdge>()
   const gaps: Array<ExecutionGap> = []
   const pending = [root]
   for (let cursor = 0; cursor < pending.length; cursor += 1) {
@@ -1174,13 +1198,13 @@ export const executionClosure = (
       const targetDeclaration = `${edge.target.declaration.module}\u0000${edge.target.declaration.name}`
       if (excludedDeclarations.has(targetDeclaration)) continue
       const target = keyText(edge.target)
-      selectedEdges.set(`${encoded}\u0005${edge.kind}\u0005${target}`, edge)
       if (!instances.has(target)) gaps.push({ _tag: 'MissingTarget', edge })
       else if (!selected.has(target)) pending.push(edge.target)
     }
   }
-  const orderedInstances = [...selected.values()].sort((left, right) =>
-    compareInstanceKeys(left.key, right.key),
+  // Key text orders instances totally, so filtering the presorted list is the sorted selection.
+  const orderedInstances = index.sortedInstances.flatMap((entry) =>
+    selected.has(entry.text) ? [entry.value] : [],
   )
   const residualBodies: Array<Residualization.Observation> = []
   for (const instance of orderedInstances) {
@@ -1199,12 +1223,14 @@ export const executionClosure = (
     _tag: 'ExecutionClosure',
     root,
     instances: orderedInstances,
-    edges: [...selectedEdges.values()].sort((left, right) => {
-      const owner = compareInstanceKeys(left.owner, right.owner)
-      if (owner !== 0) return owner
-      const target = compareInstanceKeys(left.target, right.target)
-      return target !== 0 ? target : left.kind.localeCompare(right.kind)
-    }),
+    // Exactly the edges the traversal recorded: those of selected owners into non-excluded targets.
+    edges: index.sortedEdges.filter(
+      (edge) =>
+        selected.has(keyText(edge.owner)) &&
+        !excludedDeclarations.has(
+          `${edge.target.declaration.module}\u0000${edge.target.declaration.name}`,
+        ),
+    ),
     callables: index.callables.flatMap((entry) => (owners.has(entry.owner) ? [entry.value] : [])),
     effects: index.effects.flatMap((entry) => (owners.has(entry.owner) ? [entry.value] : [])),
     intrinsics: index.intrinsics.flatMap((entry) => (spans.has(entry.span) ? [entry.value] : [])),
@@ -2626,6 +2652,9 @@ export const discover = (
       targetKeys: new Map(),
     }
   }
+  // Contexts processed by the current attempt, and where it stops once a family grew.
+  let attemptProcessed = 0
+  let stopAt = Number.POSITIVE_INFINITY
   const restartDiscovery = (): void => {
     scheduledContexts.clear()
     queuedContexts.clear()
@@ -2639,14 +2668,23 @@ export const discover = (
     violationKeys.clear()
     projectedCycleSizes.clear()
     discriminatingGrew = false
+    attemptProcessed = 0
+    stopAt = Number.POSITIVE_INFINITY
     for (const root of roots) schedule(root)
   }
   trace('Instances.expandWorklist', () => {
     while (true) {
-      // A declaration proved discriminating mid-round leaves the guards below it already taken
-      // without its ancestry, so the round is abandoned rather than expanded further: without that
-      // guard an unbounded specialization would keep scheduling work the restart discards anyway.
-      for (let cursor = 0; cursor < pending.length && !discriminatingGrew; cursor += 1) {
+      for (let cursor = 0; cursor < pending.length; cursor += 1) {
+        // A family proved discriminating leaves the guards taken without its ancestry, so this
+        // attempt is abandoned, but not at once: other families usually prove discriminating
+        // nearby, and each would otherwise cost a full restart from the roots. The attempt runs
+        // on for up to twice its work so far, which also bounds any specialization the missing
+        // guard admits before the restart discards it.
+        if (discriminatingGrew) {
+          if (stopAt === Number.POSITIVE_INFINITY) stopAt = attemptProcessed * 2 + 1024
+          if (attemptProcessed >= stopAt) break
+        }
+        attemptProcessed += 1
         const context = pending[cursor]
         if (context === undefined) continue
         queuedContexts.delete(context)
