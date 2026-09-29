@@ -4,7 +4,8 @@ import hir.Hir {HirId, HirRef, InfixOperator, Module, Node, PrefixOperator, Rang
 import hir.Intern {Symbol}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.Intrinsic {Member as IntrinsicMember}
+import semantic.FinalProfile {FinalProfile}
+import semantic.Intrinsic {Member as IntrinsicMember, spelling as intrinsicSpelling}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, IndexedDeclaration, ModuleIndex}
 import semantic.Query {Cycle}
@@ -20,6 +21,8 @@ import semantic.StaticFunction {
   Rejection as StaticHeaderRejection,
   HeaderFault as StaticHeaderFault,
 }
+import semantic.StaticText
+import semantic.StaticText {FaultKind as StaticTextFaultKind, Operation as StaticTextOperation}
 import semantic.StaticValue
 import semantic.StaticValue {
   Fault as StaticFault,
@@ -40,6 +43,7 @@ import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
 import silk.u8
+import silk.u32
 import silk.u64
 import silk.usize
 import silk.vector {Vector}
@@ -76,6 +80,8 @@ pub enum MissingFact {
   CheckedSource,
   DeclaredType,
   IntrinsicOperation,
+  /// No final build profile was supplied to this static evaluation.
+  ProfileInput,
 }
 
 pub struct TraceStep {
@@ -745,6 +751,46 @@ fn name(module: &Module, id: HirId) -> Option<&[u8]> {
   }
 }
 
+fn staticTextOperation(member: IntrinsicMember) -> Option<StaticTextOperation> {
+  if member == IntrinsicMember.StaticTextByteLength {
+    return Option.some<StaticTextOperation>(StaticTextOperation.ByteLength)
+  }
+  if member == IntrinsicMember.StaticTextByteAt {
+    return Option.some<StaticTextOperation>(StaticTextOperation.ByteAt)
+  }
+  if member == IntrinsicMember.StaticTextConcat {
+    return Option.some<StaticTextOperation>(StaticTextOperation.Concat)
+  }
+  if member == IntrinsicMember.StaticTextSlice {
+    return Option.some<StaticTextOperation>(StaticTextOperation.Slice)
+  }
+  return Option.none<StaticTextOperation>()
+}
+
+fn firstTextOrigin<'source>(machine: &Machine<'source>, values: &Vector<Shared<StaticData>>) -> Option<Span> {
+  let arguments = Vector.asSlice<Shared<StaticData>>(values)
+  if arguments.length == usize.ZERO { return Option.none<Span>() }
+  return textOrigin(machine, &arguments[usize.ZERO])
+}
+
+effect fn profileArgument<'source>(
+  machine: &mut Machine<'source>,
+  local: &mut Vector<Local>,
+  arguments: Range,
+  at: usize,
+  span: Span,
+) -> Bytes ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  if at >= arguments.length {
+    return run reject(&machine.*, Fault.InvalidValue, span)
+  }
+  let id = Module.child(run authored(&machine.*), arguments, at)
+  let value = run expression(&mut machine.*, &mut local.*, id)
+  return match move run StaticValue.textBytes(&value) {
+    Option<Bytes>.Some {value: bytes} => move bytes
+    Option<Bytes>.None => run reject(&machine.*, Fault.InvalidValue, span)
+  }
+}
+
 effect fn callSpelling<'source>(machine: &Machine<'source>, callee: HirId, span: Span) -> CallSpelling
 ! Diagnostic | OutOfMemoryError
 ? &mut Allocator {
@@ -779,12 +825,121 @@ effect fn callSpelling<'source>(machine: &Machine<'source>, callee: HirId, span:
 
 effect fn dispatchIntrinsic<'source>(
   machine: &mut Machine<'source>,
-  _member: IntrinsicMember,
-  _arguments: Range,
-  _local: &mut Vector<Local>,
+  member: IntrinsicMember,
+  arguments: Range,
+  local: &mut Vector<Local>,
   span: Span,
 ) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
-  // U6 adds target and text primitives here; all sealed calls share this boundary.
+  if member == IntrinsicMember.ProfileText || member == IntrinsicMember.ProfileFlag || member == IntrinsicMember.ProfileContains {
+    let count = if member == IntrinsicMember.ProfileContains { 2 } else { usize.ONE }
+    if arguments.length != count {
+      return run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    let key = run profileArgument(&mut machine.*, &mut local.*, arguments, usize.ZERO, span)
+    let mut memberName = Bytes.make()
+    if member == IntrinsicMember.ProfileContains {
+      memberName = run profileArgument(&mut machine.*, &mut local.*, arguments, usize.ONE, span)
+    }
+    let module = run currentModule(&machine.*)
+    let demanded = run Effect.result(StaticPort.demandProfile(&mut machine.port, &module, span))
+    if let Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} = move demanded {
+      match move error {
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        _ => return run reject(&machine.*, Fault.Unavailable, span)
+      }
+    }
+    let available = StaticPort<'source>.profile(&machine.port)
+    let profile = match move available {
+      Option<&FinalProfile>.Some {value} => value
+      Option<&FinalProfile>.None => {
+        let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+        failure.missing = Option.some<MissingFact>(MissingFact.ProfileInput)
+        fail move failure
+      }
+    }
+    if member == IntrinsicMember.ProfileText {
+      let fact = match move FinalProfile.text(profile, Bytes.asSlice(&key)) {
+        Option<&[u8]>.Some {value} => value
+        Option<&[u8]>.None => return run reject(&machine.*, Fault.InvalidValue, span)
+      }
+      if fact.length > machine.limits.valueBytes || machine.limits.valueBytes - fact.length < 16 {
+        return run reject(&machine.*, Fault.ValueLimit, span)
+      }
+      let text = match move StaticValue.text(run Bytes.copy(fact)) {
+        Option<StaticData>.Some {value} => value
+        Option<StaticData>.None => return run reject(&machine.*, Fault.InvalidValue, span)
+      }
+      let retained = run retain(&mut machine.*, move text, span)
+      run rememberTextOrigin(&mut machine.*, &retained, span)
+      return move retained
+    }
+    let result = if member == IntrinsicMember.ProfileFlag {
+      FinalProfile.flag(profile, Bytes.asSlice(&key))
+    } else {
+      FinalProfile.contains(profile, Bytes.asSlice(&key), Bytes.asSlice(&memberName))
+    }
+    return match move result {
+      Option<bool>.Some {value} => run retain(&mut machine.*, StaticData.Boolean {value: value}, span)
+      Option<bool>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+  }
+  let selectedName = intrinsicSpelling(member)
+  if let Option<u32>.Some {value: number} = move machine.target.queryNumber(selectedName) {
+    if arguments.length != usize.ZERO { return run reject(&machine.*, Fault.InvalidValue, span) }
+    return run retain(&mut machine.*, StaticData.Integer {
+      ty: StaticIntegerType.U32, sign: StaticSign.Positive, magnitude: u32.toU64(number),
+    }, span)
+  }
+  if let Option<&[u8]>.Some {value: fact} = move machine.target.queryText(selectedName) {
+    if arguments.length != usize.ZERO { return run reject(&machine.*, Fault.InvalidValue, span) }
+    if fact.length > machine.limits.valueBytes || machine.limits.valueBytes - fact.length < 16 {
+      return run reject(&machine.*, Fault.ValueLimit, span)
+    }
+    let copied = run Bytes.copy(fact)
+    let text = match move StaticValue.text(move copied) {
+      Option<StaticData>.Some {value} => value
+      Option<StaticData>.None => { return run reject(&machine.*, Fault.InvalidValue, span) }
+    }
+    let retained = run retain(&mut machine.*, move text, span)
+    run rememberTextOrigin(&mut machine.*, &retained, span)
+    return move retained
+  }
+  if let Option<StaticTextOperation>.Some {value: selected} = move staticTextOperation(member) {
+    let mut values = Vector.make<Shared<StaticData>>()
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      let argument = Module.child(run authored(&machine.*), arguments, at)
+      let value = run expression(&mut machine.*, &mut local.*, argument)
+      run Vector.append<Shared<StaticData>>(&mut values, move value)
+      at = at + usize.ONE
+    }
+    let sourceOrigin = firstTextOrigin(&machine.*, &values)
+    let producesText = selected == StaticTextOperation.Concat || selected == StaticTextOperation.Slice
+    let applied = run StaticText.apply(
+      selected, Vector.asSlice<Shared<StaticData>>(&values), machine.target.pointerBits(),
+      machine.limits.valueBytes,
+    )
+    return match move applied {
+      Result<StaticData, StaticText.Fault>.Success {value} => {
+        let retained = run retain(&mut machine.*, move value, span)
+        if producesText {
+          if let Option<Span>.Some {value: origin} = move sourceOrigin {
+            run rememberTextOrigin(&mut machine.*, &retained, origin)
+          }
+        }
+        return move retained
+      }
+      Result<StaticData, StaticText.Fault>.Failure {error} => {
+        if error.kind == StaticTextFaultKind.ValueLimit {
+          return run reject(&machine.*, Fault.ValueLimit, span)
+        }
+        let mut failure = run diagnostic(&machine.*, Fault.InvalidValue, span)
+        failure.byteOffset = Option.some<u64>(error.byteOffset)
+        failure.origin = move sourceOrigin
+        fail move failure
+      }
+    }
+  }
   let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
   failure.missing = Option.some<MissingFact>(MissingFact.IntrinsicOperation)
   fail move failure
@@ -990,6 +1145,23 @@ fn checkedIntegerType<'source>(machine: &Machine<'source>, id: HirId) -> Option<
   }
 }
 
+fn checkedFloatType<'source>(machine: &Machine<'source>, id: HirId) -> Option<StaticFloatType> {
+  return match move checkedExpressionType(machine, id) {
+    Option<Shared<SemanticType>>.Some {value: ty} => Shared.with<SemanticType, Option<StaticFloatType>>(
+      &ty,
+      fn(value: &SemanticType) -> Option<StaticFloatType> {
+        if let SemanticType.Primitive {name: spelling} = &value.* {
+          let written = Bytes.asSlice(&spelling)
+          if equal(written, b"f32") { return Option.some<StaticFloatType>(StaticFloatType.F32) }
+          if equal(written, b"f64") { return Option.some<StaticFloatType>(StaticFloatType.F64) }
+        }
+        return Option.none<StaticFloatType>()
+      },
+    )
+    Option<Shared<SemanticType>>.None => Option.none<StaticFloatType>()
+  }
+}
+
 fn appliedDeclaredType(
   declared: &Shared<SemanticType>,
   selected: &SelectedStaticFunction,
@@ -1009,7 +1181,7 @@ fn appliedDeclaredType(
       let arguments = Vector.asSlice<Argument>(&application.arguments)
       if ordinal < arguments.length {
         if let Argument.Type {value} = &arguments[ordinal] {
-          if SemanticType.hasOpenParameters(&value) {
+          if SemanticType.hasOpenRuntimeParameters(&value) {
             return Option.none<Shared<SemanticType>>()
           }
           return Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(&value))
@@ -1018,7 +1190,7 @@ fn appliedDeclaredType(
       return Option.none<Shared<SemanticType>>()
     }
     Option<usize>.None => {
-      if SemanticType.hasOpenParameters(declared) {
+      if SemanticType.hasOpenRuntimeParameters(declared) {
         return Option.none<Shared<SemanticType>>()
       }
       return Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(declared))
@@ -1247,19 +1419,18 @@ effect fn expressionFromSource<'source>(machine: &mut Machine<'source>, local: &
       run rememberTextOrigin(&mut machine.*, &text, span)
       return move text
     }
-    Node.FloatingLiteral {spelling, suffix} => {
-      let mut f32Width = false
-      if suffix.present {
-        let written = Module.text(run authored(&machine.*), suffix.symbol)
-        if equal(written, b"f32") {
-          f32Width = true
-        } else if !equal(written, b"f64") {
-          return run reject(&machine.*, Fault.InvalidValue, span)
+    Node.FloatingLiteral {spelling, suffix: ignoredSuffix} => {
+      let width = match move checkedFloatType(&machine.*, id) {
+        Option<StaticFloatType>.Some {value} => value
+        Option<StaticFloatType>.None => {
+          let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+          failure.missing = Option.some<MissingFact>(MissingFact.CheckedExpression)
+          fail move failure
         }
       }
-      let mut rounded = StaticValue.f64Literal(run authored(&machine.*), spelling)
-      if f32Width {
-        rounded = StaticValue.f32Literal(run authored(&machine.*), spelling)
+      let rounded = match move width {
+        StaticFloatType.F32 => StaticValue.f32Literal(run authored(&machine.*), spelling)
+        StaticFloatType.F64 => StaticValue.f64Literal(run authored(&machine.*), spelling)
       }
       return match move rounded {
         Result<StaticData, ParseError>.Success {value: selected} => run retain(
