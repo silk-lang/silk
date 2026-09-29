@@ -24,6 +24,7 @@ export interface Summary {
   readonly pass: number
   readonly fail: number
   readonly unsupported: number
+  readonly gapCounts: ReadonlyArray<{ readonly code: string; readonly count: number }>
   readonly trackFailures: ReadonlyArray<string>
 }
 
@@ -197,10 +198,18 @@ export const summarize = (
   if (missing.length > 0)
     throw new Error(`selfhost track names absent from corpus: ${missing.join(', ')}`)
   const trackSet = new Set(track)
+  const gapCounts = new Map<string, number>()
+  for (const result of results) {
+    if (result.status !== 'unsupported') continue
+    for (const gap of result.gaps) gapCounts.set(gap.code, (gapCounts.get(gap.code) ?? 0) + 1)
+  }
   return {
     pass: results.filter((result) => result.status === 'pass').length,
     fail: results.filter((result) => result.status === 'fail').length,
     unsupported: results.filter((result) => result.status === 'unsupported').length,
+    gapCounts: [...gapCounts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([code, count]) => ({ code, count })),
     trackFailures: results
       .filter((result) => trackSet.has(result.name) && result.status !== 'pass')
       .map((result) => result.name),
@@ -222,7 +231,7 @@ const main = (): void => {
   if (selectedSet !== undefined && programs.length !== selectedSet.size)
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
   const track = selfhostTrack.filter((name) => selectedSet === undefined || selectedSet.has(name))
-  const executable = resolve(silkc)
+  const executable = silkc.includes('/') ? resolve(silkc) : silkc
   const results = programs.map((program) => runCase(executable, program))
   for (const result of results) {
     let detail = ''
@@ -235,6 +244,8 @@ const main = (): void => {
   process.stdout.write(
     `Selfhost corpus: pass=${summary.pass} fail=${summary.fail} unsupported=${summary.unsupported} track=${track.length}\n`,
   )
+  for (const gap of summary.gapCounts)
+    process.stdout.write(`Selfhost gap ${gap.code}: ${gap.count}\n`)
   if (summary.trackFailures.length > 0) {
     process.stderr.write(`Selfhost track failed: ${summary.trackFailures.join(', ')}\n`)
     process.exitCode = 1

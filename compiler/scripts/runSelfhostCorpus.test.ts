@@ -80,6 +80,7 @@ it('fails the gate only for cases on the ordered selfhost track', () => {
     pass: 1,
     fail: 1,
     unsupported: 1,
+    gapCounts: [{ code: 'MIR_AGGREGATE', count: 1 }],
     trackFailures: [],
   })
   assert.deepStrictEqual(summarize(results, ['literal', 'later']).trackFailures, ['later'])
