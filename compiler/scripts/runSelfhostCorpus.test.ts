@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
-import { parseUnsupported, runCase, summarize } from './runSelfhostCorpus.js'
+import { parseBuildDiagnostic, parseUnsupported, runCase, summarize } from './runSelfhostCorpus.js'
 
 const literal: CorpusProgram = {
   name: 'literal',
@@ -62,6 +62,7 @@ it('keeps build and runtime regressions in the failure count', () => {
     assert.deepStrictEqual(result, {
       name: 'literal',
       status: 'fail',
+      code: 'RUNTIME_MISMATCH',
       reason: 'run 1: exit: expected 42, got 41',
     })
   })
@@ -70,7 +71,7 @@ it('keeps build and runtime regressions in the failure count', () => {
 it('fails the gate only for cases on the ordered selfhost track', () => {
   const results = [
     { name: 'literal', status: 'pass' },
-    { name: 'future', status: 'fail', reason: 'not ready' },
+    { name: 'future', status: 'fail', code: 'UnknownName', reason: 'not ready' },
     {
       name: 'later',
       status: 'unsupported',
@@ -81,6 +82,7 @@ it('fails the gate only for cases on the ordered selfhost track', () => {
     pass: 1,
     fail: 1,
     unsupported: 1,
+    failureCounts: [{ code: 'UnknownName', count: 1 }],
     gapCounts: [{ code: 'MIR_AGGREGATE', count: 1 }],
     trackFailures: [],
   })
@@ -112,4 +114,24 @@ chmod +x "$output"`
       'fail',
     )
   })
+})
+
+it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
+  const record = 'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'
+  withStub(`echo '${record}' >&2; exit 1`, (silkc) => {
+    const result = runCase(silkc, literal)
+    assert.strictEqual(result.status, 'fail')
+    if (result.status !== 'fail') throw new Error('expected rejection')
+    assert.strictEqual(result.code, 'UnknownName')
+    assert.deepStrictEqual(result.span, { start: 28, end: 34 })
+    assert.deepStrictEqual(summarize([result], []).failureCounts, [
+      { code: 'UnknownName', count: 1 },
+    ])
+  })
+  assert.strictEqual(parseBuildDiagnostic(`${record}\n${record}`), undefined)
+  assert.strictEqual(
+    parseBuildDiagnostic('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28}}'),
+    undefined,
+  )
+  assert.strictEqual(parseBuildDiagnostic('SILK_BUILD_ERROR=semantic-rejection'), undefined)
 })

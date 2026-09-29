@@ -325,3 +325,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · The B5 bootstrap check still exhausted its heap with pinned Node 24.18.1 and a 6144 MiB heap · Keep the five-minute cap and release the build slot; use exact-head Linux CI for the full compiler guard · self-hosted compiler
 - 2026-09-29 · B5 runner tests could not load Effect in the isolated worktree · Link its compiler node_modules to the prepared checkout and run the stub-only runner test with pinned Node24 · self-hosted compiler
 - 2026-09-29 · The workspace commit helper rejected an explicit file list while a merge was active · Stage the intended files and use the user-requested staged-only merge checkpoint without a files list · self-hosted compiler
+
+- 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
