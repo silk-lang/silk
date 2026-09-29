@@ -505,7 +505,7 @@ pub union Value {
 
 /// Whole-program assembly of demanded instance text, with reached unsupported forms preserved.
 pub union BackendBuild {
-  Module {pub text: Bytes},
+  Module {pub text: Bytes, pub uncheckedBodies: usize},
   Unsupported {pub gaps: Vector<Shared<BackendGap>>},
   Rejected {pub diagnostic: Shared<Rejection>},
 }
@@ -885,6 +885,7 @@ struct Resolver {
   modules: Vector<ModuleId>
   names: Vector<Bytes>
   applications: Vector<Shared<Type>>
+  layoutTypes: Vector<Shared<Type>>
   backendInstances: Vector<InstanceKey>
   keys: Vector<ScopedKey>
   // The request-selected application module ordinal, or MAX when no binding was supplied.
@@ -2532,6 +2533,21 @@ effect fn internApplication(resolver: &mut Resolver, application: &Shared<Type>)
     at = at + usize.ONE
   }
   run Vector.append<Shared<Type>>(&mut resolver.applications, Shared.clone<Type>(application))
+  return at
+}
+
+effect fn internLayoutType(resolver: &mut Resolver, ty: &Shared<Type>) -> usize
+! OutOfMemoryError
+? &mut Allocator {
+  let known = Vector.asSlice<Shared<Type>>(&resolver.layoutTypes)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if run Type.runtimeEqualsShared(&known[at], ty) {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  run Vector.append<Shared<Type>>(&mut resolver.layoutTypes, Shared.clone<Type>(ty))
   return at
 }
 
@@ -16301,11 +16317,58 @@ effect fn inferFromProviderBounds(
   return Option.none<Shared<Rejection>>()
 }
 
-// Effect construction and unsafe acknowledgement are outside the scalar body subset.
+// Effect construction remains outside runtime body lowering; unsafe is checked lexically.
+fn signatureUnsafe(answer: &Result<Answer, NoRejection>) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => signature.isUnsafe
+      _ => false
+    }
+    _ => false
+  }
+}
+
+// Runtime representation admission is independent of the unfinished borrow-safety stage.
+fn runtimeType(value: &Type) -> bool {
+  return match & value.* {
+    Type.Reference {..} => true
+    Type.Pointer {..} => true
+    _ => scalarType(value) || pointerSizedIntegerType(value)
+  }
+}
+
+fn mutablePlace(nodes: &[BodyNode], locals: &[BodyLocal], id: BodyNodeId) -> bool {
+  return match & nodes[id.index].kind {
+    BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} => locals[local.index].mutable
+    BodyNodeKind.Expression {form: BodyExpression.Dereference {value}, ..} => match & nodes[value.index].kind {
+      BodyNodeKind.Expression {ty, ..} => Shared.with<Type, bool>(
+        &ty,
+        fn(value: &Type) -> bool {
+          return match & value.* {
+            Type.Reference {access, ..} => access == Access.Mutable
+            Type.Pointer {access, ..} => access == Access.Mutable
+            _ => false
+          }
+        },
+      )
+      _ => false
+    }
+    _ => false
+  }
+}
+
+fn checkedPlace(nodes: &[BodyNode], id: BodyNodeId) -> bool {
+  return match & nodes[id.index].kind {
+    BodyNodeKind.Expression {form: BodyExpression.Local {..}, ..} => true
+    BodyNodeKind.Expression {form: BodyExpression.Dereference {..}, ..} => true
+    _ => false
+  }
+}
+
 fn signatureOutsideScalarBodies(answer: &Result<Answer, NoRejection>) -> bool {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
-      Outcome.Success {value: Value.Signature {signature}} => signature.isEffect || signature.isUnsafe
+      Outcome.Success {value: Value.Signature {signature}} => signature.isEffect
       _ => false
     }
     Result<Answer, NoRejection>.Failure {error: _} => false
@@ -16527,6 +16590,15 @@ effect fn bodyRejection(resolver: &Resolver, module: &ModuleId, code: RejectionC
 effect fn collectCall(hir: &Module, expression: HirId, calls: &mut Vector<CallSyntax>) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
+  if let Node.BorrowExpression {operand, ..} = Module.node(hir, expression) {
+    return run collectCall(hir, operand, &mut calls.*)
+  }
+  if let Node.ReferentExpression {subject} = Module.node(hir, expression) {
+    return run collectCall(hir, subject, &mut calls.*)
+  }
+  if let Node.UnsafeExpression {operand} = Module.node(hir, expression) {
+    return run collectCall(hir, operand, &mut calls.*)
+  }
   if let Node.MoveExpression {operand} = Module.node(hir, expression) {
     run collectCall(hir, operand, &mut calls.*)
     return ()
@@ -16670,6 +16742,11 @@ effect fn collectBodySyntax(
           run Vector.append<HirId>(&mut annotations.*, annotation.id)
         }
         run collectCall(hir, initializer, &mut calls.*)
+      }
+      Node.UnsafeStatement {body} => {
+        if let Node.Block {statements} = Module.node(hir, body) {
+          run collectBodySyntax(hir, statements, &mut annotations.*, &mut calls.*)
+        }
       }
       Node.AssignmentStatement {target, value} => {
         run collectCall(hir, target, &mut calls.*)
@@ -17461,6 +17538,7 @@ effect fn checkQualifiedInterfaceCall(
   qualifier: &QualifiedBodyName,
   selected: SelectedDeclaration,
   isPublic: bool,
+  unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -17524,6 +17602,7 @@ effect fn checkQualifiedInterfaceCall(
       constraints,
       contractBody,
       false,
+      unsafeAllowed,
     )
     let node = match move checked {
       Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -17691,7 +17770,7 @@ effect fn checkQualifiedInterfaceCall(
     }
     if !already {
       let mut context = Option.none<Shared<Type>>()
-      if Shared.with<Type, bool>(&parameterType, scalarType) {
+      if Shared.with<Type, bool>(&parameterType, runtimeType) {
         context = Option.some<Shared<Type>>(Shared.clone<Type>(&parameterType))
       }
       let argumentId = run bodyChild(&resolver.source, cursor, arguments, at)
@@ -17712,6 +17791,7 @@ effect fn checkQualifiedInterfaceCall(
         constraints,
         contractBody,
         false,
+        unsafeAllowed,
       )
       argumentNode = match move checked {
         Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -17921,6 +18001,7 @@ effect fn checkOperatorOperand(
   constraints: &[Constraint],
   contractBody: bool,
   staticBody: bool,
+  unsafeAllowed: bool,
 ) -> Result<CheckedOperand, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -17941,6 +18022,7 @@ effect fn checkOperatorOperand(
     constraints,
     contractBody,
     staticBody,
+    unsafeAllowed,
   )
   let node = match move checked {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -17986,6 +18068,7 @@ effect fn checkReceiverCall(
   expected: &Option<Shared<Type>>,
   constraints: &[Constraint],
   contractBody: bool,
+  unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -18018,6 +18101,7 @@ effect fn checkReceiverCall(
     constraints,
     contractBody,
     false,
+    unsafeAllowed,
   )
   let receiverNode = match move checkedReceiver {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -18215,8 +18299,39 @@ effect fn checkReceiverCall(
       return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, memberSpan)
     }
   }
+  let mut adaptedReceiver = receiverNode
+  if !exactReceiver && run Type.equalsShared(&receiverType, &provider) {
+    let access = match receiverPositionValue.mode {
+      BodyReceiverPass.Shared => Access.Shared
+      BodyReceiverPass.Mutable => Access.Mutable
+      BodyReceiverPass.Take => Access.Shared
+    }
+    if receiverPositionValue.mode != BodyReceiverPass.Take {
+      if access == Access.Mutable && !mutablePlace(
+        Vector.asSlice<BodyNode>(&nodes.*),
+        locals,
+        receiverNode,
+      ) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, memberSpan)
+      }
+      if !checkedPlace(Vector.asSlice<BodyNode>(&nodes.*), receiverNode) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, memberSpan)
+      }
+      adaptedReceiver = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+      run Vector.append<BodyNode>(
+        &mut nodes.*,
+        BodyNode {
+          origin: BodyOrigin {syntax: subject, span: span},
+          kind: BodyNodeKind.Expression {
+            ty: Shared.clone<Type>(&expectedReceiver),
+            form: BodyExpression.Borrow {access: access, value: receiverNode},
+          },
+        },
+      )
+    }
+  }
   let mut typedArguments = Vector.make<BodyNodeId>()
-  run Vector.append<BodyNodeId>(&mut typedArguments, receiverNode)
+  run Vector.append<BodyNodeId>(&mut typedArguments, adaptedReceiver)
   let mut at = usize.ZERO
   while at < arguments.length {
     let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
@@ -18232,7 +18347,7 @@ effect fn checkReceiverCall(
       }
     }
     let mut context = Option.none<Shared<Type>>()
-    if Shared.with<Type, bool>(&parameterType, scalarType) {
+    if Shared.with<Type, bool>(&parameterType, runtimeType) {
       context = Option.some<Shared<Type>>(Shared.clone<Type>(&parameterType))
     }
     let argumentId = run bodyChild(&resolver.source, cursor, arguments, at)
@@ -18253,6 +18368,7 @@ effect fn checkReceiverCall(
       constraints,
       contractBody,
       false,
+      unsafeAllowed,
     )
     let argumentNode = match move checked {
       Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -18362,6 +18478,7 @@ effect fn checkExpression(
   constraints: &[Constraint],
   contractBody: bool,
   staticBody: bool,
+  unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -18428,13 +18545,16 @@ effect fn checkExpression(
       }
       let mut contextual = false
       if let Option<Shared<Type>>.Some {value} = &expected.* {
-        contextual = Shared.with<Type, bool>(&value, fn(checked: &Type) -> bool {
-          if let Type.Primitive {name} = &checked.* {
-            let written = Bytes.asSlice(&name)
-            return same(written, b"f32") || same(written, b"f64")
-          }
-          return false
-        })
+        contextual = Shared.with<Type, bool>(
+          &value,
+          fn(checked: &Type) -> bool {
+            if let Type.Primitive {name} = &checked.* {
+              let written = Bytes.asSlice(&name)
+              return same(written, b"f32") || same(written, b"f64")
+            }
+            return false
+          },
+        )
       }
       if contextual {
         if let Option<Shared<Type>>.Some {value} = &expected.* {
@@ -18463,7 +18583,9 @@ effect fn checkExpression(
       if !staticBody {
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
-      let textType = Option.some<Shared<Type>>(run intrinsicValueType(IntrinsicValueKind.StaticText))
+      let textType = Option.some<Shared<Type>>(
+        run intrinsicValueType(IntrinsicValueKind.StaticText),
+      )
       let checked = run checkExpression(
         &mut resolver.*,
         &mut owner.*,
@@ -18481,6 +18603,7 @@ effect fn checkExpression(
         constraints,
         contractBody,
         staticBody,
+        unsafeAllowed,
       )
       let messageNode = match move checked {
         Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -18497,7 +18620,9 @@ effect fn checkExpression(
         let found = run resolvedCall(calls, expression)
         if let Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} = move found {
           match move value {
-            Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {declaration, ty: constantType}} => {
+            Result<ResolvedTarget, Shared<Rejection>>.Success {
+              value: ResolvedTarget.Constant {declaration, ty: constantType},
+            } => {
               if !staticBody {
                 return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
               }
@@ -18507,7 +18632,12 @@ effect fn checkExpression(
               }
             }
             Result<ResolvedTarget, Shared<Rejection>>.Success {value: _} => {
-              return run bodyRejection(&resolver.*, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name))
+              return run bodyRejection(
+                &resolver.*,
+                module,
+                RejectionCode.UnknownName,
+                run bodySpan(&resolver.source, cursor, name),
+              )
             }
             Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => {
               return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
@@ -18584,19 +18714,180 @@ effect fn checkExpression(
         }
       }
     }
+    Node.BorrowExpression {access, operand} => {
+      if staticBody {
+        return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span)
+      }
+      let checked = run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        operand,
+        &Option.none<Shared<Type>>(),
+        constraints,
+        contractBody,
+        staticBody,
+        unsafeAllowed,
+      )
+      let operandNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      if !checkedPlace(Vector.asSlice<BodyNode>(&nodes.*), operandNode) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+      if access == Access.Mutable && !mutablePlace(
+        Vector.asSlice<BodyNode>(&nodes.*),
+        locals,
+        operandNode,
+      ) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+      }
+      let referent = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &operandNode) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      }
+      let mut borrowLifetime = Option.none<Shared<Lifetime>>()
+      if let Option<Shared<Type>>.Some {value: context} = &expected.* {
+        borrowLifetime = Shared.with<Type, Option<Shared<Lifetime>>>(
+          &context,
+          fn(value: &Type) -> Option<Shared<Lifetime>> {
+            return match & value.* {
+              Type.Reference {lifetime: validity, ..} => Option.some<Shared<Lifetime>>(
+                Shared.clone<Lifetime>(&validity),
+              )
+              _ => Option.none<Shared<Lifetime>>()
+            }
+          },
+        )
+      }
+      let region = match move borrowLifetime {
+        Option<Shared<Lifetime>>.Some {value} => value
+        Option<Shared<Lifetime>>.None => run Shared.make<Lifetime>(
+          Lifetime.Local {
+            declaration: run DeclarationId.copy(
+              &Vector.asSlice<SignatureDependency>(&signatures.*)[usize.ZERO].declaration,
+            ),
+            ordinal: expression.index,
+          },
+        )
+      }
+      ty = run Shared.make<Type>(
+        Type.Reference {referent: move referent, access: access, lifetime: move region},
+      )
+      form = BodyExpression.Borrow {access: access, value: operandNode}
+    }
+    Node.ReferentExpression {subject} => {
+      if staticBody {
+        return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span)
+      }
+      let checked = run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        subject,
+        &Option.none<Shared<Type>>(),
+        constraints,
+        contractBody,
+        staticBody,
+        unsafeAllowed,
+      )
+      let operandNode = match move checked {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let subjectType = match move bodyExpressionType(
+        Vector.asSlice<BodyNode>(&nodes.*),
+        &operandNode,
+      ) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      }
+      let pointee = Shared.with<Type, Option<Shared<Type>>>(
+        &subjectType,
+        fn(value: &Type) -> Option<Shared<Type>> {
+          return match & value.* {
+            Type.Reference {referent, ..} => Option.some<Shared<Type>>(
+              Shared.clone<Type>(&referent),
+            )
+            Type.Pointer {pointee, nullable, multiplicity, ..} => {
+              if unsafeAllowed && !nullable && multiplicity == Multiplicity.Single {
+                return Option.some<Shared<Type>>(Shared.clone<Type>(&pointee))
+              }
+              return Option.none<Shared<Type>>()
+            }
+            _ => Option.none<Shared<Type>>()
+          }
+        },
+      )
+      ty = match move pointee {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+        }
+      }
+      form = BodyExpression.Dereference {value: operandNode}
+    }
+    Node.UnsafeExpression {operand} => {
+      return run checkExpression(
+        &mut resolver.*,
+        &mut owner.*,
+        &mut request.*,
+        &mut dependencies.*,
+        module,
+        cursor,
+        locals,
+        calls,
+        &mut nodes.*,
+        &mut signatures.*,
+        &mut requiredBodies.*,
+        operand,
+        expected,
+        constraints,
+        contractBody,
+        staticBody,
+        true,
+      )
+    }
     Node.MoveExpression {operand} => {
       // The first abstract-body subset moves a named local as a whole. A later safety stage
       // checks that it is still owned here and that cleanup follows the resulting control flow.
-      if let Node.IdentifierExpression {binding, ..} = run bodyNode(
-        &resolver.source,
-        cursor,
-        operand,
-      ) {
-        if !binding.present {
+      if staticBody {
+        if let Node.IdentifierExpression {binding, ..} = run bodyNode(
+          &resolver.source,
+          cursor,
+          operand,
+        ) {
+          if !binding.present {
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+          }
+        } else {
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
-      } else {
-        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
       let checked = run checkExpression(
         &mut resolver.*,
@@ -18615,6 +18906,7 @@ effect fn checkExpression(
         constraints,
         contractBody,
         staticBody,
+        unsafeAllowed,
       )
       let operandNode = match move checked {
         Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -18648,6 +18940,7 @@ effect fn checkExpression(
         constraints,
         contractBody,
         staticBody,
+        unsafeAllowed,
       )
       let operandNode = match move checked {
         Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -18789,6 +19082,7 @@ effect fn checkExpression(
         constraints,
         contractBody,
         staticBody,
+        unsafeAllowed,
       )
       let firstOperand = match move first {
         Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
@@ -18823,6 +19117,7 @@ effect fn checkExpression(
         constraints,
         contractBody,
         staticBody,
+        unsafeAllowed,
       )
       let secondOperand = match move second {
         Result<CheckedOperand, Shared<Rejection>>.Success {value} => value
@@ -18964,6 +19259,7 @@ effect fn checkExpression(
                 &name,
                 move target,
                 isPublic,
+                unsafeAllowed,
               )
             }
           }
@@ -18995,6 +19291,7 @@ effect fn checkExpression(
             expected,
             constraints,
             contractBody,
+            unsafeAllowed,
           )
         }
       }
@@ -19053,6 +19350,7 @@ effect fn checkExpression(
               constraints,
               contractBody,
               staticBody,
+              unsafeAllowed,
             )
             let argumentNode = match move checked {
               Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -19115,6 +19413,9 @@ effect fn checkExpression(
       ) {
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
+      if Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureUnsafe) && !unsafeAllowed {
+        return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+      }
       let binderCount = Shared.with<Result<Answer, NoRejection>, usize>(
         &target.signature,
         signatureBinderCount,
@@ -19168,7 +19469,7 @@ effect fn checkExpression(
           if Shared.with<Type, bool>(
             &parameterType,
             fn(value: &Type) -> bool {
-              return scalarType(value) || pointerSizedIntegerType(value)
+              return runtimeType(value)
             },
           ) {
             argumentContext = Option.some<Shared<Type>>(Shared.clone<Type>(&parameterType))
@@ -19180,7 +19481,7 @@ effect fn checkExpression(
                 if Shared.with<Type, bool>(
                   &fixedType,
                   fn(value: &Type) -> bool {
-                    return scalarType(value) || pointerSizedIntegerType(value)
+                    return runtimeType(value)
                   },
                 ) {
                   argumentContext = Option.some<Shared<Type>>(move fixedType)
@@ -19206,6 +19507,7 @@ effect fn checkExpression(
             constraints,
             contractBody,
             staticBody,
+            unsafeAllowed,
           )
           match move argument {
             Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
@@ -19216,7 +19518,7 @@ effect fn checkExpression(
                   return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
                 }
               }
-              if !contractBody && !staticBody && !Shared.with<Type, bool>(&evidence, scalarType) {
+              if !contractBody && !staticBody && !Shared.with<Type, bool>(&evidence, runtimeType) {
                 return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
               }
               let matched = run Type.unify(
@@ -19395,7 +19697,7 @@ effect fn checkExpression(
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
       ty = move callResult
-      if !contractBody && !staticBody && !Shared.with<Type, bool>(&ty, scalarType) {
+      if !contractBody && !staticBody && !Shared.with<Type, bool>(&ty, runtimeType) {
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
       run Vector.append<SignatureDependency>(
@@ -19433,6 +19735,22 @@ effect fn checkExpression(
     },
   )
   return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
+}
+
+fn bodyHasLoans(nodes: &[BodyNode]) -> bool {
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {ty, form} = &nodes[at].kind {
+      if !Shared.with<Type, bool>(&ty, scalarType) {
+        return true
+      }
+      if let BodyExpression.Dereference {..} = &form {
+        return true
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 fn bodyHasReceiverPass(nodes: &[BodyNode]) -> bool {
@@ -19505,6 +19823,12 @@ effect fn bodySafetyObligations(locals: &[BodyLocal], nodes: &[BodyNode]) -> Vec
     let node = &nodes[at]
     if let BodyNodeKind.Expression {ty, form} = &node.kind {
       match & form {
+        BodyExpression.Borrow {..} => {
+          run Vector.append<BodySafetyObligation>(
+            &mut obligations,
+            BodySafetyObligation.WholeValue {origin: node.origin, ty: Shared.clone<Type>(&ty)},
+          )
+        }
         BodyExpression.Local {..} => {
           if !Shared.with<Type, bool>(&ty, scalarType) {
             run Vector.append<BodySafetyObligation>(
@@ -19813,6 +20137,7 @@ effect fn checkBlock(
   contractBody: bool,
   staticBody: bool,
   loopDepth: usize,
+  unsafeAllowed: bool,
 ) -> Result<CheckedControl, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -19840,6 +20165,7 @@ effect fn checkBlock(
       contractBody,
       staticBody,
       loopDepth,
+      unsafeAllowed,
     )
     let canComplete = match move checked {
       Result<bool, Shared<Rejection>>.Success {value} => value
@@ -19888,6 +20214,7 @@ effect fn checkConditional(
   contractBody: bool,
   staticBody: bool,
   loopDepth: usize,
+  unsafeAllowed: bool,
 ) -> Result<CheckedControl, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -19913,6 +20240,7 @@ effect fn checkConditional(
       constraints,
       contractBody,
       staticBody,
+      unsafeAllowed,
     )
     let conditionNode = match move checkedCondition {
       Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -19963,6 +20291,7 @@ effect fn checkConditional(
       contractBody,
       staticBody,
       loopDepth,
+      unsafeAllowed,
     )
     let thenControl = match move checkedThen {
       Result<CheckedControl, Shared<Rejection>>.Success {value} => value
@@ -19993,6 +20322,7 @@ effect fn checkConditional(
           contractBody,
           staticBody,
           loopDepth,
+          unsafeAllowed,
         )
         Node.ConditionalStatement {..} => run checkConditional(
           &mut resolver.*,
@@ -20013,6 +20343,7 @@ effect fn checkConditional(
           contractBody,
           staticBody,
           loopDepth,
+          unsafeAllowed,
         )
         _ => Result.failResult<CheckedControl, Shared<Rejection>>(
           run reject(
@@ -20085,6 +20416,7 @@ effect fn checkStatements(
   contractBody: bool,
   staticBody: bool,
   loopDepth: usize,
+  unsafeAllowed: bool,
 ) -> Result<bool, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
@@ -20114,6 +20446,7 @@ effect fn checkStatements(
           contractBody,
           staticBody,
           loopDepth,
+          unsafeAllowed,
         )
         match move checked {
           Result<CheckedControl, Shared<Rejection>>.Success {value} => {
@@ -20155,6 +20488,7 @@ effect fn checkStatements(
             constraints,
             contractBody,
             staticBody,
+            unsafeAllowed,
           )
           match move expression {
             Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
@@ -20198,10 +20532,11 @@ effect fn checkStatements(
           constraints,
           contractBody,
           staticBody,
+          unsafeAllowed,
         )
         match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => {
-            let diverges = match &Vector.asSlice<BodyNode>(&nodes.*)[node.index].kind {
+            let diverges = match & Vector.asSlice<BodyNode>(&nodes.*)[node.index].kind {
               BodyNodeKind.Expression {ty, ..} => Shared.with<Type, bool>(&ty, neverType)
               _ => false
             }
@@ -20245,7 +20580,7 @@ effect fn checkStatements(
               found = true
               match & annotations[selected].result {
                 Result<Shared<Type>, Shared<Rejection>>.Success {value} => {
-                  if !contractBody && !staticBody && !Shared.with<Type, bool>(&value, scalarType) {
+                  if !contractBody && !staticBody && !Shared.with<Type, bool>(&value, runtimeType) {
                     return Result.failResult<bool, Shared<Rejection>>(
                       run reject(
                         &resolver.*,
@@ -20293,6 +20628,7 @@ effect fn checkStatements(
           constraints,
           contractBody,
           staticBody,
+          unsafeAllowed,
         )
         let initializerNode = match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -20333,7 +20669,117 @@ effect fn checkStatements(
         )
         run Vector.append<BodyNodeId>(&mut statements.*, node)
       }
+      Node.UnsafeStatement {body} => {
+        if staticBody {
+          return Result.failResult<bool, Shared<Rejection>>(
+            run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span),
+          )
+        }
+        let checked = run checkBlock(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut request.*,
+          &mut dependencies.*,
+          module,
+          cursor,
+          &mut locals.*,
+          annotations,
+          calls,
+          &mut nodes.*,
+          &mut signatures.*,
+          &mut requiredBodies.*,
+          body,
+          resultType,
+          constraints,
+          contractBody,
+          staticBody,
+          loopDepth,
+          true,
+        )
+        match move checked {
+          Result<CheckedControl, Shared<Rejection>>.Success {value} => {
+            run Vector.append<BodyNodeId>(&mut statements.*, value.node)
+            reachable = value.canComplete
+          }
+          Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<bool, Shared<Rejection>>(move error)
+          }
+        }
+      }
       Node.AssignmentStatement {target, value} => {
+        if !staticBody {
+          let checked = run checkExpression(
+            &mut resolver.*,
+            &mut owner.*,
+            &mut request.*,
+            &mut dependencies.*,
+            module,
+            cursor,
+            Vector.asSlice<BodyLocal>(&locals.*),
+            calls,
+            &mut nodes.*,
+            &mut signatures.*,
+            &mut requiredBodies.*,
+            target,
+            &Option.none<Shared<Type>>(),
+            constraints,
+            contractBody,
+            false,
+            unsafeAllowed,
+          )
+          let destination = match move checked {
+            Result<BodyNodeId, Shared<Rejection>>.Success {value: acceptedNode} => acceptedNode
+            Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+              return Result.failResult<bool, Shared<Rejection>>(move error)
+            }
+          }
+          if !mutablePlace(
+            Vector.asSlice<BodyNode>(&nodes.*),
+            Vector.asSlice<BodyLocal>(&locals.*),
+            destination,
+          ) {
+            return Result.failResult<bool, Shared<Rejection>>(
+              run reject(&resolver.*, module, RejectionCode.TypeMismatch, span),
+            )
+          }
+          let expected = bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &destination)
+          let replacement = run checkExpression(
+            &mut resolver.*,
+            &mut owner.*,
+            &mut request.*,
+            &mut dependencies.*,
+            module,
+            cursor,
+            Vector.asSlice<BodyLocal>(&locals.*),
+            calls,
+            &mut nodes.*,
+            &mut signatures.*,
+            &mut requiredBodies.*,
+            value,
+            &expected,
+            constraints,
+            contractBody,
+            false,
+            unsafeAllowed,
+          )
+          let replacementNode = match move replacement {
+            Result<BodyNodeId, Shared<Rejection>>.Success {value: acceptedNode} => acceptedNode
+            Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+              return Result.failResult<bool, Shared<Rejection>>(move error)
+            }
+          }
+          let node = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+          run Vector.append<BodyNode>(
+            &mut nodes.*,
+            BodyNode {
+              origin: BodyOrigin {syntax: statement, span: span},
+              kind: BodyNodeKind.PlaceAssignment {target: destination, value: replacementNode},
+            },
+          )
+          run Vector.append<BodyNodeId>(&mut statements.*, node)
+          at = at + usize.ONE
+          continue
+        }
         let mut selected = Option.none<BodyLocalId>()
         if let Node.IdentifierExpression {binding, ..} = run bodyNode(
           &resolver.source,
@@ -20384,6 +20830,7 @@ effect fn checkStatements(
           constraints,
           contractBody,
           staticBody,
+          unsafeAllowed,
         )
         let replacement = match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value: found} => found
@@ -20420,6 +20867,7 @@ effect fn checkStatements(
           constraints,
           contractBody,
           staticBody,
+          unsafeAllowed,
         )
         let conditionNode = match move checkedCondition {
           Result<BodyNodeId, Shared<Rejection>>.Success {value: found} => found
@@ -20446,6 +20894,7 @@ effect fn checkStatements(
           contractBody,
           staticBody,
           loopDepth + usize.ONE,
+          unsafeAllowed,
         )
         let bodyNode = match move checkedBody {
           Result<CheckedControl, Shared<Rejection>>.Success {value: found} => found.node
@@ -21311,7 +21760,11 @@ effect fn checkedStaticRoot(
   let mut rootSpan = Span.make(usize.ZERO, usize.ZERO)
   let mut ordinal = usize.MAX
   let mut extentLiteralTree = false
-  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    module,
+  ) {
     let hir = IndexedSource.authored(indexed)
     extentLiteralTree = bareExtentTree(hir, root)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
@@ -21334,7 +21787,12 @@ effect fn checkedStaticRoot(
     }
     if ordinal >= declarations.length {
       return rejectedBody(
-        run reject(&resolver.*, module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+        run reject(
+          &resolver.*,
+          module,
+          RejectionCode.Unsupported,
+          Span.make(usize.ZERO, usize.ZERO),
+        ),
         Vector.make<Dependency>(),
       )
     }
@@ -21349,7 +21807,12 @@ effect fn checkedStaticRoot(
     run collectCall(hir, root, &mut writtenCalls)
   } else {
     return rejectedBody(
-      run reject(&resolver.*, module, RejectionCode.MissingModule, Span.make(usize.ZERO, usize.ZERO)),
+      run reject(
+        &resolver.*,
+        module,
+        RejectionCode.MissingModule,
+        Span.make(usize.ZERO, usize.ZERO),
+      ),
       Vector.make<Dependency>(),
     )
   }
@@ -21377,11 +21840,19 @@ effect fn checkedStaticRoot(
     }
     StaticRootExpectation.Annotation {syntax} => {
       let resolved = run staticRootAnnotationType(
-        &mut resolver.*, &mut owner.*, &mut dependencies.*,
-        module, moduleOrdinal, ordinal, syntax, Vector.asSlice<Binder>(&genericBinders),
+        &mut resolver.*,
+        &mut owner.*,
+        &mut dependencies.*,
+        module,
+        moduleOrdinal,
+        ordinal,
+        syntax,
+        Vector.asSlice<Binder>(&genericBinders),
       )
       expected = match move resolved {
-        Result<Shared<Type>, Shared<Rejection>>.Success {value} => Option.some<Shared<Type>>(move value)
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => Option.some<Shared<Type>>(
+          move value,
+        )
         Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
           return rejectedBody(move error, Vector.make<Dependency>())
         }
@@ -21433,19 +21904,32 @@ effect fn checkedStaticRoot(
   while binderAt < binders.length {
     let mut syntax = HirId {index: usize.ZERO}
     let mut selectedType = Option.none<Shared<Type>>()
-    match &binders[binderAt] {
+    match & binders[binderAt] {
       StaticRootBinder.Parameter {syntax: parameter} => {
         syntax = parameter
         let mut position = Option.none<usize>()
-        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+          &resolver.*,
+          &sourceAnswer,
+          module,
+        ) {
           let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-          position = staticParameterPosition(IndexedSource.authored(indexed), declarations[ordinal].header, syntax)
+          position = staticParameterPosition(
+            IndexedSource.authored(indexed),
+            declarations[ordinal].header,
+            syntax,
+          )
         }
         let parameterAt = match move position {
           Option<usize>.Some {value} => value
           Option<usize>.None => {
             return rejectedBody(
-              run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, run bodySpan(&resolver.source, &cursor, syntax)),
+              run reject(
+                &resolver.*,
+                module,
+                RejectionCode.StaticPhaseViolation,
+                run bodySpan(&resolver.source, &cursor, syntax),
+              ),
               Vector.make<Dependency>(),
             )
           }
@@ -21482,10 +21966,17 @@ effect fn checkedStaticRoot(
         syntax = binding
         let mut initializer = HirId {index: usize.MAX}
         let mut annotation = HirId {index: usize.MAX}
-        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+          &resolver.*,
+          &sourceAnswer,
+          module,
+        ) {
           let hir = IndexedSource.authored(indexed)
           if syntax.index < Vector.length<Node>(&hir.nodes) {
-            if let Node.BindingStatement {isStatic, initializer: written, annotation: declared, ..} = Module.node(hir, syntax) {
+            if let Node.BindingStatement {isStatic, initializer: written, annotation: declared, ..} = Module.node(
+              hir,
+              syntax,
+            ) {
               if isStatic && Module.span(hir, syntax).end <= rootSpan.start {
                 initializer = written
                 if declared.present {
@@ -21509,7 +22000,12 @@ effect fn checkedStaticRoot(
         )
         if !matches {
           return rejectedBody(
-            run reject(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, &cursor, syntax)),
+            run reject(
+              &resolver.*,
+              module,
+              RejectionCode.Unsupported,
+              run bodySpan(&resolver.source, &cursor, syntax),
+            ),
             Vector.make<Dependency>(),
           )
         }
@@ -21519,8 +22015,14 @@ effect fn checkedStaticRoot(
         )
         if annotation.index != usize.MAX {
           let resolved = run staticRootAnnotationType(
-            &mut resolver.*, &mut owner.*, &mut dependencies.*,
-            module, moduleOrdinal, ordinal, annotation, Vector.asSlice<Binder>(&genericBinders),
+            &mut resolver.*,
+            &mut owner.*,
+            &mut dependencies.*,
+            module,
+            moduleOrdinal,
+            ordinal,
+            annotation,
+            Vector.asSlice<Binder>(&genericBinders),
           )
           let declaredType = match move resolved {
             Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
@@ -21534,7 +22036,12 @@ effect fn checkedStaticRoot(
           }
           if !matching {
             return rejectedBody(
-              run reject(&resolver.*, module, RejectionCode.TypeMismatch, run bodySpan(&resolver.source, &cursor, annotation)),
+              run reject(
+                &resolver.*,
+                module,
+                RejectionCode.TypeMismatch,
+                run bodySpan(&resolver.source, &cursor, annotation),
+              ),
               Vector.make<Dependency>(),
             )
           }
@@ -21550,14 +22057,14 @@ effect fn checkedStaticRoot(
         )
       }
     }
-    run Vector.append<BodyLocal>(&mut locals, BodyLocal {
-      origin: BodyOrigin {
-        syntax: syntax,
-        span: run bodySpan(&resolver.source, &cursor, syntax),
+    run Vector.append<BodyLocal>(
+      &mut locals,
+      BodyLocal {
+        origin: BodyOrigin {syntax: syntax, span: run bodySpan(&resolver.source, &cursor, syntax)},
+        ty: move ty,
+        mutable: false,
       },
-      ty: move ty,
-      mutable: false,
-    })
+    )
     binderAt = binderAt + usize.ONE
   }
   let mut nodes = Vector.make<BodyNode>()
@@ -21582,6 +22089,7 @@ effect fn checkedStaticRoot(
     Vector.asSlice<Constraint>(&constraints),
     false,
     true,
+    false,
   )
   let rootNode = match move checked {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -21594,16 +22102,29 @@ effect fn checkedStaticRoot(
   while at < checkedNodes.length {
     if let BodyNodeKind.Expression {form: BodyExpression.InterfaceCall {..}, ..} = &checkedNodes[at].kind {
       return rejectedBody(
-        run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, checkedNodes[at].origin.span),
+        run reject(
+          &resolver.*,
+          module,
+          RejectionCode.StaticPhaseViolation,
+          checkedNodes[at].origin.span,
+        ),
         Vector.make<Dependency>(),
       )
     }
-    if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {declaration: calledDeclaration, ..}, ..} = &checkedNodes[at].kind {
+    if let BodyNodeKind.Expression {
+      form: BodyExpression.DirectCall {declaration: calledDeclaration, ..},
+      ..,
+    } = &checkedNodes[at].kind {
       let called = run DeclarationId.copy(&calledDeclaration)
       let targetModuleOrdinal = knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(&called))
       if targetModuleOrdinal == usize.MAX {
         return rejectedBody(
-          run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, checkedNodes[at].origin.span),
+          run reject(
+            &resolver.*,
+            module,
+            RejectionCode.StaticPhaseViolation,
+            checkedNodes[at].origin.span,
+          ),
           Vector.make<Dependency>(),
         )
       }
@@ -21619,7 +22140,12 @@ effect fn checkedStaticRoot(
       }
       if !allowed {
         return rejectedBody(
-          run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, checkedNodes[at].origin.span),
+          run reject(
+            &resolver.*,
+            module,
+            RejectionCode.StaticPhaseViolation,
+            checkedNodes[at].origin.span,
+          ),
           Vector.make<Dependency>(),
         )
       }
@@ -21645,12 +22171,15 @@ effect fn checkedStaticRoot(
     Vector.make<DeclarationId>(),
     BodyStage.FullyChecked,
   )
-  return memberSuccess(Value.Body {
-    body: run Shared.make<TypedBody>(move body),
-    source: run Shared.make<Observation>(
-      run Observation.copy(IndexedSource.sourceObservation(indexed)),
-    ),
-  }, Vector.make<Dependency>())
+  return memberSuccess(
+    Value.Body {
+      body: run Shared.make<TypedBody>(move body),
+      source: run Shared.make<Observation>(
+        run Observation.copy(IndexedSource.sourceObservation(indexed)),
+      ),
+    },
+    Vector.make<Dependency>(),
+  )
 }
 
 effect fn storeMir(resolver: &mut Resolver, function: MirFunction, dependencies: Vector<Dependency>) -> Answer
@@ -21894,7 +22423,7 @@ effect fn resolveMir(
 effect fn resolveLayout(resolver: &mut Resolver, key: Key) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
-  let types = Vector.asSlice<Shared<Type>>(&resolver.applications)
+  let types = Vector.asSlice<Shared<Type>>(&resolver.layoutTypes)
   if key.name >= types.length {
     return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())
   }
@@ -22000,7 +22529,7 @@ effect fn resolveInstance(
   let needed = Vector.asSlice<LayoutDemand>(&types)
   let mut at = usize.ZERO
   while at < needed.length {
-    let application = run internApplication(&mut resolver.*, &needed[at].ty)
+    let application = run internLayoutType(&mut resolver.*, &needed[at].ty)
     let layout = run demandChild(
       &mut resolver.*,
       &mut owner.*,
@@ -22022,9 +22551,14 @@ effect fn resolveInstance(
     if layoutUnsupported {
       let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
       let identity = InstanceKey.identity(&functions[mirIndex].key)
-      return memberSuccess(Value.Unsupported {gap: run Shared.make<BackendGap>(
-        BackendGap.make(GapCode.ScalarLayout, &identity, needed[at].span),
-      )}, move dependencies)
+      return memberSuccess(
+        Value.Unsupported {
+          gap: run Shared.make<BackendGap>(
+            BackendGap.make(GapCode.ScalarLayout, &identity, needed[at].span),
+          ),
+        },
+        move dependencies,
+      )
     }
     let layoutFailure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
       &layout,
@@ -22045,7 +22579,11 @@ effect fn resolveInstance(
     }
     Result<EmittedInstance, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
       BackendGap {code, owner: gapOwner, span} => memberSuccess(
-        Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap {code: code, owner: move gapOwner, span: span})},
+        Value.Unsupported {
+          gap: run Shared.make<BackendGap>(
+            BackendGap {code: code, owner: move gapOwner, span: span},
+          ),
+        },
         move dependencies,
       )
       OutOfMemoryError {} => {
@@ -22302,6 +22840,7 @@ effect fn resolveBody(
     abstractBody,
     staticBody,
     usize.ZERO,
+    Shared.with<Result<Answer, NoRejection>, bool>(&signatureAnswer, signatureUnsafe),
   )
   let control = match move checked {
     Result<CheckedControl, Shared<Rejection>>.Success {value} => value
@@ -22387,7 +22926,9 @@ effect fn resolveBody(
     )
   }
   let mut stage = BodyStage.FullyChecked
-  if abstractBody || bodyHasReceiverPass(Vector.asSlice<BodyNode>(&nodes)) {
+  if abstractBody || bodyHasReceiverPass(Vector.asSlice<BodyNode>(&nodes)) || bodyHasLoans(
+    Vector.asSlice<BodyNode>(&nodes),
+  ) {
     stage = BodyStage.ContractTyped {
       obligations: run bodySafetyObligations(
         Vector.asSlice<BodyLocal>(&locals),
@@ -25633,6 +26174,7 @@ impl Semantic {
         modules: Vector.make<ModuleId>(),
         names: Vector.make<Bytes>(),
         applications: Vector.make<Shared<Type>>(),
+        layoutTypes: Vector.make<Shared<Type>>(),
         backendInstances: Vector.make<InstanceKey>(),
         keys: Vector.make<ScopedKey>(),
         currentApplication: usize.MAX,
@@ -26711,13 +27253,19 @@ impl Semantic {
       answerRejection,
     )
     if let Option<Shared<Rejection>>.Some {value} = move failure {
-      let code = Shared.with<Rejection, RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
-        return rejection.code
-      })
+      let code = Shared.with<Rejection, RejectionCode>(
+        &value,
+        fn(rejection: &Rejection) -> RejectionCode {
+          return rejection.code
+        },
+      )
       if code == RejectionCode.MissingModule || code == RejectionCode.Unsupported {
-        let span = Shared.with<Rejection, Span>(&value, fn(rejection: &Rejection) -> Span {
-          return rejection.span
-        })
+        let span = Shared.with<Rejection, Span>(
+          &value,
+          fn(rejection: &Rejection) -> Span {
+            return rejection.span
+          },
+        )
         let mut gapCode = GapCode.ModuleSource
         if code == RejectionCode.Unsupported {
           gapCode = GapCode.SignatureForm
@@ -26735,6 +27283,7 @@ impl Semantic {
     run Vector.append<InstanceKey>(&mut pending, InstanceKey.Entry {main: move main})
     let mut visited = Vector.make<InstanceKey>()
     let mut emitted = Vector.make<usize>()
+    let mut uncheckedBodies = usize.ZERO
     let mut gaps = Vector.make<Shared<BackendGap>>()
     while Vector.length<InstanceKey>(&pending) > usize.ZERO {
       let selected = Vector.pop<InstanceKey>(&mut pending)
@@ -26829,6 +27378,9 @@ impl Semantic {
       let mirIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&mir, answerMirIndex)
       if let Option<usize>.Some {value: selectedMir} = move mirIndex {
         let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
+        if !functions[selectedMir].safetyChecked {
+          uncheckedBodies = uncheckedBodies + usize.ONE
+        }
         let references = Vector.asSlice<InstanceKey>(&functions[selectedMir].references)
         let mut edge = usize.ZERO
         while edge < references.length {
@@ -26864,6 +27416,6 @@ impl Semantic {
       run Bytes.append(&mut text, b"\n")
       at = at + usize.ONE
     }
-    return BackendBuild.Module {text: move text}
+    return BackendBuild.Module {text: move text, uncheckedBodies: uncheckedBodies}
   }
 }
