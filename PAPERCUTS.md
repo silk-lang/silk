@@ -321,3 +321,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · A focused native SemanticCases run spent minutes compiling, then Apple system clang rejected LLVM 22 bitcode with `Unknown attribute kind (102)` · Put `/opt/homebrew/opt/llvm/bin` first on `PATH` before the CLI test so its object stage uses LLVM 22 clang · self-hosted compiler
 - 2026-09-29 · The workspace commit helper refused a resolved merge whose tree matched HEAD because no files were staged · Complete that empty merge with `git commit` after confirming the merge has no conflicts or staged changes · self-hosted compiler
 - 2026-09-29 · A focused native SemanticCases build consumed one CPU and about 5.5 GiB for seven hours without output, holding the shared build slot · Stop the stalled process, release the slot, and use exact-head Linux CI for the diagnostic instead · self-hosted compiler
+
+- 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
