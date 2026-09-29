@@ -15,15 +15,27 @@ export interface Gap {
   readonly reason: string
 }
 
+export interface BuildDiagnostic {
+  readonly code: string
+  readonly span: { readonly start: number; readonly end: number }
+}
+
 export type CaseResult =
   | { readonly name: string; readonly status: 'pass' }
-  | { readonly name: string; readonly status: 'fail'; readonly reason: string }
+  | {
+      readonly name: string
+      readonly status: 'fail'
+      readonly code: string
+      readonly span?: BuildDiagnostic['span']
+      readonly reason: string
+    }
   | { readonly name: string; readonly status: 'unsupported'; readonly gaps: ReadonlyArray<Gap> }
 
 export interface Summary {
   readonly pass: number
   readonly fail: number
   readonly unsupported: number
+  readonly failureCounts: ReadonlyArray<{ readonly code: string; readonly count: number }>
   readonly gapCounts: ReadonlyArray<{ readonly code: string; readonly count: number }>
   readonly trackFailures: ReadonlyArray<string>
 }
@@ -66,6 +78,43 @@ export const parseUnsupported = (stderr: string): ReadonlyArray<Gap> | undefined
     )
       return undefined
     return gaps.map((gap: Gap) => ({ code: gap.code, reason: gap.reason }))
+  } catch {
+    return undefined
+  }
+}
+
+/** Reads one anchored semantic rejection; malformed records remain build failures. */
+export const parseBuildDiagnostic = (stderr: string): BuildDiagnostic | undefined => {
+  const prefix = 'SILK_BUILD_ERROR='
+  const records = stderr.split('\n').filter((line) => line.startsWith(prefix))
+  const record = records[0]
+  if (records.length !== 1 || record === undefined) return undefined
+  try {
+    const value: unknown = JSON.parse(record.slice(prefix.length))
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !('code' in value) ||
+      typeof value.code !== 'string' ||
+      value.code.length === 0 ||
+      !('span' in value)
+    )
+      return undefined
+    const span = value.span
+    if (
+      typeof span !== 'object' ||
+      span === null ||
+      !('start' in span) ||
+      !('end' in span) ||
+      typeof span.start !== 'number' ||
+      typeof span.end !== 'number' ||
+      !Number.isSafeInteger(span.start) ||
+      !Number.isSafeInteger(span.end) ||
+      span.start < 0 ||
+      span.end < span.start
+    )
+      return undefined
+    return { code: value.code, span: { start: span.start, end: span.end } }
   } catch {
     return undefined
   }
@@ -166,21 +215,35 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
     })
     if (built.error !== undefined || built.status !== 0 || built.signal !== null) {
       const gaps = built.error === undefined ? parseUnsupported(text(built.stderr)) : undefined
+      const diagnostic =
+        built.error === undefined ? parseBuildDiagnostic(text(built.stderr)) : undefined
       return gaps === undefined
-        ? { name: program.name, status: 'fail', reason: `build: ${processFailure(built)}` }
+        ? {
+            name: program.name,
+            status: 'fail',
+            code: diagnostic?.code ?? 'BUILD_PROCESS_FAILURE',
+            ...(diagnostic === undefined ? {} : { span: diagnostic.span }),
+            reason: `build: ${processFailure(built)}`,
+          }
         : { name: program.name, status: 'unsupported', gaps }
     }
 
     for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
       const mismatch = compareRun(program, invocation, runExecutable(executable, invocation))
       if (mismatch !== undefined)
-        return { name: program.name, status: 'fail', reason: `run ${ordinal + 1}: ${mismatch}` }
+        return {
+          name: program.name,
+          status: 'fail',
+          code: 'RUNTIME_MISMATCH',
+          reason: `run ${ordinal + 1}: ${mismatch}`,
+        }
     }
     return { name: program.name, status: 'pass' }
   } catch (error) {
     return {
       name: program.name,
       status: 'fail',
+      code: 'CORPUS_RUNNER_FAILURE',
       reason: error instanceof Error ? error.message : String(error),
     }
   } finally {
@@ -201,7 +264,10 @@ export const summarize = (
     throw new Error(`selfhost track names absent from corpus: ${missing.join(', ')}`)
   const trackSet = new Set(track)
   const gapCounts = new Map<string, number>()
+  const failureCounts = new Map<string, number>()
   for (const result of results) {
+    if (result.status === 'fail')
+      failureCounts.set(result.code, (failureCounts.get(result.code) ?? 0) + 1)
     if (result.status !== 'unsupported') continue
     for (const gap of result.gaps) gapCounts.set(gap.code, (gapCounts.get(gap.code) ?? 0) + 1)
   }
@@ -209,6 +275,9 @@ export const summarize = (
     pass: results.filter((result) => result.status === 'pass').length,
     fail: results.filter((result) => result.status === 'fail').length,
     unsupported: results.filter((result) => result.status === 'unsupported').length,
+    failureCounts: [...failureCounts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([code, count]) => ({ code, count })),
     gapCounts: [...gapCounts.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([code, count]) => ({ code, count })),
@@ -237,7 +306,8 @@ const main = (): void => {
   const results = programs.map((program) => runCase(executable, program))
   for (const result of results) {
     let detail = ''
-    if (result.status === 'fail') detail = `: ${result.reason}`
+    if (result.status === 'fail')
+      detail = `: code=${result.code} span=${result.span === undefined ? 'unavailable' : `${result.span.start}-${result.span.end}`} ${result.reason}`
     if (result.status === 'unsupported')
       detail = `: ${result.gaps.map((gap) => `${gap.code}: ${gap.reason}`).join('; ')}`
     process.stdout.write(`${result.status.toUpperCase()} ${result.name}${detail}\n`)
@@ -246,6 +316,8 @@ const main = (): void => {
   process.stdout.write(
     `Selfhost corpus: pass=${summary.pass} fail=${summary.fail} unsupported=${summary.unsupported} track=${track.length}\n`,
   )
+  for (const failure of summary.failureCounts)
+    process.stdout.write(`Selfhost failure ${failure.code}: ${failure.count}\n`)
   for (const gap of summary.gapCounts)
     process.stdout.write(`Selfhost gap ${gap.code}: ${gap.count}\n`)
   if (summary.trackFailures.length > 0) {
