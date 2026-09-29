@@ -91,7 +91,7 @@ const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
   return gaps
 }
 
-const writeProgram = (directory: string, program: CorpusProgram): string => {
+const writeProgram = (directory: string, program: CorpusProgram): void => {
   const source = join(directory, 'main.silk')
   writeFileSync(source, program.nativeSource ?? program.source)
   for (const [module, contents] of Object.entries(program.nativeImports ?? {})) {
@@ -101,7 +101,6 @@ const writeProgram = (directory: string, program: CorpusProgram): string => {
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, contents)
   }
-  return source
 }
 
 const runExecutable = (executable: string, invocation: NativeRun): SpawnSyncReturns<string> =>
@@ -154,9 +153,9 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
 
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
   try {
-    const source = writeProgram(directory, program)
+    writeProgram(directory, program)
     const executable = join(directory, 'program')
-    const built = spawnSync(silkc, ['build', source, '-o', executable], {
+    const built = spawnSync(silkc, ['build', 'main.silk', '-o', 'program'], {
       cwd: directory,
       encoding: 'utf8',
       timeout: processTimeoutMs,

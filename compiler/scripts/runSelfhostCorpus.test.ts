@@ -24,7 +24,8 @@ const withStub = (body: string, run: (path: string) => void): void => {
   }
 }
 
-const compiled = `while [ "$1" != "-o" ]; do shift; done
+const compiled = `if [ "$1" != build ] || [ "$2" != main.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
+while [ "$1" != "-o" ]; do shift; done
 output="$2"
 printf '#!/bin/sh\\nexit 42\\n' > "$output"
 chmod +x "$output"`
