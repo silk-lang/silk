@@ -385,3 +385,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · A temporary SemanticCases check root inferred compiler/src/semantic as the module source root and had no main · Check through a temporary compiler/src wrapper importing SemanticCases with a main, then remove both temporary files · B9 runtime slice frontend checks
 
 - 2026-09-30 · Allocator provision on an outer Shared.make did not cover allocations evaluated in its argument fields (SEM0071) · Allocate and provide each child before constructing the descriptor type; bounded frontend check caught it before push · B9 runtime slice structured snapshot
+
+- 2026-09-30 · Runtime slice fixtures wrote &[i32; 2], which both parsers treat as damaged slice syntax, so stage-only positives did not prove array-reference reborrows · Group the fixed array as &([i32; 2]) and assert the actual fixed referent and dereference/borrow/conversion chain in the existing snapshot · B9 runtime slices
