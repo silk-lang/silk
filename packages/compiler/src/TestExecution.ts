@@ -42,6 +42,18 @@ export interface Entry {
   readonly eligibility: Eligibility
 }
 
+/** Canonical-order runtime test metadata, independent of result-cache eligibility. */
+export interface Catalog {
+  readonly _tag: 'TestExecutionCatalog'
+  readonly entries: ReadonlyArray<TestDiscovery.Info>
+}
+
+/** Projects discovered tests without retaining their declarations or executable graphs. */
+export const catalog = (self: TestDiscovery.Catalog): Catalog => ({
+  _tag: 'TestExecutionCatalog',
+  entries: self.entries.map((entry) => entry.info),
+})
+
 /** Canonical-order execution identities for one completed test-purpose compilation. */
 export interface Manifest {
   readonly _tag: 'TestExecutionManifest'

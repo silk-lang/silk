@@ -198,6 +198,11 @@ export interface CompileRequest {
   readonly saveTemps?: boolean
   /** Set false to bypass artifact caches and provided semantic persistence for this request. */
   readonly cache?: boolean
+  /**
+   * Enables test-result reuse identities by default, independently of artifact caching.
+   * Set false to publish runtime test metadata without computing result-cache identities.
+   */
+  readonly testResultCache?: boolean
   /** Explicit distribution metadata for embeddings and integrity tests; defaults to this build. */
   readonly distribution?: ToolchainIntegrity.Graph
 }
@@ -223,7 +228,9 @@ export interface Compiled {
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
   readonly report: ReadonlyArray<DriverPhaseReport>
   readonly toolchainIdentity: string
-  /** Per-test execution identities, present only for a successful discovered-test executable. */
+  /** Runtime metadata, present only for a successful discovered-test executable. */
+  readonly testCatalog?: TestExecution.Catalog
+  /** Per-test execution identities, present when discovered-test result caching is enabled. */
   readonly testManifest?: TestExecution.Manifest
 }
 
@@ -324,12 +331,17 @@ interface Staged {
   readonly program: Prepared['program']
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
   readonly artifactPlan: ArtifactPlan.ArtifactPlan
-  /** Link-independent test identities, computed before the large backend emission. */
+  /** Runtime metadata and optional link-independent identities, prepared before backend emission. */
   readonly tests:
     | {
-        readonly runner: { readonly identity: string; readonly complete: boolean }
-        readonly closures: TestExecution.Closures | undefined
-        readonly bootstrapIdentity: string | undefined
+        readonly catalog: TestExecution.Catalog
+        readonly reuse:
+          | {
+              readonly runner: { readonly identity: string; readonly complete: boolean }
+              readonly closures: TestExecution.Closures
+              readonly bootstrapIdentity: string
+            }
+          | undefined
       }
     | undefined
 }
@@ -517,19 +529,29 @@ const prepareEmission = Effect.fnUntraced(function* (
   const testCatalog = frontend.testCatalog
   const bootstrapIdentity = bundle.completion?.bootstrapIdentity
   const tests =
-    stage !== 'final' || !Target.isNative(target) || testCatalog === undefined
+    stage !== 'final' ||
+    !Target.isNative(target) ||
+    request.artifactKind !== 'NativeExecutable' ||
+    testCatalog === undefined
       ? undefined
       : {
-          runner: yield* TestExecution.runnerIdentity(
-            preparation.instances,
-            frontend.results,
-            testCatalog,
-          ),
-          closures:
-            request.artifactKind === 'NativeExecutable' && bootstrapIdentity !== undefined
-              ? yield* TestExecution.closures(testCatalog, preparation.instances, frontend.results)
-              : undefined,
-          bootstrapIdentity,
+          catalog: TestExecution.catalog(testCatalog),
+          reuse:
+            request.testResultCache === false || bootstrapIdentity === undefined
+              ? undefined
+              : {
+                  runner: yield* TestExecution.runnerIdentity(
+                    preparation.instances,
+                    frontend.results,
+                    testCatalog,
+                  ),
+                  closures: yield* TestExecution.closures(
+                    testCatalog,
+                    preparation.instances,
+                    frontend.results,
+                  ),
+                  bootstrapIdentity,
+                },
         }
   return {
     _tag: 'Staged',
@@ -1099,12 +1121,13 @@ export const compile = Effect.fn('Driver.compile')(
                   { heapBytes },
                 )
               : undefined
+          const reuse = tests?.reuse
           const testManifest =
-            tests?.closures !== undefined && tests.bootstrapIdentity !== undefined
-              ? TestExecution.make(tests.closures, {
+            reuse !== undefined
+              ? TestExecution.make(reuse.closures, {
                   profileIdentity: staged.profile.identity,
-                  bootstrapIdentity: tests.bootstrapIdentity,
-                  runnerIdentity: tests.runner.identity,
+                  bootstrapIdentity: reuse.bootstrapIdentity,
+                  runnerIdentity: reuse.runner.identity,
                   compilerIdentity: distribution.digest,
                   runtimeIdentity: TestExecution.runtimeIdentity(distribution),
                   nativeIdentity: TestExecution.nativeIdentity(
@@ -1113,7 +1136,7 @@ export const compile = Effect.fn('Driver.compile')(
                     bound.success.identity,
                     HelperCapability.policyIdentity(staged.profile),
                   ),
-                  complete: tests.runner.complete,
+                  complete: reuse.runner.complete,
                 })
               : undefined
           // Return the durable artifact together with linkage provenance, foreign symbols,
@@ -1135,6 +1158,7 @@ export const compile = Effect.fn('Driver.compile')(
             foreignExports: artifact.foreignExports,
             foreignStatics: artifact.foreignStatics,
             ...(libraryInterface === undefined ? {} : { libraryInterface }),
+            ...(tests === undefined ? {} : { testCatalog: tests.catalog }),
             ...(testManifest === undefined ? {} : { testManifest }),
             diagnostics,
             report: [...report],

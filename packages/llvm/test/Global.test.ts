@@ -163,12 +163,20 @@ it.effect('preserves exact byte identities across declaration and lookup', () =>
   Effect.gen(function* () {
     const builder = yield* Builder.make()
     const signature = yield* Type.functionType(builder, yield* Type.voidType(builder), [])
-    // Cover every byte, including NUL and invalid UTF-8, then distinguish equal-length names
-    // whose hex digits would collide if bytes lost their leading zeroes.
+    // Cover every byte, including NUL and invalid UTF-8, and distinguish long equal-length
+    // names that differ at their interior or final byte.
+    const longName = Uint8Array.from({ length: 16_385 }, (_, index) => index % 256)
     const names = [
       Uint8Array.from({ length: 256 }, (_, byte) => byte),
       Uint8Array.of(0x01, 0x23),
       Uint8Array.of(0x12, 0x03),
+      longName.subarray(0, 8191),
+      longName.subarray(0, 8192),
+      longName.subarray(0, 8193),
+      longName,
+      longName.with(8191, 0),
+      longName.with(8192, 0xff),
+      longName.with(16_384, 0xff),
     ]
     const handles: Array<FunctionActor.Function> = []
     for (const input of names) {

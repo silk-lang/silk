@@ -695,7 +695,12 @@ pub fn main() -> i32 {
     const call = Analysis.instancesOf(snapshot).foreignCalls[0]
     assert.deepEqual(call?.signature.contract.borrow, [0])
     const artifact = yield* Analysis.codegen(snapshot, { mode: 'release' })
-    assert.include(artifact.ir, 'invoke i32 @inspect(ptr nofree readonly captures(none)')
+    const invocation =
+      artifact.ir.split('\n').find((line) => line.includes('invoke i32 @inspect(ptr ')) ??
+      unreachable('expected the unwinding foreign read call')
+    assert.include(invocation, 'nofree')
+    assert.include(invocation, 'readonly')
+    assert.include(invocation, 'captures(none)')
     assert.include(artifact.ir, 'memory(argmem: read)')
     assert.notMatch(artifact.ir, /declare i32 @inspect[^\n]*nounwind/)
     const program = Analysis.loweredMir(snapshot)

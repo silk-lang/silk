@@ -1,7 +1,10 @@
+import type * as ByteString from '../ByteString.js'
 import { invalidInput, type LlvmError } from '../LlvmError.js'
 
 export interface Writer {
-  readonly words: Array<number>
+  /** Emitted 32-bit words; only the first `length` are meaningful. */
+  words: Uint32Array
+  length: number
   bitBuffer: number
   bitCount: number
 }
@@ -33,7 +36,7 @@ export interface BlockWriter {
   readonly sizeWordIndex: number
 }
 
-export type RecordValue = Scalar | ReadonlyArray<Scalar>
+export type RecordValue = Scalar | ReadonlyArray<Scalar> | ByteString.ReadonlyBytes
 
 /** @internal */
 const failure = (operation: string, message: string, cause: unknown): LlvmError =>
@@ -59,7 +62,24 @@ const width = (value: number, operation: string, minimum: number): void => {
 }
 
 /** @internal */
-export const make = (): Writer => ({ words: [], bitBuffer: 0, bitCount: 0 })
+export const make = (): Writer => ({
+  words: new Uint32Array(1024),
+  length: 0,
+  bitBuffer: 0,
+  bitCount: 0,
+})
+
+// Large modules emit tens of millions of words. A typed buffer holds each as four bytes; a
+// number array boxed every word with its high bit set.
+const pushWord = (self: Writer, word: number): void => {
+  if (self.length === self.words.length) {
+    const grown = new Uint32Array(self.words.length * 2)
+    grown.set(self.words)
+    self.words = grown
+  }
+  self.words[self.length] = word
+  self.length += 1
+}
 
 // Packs up to one word; a write may straddle two output words. Mask before shifting so
 // excess input bits cannot leak into the following record. Handle full words explicitly:
@@ -72,7 +92,7 @@ const writeWord = (self: Writer, input: number, bits: number): void => {
     self.bitCount += bits
     return
   }
-  self.words.push(self.bitBuffer >>> 0)
+  pushWord(self, self.bitBuffer >>> 0)
   self.bitCount = bits - available
   self.bitBuffer = self.bitCount === 0 ? 0 : value >>> available
 }
@@ -119,7 +139,7 @@ export const writeBits = (self: Writer, input: Scalar, bits: number): void => {
 /** @internal */
 export const alignTo32 = (self: Writer): void => {
   if (self.bitCount === 0) return
-  self.words.push(self.bitBuffer >>> 0)
+  pushWord(self, self.bitBuffer >>> 0)
   self.bitBuffer = 0
   self.bitCount = 0
 }
@@ -190,22 +210,32 @@ export const write6BitChar = (self: Writer, value: string): void => {
 }
 
 /** @internal */
-export const writeBlob = (self: Writer, bytes: ReadonlyArray<Scalar>): void => {
+export const writeBlob = (
+  self: Writer,
+  bytes: ReadonlyArray<Scalar> | ByteString.ReadonlyBytes,
+): void => {
   // `parity:bench` exercises a one-megabyte blob; this measured byte-copy loop remains imperative
   // and is contained by the same Bitcode.encode Effect boundary as writeBits.
   alignTo32(self)
-  const paddedLength = Math.ceil(bytes.length / 4) * 4
-  const padded = new Uint8Array(paddedLength)
-  for (let index = 0; index < bytes.length; index += 1) {
-    const byte = integer(bytes[index] ?? 0, 'Bitstream.writeBlob')
-    if (byte > 0xffn) {
-      throw failure('Bitstream.writeBlob', 'Blob elements must be bytes', byte)
-    }
-    padded[index] = Number(byte)
-  }
-  const view = new DataView(padded.buffer)
-  for (let offset = 0; offset < paddedLength; offset += 4) {
-    self.words.push(view.getUint32(offset, true))
+  const checked =
+    bytes instanceof Uint8Array
+      ? bytes
+      : Uint8Array.from(bytes, (value) => {
+          const byte = integer(value, 'Bitstream.writeBlob')
+          if (byte > 0xffn) {
+            throw failure('Bitstream.writeBlob', 'Blob elements must be bytes', byte)
+          }
+          return Number(byte)
+        })
+  for (let offset = 0; offset < checked.length; offset += 4) {
+    pushWord(
+      self,
+      ((checked[offset] ?? 0) |
+        ((checked[offset + 1] ?? 0) << 8) |
+        ((checked[offset + 2] ?? 0) << 16) |
+        ((checked[offset + 3] ?? 0) << 24)) >>>
+        0,
+    )
   }
 }
 
@@ -224,7 +254,7 @@ export const enterBlock = (
   const abbrevWidth = abbreviationWidth(block.abbreviations.length)
   writeVbr(self, abbrevWidth, 4)
   alignTo32(self)
-  const sizeWordIndex = self.words.length
+  const sizeWordIndex = self.length
   writeBits(self, 0, 32)
   const result = { writer: self, block, abbrevWidth, sizeWordIndex }
   if (defineAbbreviations) {
@@ -237,7 +267,7 @@ export const enterBlock = (
 export const endBlock = (self: BlockWriter): void => {
   writeBits(self.writer, 0, self.abbrevWidth)
   alignTo32(self.writer)
-  self.writer.words[self.sizeWordIndex] = self.writer.words.length - self.sizeWordIndex - 1
+  self.writer.words[self.sizeWordIndex] = self.writer.length - self.sizeWordIndex - 1
 }
 
 /** @internal */
@@ -279,7 +309,10 @@ const scalar = (value: RecordValue | undefined, operation: string): Scalar => {
 }
 
 /** @internal */
-const array = (value: RecordValue | undefined, operation: string): ReadonlyArray<Scalar> => {
+const array = (
+  value: RecordValue | undefined,
+  operation: string,
+): ReadonlyArray<Scalar> | ByteString.ReadonlyBytes => {
   if (value !== undefined && typeof value !== 'number' && typeof value !== 'bigint') return value
   throw failure(operation, 'Expected an array record operand', value)
 }
@@ -369,7 +402,7 @@ export const writeRecord = (
 export const writeUnabbreviatedRecord = (
   self: BlockWriter,
   code: Scalar,
-  values: ReadonlyArray<Scalar>,
+  values: ReadonlyArray<Scalar> | ByteString.ReadonlyBytes,
 ): void => {
   writeBits(self.writer, 3, self.abbrevWidth)
   writeVbr(self.writer, code, 6)
@@ -386,9 +419,9 @@ export const toUint8Array = (self: Writer): Uint8Array => {
       self.bitCount,
     )
   }
-  const bytes = new Uint8Array(self.words.length * 4)
+  const bytes = new Uint8Array(self.length * 4)
   const view = new DataView(bytes.buffer)
-  for (let index = 0; index < self.words.length; index += 1) {
+  for (let index = 0; index < self.length; index += 1) {
     view.setUint32(index * 4, self.words[index] ?? 0, true)
   }
   return bytes

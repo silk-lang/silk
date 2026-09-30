@@ -36,7 +36,7 @@ it('packs wide numbers and bigint limbs across unaligned word boundaries', () =>
   Bitstream.alignTo32(writer)
 
   assert.deepEqual(
-    writer.words,
+    Array.from(writer.words.subarray(0, writer.length)),
     [0xffff_ffff, 0x7bff_ffff, 0x7be2_6af3, 0x59e2_6af3, 0x7bc0_48d1, 0x01e2_6af3],
   )
 })
@@ -52,7 +52,7 @@ it('preserves high numeric bits and continuation bits in wide VBR groups', () =>
   Bitstream.alignTo32(writer)
 
   assert.deepEqual(
-    writer.words,
+    Array.from(writer.words.subarray(0, writer.length)),
     [
       0xffff_fff5, 0x07ff_ffff, 0xffff_ffe0, 0x0000_003f, 0x0410_4100, 0xffff_8241, 0xffff_ffff,
       0x0001_ffff, 0x0000_0000,

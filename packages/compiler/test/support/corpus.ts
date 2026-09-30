@@ -6855,6 +6855,38 @@ export const httpRedirectCorpusProgram = Object.freeze({
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
+    name: 'sealed-scalar-intrinsics',
+    source: `pub fn main() -> i32 {
+  let left: i32 = 40
+  let right: i32 = 2
+  let sum = Intrinsic.i32Add(left, right)
+  if Intrinsic.i32Subtract(sum, right) != left { return 1 }
+  if Intrinsic.i32Multiply(6, 7) != sum { return 2 }
+  if Intrinsic.i32Divide(-43, 2) != -21 { return 3 }
+  if Intrinsic.i32Remainder(-43, 2) != -1 { return 4 }
+  if Intrinsic.i32Negate(-42) != sum { return 5 }
+  if Intrinsic.i32BitAnd(43, 42) != sum { return 6 }
+  if Intrinsic.i32BitOr(40, 2) != sum { return 7 }
+  if Intrinsic.i32BitXor(43, 1) != sum { return 8 }
+  if Intrinsic.i32BitNot(-43) != sum { return 9 }
+  if !Intrinsic.i32Equals(sum, 42) { return 10 }
+  if !Intrinsic.i32NotEquals(left, right) { return 11 }
+  if !Intrinsic.i32LessThan(&right, &left) { return 12 }
+  if !Intrinsic.i32LessOrEqual(right, left) { return 13 }
+  if !Intrinsic.i32GreaterThan(left, right) { return 14 }
+  if !Intrinsic.i32GreaterOrEqual(left, right) { return 15 }
+  if !Intrinsic.boolEquals(true, true) { return 16 }
+  if !Intrinsic.boolNotEquals(true, false) { return 17 }
+  if !Intrinsic.boolNot(false) { return 18 }
+  if Intrinsic.f32ToBits(Intrinsic.f32FromBits(2147483648)) != 2147483648 { return 19 }
+  if Intrinsic.f64ToBits(Intrinsic.f64FromBits(9223372036854775808)) != 9223372036854775808 { return 20 }
+  if Intrinsic.f32ToBits(Intrinsic.f32FromBits(2143363909)) != 2143363909 { return 21 }
+  if Intrinsic.f64ToBits(Intrinsic.f64FromBits(9221120237041095220)) != 9221120237041095220 { return 22 }
+  return sum
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'foreign-libc-pointer-roundtrip',
     source: `pub fn main() -> i32 {
   return 42

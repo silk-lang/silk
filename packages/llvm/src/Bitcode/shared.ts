@@ -12,7 +12,7 @@ export interface GlobalOrder {
   }>
   readonly valueIndex: ReadonlyMap<number, number>
   readonly strtab: ReadonlyMap<number, { readonly offset: number; readonly size: number }>
-  readonly bytes: ReadonlyArray<number>
+  readonly bytes: Uint8Array
 }
 
 export interface ConstantAdapter {
