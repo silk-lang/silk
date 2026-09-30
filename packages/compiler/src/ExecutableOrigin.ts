@@ -372,6 +372,10 @@ const providerWorklist = (bindings: Iterable<ProviderBinding>): ProviderWorklist
 // lookup walks the same bodies again; flatten each body once.
 const callableBindingsCache = new WeakMap<Tir.TirFunction, ReadonlyMap<number, Tir.Expression>>()
 const callableExpressionsCache = new WeakMap<Tir.TirFunction, ReadonlyArray<Tir.Expression>>()
+const bodyEvidenceCache = new WeakMap<
+  ReadonlyMap<string, Elaboration.Result>,
+  WeakMap<Tir.TirFunction, Elaboration.BodyResults['evidence']>
+>()
 
 export const make = (operations: Operations) => {
   const {
@@ -1292,11 +1296,18 @@ export const make = (operations: Operations) => {
     results: ReadonlyMap<string, Elaboration.Result>,
     fn: Tir.TirFunction,
   ): Elaboration.BodyResults['evidence'] => {
-    for (const result of results.values()) {
-      const body = result.bodies.find((candidate) => candidate.function === fn)
-      if (body !== undefined) return body.results.evidence
+    // Body evidence belongs to this completed elaboration frontier. Origin queries for each
+    // specialization read it repeatedly, so index the immutable bodies once and retain the first
+    // match in module/body order, as the authored lookup does.
+    let byFunction = bodyEvidenceCache.get(results)
+    if (byFunction === undefined) {
+      byFunction = new WeakMap()
+      for (const result of results.values())
+        for (const body of result.bodies)
+          if (!byFunction.has(body.function)) byFunction.set(body.function, body.results.evidence)
+      bodyEvidenceCache.set(results, byFunction)
     }
-    return []
+    return byFunction.get(fn) ?? []
   }
 
   function commonOrigin<A>(
@@ -3325,18 +3336,26 @@ export const make = (operations: Operations) => {
         })
       }
     }
-    const callableFor = (identity: Type.CallableIdentityArgument): CallableInstance | undefined =>
-      callables.find(
+    // Capture refinement asks repeatedly for the same callable environments. Index them once in
+    // source order, using each callable's cached environment identity instead of rebuilding every
+    // candidate's owner key for every capture and refinement pass.
+    let callablesByEnvironment: Map<string, Array<CallableInstance>> | undefined
+    const callableFor = (identity: Type.CallableIdentityArgument): CallableInstance | undefined => {
+      if (identity.environment === undefined) return undefined
+      if (callablesByEnvironment === undefined) {
+        callablesByEnvironment = new Map()
+        for (const candidate of callables) {
+          const environment = Type.runtimeCallableEnvironmentIdentityKey(
+            operations.callableEnvironmentIdentity(candidate),
+          )
+          const group = callablesByEnvironment.get(environment)
+          if (group === undefined) callablesByEnvironment.set(environment, [candidate])
+          else group.push(candidate)
+        }
+      }
+      const environment = Type.runtimeCallableEnvironmentIdentityKey(identity.environment)
+      return callablesByEnvironment.get(environment)?.find(
         (candidate) =>
-          identity.environment !== undefined &&
-          Type.runtimeCallableEnvironmentIdentityKey(identity.environment) ===
-            Type.runtimeCallableEnvironmentIdentityKey(
-              Tir.callableEnvironmentIdentity(candidate.site, {
-                declaration: candidate.owner.declaration,
-                typeArguments: candidate.owner.typeArguments,
-                staticArgumentKeys: candidate.owner.staticArguments.map(StaticValue.key),
-              }),
-            ) &&
           Tir.matchesCallableTargetIdentity(candidate.target, identity.target) &&
           identity.typeArguments.length === candidate.typeArguments.length &&
           identity.typeArguments.every((argument, ordinal) => {
@@ -3347,6 +3366,7 @@ export const make = (operations: Operations) => {
             )
           }),
       )
+    }
     let refined = new Map(effects)
     for (let pass = 0; pass <= effects.size; pass += 1) {
       let changed = false

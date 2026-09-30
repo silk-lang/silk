@@ -1986,6 +1986,10 @@ pub fn main() -> i32 {
   let mut value: i32 = 20
   return add(value, change(&mut value))
 }`,
+    nativeProfiles: [
+      { name: 'debug', optimization: 'none', debug: true },
+      { name: 'optimized', optimization: 'speed', debug: false },
+    ],
     expected: { _tag: 'Completes', result: 42 },
   },
   {

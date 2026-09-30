@@ -190,6 +190,11 @@ interface ModuleAnalysis {
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
 }
 
+// Independent compiler requests repeatedly lower the same shipped source closure. Keep only the
+// latest source revision of each manifest module: syntax and authored artifacts are immutable,
+// while profile selection and import resolution must be rebuilt for every request.
+const standardLibraryLowerings = new Map<string, Hir.Lowered>()
+
 const parseModule = Effect.fnUntraced(function* (
   name: string,
   source: SourceResolver.ResolvedSource,
@@ -198,10 +203,18 @@ const parseModule = Effect.fnUntraced(function* (
   application?: string,
 ): Effect.fn.Return<ParsedModule> {
   const currentSource = SourceFile.make(name, source.bytes, source.origin)
-  const reused = previous !== undefined && SourceFile.equals(previous.syntax.source, currentSource)
-  const lowered = reused ? undefined : yield* Effect.orDie(Hir.lower(currentSource))
-  const syntax = reused ? previous?.syntax : lowered?.syntax
-  const authored = reused ? previous?.authored : lowered?.authored
+  const cacheable = Stdlib.find(name) !== undefined
+  const cached = cacheable ? standardLibraryLowerings.get(name) : undefined
+  let reused: Module | Hir.Lowered | undefined
+  if (previous !== undefined && SourceFile.equals(previous.syntax.source, currentSource)) {
+    reused = previous
+  } else if (cached !== undefined && SourceFile.equals(cached.syntax.source, currentSource)) {
+    reused = cached
+  }
+  const lowered = reused === undefined ? yield* Effect.orDie(Hir.lower(currentSource)) : undefined
+  if (cacheable && lowered !== undefined) standardLibraryLowerings.set(name, lowered)
+  const syntax = reused?.syntax ?? lowered?.syntax
+  const authored = reused?.authored ?? lowered?.authored
   if (syntax === undefined || authored === undefined)
     throw new RangeError(`HIR lowering lost products for ${name}`)
   const context = SemanticContext.make(authored)

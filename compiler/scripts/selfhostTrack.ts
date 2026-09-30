@@ -6,5 +6,5 @@ export const selfhostTrack = [
   'foreign-libc-floating',
   'scalar-reference-read',
   'scalar-reference-write-through',
-  'scalar-reference-argument-order',
+  // Re-add scalar-reference-argument-order when CLI profile selection lands (U8 #603).
 ] as const satisfies ReadonlyArray<string>
