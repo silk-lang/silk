@@ -4,17 +4,68 @@ import * as Effect from 'effect/Effect'
 import * as Layer from 'effect/Layer'
 import * as Option from 'effect/Option'
 import * as Analysis from '../src/Analysis.js'
+import * as AuthoredIdentity from '../src/AuthoredIdentity.js'
 import * as Diagnostic from '../src/Diagnostic.js'
 import * as DeclarationFacts from '../src/DeclarationFacts.js'
 import * as ModuleClosure from '../src/ModuleClosure.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceOrigin from '../src/SourceOrigin.js'
 import * as SourceResolver from '../src/SourceResolver.js'
+import { unreachable } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
 
 const fn = 'pub fn main() -> i32 { return 42 }'
+
+it.effect(
+  'reuses exact shipped syntax while refreshing source policy and declaration selection',
+  () =>
+    Effect.gen(function* () {
+      const name = 'silk/effect'
+      const source = 'static if true { import left } else { import right }'
+      const load = Effect.fnUntraced(function* (
+        text = source,
+        origin = SourceOrigin.memory(),
+        selection?: ReadonlyMap<string, boolean>,
+      ) {
+        const closure = yield* ModuleClosure.loadProject({
+          roots: [name],
+          ...(selection === undefined ? {} : { selection: new Map([[name, selection]]) }),
+        }).pipe(
+          Effect.provide(
+            Layer.succeed(SourceResolver.SourceResolver, {
+              resolve: () => Effect.succeedSome(SourceResolver.resolved(ascii(fn), origin)),
+              resolveStandardLibrary: () =>
+                Effect.succeedSome(SourceResolver.resolved(ascii(text), origin)),
+            }),
+          ),
+        )
+        return (
+          closure.modules.find((module) => module.name === name) ?? unreachable('shipped module')
+        )
+      })
+      const first = yield* load()
+      const condition = first.authored.module.declarations.at(0) ?? unreachable('condition')
+      const owner = AuthoredIdentity.key(condition.owner)
+      const selected = yield* load(source, SourceOrigin.memory(), new Map([[owner, true]]))
+      assert.strictEqual(selected.syntax, first.syntax)
+      assert.strictEqual(selected.authored, first.authored)
+      assert.deepEqual(importNames(selected), ['left'])
+      const alternate = yield* load(source, SourceOrigin.memory(), new Map([[owner, false]]))
+      assert.strictEqual(alternate.syntax, first.syntax)
+      assert.deepEqual(importNames(alternate), ['right'])
+
+      const edited = yield* load(`${source}\npub fn added() -> i32 { return 7 }`)
+      assert.notStrictEqual(edited.syntax, first.syntax)
+      assert.strictEqual(edited.authored.module.declarations.length, 2)
+      const origin = SourceOrigin.toolchainFile('file:///toolchain/effect.silk')
+      const relocated = yield* load(source, origin)
+      assert.notStrictEqual(relocated.syntax, first.syntax)
+      assert.deepEqual(relocated.syntax.source.origin, origin)
+      assert.strictEqual(relocated.authored.module.owner.namespace, 'toolchain')
+    }),
+)
 
 it.effect(
   'selects module declarations through imported static helpers without resolving inactive imports',

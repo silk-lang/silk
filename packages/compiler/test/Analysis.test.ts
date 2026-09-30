@@ -4,6 +4,7 @@ import * as CompilerTrace from '../src/CompilerTrace.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as Clock from 'effect/Clock'
 import * as Option from 'effect/Option'
 import * as Tracer from 'effect/Tracer'
 import * as Analysis from '../src/Analysis.js'
@@ -28,6 +29,41 @@ import { raise, unreachable } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
+
+it.effect('runs unobserved synchronous passes without reading the trace clock', () =>
+  Effect.gen(function* () {
+    const clock = yield* Clock.Clock
+    const value = { answer: 42 }
+    const defect = new Error('unobserved pass defect')
+    yield* Effect.gen(function* () {
+      const trace = yield* CompilerTrace.capture()
+      assert.strictEqual(
+        trace('outer', () => trace('inner', () => value)),
+        value,
+      )
+      assert.throws(
+        () =>
+          trace('failed', () => {
+            throw defect
+          }),
+        defect,
+      )
+    }).pipe(
+      Effect.withTracer(Tracer.nativeTracer),
+      Effect.withTracerEnabled(true),
+      Effect.withTracerTiming(true),
+      Effect.provideService(Clock.Clock, {
+        currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe(),
+        currentTimeMillis: clock.currentTimeMillis,
+        monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+        monotonicTimeNanos: clock.monotonicTimeNanos,
+        currentTimeNanos: clock.currentTimeNanos,
+        sleep: (duration) => clock.sleep(duration),
+        currentTimeNanosUnsafe: () => unreachable('an unobserved pass has no trace timestamp'),
+      }),
+    )
+  }),
+)
 
 it.effect('preserves synchronous trace nesting, results, and defects', () =>
   Effect.gen(function* () {

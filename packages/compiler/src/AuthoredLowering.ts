@@ -3285,13 +3285,18 @@ const declaration = (
 
 /** A cheap deterministic revision token for presentation; content identity lives in A1 digests. */
 const revisionOf = (source: SourceFile.SourceFile): string => {
-  // ponytail: FNV-1a over source bytes; presentation only needs a stable per-revision label.
-  let hash = 0xcbf29ce484222325n
+  // FNV-1a uses two exact u32 limbs: per-byte BigInt arithmetic cost 21 ms versus 5 ms for
+  // 500 KB in the focused benchmark. The prime is 2^40 + 435, so its low-limb product is
+  // smaller than 2^53 and its carry is exact; the shifted term contributes only to high.
+  let high = 0xcbf29ce4
+  let low = 0x84222325
   for (const byte of source.bytes) {
-    hash ^= BigInt(byte)
-    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+    low = (low ^ byte) >>> 0
+    const product = low * 0x1b3
+    high = (Math.imul(high, 0x1b3) + ((product / 0x100000000) >>> 0) + (low << 8)) >>> 0
+    low = product >>> 0
   }
-  return hash.toString(16).padStart(16, '0')
+  return high.toString(16).padStart(8, '0') + low.toString(16).padStart(8, '0')
 }
 
 const moduleAnchor = (owner: AuthoredIdentity.Identity): AuthoredHir.Anchor => ({
@@ -3430,12 +3435,21 @@ const lifetimeBinders = (
   return undefined
 }
 
+const bodyKeys = new WeakMap<Lowered, WeakMap<AuthoredHir.Declaration, string>>()
+
 /**
  * A canonical rendering of one authored body for reuse keys: pool references resolve to their
  * text, lifetime binders are alpha-normalized to their binding depth and ordinal, and only
  * semantic fields participate. Equal keys mean equal authored meaning up to lifetime spelling.
  */
 export const canonicalBody = (self: Lowered, declaration: AuthoredHir.Declaration): string => {
+  let keys = bodyKeys.get(self)
+  if (keys === undefined) {
+    keys = new WeakMap()
+    bodyKeys.set(self, keys)
+  }
+  const cached = keys.get(declaration)
+  if (cached !== undefined) return cached
   const module = self.module
   const frameOf = (
     generics: ReadonlyArray<AuthoredHir.GenericParameter>,
@@ -3496,14 +3510,30 @@ export const canonicalBody = (self: Lowered, declaration: AuthoredHir.Declaratio
     if (binders !== undefined) frames.pop()
   }
   visit(declaration.body, false)
-  return parts.join(' ')
+  const result = parts.join(' ')
+  keys.set(declaration, result)
+  return result
 }
+
+// Body fingerprints and presentation dependency discovery read the same immutable declaration
+// repeatedly. Include its lowering in the cache key because pool references belong to that module.
+const bodyNameIndexes = new WeakMap<
+  Lowered,
+  WeakMap<AuthoredHir.Declaration, ReadonlySet<string>>
+>()
 
 /** Every authored name spelled inside one declaration body, for scope-sensitive reuse keys. */
 export const bodyNames = (
   self: Lowered,
   declaration: AuthoredHir.Declaration,
 ): ReadonlySet<string> => {
+  let indexes = bodyNameIndexes.get(self)
+  if (indexes === undefined) {
+    indexes = new WeakMap()
+    bodyNameIndexes.set(self, indexes)
+  }
+  const cached = indexes.get(declaration)
+  if (cached !== undefined) return cached
   const names = new Set<string>()
   const pending: unknown[] = [declaration.body]
   while (pending.length > 0) {
@@ -3522,5 +3552,6 @@ export const bodyNames = (
     }
     for (const child of Object.values(value)) pending.push(child)
   }
+  indexes.set(declaration, names)
   return names
 }
