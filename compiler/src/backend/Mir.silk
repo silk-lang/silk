@@ -2,6 +2,9 @@
 
 import backend.Gap {Code as GapCode, Gap}
 import backend.InstanceKey {InstanceKey}
+import semantic.Specialization {Application, Edge, Target}
+import semantic.RuntimeEncoding
+import semantic.Lifetime {Lifetime}
 import hir.FloatingLiteral
 import silk.f32
 import silk.f64
@@ -12,7 +15,7 @@ import silk.u64
 import hir.Hir {Access, HirId, InfixOperator, Module, Node as HirNode, PrefixOperator, Sign}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.Type {Argument, ArrayShape, Type}
+import semantic.Type {Argument, ArrayShape, Requirement, Row, RowParameter, Type}
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.Intrinsic {Member as IntrinsicMember}
 import semantic.TypedBody {
@@ -124,8 +127,15 @@ pub struct MirFunction {
   pub parameters: Vector<Shared<Type>>
   pub locals: Vector<Local>
   pub blocks: Vector<Block>
-  pub references: Vector<InstanceKey>
+  pub references: Vector<Reference>
   pub externs: Vector<Shared<DeclarationId>>
+}
+
+/// A sorted reached instance with its admission provenance and authored call site.
+pub struct Reference {
+  pub key: InstanceKey
+  pub edge: Edge
+  pub origin: Origin
 }
 
 struct LoopTargets {
@@ -134,6 +144,8 @@ struct LoopTargets {
 }
 
 struct Builder {
+  owner: DeclarationId
+  arguments: Vector<Argument>
   function: MirFunction
   current: usize
   live: bool
@@ -362,7 +374,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             origin: origin,
           }
           BodyExpression.Field {value, index} => View.Field {
-            value: value, index: index, ty: Shared.clone<Type>(&ty), origin: origin,
+            value: value,
+            index: index,
+            ty: Shared.clone<Type>(&ty),
+            origin: origin,
           }
           BodyExpression.ArrayLength {value, count} => View.ArrayLength {
             value: value, count: count, ty: Shared.clone<Type>(&ty), origin: origin,
@@ -388,15 +403,6 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             origin: origin,
           }
           BodyExpression.DirectCall {declaration, genericArguments, receiverPass, arguments} => {
-            let supplied = Vector.asSlice<Argument>(&genericArguments)
-            let mut at = usize.ZERO
-            while at < supplied.length {
-              if let Argument.Lifetime {..} = &supplied[at] {
-                at = at + usize.ONE
-              } else {
-                return View.Unsupported {origin: origin}
-              }
-            }
             let callee = TypedBody.runtimeBodyHandle(bodyValue, &declaration)
             return match move callee {
               Option<Shared<DeclarationId>>.Some {value: identity} => View.Call {
@@ -554,7 +560,7 @@ effect fn expressionPlace(
   hir: &Module,
   id: BodyNodeId,
 ) -> Place ! Gap | OutOfMemoryError ? &mut Allocator {
-  let selected = view(body, id)
+  let selected = run instanceView(&builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
     View.Local {index, ..} => place(index + usize.ONE)
@@ -566,7 +572,7 @@ effect fn expressionPlace(
     View.Index {value, index, origin, ..} => {
       // Bounds precede the projected access and a PlaceAssignment's replacement expression.
       let mut projected = run expressionPlace(&mut builder.*, body, hir, value)
-      let subjectType = match move nodeType(body, value) {
+      let subjectType = match move run instanceNodeType(&builder.*, body, value) {
         Option<Shared<Type>>.Some {value: selectedType} => move selectedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
@@ -575,7 +581,7 @@ effect fn expressionPlace(
         Option<ArrayShape>.None => { return run unsupported(&owner, origin, GapCode.IndexProjection) }
       }
       let length = run Type.extentText(shape.length)
-      let indexType = match move nodeType(body, index) {
+      let indexType = match move run instanceNodeType(&builder.*, body, index) {
         Option<Shared<Type>>.Some {value: selectedType} => move selectedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
@@ -624,7 +630,7 @@ effect fn expressionPlace(
 effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | OutOfMemoryError
 ? &mut Allocator {
-  let selected = view(body, id)
+  let selected = run instanceView(&builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
     View.Integer {ty, literal, origin} => match Module.node(hir, literal) {
@@ -693,7 +699,12 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     View.Field {ty, origin, ..} => {
       let projected = run expressionPlace(&mut builder.*, body, hir, id)
       let output = run temporary(&mut builder.*, &ty, origin)
-      run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move projected}}, origin)
+      run assign(
+        &mut builder.*,
+        place(output),
+        Rvalue.Use {value: Operand.Copy {place: move projected}},
+        origin,
+      )
       return Operand.Copy {place: place(output)}
     }
     View.Aggregate {node, count, ty, origin} => {
@@ -702,7 +713,9 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       while at < count {
         let child = match move childAt(body, node, at) {
           Option<BodyNodeId>.Some {value} => value
-          Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+          Option<BodyNodeId>.None => {
+            return run unsupported(&owner, origin, GapCode.TypedForm)
+          }
         }
         let input = run expression(&mut builder.*, body, hir, child)
         run Vector.append<AggregateField>(&mut fields, AggregateField {
@@ -790,8 +803,17 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
           Shared.clone<DeclarationId>(&callee),
         )
       } else {
-        let key = InstanceKey.Function {declaration: Shared.clone<DeclarationId>(&callee)}
-        run Vector.append<InstanceKey>(&mut builder.*.function.references, InstanceKey.copy(&key))
+        let application = run directApplication(body, callNode, &callee)
+        let closed = run Application.substitute(
+          &application,
+          &builder.owner,
+          Vector.asSlice<Argument>(&builder.arguments),
+        )
+        let key = run InstanceKey.function(move closed)
+        run Vector.append<Reference>(
+          &mut builder.*.function.references,
+          Reference {key: InstanceKey.copy(&key), edge: Edge.Direct, origin: origin},
+        )
         target = Callee.Instance {key: move key}
       }
       terminate(
@@ -931,7 +953,7 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
   if !builder.live {
     return ()
   }
-  let selected = view(body, id)
+  let selected = run instanceView(&builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   match move selected {
     View.Integer {..} => {
@@ -1123,7 +1145,7 @@ impl MirFunction {
   ? &mut Allocator {
     let origin = Origin {syntax: HirId {index: usize.ZERO}, span: Span.make(usize.ZERO, usize.ZERO)}
     let key = InstanceKey.Entry {main: Shared.clone<DeclarationId>(main)}
-    let callee = InstanceKey.Function {declaration: Shared.clone<DeclarationId>(main)}
+    let callee = run InstanceKey.named(main)
     let mut locals = Vector.make<Local>()
     run Vector.append<Local>(
       &mut locals,
@@ -1148,8 +1170,11 @@ impl MirFunction {
       &mut blocks,
       Block {statements: Vector.make<Statement>(), terminator: Terminator.Return {origin: origin}},
     )
-    let mut references = Vector.make<InstanceKey>()
-    run Vector.append<InstanceKey>(&mut references, move callee)
+    let mut references = Vector.make<Reference>()
+    run Vector.append<Reference>(
+      &mut references,
+      Reference {key: move callee, edge: Edge.Direct, origin: origin},
+    )
     return MirFunction {
       key: move key,
       safetyChecked: true,
@@ -1169,6 +1194,29 @@ impl MirFunction {
     result: &Shared<Type>,
     parameters: &[Shared<Type>],
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
+    let identity = InstanceKey.identity(&key)
+    let owner = run DeclarationId.copyShared(&identity)
+    let arguments = run InstanceKey.arguments(&key)
+    let supplied = Vector.asSlice<Argument>(&arguments)
+    let mut argumentAt = usize.ZERO
+    while argumentAt < supplied.length {
+      if let Argument.Row {value: row} = &supplied[argumentAt] {
+        let nonempty = Shared.with<Row, bool>(
+          &row,
+          fn(value: &Row) -> bool {
+            return Vector.length<Requirement>(&value.entries) > usize.ZERO || Vector.length<
+              RowParameter,
+            >(&value.parameters) > usize.ZERO
+          },
+        )
+        if nonempty {
+          fail Gap.make(GapCode.EffectInstance, &identity, bodyOrigin(body).span)
+        }
+      }
+      argumentAt = argumentAt + usize.ONE
+    }
+
+    let closedResult = run Type.substitute(result, &owner, supplied)
     let root = bodyRoot(body)
     let origin = bodyOrigin(body)
     // ContractTyped bodies retain explicit safety obligations. Building MIR does not discharge
@@ -1176,13 +1224,16 @@ impl MirFunction {
     let mut params = Vector.make<Shared<Type>>()
     let mut at = usize.ZERO
     while at < parameters.length {
-      run Vector.append<Shared<Type>>(&mut params, Shared.clone<Type>(&parameters[at]))
+      run Vector.append<Shared<Type>>(
+        &mut params,
+        run Type.substitute(&parameters[at], &owner, supplied),
+      )
       at = at + usize.ONE
     }
     let mut locals = Vector.make<Local>()
     run Vector.append<Local>(
       &mut locals,
-      Local {ty: Shared.clone<Type>(result), kind: LocalKind.Return, origin: origin},
+      Local {ty: Shared.clone<Type>(&closedResult), kind: LocalKind.Return, origin: origin},
     )
     at = usize.ZERO
     let count = localCount(body)
@@ -1194,19 +1245,25 @@ impl MirFunction {
       }
       run Vector.append<Local>(
         &mut locals,
-        Local {ty: move local.ty, kind: move kind, origin: local.origin},
+        Local {
+          ty: run Type.substitute(&local.ty, &owner, supplied),
+          kind: move kind,
+          origin: local.origin,
+        },
       )
       at = at + usize.ONE
     }
     let mut builder = Builder {
+      owner: move owner,
+      arguments: move arguments,
       function: MirFunction {
         key: move key,
         safetyChecked: bodySafetyChecked(body),
-        result: Shared.clone<Type>(result),
+        result: move closedResult,
         parameters: move params,
         locals: move locals,
         blocks: Vector.make<Block>(),
-        references: Vector.make<InstanceKey>(),
+        references: Vector.make<Reference>(),
         externs: Vector.make<Shared<DeclarationId>>(),
       },
       current: usize.ZERO,
@@ -1220,6 +1277,231 @@ impl MirFunction {
       // Unit may fall through. A non-unit missing return was rejected by body typing.
       terminate(&mut builder, Terminator.Return {origin: origin})
     }
+    run sortReferences(&mut builder.function.references)
     return move builder.function
   }
+}
+
+effect fn instanceNodeType(builder: &Builder, body: &Shared<TypedBody>, id: BodyNodeId) -> Option<Shared<Type>>
+! OutOfMemoryError ? &mut Allocator {
+  return match move nodeType(body, id) {
+    Option<Shared<Type>>.Some {value: ty} => Option.some<Shared<Type>>(
+      run Type.substitute(&ty, &builder.owner, Vector.asSlice<Argument>(&builder.arguments)),
+    )
+    Option<Shared<Type>>.None => Option.none<Shared<Type>>()
+  }
+}
+
+effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNodeId) -> View
+! OutOfMemoryError
+? &mut Allocator {
+  let selected = view(body, id)
+  let arguments = Vector.asSlice<Argument>(&builder.arguments)
+  return match move selected {
+    View.Integer {ty, literal, origin} => View.Integer {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      literal: literal,
+      origin: origin,
+    }
+    View.Float {ty, literal, origin} => View.Float {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      literal: literal,
+      origin: origin,
+    }
+    View.Local {ty, index, origin} => View.Local {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      index: index,
+      origin: origin,
+    }
+    View.Move {ty, value, origin} => View.Move {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      value: value,
+      origin: origin,
+    }
+    View.Borrow {ty, access, value, origin} => View.Borrow {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      access: access,
+      value: value,
+      origin: origin,
+    }
+    View.Dereference {ty, value, origin} => View.Dereference {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      value: value,
+      origin: origin,
+    }
+    View.Field {ty, value, index, origin} => View.Field {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      value: value,
+      index: index,
+      origin: origin,
+    }
+    View.Index {ty, value, index, origin} => View.Index {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      value: value,
+      index: index,
+      origin: origin,
+    }
+    View.ArrayLength {ty, value, count, origin} => View.ArrayLength {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      value: value,
+      count: count,
+      origin: origin,
+    }
+    View.Aggregate {ty, node, count, origin} => View.Aggregate {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      node: node,
+      count: count,
+      origin: origin,
+    }
+    View.Prefix {ty, operation, operand, origin} => View.Prefix {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      operation: operation,
+      operand: operand,
+      origin: origin,
+    }
+    View.Infix {ty, operation, left, right, origin} => View.Infix {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      operation: operation,
+      left: left,
+      right: right,
+      origin: origin,
+    }
+    View.Call {ty, callee, foreign, count, node, origin} => View.Call {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      callee: move callee,
+      foreign: foreign,
+      count: count,
+      node: node,
+      origin: origin,
+    }
+    View.Intrinsic {ty, member, node, origin} => View.Intrinsic {
+      ty: run Type.substitute(&ty, &builder.owner, arguments),
+      member: member,
+      node: node,
+      origin: origin,
+    }
+    View.Boolean {value, origin} => View.Boolean {value: value, origin: origin}
+    View.Unit {origin} => View.Unit {origin: origin}
+    View.PlaceAssignment {target, value, origin} => View.PlaceAssignment {
+      target: target,
+      value: value,
+      origin: origin,
+    }
+    View.Binding {index, initializer, origin} => View.Binding {
+      index: index,
+      initializer: initializer,
+      origin: origin,
+    }
+    View.Assignment {index, value, origin} => View.Assignment {
+      index: index,
+      value: value,
+      origin: origin,
+    }
+    View.Return {value, origin} => View.Return {value: move value, origin: origin}
+    View.Branch {condition, thenBranch, elseBranch, origin} => View.Branch {
+      condition: condition,
+      thenBranch: thenBranch,
+      elseBranch: move elseBranch,
+      origin: origin,
+    }
+    View.While {condition, body: loopBody, origin} => View.While {
+      condition: condition,
+      body: loopBody,
+      origin: origin,
+    }
+    View.Break {origin} => View.Break {origin: origin}
+    View.Continue {origin} => View.Continue {origin: origin}
+    View.Block {count, node, origin} => View.Block {count: count, node: node, origin: origin}
+    View.Unsupported {origin} => View.Unsupported {origin: origin}
+  }
+}
+
+effect fn directApplication(
+  body: &Shared<TypedBody>,
+  id: BodyNodeId,
+  callee: &Shared<DeclarationId>,
+) -> Application ! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = Vector.make<Argument>()
+  let count = Shared.with<TypedBody, usize>(
+    body,
+    fn(typed: &TypedBody) -> usize {
+      let nodes = TypedBody.nodeSlice(typed)
+      if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {genericArguments, ..}, ..} = &nodes[id.index].kind {
+        return Vector.length<Argument>(&genericArguments)
+      }
+      return usize.ZERO
+    },
+  )
+  let mut at = usize.ZERO
+  while at < count {
+    let found = Shared.with<TypedBody, Option<Argument>>(
+      body,
+      fn(typed: &TypedBody) -> Option<Argument> {
+        let nodes = TypedBody.nodeSlice(typed)
+        if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {genericArguments, ..}, ..} = &nodes[id.index].kind {
+          let listed = Vector.asSlice<Argument>(&genericArguments)
+          return Option.some<Argument>(Argument.copy(&listed[at]))
+        }
+        return Option.none<Argument>()
+      },
+    )
+    if let Option<Argument>.Some {value: argument} = move found {
+      run Vector.append<Argument>(&mut arguments, move argument)
+    }
+    at = at + usize.ONE
+  }
+  return Application {
+    target: Target.Named {declaration: run DeclarationId.copyShared(callee)},
+    arguments: move arguments,
+  }
+}
+
+effect fn sortReferences(references: &mut Vector<Reference>) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let listed = Vector.asSlice<Reference>(&references.*)
+  let mut symbols = Vector.make<Bytes>()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector.append<Bytes>(&mut symbols, run InstanceKey.symbol(&listed[at].key))
+    at = at + usize.ONE
+  }
+  let mut order = Vector.make<usize>()
+  at = usize.ZERO
+  while at < listed.length {
+    run Vector.append<usize>(&mut order, at)
+    at = at + usize.ONE
+  }
+  let sorted = Vector.asMutSlice<usize>(&mut order)
+  let names = Vector.asSlice<Bytes>(&symbols)
+  at = usize.ONE
+  while at < sorted.length {
+    let mut next = at
+    while next > usize.ZERO && RuntimeEncoding.less(
+      Bytes.asSlice(&names[sorted[next]]),
+      Bytes.asSlice(&names[sorted[next - usize.ONE]]),
+    ) {
+      let prior = sorted[next - usize.ONE]
+      sorted[next - usize.ONE] = sorted[next]
+      sorted[next] = prior
+      next = next - usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut output = Vector.make<Reference>()
+  at = usize.ZERO
+  while at < sorted.length {
+    let current = &listed[sorted[at]]
+    run Vector.append<Reference>(
+      &mut output,
+      Reference {
+        key: InstanceKey.copy(&current.key),
+        edge: Edge.copy(&current.edge),
+        origin: current.origin,
+      },
+    )
+    at = at + usize.ONE
+  }
+  references.* = move output
+  return ()
 }

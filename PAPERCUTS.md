@@ -364,6 +364,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
 
+- 2026-09-30 · Generic declaration-copy callback forwarding failed bootstrap residualization with five closure arguments for four binders; a smaller reproduction did not fail · Use concrete projection readers and keep any bootstrap investigation on main · B12 direct generic calls
 - 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
 
 - 2026-09-30 · Sequence test CI stopped on a nested callback pattern binding that reused value from its enclosing scope · Give the callback binding a distinct name and check the SemanticCases root with the bootstrap before publishing · Silk selfhost B9.
@@ -374,6 +375,9 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
 - 2026-09-30 · The resolved arity guard exposed demand roots that built empty applications for elided lifetimes · Complete root lifetime arguments from the selected signature and owned static values, then use the same application validation as source calls · M2.4 static evaluation
 
+- 2026-09-30 · Resumed B12 session lost its temporary worktree and the default zsh launcher was unavailable · Use explicit bash, remove only the stale B12 worktree registration, and restore its published branch in an isolated checkout · B12 direct generic calls
 - 2026-09-30 · Existing compiler dist generated older synthesized lifetime signatures for B13 documentation, despite fresh source bytes · Preserve current-base signatures for unchanged APIs and let exact-head documentation CI validate; do not rebuild the compiler locally · B13 stdlib platform migration
 
 - 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
+
+- 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler

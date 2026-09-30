@@ -1,10 +1,21 @@
 //! Content-based identities and deterministic names for emitted instances.
 
 import hir.Hir {OwnerKind}
-import semantic.DeclarationId {DeclarationId}
-import semantic.ModuleId {ModuleId}
+import semantic.DeclarationId {
+  DeclarationId,
+  Part as DeclarationPart,
+  Projection as DeclarationProjection,
+  OwnerStep,
+}
+import semantic.Specialization {Application, Target}
+import semantic.Type {Argument, Row, Type}
+import semantic.Lifetime {Lifetime}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.RuntimeEncoding
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.result {Result}
 import silk.hash {Hash}
 import silk.option {Option}
 import silk.pointer {Pointer}
@@ -14,32 +25,14 @@ import silk.u64
 import silk.usize
 import silk.vector {Vector}
 
-/// The scalar backend emits an unspecialized function and a C entry shim.
+/// One canonical selected application or the C entry shim. Cached projections are derived once.
 pub union InstanceKey {
-  Function {pub declaration: Shared<DeclarationId>},
+  Function {
+    pub application: Shared<Application>,
+    identity: Shared<DeclarationId>,
+    runtime: Shared<Bytes>,
+  },
   Entry {pub main: Shared<DeclarationId>},
-}
-
-fn kindCode(kind: OwnerKind) -> u64 {
-  return match kind {
-    OwnerKind.Import => 1
-    OwnerKind.Conditional => 2
-    OwnerKind.ModuleProperty => 3
-    OwnerKind.Implementation => 4
-    OwnerKind.Function => 5
-    OwnerKind.Struct => 6
-    OwnerKind.Tuple => 7
-    OwnerKind.Enumeration => 8
-    OwnerKind.Union => 9
-    OwnerKind.Service => 10
-    OwnerKind.Interface => 11
-    OwnerKind.Role => 12
-    OwnerKind.Constant => 13
-    OwnerKind.PackageParameter => 14
-    OwnerKind.Alias => 15
-    OwnerKind.Static => 16
-    OwnerKind.Damaged => 17
-  }
 }
 
 fn foldBytes(start: u64, bytes: &[u8]) -> u64 {
@@ -47,27 +40,6 @@ fn foldBytes(start: u64, bytes: &[u8]) -> u64 {
   let mut at = usize.ZERO
   while at < bytes.length {
     hash = Hash.combine(hash, u8.toU64(bytes[at]))
-    at = at + usize.ONE
-  }
-  return hash
-}
-
-fn fingerprint(declaration: &DeclarationId, seed: u64) -> u64 {
-  let module = DeclarationId.moduleId(declaration)
-  let mut hash = foldBytes(Hash.mix(&Hash.seed(seed), 1), ModuleId.sourceOrigin(module))
-  hash = foldBytes(hash, ModuleId.packageIdentity(module))
-  hash = foldBytes(hash, ModuleId.logicalPath(module))
-  let owners = DeclarationId.ownerSteps(declaration)
-  hash = Hash.combine(hash, usize.toU64(owners.length))
-  let mut at = usize.ZERO
-  while at < owners.length {
-    let step = &owners[at]
-    hash = Hash.combine(hash, kindCode(step.kind))
-    hash = match & step.name {
-      Option<Bytes>.Some {value} => foldBytes(Hash.combine(hash, 1), Bytes.asSlice(&value))
-      Option<Bytes>.None => Hash.combine(hash, 0)
-    }
-    hash = Hash.combine(hash, usize.toU64(step.occurrence))
     at = at + usize.ONE
   }
   return hash
@@ -123,31 +95,151 @@ effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &
   return ()
 }
 
+struct OperationInputs {
+  contract: Shared<Type>
+  provider: Shared<Type>
+}
+
 impl InstanceKey {
+  /// Copies this function's semantic application for path admission.
+  pub effect fn selected(self: &Self) -> Application ! OutOfMemoryError ? &mut Allocator {
+    let arguments = run InstanceKey.arguments(self)
+    let identity = InstanceKey.identity(self)
+    let body = Option.some<DeclarationId>(run DeclarationId.copyShared(&identity))
+    if let Option<DeclarationId>.Some {value: declaration} = move body {
+      if let Option<Shared<Application>>.Some {value: application} = move InstanceKey.application(
+        self,
+      ) {
+        let operation = run copyOperationDeclaration(&application)
+        if let Option<DeclarationId>.Some {value: selectedOperation} = move operation {
+          let inputs = Shared.with<Application, Option<OperationInputs>>(
+            &application,
+            fn(value: &Application) -> Option<OperationInputs> {
+              return match & value.target {
+                Target.Operation {contract, provider, ..} => Option.some<OperationInputs>(
+                  OperationInputs {
+                    contract: Shared.clone<Type>(&contract),
+                    provider: Shared.clone<Type>(&provider),
+                  },
+                )
+                Target.Named {..} => Option.none<OperationInputs>()
+              }
+            },
+          )
+          if let Option<OperationInputs>.Some {value: selectedInputs} = move inputs {
+            return Application {
+              target: Target.Operation {
+                contract: move selectedInputs.contract,
+                provider: move selectedInputs.provider,
+                operation: move selectedOperation,
+                implementation: move declaration,
+              },
+              arguments: move arguments,
+            }
+          }
+        }
+      }
+      return Application {
+        target: Target.Named {declaration: move declaration},
+        arguments: move arguments,
+      }
+    }
+    // The identity projection always selects its input.
+    return absurd<Application>()
+  }
+  /// Copies the ordered arguments under short application borrows.
+  pub effect fn arguments(self: &Self) -> Vector<Argument> ! OutOfMemoryError ? &mut Allocator {
+    let mut output = Vector.make<Argument>()
+    if let Option<Shared<Application>>.Some {value: application} = move InstanceKey.application(
+      self,
+    ) {
+      let count = Shared.with<Application, usize>(
+        &application,
+        fn(value: &Application) -> usize {
+          return Vector.length<Argument>(&value.arguments)
+        },
+      )
+      let mut at = usize.ZERO
+      while at < count {
+        let argument = Shared.with<Application, Argument>(
+          &application,
+          fn(value: &Application) -> Argument {
+            let listed = Vector.asSlice<Argument>(&value.arguments)
+            return match & listed[at] {
+              Argument.Type {value: ty} => Argument.Type {value: Shared.clone<Type>(&ty)}
+              Argument.Row {value: row} => Argument.Row {value: Shared.clone<Row>(&row)}
+              Argument.Lifetime {value: lifetime} => Argument.Lifetime {
+                value: Shared.clone<Lifetime>(&lifetime),
+              }
+            }
+          },
+        )
+        run Vector.append<Argument>(&mut output, move argument)
+        at = at + usize.ONE
+      }
+    }
+    return move output
+  }
+  /// Constructs a key from its canonical application; all cached fields are derived here.
+  pub effect fn function(application: Application) -> InstanceKey
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let runtime = run Shared.make<Bytes>(run Application.runtime(&application))
+    let identity = run Shared.make<DeclarationId>(
+      run DeclarationId.copy(Application.bodyDeclaration(&application)),
+    )
+    return InstanceKey.Function {
+      application: run Shared.make<Application>(move application),
+      identity: move identity,
+      runtime: move runtime,
+    }
+  }
+  /// Constructs the application of a declaration with no generic arguments.
+  pub effect fn named(declaration: &Shared<DeclarationId>) -> InstanceKey
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    return run InstanceKey.function(
+      Application {
+        target: Target.Named {declaration: run DeclarationId.copyShared(declaration)},
+        arguments: Vector.make<Argument>(),
+      },
+    )
+  }
+  /// Returns the selected semantic application; an entry shim has no generic contract.
+  pub fn application(self: &Self) -> Option<Shared<Application>> {
+    return match & self.* {
+      InstanceKey.Function {application, ..} => Option.some<Shared<Application>>(
+        Shared.clone<Application>(&application),
+      )
+      InstanceKey.Entry {..} => Option.none<Shared<Application>>()
+    }
+  }
   pub fn copy(self: &Self) -> InstanceKey {
     return match & self.* {
-      InstanceKey.Function {declaration} => InstanceKey.Function {
-        declaration: Shared.clone<DeclarationId>(&declaration),
+      InstanceKey.Function {application, identity, runtime} => InstanceKey.Function {
+        application: Shared.clone<Application>(&application),
+        identity: Shared.clone<DeclarationId>(&identity),
+        runtime: Shared.clone<Bytes>(&runtime),
       }
       InstanceKey.Entry {main} => InstanceKey.Entry {main: Shared.clone<DeclarationId>(&main)}
     }
   }
   pub fn identity(self: &Self) -> Shared<DeclarationId> {
     return match & self.* {
-      InstanceKey.Function {declaration} => Shared.clone<DeclarationId>(&declaration)
+      InstanceKey.Function {identity, ..} => Shared.clone<DeclarationId>(&identity)
       InstanceKey.Entry {main} => Shared.clone<DeclarationId>(&main)
     }
   }
   pub fn isEntry(self: &Self) -> bool {
     return match & self.* {
       InstanceKey.Entry {main: _} => true
-      InstanceKey.Function {declaration: _} => false
+      InstanceKey.Function {..} => false
     }
   }
   pub fn equals(self: &Self, other: &InstanceKey) -> bool {
     return match & self.* {
-      InstanceKey.Function {declaration} => match & other.* {
-        InstanceKey.Function {declaration: compared} => same(&declaration, &compared)
+      InstanceKey.Function {runtime, ..} => match & other.* {
+        InstanceKey.Function {runtime: compared, ..} => sameRuntime(&runtime, &compared)
         _ => false
       }
       InstanceKey.Entry {main} => match & other.* {
@@ -156,22 +248,35 @@ impl InstanceKey {
       }
     }
   }
+  fn runtimeBytes(self: &Self) -> Option<Shared<Bytes>> {
+    return match & self.* {
+      InstanceKey.Function {runtime, ..} => Option.some<Shared<Bytes>>(
+        Shared.clone<Bytes>(&runtime),
+      )
+      InstanceKey.Entry {..} => Option.none<Shared<Bytes>>()
+    }
+  }
   /// A readable prefix and fixed-width content digest independent of query intern ordinals.
   pub effect fn symbol(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
     if InstanceKey.isEntry(self) {
       return run Bytes.copy(b"main")
     }
-    let identity = InstanceKey.identity(self)
-    let first = Shared.with<DeclarationId, u64>(
-      &identity,
-      fn(id: &DeclarationId) -> u64 {
-        return fingerprint(id, 0)
+    let runtime = match move InstanceKey.runtimeBytes(self) {
+      Option<Shared<Bytes>>.Some {value} => move value
+      Option<Shared<Bytes>>.None => {
+        return run Bytes.copy(b"main")
+      }
+    }
+    let first = Shared.with<Bytes, u64>(
+      &runtime,
+      fn(bytes: &Bytes) -> u64 {
+        return foldBytes(Hash.mix(&Hash.seed(0), 0), Bytes.asSlice(bytes))
       },
     )
-    let second = Shared.with<DeclarationId, u64>(
-      &identity,
-      fn(id: &DeclarationId) -> u64 {
-        return fingerprint(id, 1)
+    let second = Shared.with<Bytes, u64>(
+      &runtime,
+      fn(bytes: &Bytes) -> u64 {
+        return foldBytes(Hash.mix(&Hash.seed(1), 0), Bytes.asSlice(bytes))
       },
     )
     let mut result = run Bytes.copy(b"silk_")
@@ -179,4 +284,184 @@ impl InstanceKey {
     run appendHex(&mut result, second)
     return move result
   }
+}
+
+fn sameRuntime(left: &Shared<Bytes>, right: &Shared<Bytes>) -> bool {
+  let firstAddress = Shared.with<Bytes, usize>(
+    left,
+    fn(value: &Bytes) -> usize {
+      return Pointer.address<Bytes>(Pointer.fromRef<Bytes>(value))
+    },
+  )
+  let secondAddress = Shared.with<Bytes, usize>(
+    right,
+    fn(value: &Bytes) -> usize {
+      return Pointer.address<Bytes>(Pointer.fromRef<Bytes>(value))
+    },
+  )
+  if firstAddress == secondAddress {
+    return true
+  }
+  return Shared.with<Bytes, bool>(
+    left,
+    fn(first: &Bytes) -> bool {
+      return sameRuntimeRight(first, right)
+    },
+  )
+}
+
+fn sameRuntimeRight(first: &Bytes, right: &Shared<Bytes>) -> bool {
+  return Shared.with<Bytes, bool>(
+    right,
+    fn(second: &Bytes) -> bool {
+      return RuntimeEncoding.equals(Bytes.asSlice(first), Bytes.asSlice(second))
+    },
+  )
+}
+
+fn operationProjection(value: &Application, part: DeclarationPart, owner: usize, offset: usize) -> Option<
+  DeclarationProjection,
+> {
+  return match & value.target {
+    Target.Operation {operation, ..} => Option.some<DeclarationProjection>(
+      DeclarationId.project(&operation, part, owner, offset),
+    )
+    Target.Named {..} => Option.none<DeclarationProjection>()
+  }
+}
+
+effect fn copyOperationDeclaration(source: &Shared<Application>) -> Option<DeclarationId>
+! OutOfMemoryError
+? &mut Allocator {
+  let mut components = Vector.make<Bytes>()
+  let mut section = usize.ZERO
+  while section < 3 {
+    let mut part = DeclarationPart.Path
+    if section == usize.ZERO {
+      part = DeclarationPart.Origin
+    }
+    if section == usize.ONE {
+      part = DeclarationPart.Package
+    }
+    let measured = Shared.with<Application, Option<DeclarationProjection>>(
+      source,
+      fn(value: &Application) -> Option<DeclarationProjection> {
+        return operationProjection(value, part, usize.MAX, usize.MAX)
+      },
+    )
+    let count = match move measured {
+      Option<DeclarationProjection>.Some {value: field} => field.length
+      Option<DeclarationProjection>.None => {
+        return Option.none<DeclarationId>()
+      }
+    }
+    let mut bytes = run Bytes.zeroed(count)
+    let target = Bytes.asMutSlice(&mut bytes)
+    let mut offset = usize.ZERO
+    while offset < count {
+      let selected = Shared.with<Application, Option<DeclarationProjection>>(
+        source,
+        fn(value: &Application) -> Option<DeclarationProjection> {
+          return operationProjection(value, part, usize.MAX, offset)
+        },
+      )
+      match move selected {
+        Option<DeclarationProjection>.Some {value: field} => {
+          target[offset] = field.byte
+        }
+        Option<DeclarationProjection>.None => {
+          return absurd<Option<DeclarationId>>()
+        }
+      }
+      offset = offset + usize.ONE
+    }
+    run Vector.append<Bytes>(&mut components, move bytes)
+    section = section + usize.ONE
+  }
+  let measured = Shared.with<Application, Option<DeclarationProjection>>(
+    source,
+    fn(value: &Application) -> Option<DeclarationProjection> {
+      return operationProjection(value, DeclarationPart.Owners, usize.MAX, usize.MAX)
+    },
+  )
+  let count = match move measured {
+    Option<DeclarationProjection>.Some {value: field} => field.length
+    Option<DeclarationProjection>.None => {
+      return absurd<Option<DeclarationId>>()
+    }
+  }
+  let mut owners = Vector.make<OwnerStep>()
+  let mut at = usize.ZERO
+  while at < count {
+    let selected = Shared.with<Application, Option<DeclarationProjection>>(
+      source,
+      fn(value: &Application) -> Option<DeclarationProjection> {
+        return operationProjection(value, DeclarationPart.Owners, at, usize.MAX)
+      },
+    )
+    let step = match move selected {
+      Option<DeclarationProjection>.Some {value: field} => field
+      Option<DeclarationProjection>.None => {
+        return absurd<Option<DeclarationId>>()
+      }
+    }
+    let mut name = Option.none<Bytes>()
+    if step.named {
+      let mut bytes = run Bytes.zeroed(step.length)
+      let target = Bytes.asMutSlice(&mut bytes)
+      let mut offset = usize.ZERO
+      while offset < step.length {
+        let selected = Shared.with<Application, Option<DeclarationProjection>>(
+          source,
+          fn(value: &Application) -> Option<DeclarationProjection> {
+            return operationProjection(value, DeclarationPart.Owners, at, offset)
+          },
+        )
+        match move selected {
+          Option<DeclarationProjection>.Some {value: field} => {
+            target[offset] = field.byte
+          }
+          Option<DeclarationProjection>.None => {
+            return absurd<Option<DeclarationId>>()
+          }
+        }
+        offset = offset + usize.ONE
+      }
+      name = Option.some<Bytes>(move bytes)
+    }
+    run Vector.append<OwnerStep>(
+      &mut owners,
+      OwnerStep {kind: step.kind, occurrence: step.occurrence, name: move name},
+    )
+    at = at + usize.ONE
+  }
+  let path = match move Vector.pop<Bytes>(&mut components) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      return absurd<Option<DeclarationId>>()
+    }
+  }
+  let package = match move Vector.pop<Bytes>(&mut components) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      return absurd<Option<DeclarationId>>()
+    }
+  }
+  let origin = match move Vector.pop<Bytes>(&mut components) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      return absurd<Option<DeclarationId>>()
+    }
+  }
+  let assembled = run Effect.result(ModuleId.fromParts(move origin, move package, move path))
+  let module = match move assembled {
+    Result<ModuleId, InvalidModulePath>.Success {value} => move value
+    Result<ModuleId, InvalidModulePath>.Failure {error: _} => { return absurd<Option<DeclarationId>>() }
+  }
+  return Option.some<DeclarationId>(DeclarationId.fromParts(move module, move owners))
+}
+
+fn absurd<T>() -> T {
+  let boom = 1 / 0
+  return absurd<T>()
 }
