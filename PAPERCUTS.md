@@ -363,3 +363,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
+
+- 2026-09-30 · Generic declaration-copy callback forwarding failed bootstrap residualization with five closure arguments for four binders; a smaller reproduction did not fail · Use concrete projection readers and keep any bootstrap investigation on main · B12 direct generic calls
