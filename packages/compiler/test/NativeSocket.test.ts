@@ -7,6 +7,8 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import * as Stdlib from '../src/Stdlib.js'
+import { unreachable } from './support/raise.js'
 import {
   nativeSocketAcceptanceSource,
   nativeSocketCorpusProgram,
@@ -83,8 +85,8 @@ it('exports one profile-agnostic native corpus program with independent ABI witn
   assert.include(nativeSocketCorpusProgram.nativeSource, 'connectUnix(')
   assert.include(nativeSocketCorpusProgram.nativeSource, 'connectUnixOwned(')
   assert.include(implementation, 'close$NOCANCEL')
-  assert.include(implementation, 'const MAX_TRANSFER: usize = 9223372036854775807')
-  assert.strictEqual(implementation.match(/if requested > MAX_TRANSFER/g)?.length, 2)
+  assert.include(implementation, 'return 9223372036854775807')
+  assert.strictEqual(implementation.match(/if requested > maxTransfer\(\)/g)?.length, 2)
   assert.include(nativeSocketDarwinWitnessSource, 'sun_path) == 104')
   assert.include(nativeSocketDarwinWitnessSource, 'SSIZE_MAX == INTPTR_MAX')
   assert.include(nativeSocketGnuWitnessSource, 'sun_path) == 108')
@@ -144,7 +146,7 @@ pub fn main() -> i32 { return 42 }
 `
 
 it.effect(
-  'selects the public Darwin actor and rejects its public Wasm import',
+  'selects the public Darwin actor and keeps its unused Wasm import available',
   () =>
     Effect.gen(function* () {
       const darwin = yield* AnalysisFixture.retainingMain(
@@ -158,15 +160,8 @@ it.effect(
         encoder.encode(wasmSelectionProbe),
         'wasm32-unknown-unknown',
       )
-      const missingStart = wasmSelectionProbe.indexOf('ConnectOptions')
-      assert.deepEqual(
-        Analysis.diagnostics(wasm).map((diagnostic) => ({
-          code: diagnostic.code,
-          start: diagnostic.span.start,
-          end: diagnostic.span.end,
-        })),
-        [{ code: 'SEM0014', start: missingStart, end: missingStart + 'ConnectOptions'.length }],
-      )
+      assert.deepEqual(Analysis.diagnostics(wasm), [])
+      assert.deepEqual(Analysis.instancesOf(wasm).foreignCalls, [])
     }),
   30_000,
 )
@@ -194,5 +189,53 @@ pub fn main() -> i32 { return 42 }
         source.slice(diagnostic.span.start, diagnostic.span.end),
         'move connection.*',
       )
+  }),
+)
+
+it.effect('rejects reached native connection acquisition on unsupported profiles', () =>
+  Effect.gen(function* () {
+    const sourceId = 'native-socket/unsupported-acquisition'
+    const source = `import silk.native_socket {Connection, ConnectOptions, NativeSocketError, connectResolvedOwned}
+import silk.monotonic_clock {MonotonicClock}
+import silk.network_address {Endpoint}
+import silk.option {Option}
+import silk.system_clock {Instant}
+
+pub fn main() -> i32 {
+  let endpoints: [Endpoint; 0] = []
+  let pending = connectResolvedOwned(&endpoints, ConnectOptions.defaults(), Option.none<Instant>())
+  drop pending
+  return 42
+}`
+    const module = Stdlib.find('silk/native_socket') ?? unreachable('expected socket source')
+    const text = new TextDecoder().decode(module.bytes)
+    const operation = text.indexOf('pub effect fn connectResolvedOwned(')
+    const start = text.indexOf('compileError("', operation) + 'compileError("'.length
+    const end = text.indexOf('"', start)
+    for (const profile of [
+      { target: 'wasm32-unknown-unknown' },
+      { target: 'x86_64-unknown-linux-gnu', libc: 'none' },
+    ] as const) {
+      const configuration = AnalysisFixture.configuration(sourceId, profile.target)
+      const snapshot = yield* Analysis.makeRealized({
+        root: sourceId,
+        configuration: { ...configuration, profile: { ...configuration.profile, ...profile } },
+      }).pipe(
+        Effect.provide(
+          SourceResolver.overlay([SourceFile.make(sourceId, encoder.encode(source))]).pipe(
+            Layer.provideMerge(SourceResolver.empty),
+          ),
+        ),
+      )
+      assert.deepEqual(
+        Analysis.diagnostics(snapshot).map((diagnostic) => [
+          diagnostic.code,
+          diagnostic.span.sourceId,
+          diagnostic.span.start,
+          diagnostic.span.end,
+        ]),
+        [['SEM0177', module.module, start, end]],
+      )
+    }
   }),
 )

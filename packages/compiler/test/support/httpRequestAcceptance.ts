@@ -365,23 +365,10 @@ impl TrustSource for RedirectTrustSource {
   }
 }
 
-static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
-  "libc",
-) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
-  "libc",
-) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
-  fn expectedRedirectDeadline(error: NativeClientError) -> bool {
-    return match move error {
-      NativeClientError.UnsupportedDeadline => true
-      _ => false
-    }
-  }
-} else {
-  fn expectedRedirectDeadline(error: NativeClientError) -> bool {
-    return match move error {
-      NativeClientError.UnsupportedTarget => true
-      _ => false
-    }
+fn expectedRedirectDeadline(error: NativeClientError) -> bool {
+  return match move error {
+    NativeClientError.UnsupportedDeadline => true
+    _ => false
   }
 }
 
@@ -445,13 +432,9 @@ fn nativeAdmissionChecks() -> i32 {
     Result.Success {value} => {
       drop value
     }
-    Result.Failure {error} => match move error {
-      NativeClientError.UnsupportedTarget => {
-        return 0
-      }
-      _ => {
-        return 1
-      }
+    Result.Failure {error} => {
+      drop error
+      return 1
     }
   }
   match move preflight(&dns, &options) {
@@ -472,13 +455,13 @@ fn nativeAdmissionChecks() -> i32 {
   }
 }
 
-static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
+effect fn nativeOwnedAcquisitionChecks() -> i32
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
   "libc",
 ) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
   "libc",
 ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
-  effect fn nativeOwnedAcquisitionChecks() -> i32
-  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     let direct = nativeOrigin("http://127.0.0.1/")
     let mut directOptions = Options.defaults()
     directOptions.deadline = Option.some<Instant>(SystemClock.make(10, 0))
@@ -549,46 +532,8 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
         _ => 9
       }
     }
-  }
-} else {
-  effect fn nativeOwnedAcquisitionChecks() -> i32 {
-    let direct = nativeOrigin("http://127.0.0.1/")
-    let attempted = run Effect.result(acquireOwned(
-      direct,
-      Options.defaults(),
-      ClientLimits.defaults(),
-      Option.none<TrustSnapshot>(),
-      Option.none<Instant>(),
-    ))
-    match move attempted {
-      Result.Success {value} => {
-        drop value
-        return 10
-      }
-      Result.Failure {error} => match move error {
-        NativeClientError.UnsupportedTarget => {}
-        _ => { return 11 }
-      }
-    }
-    let unix = nativeOrigin("http://unix.invalid/")
-    let unixAttempt = run Effect.result(acquireUnixOwned(
-      b"/tmp/silk-owned-acquisition",
-      unix,
-      Options.defaults(),
-      ClientLimits.defaults(),
-      Option.none<TrustSnapshot>(),
-      Option.none<Instant>(),
-    ))
-    return match move unixAttempt {
-      Result.Success {value} => {
-        drop value
-        12
-      }
-      Result.Failure {error} => match move error {
-        NativeClientError.UnsupportedTarget => 0
-        _ => 13
-      }
-    }
+  } else {
+    compileError("Native HTTP acquisition checks require a supported libc profile")
   }
 }
 
@@ -702,9 +647,9 @@ effect fn nativeProxyAdmissionChecks() -> i32 ! OutOfMemoryError ? &mut Allocato
       if !Origin.equals(&value, &direct) { return 10 }
     }
     Result.Failure {error} => match move error {
-      NativeClientError cause => match move cause {
-        NativeClientError.UnsupportedTarget => {}
-        _ => { return 11 }
+      NativeClientError cause => {
+        drop cause
+        return 11
       }
       ProxyError cause => {
         drop cause
@@ -717,9 +662,9 @@ effect fn nativeProxyAdmissionChecks() -> i32 ! OutOfMemoryError ? &mut Allocato
       if !Origin.equals(&value, &proxy) { return 13 }
     }
     Result.Failure {error} => match move error {
-      NativeClientError cause => match move cause {
-        NativeClientError.UnsupportedTarget => {}
-        _ => { return 14 }
+      NativeClientError cause => {
+        drop cause
+        return 14
       }
       ProxyError cause => {
         drop cause

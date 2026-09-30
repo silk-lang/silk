@@ -273,7 +273,7 @@ it.effect('rejects affine listener and accepted-owner violations in one analysis
   }),
 )
 
-it.effect('realizes the canonical native example and rejects the complete Wasm surface', () =>
+it.effect('realizes the canonical native example and permits unused Wasm imports', () =>
   Effect.gen(function* () {
     const opening = '```silk\n'
     const start = reference.indexOf(opening)
@@ -301,16 +301,8 @@ pub fn main() -> i32 { return 42 }`
       encoder.encode(wasmSource),
       'wasm32-unknown-unknown',
     )
-    assert.deepEqual(
-      Analysis.diagnostics(wasm).map((diagnostic) => ({
-        code: diagnostic.code,
-        start: diagnostic.span.start,
-      })),
-      [27, 37, 54, 68, 83, 93, 106, 114, 122, 134, 148, 169].map((start) => ({
-        code: 'SEM0014',
-        start,
-      })),
-    )
+    assert.deepEqual(Analysis.diagnostics(wasm), [])
+    assert.deepEqual(Analysis.instancesOf(wasm).foreignCalls, [])
   }),
 )
 

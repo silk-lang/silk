@@ -8,7 +8,7 @@ Native ownership context for one-shot HTTP fetch operations.
 
 ## Details
 
-The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-client-native.profile-2.md#declaration-73696c6b2f687474705f636c69656e745f6e61746976653a3a4e61746976655265646972656374436c69656e74). Fresh
+The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-client-native.md#declaration-73696c6b2f687474705f636c69656e745f6e61746976653a3a4e61746976655265646972656374436c69656e74). Fresh
 attempts therefore recompute the sealed route for every current URI before contact. An
 optional native pool handle is copied explicitly, sharing only its preallocated slot state and
 bounded immutable direct-route context.
