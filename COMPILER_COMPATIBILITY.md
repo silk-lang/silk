@@ -249,6 +249,16 @@ The fixture now declares both functions in `impl Vector`, retaining its expected
 The bootstrap is frozen during backend development; retire this entry when it enforces the
 same owner lookup rule.
 
+### Struct declaration fields use whitespace separators
+
+STRUCT-002 and GEN-002 show whitespace/newline-separated declaration fields. The TypeScript
+bootstrap currently accepts commas between struct declaration fields; the self-hosted parser
+previously stopped after the first field without preserving the remaining declaration.
+B10 diagnoses an authored comma as `UnexpectedToken` with its exact byte span and recovers to
+continue parsing fields. Struct literal initializers still use commas. The bootstrap is frozen;
+its comma acceptance is an intentional recorded divergence until a separately authorized repair.
+The structured parser assertion lives in `hir/LoweringCases.structFieldCommaReportsAuthoredSyntax`.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or

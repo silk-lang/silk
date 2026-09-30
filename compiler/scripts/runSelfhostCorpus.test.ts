@@ -49,6 +49,19 @@ chmod +x "$output"`
 it('runs a pinned native corpus program through the build command', () => {
   withStub(compiled, (silkc) => {
     assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+    const profiled = {
+      ...literal,
+      nativeProfiles: [
+        { name: 'debug', optimization: 'none', debug: true },
+        { name: 'optimized', optimization: 'speed', debug: false },
+      ],
+    } as const
+    withStub(`if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
+printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
+${compiled}`, (profileSilkc) => {
+      assert.deepStrictEqual(runCase(profileSilkc, profiled), { name: 'literal', status: 'pass' })
+      assert.strictEqual(readFileSync(`${profileSilkc}.profiles`, 'utf8'), 'none:true\nspeed:false\n')
+    })
     assert.deepStrictEqual(runCase(silkc, { ...literal, nativeDynamicLibraries: ['c', 'm'] }), {
       name: 'literal',
       status: 'pass',
@@ -87,7 +100,7 @@ it('keeps build and runtime regressions in the failure count', () => {
       name: 'literal',
       status: 'fail',
       code: 'RUNTIME_MISMATCH',
-      reason: 'run 1: exit: expected 42, got 41',
+      reason: 'profile optimized: run 1: exit: expected 42, got 41',
     })
   })
 })
