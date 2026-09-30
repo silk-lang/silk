@@ -30,6 +30,7 @@ it.effect('lowers an identified revision with recovered syntax and presentation 
       SourceFile.make('app/Broken', encoder.encode('pub fn broken( -> i32 { return 1 }')),
     )
     assert.strictEqual(lowered.syntax.source.id, 'app/Broken')
+    assert.strictEqual(lowered.authored.presentation.revision, 'f7b12fdd82019f15')
     assert.isAbove(lowered.syntax.parserDiagnostics.length, 0)
     assert.strictEqual(lowered.authored.module.owner.module, 'app/Broken')
     assert.isAbove(lowered.authored.presentation.diagnostics.length, 0)

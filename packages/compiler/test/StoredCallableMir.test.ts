@@ -165,7 +165,18 @@ pub fn main() -> i32 {
     )
     assert.include(encoded.symbols.join('\n'), 'silk_stored_callable_mir_determinism_box__')
     assert.include(encoded.mir, 'stored=silk/i32.add')
-    assert.include(encoded.mir, 'read-place %5.#0.#0')
+    assert.isTrue(
+      first.module.functions
+        .flatMap(MirVerification.operations)
+        .some(
+          (operation) =>
+            operation._tag === 'ReadPlace' &&
+            operation.selectors.length === 2 &&
+            operation.selectors.every(
+              (selector) => selector._tag === 'FieldSelector' && selector.field.ordinal === 0,
+            ),
+        ),
+    )
     assert.deepEqual(yield* MirVerification.verify(first.module), [])
   }),
 )

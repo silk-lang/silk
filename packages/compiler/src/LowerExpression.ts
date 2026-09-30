@@ -176,10 +176,12 @@ const lowerOperandWithProvision = (
   provision: Exclude<ReturnType<typeof forwardedServiceProvision>, 'Transferred'>,
   operand: Tir.Expression,
   availableRequirements: ReadonlyArray<ProvidedRequirement>,
+  capture = true,
 ): LoweredExpression | undefined => {
-  if (provision === undefined) return lowerExpression(fn, operand, availableRequirements)
+  const lower = capture ? lowerCallOperand : lowerExpression
+  if (provision === undefined) return lower(fn, operand, availableRequirements)
   if (operand === provision.provider) return { result: provision.local }
-  return lowerExpression(
+  return lower(
     fn,
     operand,
     operand === provision.protected ? provision.requirements : availableRequirements,
@@ -251,6 +253,43 @@ export function lowerExpression(
   fn.activeRequirements = previousRequirements
   if (result === undefined) fn.recordLoweringFailure('Expression', expression._tag, expression.span)
   return result
+}
+
+/** Captures a by-value operand before evaluation continues with the next call operand. */
+export const captureCallOperand = (
+  fn: FunctionLowering,
+  source: Mir.LocalId,
+  span: SourceSpan.SourceSpan,
+): Mir.LocalId | undefined => {
+  const type = fn.localTypes.at(source.ordinal)
+  if (type === undefined) return undefined
+  // Computed temporaries already own their value. Named storage may be changed by a later
+  // argument, so its value must leave that storage at this evaluation point.
+  const named = [fn.parameterLocals, fn.bindingLocals, fn.patternLocals].some((locals) =>
+    [...locals.values()].some((local) => local.ordinal === source.ordinal),
+  )
+  if (type._tag !== 'EnvironmentBorrow' && !named) return source
+  const valueType = type._tag === 'EnvironmentBorrow' ? fn.type(type.type) : type
+  if (valueType === undefined) return undefined
+  const destination = fn.alloc(valueType)
+  fn.emit({ _tag: 'Move', destination, source, provenance: authored(span) })
+  const heldLoans = fn.slotLoans.get(source.ordinal)
+  if (heldLoans !== undefined) {
+    fn.slotLoans.delete(source.ordinal)
+    fn.slotLoans.set(destination.ordinal, heldLoans)
+  }
+  return destination
+}
+
+export const lowerCallOperand = (
+  fn: FunctionLowering,
+  expression: Tir.Expression,
+  availableRequirements = fn.activeRequirements ?? fn.providedRequirements,
+): LoweredExpression | undefined => {
+  const lowered = lowerExpression(fn, expression, availableRequirements)
+  if (lowered === undefined || lowered === 'Transferred') return lowered
+  const result = captureCallOperand(fn, lowered.result, expression.span)
+  return result === undefined ? undefined : { result }
 }
 
 /** Captures a selected eager computation, preserving ordinary return and loop exits. */
@@ -402,7 +441,7 @@ export function lowerExpressionInner(
       const arguments_: Array<Mir.LocalId> = []
       let callee: Mir.LocalId | undefined
       for (const child of Tir.expressionChildren(expression)) {
-        const value = lowerExpression(fn, child, availableRequirements)
+        const value = lowerCallOperand(fn, child, availableRequirements)
         if (value === 'Transferred' || value === undefined) return value
         if (child === expression.callee) callee = value.result
         else arguments_.push(value.result)
@@ -869,7 +908,10 @@ function lowerCallableSectionExpression(
     readonly access: Type.CaptureAccess
   }> = []
   for (const capture of expression.captures) {
-    const lowered = lowerExpression(fn, capture.value, availableRequirements)
+    const lowered =
+      capture.access === 'Copy' || capture.access === 'Take'
+        ? lowerCallOperand(fn, capture.value, availableRequirements)
+        : lowerExpression(fn, capture.value, availableRequirements)
     if (lowered === 'Transferred') return lowered
     if (lowered === undefined) return undefined
     captures.push({
@@ -919,8 +961,16 @@ function lowerStagedCallableApply(
     return true
   }
   const lowerArguments = (): boolean | 'Transferred' => {
-    for (const argument of expression.arguments) {
-      const lowered = lowerExpression(fn, argument, availableRequirements)
+    for (const [ordinal, argument] of expression.arguments.entries()) {
+      const field = environment.fields.find(
+        (candidate) =>
+          candidate.ordinal === environment.fields.length - expression.arguments.length + ordinal,
+      )
+      if (field === undefined) return false
+      const lowered =
+        field.access === 'Copy' || field.access === 'Take'
+          ? lowerCallOperand(fn, argument, availableRequirements)
+          : lowerExpression(fn, argument, availableRequirements)
       if (lowered === 'Transferred') return lowered
       if (lowered === undefined) return false
       sources.push(lowered.result)
@@ -1022,6 +1072,7 @@ function lowerCallableApplyExpression(
             provision,
             capture.value,
             availableRequirements,
+            capture.access === 'Copy' || capture.access === 'Take',
           )
           if (lowered === 'Transferred') return lowered
           if (lowered === undefined) return false
@@ -1867,7 +1918,7 @@ function lowerRunExpression(
     const staticArguments = call.target.staticArguments
     const arguments_: Array<Mir.LocalId> = []
     for (const argument of recipe.arguments) {
-      const lowered = lowerExpression(fn, argument, availableRequirements)
+      const lowered = lowerCallOperand(fn, argument, availableRequirements)
       if (lowered === 'Transferred') return lowered
       if (lowered === undefined) return undefined
       arguments_.push(lowered.result)
@@ -2741,7 +2792,7 @@ function lowerCallExpression(
 ): LoweredExpression | undefined {
   const argumentLocals: Array<Mir.LocalId> = []
   for (const argument of expression.arguments) {
-    const lowered = lowerExpression(fn, argument, availableRequirements)
+    const lowered = lowerCallOperand(fn, argument, availableRequirements)
     if (lowered === 'Transferred') return lowered
     if (lowered === undefined) return undefined
     argumentLocals.push(lowered.result)
@@ -2858,7 +2909,7 @@ function lowerInterfaceOperationCallExpression(
   if (selected?.rule._tag !== 'BuiltinRule') {
     const argumentLocals: Array<Mir.LocalId> = []
     for (const argument of expression.arguments) {
-      const lowered = lowerExpression(fn, argument, availableRequirements)
+      const lowered = lowerCallOperand(fn, argument, availableRequirements)
       if (lowered === 'Transferred') return lowered
       if (lowered === undefined) return undefined
       argumentLocals.push(lowered.result)

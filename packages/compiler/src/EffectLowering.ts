@@ -21,7 +21,7 @@ import * as Lifetime from './Lifetime.js'
 import type { ProvidedRequirement } from './Lower.js'
 import { borrowKey, patternKey, specializeProvider } from './Lower.js'
 import type {} from './LowerExpression.js'
-import { lowerExpression, lowerExecution } from './LowerExpression.js'
+import { lowerCallOperand, lowerExpression, lowerExecution } from './LowerExpression.js'
 import * as Match from './Match.js'
 import * as Ownership from './Ownership.js'
 import * as Mir from './Mir.js'
@@ -1694,7 +1694,7 @@ export const lowerServiceEffectValue = (
   if (target === undefined) return undefined
   const loweredArguments: Array<Mir.LocalId> = []
   for (const argument of subject.arguments) {
-    const lowered = lowerExpression(fn, argument, availableRequirements)
+    const lowered = lowerCallOperand(fn, argument, availableRequirements)
     if (lowered === 'Transferred' || lowered === undefined) return lowered
     loweredArguments.push(lowered.result)
   }

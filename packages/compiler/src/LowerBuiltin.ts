@@ -1,5 +1,5 @@
 import * as ConcreteCleanup from './ConcreteCleanup.js'
-import { lowerExpression } from './LowerExpression.js'
+import { lowerCallOperand } from './LowerExpression.js'
 import { authored, cleanupForLocal, generated } from './CleanupEmission.js'
 import type * as DeclarationFacts from './DeclarationFacts.js'
 import type { LoweredExpression } from './EffectLowering.js'
@@ -45,7 +45,7 @@ export const lowerBuiltinExpression = (
     if (tuple._tag !== 'Construct' && tuple._tag !== 'UnitLiteral') return undefined
     const arguments_: Array<Mir.LocalId> = []
     for (const operand of operands) {
-      const lowered = lowerExpression(fn, operand)
+      const lowered = lowerCallOperand(fn, operand)
       if (lowered === undefined || lowered === 'Transferred') return lowered
       arguments_.push(lowered.result)
     }

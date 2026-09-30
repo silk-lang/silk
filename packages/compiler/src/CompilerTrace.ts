@@ -21,11 +21,13 @@ export const none: CompilerTrace = (_name, body) => body()
  * Captures Effect's tracer, clock, and parent for synchronous pass/function boundaries.
  * The compiler's recursive instruction/type loops stay synchronous; no nested Effect runtime
  * or per-instruction spans are needed. The observer must not escape this invocation to a fiber.
+ * Without an installed tracing backend, passes run directly instead of allocating unobserved spans.
  * Defects close their spans and are rethrown unchanged; results are never retained in spans.
  */
 export const capture = Effect.fnUntraced(function* () {
   if (!(yield* References.TracerEnabled)) return none
   const tracer = yield* Tracer.Tracer
+  if (tracer === Tracer.nativeTracer) return none
   const clock = yield* Clock.Clock
   const attributesFromContext = yield* References.TracerSpanAnnotations
   const links = yield* References.TracerSpanLinks
