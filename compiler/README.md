@@ -369,8 +369,11 @@ text aliases preserve their original authored spans.
 The sealed `Intrinsic` surface supplies target and final-profile facts and static text operations.
 One explicit final build profile controls selected static-if arms; inactive arms contribute no
 annotation, call, or body demands. Authored generic/evidence execution, nominal resource safety,
-profile predicates, and validated static-query reuse remain explicitly deferred. Foreign `static`
-data is outside this initializer path. The native CLI/backend coverage remains the limited subset
+and profile predicates remain explicitly deferred. Static-query reuse validates executed-body,
+initializer and profile-input dependencies. Canonical values exclude source origins; each request
+replays current source observations and registration checks before using a completed fact. Unrelated
+edits can retain checked bodies, while changed helpers or selected profile content invalidate their
+consumers. Foreign `static` data is outside this initializer path. The native CLI/backend coverage remains the limited subset
 listed at the beginning of this document.
 
 `Semantic.demandBody` checks one requested ordinary function body against its written signature.
