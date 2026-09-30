@@ -34,6 +34,14 @@ chmod +x "$output"`
 it('runs a pinned native corpus program through the build command', () => {
   withStub(compiled, (silkc) => {
     assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+    assert.deepStrictEqual(runCase(silkc, { ...literal, nativeDynamicLibraries: ['c', 'm'] }), {
+      name: 'literal',
+      status: 'pass',
+    })
+    assert.strictEqual(
+      runCase(silkc, { ...literal, nativeDynamicLibraries: ['custom'] }).status,
+      'unsupported',
+    )
   })
 })
 
