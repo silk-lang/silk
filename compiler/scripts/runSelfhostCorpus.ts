@@ -2,6 +2,7 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   nativeCorpus,
@@ -307,7 +308,14 @@ const main = (): void => {
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
   const track = selfhostTrack.filter((name) => selectedSet === undefined || selectedSet.has(name))
   const executable = silkc.includes('/') ? resolve(silkc) : silkc
-  const results = programs.map((program) => runCase(executable, program))
+  const results = programs.map((program) => {
+    const started = performance.now()
+    const result = runCase(executable, program)
+    process.stdout.write(
+      `SELFHOST_CASE_TIMING=${JSON.stringify({ name: program.name, elapsedMs: Math.round(performance.now() - started) })}\n`,
+    )
+    return result
+  })
   for (const result of results) {
     let detail = ''
     if (result.status === 'fail')
