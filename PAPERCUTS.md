@@ -344,3 +344,4 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · B6 integration parsed but CI rejected its ABI fixture pattern after B5 added BackendBuild.Module.uncheckedBodies · Match the text field with an explicit remaining-field pattern; parser-only merge audits do not prove typed pattern completeness · self-hosted backend
 - 2026-09-30 · The multi-file fixture expected a body Reuse event after publishing an unrelated source, but unchanged observations take the completed-answer Hit path · Assert a body cache hit and no new body start in the existing single reuse check · self-hosted compiler
+- 2026-09-30 · The corpus runner passed a directory URL's trailing separator to the normalized Path CLI boundary, so every invoked build failed before source loading · Pass the stdlib URL without a trailing separator and require this in the existing runner stub · self-hosted compiler

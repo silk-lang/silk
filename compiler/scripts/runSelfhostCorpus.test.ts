@@ -25,6 +25,7 @@ const withStub = (body: string, run: (path: string) => void): void => {
 }
 
 const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || [ ! -f silk.toml ]; then exit 4; fi
+case "$6" in */) exit 5;; esac
 if [ "$1" != build ] || [ "$2" != main.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
 while [ "$1" != "-o" ]; do shift; done
 output="$2"

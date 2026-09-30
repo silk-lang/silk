@@ -210,7 +210,7 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
     const executable = join(directory, 'program')
     const built = spawnSync(silkc, [
       'build', 'main.silk', '-o', 'program', '--stdlib',
-      fileURLToPath(new URL('../../packages/compiler/stdlib/', import.meta.url)),
+      fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
     ], {
       cwd: directory,
       encoding: 'utf8',
