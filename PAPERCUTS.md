@@ -357,3 +357,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · U8b code graph indexing could not start while an unverified generation was active · Read the worker log, retain the active generation, and use scoped source reads · self-hosted CLI build profiles
 
 - 2026-09-30 · U8b CI rejected a borrowed empty literal and an if expression used to choose Clang flags · Keep schema slices backed by an owned Vector and select flags with a normal conditional assignment · self-hosted CLI build profiles
+- 2026-09-29 · A compiler test passed locally against stale LLVM dist files while the rebuilt dependency failed on CI · Rebuild changed workspace dependencies before running their consumer tests · compiler/LLVM
+
+- 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
+- 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration

@@ -4167,6 +4167,7 @@ const substituteExecutableLifetimes = (
 // Argument lists are built once and then only read; instance matching compares the same lists
 // against many candidates. The cached length guards a list that is still being filled.
 const cachedRuntimeArgumentKeys: unique symbol = Symbol('Type.runtimeArgumentKeys')
+const emptyRuntimeArgumentKeys: ReadonlyArray<string> = []
 
 export const runtimeArgumentKeys = (
   self: ReadonlyArray<GenericArgument>,
@@ -4181,9 +4182,14 @@ export const runtimeArgumentKeys = (
     Array.isArray(cached.keys)
   )
     return cached.keys
-  const keys = self.flatMap((argument) =>
-    Lifetime.isLifetime(argument) ? [] : [runtimeGenericArgumentKey(argument)],
-  )
+  // Fresh empty lists need no cache entry. A previously cached list still records its new length,
+  // so shrinking through zero and growing again cannot reuse its former arguments.
+  if (self.length === 0 && cached === undefined) return emptyRuntimeArgumentKeys
+  // Cold selfhost profiles spend most list-key time in flatMap and cache installation. Avoid the
+  // callback and per-argument singleton arrays while preserving the existing warm cache path.
+  const keys: Array<string> = []
+  for (const argument of self)
+    if (!Lifetime.isLifetime(argument)) keys.push(runtimeGenericArgumentKey(argument))
   if (Object.isExtensible(self))
     Object.defineProperty(self, cachedRuntimeArgumentKeys, {
       value: { length: self.length, keys },

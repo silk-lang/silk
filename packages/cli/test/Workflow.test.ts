@@ -97,21 +97,33 @@ const options = (workingDirectory: string): Workflow.ProjectSelection => ({
 
 const executionIdentity = (ordinal: number): string => ordinal.toString(16).padStart(64, '0')
 
+const testInfo = (
+  ordinal: number,
+  declarationIdentity = `tests/Cases::test${ordinal}`,
+): TestExecution.Entry['test'] => ({
+  identity: declarationIdentity,
+  name: `test${ordinal}`,
+  module: 'tests/Cases',
+  path: 'tests/Cases.silk',
+  line: ordinal + 1,
+  column: 1,
+  fingerprint: `silk-test-v1:${ordinal}`,
+})
+
 const testEntry = (
   ordinal: number,
   eligibility: TestExecution.Eligibility,
   declarationIdentity = `tests/Cases::test${ordinal}`,
 ): TestExecution.Entry => ({
-  test: {
-    identity: declarationIdentity,
-    name: `test${ordinal}`,
-    module: 'tests/Cases',
-    path: 'tests/Cases.silk',
-    line: ordinal + 1,
-    column: 1,
-    fingerprint: `silk-test-v1:${ordinal}`,
-  },
+  test: testInfo(ordinal, declarationIdentity),
   eligibility,
+})
+
+const testCatalog = (
+  entries: ReadonlyArray<TestExecution.Entry['test']>,
+): TestExecution.Catalog => ({
+  _tag: 'TestExecutionCatalog',
+  entries,
 })
 
 const testManifest = (entries: ReadonlyArray<TestExecution.Entry>): TestExecution.Manifest => ({
@@ -168,12 +180,14 @@ it.effect(
       )
       observed.reads.length = 0
       observed.publications.length = 0
+      const manifest = testManifest([
+        testEntry(0, { _tag: 'Eligible', identity: reused }),
+        testEntry(1, { _tag: 'Ineligible', reason: { _tag: 'MissingTestRoot' } }),
+        testEntry(2, { _tag: 'Eligible', identity: missing }),
+      ])
       const prepared = yield* Workflow.prepareTestRun(
-        testManifest([
-          testEntry(0, { _tag: 'Eligible', identity: reused }),
-          testEntry(1, { _tag: 'Ineligible', reason: { _tag: 'MissingTestRoot' } }),
-          testEntry(2, { _tag: 'Eligible', identity: missing }),
-        ]),
+        testCatalog(manifest.entries.map((entry) => entry.test)),
+        manifest,
       ).pipe(Effect.provideService(Storage.Storage, observed.service))
 
       assert.strictEqual(prepared.plan._tag, 'PerTest')
@@ -211,9 +225,10 @@ it.effect('selects compact mode before result lookup for every overflow boundary
   Effect.gen(function* () {
     const observed = observedStorage()
     const prepare = (manifest: TestExecution.Manifest) =>
-      Workflow.prepareTestRun(manifest).pipe(
-        Effect.provideService(Storage.Storage, observed.service),
-      )
+      Workflow.prepareTestRun(
+        testCatalog(manifest.entries.map((entry) => entry.test)),
+        manifest,
+      ).pipe(Effect.provideService(Storage.Storage, observed.service))
 
     const receiptOnlyOverflow = yield* prepare(
       testManifest([
@@ -294,15 +309,21 @@ it.effect('bypasses result reads and writes without disturbing an existing pass 
     )
     observed.reads.length = 0
     observed.publications.length = 0
-    const manifest = testManifest([testEntry(0, { _tag: 'Eligible', identity })])
-    const first = yield* Workflow.prepareTestRun(manifest, false).pipe(
+    const catalog = testCatalog([testInfo(0)])
+    const first = yield* Workflow.prepareTestRun(catalog).pipe(
       Effect.provideService(Storage.Storage, observed.service),
     )
-    const second = yield* Workflow.prepareTestRun(manifest, false).pipe(
+    const second = yield* Workflow.prepareTestRun(catalog).pipe(
       Effect.provideService(Storage.Storage, observed.service),
     )
     assert.strictEqual(first.plan._tag, 'Uncached')
     assert.strictEqual(second.plan._tag, 'Uncached')
+    if (first.plan._tag !== 'Uncached') return
+    assert.strictEqual(first.plan.discovered, 1n)
+    assert.deepStrictEqual(
+      first.plan.catalogDigest,
+      yield* TestExchange.catalogDigest(['tests/Cases::test0']),
+    )
     assert.deepStrictEqual(observed.reads, [])
     assert.isFalse(
       first.plan.nonce.every((byte, index) => byte === (second.plan.nonce.at(index) ?? -1)),
@@ -416,8 +437,10 @@ it.effect('degrades optional cache read and publication failures observably', ()
           }),
         ),
     })
+    const manifest = testManifest([testEntry(0, { _tag: 'Eligible', identity })])
     const prepared = yield* Workflow.prepareTestRun(
-      testManifest([testEntry(0, { _tag: 'Eligible', identity })]),
+      testCatalog(manifest.entries.map((entry) => entry.test)),
+      manifest,
     ).pipe(Effect.provideService(Storage.Storage, failing))
     assert.strictEqual(prepared.plan._tag, 'PerTest')
     assert.strictEqual(prepared.events[0]?._tag, 'ReadSkipped')

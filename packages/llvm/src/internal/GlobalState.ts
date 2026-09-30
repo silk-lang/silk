@@ -40,12 +40,7 @@ const defaults = (
 /** @internal */
 const availableAnonymousName = (state: BuilderState.MutableState): ByteString.ByteString => {
   while (true) {
-    const name: ByteString.ByteString = {
-      _tag: 'ByteString',
-      bytes: Array.from(String(state.globals.nextAnonymous), (character) =>
-        character.charCodeAt(0),
-      ),
-    }
+    const name = ByteString.fromString(String(state.globals.nextAnonymous))
     state.globals.nextAnonymous += 1
     if (!state.globals.entries.keys.has(CanonicalKey.bytes(name))) return name
   }

@@ -1130,7 +1130,9 @@ effect fn suspendingWork(self: &mut Suspending) -> i32 {
 }
 impl Work for Suspending { perform: Suspending.suspendingWork }
 struct Immediate {}
-effect fn immediateWork(self: &mut Immediate) -> i32 { return 1 }
+effect fn serviceFreeLeaf() -> i32 { return 1 }
+effect fn serviceFreeBranch() -> i32 { return run serviceFreeLeaf() }
+effect fn immediateWork(self: &mut Immediate) -> i32 { return run serviceFreeBranch() }
 impl Work for Immediate { perform: Immediate.immediateWork }
 effect fn read() -> i32 ? &mut Work { return run Work.perform() }
 effect fn nested() -> i32 ? &mut Work {
@@ -1146,6 +1148,8 @@ pub fn main() -> i32 {
     const targets = self.instances.calls.map((call) => call.target.declaration.name)
     assert.include(targets, 'suspendingWork')
     assert.include(targets, 'immediateWork')
+    assert.include(targets, 'serviceFreeBranch')
+    assert.include(targets, 'serviceFreeLeaf')
     for (const [name, suspends] of [
       ['main', true],
       ['nested', false],

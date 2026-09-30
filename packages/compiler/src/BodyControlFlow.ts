@@ -265,6 +265,53 @@ export const at = (self: BodyControlFlow, span: SourceSpan.SourceSpan): Boundary
 export const writeAt = (self: BodyControlFlow, span: SourceSpan.SourceSpan): number | undefined =>
   self.writes.get(spanKey(span))
 
+const reverseEdges = new WeakMap<BodyControlFlow['edges'], ReadonlyArray<ReadonlyArray<number>>>()
+
+const predecessorsOf = (self: BodyControlFlow): ReadonlyArray<ReadonlyArray<number>> => {
+  let edges = reverseEdges.get(self.edges)
+  if (edges === undefined) {
+    const reversed: Array<Array<number>> = self.edges.map(() => [])
+    for (const [from, successors] of self.edges.entries())
+      for (const to of successors) reversed.at(to)?.push(from)
+    edges = reversed
+    reverseEdges.set(self.edges, edges)
+  }
+  return edges
+}
+
+// Actual selfhost profiling attributed 5.5 seconds to this CFG traversal. Keep the per-edge
+// bitset loop shared by forward queries and the smaller set of backward loan-use queries.
+const walk = (
+  edges: BodyControlFlow['edges'],
+  starts: ReadonlyArray<number>,
+  barriers: ReadonlySet<number>,
+  work: BodyControlFlow['work'],
+): Reachable => {
+  const pending = [...starts]
+  const visited: Reachable = new Uint32Array((edges.length + 31) >>> 5)
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === undefined || barriers.has(current) || includes(visited, current)) continue
+    visited[current >>> 5] = (visited[current >>> 5] ?? 0) | (1 << (current & 31))
+    for (const next of edges.at(current) ?? []) {
+      work.visitedEdges += 1
+      pending.push(next)
+    }
+  }
+  return visited
+}
+
+/** Every point that can reach any target without passing the barrier, including target points. */
+export const predecessors = (
+  self: BodyControlFlow,
+  targets: ReadonlyArray<number>,
+  barrier: number,
+): Reachable => {
+  self.work.queries += 1
+  if (targets.length === 0) return new Uint32Array((self.edges.length + 31) >>> 5)
+  return walk(predecessorsOf(self), targets, new Set([barrier]), self.work)
+}
+
 /**
  * Every point reachable from one start without passing a barrier, computed lazily and reused for
  * every later query from the same start and barriers.
@@ -292,17 +339,7 @@ export const reachable = (
     return cached
   }
   const barriers = new Set(typeof barrier === 'number' ? [barrier] : (barrier ?? []))
-  const pending = [from]
-  const visited: Reachable = new Uint32Array((self.edges.length + 31) >>> 5)
-  while (pending.length > 0) {
-    const current = pending.pop()
-    if (current === undefined || barriers.has(current) || includes(visited, current)) continue
-    visited[current >>> 5] = (visited[current >>> 5] ?? 0) | (1 << (current & 31))
-    for (const next of self.edges.at(current) ?? []) {
-      self.work.visitedEdges += 1
-      pending.push(next)
-    }
-  }
+  const visited = walk(self.edges, [from], barriers, self.work)
   answers.set(key, visited)
   return visited
 }
