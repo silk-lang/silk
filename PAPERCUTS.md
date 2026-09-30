@@ -365,3 +365,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
 
 - 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
+
+- 2026-09-30 · Sequence test CI stopped on a nested callback pattern binding that reused value from its enclosing scope · Give the callback binding a distinct name and check the SemanticCases root with the bootstrap before publishing · Silk selfhost B9.
