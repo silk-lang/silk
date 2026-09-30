@@ -10,4 +10,12 @@ export const selfhostTrack = [
   'mutable-struct-loop',
   'recursive-aggregate-return',
   'inherent-member-over-module-projection',
+  'array-inferred',
+  'array-contextual-empty',
+  'array-nested',
+  'array-indexed-struct-field',
+  'array-whole-move',
+  'array-upper-index-trap',
+  'array-zero-index-trap',
+  'mutable-array-loop',
 ] as const satisfies ReadonlyArray<string>
