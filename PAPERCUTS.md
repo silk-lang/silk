@@ -381,3 +381,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
 
 - 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler
+
+- 2026-09-30 · Cloud Linux container had only system LLVM 18 and no `/usr/bin/time`; a merged Semantic+Target probe root was SIGKILLed near 7 GB while other compiles ran · Fetch LLVM 22.1.8 into `.scratch/llvm-22.1.8` exactly as `.github/actions/setup-linux-llvm` does, put it first on `PATH`, sample peak RSS with `ps`, and run one native test root at a time (SemanticCases alone peaks near 11.5 GB of process-tree RSS) · selfhost test audit
