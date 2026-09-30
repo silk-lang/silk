@@ -2,7 +2,7 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   nativeCorpus,
   type CorpusProgram,
@@ -143,6 +143,7 @@ const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
 const writeProgram = (directory: string, program: CorpusProgram): void => {
   const source = join(directory, 'main.silk')
   writeFileSync(source, program.nativeSource ?? program.source)
+  writeFileSync(join(directory, 'silk.toml'), '[package]\nname = "corpus"\nroot = "main.silk"\n')
   for (const [module, contents] of Object.entries(program.nativeImports ?? {})) {
     if (module.startsWith('/') || module.split('/').includes('..'))
       throw new Error(`unsafe corpus import path: ${module}`)
@@ -206,6 +207,10 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
     const executable = join(directory, 'program')
     const built = spawnSync(silkc, ['build', 'main.silk', '-o', 'program'], {
       cwd: directory,
+      env: {
+        ...process.env,
+        SILKC_STDLIB: fileURLToPath(new URL('../../packages/compiler/stdlib/', import.meta.url)),
+      },
       encoding: 'utf8',
       timeout: processTimeoutMs,
       maxBuffer: 4 * 1024 * 1024,
