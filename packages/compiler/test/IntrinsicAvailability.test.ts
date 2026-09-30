@@ -18,6 +18,7 @@ import * as IntrinsicAvailability from '../src/IntrinsicAvailability.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as SourceSpan from '../src/SourceSpan.js'
+import * as Stdlib from '../src/Stdlib.js'
 import * as Target from '../src/Target.js'
 import * as ToolchainIntegrity from '../src/ToolchainIntegrity.js'
 import * as Type from '../src/Type.js'
@@ -138,7 +139,7 @@ it.effect('does not admit targetPointerBits into runtime TIR', () =>
 it.effect('rejects selected native providers and preserves portable LLVM-to-Wasm imports', () =>
   Effect.gen(function* () {
     const unused = yield* snapshot(
-      `import silk.os_monotonic_clock
+      `import silk.os_monotonic_clock { OsMonotonicClock }
 pub fn main() -> i32 { return 42 }`,
       'wasm32-unknown-unknown',
     )
@@ -155,21 +156,22 @@ pub fn main() -> i32 { return 42 }`,
     assert.deepEqual(portable.nativeRuntimeSymbols, [])
 
     const reachable = yield* snapshot(
-      `import silk.effect { Effect }
-import silk.monotonic_clock { MonotonicClock }
-import silk.os_monotonic_clock { OsMonotonicClock }
-pub fn main() -> i32 {
-  let mut provider = OsMonotonicClock.make()
-  let resolution = run Effect.provideMut(MonotonicClock.getResolution(), &mut provider)
-  if resolution > 0 { return 42 }
-  return 0
-}`,
+      `import silk.os_monotonic_clock { OsMonotonicClock }
+pub fn main() -> i32 { let provider = OsMonotonicClock.make() return 42 }`,
       'wasm32-unknown-unknown',
     )
-    assert.isTrue(
-      Analysis.diagnostics(reachable).some(
-        (diagnostic) => diagnostic.reason._tag === 'UnknownImportedMember',
-      ),
+    const module = Stdlib.find('silk/os_monotonic_clock') ?? unreachable('expected clock source')
+    const text = new TextDecoder().decode(module.bytes)
+    const start = text.indexOf('compileError("') + 'compileError("'.length
+    const end = text.indexOf('"', start)
+    assert.deepEqual(
+      Analysis.diagnostics(reachable).map((diagnostic) => [
+        diagnostic.code,
+        diagnostic.span.sourceId,
+        diagnostic.span.start,
+        diagnostic.span.end,
+      ]),
+      [['SEM0177', module.module, start, end]],
     )
 
     const standardOutput = yield* snapshot(
@@ -1149,7 +1151,7 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`),
   }),
 )
 
-it.effect('keeps native clock providers absent from no-libc selections', () =>
+it.effect('binds unused migrated clock providers while the system provider remains selected', () =>
   Effect.gen(function* () {
     const source = `import silk.os_system_clock { OsSystemClock }
 import silk.os_monotonic_clock { OsMonotonicClock }
@@ -1170,7 +1172,7 @@ pub fn main() -> i32 { return 42 }`
       )
       assert.deepEqual(
         Analysis.diagnostics(self).map((value) => [value.code, value.span.start, value.span.end]),
-        ['OsSystemClock', 'OsMonotonicClock', 'NativeClock'].map((name) => [
+        ['OsSystemClock'].map((name) => [
           'SEM0014',
           source.indexOf(name),
           source.indexOf(name) + name.length,

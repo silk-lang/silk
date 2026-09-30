@@ -114,6 +114,24 @@ it('reuses the runtime identity of an immutable type across nested layout querie
   assert.strictEqual(argumentReads, readsAfterFirst)
 })
 
+it('erases lifetime arguments in order while generic argument lists are being filled', () => {
+  const arguments_: Array<Type.GenericArgument> = []
+  assert.deepEqual(Type.runtimeArgumentKeys(arguments_), [])
+  arguments_.push('i32', Lifetime.staticLifetime, 'bool')
+  assert.deepEqual(Type.runtimeArgumentKeys(arguments_), ['builtin:i32', 'builtin:bool'])
+  arguments_.length = 1
+  assert.deepEqual(Type.runtimeArgumentKeys(arguments_), ['builtin:i32'])
+  arguments_.length = 0
+  assert.deepEqual(Type.runtimeArgumentKeys(arguments_), [])
+  arguments_.push('i64')
+  assert.deepEqual(Type.runtimeArgumentKeys(arguments_), ['builtin:i64'])
+  assert.deepEqual(Type.runtimeArgumentKeys(Object.freeze([])), [])
+  assert.deepEqual(
+    Type.runtimeArgumentKeys(Object.freeze(['bool', Lifetime.staticLifetime, 'i32'])),
+    ['builtin:bool', 'builtin:i32'],
+  )
+})
+
 const span = (sourceId: string, start: number, end: number): SourceSpan.SourceSpan =>
   SourceSpan.fromOffsets(sourceId, start, end) ?? unreachable('expected a valid source span')
 

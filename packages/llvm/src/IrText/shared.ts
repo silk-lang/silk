@@ -13,5 +13,8 @@ export const identifier = (prefix: '@' | '%', value: ByteString.ByteString): str
 }
 
 /** @internal */
-export const rawBytes = (value: ByteString.ByteString): string =>
-  value.bytes.map((byte) => String.fromCharCode(byte)).join('')
+export const rawBytes = (value: ByteString.ByteString): string => {
+  let ascii = ''
+  for (const byte of value.bytes) ascii += String.fromCharCode(byte)
+  return ascii
+}

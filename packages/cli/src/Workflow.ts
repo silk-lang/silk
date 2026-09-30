@@ -48,6 +48,7 @@ export type BuildAttempt =
       readonly artifact: string
       readonly artifactKind: Driver.Compiled['artifactKind']
       readonly libraryInterface?: NativeToolchain.LibraryInterfaceArtifacts
+      readonly testCatalog?: TestExecution.Catalog
       readonly testManifest?: TestExecution.Manifest
     }
   | { readonly _tag: 'NotBuilt'; readonly status: 1 | 2 }
@@ -60,6 +61,8 @@ export interface ProjectSelection extends ProjectOptions.ProjectOptions {
 }
 
 export interface CompileOptions {
+  /** Compute test-result reuse identities by default, independently of artifact caching. */
+  readonly testResultCache?: boolean
   readonly verifyMir?: boolean
   readonly nativeBindings?: ReadonlyArray<NativeRequirementBinding.NativeRequirementBinding>
   readonly stage?: ArtifactPlan.Stage
@@ -192,6 +195,9 @@ export const compile = Effect.fn('Workflow.compile')(function* (
       scopeName: options.scopeName,
       saveTemps: options.saveTemps ?? false,
       verifyMir: options.verifyMir ?? false,
+      ...(options.testResultCache === undefined
+        ? {}
+        : { testResultCache: options.testResultCache }),
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -251,6 +257,7 @@ export const compile = Effect.fn('Workflow.compile')(function* (
         ? {}
         : { libraryInterface: outcome.libraryInterface }),
       ...(outcome.testManifest === undefined ? {} : { testManifest: outcome.testManifest }),
+      ...(outcome.testCatalog === undefined ? {} : { testCatalog: outcome.testCatalog }),
     }
   }
   return { _tag: 'NotBuilt', status: outcomeStatus(outcome) }
@@ -715,20 +722,20 @@ const planEntry = (entry: TestExecution.Entry): TestExchange.PlanEntry => ({
 
 /** Prepares one full-catalog runner plan, selecting compact mode before optional result lookup. */
 export const prepareTestRun = Effect.fn('Workflow.prepareTestRun')(function* (
-  manifest: TestExecution.Manifest,
-  cacheResults = true,
+  catalog: TestExecution.Catalog,
+  manifest?: TestExecution.Manifest,
 ): Effect.fn.Return<PreparedTestRun, TestExchange.ExchangeError, Crypto.Crypto | Storage.Storage> {
-  const entries = manifest.entries.map(planEntry)
+  const entries = manifest?.entries.map(planEntry)
   const invocationNonce = yield* TestExchange.nonce()
-  if (!cacheResults || TestExchange.selectMode(entries) === 'Uncached') {
+  if (entries === undefined || TestExchange.selectMode(entries) === 'Uncached') {
     return {
       plan: {
         _tag: 'Uncached',
         nonce: invocationNonce,
         catalogDigest: yield* TestExchange.catalogDigest(
-          manifest.entries.map((entry) => entry.test.identity),
+          catalog.entries.map((entry) => entry.identity),
         ),
-        discovered: BigInt(entries.length),
+        discovered: BigInt(catalog.entries.length),
       },
       events: [],
     }
@@ -856,6 +863,7 @@ export const test = Effect.fn('Workflow.test')(function* (
   const [plan] = planned.success.plans
   const attempted = yield* compile({
     verifyMir: options.verifyMir ?? false,
+    testResultCache: options.cacheResults ?? true,
     entry: discoveryEntry.success,
     displayRoot: project.directory,
     root: 'silk/test_runner',
@@ -881,7 +889,11 @@ export const test = Effect.fn('Workflow.test')(function* (
     yield* Console.error('The compiler did not produce a runnable test executable')
     return 2
   }
-  if (attempted.testManifest === undefined) {
+  if (attempted.testCatalog === undefined) {
+    yield* Console.error('The compiler did not publish a test catalog')
+    return 2
+  }
+  if ((options.cacheResults ?? true) && attempted.testManifest === undefined) {
     yield* Console.error('The compiler did not publish a test execution manifest')
     return 2
   }
@@ -890,7 +902,7 @@ export const test = Effect.fn('Workflow.test')(function* (
   if (options.filter !== undefined) arguments_.push('--filter', options.filter)
   const resultStorage = TestResult.fileSystem(project.build.outputDirectory)
   const prepared = yield* Effect.result(
-    prepareTestRun(attempted.testManifest, options.cacheResults ?? true).pipe(
+    prepareTestRun(attempted.testCatalog, attempted.testManifest).pipe(
       Effect.provide(resultStorage),
     ),
   )

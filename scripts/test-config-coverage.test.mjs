@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { runInNewContext } from 'node:vm'
 
 /**
  * The workspace's test defaults only hold for packages that actually extend them, and the way this
@@ -149,10 +150,54 @@ void test('exact-head full verification remains explicit and complete', () => {
   assert.match(full, /^      - run: pnpm check$/m)
   assert.match(full, /^      - run: pnpm release:candidate$/m)
   assert.match(full, /timeout-minutes: 240/)
-  assert.match(
-    ciJobBody('platform-supplies'),
-    /^    if: github\.event_name != 'workflow_dispatch' \|\| !inputs\.full_verification$/m,
-  )
+  const scenarios = [
+    ...['push', 'pull_request', 'schedule'].map((event) => ({
+      event,
+      full: false,
+      workload: '',
+      enabled: ['platform-supplies'],
+    })),
+    {
+      event: 'workflow_dispatch',
+      full: false,
+      workload: '',
+      enabled: ['platform-supplies'],
+    },
+    {
+      event: 'workflow_dispatch',
+      full: false,
+      workload: 'a'.repeat(40),
+      enabled: ['selfhost-bootstrap-benchmark'],
+    },
+    {
+      event: 'workflow_dispatch',
+      full: true,
+      workload: '',
+      enabled: ['full-verification'],
+    },
+    {
+      event: 'workflow_dispatch',
+      full: true,
+      workload: 'a'.repeat(40),
+      enabled: ['full-verification'],
+    },
+  ]
+  for (const scenario of scenarios) {
+    const enabled = [
+      'full-verification',
+      'selfhost-bootstrap-benchmark',
+      'platform-supplies',
+    ].filter((job) => {
+      const condition = /^    if: ([^\n]+)$/m.exec(ciJobBody(job))?.[1]
+      assert.ok(condition, `${job} must declare its event gate`)
+      // These repository-owned GitHub gates use the shared JavaScript boolean/string operators.
+      return runInNewContext(condition, {
+        github: { event_name: scenario.event },
+        inputs: { full_verification: scenario.full, selfhost_sha: scenario.workload },
+      })
+    })
+    assert.deepEqual(enabled, scenario.enabled, JSON.stringify(scenario))
+  }
 })
 
 void test('TLS client smoke coverage uses only the bounded focused witnesses', () => {

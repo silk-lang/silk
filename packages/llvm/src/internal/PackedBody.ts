@@ -46,9 +46,6 @@ const sameKeys = (left: ReadonlyArray<string>, right: ReadonlyArray<string>): bo
   return true
 }
 
-const isByte = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 255
-
 class Writer {
   bytes = new Uint8Array(1024)
   length = 0
@@ -144,24 +141,15 @@ class Writer {
       keys[0] === '_tag' &&
       keys[1] === 'bytes' &&
       fields['_tag'] === 'ByteString' &&
-      Array.isArray(fields['bytes'])
+      fields['bytes'] instanceof Uint8Array
     ) {
-      const bytes: ReadonlyArray<unknown> = fields['bytes']
-      const start = this.length
+      const bytes = fields['bytes']
       this.byte(Bytes)
       this.natural(bytes.length)
       this.reserve(bytes.length)
-      let raw = true
-      for (const byte of bytes) {
-        if (!isByte(byte)) {
-          raw = false
-          break
-        }
-        this.bytes[this.length++] = byte
-      }
-      if (raw) return
-      // Not a byte string after all: rewind and pack it as an ordinary record.
-      this.length = start
+      this.bytes.set(bytes, this.length)
+      this.length += bytes.length
+      return
     }
     const discriminator = fields['_tag']
     let candidates = this.shapes.get(discriminator)
@@ -248,8 +236,8 @@ class Reader {
       }
       case Bytes: {
         const length = this.natural()
-        const bytes: Array<number> = []
-        for (let index = 0; index < length; index += 1) bytes.push(this.bytes[this.offset++] ?? 0)
+        const bytes = this.bytes.slice(this.offset, this.offset + length)
+        this.offset += length
         return { _tag: 'ByteString', bytes }
       }
       case NewShape: {

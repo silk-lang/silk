@@ -468,7 +468,7 @@ it.effect(
       assert.lengthOf(WorkspaceInventory.candidates(firstInventory, 'enabledChoice'), 0)
       assert.lengthOf(WorkspaceInventory.candidates(nextInventory, 'enabledChoice'), 1)
       assert.lengthOf(WorkspaceInventory.candidates(nextInventory, 'disabledChoice'), 0)
-      assert.lengthOf(WorkspaceInventory.candidates(nextInventory, 'OsMonotonicClock'), 0)
+      assert.lengthOf(WorkspaceInventory.candidates(nextInventory, 'OsMonotonicClock'), 1)
       assert.notStrictEqual(firstInventory.identity, nextInventory.identity)
       const repeated = yield* Workspace.analyzeProject([right], next)
       const repeatedSession = repeated.get(right.uri)

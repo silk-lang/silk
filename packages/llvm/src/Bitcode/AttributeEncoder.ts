@@ -5,8 +5,11 @@ import type * as BuilderState from '../internal/BuilderState.js'
 import * as DeclarationSchema from '../internal/DeclarationBitcodeSchema.js'
 
 /** @internal */
-const attributeName = (bytes: ByteString.ByteString): string =>
-  bytes.bytes.map((byte) => String.fromCharCode(byte)).join('')
+const attributeName = (bytes: ByteString.ByteString): string => {
+  let ascii = ''
+  for (const byte of bytes.bytes) ascii += String.fromCharCode(byte)
+  return ascii
+}
 
 /** @internal */
 const stringAttribute = (
