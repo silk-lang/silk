@@ -69,8 +69,11 @@ to the held revision, with no host file snapshot or mutable filesystem provider 
 `Semantic.revise` selects another immutable revision. The next demand validates retained source
 bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
 affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. A body can also retain its checked payload after a same-file or imported callee
-body edit when its own declaration and the semantic results it consumed still match. That
+facts reusable. The source index retains completed presence or absence queries when their exact
+content observation agrees, including parsed syntax, authored HIR, and name indexes for unchanged
+files. Changed content releases its parsed unit; a same-path edit never reuses different bytes.
+Previously issued authored cursors expire on every revision selection. A body can also retain its
+checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
 validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
 queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
