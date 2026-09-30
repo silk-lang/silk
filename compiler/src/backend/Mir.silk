@@ -13,6 +13,8 @@ import hir.Hir {Access, HirId, InfixOperator, Module, Node as HirNode, PrefixOpe
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Type {Argument, Type}
+import semantic.Intrinsic
+import semantic.Intrinsic {Member as IntrinsicMember}
 import semantic.TypedBody {
   Expression as BodyExpression,
   NodeId as BodyNodeId,
@@ -70,6 +72,7 @@ pub union Rvalue {
   AddressOf {pub access: Access, pub place: Place},
   Unary {pub operation: PrefixOperator, pub value: Operand},
   Binary {pub operation: InfixOperator, pub left: Operand, pub right: Operand},
+  Bitcast {pub value: Operand, pub ty: Shared<Type>},
 }
 
 pub union Statement {
@@ -156,6 +159,7 @@ union View {
     ty: Shared<Type>,
     origin: Origin,
   },
+  Intrinsic {member: IntrinsicMember, node: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Binding {index: usize, initializer: BodyNodeId, origin: Origin},
   Assignment {index: usize, value: BodyNodeId, origin: Origin},
   Return {value: Option<BodyNodeId>, origin: Origin},
@@ -259,6 +263,13 @@ fn childAt(body: &Shared<TypedBody>, id: BodyNodeId, index: usize) -> Option<Bod
           }
           return Option.none<BodyNodeId>()
         }
+        BodyNodeKind.Expression {form: BodyExpression.IntrinsicCall {arguments, ..}, ..} => {
+          let children = Vector.asSlice<BodyNodeId>(&arguments)
+          if index < children.length {
+            return Option.some<BodyNodeId>(children[index])
+          }
+          return Option.none<BodyNodeId>()
+        }
         _ => Option.none<BodyNodeId>()
       }
     },
@@ -347,6 +358,12 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
               }
               Option<Shared<DeclarationId>>.None => View.Unsupported {origin: origin}
             }
+          }
+          BodyExpression.IntrinsicCall {member, ..} => View.Intrinsic {
+            member: member,
+            node: id,
+            ty: Shared.clone<Type>(&ty),
+            origin: origin,
           }
           BodyExpression.ForeignCall {declaration, arguments} => {
             let identities = TypedBody.foreignHandles(bodyValue)
@@ -610,6 +627,12 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       )
       return Operand.Copy {place: place(output)}
     }
+    View.Intrinsic {member, node: callNode, ty, origin} => {
+      let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, member, &ty, origin)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), move operation, origin)
+      return Operand.Copy {place: place(output)}
+    }
     View.Call {callee, foreign, count, node: callNode, ty, origin} => {
       let mut values = Vector.make<Operand>()
       let mut at = usize.ZERO
@@ -657,6 +680,62 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       GapCode.ExpectedExpression,
     )
   }
+}
+
+// Capture borrowed scalar operands before a later argument can change their referents.
+effect fn intrinsicOperand(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  child: BodyNodeId,
+  member: IntrinsicMember,
+  origin: Origin,
+) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let input = run expression(&mut builder.*, body, hir, child)
+  if !Intrinsic.borrowsOperands(member) { return move input }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut borrowed = match move input {
+    Operand.Copy {place: selected} => move selected
+    Operand.Move {place: selected} => move selected
+    _ => run unsupported(&owner, origin, GapCode.ExpectedPlace)
+  }
+  run Vector.append<Projection>(&mut borrowed.projections, Projection.Deref)
+  let ty = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"i32")})
+  let output = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move borrowed}}, origin)
+  return Operand.Copy {place: place(output)}
+}
+
+effect fn intrinsicRvalue(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  member: IntrinsicMember,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let first = match move childAt(body, callNode, usize.ZERO) {
+    Option<BodyNodeId>.Some {value} => value
+    Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
+  }
+  let left = run intrinsicOperand(&mut builder.*, body, hir, first, member, origin)
+  if let Option<InfixOperator>.Some {value: binary} = move Intrinsic.binary(member) {
+    let second = match move childAt(body, callNode, usize.ONE) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
+    }
+    let right = run intrinsicOperand(&mut builder.*, body, hir, second, member, origin)
+    return Rvalue.Binary {operation: binary, left: move left, right: move right}
+  }
+  if let Option<PrefixOperator>.Some {value: unary} = move Intrinsic.unary(member) {
+    return Rvalue.Unary {operation: unary, value: move left}
+  }
+  if Intrinsic.isBitcast(member) {
+    return Rvalue.Bitcast {value: move left, ty: Shared.clone<Type>(ty)}
+  }
+  return run unsupported(&owner, origin, GapCode.IntrinsicMember)
 }
 
 effect fn shortCircuit(
@@ -762,6 +841,10 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       drop ignored
     }
     View.Infix {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.Intrinsic {..} => {
       let ignored = run expression(&mut builder.*, body, hir, id)
       drop ignored
     }

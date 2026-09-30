@@ -351,3 +351,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · Compiler profiling could not use Codebase Memory because an unverified generation held the coordination lock · Inspect the worker log and use targeted source discovery while the existing generation remains active · compiler performance
 - 2026-09-29 · The Homebrew node@24 executable reported Node 26.5.0 during profiling · Record the actual runtime version and use the same executable for before/after comparisons; CI still validates on Node 24 · compiler performance
 - 2026-09-29 · Vitest 4 accepts --execArgv but rejects --setupFiles, and --logHeapUsage reports uncollected allocations · Supply temporary setupFiles through a merged config and expose GC in worker execArgv for retained-heap diagnostics · compiler performance
+
+- 2026-09-30 · Adding a shared acceptance corpus case directly on selfhost failed the bootstrap provenance gate before compilation · Publish corpus fixtures on main first, then synchronize the landed main history into selfhost · B10 scalar primitives
