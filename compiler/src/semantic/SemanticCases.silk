@@ -5,6 +5,7 @@ import hir.Hir {Access, CallableMode, HirId, InfixOperator, Node, OwnerKind, Pre
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Layout as BackendLayout, TypeLayout}
 import backend.LlvmText
+import backend.CAbi
 import silk.slice {Slice}
 import backend.Gap {Code as GapCode, Gap as BackendGap}
 import backend.Mir {
@@ -6134,7 +6135,7 @@ effect fn contractClaims(part: usize) -> ()
           return rejectedTypeApplication(answer, RejectionCode.Unsupported)
         },
       ),
-      "scalar bodies reject unsafe calls and effect bodies despite resolved contracts",
+      "calls require lexical unsafe acknowledgement and effect bodies remain unsupported",
     )
   }
   if part == 1 {
@@ -15679,6 +15680,193 @@ pub fn main() -> i32 { return answer() }
   return ()
 }
 
+test effect fn foreignCallsKeepCSignatureAndSeparateMirEdges() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-c-signature.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut store = run staticSemantic(&id, """unsafe extern "C" fn narrow(value: i8) -> i8
+unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+unsafe extern "C" fn fabs(value: f64) -> f64
+unsafe extern "C" fn fabsf(value: f32) -> f32
+pub fn main() -> i32 {
+  let value = unsafe narrow(-7)
+  let memory = unsafe malloc(8)
+  unsafe free(memory)
+  if unsafe fabs(-42.0) != 42.0 { return 1 }
+  if unsafe fabsf(-7.0) != 7.0 { return 2 }
+  if 7.0 != unsafe fabsf(-7.0) { return 3 }
+  return 42
+}
+""", MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let built = run Semantic.buildMain(&mut store, &mut request, &id) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut classified = false
+  match move built {
+    BackendBuild.Module {text, ..} => {
+      let ir = Bytes.asSlice(&text)
+      classified = containsIr(ir, b"declare signext i8 @\"narrow\"(i8 signext ") && containsIr(ir, b"call signext i8 @\"narrow\"(i8 signext -7)") && containsIr(ir, b"declare ptr @\"malloc\"(i64 ") && containsIr(ir, b"declare void @\"free\"(ptr ") && containsIr(ir, b"declare double @\"fabs\"(double ") && containsIr(ir, b"declare float @\"fabsf\"(float ") && containsIr(ir, b"call float @\"fabsf\"(float 0xC01C000000000000") && containsIr(ir, b"call double @\"fabs\"(double 0xC045000000000000") && containsIr(ir, b" = fcmp une float ") && containsIr(ir, b" = fcmp une double ")
+    }
+    _ => {}
+  }
+  run Testing.expect(classified, "C narrow extensions, pointer and contextual floating lanes agree at declaration and call")
+  let mirAnswer = run Semantic.demandMir(&mut store, &mut request, &id, b"main") |> Effect.provideMut<Allocator>(&mut allocator)
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&mirAnswer, fn(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+    return match & answer.* {
+      Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+        Outcome.Success {value: Value.Mir {index}} => Option.some<usize>(index)
+        _ => Option.none<usize>()
+      }
+      _ => Option.none<usize>()
+    }
+  })
+  let mut separate = false
+  if let Option<usize>.Some {value} = move index {
+    if let Option<&MirFunction>.Some {value: mir} = move Semantic.mirAt(&store, value) {
+      separate = Vector.length<InstanceKey>(&mir.references) == usize.ZERO && Vector.length<Shared<DeclarationId>>(&mir.externs) > usize.ZERO
+    }
+  }
+  run Testing.expect(separate, "foreign declarations never enter the runtime body worklist")
+  return ()
+}
+
+test effect fn foreignCallsRequireUnsafeAcknowledgement() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-unsafe.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """unsafe extern "C" fn abs(value: i32) -> i32
+pub fn main() -> i32 { return abs(-42) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let body = run Semantic.demandBody(&mut store, &mut request, &id, b"main") |> Effect.provideMut<Allocator>(&mut allocator)
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&body, rejection)
+  let mut unsafeRejected = false
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    unsafeRejected = Shared.with<Rejection, bool>(&value, fn(value: &Rejection) -> bool {
+      return value.code == RejectionCode.UnsafeAcknowledgement &&
+        value.span.start == offsetOf(text, "abs(-42)", usize.ZERO) &&
+        value.span.end == offsetOf(text, " }", usize.ZERO)
+    })
+  }
+  run Testing.expect(unsafeRejected, "unsafe C invocation has an exact safety diagnostic span")
+  return ()
+}
+
+test effect fn foreignUnsafePrefixesSelectOnlyTheirInvocation() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-unsafe-regions.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """unsafe extern "C" fn outer(value: i32) -> i32
+unsafe extern "C" fn inner() -> i32
+fn safe(value: i32) -> i32 { return value }
+fn nestedMissing() -> i32 { return unsafe outer(inner()) }
+fn invalidPrefix() -> i32 { return unsafe 1 }
+fn unnecessaryPrefix() -> i32 { return unsafe safe(42) }
+unsafe fn unsafeFunction() -> i32 { return inner() }
+fn explicitNested() -> i32 { return unsafe outer(unsafe inner()) }
+fn blockNested() -> i32 {
+  unsafe { return outer(inner()) }
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let nested = run Semantic.demandBody(&mut store, &mut request, &id, b"nestedMissing") |> Effect.provideMut<Allocator>(&mut allocator)
+  let invalid = run Semantic.demandBody(&mut store, &mut request, &id, b"invalidPrefix") |> Effect.provideMut<Allocator>(&mut allocator)
+  let unnecessary = run Semantic.demandBody(&mut store, &mut request, &id, b"unnecessaryPrefix") |> Effect.provideMut<Allocator>(&mut allocator)
+  let unmarked = run Semantic.demandBody(&mut store, &mut request, &id, b"unsafeFunction") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    rejectsFrom(&nested, RejectionCode.UnsafeAcknowledgement, offsetOf(text, "inner())", usize.ZERO)) &&
+    rejectsFrom(&invalid, RejectionCode.UnsafeInvocation, offsetOf(text, "unsafe 1", usize.ZERO)) &&
+    rejectsFrom(&unnecessary, RejectionCode.UnsafeInvocation, offsetOf(text, "safe(42)", usize.ZERO)) &&
+    rejectsFrom(&unmarked, RejectionCode.UnsafeAcknowledgement, offsetOf(text, "inner() }", usize.ZERO)),
+    "prefix authority selects one unsafe call and function modifiers grant no lexical permission",
+  )
+  let explicit = run Semantic.demandBody(&mut store, &mut request, &id, b"explicitNested") |> Effect.provideMut<Allocator>(&mut allocator)
+  let blocked = run Semantic.demandBody(&mut store, &mut request, &id, b"blockNested") |> Effect.provideMut<Allocator>(&mut allocator)
+  let markedBody = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&explicit, checkedBody)
+  let blockBody = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&blocked, checkedBody)
+  let mut accepted = false
+  if let Option<Shared<TypedBody>>.Some {value: marked} = move markedBody {
+    if let Option<Shared<TypedBody>>.Some {value: region} = move blockBody {
+      accepted = Shared.with<TypedBody, bool>(&marked, bodyIsFullyChecked) && Shared.with<TypedBody, bool>(&region, bodyIsFullyChecked)
+    }
+  }
+  run Testing.expect(accepted, "explicit nested prefixes and a lexical unsafe block acknowledge both calls")
+  return ()
+}
+
+test effect fn foreignBoolSignatureRejectsDespiteItsRuntimeLayout() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-bool.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """unsafe extern "C" fn probe(value: bool) -> bool
+pub fn main() -> i32 {
+  let value = unsafe probe(true)
+  return 42
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let body = run Semantic.demandBody(&mut store, &mut request, &id, b"main") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsFrom(&body, RejectionCode.ForeignType, offsetOf(text, "probe(true)", usize.ZERO)), "closed foreign admission rejects bool before C ABI emission")
+  return ()
+}
+
+test effect fn foreignCFunctionPointersReportTheirNamedGap() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-callback.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """unsafe extern "C" fn consume(callback: extern "C" fn(i32) -> i32) -> i32
+unsafe extern "C" fn create() -> extern "C" fn(i32) -> i32
+pub fn main() -> i32 { return unsafe consume(unsafe create()) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let built = run Semantic.buildMain(&mut store, &mut request, &id) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut deferred = false
+  match move built {
+    BackendBuild.Unsupported {gaps} => {
+      let entries = Vector.asSlice<Shared<BackendGap>>(&gaps)
+      if entries.length == usize.ONE {
+        deferred = Shared.with<BackendGap, bool>(&entries[usize.ZERO], fn(value: &BackendGap) -> bool {
+          return value.code == GapCode.CAbiCallback && value.span.start == usize.ZERO && value.span.end == offsetOf(text, "unsafe extern \"C\" fn create", usize.ZERO) - usize.ONE
+        })
+      }
+    }
+    _ => {}
+  }
+  run Testing.expect(deferred, "a reached C function pointer parameter has an anchored callback gap")
+  return ()
+}
+
+test effect fn foreignVariadicsReportTheirNamedGap() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("foreign-variadic.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """unsafe extern "C" fn variadic(value: i32, ...) -> i32
+pub fn main() -> i32 { return unsafe variadic(1, 2) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let built = run Semantic.buildMain(&mut store, &mut request, &id) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut deferred = false
+  match move built {
+    BackendBuild.Unsupported {gaps} => {
+      let entries = Vector.asSlice<Shared<BackendGap>>(&gaps)
+      if entries.length == usize.ONE {
+        deferred = Shared.with<BackendGap, bool>(&entries[usize.ZERO], fn(value: &BackendGap) -> bool {
+          return value.code == GapCode.CAbiVariadic &&
+            value.span.start == offsetOf(text, "variadic(1, 2)", usize.ZERO) &&
+            value.span.end == offsetOf(text, " }", usize.ZERO)
+        })
+      }
+    }
+    _ => {}
+  }
+  run Testing.expect(deferred, "variadic C ABI has exactly one reached gap covering the invocation")
+  return ()
+}
 fn mirProjectionIsDeref(projection: &MirProjection) -> bool {
   return match &projection.* {
     MirProjection.Deref => true
@@ -16102,8 +16290,9 @@ fn probe(aligned: *const i32, unaligned: *const align(1) i32) -> i32 {
         }
         at = at + usize.ONE
       }
+      let foreign = Vector.make<CAbi.Signature>()
       let emitted = run Effect.result(
-        LlvmText.emit(function, &target, Vector.asSlice<TypeLayout>(&layouts)),
+        LlvmText.emit(function, &target, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign)),
       )
         |> Effect.provideMut<Allocator>(&mut allocator)
       match move emitted {
