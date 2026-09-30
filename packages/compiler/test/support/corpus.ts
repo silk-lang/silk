@@ -2696,11 +2696,13 @@ pub fn main() -> i32 {
   {
     name: 'operator-interface-contract',
     source: `struct Vector { value: i32 }
-fn scale(left: Vector, right: i32) -> Vector {
-  return Vector { value: left.value * right }
-}
-fn dot(left: Vector, right: Vector) -> i32 {
-  return left.value * right.value
+impl Vector {
+  fn scale(left: Self, right: i32) -> Self {
+    return Vector { value: left.value * right }
+  }
+  fn dot(left: Self, right: Self) -> i32 {
+    return left.value * right.value
+  }
 }
 interface Multiply<Right, Output> {
   operator * fn multiply(left: Self, right: Right) -> Output
