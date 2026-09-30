@@ -253,7 +253,11 @@ const internSetIn = (
       const leftDescription = state.attributes.descriptions[left]
       const rightDescription = state.attributes.descriptions[right]
       if (leftDescription === undefined || rightDescription === undefined) return left - right
-      return descriptionKey(leftDescription).localeCompare(descriptionKey(rightDescription))
+      // Canonical keys preserve arbitrary bytes; locale collation can equate distinct names.
+      const leftKey = descriptionKey(leftDescription)
+      const rightKey = descriptionKey(rightDescription)
+      if (leftKey === rightKey) return 0
+      return leftKey < rightKey ? -1 : 1
     })
     const names = new Map<string, number>()
     for (const index of ordered) {

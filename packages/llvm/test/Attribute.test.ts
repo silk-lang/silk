@@ -14,7 +14,13 @@ it.effect('interns every attribute storage shape and canonicalizes set ordering'
     const byValue = yield* Attribute.typeAttribute(builder, 'byval', i8)
     const targetCpu = yield* Attribute.string(builder, 'target-cpu', 'generic')
     const initializes = yield* Attribute.integerList(builder, 'initializes', [0n, 8n])
+    // Locale collation ignores these distinct bytes; byte-oriented names must still have one
+    // canonical set identity regardless of insertion order.
+    const nulName = yield* Attribute.string(builder, Uint8Array.of(0), 'value')
+    const controlName = yield* Attribute.string(builder, Uint8Array.of(1), 'value')
     const first = yield* Attribute.set(builder, [
+      nulName,
+      controlName,
       targetCpu,
       noAlias,
       byValue,
@@ -22,6 +28,8 @@ it.effect('interns every attribute storage shape and canonicalizes set ordering'
       initializes,
     ])
     const second = yield* Attribute.set(builder, [
+      controlName,
+      nulName,
       initializes,
       dereferenceable,
       byValue,
@@ -30,7 +38,7 @@ it.effect('interns every attribute storage shape and canonicalizes set ordering'
     ])
 
     assert.strictEqual(first, second)
-    assert.lengthOf(yield* Attribute.entries(builder, first), 5)
+    assert.lengthOf(yield* Attribute.entries(builder, first), 7)
   }),
 )
 

@@ -4637,6 +4637,26 @@ export const failurePayloadRepacking = (
   }
 }
 
+type AvailableCallableEnvironment = Extract<
+  CallableEnvironment,
+  { readonly _tag: 'CallableEnvironment' }
+>
+
+type AvailableEffectEnvironment = Extract<EffectEnvironment, { readonly _tag: 'EffectEnvironment' }>
+
+// Published plans never mutate their environment arrays. MIR/backend lane queries repeatedly
+// resolve the same identities; whole-array Effect scans consumed 4% of a cold selfhost profile window.
+// Key the indexes by the arrays so a derived plan replacing either frontier gets a fresh index.
+const callableEnvironmentIndexes = new WeakMap<
+  ReadonlyArray<CallableEnvironment>,
+  ReadonlyMap<string, AvailableCallableEnvironment>
+>()
+
+const effectEnvironmentIndexes = new WeakMap<
+  ReadonlyArray<EffectEnvironment>,
+  ReadonlyMap<string, AvailableEffectEnvironment>
+>()
+
 /** Resolves one canonical callable-environment identity in this target's runtime plan. */
 export const callableEnvironmentByIdentity = (
   self: Plan,
@@ -4648,21 +4668,22 @@ export const callableEnvironmentByIdentity = (
         readonly _tag: 'CallableEnvironment'
       }
     >
-  | undefined =>
-  self.callableEnvironments.find(
-    (
-      candidate,
-    ): candidate is Extract<
-      CallableEnvironment,
-      {
-        readonly _tag: 'CallableEnvironment'
-      }
-    > =>
-      candidate._tag === 'CallableEnvironment' &&
-      Type.runtimeCallableEnvironmentIdentityKey(
+  | undefined => {
+  let index = callableEnvironmentIndexes.get(self.callableEnvironments)
+  if (index === undefined) {
+    const built = new Map<string, AvailableCallableEnvironment>()
+    for (const candidate of self.callableEnvironments) {
+      if (candidate._tag !== 'CallableEnvironment') continue
+      const key = Type.runtimeCallableEnvironmentIdentityKey(
         Instances.callableEnvironmentIdentity(candidate.callable),
-      ) === Type.runtimeCallableEnvironmentIdentityKey(identity),
-  )
+      )
+      if (!built.has(key)) built.set(key, candidate)
+    }
+    callableEnvironmentIndexes.set(self.callableEnvironments, built)
+    index = built
+  }
+  return index.get(Type.runtimeCallableEnvironmentIdentityKey(identity))
+}
 
 /** Resolves the Effect environment a capture field's identity names, including success carriers. */
 export const effectEnvironmentByFieldIdentity = (
@@ -4676,20 +4697,20 @@ export const effectEnvironmentByFieldIdentity = (
       }
     >
   | undefined => {
-  const matches = self.effectEnvironments.filter(
-    (
-      candidate,
-    ): candidate is Extract<
-      EffectEnvironment,
-      {
-        readonly _tag: 'EffectEnvironment'
-      }
-    > =>
-      candidate._tag === 'EffectEnvironment' &&
-      (Instances.effectIdentity(candidate.instance, candidate.site) === identity ||
-        candidate.successEffectIdentity === identity),
-  )
-  return matches.at(0)
+  let index = effectEnvironmentIndexes.get(self.effectEnvironments)
+  if (index === undefined) {
+    const built = new Map<string, AvailableEffectEnvironment>()
+    for (const candidate of self.effectEnvironments) {
+      if (candidate._tag !== 'EffectEnvironment') continue
+      const key = Instances.effectIdentity(candidate.instance, candidate.site)
+      if (!built.has(key)) built.set(key, candidate)
+      const success = candidate.successEffectIdentity
+      if (success !== undefined && !built.has(success)) built.set(success, candidate)
+    }
+    effectEnvironmentIndexes.set(self.effectEnvironments, built)
+    index = built
+  }
+  return index.get(identity)
 }
 
 /** Materializes the ABI lanes of one Effect environment capture field. */

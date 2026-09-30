@@ -1414,6 +1414,52 @@ const originsBySpan = (self: LifetimeFlow): ReadonlyMap<string, ReadonlyArray<st
   return index
 }
 
+interface LoanLiveness {
+  readonly created: BodyControlFlow.Boundary
+  readonly required: BodyControlFlow.Reachable
+  readonly observedHolderUse: boolean
+  readonly retainedEnds: Map<number, BodyControlFlow.Reachable>
+}
+
+// Ownership probes many accesses against the same loan. Reverse its fixed required uses once,
+// rather than retaining one forward traversal for every access and creation barrier pair.
+// Cleanup and presentation return new flows, so their changed uses and spans get fresh answers.
+const loanLivenessCache = new WeakMap<LifetimeFlow, Map<string, LoanLiveness>>()
+
+const loanLiveness = (
+  self: LifetimeFlow,
+  solution: Extract<Lifetime.Solution, { readonly _tag: 'Solved' }>,
+  start: SourceSpan.SourceSpan,
+): LoanLiveness | undefined => {
+  const spanKey = originSpanKey(start)
+  let byOrigin = loanLivenessCache.get(self)
+  const found = byOrigin?.get(spanKey)
+  if (found !== undefined) return found
+  const origins = originsBySpan(self).get(spanKey)
+  if (origins === undefined) return undefined
+  const created = BodyControlFlow.at(self.controlFlow, start)
+  if (created === undefined) return undefined
+  const targets: Array<number> = []
+  let observedHolderUse = false
+  for (const key of origins)
+    for (const use of requiredUses(self, solution, key)) {
+      if (use.start !== undefined && use.start >= start.end) observedHolderUse = true
+      if (!use.retired && use.after !== undefined) targets.push(use.after)
+    }
+  const answer: LoanLiveness = {
+    created,
+    required: BodyControlFlow.predecessors(self.controlFlow, targets, created.before),
+    observedHolderUse,
+    retainedEnds: new Map(),
+  }
+  if (byOrigin === undefined) {
+    byOrigin = new Map()
+    loanLivenessCache.set(self, byOrigin)
+  }
+  byOrigin.set(spanKey, answer)
+  return answer
+}
+
 /** Tests concrete loan liveness at an access using the solved holder uses and source CFG. */
 export const liveAt = (
   self: LifetimeFlow,
@@ -1423,32 +1469,25 @@ export const liveAt = (
   write = false,
 ): boolean | undefined => {
   if (self.solution._tag !== 'Solved') return undefined
-  const origins = originsBySpan(self).get(originSpanKey(start))
-  if (origins === undefined) return undefined
-  const created = BodyControlFlow.at(self.controlFlow, start)
   const accessed = BodyControlFlow.at(self.controlFlow, access)
-  if (created === undefined || accessed === undefined) return undefined
+  if (accessed === undefined) return undefined
+  const liveness = loanLiveness(self, self.solution, start)
+  if (liveness === undefined) return undefined
+  const { created } = liveness
   const at = write
     ? (BodyControlFlow.writeAt(self.controlFlow, access) ?? accessed.after)
     : accessed.before
   if (!BodyControlFlow.reaches(self.controlFlow, created.after, at, created.before)) return false
-  let observedHolderUse = false
-  const reachable = BodyControlFlow.reachable(self.controlFlow, at, created.before)
-  for (const key of origins)
-    for (const use of requiredUses(self, self.solution, key)) {
-      if (use.start !== undefined && use.start >= start.end) observedHolderUse = true
-      if (use.retired) continue
-      if (use.after !== undefined && BodyControlFlow.includes(reachable, use.after)) return true
-    }
+  if (BodyControlFlow.includes(liveness.required, at)) return true
+  if (liveness.observedHolderUse) return false
   const retainedEnd = BodyControlFlow.at(self.controlFlow, end)
-  if (
-    !observedHolderUse &&
-    retainedEnd !== undefined &&
-    BodyControlFlow.includes(reachable, retainedEnd.after)
-  )
-    return true
-
-  return false
+  if (retainedEnd === undefined) return false
+  let retained = liveness.retainedEnds.get(retainedEnd.after)
+  if (retained === undefined) {
+    retained = BodyControlFlow.predecessors(self.controlFlow, [retainedEnd.after], created.before)
+    liveness.retainedEnds.set(retainedEnd.after, retained)
+  }
+  return BodyControlFlow.includes(retained, at)
 }
 
 /**

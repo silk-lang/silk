@@ -3,6 +3,7 @@ import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as Layout from '../src/Layout.js'
+import * as Instances from '../src/Instances.js'
 import * as LayoutEncode from '../src/LayoutEncode.js'
 import * as LayoutVerify from '../src/LayoutVerify.js'
 import * as Target from '../src/Target.js'
@@ -178,6 +179,87 @@ pub fn main() -> i32 {
     assert.strictEqual(
       shape.laneCount,
       shape.tree.fields.reduce((total, field) => total + field.shape.laneCount, 0),
+    )
+    const effect =
+      plan.effectEnvironments.find((candidate) => candidate._tag === 'EffectEnvironment') ??
+      unreachable('expected available Effect environment')
+    const alternate = {
+      ...effect,
+      instance: {
+        ...effect.instance,
+        declaration: { ...effect.instance.declaration, name: 'alternate' },
+      },
+    }
+    const alias = Instances.effectIdentity(alternate.instance, alternate.site)
+    const first = { ...effect, successEffectIdentity: alias }
+    const effects: ReadonlyArray<Layout.EffectEnvironment> = [
+      {
+        _tag: 'UnavailableEffectEnvironment',
+        instance: alternate.instance,
+        site: alternate.site,
+        effect: alternate.effect,
+        reason: 'unavailable fixture',
+      },
+      first,
+      alternate,
+    ]
+    const aliased = { ...plan, effectEnvironments: effects }
+    assert.strictEqual(Layout.effectEnvironmentByFieldIdentity(aliased, alias), first)
+    assert.strictEqual(
+      Layout.effectEnvironmentByFieldIdentity(
+        aliased,
+        Instances.effectIdentity(first.instance, first.site),
+      ),
+      first,
+    )
+    assert.strictEqual(Layout.effectEnvironmentByFieldIdentity(aliased, 'missing'), undefined)
+    assert.strictEqual(
+      Layout.effectEnvironmentByFieldIdentity(
+        { ...aliased, effectEnvironments: [alternate, first] },
+        alias,
+      ),
+      alternate,
+    )
+    const callable =
+      plan.callableEnvironments.find((candidate) => candidate._tag === 'CallableEnvironment') ??
+      unreachable('expected available callable environment')
+    const second = { ...callable, size: callable.size + 1 }
+    const callables: ReadonlyArray<Layout.CallableEnvironment> = [
+      {
+        _tag: 'UnavailableCallableEnvironment',
+        callable: callable.callable,
+        view: callable.view,
+        reason: 'unavailable fixture',
+      },
+      callable,
+      second,
+    ]
+    const identity = Instances.callableEnvironmentIdentity(callable.callable)
+    const callablePlan = { ...plan, callableEnvironments: callables }
+    assert.strictEqual(Layout.callableEnvironmentByIdentity(callablePlan, identity), callable)
+    assert.strictEqual(
+      Layout.callableEnvironmentByIdentity(
+        callablePlan,
+        Type.callableEnvironmentIdentity(identity.site, identity.owner),
+      ),
+      callable,
+    )
+    assert.strictEqual(
+      Layout.callableEnvironmentByIdentity(
+        callablePlan,
+        Type.callableEnvironmentIdentity(
+          { ...identity.site, ordinal: identity.site.ordinal + 1 },
+          identity.owner,
+        ),
+      ),
+      undefined,
+    )
+    assert.strictEqual(
+      Layout.callableEnvironmentByIdentity(
+        { ...callablePlan, callableEnvironments: [second, callable] },
+        identity,
+      ),
+      second,
     )
     assert.deepEqual(yield* LayoutVerify.verify(plan), [])
   }),
