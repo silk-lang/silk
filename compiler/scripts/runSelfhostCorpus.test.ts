@@ -1,10 +1,24 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
+import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
 import { parseBuildDiagnostic, parseUnsupported, runCase, summarize } from './runSelfhostCorpus.js'
+
+it('keeps the selfhost runtime-member list equal to the canonical intrinsic catalog', () => {
+  const source = readFileSync(new URL('../src/semantic/IntrinsicCatalog.silk', import.meta.url), 'utf8')
+  const encoded = source.split('let members = b"').at(1)?.split('"').at(0)
+  assert.ok(encoded !== undefined)
+  assert.deepStrictEqual(
+    encoded.split('|').filter((name) => name.length > 0),
+    Intrinsic.inventory()
+      .filter((entry) => entry.phase !== 'StaticOnly')
+      .map((entry) => entry.operation.slice('Intrinsic.'.length))
+      .sort(),
+  )
+})
 
 const literal: CorpusProgram = {
   name: 'literal',
@@ -24,7 +38,9 @@ const withStub = (body: string, run: (path: string) => void): void => {
   }
 }
 
-const compiled = `if [ "$1" != build ] || [ "$2" != main.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
+const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || [ ! -f silk.toml ]; then exit 4; fi
+case "$6" in */) exit 5;; esac
+if [ "$1" != build ] || [ "$2" != main.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
 while [ "$1" != "-o" ]; do shift; done
 output="$2"
 printf '#!/bin/sh\\nexit 42\\n' > "$output"
