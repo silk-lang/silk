@@ -7,6 +7,8 @@ import * as Analysis from '../src/Analysis.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
+import * as Stdlib from '../src/Stdlib.js'
+import { unreachable } from './support/raise.js'
 import {
   networkAddressValueAcceptanceSource,
   nativeResolverAcceptanceSource,
@@ -30,19 +32,19 @@ const nativeResolverImplementation = readFileSync(
   'utf8',
 )
   .replace(
-    '  import silk.network_address {DomainHost, Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port}\n',
+    'import silk.network_address {DomainHost, Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port}\n',
     '',
   )
   .replace(
-    '  import silk.resolver {FamilySelection, NativeResolverOperation, NativeResultReason, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError}\n',
+    'import silk.resolver {FamilySelection, NativeResolverOperation, NativeResultReason, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError}\n',
     '',
   )
-  .replace('  import silk.allocator {Allocator, OutOfMemoryError}\n', '')
-  .replace('  import silk.option {Option}\n', '')
-  .replace('  import silk.result {Result}\n', '')
-  .replace('  import silk.slice {Slice}\n', '')
-  .replace('  import silk.u16\n', '')
-  .replace('  import silk.usize\n', '')
+  .replace('import silk.allocator {Allocator, OutOfMemoryError}\n', '')
+  .replace('import silk.option {Option}\n', '')
+  .replace('import silk.result {Result}\n', '')
+  .replace('import silk.slice {Slice}\n', '')
+  .replace('import silk.u16\n', '')
+  .replace('import silk.usize\n', '')
 const encoder = new TextEncoder()
 
 it.effect('realizes the consolidated owned address value contract on the native target', () =>
@@ -99,10 +101,7 @@ it.effect(
           target === 'wasm32-unknown-unknown'
             ? 'pub fn main() -> i32 { return 42 }'
             : nativeResolverAcceptanceSource
-        const source =
-          target === 'wasm32-unknown-unknown'
-            ? `${nativeResolverImplementation}\n${entry}`
-            : `${implementation}\n${resolverImplementation}\n${nativeResolverImplementation}\n${entry}`
+        const source = `${implementation}\n${resolverImplementation}\n${nativeResolverImplementation}\n${entry}`
         const sourceId = `network-address/native-${target}`
         const snapshot = yield* Analysis.makeRealized({
           root: sourceId,
@@ -134,19 +133,14 @@ it.effect(
           assert.deepEqual(imports, ['__errno_location', 'freeaddrinfo', 'getaddrinfo'])
         }
       }
-      const rejectedImport = yield* AnalysisFixture.retainingMain(
+      const unusedImport = yield* AnalysisFixture.retainingMain(
         'network-address/native-public-import-wasm',
         encoder.encode(`import silk.native_resolver {NativeSystemResolver}
 pub fn main() -> i32 { return 42 }`),
         'wasm32-unknown-unknown',
       )
-      assert.deepEqual(
-        Analysis.diagnostics(rejectedImport).map((diagnostic) => ({
-          code: diagnostic.code,
-          start: diagnostic.span.start,
-        })),
-        [{ code: 'SEM0014', start: 29 }],
-      )
+      assert.deepEqual(Analysis.diagnostics(unusedImport), [])
+      assert.deepEqual(Analysis.instancesOf(unusedImport).foreignCalls, [])
     }),
   45000,
 )
@@ -172,4 +166,45 @@ it.effect(
       assert.isTrue(parks.every((park) => park.guardCleanup._tag !== 'NoCleanup'))
     }),
   60000,
+)
+
+it.effect('rejects reached native resolver construction on unsupported profiles', () =>
+  Effect.gen(function* () {
+    const sourceId = 'network-address/unsupported-native-construction'
+    const source = `import silk.native_resolver {NativeSystemResolver}
+
+pub fn main() -> i32 {
+  let provider = NativeSystemResolver.make()
+  return 42
+}`
+    const module = Stdlib.find('silk/native_resolver') ?? unreachable('expected resolver source')
+    const text = new TextDecoder().decode(module.bytes)
+    const start = text.indexOf('compileError("') + 'compileError("'.length
+    const end = text.indexOf('"', start)
+    for (const profile of [
+      { target: 'wasm32-unknown-unknown' },
+      { target: 'x86_64-unknown-linux-gnu', libc: 'none' },
+    ] as const) {
+      const configuration = AnalysisFixture.configuration(sourceId, profile.target)
+      const snapshot = yield* Analysis.makeRealized({
+        root: sourceId,
+        configuration: { ...configuration, profile: { ...configuration.profile, ...profile } },
+      }).pipe(
+        Effect.provide(
+          SourceResolver.overlay([SourceFile.make(sourceId, encoder.encode(source))]).pipe(
+            Layer.provideMerge(SourceResolver.empty),
+          ),
+        ),
+      )
+      assert.deepEqual(
+        Analysis.diagnostics(snapshot).map((diagnostic) => [
+          diagnostic.code,
+          diagnostic.span.sourceId,
+          diagnostic.span.start,
+          diagnostic.span.end,
+        ]),
+        [['SEM0177', module.module, start, end]],
+      )
+    }
+  }),
 )
