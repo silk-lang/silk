@@ -381,3 +381,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
 
 - 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler
+
+- 2026-09-30 · B12’s reserved importer retry found B9 had reclaimed the shared frontend slot after the previous B12 process released its physical lock · The atomic owner/live-process gate refused the overlap; hold the retry until an explicit coordinator handoff, and distinguish a sequential reservation from each process’s lock lifetime · self-hosted compiler
