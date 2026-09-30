@@ -11,6 +11,19 @@ Field/index projections and slice Layout remain named coverage gaps for backend 
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
+Build invocation: `silkc build <source> -o <program> --stdlib <directory>`. The standard-library
+root contains `silk/`; it is an explicit CLI input. Standalone builds without standard-library
+imports may omit it. The nearest `silk.toml` selects `[package].root`, whose containing directory
+is the root for local module paths. Without a manifest, the entry file's directory is the module
+root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
+accepted.
+
+`driver.ModuleSources` reads only modules observed as absent by a reached semantic demand. It
+publishes each file's exact bytes or absence as a separate `SourceRevision` mapping, then resumes
+through `Semantic.revise`. Unused imports stay unread and unchanged per-file observations remain
+reusable. Actual missing files report `MissingModule`; filesystem permission/I/O and malformed
+manifest failures propagate rather than becoming backend coverage gaps.
+
 ## Development branches and bootstrap
 
 `selfhost` is the integration branch for the source-written compiler. Start native compiler work on
