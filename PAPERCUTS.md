@@ -367,3 +367,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
 
 - 2026-09-30 · Sequence test CI stopped on a nested callback pattern binding that reused value from its enclosing scope · Give the callback binding a distinct name and check the SemanticCases root with the bootstrap before publishing · Silk selfhost B9.
+
+- 2026-09-30 · B9 array-to-slice validation nested a Shared.with callback inside another and CLI compilation rejected SEM0199 · Lift the outer inspection into the named borrowedArraySlice function, retaining one callback level and Exact inference · self-hosted compiler
