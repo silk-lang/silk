@@ -340,3 +340,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · The selfhost test-audit code graph worker could not start while an unverified generation was active · Used scoped source reads after checking the existing index-lock papercut · self-hosted compiler
 
 - 2026-09-29 · Copying optional prefix-span evidence from borrowed call syntax produced OWN0002/OWN0003 in Linux bootstrap CI · Copy the span through a borrowed Option match and inspect retained prefix evidence by borrow · self-hosted backend
+
+- 2026-09-30 · B6 integration parsed but CI rejected its ABI fixture pattern after B5 added BackendBuild.Module.uncheckedBodies · Match the text field with an explicit remaining-field pattern; parser-only merge audits do not prove typed pattern completeness · self-hosted backend
