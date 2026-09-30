@@ -4,4 +4,6 @@ export const selfhostTrack = [
   'scalar-reference-read',
   'scalar-reference-write-through',
   'scalar-reference-argument-order',
+  'mutable-struct-loop',
+  'recursive-aggregate-return',
 ] as const satisfies ReadonlyArray<string>
