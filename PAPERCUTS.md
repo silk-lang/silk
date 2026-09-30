@@ -366,3 +366,4 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · M2.4 review-fix graph indexing hit the active-generation guard · Confirmed the worker log and used targeted source reads without disturbing the other indexer · self-hosted compiler
 - 2026-09-30 · A nested origin assertion misparsed the next Option arm after an escaped-text lookup and failed CI repeatedly · Hoist the needle, lookup, and match result into named locals; check the SemanticCases root with the current bootstrap before pushing · M2.4 static evaluation
+- 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
