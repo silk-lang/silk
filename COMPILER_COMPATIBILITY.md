@@ -46,8 +46,12 @@ validated facts; cached Pool or instance answers are outside M2.3. See
 [compiler/README.md](compiler/README.md#semantic-scope-and-later-waves) and the reconciled M2
 coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped`
 body still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This
-does not claim native CLI integration, persistent caching, MIR, LLVM, or executable output; the
-TypeScript bootstrap still builds the source programs named above.
+does not claim borrow checking or general executable support. The selfhost build CLI currently
+lowers a closed scalar/reference subset through demanded MIR and LLVM text. It emits a
+`SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
+projections and slice layouts remain named coverage gaps until backend roadmap step 4; ownership,
+lifetime, and cleanup checking remains step 14. The TypeScript bootstrap still builds the native
+compiler and remains the complete language oracle.
 
 ## Entry format
 
