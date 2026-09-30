@@ -1,0 +1,894 @@
+//! Resolve registered source parameter types into portable binding shapes.
+//!
+//! # When to use
+//! A schema header supplies a concrete `Type`; resolve it here before calling
+//! `ProfileBinding.prepare`. This actor follows canonical source member demands so forward
+//! declarations and array extents have the same answers as ordinary semantic analysis.
+
+import hir.Hir {OwnerKind}
+import semantic.Lifetime {Lifetime}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {ModuleId}
+import semantic.ModuleId {InvalidModulePath}
+import semantic.ParameterSchema {ParameterSchema}
+import semantic.ProfileBinding {EnumMember, NamedShape, RegisteredShape, Shape}
+import semantic.Query {Cycle}
+import semantic.ScalarEnum {Case as EnumCase}
+import semantic.Semantic {
+  Answer,
+  Outcome,
+  Member,
+  MemberKind,
+  RegisteredParameter,
+  Request,
+  Semantic,
+  Value,
+}
+import semantic.SourceIndex {NoRejection, RevisionMismatch}
+import semantic.StaticValue {IntegerType, Sign, Value as StaticData}
+import semantic.StaticValue
+import semantic.Target {Target}
+import semantic.Type {Argument, Type}
+import semantic.Rejection {Rejection}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.pointer {Pointer}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.u8
+import silk.u32
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+/// A source type cannot become a portable configuration value.
+pub enum Problem {
+  InvalidHeader,
+  UnsupportedType,
+  InvalidExtent,
+  RecursiveShape,
+  InvalidMember,
+}
+
+/// Concrete schemas aligned with the canonical registered declarations that supplied them.
+pub struct Registered {
+  pub schemas: Vector<RegisteredShape>
+  pub parameters: Vector<RegisteredParameter>
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn integer(name: &[u8]) -> Option<IntegerType> {
+  if same(name, b"u8") {
+    return Option.some<IntegerType>(IntegerType.U8)
+  }
+  if same(name, b"u16") {
+    return Option.some<IntegerType>(IntegerType.U16)
+  }
+  if same(name, b"u32") {
+    return Option.some<IntegerType>(IntegerType.U32)
+  }
+  if same(name, b"u64") {
+    return Option.some<IntegerType>(IntegerType.U64)
+  }
+  if same(name, b"usize") {
+    return Option.some<IntegerType>(IntegerType.Usize)
+  }
+  if same(name, b"i8") {
+    return Option.some<IntegerType>(IntegerType.I8)
+  }
+  if same(name, b"i16") {
+    return Option.some<IntegerType>(IntegerType.I16)
+  }
+  if same(name, b"i32") {
+    return Option.some<IntegerType>(IntegerType.I32)
+  }
+  if same(name, b"i64") {
+    return Option.some<IntegerType>(IntegerType.I64)
+  }
+  if same(name, b"isize") {
+    return Option.some<IntegerType>(IntegerType.Isize)
+  }
+  return Option.none<IntegerType>()
+}
+
+fn extent(bytes: &[u8]) -> Option<usize> {
+  if bytes.length == usize.ZERO {
+    return Option.none<usize>()
+  }
+  let mut value = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let digit = bytes[at]
+    if digit < 48 || digit > 57 {
+      return Option.none<usize>()
+    }
+    value = match move usize.checkedMultiply(value, 10) {
+      Option<usize>.Some {value: next} => next
+      Option<usize>.None => {
+        return Option.none<usize>()
+      }
+    }
+    value = match move usize.checkedAdd(value, u8.toUsize(digit - 48)) {
+      Option<usize>.Some {value: next} => next
+      Option<usize>.None => {
+        return Option.none<usize>()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<usize>(value)
+}
+
+fn header(answer: &Result<Answer, NoRejection>) -> Option<Shared<ParameterSchema>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.ParameterSchema {schema}} => Option.some<
+        Shared<ParameterSchema>,
+      >(Shared.clone<ParameterSchema>(&schema))
+      _ => Option.none<Shared<ParameterSchema>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<ParameterSchema>>()
+  }
+}
+
+struct NominalLengths {
+  origin: usize
+  package: usize
+  path: usize
+  name: usize
+  kind: OwnerKind
+  arguments: usize
+}
+
+struct NominalPath {
+  module: ModuleId
+  name: Bytes
+  kind: OwnerKind
+}
+
+struct MemberSet {
+  identity: Shared<DeclarationId>
+  count: usize
+  representation: IntegerType
+}
+
+struct MemberInfo {
+  nameLength: usize
+  kind: MemberKind
+  isPublic: bool
+  discriminant: Option<EnumCase>
+}
+
+fn memberSet(answer: &Result<Answer, NoRejection>) -> Option<MemberSet> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Members {identity, members, enumRepresentation}} => Option.some<
+        MemberSet,
+      >(
+        MemberSet {
+          identity: Shared.clone<DeclarationId>(&identity),
+          count: Vector.length<Member>(&members),
+          representation: enumRepresentation,
+        },
+      )
+      _ => Option.none<MemberSet>()
+    }
+    _ => Option.none<MemberSet>()
+  }
+}
+
+fn memberInfo(answer: &Result<Answer, NoRejection>, ordinal: usize) -> Option<MemberInfo> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Members {members, ..}} => {
+        let listed = Vector.asSlice<Member>(&members)
+        if ordinal >= listed.length {
+          return Option.none<MemberInfo>()
+        }
+        let length = match & listed[ordinal].name {
+          Option<Bytes>.Some {value: text} => Bytes.length(&text)
+          Option<Bytes>.None => usize.ZERO
+        }
+        return Option.some<MemberInfo>(
+          MemberInfo {
+            nameLength: length,
+            kind: listed[ordinal].kind,
+            isPublic: listed[ordinal].isPublic,
+            discriminant: match & listed[ordinal].discriminant {
+              Option<EnumCase>.Some {value: selected} => Option.some<EnumCase>(
+                EnumCase {sign: selected.sign, magnitude: selected.magnitude},
+              )
+              Option<EnumCase>.None => Option.none<EnumCase>()
+            },
+          },
+        )
+      }
+      _ => Option.none<MemberInfo>()
+    }
+    _ => Option.none<MemberInfo>()
+  }
+}
+
+fn copyMemberName(answer: &Result<Answer, NoRejection>, ordinal: usize, destination: &mut [u8]) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Members {members, ..}} => {
+        let listed = Vector.asSlice<Member>(&members)
+        if ordinal >= listed.length {
+          return false
+        }
+        return match & listed[ordinal].name {
+          Option<Bytes>.Some {value: text} => copySlice(Bytes.asSlice(&text), move destination)
+          Option<Bytes>.None => false
+        }
+      }
+      _ => false
+    }
+    _ => false
+  }
+}
+
+fn memberType(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let listed = Vector.asSlice<Shared<Type>>(&types)
+        if listed.length != usize.ONE {
+          return Option.none<Shared<Type>>()
+        }
+        return Option.some<Shared<Type>>(Shared.clone<Type>(&listed[usize.ZERO]))
+      }
+      _ => Option.none<Shared<Type>>()
+    }
+    _ => Option.none<Shared<Type>>()
+  }
+}
+
+fn memberTypeCount(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => Option.some<usize>(
+        Vector.length<Shared<Type>>(&types),
+      )
+      _ => Option.none<usize>()
+    }
+    _ => Option.none<usize>()
+  }
+}
+
+fn sameDeclaration(left: &DeclarationId, right: &Shared<DeclarationId>) -> bool {
+  return Shared.with<DeclarationId, bool>(
+    right,
+    fn(value: &DeclarationId) -> bool {
+      return DeclarationId.equals(left, value)
+    },
+  )
+}
+
+fn nominalMatches(value: &Type, identity: &Shared<DeclarationId>) -> bool {
+  return match & value.* {
+    Type.Nominal {declaration, ..} => sameDeclaration(&declaration, identity)
+    _ => false
+  }
+}
+
+fn alreadySeen(seen: &[Shared<DeclarationId>], identity: &Shared<DeclarationId>) -> bool {
+  let mut at = usize.ZERO
+  while at < seen.length {
+    // `Shared.with` is exclusive even for inspection. A recursive shape can reach the
+    // same allocation through a cloned handle, so detect that alias before nested reads.
+    let leftAddress = Shared.with<DeclarationId, usize>(
+      &seen[at],
+      fn(value: &DeclarationId) -> usize {
+        return Pointer.address<DeclarationId>(Pointer.fromRef<DeclarationId>(value))
+      },
+    )
+    let rightAddress = Shared.with<DeclarationId, usize>(
+      identity,
+      fn(value: &DeclarationId) -> usize {
+        return Pointer.address<DeclarationId>(Pointer.fromRef<DeclarationId>(value))
+      },
+    )
+    if leftAddress == rightAddress {
+      return true
+    }
+    if Shared.with<DeclarationId, bool>(
+      &seen[at],
+      fn(value: &DeclarationId) -> bool {
+        return sameDeclaration(value, identity)
+      },
+    ) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn nominalPath(ty: &Shared<Type>) -> Option<NominalPath>
+! InvalidModulePath | OutOfMemoryError
+? &mut Allocator {
+  let lengths = match move Shared.with<Type, Option<NominalLengths>>(ty, nominalLengths) {
+    Option<NominalLengths>.Some {value} => value
+    Option<NominalLengths>.None => {
+      return Option.none<NominalPath>()
+    }
+  }
+  if lengths.name == usize.ZERO {
+    return Option.none<NominalPath>()
+  }
+  let mut origin = run Bytes.zeroed(lengths.origin)
+  let mut package = run Bytes.zeroed(lengths.package)
+  let mut path = run Bytes.zeroed(lengths.path)
+  let mut name = run Bytes.zeroed(lengths.name)
+  let copied = Shared.with<Type, bool>(
+    ty,
+    fn(value: &Type) -> bool {
+      return copyNominal(
+        value,
+        Bytes.asMutSlice(&mut origin),
+        Bytes.asMutSlice(&mut package),
+        Bytes.asMutSlice(&mut path),
+        Bytes.asMutSlice(&mut name),
+      )
+    },
+  )
+  if !copied {
+    return Option.none<NominalPath>()
+  }
+  let module = run ModuleId.make(
+    Bytes.asSlice(&origin),
+    Bytes.asSlice(&package),
+    Bytes.asSlice(&path),
+  )
+  return Option.some<NominalPath>(
+    NominalPath {module: move module, name: move name, kind: lengths.kind},
+  )
+}
+
+fn canonicalName(package: &[u8], path: &[u8], name: &[u8], destination: &mut [u8]) -> bool {
+  if destination.length != package.length + path.length + name.length + 2 {
+    return false
+  }
+  let mut at = usize.ZERO
+  let mut i = usize.ZERO
+  while i < package.length {
+    destination[at] = package[i]
+    at = at + usize.ONE
+    i = i + usize.ONE
+  }
+  destination[at] = 47
+  at = at + usize.ONE
+  i = usize.ZERO
+  while i < path.length {
+    destination[at] = path[i]
+    at = at + usize.ONE
+    i = i + usize.ONE
+  }
+  destination[at] = 47
+  at = at + usize.ONE
+  i = usize.ZERO
+  while i < name.length {
+    destination[at] = name[i]
+    at = at + usize.ONE
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn nominalLengths(value: &Type) -> Option<NominalLengths> {
+  return match & value.* {
+    Type.Nominal {declaration, arguments, ..} => {
+      let module = DeclarationId.moduleId(&declaration)
+      return Option.some<NominalLengths>(
+        NominalLengths {
+          origin: ModuleId.sourceOrigin(module).length,
+          package: ModuleId.packageIdentity(module).length,
+          path: ModuleId.logicalPath(module).length,
+          name: DeclarationId.spelling(&declaration).length,
+          kind: DeclarationId.kind(&declaration),
+          arguments: Vector.length<Argument>(&arguments),
+        },
+      )
+    }
+    _ => Option.none<NominalLengths>()
+  }
+}
+
+fn copySlice(source: &[u8], target: &mut [u8]) -> bool {
+  if source.length != target.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < source.length {
+    target[at] = source[at]
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn copyNominal(
+  value: &Type,
+  origin: &mut [u8],
+  package: &mut [u8],
+  path: &mut [u8],
+  name: &mut [u8],
+) -> bool {
+  return match & value.* {
+    Type.Nominal {declaration, ..} => {
+      let module = DeclarationId.moduleId(&declaration)
+      return copySlice(ModuleId.sourceOrigin(module), move origin) && copySlice(
+        ModuleId.packageIdentity(module),
+        move package,
+      ) && copySlice(ModuleId.logicalPath(module), move path) && copySlice(
+        DeclarationId.spelling(&declaration),
+        move name,
+      )
+    }
+    _ => false
+  }
+}
+
+/// Resolve one concrete source type using the selected target's pointer width.
+pub effect fn resolve(
+  semantic: &mut Semantic,
+  request: &mut Request,
+  target: &Target,
+  ty: &Shared<Type>,
+) -> Result<Shape, Problem>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut seen = Vector.make<Shared<DeclarationId>>()
+  return run resolveInner(move semantic, move request, target, ty, &mut seen)
+}
+
+effect fn resolveInner(
+  semantic: &mut Semantic,
+  request: &mut Request,
+  target: &Target,
+  ty: &Shared<Type>,
+  seen: &mut Vector<Shared<DeclarationId>>,
+) -> Result<Shape, Problem>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let view = Shared.with<Type, TypeView>(ty, typeView)
+  return match move view {
+    TypeView.Boolean => Result.succeed<Shape, Problem>(Shape.Boolean)
+    TypeView.Integer {kind} => {
+      let bits = StaticValue.integerBits(kind, Target.pointerBits(target))
+      return match move bits {
+        Option<u32>.Some {value} => Result.succeed<Shape, Problem>(
+          Shape.Integer {kind: kind, bits: value},
+        )
+        Option<u32>.None => Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+    }
+    TypeView.String => Result.succeed<Shape, Problem>(Shape.String)
+    TypeView.Array {element, length} => {
+      let count = match move length {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidExtent)
+        }
+      }
+      let child = run resolveInner(move semantic, move request, target, &element, move seen)
+      return match move child {
+        Result<Shape, Problem>.Success {value} => Result.succeed<Shape, Problem>(
+          Shape.Array {
+            length: count,
+            elementType: move element,
+            element: run Box.make<Shape>(move value),
+          },
+        )
+        Result<Shape, Problem>.Failure {error} => Result.failResult<Shape, Problem>(move error)
+      }
+    }
+    TypeView.Nominal => run nominal(move semantic, move request, target, ty, move seen)
+    TypeView.Unsupported => Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+  }
+}
+
+effect fn nominal(
+  semantic: &mut Semantic,
+  request: &mut Request,
+  target: &Target,
+  ty: &Shared<Type>,
+  seen: &mut Vector<Shared<DeclarationId>>,
+) -> Result<Shape, Problem>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let path = match move run nominalPath(ty) {
+    Option<NominalPath>.Some {value} => value
+    Option<NominalPath>.None => {
+      return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+    }
+  }
+  let answer = run Semantic.demandMembers(
+    &mut semantic.*,
+    &mut request.*,
+    &path.module,
+    Bytes.asSlice(&path.name),
+  )
+  let set = match move Shared.with<Result<Answer, NoRejection>, Option<MemberSet>>(
+    &answer,
+    memberSet,
+  ) {
+    Option<MemberSet>.Some {value} => value
+    Option<MemberSet>.None => {
+      return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+    }
+  }
+  if !Shared.with<Type, bool>(
+    ty,
+    fn(value: &Type) -> bool {
+      return nominalMatches(value, &set.identity)
+    },
+  ) {
+    return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+  }
+  if alreadySeen(Vector.asSlice<Shared<DeclarationId>>(&seen.*), &set.identity) {
+    return Result.failResult<Shape, Problem>(Problem.RecursiveShape)
+  }
+  run Vector.append<Shared<DeclarationId>>(&mut seen.*, Shared.clone<DeclarationId>(&set.identity))
+  if path.kind == OwnerKind.Enumeration {
+    if set.count == usize.ZERO {
+      return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+    }
+    let package = ModuleId.packageIdentity(&path.module)
+    let modulePath = ModuleId.logicalPath(&path.module)
+    let spelling = Bytes.asSlice(&path.name)
+    let mut canonical = run Bytes.zeroed(package.length + modulePath.length + spelling.length + 2)
+    if !canonicalName(package, modulePath, spelling, Bytes.asMutSlice(&mut canonical)) {
+      return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+    }
+    let mut members = Vector.make<EnumMember>()
+    let mut at = usize.ZERO
+    while at < set.count {
+      let info = match move Shared.with<Result<Answer, NoRejection>, Option<MemberInfo>>(
+        &answer,
+        fn(value: &Result<Answer, NoRejection>) -> Option<MemberInfo> {
+          return memberInfo(value, at)
+        },
+      ) {
+        Option<MemberInfo>.Some {value} => value
+        Option<MemberInfo>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      if info.kind != MemberKind.EnumCase || info.nameLength == usize.ZERO {
+        return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+      }
+      let discriminant = match move info.discriminant {
+        Option<EnumCase>.Some {value} => value
+        Option<EnumCase>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      let mut name = run Bytes.zeroed(info.nameLength)
+      if !Shared.with<Result<Answer, NoRejection>, bool>(
+        &answer,
+        fn(value: &Result<Answer, NoRejection>) -> bool {
+          return copyMemberName(value, at, Bytes.asMutSlice(&mut name))
+        },
+      ) {
+        return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+      }
+      let staticValue = match move StaticValue.enumeration(
+        Shared.clone<DeclarationId>(&set.identity),
+        at,
+        set.representation,
+        discriminant.sign,
+        discriminant.magnitude,
+      ) {
+        Option<StaticData>.Some {value} => value
+        Option<StaticData>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      run Vector.append<EnumMember>(
+        &mut members,
+        EnumMember {name: move name, value: run Shared.make<StaticData>(move staticValue)},
+      )
+      at = at + usize.ONE
+    }
+    let last = Vector.length<Shared<DeclarationId>>(&seen.*) - usize.ONE
+    let discarded = Vector.remove<Shared<DeclarationId>>(&mut seen.*, last)
+    drop discarded
+    return Result.succeed<Shape, Problem>(
+      Shape.Enum {canonical: move canonical, members: move members},
+    )
+  }
+  if path.kind == OwnerKind.Struct {
+    let mut fields = Vector.make<NamedShape>()
+    let mut at = usize.ZERO
+    while at < set.count {
+      let info = match move Shared.with<Result<Answer, NoRejection>, Option<MemberInfo>>(
+        &answer,
+        fn(value: &Result<Answer, NoRejection>) -> Option<MemberInfo> {
+          return memberInfo(value, at)
+        },
+      ) {
+        Option<MemberInfo>.Some {value} => value
+        Option<MemberInfo>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      if info.kind != MemberKind.Field || info.nameLength == usize.ZERO || !info.isPublic {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+      let mut name = run Bytes.zeroed(info.nameLength)
+      if !Shared.with<Result<Answer, NoRejection>, bool>(
+        &answer,
+        fn(value: &Result<Answer, NoRejection>) -> bool {
+          return copyMemberName(value, at, Bytes.asMutSlice(&mut name))
+        },
+      ) {
+        return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+      }
+      let fieldAnswer = run Semantic.demandMemberShape(
+        &mut semantic.*,
+        &mut request.*,
+        &path.module,
+        Bytes.asSlice(&path.name),
+        at,
+        ty,
+      )
+      let fieldType = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+        &fieldAnswer,
+        memberType,
+      ) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      let child = match move run resolveInner(
+        &mut semantic.*,
+        &mut request.*,
+        target,
+        &fieldType,
+        &mut seen.*,
+      ) {
+        Result<Shape, Problem>.Success {value} => value
+        Result<Shape, Problem>.Failure {error} => {
+          return Result.failResult<Shape, Problem>(move error)
+        }
+      }
+      run Vector.append<NamedShape>(
+        &mut fields,
+        NamedShape {name: move name, ty: move fieldType, value: run Box.make<Shape>(move child)},
+      )
+      at = at + usize.ONE
+    }
+    let last = Vector.length<Shared<DeclarationId>>(&seen.*) - usize.ONE
+    let discarded = Vector.remove<Shared<DeclarationId>>(&mut seen.*, last)
+    drop discarded
+    return Result.succeed<Shape, Problem>(Shape.Record {fields: move fields})
+  }
+  if path.kind == OwnerKind.Union {
+    if set.count != 2 {
+      return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+    }
+    let mut absent = Option.none<usize>()
+    let mut present = Option.none<usize>()
+    let mut payloadType = Option.none<Shared<Type>>()
+    let mut payloadShape = Option.none<Shape>()
+    let mut at = usize.ZERO
+    while at < set.count {
+      let info = match move Shared.with<Result<Answer, NoRejection>, Option<MemberInfo>>(
+        &answer,
+        fn(value: &Result<Answer, NoRejection>) -> Option<MemberInfo> {
+          return memberInfo(value, at)
+        },
+      ) {
+        Option<MemberInfo>.Some {value} => value
+        Option<MemberInfo>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      if info.kind != MemberKind.Variant || !info.isPublic {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+      let variantAnswer = run Semantic.demandMemberShape(
+        &mut semantic.*,
+        &mut request.*,
+        &path.module,
+        Bytes.asSlice(&path.name),
+        at,
+        ty,
+      )
+      let count = match move Shared.with<Result<Answer, NoRejection>, Option<usize>>(
+        &variantAnswer,
+        memberTypeCount,
+      ) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => {
+          return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+        }
+      }
+      if count == usize.ZERO {
+        if let Option<usize>.Some {..} = &absent {
+          return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+        }
+        absent = Option.some<usize>(at)
+      } else if count == usize.ONE {
+        if let Option<usize>.Some {..} = &present {
+          return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+        }
+        let childType = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+          &variantAnswer,
+          memberType,
+        ) {
+          Option<Shared<Type>>.Some {value} => value
+          Option<Shared<Type>>.None => {
+            return Result.failResult<Shape, Problem>(Problem.InvalidMember)
+          }
+        }
+        let child = match move run resolveInner(
+          &mut semantic.*,
+          &mut request.*,
+          target,
+          &childType,
+          &mut seen.*,
+        ) {
+          Result<Shape, Problem>.Success {value} => value
+          Result<Shape, Problem>.Failure {error} => {
+            return Result.failResult<Shape, Problem>(move error)
+          }
+        }
+        present = Option.some<usize>(at)
+        payloadType = Option.some<Shared<Type>>(move childType)
+        payloadShape = Option.some<Shape>(move child)
+      } else {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+      at = at + usize.ONE
+    }
+    let absentIndex = match move absent {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+    }
+    let presentIndex = match move present {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+    }
+    let elementType = match move payloadType {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+    }
+    let element = match move payloadShape {
+      Option<Shape>.Some {value} => value
+      Option<Shape>.None => {
+        return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+      }
+    }
+    let last = Vector.length<Shared<DeclarationId>>(&seen.*) - usize.ONE
+    let discarded = Vector.remove<Shared<DeclarationId>>(&mut seen.*, last)
+    drop discarded
+    return Result.succeed<Shape, Problem>(
+      Shape.Optional {
+        absent: absentIndex,
+        present: presentIndex,
+        elementType: move elementType,
+        element: run Box.make<Shape>(move element),
+      },
+    )
+  }
+  return Result.failResult<Shape, Problem>(Problem.UnsupportedType)
+}
+
+union TypeView {
+  Boolean,
+  Integer {kind: IntegerType},
+  String,
+  Array {element: Shared<Type>, length: Option<usize>},
+  Nominal,
+  Unsupported,
+}
+
+fn typeView(value: &Type) -> TypeView {
+  return match & value.* {
+    Type.Primitive {name} => {
+      let spelling = Bytes.asSlice(&name)
+      if same(spelling, b"bool") {
+        return TypeView.Boolean
+      }
+      return match move integer(spelling) {
+        Option<IntegerType>.Some {value: selected} => TypeView.Integer {kind: selected}
+        Option<IntegerType>.None => TypeView.Unsupported
+      }
+    }
+    Type.String {lifetime} => {
+      let isStatic = Shared.with<Lifetime, bool>(
+        &lifetime,
+        fn(value: &Lifetime) -> bool {
+          return match & value.* {
+            Lifetime.Static => true
+            _ => false
+          }
+        },
+      )
+      if isStatic {
+        return TypeView.String
+      }
+      return TypeView.Unsupported
+    }
+    Type.Array {element, extent: length} => TypeView.Array {
+      element: Shared.clone<Type>(&element),
+      length: extent(Bytes.asSlice(&length)),
+    }
+    Type.Nominal {..} => TypeView.Nominal
+    _ => TypeView.Unsupported
+  }
+}
+
+/// Resolve all registered headers into U7's concrete binding schema input.
+pub effect fn registered(semantic: &mut Semantic, request: &mut Request, target: &Target) -> Result<
+  Registered,
+  Problem,
+> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let demanded = run Semantic.demandRegisteredParameters(&mut semantic.*, &mut request.*)
+  let found = match move demanded {
+    Result<Vector<RegisteredParameter>, Shared<Rejection>>.Success {value} => value
+    Result<Vector<RegisteredParameter>, Shared<Rejection>>.Failure {error: _} => {
+      return Result.failResult<Registered, Problem>(Problem.InvalidHeader)
+    }
+  }
+  let mut remaining = move found
+  let mut shapes = Vector.make<RegisteredShape>()
+  let mut parameters = Vector.make<RegisteredParameter>()
+  while Vector.length<RegisteredParameter>(&remaining) > usize.ZERO {
+    let item = Vector.remove<RegisteredParameter>(&mut remaining, usize.ZERO)
+    let schema = match move Shared.with<
+      Result<Answer, NoRejection>,
+      Option<Shared<ParameterSchema>>,
+    >(&item.answer, header) {
+      Option<Shared<ParameterSchema>>.Some {value} => value
+      Option<Shared<ParameterSchema>>.None => {
+        return Result.failResult<Registered, Problem>(Problem.InvalidHeader)
+      }
+    }
+    let ty = Shared.with<ParameterSchema, Shared<Type>>(
+      &schema,
+      fn(value: &ParameterSchema) -> Shared<Type> {
+        return Shared.clone<Type>(&value.ty)
+      },
+    )
+    let resolved = run resolve(&mut semantic.*, &mut request.*, target, &ty)
+    let shape = match move resolved {
+      Result<Shape, Problem>.Success {value} => value
+      Result<Shape, Problem>.Failure {error} => {
+        return Result.failResult<Registered, Problem>(move error)
+      }
+    }
+    run Vector.append<RegisteredShape>(
+      &mut shapes,
+      RegisteredShape {schema: move schema, shape: move shape},
+    )
+    run Vector.append<RegisteredParameter>(&mut parameters, move item)
+  }
+  return Result.succeed<Registered, Problem>(
+    Registered {schemas: move shapes, parameters: move parameters},
+  )
+}

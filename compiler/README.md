@@ -492,10 +492,10 @@ cannot make a completed path reachable again.
 This native semantic API is not wired into the inspection executable above. Contract-level
 conformance, method selection, and eligible closed scalar/string operator typing are available;
 their ownership, capture, cleanup, and Effect safety obligations remain for M2.5. Function values,
-sections, pointer-sized literal ranges, Effect execution, static evaluation, layout, and code
-emission are outside the current body subset. For example,
-`fn selected() -> i32 { static if true { return 1 } else { return 2 } }` produces `Unsupported`
-when demanded; static selection does not use runtime branch checking. Unused declarations with
+sections, pointer-sized literal ranges, Effect execution, layout, and code emission are outside
+the current body subset. A `static if` with a checked `bool` condition now checks only its selected
+body arm, so `fn selected() -> i32 { static if true { return 1 } else { return 2 } }` has no reachable
+fallthrough. Static selection does not use runtime branch checking. Unused declarations with
 these forms remain indexed. The authored HIR keeps integer sign, radix, and exact decimal
 magnitude beyond `u64`; body checking compares those digits without rounding through a
 host number. Structured typed failures and cancellation release incomplete query reservations and
