@@ -68,6 +68,27 @@ Each entry records:
 
 ## Entries
 
+### Catalog-defined runtime intrinsic coverage in selfhost
+
+- **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
+  implementation verification is pending exact-head CI on PR #615.
+- **Rule:** source-callable compiler primitives retain their canonical sealed `Intrinsic`
+  identities from the [intrinsic reference](apps/docs/content/reference/unsafe-intrinsics-and-targets.md).
+  A misspelled member is an error; a catalog-defined runtime or mixed-phase member that selfhost
+  has not implemented is an explicit `intrinsic-member` build gap.
+- **Compilers:** the bootstrap catalog defines the complete membership and phase metadata.
+  Selfhost implements only its existing target/static-text subset; the new membership check adds
+  no runtime primitive, contract validation, evaluation, or lowering.
+- **Source migration:** none. Keep ordinary standard-library wrappers in Silk source rather than
+  adding privileged library actors or substituting unsupported runtime implementations.
+- **Diagnostics and limits:** the semantic lane retains `IntrinsicUnavailable` at the authored
+  member span, and the backend reports `intrinsic-member`. A noncatalog spelling remains
+  `UnknownMember`, including with explicit generic arguments. Other rejection codes and build
+  timeouts are not converted by this classification.
+- **Evidence:** the existing `staticIntrinsicContractsRejectUnknownMembersAndMismatches` fixture
+  asserts known versus unknown membership and the exact backend gap span. The corpus runner check
+  compares the complete committed runtime/mixed spellings with `Intrinsic.inventory()`.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
@@ -213,6 +234,20 @@ Each entry records:
 - **Background:** the workspace design-checkpoint note "Effect architecture — design checkpoint"
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
+
+### Nominal qualification requires an inherent member
+
+CALL-003 and STYLE-002 require a nominal-qualified function to be published in that type's
+inherent `impl`. A top-level function whose first parameter is that type is not an inherent
+member. Operator mappings follow the same ordinary lookup rule (OP-009).
+
+The TypeScript bootstrap currently accepts the old `operator-interface-contract` fixture's
+`Vector.scale` and `Vector.dot` mappings even though those functions were top-level declarations.
+The native acceptance job in [run 36627847695](https://github.com/julia-script/silk/actions/runs/36627847695)
+confirmed that acceptance. The self-hosted frontend correctly rejects those unpublished members.
+The fixture now declares both functions in `impl Vector`, retaining its expected result of 42.
+The bootstrap is frozen during backend development; retire this entry when it enforces the
+same owner lookup rule.
 
 ## Maintaining this file
 
