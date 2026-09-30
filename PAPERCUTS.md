@@ -364,6 +364,11 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
 
+- 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
+
+- 2026-09-30 · Sequence test CI stopped on a nested callback pattern binding that reused value from its enclosing scope · Give the callback binding a distinct name and check the SemanticCases root with the bootstrap before publishing · Silk selfhost B9.
+
+- 2026-09-30 · B9 array-to-slice validation nested a Shared.with callback inside another and CLI compilation rejected SEM0199 · Lift the outer inspection into the named borrowedArraySlice function, retaining one callback level and Exact inference · self-hosted compiler
 - 2026-09-30 · M2.4 review-fix graph indexing hit the active-generation guard · Confirmed the worker log and used targeted source reads without disturbing the other indexer · self-hosted compiler
 - 2026-09-30 · A nested origin assertion misparsed the next Option arm after an escaped-text lookup and failed CI repeatedly · Hoist the needle, lookup, and match result into named locals; check the SemanticCases root with the current bootstrap before pushing · M2.4 static evaluation
 - 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
