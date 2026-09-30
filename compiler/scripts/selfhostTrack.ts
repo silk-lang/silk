@@ -7,7 +7,7 @@ export const selfhostTrack = [
   'sealed-scalar-intrinsics',
   'scalar-reference-read',
   'scalar-reference-write-through',
-  // Re-add scalar-reference-argument-order when CLI profile selection lands (U8 #603).
+  'scalar-reference-argument-order',
   'mutable-struct-loop',
   'recursive-aggregate-return',
   'inherent-member-over-module-projection',
