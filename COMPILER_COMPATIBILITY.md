@@ -68,6 +68,27 @@ Each entry records:
 
 ## Entries
 
+### Catalog-defined runtime intrinsic coverage in selfhost
+
+- **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
+  implementation verification is pending exact-head CI on PR #615.
+- **Rule:** source-callable compiler primitives retain their canonical sealed `Intrinsic`
+  identities from the [intrinsic reference](apps/docs/content/reference/unsafe-intrinsics-and-targets.md).
+  A misspelled member is an error; a catalog-defined runtime or mixed-phase member that selfhost
+  has not implemented is an explicit `intrinsic-member` build gap.
+- **Compilers:** the bootstrap catalog defines the complete membership and phase metadata.
+  Selfhost implements only its existing target/static-text subset; the new membership check adds
+  no runtime primitive, contract validation, evaluation, or lowering.
+- **Source migration:** none. Keep ordinary standard-library wrappers in Silk source rather than
+  adding privileged library actors or substituting unsupported runtime implementations.
+- **Diagnostics and limits:** the semantic lane retains `IntrinsicUnavailable` at the authored
+  member span, and the backend reports `intrinsic-member`. A noncatalog spelling remains
+  `UnknownMember`, including with explicit generic arguments. Other rejection codes and build
+  timeouts are not converted by this classification.
+- **Evidence:** the existing `staticIntrinsicContractsRejectUnknownMembersAndMismatches` fixture
+  asserts known versus unknown membership and the exact backend gap span. The corpus runner check
+  compares the complete committed runtime/mixed spellings with `Intrinsic.inventory()`.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned

@@ -24,6 +24,11 @@ through `Semantic.revise`. Unused imports stay unread and unchanged per-file obs
 reusable. Actual missing files report `MissingModule`; filesystem permission/I/O and malformed
 manifest failures propagate rather than becoming backend coverage gaps.
 
+A reached sealed runtime primitive that the canonical intrinsic catalog defines but selfhost has
+not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains the exact runtime
+and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
+An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
+
 ## Development branches and bootstrap
 
 `selfhost` is the integration branch for the source-written compiler. Start native compiler work on
