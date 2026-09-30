@@ -34,7 +34,7 @@ it.effect(
       const inspected = yield* Metadata.inspect(builder, first)
       assert.strictEqual(inspected._tag, 'String')
       const inspectedString = inspected._tag === 'String' ? inspected : raise('expected a string')
-      assert.deepEqual(inspectedString.value.bytes, [0x61, 0, 0xff])
+      assert.deepEqual(inspectedString.value.bytes, Uint8Array.of(0x61, 0, 0xff))
       assert.instanceOf(yield* Effect.flip(Metadata.tuple(other, [first])), LlvmError)
       const diFlags = DIFlags.make({
         visibility: 'public',

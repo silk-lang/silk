@@ -7,6 +7,8 @@ import * as MirVerification from '../src/MirVerification.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Target from '../src/Target.js'
+import * as Stdlib from '../src/Stdlib.js'
+import { unreachable } from './support/raise.js'
 
 const encoder = new TextEncoder()
 const nativeSource = `import silk.os_random { OsRandom }
@@ -38,14 +40,26 @@ it.effect('selects only the ordinary platform entropy imports with no OS operati
   }),
 )
 
-it.effect('rejects native entropy members in Wasm and no-libc selections', () =>
+it.effect('rejects reached native entropy construction in Wasm and no-libc selections', () =>
   Effect.gen(function* () {
-    const source = 'import silk.os_random { OsRandom }\npub fn main() -> i32 { return 42 }'
+    const source = `import silk.os_random { OsRandom }
+pub fn main() -> i32 { let provider = OsRandom.make() return 42 }`
+    const module = Stdlib.find('silk/os_random') ?? unreachable('expected entropy source')
+    const text = new TextDecoder().decode(module.bytes)
+    const start = text.indexOf('compileError("') + 'compileError("'.length
+    const end = text.indexOf('"', start)
     for (const target of Target.all) {
       const snapshot = yield* Analysis.makeRealized({
         root: 'entropy/unavailable',
         configuration: {
-          profile: { target: target.id, artifact: 'object', libc: 'none', entry: { kind: 'none' } },
+          ...AnalysisFixture.configuration('entropy/unavailable', target.id),
+          profile: {
+            target: target.id,
+            artifact: 'object',
+            libc: 'none',
+            runtime: { kind: 'none' },
+            entry: { kind: 'none' },
+          },
         },
       }).pipe(
         Effect.provide(
@@ -57,10 +71,11 @@ it.effect('rejects native entropy members in Wasm and no-libc selections', () =>
       assert.deepEqual(
         Analysis.diagnostics(snapshot).map((diagnostic) => [
           diagnostic.code,
+          diagnostic.span.sourceId,
           diagnostic.span.start,
           diagnostic.span.end,
         ]),
-        [['SEM0014', source.indexOf('OsRandom'), source.indexOf('OsRandom') + 'OsRandom'.length]],
+        [['SEM0177', module.module, start, end]],
       )
       assert.deepEqual(snapshot.instances.foreignCalls, [])
     }
@@ -71,7 +86,8 @@ it.effect('keeps portable secure-byte replacement free of native entropy imports
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'entropy/portable',
-      encoder.encode(`import silk.random { Random }
+      encoder.encode(`import silk.os_random { OsRandom }
+import silk.random { Random }
 import silk.effect { Effect }
 import silk.u8
 struct Scripted {}

@@ -55,6 +55,11 @@ fn stopped() -> i32 {
   while i < 2 { i = read(r) x = Data { value: 2 } break }
   return i
 }
+fn recreated() -> i32 {
+  let mut x = Data { value: 1 } let mut i = 0
+  while i < 2 { let r = &x i = read(r) x = Data { value: 2 } }
+  return i
+}
 fn branches<'a>(x: &'a i32, flag: bool) -> &'a i32 {
   let mut n = 1 let r = &n
   if flag { n = 2 return x } else { drop r }

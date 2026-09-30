@@ -1763,6 +1763,9 @@ export const discover = (
     recursionFamily(ancestor.key)
     const cycle = cycleOf(declaration)
     if (!projectedCycleSizes.has(declaration)) projectedCycleSizes.set(declaration, cycle.size)
+    // Terminal histories have no assignments to project. They accounted for 66% of the family
+    // members collected by the selfhost diagnostic; retain the graph bookkeeping above first.
+    if (history.variable === undefined) return withAncestor(history, ancestor)
     const families = new Set(
       [...cycle].flatMap((member) => [...(familiesByDeclaration.get(member) ?? [])]),
     )

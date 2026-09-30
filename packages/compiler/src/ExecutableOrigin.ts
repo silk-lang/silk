@@ -314,6 +314,7 @@ interface ProviderBinding {
 type ProviderEnvironment = ReadonlyArray<ProviderBinding>
 
 interface ProviderWorklist {
+  readonly relevant: ReadonlySet<string>
   readonly pending: Array<{ readonly node: string; readonly environment: ProviderEnvironment }>
   readonly queued: Map<string, Set<ProviderEnvironment>>
   readonly extensions: WeakMap<ProviderEnvironment, Map<string, ProviderEnvironment>>
@@ -326,6 +327,7 @@ const enqueueProvider = (
   node: string,
   environment: ProviderEnvironment,
 ): void => {
+  if (!self.relevant.has(node)) return
   let environments = self.queued.get(node)
   if (environments === undefined) {
     environments = new Set()
@@ -355,8 +357,44 @@ const enterProviderBinding = (
   return extended
 }
 
-const providerWorklist = (bindings: Iterable<ProviderBinding>): ProviderWorklist => {
+// The selfhost graph queued 8.8 million provider states, 85.5% unable to reach a service or
+// deferred call. Only those calls select new targets; retain their static predecessors once
+// per rebuilt graph rather than carrying every environment through unrelated executions.
+const providerRelevance = (
+  dependencies: ReadonlyMap<string, ReadonlySet<string>>,
+  selectedCalls: Iterable<string>,
+): ReadonlySet<string> => {
+  const relevant = new Set(selectedCalls)
+  if (relevant.size === 0) return relevant
+  const callers = new Map<string, Array<string>>()
+  for (const [owner, targets] of dependencies)
+    for (const target of targets) {
+      let incoming = callers.get(target)
+      if (incoming === undefined) {
+        incoming = []
+        callers.set(target, incoming)
+      }
+      incoming.push(owner)
+    }
+  const pending = [...relevant]
+  for (let cursor = 0; cursor < pending.length; cursor += 1) {
+    const node = pending.at(cursor)
+    if (node === undefined) continue
+    for (const caller of callers.get(node) ?? []) {
+      if (relevant.has(caller)) continue
+      relevant.add(caller)
+      pending.push(caller)
+    }
+  }
+  return relevant
+}
+
+const providerWorklist = (
+  bindings: Iterable<ProviderBinding>,
+  relevant: ReadonlySet<string>,
+): ProviderWorklist => {
   const self: ProviderWorklist = {
+    relevant,
     pending: [],
     queued: new Map(),
     extensions: new WeakMap(),
@@ -4374,7 +4412,10 @@ export const make = (operations: Operations) => {
       }
     }
 
-    const providers = providerWorklist(providerBindings.values())
+    const providers = providerWorklist(
+      providerBindings.values(),
+      providerRelevance(dependencies, [...serviceCalls.keys(), ...deferredCalls.keys()]),
+    )
     const selectedEdges: Array<readonly [string, string]> = []
     for (let ordinal = 0; ordinal < providers.pending.length; ordinal += 1) {
       const current = providers.pending[ordinal]

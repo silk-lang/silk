@@ -119,16 +119,21 @@ const buildGlobalOrder = (state: BuilderState.Snapshot): GlobalOrder => {
   })
   const valueIndex = new Map<number, number>()
   const strtab = new Map<number, { readonly offset: number; readonly size: number }>()
-  const bytes: Array<number> = []
+  // Mangled names average about a kilobyte, so the string table is tens of megabytes on large
+  // modules. Size it once as bytes; growing a number array of bytes retained eight times that.
+  let length = 0
+  for (const entry of entries) length += entry.global.name.bytes.length
+  const bytes = new Uint8Array(length)
+  let offset = 0
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index]
     if (entry === undefined) continue
     valueIndex.set(entry.globalIndex, index)
-    strtab.set(entry.globalIndex, { offset: bytes.length, size: entry.global.name.bytes.length })
-    bytes.push(...entry.global.name.bytes)
+    const size = entry.global.name.bytes.length
+    strtab.set(entry.globalIndex, { offset, size })
+    bytes.set(entry.global.name.bytes, offset)
+    offset += size
   }
-  // This byte array is owned by one encoding and only read by the string-table writer.
-  // Freezing multi-megabyte symbol tables dominated encode time in compiler replays.
   return { entries: entries, valueIndex, strtab, bytes }
 }
 

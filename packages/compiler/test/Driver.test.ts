@@ -135,6 +135,41 @@ it.effect('consumes a shorthand target when synthesizing the complete profile', 
   }),
 )
 
+it.effect('publishes the runtime test catalog without result-cache identities when disabled', () =>
+  Effect.gen(function* () {
+    const root = 'memory/uncached-driver-tests'
+    const outcome = yield* compileSource(
+      'uncached-test-catalog',
+      `test fn uncached() -> () {}
+pub fn main() -> () {
+  static for descriptor in Intrinsic.tests() {
+    let body = Intrinsic.testFunction(descriptor)
+    body()
+  }
+}`,
+      {
+        testResultCache: false,
+        compilation: {
+          root,
+          discovery: {
+            root,
+            sources: new Map([
+              [root, { ownership: 'Project', logicalPath: 'tests/uncached-driver-tests.silk' }],
+            ]),
+          },
+        },
+      },
+    )
+    assert.strictEqual(outcome._tag, 'Compiled')
+    if (outcome._tag !== 'Compiled') return
+    assert.deepStrictEqual(
+      outcome.testCatalog?.entries.map((entry) => entry.name),
+      ['uncached'],
+    )
+    assert.isUndefined(outcome.testManifest)
+  }),
+)
+
 it.effect('publishes a manifest and execution environment for a discovered-test executable', () =>
   Effect.gen(function* () {
     const root = 'memory/driver-tests'
@@ -174,6 +209,10 @@ pub fn main() -> () {
     assert.deepEqual(
       outcome.testManifest?.entries.map((entry) => entry.eligibility._tag),
       ['Eligible', 'Eligible'],
+    )
+    assert.deepStrictEqual(
+      outcome.testCatalog?.entries,
+      outcome.testManifest?.entries.map((entry) => entry.test),
     )
 
     const plan = outcome.linkPlan

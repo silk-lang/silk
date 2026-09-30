@@ -1,4 +1,21 @@
 /**
+ * A read-only view of owned byte storage, without mutators or access to its backing buffer.
+ *
+ * Slices are independent mutable copies; subarrays remain read-only views.
+ *
+ * @category byte strings
+ * @since 0.0.0
+ */
+export interface ReadonlyBytes extends Iterable<number> {
+  readonly [index: number]: number
+  readonly length: number
+  at(index: number): number | undefined
+  indexOf(value: number, fromIndex?: number): number
+  slice(start?: number, end?: number): Uint8Array
+  subarray(begin?: number, end?: number): ReadonlyBytes
+}
+
+/**
  * An immutable sequence of bytes used at LLVM's byte-oriented boundaries.
  *
  * @category byte strings
@@ -6,14 +23,12 @@
  */
 export interface ByteString {
   readonly _tag: 'ByteString'
-  readonly bytes: ReadonlyArray<number>
+  /** Owned by the byte string; never mutated after construction. */
+  readonly bytes: ReadonlyBytes
 }
 
 /** @internal */
-const fromNumbers = (bytes: Iterable<number>): ByteString => ({
-  _tag: 'ByteString',
-  bytes: Array.from(bytes),
-})
+const own = (bytes: Uint8Array): ByteString => ({ _tag: 'ByteString', bytes })
 
 /**
  * Copies a typed array into an immutable byte string, isolating it from later mutations.
@@ -21,10 +36,12 @@ const fromNumbers = (bytes: Iterable<number>): ByteString => ({
  * @category byte strings
  * @since 0.0.0
  */
-export const fromUint8Array = (bytes: Uint8Array): ByteString => fromNumbers(bytes)
+export const fromUint8Array = (bytes: Uint8Array): ByteString => own(bytes.slice())
+
+const utf8 = new TextEncoder()
 
 /**
- * Encodes a JavaScript string as immutable UTF-8 bytes without a platform dependency.
+ * Encodes a JavaScript string as immutable UTF-8 bytes.
  *
  * **When to use**
  *
@@ -45,38 +62,7 @@ export const fromUint8Array = (bytes: Uint8Array): ByteString => fromNumbers(byt
  * @category byte strings
  * @since 0.0.0
  */
-export const fromString = (value: string): ByteString => {
-  // Every emitted value and block name is encoded here; index by UTF-16 unit instead of the
-  // allocating string iterator and hand the array over without a second copy.
-  const bytes: Array<number> = []
-  for (let index = 0; index < value.length; index += 1) {
-    const unit = value.charCodeAt(index)
-    if (unit <= 0x7f) {
-      bytes.push(unit)
-      continue
-    }
-    const codePoint = value.codePointAt(index) ?? unit
-    if (codePoint > 0xffff) index += 1
-    const scalarValue = codePoint >= 0xd800 && codePoint <= 0xdfff ? 0xfffd : codePoint
-    if (scalarValue <= 0x7ff) {
-      bytes.push(0xc0 | (scalarValue >> 6), 0x80 | (scalarValue & 0x3f))
-    } else if (scalarValue <= 0xffff) {
-      bytes.push(
-        0xe0 | (scalarValue >> 12),
-        0x80 | ((scalarValue >> 6) & 0x3f),
-        0x80 | (scalarValue & 0x3f),
-      )
-    } else {
-      bytes.push(
-        0xf0 | (scalarValue >> 18),
-        0x80 | ((scalarValue >> 12) & 0x3f),
-        0x80 | ((scalarValue >> 6) & 0x3f),
-        0x80 | (scalarValue & 0x3f),
-      )
-    }
-  }
-  return { _tag: 'ByteString', bytes }
-}
+export const fromString = (value: string): ByteString => own(utf8.encode(value))
 
 /**
  * The canonical empty byte sequence.
@@ -84,7 +70,7 @@ export const fromString = (value: string): ByteString => {
  * @category byte strings
  * @since 0.0.0
  */
-export const empty: ByteString = fromNumbers([])
+export const empty: ByteString = own(new Uint8Array(0))
 
 /**
  * Coerces a UTF-8 string, typed array, or existing byte string into an immutable byte string.
@@ -118,7 +104,7 @@ export const coerceOrEmpty = (value: ByteString | Uint8Array | string | undefine
  * @category byte strings
  * @since 0.0.0
  */
-export const toUint8Array = (self: ByteString): Uint8Array => Uint8Array.from(self.bytes)
+export const toUint8Array = (self: ByteString): Uint8Array => self.bytes.slice()
 
 /**
  * Compares two byte strings byte-for-byte.
@@ -128,7 +114,10 @@ export const toUint8Array = (self: ByteString): Uint8Array => Uint8Array.from(se
  */
 export const equals = (self: ByteString, other: ByteString): boolean => {
   if (self.bytes.length !== other.bytes.length) return false
-  return self.bytes.every((byte, index) => byte === other.bytes[index])
+  for (let index = 0; index < self.bytes.length; index += 1) {
+    if (self.bytes[index] !== other.bytes[index]) return false
+  }
+  return true
 }
 
 /** @internal */
@@ -167,9 +156,16 @@ export const isEmpty = (self: ByteString): boolean => self.bytes.length === 0
  * @since 0.0.0
  */
 export const concat = (parts: Iterable<ByteString>): ByteString => {
-  const bytes: Array<number> = []
-  for (const part of parts) bytes.push(...part.bytes)
-  return fromNumbers(bytes)
+  const list = Array.from(parts)
+  let length = 0
+  for (const part of list) length += part.bytes.length
+  const bytes = new Uint8Array(length)
+  let offset = 0
+  for (const part of list) {
+    bytes.set(part.bytes, offset)
+    offset += part.bytes.length
+  }
+  return own(bytes)
 }
 
 /**
@@ -185,15 +181,12 @@ export const concat = (parts: Iterable<ByteString>): ByteString => {
  */
 export const splitLines = (self: ByteString): ReadonlyArray<ByteString> => {
   const lines: Array<ByteString> = []
-  let line: Array<number> = []
-  for (const byte of self.bytes) {
-    if (byte === 0x0a) {
-      if (line.length > 0) lines.push(fromNumbers(line))
-      line = []
-    } else {
-      line.push(byte)
-    }
+  let start = 0
+  while (start < self.bytes.length) {
+    let end = self.bytes.indexOf(0x0a, start)
+    if (end < 0) end = self.bytes.length
+    if (end > start) lines.push(own(self.bytes.slice(start, end)))
+    start = end + 1
   }
-  if (line.length > 0) lines.push(fromNumbers(line))
   return lines
 }

@@ -846,7 +846,7 @@ it.effect('reaches a shadowed standard-library module through an ordinary import
 )
 
 it.effect(
-  'selects every ordinary native provider and its facade imports for each admitted profile',
+  'lists unconditional providers and selects other native providers and facade imports by profile',
   () =>
     Effect.gen(function* () {
       const providers = [
@@ -890,7 +890,7 @@ it.effect(
           assert.isDefined(summary, name)
           assert.strictEqual(
             (summary?.publicDeclarations.length ?? 0) > 0,
-            target.kind === 'Native',
+            target.kind === 'Native' || name === 'monotonic_clock' || name === 'random',
             `${target.id}: ${name}`,
           )
         }

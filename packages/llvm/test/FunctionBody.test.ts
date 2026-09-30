@@ -649,7 +649,7 @@ it.effect('rejects unresolved and cyclic forward chains and releases the body re
 )
 
 it('packs committed bodies without changing their data', () => {
-  const name = { _tag: 'ByteString' as const, bytes: [0, 104, 255] }
+  const name = { _tag: 'ByteString' as const, bytes: Uint8Array.of(0, 104, 255) }
   const snapshot: FunctionBodyDescription.Snapshot = {
     arguments: [0],
     blocks: [{ name, instructions: [0, 1], predecessors: [] }],
@@ -664,7 +664,11 @@ it('packs committed bodies without changing their data', () => {
         inbounds: true,
         inrange: undefined,
       },
-      { _tag: 'ReturnVoid', result: undefined, name: { _tag: 'ByteString', bytes: [] } },
+      {
+        _tag: 'ReturnVoid',
+        result: undefined,
+        name: { _tag: 'ByteString', bytes: new Uint8Array(0) },
+      },
     ],
     values: [
       { type: 0, name, source: { _tag: 'Argument', index: 0 } },
