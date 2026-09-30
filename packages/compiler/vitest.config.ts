@@ -15,6 +15,9 @@ const ci = Effect.runSync(Config.Boolean('CI').pipe(Config.withDefault(false)))
 export default defineSilkConfig({
   test: {
     exclude: [...configDefaults.exclude, 'conformance/**'],
+    // Service replacements are scoped to each Effect and source fixture overrides are restored.
+    // Reuse compiler modules and immutable shipped syntax across files in each worker.
+    isolate: false,
     /**
      * JUL-227: each compiler shard has its own four-core CI runner, but full-core concurrency
      * made expensive files contend with each other. A native-final-cache test took 39.9 s on an

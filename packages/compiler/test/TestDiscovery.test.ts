@@ -659,9 +659,27 @@ pub fn main() -> () {
     body()
   }
 }`
-    const before = yield* executionManifest(program(40, 1))
-    const alphaChanged = yield* executionManifest(program(40, 7))
+    const initial = yield* executionSnapshot(program(40, 1))
+    const before = initial.manifest
+    const alphaEdited = yield* executionSnapshot(program(40, 7))
+    const alphaChanged = alphaEdited.manifest
     const sharedChanged = yield* executionManifest(program(41, 1))
+
+    const catalog = initial.analysis.testCatalog ?? unreachable('expected test catalog')
+    const discovery = Analysis.instancesOf(initial.analysis)
+    const reattributed = TestExecution.make(
+      yield* TestExecution.closures(catalog, discovery, alphaEdited.analysis.results),
+      defaultEnvironment,
+    )
+    assert.deepEqual(eligibleIdentities(reattributed), eligibleIdentities(alphaChanged))
+    const missingAuthored = yield* TestExecution.closures(catalog, discovery, new Map())
+    for (const closure of missingAuthored.entries) {
+      assert.strictEqual(closure._tag, 'Ineligible')
+      if (closure._tag === 'Ineligible')
+        assert.strictEqual(closure.reason._tag, 'MissingAuthoredDependency')
+    }
+    const restored = yield* manifestOf(initial.analysis, defaultEnvironment)
+    assert.deepEqual(restored.entries, before.entries)
 
     for (const manifest of [before, alphaChanged, sharedChanged]) {
       assert.deepEqual(

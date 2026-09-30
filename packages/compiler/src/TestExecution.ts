@@ -65,12 +65,28 @@ const digest = (value: string): string => ToolchainIntegrity.contentDigest(value
 
 // Test closures share most of their items, and the platform-neutral digest is slow; hash each
 // item once per discovery and build closure identities from item digests.
-const closureItemCaches = new WeakMap<Instances.Discovery, Map<string, string>>()
+interface ClosureItemCache {
+  readonly digests: Map<string, string>
+  readonly instanceEncoding: typeof instanceEncoding
+  readonly edgeEncoding: typeof edgeEncoding
+  readonly callableEncoding: typeof callableEncoding
+  readonly effectEncoding: typeof effectEncoding
+  readonly residualEncoding: typeof residualEncoding
+}
 
-const closureItemCache = (discovery: Instances.Discovery): Map<string, string> => {
+const closureItemCaches = new WeakMap<Instances.Discovery, ClosureItemCache>()
+
+const closureItemCache = (discovery: Instances.Discovery): ClosureItemCache => {
   let cache = closureItemCaches.get(discovery)
   if (cache === undefined) {
-    cache = new Map()
+    cache = {
+      digests: new Map(),
+      instanceEncoding: memoizedInstanceEncoding(),
+      edgeEncoding: memoizedEncoding(edgeEncoding),
+      callableEncoding: memoizedEncoding(callableEncoding),
+      effectEncoding: memoizedEncoding(effectEncoding),
+      residualEncoding: memoizedEncoding(residualEncoding),
+    }
     closureItemCaches.set(discovery, cache)
   }
   return cache
@@ -145,6 +161,35 @@ const providerEncoding = (provider: Instances.CallProvider): string =>
     Type.key(provider.capability),
     Type.key(provider.providerType),
   ])
+
+// Execution closures revisit the same immutable discovery items. Cache their canonical text
+// before the digest cache so every test also avoids rebuilding shared nested encodings.
+const memoizedEncoding = <A extends object>(
+  encode: (value: A) => string,
+): ((value: A) => string) => {
+  const cache = new WeakMap<A, string>()
+  return (value) => {
+    let encoded = cache.get(value)
+    if (encoded === undefined) {
+      encoded = encode(value)
+      cache.set(value, encoded)
+    }
+    return encoded
+  }
+}
+
+const memoizedInstanceEncoding = (): typeof instanceEncoding => {
+  const cache = new WeakMap<Instances.Instance, { authored: string; encoding: string }>()
+  return (instance, authored) => {
+    const cached = cache.get(instance)
+    // Authored attribution comes from the caller's results, which can change independently of
+    // the discovery frontier. Validate it on every closure before reusing this item's encoding.
+    if (cached !== undefined && cached.authored === authored) return cached.encoding
+    const encoding = instanceEncoding(instance, authored)
+    cache.set(instance, { authored, encoding })
+    return encoding
+  }
+}
 
 const instanceEncoding = (instance: Instances.Instance, authored: string): string =>
   Canonical.record('Instance', [
@@ -477,26 +522,27 @@ const executionEncoding = Effect.fnUntraced(function* (
   }
 
   const itemCache = closureItemCache(discovery)
+  const digestCache = itemCache.digests
   return {
     _tag: 'Complete',
     encoding: Canonical.record('ExecutionClosure.v4', [
       itemDigests(
-        itemCache,
+        digestCache,
         closure.instances.map((instance) =>
-          instanceEncoding(instance, authored.get(Instances.keyText(instance.key)) ?? ''),
+          itemCache.instanceEncoding(instance, authored.get(Instances.keyText(instance.key)) ?? ''),
         ),
       ),
-      itemDigests(itemCache, closure.edges.map(edgeEncoding)),
-      itemDigests(itemCache, closure.callables.map(callableEncoding)),
-      itemDigests(itemCache, closure.effects.map(effectEncoding)),
+      itemDigests(digestCache, closure.edges.map(itemCache.edgeEncoding)),
+      itemDigests(digestCache, closure.callables.map(itemCache.callableEncoding)),
+      itemDigests(digestCache, closure.effects.map(itemCache.effectEncoding)),
       itemDigests(
-        itemCache,
+        digestCache,
         closure.intrinsics.map((call) =>
           Canonical.record('Intrinsic', [Intrinsic.operationText(call.operation)]),
         ),
       ),
       itemDigests(
-        itemCache,
+        digestCache,
         closure.foreignCalls.map((call) =>
           Canonical.record('Foreign', [
             call.symbol,
@@ -505,10 +551,10 @@ const executionEncoding = Effect.fnUntraced(function* (
           ]),
         ),
       ),
-      itemDigests(itemCache, closure.residualBodies.map(residualEncoding)),
-      itemDigests(itemCache, constantEncodings),
-      itemDigests(itemCache, [...semanticTypeEncodings.values()].sort(Canonical.compare)),
-      itemDigests(itemCache, [...nominalTypeEncodings.values()].sort(Canonical.compare)),
+      itemDigests(digestCache, closure.residualBodies.map(itemCache.residualEncoding)),
+      itemDigests(digestCache, constantEncodings),
+      itemDigests(digestCache, [...semanticTypeEncodings.values()].sort(Canonical.compare)),
+      itemDigests(digestCache, [...nominalTypeEncodings.values()].sort(Canonical.compare)),
     ]),
   }
 })
