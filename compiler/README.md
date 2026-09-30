@@ -11,7 +11,11 @@ Field/index projections and slice Layout remain named coverage gaps for backend 
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
-Build invocation: `silkc build <source> -o <program> --stdlib <directory>`. The standard-library
+Build invocation: `silkc build <source> -o <program> --stdlib <directory>
+--optimization <none|speed> --debug <true|false>`.
+Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
+and published as the content-keyed profile input before source loading; the native corpus runner
+builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. The standard-library
 root contains `silk/`; it is an explicit CLI input. Standalone builds without standard-library
 imports may omit it. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Without a manifest, the entry file's directory is the module

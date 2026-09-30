@@ -353,3 +353,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · Compiler profiling could not use Codebase Memory because an unverified generation held the coordination lock · Inspect the worker log and use targeted source discovery while the existing generation remains active · compiler performance
 - 2026-09-29 · The Homebrew node@24 executable reported Node 26.5.0 during profiling · Record the actual runtime version and use the same executable for before/after comparisons; CI still validates on Node 24 · compiler performance
 - 2026-09-29 · Vitest 4 accepts --execArgv but rejects --setupFiles, and --logHeapUsage reports uncollected allocations · Supply temporary setupFiles through a merged config and expose GC in worker execArgv for retained-heap diagnostics · compiler performance
+
+- 2026-09-30 · U8b code graph indexing could not start while an unverified generation was active · Read the worker log, retain the active generation, and use scoped source reads · self-hosted CLI build profiles
