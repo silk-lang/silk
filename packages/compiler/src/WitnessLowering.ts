@@ -12,7 +12,7 @@ import type * as Intrinsic from './Intrinsic.js'
 import * as TypeInference from './internal/TypeInference.js'
 import { borrowKey } from './Lower.js'
 import type {} from './LowerExpression.js'
-import { lowerExpression } from './LowerExpression.js'
+import { captureCallOperand, lowerExpression } from './LowerExpression.js'
 import * as Mir from './Mir.js'
 import * as Scalar from './Scalar.js'
 import type * as SourceSpan from './SourceSpan.js'
@@ -191,7 +191,10 @@ export const lowerInterfaceOperands = (
         ordinal,
       }
     if (Type.runtimeKey(Mir.semanticType(actual)) === Type.runtimeKey(Mir.semanticType(expected))) {
-      lowered.push(value.result)
+      const captured = captureCallOperand(fn, value.result, argument.span)
+      if (captured === undefined)
+        return { _tag: 'InterfaceOperandLoweringFailure', reason: 'Argument', ordinal }
+      lowered.push(captured)
       continue
     }
     if (
@@ -578,7 +581,9 @@ export const lowerBuiltinArguments = (
       Type.equals(actual.type, callParameter) &&
       Type.equals(actual.type, primitiveParameter)
     if (!sharedScalarReference && !borrowedScalarValue) {
-      loweredArguments.push(lowered.result)
+      const captured = captureCallOperand(fn, lowered.result, argument.span)
+      if (captured === undefined) return undefined
+      loweredArguments.push(captured)
       continue
     }
     const type = fn.type(primitiveParameter)

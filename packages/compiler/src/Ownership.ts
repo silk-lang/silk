@@ -4934,6 +4934,36 @@ export const localSharedAccessBoundaryPlan = (
       : parameterOrdinals(initializer, bindings, new Set(seen).add(expression.binding.ordinal))
   }
   const functions = [...results.values()].flatMap((result) => result.tir.functions)
+  // Both fixed points inspect only call edges. Materialize those edges once instead of
+  // walking and allocating the complete expression trees on every propagation pass.
+  const callsByFunction = new Map<
+    Tir.TirFunction,
+    ReadonlyArray<Extract<Tir.Expression, { readonly _tag: 'Call' | 'BuiltinCall' }>>
+  >()
+  let hasAccessBoundary = false
+  for (const fn of functions) {
+    const calls: Array<Extract<Tir.Expression, { readonly _tag: 'Call' | 'BuiltinCall' }>> = []
+    const collect = (expression: Tir.Expression): void => {
+      if (
+        expression._tag === 'Call' ||
+        (expression._tag === 'BuiltinCall' && expression.operation === 'SharedWithMut')
+      ) {
+        calls.push(expression)
+        if (expression._tag === 'BuiltinCall') hasAccessBoundary = true
+      }
+      for (const child of Tir.expressionChildren(expression)) collect(child)
+    }
+    for (const statement of fn.statements)
+      for (const expression of Tir.statementExpressions(statement)) collect(expression)
+    callsByFunction.set(fn, calls)
+  }
+  // With no sealed access operation, neither propagation can produce a boundary.
+  if (!hasAccessBoundary)
+    return {
+      _tag: 'LocalSharedAccessBoundaryPlan',
+      boundaries: new Map(),
+      resultBoundaries: new Map(),
+    }
   let changed = true
   while (changed) {
     changed = false
@@ -4942,9 +4972,7 @@ export const localSharedAccessBoundaryPlan = (
       const owner = localSharedTargetKey(fn.declaration.canonical.id)
       const ordinals = callbackOrdinals.get(owner) ?? new Set<number>()
       const bindings = bindingsOf(fn)
-      for (const expression of fn.statements
-        .flatMap(Tir.statementExpressions)
-        .flatMap(Tir.expressionTree)) {
+      for (const expression of callsByFunction.get(fn) ?? []) {
         let boundaryOrdinals: ReadonlySet<number> | undefined
         let arguments_: ReadonlyArray<Tir.Expression> | undefined
         if (expression._tag === 'BuiltinCall' && expression.operation === 'SharedWithMut') {
@@ -4988,9 +5016,7 @@ export const localSharedAccessBoundaryPlan = (
   }
   for (const fn of functions) {
     const bindings = bindingsOf(fn)
-    for (const expression of fn.statements
-      .flatMap(Tir.statementExpressions)
-      .flatMap(Tir.expressionTree)) {
+    for (const expression of callsByFunction.get(fn) ?? []) {
       let ordinals: ReadonlySet<number> | undefined
       let arguments_: ReadonlyArray<Tir.Expression> | undefined
       if (expression._tag === 'BuiltinCall' && expression.operation === 'SharedWithMut') {
@@ -5028,9 +5054,7 @@ export const localSharedAccessBoundaryPlan = (
       if (fn.declaration.canonical._tag !== 'Canonical') continue
       const inherited = boundaries.get(localSharedTargetKey(fn.declaration.canonical.id))
       if (inherited === undefined || inherited.length === 0) continue
-      for (const expression of fn.statements
-        .flatMap(Tir.statementExpressions)
-        .flatMap(Tir.expressionTree)) {
+      for (const expression of callsByFunction.get(fn) ?? []) {
         if (expression._tag !== 'Call') continue
         const key = localSharedTargetKey(expression.target)
         const existing = boundaries.get(key) ?? []

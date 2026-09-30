@@ -1,5 +1,5 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
-import { narrowEffectRecord } from './support/corpus.js'
+import { corpus, narrowEffectRecord } from './support/corpus.js'
 import { outputStorageSource } from './support/corpus.js'
 import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
@@ -63,6 +63,35 @@ const operationRegion = (region: Mir.Region | undefined): Mir.OperationRegion =>
   if (region?._tag !== 'OperationRegion') throw new Error('expected an operation region')
   return region
 }
+
+it.effect('captures by-value call arguments before later arguments mutate their source', () =>
+  Effect.gen(function* () {
+    const program =
+      corpus.find((entry) => entry.name === 'scalar-reference-argument-order') ??
+      raise('expected argument-order corpus case')
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'mir/call-argument-order',
+      ascii(program.source),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    for (const mode of ['debug', 'release'] as const) {
+      const artifact = yield* Analysis.codegen(snapshot, { mode })
+      const main =
+        artifact.ir.match(
+          /define[^\n]+@silk_mir_call_argument_order_main[^\n]+\n([\s\S]*?)\n}/,
+        )?.[1] ?? raise('expected main LLVM body')
+      const mutation = main.indexOf('call i32 @silk_mir_call_argument_order_change')
+      const first =
+        main.match(/call i32 @silk_mir_call_argument_order_add[^\n]*\(i32 ([^,]+),/)?.[1] ??
+        raise('expected first argument')
+      assert.isAtLeast(mutation, 0)
+      if (first === '20') continue
+      const capture = main.indexOf(`${first} =`)
+      assert.isAtLeast(capture, 0)
+      assert.isBelow(capture, mutation, `${mode}: first argument must be read before change`)
+    }
+  }),
+)
 
 it.effect('reads borrowed match scalars before lowering builtin value operations', () =>
   Effect.gen(function* () {
