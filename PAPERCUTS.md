@@ -363,3 +363,8 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
+
+- 2026-09-30 · M2.4 review-fix graph indexing hit the active-generation guard · Confirmed the worker log and used targeted source reads without disturbing the other indexer · self-hosted compiler
+- 2026-09-30 · A nested origin assertion misparsed the next Option arm after an escaped-text lookup and failed CI repeatedly · Hoist the needle, lookup, and match result into named locals; check the SemanticCases root with the current bootstrap before pushing · M2.4 static evaluation
+- 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
+- 2026-09-30 · The resolved arity guard exposed demand roots that built empty applications for elided lifetimes · Complete root lifetime arguments from the selected signature and owned static values, then use the same application validation as source calls · M2.4 static evaluation
