@@ -381,3 +381,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
 
 - 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler
+
+- 2026-09-30 · A temporary SemanticCases check root inferred compiler/src/semantic as the module source root and had no main · Check through a temporary compiler/src wrapper importing SemanticCases with a main, then remove both temporary files · B9 runtime slice frontend checks
+
+- 2026-09-30 · Allocator provision on an outer Shared.make did not cover allocations evaluated in its argument fields (SEM0071) · Allocate and provide each child before constructing the descriptor type; bounded frontend check caught it before push · B9 runtime slice structured snapshot

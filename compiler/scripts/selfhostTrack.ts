@@ -24,4 +24,6 @@ export const selfhostTrack = [
   'mutable-array-loop',
   'usize-array-roundtrip',
   'algorithm-sieve',
+  'runtime-indexed-subplace-borrow',
+  'short-circuit-counting',
 ] as const satisfies ReadonlyArray<string>
