@@ -2,9 +2,14 @@
 
 This directory contains the self-hosted lexer, parser, HIR lowering, semantic queries, and the
 first demanded ordinary-body checks.
-The current executable reads one Silk file and prints its flat AST and syntax diagnostics, or its
-lowered module and declaration fingerprints in `hir` mode. It does not yet perform name resolution,
-type checking, or code generation on that input. The TypeScript bootstrap compiler still builds it.
+The inspection modes read one Silk file and print its flat AST and syntax diagnostics, or its
+lowered module and declaration fingerprints in `hir` mode. The `build` mode demands semantic facts,
+MIR, scalar/address Layout, and LLVM emission for a limited closed-body subset. Shared and mutable
+scalar references, dereference reads and stores, and receiver auto-borrows are supported. Raw-pointer
+dereference requires an explicit lexical `unsafe` boundary, including inside an `unsafe fn`.
+Field/index projections and slice Layout remain named coverage gaps for backend roadmap step 4.
+Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
+reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
 ## Development branches and bootstrap
 
