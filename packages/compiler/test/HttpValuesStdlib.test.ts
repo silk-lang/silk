@@ -5,11 +5,15 @@ import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as CleanupPlan from '../src/CleanupPlan.js'
 import * as Intrinsic from '../src/Intrinsic.js'
+import * as Lexer from '../src/Lexer.js'
+import * as Parser from '../src/Parser.js'
+import * as SyntaxTree from '../src/SyntaxTree.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Stdlib from '../src/Stdlib.js'
 import * as Projections from './support/projections.js'
+import { unreachable } from './support/raise.js'
 import { httpValuesAcceptanceSource } from './support/httpValuesAcceptance.js'
 import {
   httpRedirectAffineDiagnosticSource,
@@ -406,3 +410,55 @@ it.effect(
     }),
   120_000,
 )
+
+it('declares native HTTP providers unconditionally and rejects unsupported use inside bodies', () => {
+  const module =
+    Stdlib.find('silk/http_client_native') ?? unreachable('expected HTTP native source')
+  const syntax = Parser.parse(Lexer.lex(SourceFile.make(module.module, module.bytes)))
+  assert.deepEqual(syntax.lexicalDiagnostics, [])
+  assert.deepEqual(syntax.parserDiagnostics, [])
+  const declarations = syntax.root.children.filter(SyntaxTree.isNode)
+  assert.isFalse(declarations.some((node) => node.kind === 'StaticConditionalDeclaration'))
+  const decode = new TextDecoder()
+  const named = (name: string): SyntaxTree.Node =>
+    declarations.find((node) => {
+      const token = SyntaxTree.tokens(node).find((token) => token.kind === 'Identifier')
+      return (
+        token !== undefined &&
+        decode.decode(module.bytes.subarray(token.span.start, token.span.end)) === name
+      )
+    }) ?? unreachable(`expected declaration ${name}`)
+  for (const [name, kind] of [
+    ['NativeTransport', 'StructDeclaration'],
+    ['NativeRouteProvider', 'StructDeclaration'],
+    ['acquireOwned', 'FunctionDeclaration'],
+  ] as const) {
+    const declaration = named(name)
+    assert.strictEqual(declaration.kind, kind)
+    assert.isTrue(
+      declaration.children.some(
+        (child) => SyntaxTree.isToken(child) && child.kind === 'PubKeyword',
+      ),
+    )
+  }
+  const preflight = named('preflight')
+  const body =
+    preflight.children.filter(SyntaxTree.isNode).find((node) => node.kind === 'Block') ??
+    unreachable('expected preflight body')
+  const guard =
+    body.children
+      .filter(SyntaxTree.isNode)
+      .find((node) => node.kind === 'StaticConditionalStatement') ??
+    unreachable('expected body-level platform guard')
+  const branches = guard.children.filter(SyntaxTree.isNode).filter((node) => node.kind === 'Block')
+  assert.strictEqual(branches.length, 2)
+  const rejected = branches.at(-1) ?? unreachable('expected unsupported branch')
+  const descendants = (node: SyntaxTree.Node): ReadonlyArray<SyntaxTree.Node> => [
+    node,
+    ...node.children.filter(SyntaxTree.isNode).flatMap(descendants),
+  ]
+  assert.strictEqual(
+    descendants(rejected).filter((node) => node.kind === 'CompileErrorExpression').length,
+    1,
+  )
+})

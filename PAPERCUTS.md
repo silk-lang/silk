@@ -368,3 +368,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · A nested origin assertion misparsed the next Option arm after an escaped-text lookup and failed CI repeatedly · Hoist the needle, lookup, and match result into named locals; check the SemanticCases root with the current bootstrap before pushing · M2.4 static evaluation
 - 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
 - 2026-09-30 · The resolved arity guard exposed demand roots that built empty applications for elided lifetimes · Complete root lifetime arguments from the selected signature and owned static values, then use the same application validation as source calls · M2.4 static evaluation
+
+- 2026-09-30 · Existing compiler dist generated older synthesized lifetime signatures for B13 documentation, despite fresh source bytes · Preserve current-base signatures for unchanged APIs and let exact-head documentation CI validate; do not rebuild the compiler locally · B13 stdlib platform migration
+
+- 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
