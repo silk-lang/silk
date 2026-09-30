@@ -4,4 +4,7 @@ export const selfhostTrack = [
   'foreign-libc-abs',
   'foreign-libc-pointer-roundtrip',
   'foreign-libc-floating',
+  'scalar-reference-read',
+  'scalar-reference-write-through',
+  'scalar-reference-argument-order',
 ] as const satisfies ReadonlyArray<string>
