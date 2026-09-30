@@ -75,8 +75,8 @@ validation starts a real query and records `Reuse`; it does not count as a `Hit`
 queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
 reads and name observations. The focused source-written M1 checks use these records to prove
-avoided provider reads and semantic demands; they do not measure speed. This API is not wired into
-the inspection executable above.
+avoided provider reads and semantic demands; they do not measure speed. The native `build`
+mode consumes these demanded facts for its documented closed-body subset.
 
 The current semantic subset resolves local names, ordinary namespace imports, selective imports,
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
@@ -317,8 +317,9 @@ only the result's own environment.
 `fn nested() -> Effect<'static; Effect<i32>>` leaves the inner environment without a default, and
 callables and Effects nested inside callables need their environments written. Invalid or unknown
 lifetimes and pointer qualifiers have anchored rejections. Written `[T; N]` arrays
-retain the exact non-negative decimal literal extent and element type, including at zero length;
-extents needing static execution remain `Unsupported` at their source span. A member type request
+retain the exact non-negative decimal extent and element type, including at zero length. Extents
+execute checked static expressions, including arithmetic, constants selected through imports, and
+static calls; the final non-negative integer must fit the selected target's pointer width. A member type request
 that elides a generated field lifetime is `Unsupported` until applications substitute generated
 lifetimes into member types. No machine layout fact is inspected. Unused declarations
 with these forms are still indexed as written
@@ -327,10 +328,12 @@ names and do not require semantic resolution.
 Constants have two separate facts. `Semantic.demandConstant` resolves only the written type, which
 must be `bool`, `char`, an integer or floating-point primitive, or `string`, whose omitted lifetime is
 `'static`. Any other type is `InvalidConstant`, and the initializer is never read; an omitted
-annotation is a syntax error. `Semantic.demandInitializer` first demands that type, then publishes a value only when no
-static execution is needed: an exact `bool` literal, or a fixed-width integer literal that fits the
-declared type and any suffix. A bare name of another constant, in the same module or selected by an
-import, demands that constant's type and then its value. For example:
+annotation is a syntax error. `Semantic.demandInitializer` first demands that type, checks the
+initializer against it, then executes the checked static expression. It publishes canonical bool,
+character, fixed-width or target-sized integer, floating-point, and UTF-8 text values. Supported
+expressions include operators, local or namespace-qualified constant references, and calls to
+checked static functions, including canonical inherent helpers. A reference to another constant
+demands its type before its value. For example:
 
 ```silk,ignore
 const limit: u8 = 255
@@ -341,14 +344,18 @@ const second: i32 = first
 
 `copied` has the value 255, while the value demands of `first` and `second` reject with a `Cycle`,
 each at its own reference to the other, whichever is demanded first; their `i32` types remain
-available. A literal of the wrong kind or out of range is `InvalidConstant`, and a constant of a
-different type is `TypeMismatch`. Every other initializer is an anchored `Unsupported` with no
-value: floating-point, text, and character literals, pointer-sized integers (whose range belongs to
-the selected target), namespace-qualified names, calls to static functions, operators, and names of
-non-constant declarations. Static evaluation of those forms, target selection, foreign `static`
-data, and package parameters are later work. Array extents do not read constants yet. A function
-body that names a module declaration without a local binding, such as `return limit`, looks the name
-up and rejects `Unsupported` at the use; only an absent name is `UnknownName`.
+available. A literal of the wrong kind or out of range rejects at its authored span, and a constant of a
+different type is `TypeMismatch`. Runtime calls are `StaticPhaseViolation`; an unsupported checked
+expression publishes no value. Static execution records reached body and initializer dependencies
+and enforces step, depth, and retained-value limits, including retained text provenance. Returned
+text aliases preserve their original authored spans.
+
+The sealed `Intrinsic` surface supplies target and final-profile facts and static text operations.
+One explicit final build profile controls selected static-if arms; inactive arms contribute no
+annotation, call, or body demands. Authored generic/evidence execution, nominal resource safety,
+profile predicates, and validated static-query reuse remain explicitly deferred. Foreign `static`
+data is outside this initializer path. The native CLI/backend coverage remains the limited subset
+listed at the beginning of this document.
 
 `Semantic.demandBody` checks one requested ordinary function body against its written signature.
 It accepts fixed-width integer, `bool`, and unit literals, by-value parameter reads and whole-value

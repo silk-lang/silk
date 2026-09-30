@@ -987,6 +987,12 @@ pub struct Semantic {
   query: Query<Word, Answer, NoRejection>
 }
 
+/// An owned snapshot of one checked direct call's canonical selection.
+pub struct StaticCall {
+  pub declaration: DeclarationId
+  pub arguments: Vector<Argument>
+}
+
 /// A short loan of an active semantic query for static call resolution.
 /// Its dependency ledger is the caller's ledger, including an in-flight initializer.
 pub struct StaticPort<'source> {
@@ -21159,6 +21165,88 @@ effect fn checkConditional(
   )
 }
 
+struct BodyFacts {
+  annotations: Vector<ResolvedAnnotation>
+  calls: Vector<ResolvedCall>
+}
+
+// Prepare ordinary facts only for syntax reached by the enclosing body or selected static arm.
+effect fn resolveBodyFacts(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  moduleOrdinal: usize,
+  declaration: usize,
+  annotationIds: &Vector<HirId>,
+  writtenCalls: &Vector<CallSyntax>,
+) -> Result<BodyFacts, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let mut annotations = Vector.make<ResolvedAnnotation>()
+  let template = run templateBinders(&mut resolver.*, module, declaration)
+  let binders = match move template {
+    Result<Vector<Binder>, Shared<Rejection>>.Success {value} => move value
+    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<BodyFacts, Shared<Rejection>>(move error)
+    }
+  }
+  let mut noElision = LifetimeElision {
+    owner: run declarationAt(&mut resolver.*, module, declaration),
+    nextOrdinal: Vector.length<Binder>(&binders),
+    output: false,
+    resultDefault: Option.none<Shared<Lifetime>>(),
+    generated: Vector.make<Shared<Lifetime>>(),
+    invocation: false,
+    nested: false,
+    renumber: Vector.make<usize>(),
+    staticEnvironment: false,
+    supplied: Option.none<Vector<Argument>>(),
+    assumptions: Option.none<Vector<Constraint>>(),
+  }
+  let writtenAnnotations = Vector.asSlice<HirId>(annotationIds)
+  let mut annotationAt = usize.ZERO
+  while annotationAt < writtenAnnotations.length {
+    let id = writtenAnnotations[annotationAt]
+    let result = run resolveType(
+      &mut resolver.*,
+      &mut owner.*,
+      &mut dependencies.*,
+      moduleOrdinal,
+      id,
+      Vector.asSlice<Binder>(&binders),
+      &mut noElision,
+    )
+    run Vector.append<ResolvedAnnotation>(
+      &mut annotations,
+      ResolvedAnnotation {id: id, result: move result},
+    )
+    annotationAt = annotationAt + usize.ONE
+  }
+  let mut resolvedCalls = Vector.make<ResolvedCall>()
+  let callSyntax = Vector.asSlice<CallSyntax>(writtenCalls)
+  let mut callAt = usize.ZERO
+  while callAt < callSyntax.length {
+    let result = run callTarget(
+      &mut resolver.*,
+      &mut owner.*,
+      &mut dependencies.*,
+      module,
+      moduleOrdinal,
+      &callSyntax[callAt],
+      Vector.asSlice<Binder>(&binders),
+    )
+    run Vector.append<ResolvedCall>(
+      &mut resolvedCalls,
+      ResolvedCall {id: callSyntax[callAt].id, result: move result},
+    )
+    callAt = callAt + usize.ONE
+  }
+  return Result.succeed<BodyFacts, Shared<Rejection>>(
+    BodyFacts {annotations: move annotations, calls: move resolvedCalls},
+  )
+}
+
 effect fn checkStaticConditional(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -21219,13 +21307,43 @@ effect fn checkStaticConditional(
     }
     let mut selectedArm = HirRef.absent()
     if chooseThen { selectedArm = HirRef.of(thenBranch) } else { selectedArm = elseBranch }
+    let mut annotationIds = Vector.make<HirId>()
+    let mut writtenCalls = Vector.make<CallSyntax>()
+    let mut declaration = usize.MAX
+    if let Option<&IndexedSource>.Some {value: indexed} = move SourceIndex.sourceAtCursor(&resolver.source, cursor) {
+      let hir = IndexedSource.authored(indexed)
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        if DeclarationId.equals(&declarations[at].identity, caller) { declaration = at }
+        at = at + usize.ONE
+      }
+      if selectedArm.present {
+        if let Node.Block {statements} = Module.node(hir, selectedArm.id) {
+          run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls)
+        }
+      }
+    }
+    if declaration == usize.MAX { fail InvalidModulePath {} }
+    let moduleOrdinal = knownModuleOrdinal(&resolver.*, module)
+    let resolved = run resolveBodyFacts(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+      moduleOrdinal, declaration, &annotationIds, &writtenCalls,
+    )
+    let BodyFacts {annotations: selectedAnnotations, calls: selectedCalls} = match move resolved {
+      Result<BodyFacts, Shared<Rejection>>.Success {value} => value
+      Result<BodyFacts, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<CheckedControl, Shared<Rejection>>(move error)
+      }
+    }
     let mut retained = Vector.make<BodyNodeId>()
     let mut canComplete = true
     if selectedArm.present {
       let checked = match run bodyNode(&resolver.source, cursor, selectedArm.id) {
         Node.Block {..} => run checkBlock(
           &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
-          module, cursor, caller, &mut locals.*, annotations, calls, &mut nodes.*,
+          module, cursor, caller, &mut locals.*, Vector.asSlice<ResolvedAnnotation>(&selectedAnnotations),
+          Vector.asSlice<ResolvedCall>(&selectedCalls), &mut nodes.*,
           &mut signatures.*, &mut requiredBodies.*, selectedArm.id, resultType,
           constraints, contractBody, staticBody, loopDepth, unsafeAllowed,
         )
@@ -24131,64 +24249,15 @@ effect fn resolveBody(
       }
     }
   }
-  let mut annotations = Vector.make<ResolvedAnnotation>()
-  let template = run templateBinders(&mut resolver.*, &module, key.declaration)
-  let binders = match move template {
-    Result<Vector<Binder>, Shared<Rejection>>.Success {value} => move value
-    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+  let facts = run resolveBodyFacts(
+    &mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module,
+    key.declaration, &annotationIds, &writtenCalls,
+  )
+  let BodyFacts {annotations, calls: resolvedCalls} = match move facts {
+    Result<BodyFacts, Shared<Rejection>>.Success {value} => value
+    Result<BodyFacts, Shared<Rejection>>.Failure {error} => {
       return rejectedBody(move error, move dependencies)
     }
-  }
-  let mut noElision = LifetimeElision {
-    owner: run declarationAt(&mut resolver.*, &module, key.declaration),
-    nextOrdinal: Vector.length<Binder>(&binders),
-    output: false,
-    resultDefault: Option.none<Shared<Lifetime>>(),
-    generated: Vector.make<Shared<Lifetime>>(),
-    invocation: false,
-    nested: false,
-    renumber: Vector.make<usize>(),
-    staticEnvironment: false,
-    supplied: Option.none<Vector<Argument>>(),
-    assumptions: Option.none<Vector<Constraint>>(),
-  }
-  let writtenAnnotations = Vector.asSlice<HirId>(&annotationIds)
-  let mut annotationAt = usize.ZERO
-  while annotationAt < writtenAnnotations.length {
-    let id = writtenAnnotations[annotationAt]
-    let result = run resolveType(
-      &mut resolver.*,
-      &mut owner.*,
-      &mut dependencies,
-      key.module,
-      id,
-      Vector.asSlice<Binder>(&binders),
-      &mut noElision,
-    )
-    run Vector.append<ResolvedAnnotation>(
-      &mut annotations,
-      ResolvedAnnotation {id: id, result: move result},
-    )
-    annotationAt = annotationAt + usize.ONE
-  }
-  let mut resolvedCalls = Vector.make<ResolvedCall>()
-  let callSyntax = Vector.asSlice<CallSyntax>(&writtenCalls)
-  let mut callAt = usize.ZERO
-  while callAt < callSyntax.length {
-    let result = run callTarget(
-      &mut resolver.*,
-      &mut owner.*,
-      &mut dependencies,
-      &module,
-      key.module,
-      &callSyntax[callAt],
-      Vector.asSlice<Binder>(&binders),
-    )
-    run Vector.append<ResolvedCall>(
-      &mut resolvedCalls,
-      ResolvedCall {id: callSyntax[callAt].id, result: move result},
-    )
-    callAt = callAt + usize.ONE
   }
   let prepared = match move sourceOf(&resolver.*, &sourceAnswer, &module) {
     Option<&IndexedSource>.Some {value: indexed} => run prepareBody(
@@ -27384,6 +27453,82 @@ impl<'source> StaticPort<'source> {
     let answer = run source(&mut self.resolver.*, module)
     return run SourceIndex.authoredCursor(&mut self.resolver.*.source, &answer, module)
   }
+  /// Copies a source call's checked identity and arguments without resolving its spelling again.
+  pub effect fn copyDirectCall(self: &mut Self, body: &Shared<TypedBody>, syntax: HirId) -> Option<StaticCall>
+  ! Cycle | InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+    let node = Shared.with<TypedBody, usize>(body, fn(checked: &TypedBody) -> usize {
+      let nodes = TypedBody.nodeSlice(checked)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        if nodes[at].origin.syntax.index == syntax.index {
+          if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {..}, ..} = &nodes[at].kind {
+            return at
+          }
+        }
+        at = at + usize.ONE
+      }
+      return usize.MAX
+    })
+    if node == usize.MAX { return Option.none<StaticCall>() }
+    let moduleOrdinal = Shared.with<TypedBody, usize>(body, fn(checked: &TypedBody) -> usize {
+      let nodes = TypedBody.nodeSlice(checked)
+      if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {declaration, ..}, ..} = &nodes[node].kind {
+        return knownModuleOrdinal(&self.resolver.*, DeclarationId.moduleId(&declaration))
+      }
+      return usize.MAX
+    })
+    if moduleOrdinal == usize.MAX { return Option.none<StaticCall>() }
+    let module = run resolvedModule(&self.resolver.*, moduleOrdinal)
+    let sourceAnswer = run source(&mut self.resolver.*, &module)
+    let mut selected = Option.none<DeclarationId>()
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&self.resolver.*, &sourceAnswer, &module) {
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        let matches = Shared.with<TypedBody, bool>(body, fn(checked: &TypedBody) -> bool {
+          let nodes = TypedBody.nodeSlice(checked)
+          if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {declaration, ..}, ..} = &nodes[node].kind {
+            return DeclarationId.equals(&declaration, &declarations[at].identity)
+          }
+          return false
+        })
+        if matches {
+          selected = Option.some<DeclarationId>(run DeclarationId.copy(&declarations[at].identity))
+          break
+        }
+        at = at + usize.ONE
+      }
+    }
+    let declaration = match move selected {
+      Option<DeclarationId>.Some {value} => value
+      Option<DeclarationId>.None => { return Option.none<StaticCall>() }
+    }
+    let count = Shared.with<TypedBody, usize>(body, fn(checked: &TypedBody) -> usize {
+      let nodes = TypedBody.nodeSlice(checked)
+      if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {genericArguments, ..}, ..} = &nodes[node].kind {
+        return Vector.length<Argument>(&genericArguments)
+      }
+      return usize.ZERO
+    })
+    let mut arguments = Vector.make<Argument>()
+    let mut at = usize.ZERO
+    while at < count {
+      let argument = Shared.with<TypedBody, Option<Argument>>(body, fn(checked: &TypedBody) -> Option<Argument> {
+        let nodes = TypedBody.nodeSlice(checked)
+        if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {genericArguments, ..}, ..} = &nodes[node].kind {
+          let values = Vector.asSlice<Argument>(&genericArguments)
+          return Option.some<Argument>(copyArgument(&values[at]))
+        }
+        return Option.none<Argument>()
+      })
+      if let Option<Argument>.Some {value} = move argument {
+        run Vector.append<Argument>(&mut arguments, move value)
+      }
+      at = at + usize.ONE
+    }
+    return Option.some<StaticCall>(StaticCall {declaration: move declaration, arguments: move arguments})
+  }
+
   /// Demands the exact reached body through the active query and records its dependency edge.
   pub effect fn demandBody(self: &mut Self, declaration: &DeclarationId, span: Span) -> Option<
     Shared<Result<Answer, NoRejection>>,
