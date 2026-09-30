@@ -4,6 +4,7 @@ export const selfhostTrack = [
   'foreign-libc-abs',
   'foreign-libc-pointer-roundtrip',
   'foreign-libc-floating',
+  'sealed-scalar-intrinsics',
   'scalar-reference-read',
   'scalar-reference-write-through',
   'scalar-reference-argument-order',

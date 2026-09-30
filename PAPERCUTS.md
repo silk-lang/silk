@@ -355,6 +355,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · The Homebrew node@24 executable reported Node 26.5.0 during profiling · Record the actual runtime version and use the same executable for before/after comparisons; CI still validates on Node 24 · compiler performance
 - 2026-09-29 · Vitest 4 accepts --execArgv but rejects --setupFiles, and --logHeapUsage reports uncollected allocations · Supply temporary setupFiles through a merged config and expose GC in worker execArgv for retained-heap diagnostics · compiler performance
 
+- 2026-09-30 · Adding a shared acceptance corpus case directly on selfhost failed the bootstrap provenance gate before compilation · Publish corpus fixtures on main first, then synchronize the landed main history into selfhost · B10 scalar primitives
 - 2026-09-30 · U8b code graph indexing could not start while an unverified generation was active · Read the worker log, retain the active generation, and use scoped source reads · self-hosted CLI build profiles
 
 - 2026-09-30 · U8b CI rejected a borrowed empty literal and an if expression used to choose Clang flags · Keep schema slices backed by an owned Vector and select flags with a normal conditional assignment · self-hosted CLI build profiles
@@ -362,3 +363,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
+
+- 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
