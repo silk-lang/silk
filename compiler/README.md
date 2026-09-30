@@ -81,7 +81,10 @@ bytes and absent paths before reuse, so changed imported headers or newly presen
 affected facts and diagnostics against the new source. Unrelated source changes leave completed
 facts reusable. The source index retains completed presence or absence queries when their exact
 content observation agrees, including parsed syntax, authored HIR, and name indexes for unchanged
-files. Changed content releases its parsed unit; a same-path edit never reuses different bytes.
+files. Each parsed declaration also owns a lazy shared `BodyInput`: its exact source span and
+canonical header/body bytes are captured once for typed bodies, selected static roots, and reuse
+checks. Changed content releases its parsed unit and declaration inputs; a same-path edit never
+reuses different bytes.
 Previously issued authored cursors expire on every revision selection. A body can also retain its
 checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
 validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
