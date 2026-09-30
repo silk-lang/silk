@@ -4,10 +4,13 @@ This directory contains the self-hosted lexer, parser, HIR lowering, semantic qu
 first demanded ordinary-body checks.
 The inspection modes read one Silk file and print its flat AST and syntax diagnostics, or its
 lowered module and declaration fingerprints in `hir` mode. The `build` mode demands semantic facts,
-MIR, scalar/address Layout, and LLVM emission for a limited closed-body subset. Shared and mutable
+MIR, scalar/address/record Layout, and LLVM emission for a limited closed-body subset. Shared and mutable
 scalar references, dereference reads and stores, and receiver auto-borrows are supported. Raw-pointer
 dereference requires an explicit lexical `unsafe` boundary, including inside an `unsafe fn`.
-Field/index projections and slice Layout remain named coverage gaps for backend roadmap step 4.
+Record construction and field places retain written operand order and declaration-order byte offsets.
+Internal record calls copy parameters into callee storage and return through a caller-provided
+destination. Tuple/array/enum/union construction, index/slice projection and match remain the
+remaining coverage work for backend roadmap step 4.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
@@ -69,8 +72,11 @@ to the held revision, with no host file snapshot or mutable filesystem provider 
 `Semantic.revise` selects another immutable revision. The next demand validates retained source
 bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
 affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. A body can also retain its checked payload after a same-file or imported callee
-body edit when its own declaration and the semantic results it consumed still match. That
+facts reusable. The source index retains completed presence or absence queries when their exact
+content observation agrees, including parsed syntax, authored HIR, and name indexes for unchanged
+files. Changed content releases its parsed unit; a same-path edit never reuses different bytes.
+Previously issued authored cursors expire on every revision selection. A body can also retain its
+checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
 validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
 queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
