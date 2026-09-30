@@ -205,12 +205,11 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
   try {
     writeProgram(directory, program)
     const executable = join(directory, 'program')
-    const built = spawnSync(silkc, ['build', 'main.silk', '-o', 'program'], {
+    const built = spawnSync(silkc, [
+      'build', 'main.silk', '-o', 'program', '--stdlib',
+      fileURLToPath(new URL('../../packages/compiler/stdlib/', import.meta.url)),
+    ], {
       cwd: directory,
-      env: {
-        ...process.env,
-        SILKC_STDLIB: fileURLToPath(new URL('../../packages/compiler/stdlib/', import.meta.url)),
-      },
       encoding: 'utf8',
       timeout: processTimeoutMs,
       maxBuffer: 4 * 1024 * 1024,
