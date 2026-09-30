@@ -328,7 +328,19 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · B5 runner tests could not load Effect in the isolated worktree · Link its compiler node_modules to the prepared checkout and run the stub-only runner test with pinned Node24 · self-hosted compiler
 - 2026-09-29 · The workspace commit helper rejected an explicit file list while a merge was active · Stage the intended files and use the user-requested staged-only merge checkpoint without a files list · self-hosted compiler
 
+- 2026-09-29 · Concurrent full-manifest bootstrap checks exhausted the five-minute cap without diagnostics on the 32 GB Mac · Hold `/private/tmp/silk-build-slot.lock` with an owner marker for local checks; when busy, skip the concurrent check and use exact-head Linux CI as instructed by the coordinator · self-hosted backend
+- 2026-09-29 · The B6 full-manifest bootstrap check aborted at the default 4 GiB heap, and verified Node 24.18.1 with 6144 MiB reached the five-minute cap without diagnostics · The coordinator disabled local bootstrap checks after matching failures across agents; push and use exact-head Linux CI without holding the build slot · self-hosted backend
+- 2026-09-29 · The workspace commit helper rejected an explicit file list during a clean main merge as a partial merge commit · Stage the task changes with git add, then call ws.git.commit with userRequested and no files list to complete the staged merge checkpoint · self-hosted backend
 - 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
 
+- 2026-09-29 · An expanded C ABI assertion expected fneg for signed float literals, but HIR stores those literals as signed constants, causing a CI-only failure · Assert the exact emitted f32/f64 argument constants and keep foreign-header scans off ordinary signature queries · self-hosted backend
+
+- 2026-09-29 · A MIR assertion counted unique extern declarations even though repeated calls retain separate foreign edges · Assert foreign edge presence and an empty runtime-body worklist; declaration deduplication happens at final emission · self-hosted backend
 - 2026-09-29 · An inline effectful tuple copy inside a nested match argument reported PAR0001 in Linux CI even after simplifying its call · Use a statement-block arm with an explicit enclosing return, and verify the replacement head in CI · self-hosted compiler
+
+- 2026-09-29 · A direct-call test passed all assertions but exceeded the 1 s CI gate after B6 added repeated declaration/header queries and whole-source unsafe-prefix scans to ordinary calls · Retain foreign facts on the resolved call target and direct-prefix evidence during the existing syntax traversal; verify timing in exact-head Linux CI without dropping assertions · self-hosted backend
 - 2026-09-29 · The selfhost test-audit code graph worker could not start while an unverified generation was active · Used scoped source reads after checking the existing index-lock papercut · self-hosted compiler
+
+- 2026-09-29 · Copying optional prefix-span evidence from borrowed call syntax produced OWN0002/OWN0003 in Linux bootstrap CI · Copy the span through a borrowed Option match and inspect retained prefix evidence by borrow · self-hosted backend
+
+- 2026-09-30 · B6 integration parsed but CI rejected its ABI fixture pattern after B5 added BackendBuild.Module.uncheckedBodies · Match the text field with an explicit remaining-field pattern; parser-only merge audits do not prove typed pattern completeness · self-hosted backend
