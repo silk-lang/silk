@@ -6,11 +6,12 @@ import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.FinalProfile {FinalProfile}
 import semantic.Intrinsic {Member as IntrinsicMember, spelling as intrinsicSpelling}
+import semantic.Lifetime {Lifetime}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, IndexedDeclaration, ModuleIndex}
 import semantic.Query {Cycle}
 import semantic.Rejection {Rejection}
-import semantic.Semantic {Answer, Outcome, StaticPort, Value}
+import semantic.Semantic {Answer, Outcome, StaticCall, StaticPort, Value}
 import semantic.SourceIndex {AuthoredCursor, IndexedSource, NoRejection, RevisionMismatch}
 import semantic.SourceRevision {Observation}
 import semantic.SourceUnit {SourceUnit}
@@ -32,7 +33,7 @@ import semantic.StaticValue {
   Value as StaticData,
 }
 import semantic.Target {Target as MachineTarget}
-import semantic.Type {Argument, Type as SemanticType}
+import semantic.Type {Argument, RowParameter, Type as SemanticType}
 import semantic.TypedBody {Expression as CheckedExpression, NodeId as CheckedNodeId, NodeKind as CheckedNodeKind, TypedBody}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
@@ -161,6 +162,13 @@ pub fn checkedRoot(answer: &Result<Answer, NoRejection>) -> Option<CheckedRoot> 
   }
 }
 
+struct RetainedBinding {
+  module: ModuleId
+  binder: HirId
+  value: Shared<StaticData>
+  chargedBytes: usize
+}
+
 struct Local {
   binder: HirId
   mutable: bool
@@ -191,11 +199,7 @@ struct TextOrigin {
 struct Chosen {
   function: SelectedStaticFunction
   cursor: AuthoredCursor
-}
-
-struct CallSpelling {
-  namespace: Option<Bytes>
-  member: Bytes
+  signature: Shared<Result<Answer, NoRejection>>
 }
 
 struct FrameReservation<'a, 'source> {
@@ -229,7 +233,7 @@ pub struct Machine<'source> {
   retainedBytes: usize
   applications: Pool
   active: Vector<Frame>
-  supplied: Vector<Binding>
+  supplied: Vector<RetainedBinding>
   complete: Vector<Complete>
   textOrigins: Vector<TextOrigin>
 }
@@ -250,7 +254,7 @@ pub effect fn make<'source>(port: StaticPort<'source>, root: &ModuleId, limits: 
     retainedBytes: usize.ZERO,
     applications: Pool.make(),
     active: Vector.make<Frame>(),
-    supplied: Vector.make<Binding>(),
+    supplied: Vector.make<RetainedBinding>(),
     complete: Vector.make<Complete>(),
     textOrigins: Vector.make<TextOrigin>(),
   }
@@ -271,7 +275,7 @@ fn sharedDataAddress(value: &Shared<StaticData>) -> usize {
 
 /// Retains a text value's original authored span independently of its value identity.
 pub effect fn rememberTextOrigin<'source>(machine: &mut Machine<'source>, value: &Shared<StaticData>, span: Span) -> ()
-! OutOfMemoryError
+! Diagnostic | OutOfMemoryError
 ? &mut Allocator {
   let address = sharedDataAddress(value)
   let origins = Vector.asSlice<TextOrigin>(&machine.textOrigins)
@@ -280,11 +284,17 @@ pub effect fn rememberTextOrigin<'source>(machine: &mut Machine<'source>, value:
     if origins[at].address == address { return () }
     at = at + usize.ONE
   }
+  let bytes = retainedValueBytes(&machine.*, value)
+  if machine.retainedBytes > machine.limits.valueBytes || bytes > machine.limits.valueBytes - machine.retainedBytes {
+    return run reject(&machine.*, Fault.ValueLimit, span)
+  }
   run Vector.append<TextOrigin>(&mut machine.textOrigins, TextOrigin {
     address: address,
     value: Shared.clone<StaticData>(value),
     span: span,
   })
+  machine.retainedBytes = machine.retainedBytes + bytes
+  return ()
 }
 
 /// Finds the original authored span of a text value retained by this machine.
@@ -297,6 +307,19 @@ pub fn textOrigin<'source>(machine: &Machine<'source>, value: &Shared<StaticData
     at = at + usize.ONE
   }
   return Option.none<Span>()
+}
+
+// Provenance owns each text allocation until the machine is released. Aliases in supplied
+// bindings and completed calls share that charge rather than charging its bytes again.
+fn retainedValueBytes<'source>(machine: &Machine<'source>, value: &Shared<StaticData>) -> usize {
+  let address = sharedDataAddress(value)
+  let origins = Vector.asSlice<TextOrigin>(&machine.textOrigins)
+  let mut at = usize.ZERO
+  while at < origins.length {
+    if origins[at].address == address { return usize.ZERO }
+    at = at + usize.ONE
+  }
+  return Shared.with<StaticData, usize>(value, StaticValue.size)
 }
 
 fn copyCurrent<'source>(machine: &Machine<'source>) -> Option<AuthoredCursor> {
@@ -585,7 +608,7 @@ effect fn supplyBindings<'source>(machine: &mut Machine<'source>, bindings: &[Bi
 ? &mut Allocator {
   let mut at = usize.ZERO
   while at < bindings.length {
-    let supplied = Vector.asSlice<Binding>(&machine.supplied)
+    let supplied = Vector.asSlice<RetainedBinding>(&machine.supplied)
     let mut found = false
     let mut prior = usize.ZERO
     while prior < supplied.length {
@@ -600,14 +623,15 @@ effect fn supplyBindings<'source>(machine: &mut Machine<'source>, bindings: &[Bi
       prior = prior + usize.ONE
     }
     if !found {
-      let bytes = Shared.with<StaticData, usize>(&bindings[at].value, StaticValue.size)
+      let bytes = retainedValueBytes(&machine.*, &bindings[at].value)
       if machine.retainedBytes > machine.limits.valueBytes || bytes > machine.limits.valueBytes - machine.retainedBytes {
         return run reject(&machine.*, Fault.ValueLimit, Span.make(usize.ZERO, usize.ZERO))
       }
-      run Vector.append<Binding>(&mut machine.supplied, Binding {
+      run Vector.append<RetainedBinding>(&mut machine.supplied, RetainedBinding {
         module: run ModuleId.copy(&bindings[at].module),
         binder: bindings[at].binder,
         value: StaticValue.copy(&bindings[at].value),
+        chargedBytes: bytes,
       })
       machine.retainedBytes = machine.retainedBytes + bytes
     }
@@ -620,7 +644,7 @@ effect fn suppliedValue<'source>(machine: &Machine<'source>, id: HirId, target: 
 ! Diagnostic | OutOfMemoryError
 ? &mut Allocator {
   let module = run currentModule(machine)
-  let supplied = Vector.asSlice<Binding>(&machine.supplied)
+  let supplied = Vector.asSlice<RetainedBinding>(&machine.supplied)
   let mut at = supplied.length
   while at > usize.ZERO {
     at = at - usize.ONE
@@ -705,10 +729,10 @@ effect fn publish<'source>(
   value: &Shared<StaticData>,
   span: Span,
 ) -> () ! Diagnostic | OutOfMemoryError ? &mut Allocator {
-  let mut bytes = Shared.with<StaticData, usize>(value, StaticValue.size)
+  let mut bytes = retainedValueBytes(&machine.*, value)
   let mut at = usize.ZERO
   while at < args.length {
-    let argumentBytes = Shared.with<StaticData, usize>(&args[at], StaticValue.size)
+    let argumentBytes = retainedValueBytes(&machine.*, &args[at])
     bytes = match move usize.checkedAdd(bytes, argumentBytes) {
       Option<usize>.Some {value: total} => total
       Option<usize>.None => {
@@ -744,12 +768,6 @@ fn equal(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
-fn name(module: &Module, id: HirId) -> Option<&[u8]> {
-  return match Module.node(module, id) {
-    Node.Name {text} => Option.some<&[u8]>(Module.text(module, text))
-    _ => Option.none<&[u8]>()
-  }
-}
 
 fn staticTextOperation(member: IntrinsicMember) -> Option<StaticTextOperation> {
   if member == IntrinsicMember.StaticTextByteLength {
@@ -789,38 +807,6 @@ effect fn profileArgument<'source>(
     Option<Bytes>.Some {value: bytes} => move bytes
     Option<Bytes>.None => run reject(&machine.*, Fault.InvalidValue, span)
   }
-}
-
-effect fn callSpelling<'source>(machine: &Machine<'source>, callee: HirId, span: Span) -> CallSpelling
-! Diagnostic | OutOfMemoryError
-? &mut Allocator {
-  let hir = run authored(machine)
-  let called = Module.node(hir, callee)
-  if let Node.IdentifierExpression {name: written, binding} = called {
-    if binding.present {
-      if let Node.Declaration {..} = Module.node(hir, binding.id) {} else {
-        return run reject(machine, Fault.Unavailable, span)
-      }
-    }
-    if let Option<&[u8]>.Some {value} = move name(hir, written) {
-      return CallSpelling {namespace: Option.none<Bytes>(), member: run Bytes.copy(value)}
-    }
-  }
-  if let Node.FieldExpression {subject, field} = called {
-    if let Node.IdentifierExpression {name: namespaceName, binding} = Module.node(hir, subject) {
-      if !binding.present {
-        if let Option<&[u8]>.Some {value: namespace} = move name(hir, namespaceName) {
-          if let Option<&[u8]>.Some {value: member} = move name(hir, field) {
-            return CallSpelling {
-              namespace: Option.some<Bytes>(run Bytes.copy(namespace)),
-              member: run Bytes.copy(member),
-            }
-          }
-        }
-      }
-    }
-  }
-  return run reject(machine, Fault.Unavailable, span)
 }
 
 effect fn dispatchIntrinsic<'source>(
@@ -1256,6 +1242,35 @@ fn signatureType(answer: &Result<Answer, NoRejection>, parameter: Option<usize>)
   }
 }
 
+fn signatureApplicationArityMatches(answer: &Result<Answer, NoRejection>, count: usize) -> bool {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => match &value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => count ==
+        Vector.length<Shared<SemanticType>>(&signature.typeParameters) +
+        Vector.length<Shared<Lifetime>>(&signature.lifetimeParameters) +
+        Vector.length<RowParameter>(&signature.rowParameters)
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn rootLifetimeArgumentCount(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => match &value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => {
+        if Vector.length<Shared<SemanticType>>(&signature.typeParameters) != usize.ZERO ||
+          Vector.length<RowParameter>(&signature.rowParameters) != usize.ZERO {
+          return Option.none<usize>()
+        }
+        return Option.some<usize>(Vector.length<Shared<Lifetime>>(&signature.lifetimeParameters))
+      }
+      _ => Option.none<usize>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<usize>()
+  }
+}
+
 fn selectedSignatureType(
   answer: &Shared<Result<Answer, NoRejection>>,
   parameter: Option<usize>,
@@ -1577,21 +1592,38 @@ effect fn expressionFromSource<'source>(machine: &mut Machine<'source>, local: &
       let second = run expression(&mut machine.*, &mut local.*, right)
       return run applyInfix(&mut machine.*, operator, operatorAnchor, span, &first, &second)
     }
-    Node.CallExpression {callee, arguments, generics} => {
+    Node.CallExpression {arguments, ..} => {
       if let Option<IntrinsicMember>.Some {value: member} = move checkedIntrinsicMember(&machine.*, id) {
         return run dispatchIntrinsic(&mut machine.*, member, arguments, &mut local.*, span)
       }
-      if generics.present {
-        let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
-        failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
-        fail move failure
+      let checked = match move checkedBodyForExpression(&machine.*) {
+        Option<Shared<TypedBody>>.Some {value} => value
+        Option<Shared<TypedBody>>.None => {
+          let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+          failure.missing = Option.some<MissingFact>(MissingFact.CheckedBody)
+          fail move failure
+        }
       }
-      let written = run callSpelling(&machine.*, callee, span)
-      let caller = run currentModule(&machine.*)
-      let chosen = run choose(&mut machine.*, &caller, &written.namespace, Bytes.asSlice(&written.member), span)
-      let parameters = Vector.asSlice<HirId>(&chosen.function.parameters)
-      if parameters.length != arguments.length {
-        return run reject(&machine.*, Fault.InvalidHeader, span)
+      let copied = run Effect.result(StaticPort.copyDirectCall(&mut machine.port, &checked, id))
+      let call = match move copied {
+        Result<Option<StaticCall>, Cycle | InvalidModulePath | OutOfMemoryError>.Success {value} => match move value {
+          Option<StaticCall>.Some {value: selected} => selected
+          Option<StaticCall>.None => {
+            let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+            failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
+            fail move failure
+          }
+        }
+        Result<Option<StaticCall>, Cycle | InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          Cycle {} => run reject(&machine.*, Fault.Cycle, span)
+          InvalidModulePath {} => run reject(&machine.*, Fault.Unavailable, span)
+        }
+      }
+      let selectedName = run Bytes.copy(DeclarationId.spelling(&call.declaration))
+      let application = Application {
+        target: ApplicationTarget.Named {declaration: move call.declaration},
+        arguments: move call.arguments,
       }
       let mut values = Vector.make<Shared<StaticData>>()
       let mut at = usize.ZERO
@@ -1604,17 +1636,9 @@ effect fn expressionFromSource<'source>(machine: &mut Machine<'source>, local: &
         )
         at = at + usize.ONE
       }
-      let application = Application {
-        target: ApplicationTarget.Named {declaration: run DeclarationId.copy(&chosen.function.declaration)},
-        arguments: Vector.make<Argument>(),
-      }
-      return run demandSelected(
-        &mut machine.*,
-        move chosen,
-        &application,
-        Bytes.asSlice(&written.member),
-        Vector.asSlice<Shared<StaticData>>(&values),
-        span,
+      return run demandApplication(
+        &mut machine.*, &application, Bytes.asSlice(&selectedName),
+        Vector.asSlice<Shared<StaticData>>(&values), span,
       )
     }
     _ => run reject(&machine.*, Fault.Unavailable, span)
@@ -1629,7 +1653,7 @@ effect<'owner & 'env> fn evaluateCurrent<'owner, 'env, 'source>(
   run supplyBindings(&mut machine.*, bindings)
   let mut local = Vector.make<Local>()
   let value = run expression(&mut machine.*, &mut local, id)
-  let bytes = Shared.with<StaticData, usize>(&value, StaticValue.size)
+  let bytes = retainedValueBytes(&machine.*, &value)
   if machine.retainedBytes > machine.limits.valueBytes || bytes > machine.limits.valueBytes - machine.retainedBytes {
     return run reject(&machine.*, Fault.ValueLimit, Module.span(run authored(&machine.*), id))
   }
@@ -1659,7 +1683,7 @@ pub effect<'owner & 'env> fn evaluate<'owner, 'env, 'source>(
     Option<Shared<TypedBody>>.Some {value} => Option.some<Shared<TypedBody>>(Shared.clone<TypedBody>(&value))
     Option<Shared<TypedBody>>.None => Option.none<Shared<TypedBody>>()
   }
-  let suppliedBase = Vector.length<Binding>(&machine.supplied)
+  let suppliedBase = Vector.length<RetainedBinding>(&machine.supplied)
   machine.current = Option.some<AuthoredCursor>(move cursor)
   machine.rootBody = Option.some<Shared<TypedBody>>(Shared.clone<TypedBody>(&checked.body))
   let reservation = SourceReservation {
@@ -1674,15 +1698,14 @@ pub effect<'owner & 'env> fn evaluate<'owner, 'env, 'source>(
     return run evaluateCurrent(&mut resource.machine.*, bindings, id)
   }
   let release = effect fn(resource: &mut SourceReservation<'owner, 'source>) -> () {
-    let supplied = Vector.asSlice<Binding>(&resource.machine.*.supplied)
+    let supplied = Vector.asSlice<RetainedBinding>(&resource.machine.*.supplied)
     let mut at = resource.suppliedBase
     let mut releasedBytes = usize.ZERO
     while at < supplied.length {
-      let bytes = Shared.with<StaticData, usize>(&supplied[at].value, StaticValue.size)
-      releasedBytes = releasedBytes + bytes
+      releasedBytes = releasedBytes + supplied[at].chargedBytes
       at = at + usize.ONE
     }
-    Vector.truncate<Binding>(&mut resource.machine.*.supplied, resource.suppliedBase)
+    Vector.truncate<RetainedBinding>(&mut resource.machine.*.supplied, resource.suppliedBase)
     resource.machine.*.retainedBytes = resource.machine.*.retainedBytes - releasedBytes
     resource.machine.*.current = copyPrevious(&resource.previous)
     resource.machine.*.rootBody = match &resource.previousBody {
@@ -1879,23 +1902,17 @@ effect fn execute<'source>(
   return move returned
 }
 
-effect fn choose<'source>(
+effect fn chooseRoot<'source>(
   machine: &mut Machine<'source>,
   caller: &ModuleId,
-  namespace: &Option<Bytes>,
   selectedName: &[u8],
   callSpan: Span,
 ) -> Chosen
 ! Diagnostic | OutOfMemoryError
 ? &mut Allocator {
-  let attempted = match &namespace.* {
-    Option<Bytes>.Some {value} => run Effect.result(StaticPort.resolveDeclaration(
-      &mut machine.port, caller, Option.some<&[u8]>(Bytes.asSlice(&value)), selectedName, callSpan,
-    ))
-    Option<Bytes>.None => run Effect.result(StaticPort.resolveDeclaration(
-      &mut machine.port, caller, Option.none<&[u8]>(), selectedName, callSpan,
-    ))
-  }
+  let attempted = run Effect.result(StaticPort.resolveRootDeclaration(
+    &mut machine.port, caller, selectedName, callSpan,
+  ))
   let resolved = match move attempted {
     Result<Result<DeclarationId, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
     Result<Result<DeclarationId, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
@@ -1929,8 +1946,8 @@ effect fn chooseDeclaration<'source>(
     Option<&IndexedSource>.Some {value} => run StaticFunction.selectIndexed(value, declaration)
     Option<&IndexedSource>.None => { return run reject(&machine.*, Fault.Unavailable, callSpan) }
   }
-  return match move selected {
-    Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value} => Chosen {function: move value, cursor: move cursor}
+  let function = match move selected {
+    Result<SelectedStaticFunction, StaticHeaderRejection>.Success {value} => move value
     Result<SelectedStaticFunction, StaticHeaderRejection>.Failure {error} => {
       if error.fault == StaticHeaderFault.RuntimeFunction || error.fault == StaticHeaderFault.UnknownName {
         return run reject(&machine.*, Fault.Unavailable, callSpan)
@@ -1938,6 +1955,24 @@ effect fn chooseDeclaration<'source>(
       return run reject(&machine.*, Fault.InvalidHeader, error.span)
     }
   }
+  let attemptedSignature = run Effect.result(StaticPort.demandSignature(&mut machine.port, &function.declaration, callSpan))
+  let signature = match move attemptedSignature {
+    Result<Option<Shared<Result<Answer, NoRejection>>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => match move value {
+      Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} => answer
+      Option<Shared<Result<Answer, NoRejection>>>.None => {
+        let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
+        failure.missing = Option.some<MissingFact>(MissingFact.DeclaredType)
+        fail move failure
+      }
+    }
+    Result<Option<Shared<Result<Answer, NoRejection>>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      Cycle {} => run reject(&machine.*, Fault.Cycle, callSpan)
+      InvalidModulePath {} => run reject(&machine.*, Fault.Unavailable, callSpan)
+      RevisionMismatch {} => run reject(&machine.*, Fault.Unavailable, callSpan)
+    }
+  }
+  return Chosen {function: move function, cursor: move cursor, signature: move signature}
 }
 
 effect<'owner & 'env> fn demandSelected<'owner, 'env, 'source>(
@@ -1948,9 +1983,8 @@ effect<'owner & 'env> fn demandSelected<'owner, 'env, 'source>(
   args: &'env [Shared<StaticData>],
   callSpan: Span,
 ) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
-  let Chosen {function: selected, cursor} = move chosen
-  if !DeclarationId.equals(Application.bodyDeclaration(application), &selected.declaration) ||
-    Vector.length<Argument>(&application.arguments) != selected.generics.length {
+  let Chosen {function: selected, cursor, signature} = move chosen
+  if !DeclarationId.equals(Application.bodyDeclaration(application), &selected.declaration) {
     let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
     failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
     fail move failure
@@ -1987,22 +2021,15 @@ effect<'owner & 'env> fn demandSelected<'owner, 'env, 'source>(
       RevisionMismatch {} => run reject(&machine.*, Fault.Unavailable, callSpan)
     }
   }
-  let attemptedSignature = run Effect.result(StaticPort.demandSignature(&mut machine.port, &selected.declaration, callSpan))
-  let signature = match move attemptedSignature {
-    Result<Option<Shared<Result<Answer, NoRejection>>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => match move value {
-      Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} => answer
-      Option<Shared<Result<Answer, NoRejection>>>.None => {
-        let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
-        failure.missing = Option.some<MissingFact>(MissingFact.DeclaredType)
-        fail move failure
-      }
-    }
-    Result<Option<Shared<Result<Answer, NoRejection>>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
-      OutOfMemoryError {} => { fail OutOfMemoryError {} }
-      Cycle {} => run reject(&machine.*, Fault.Cycle, callSpan)
-      InvalidModulePath {} => run reject(&machine.*, Fault.Unavailable, callSpan)
-      RevisionMismatch {} => run reject(&machine.*, Fault.Unavailable, callSpan)
-    }
+  // Checked applications include elided lifetime binders as well as written generics.
+  // Validate against the same resolved signature that supplied those completed arguments.
+  let argumentCount = Vector.length<Argument>(&application.arguments)
+  if !Shared.with<Result<Answer, NoRejection>, bool>(&signature, fn(answer: &Result<Answer, NoRejection>) -> bool {
+    return signatureApplicationArityMatches(answer, argumentCount)
+  }) {
+    let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
+    failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
+    fail move failure
   }
   let identity = match move run Pool.intern(&mut machine.applications, application) {
     Option<Identity>.Some {value} => value.semantic
@@ -2061,7 +2088,9 @@ effect<'owner & 'env> fn demandSelected<'owner, 'env, 'source>(
   return run Effect.useReleaseNonParking(move reservation, move use, move release)
 }
 
-/// Demands a source-only nongeneric static function. The active frame is released on failure or interruption.
+/// Demands a static function without written generic parameters from owned static values.
+/// Elided lifetime arguments are completed before the shared application validation.
+/// The active frame is released on failure or interruption.
 pub effect<'owner & 'env> fn demand<'owner, 'env, 'source>(
   machine: &'owner mut Machine<'source>,
   selectedName: &'env [u8],
@@ -2069,16 +2098,32 @@ pub effect<'owner & 'env> fn demand<'owner, 'env, 'source>(
   callSpan: Span,
 ) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
   let caller = run ModuleId.copy(&machine.root)
-  let namespace = Option.none<Bytes>()
-  let chosen = run choose(&mut machine.*, &caller, &namespace, selectedName, callSpan)
+  let chosen = run chooseRoot(&mut machine.*, &caller, selectedName, callSpan)
   if chosen.function.generics.length > usize.ZERO {
     let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
     failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
     fail move failure
   }
+  let inferred = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&chosen.signature, rootLifetimeArgumentCount)
+  let lifetimeCount = match move inferred {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => {
+      let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
+      failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
+      fail move failure
+    }
+  }
+  let mut arguments = Vector.make<Argument>()
+  let mut at = usize.ZERO
+  while at < lifetimeCount {
+    // Static values retain their storage rather than borrowing from the demand caller.
+    let lifetime = run Shared.make<Lifetime>(Lifetime.Static)
+    run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move lifetime})
+    at = at + usize.ONE
+  }
   let application = Application {
     target: ApplicationTarget.Named {declaration: run DeclarationId.copy(&chosen.function.declaration)},
-    arguments: Vector.make<Argument>(),
+    arguments: move arguments,
   }
   return run demandSelected(move machine, move chosen, &application, selectedName, args, callSpan)
 }
@@ -2096,21 +2141,4 @@ pub effect<'owner & 'env> fn demandApplication<'owner, 'env, 'source>(
   }
   let chosen = run chooseDeclaration(&mut machine.*, Application.bodyDeclaration(application), callSpan)
   return run demandSelected(move machine, move chosen, application, selectedName, args, callSpan)
-}
-
-/// Executes the exact declaration selected by a checked direct call.
-pub effect<'owner & 'env> fn demandCheckedCall<'owner, 'env, 'source>(
-  machine: &'owner mut Machine<'source>,
-  expression: &'env CheckedExpression,
-  selectedName: &'env [u8],
-  args: &'env [Shared<StaticData>],
-  callSpan: Span,
-) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
-  let application = run Application.fromDirectCall(expression)
-  if let Option<Application>.Some {value} = move application {
-    return run demandApplication(move machine, &value, selectedName, args, callSpan)
-  }
-  let mut failure = run diagnostic(&machine.*, Fault.Unsupported, callSpan)
-  failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
-  fail move failure
 }
