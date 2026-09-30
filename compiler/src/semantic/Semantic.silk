@@ -22,7 +22,7 @@ import hir.Hir {
 }
 import backend.Gap {Code as GapCode, Gap as BackendGap}
 import backend.InstanceKey {InstanceKey}
-import backend.Layout {Layout as BackendLayout, TypeLayout}
+import backend.Layout {FieldInput as LayoutFieldInput, Layout as BackendLayout, Metrics as LayoutMetrics, TypeLayout}
 import backend.LlvmText
 import backend.Mir {Block as MirBlock, Local as MirLocal, MirFunction, Operand as MirOperand, Place as MirPlace, Projection as MirProjection, Rvalue as MirRvalue, Statement as MirStatement}
 import hir.Fingerprint
@@ -880,7 +880,7 @@ struct Resolver {
   source: SourceIndex
   target: MachineTarget
   mirValues: Vector<MirFunction>
-  layoutValues: Vector<BackendLayout>
+  layoutValues: Vector<Shared<BackendLayout>>
   instanceTexts: Vector<Bytes>
   instanceSymbols: Vector<Bytes>
   modules: Vector<ModuleId>
@@ -3485,7 +3485,7 @@ effect fn resolve(
     Family.ParameterSchema => run resolveParameterSchema(&mut resolver.*, &mut owner.*, key)
     Family.Body => run resolveBody(&mut resolver.*, &mut owner.*, key, move candidate)
     Family.Mir => run resolveMir(&mut resolver.*, &mut owner.*, key)
-    Family.Layout => run resolveLayout(&mut resolver.*, key)
+    Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.Instance => run resolveInstance(&mut resolver.*, &mut owner.*, key)
   }
 }
@@ -23153,22 +23153,99 @@ effect fn resolveMir(
   }
 }
 
-effect fn resolveLayout(resolver: &mut Resolver, key: Key) -> Answer
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
-? &mut Allocator {
+fn singleMemberType(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.MemberShape {types}} = &value.outcome {
+      let fields = Vector.asSlice<Shared<Type>>(&types)
+      if fields.length == usize.ONE { return Option.some<Shared<Type>>(Shared.clone<Type>(&fields[usize.ZERO])) }
+    }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+effect fn storeLayout(resolver: &mut Resolver, computed: Option<BackendLayout>, dependencies: Vector<Dependency>) -> Answer
+! OutOfMemoryError ? &mut Allocator {
+  return match move computed {
+    Option<BackendLayout>.Some {value} => {
+      let index = Vector.length<Shared<BackendLayout>>(&resolver.layoutValues)
+      run Vector.append<Shared<BackendLayout>>(&mut resolver.*.layoutValues, run Shared.make<BackendLayout>(move value))
+      return memberSuccess(Value.Layout {index: index}, move dependencies)
+    }
+    Option<BackendLayout>.None => memberSuccess(Value.LayoutUnsupported, move dependencies)
+  }
+}
+
+effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let types = Vector.asSlice<Shared<Type>>(&resolver.layoutTypes)
   if key.name >= types.length {
     return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())
   }
-  let computed = BackendLayout.scalar(&types[key.name], &resolver.target)
-  return match move computed {
-    Option<BackendLayout>.Some {value} => {
-      let index = Vector.length<BackendLayout>(&resolver.layoutValues)
-      run Vector.append<BackendLayout>(&mut resolver.*.layoutValues, move value)
-      return memberSuccess(Value.Layout {index: index}, Vector.make<Dependency>())
-    }
-    Option<BackendLayout>.None => memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())
+  let ty = Shared.clone<Type>(&types[key.name])
+  let scalar = BackendLayout.scalar(&ty, &resolver.target)
+  if let Option<BackendLayout>.Some {value} = move scalar {
+    return run storeLayout(&mut resolver.*, Option.some<BackendLayout>(move value), Vector.make<Dependency>())
   }
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, &ty)
+  if moduleOrdinal == usize.MAX {
+    return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())
+  }
+  let module = run resolvedModule(&resolver.*, moduleOrdinal)
+  let ordinal = run ordinalOfProvider(&mut resolver.*, &module, &ty)
+  let declaration = match move ordinal {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>()) }
+  }
+  let written = run header(&mut resolver.*, &module, declaration)
+  let writtenHeader = match move written {
+    Option<HeaderSyntax>.Some {value} => value
+    Option<HeaderSyntax>.None => { return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>()) }
+  }
+  let mut count = usize.MAX
+  if let Node.StructHeader {fields, ..} = writtenHeader.header { count = fields.length }
+  if let Node.TupleHeader {elements, ..} = writtenHeader.header { count = elements.length }
+  if count == usize.MAX {
+    return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())
+  }
+  let application = run internApplication(&mut resolver.*, &ty)
+  let mut dependencies = Vector.make<Dependency>()
+  let mut inputs = Vector.make<LayoutFieldInput>()
+  let mut at = usize.ZERO
+  while at < count {
+    let shaped = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {
+      family: Family.MemberShape, module: moduleOrdinal, name: application,
+      declaration: declaration, member: at, external: false,
+    }, writtenHeader.span)
+    let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&shaped, answerRejection)
+    if let Option<Shared<Rejection>>.Some {value} = move rejected {
+      return memberRejected(move value, move dependencies)
+    }
+    let field = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&shaped, singleMemberType)
+    let fieldType = match move field {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
+    }
+    let fieldKey = run internLayoutType(&mut resolver.*, &fieldType)
+    let child = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {
+      family: Family.Layout, module: key.module, name: fieldKey,
+      declaration: usize.ZERO, member: usize.ZERO, external: false,
+    }, writtenHeader.span)
+    let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&child, answerRejection)
+    if let Option<Shared<Rejection>>.Some {value} = move rejected {
+      return memberRejected(move value, move dependencies)
+    }
+    let childIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&child, answerLayoutIndex)
+    let index = match move childIndex {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
+    }
+    let layouts = Vector.asSlice<Shared<BackendLayout>>(&resolver.layoutValues)
+    let metrics = Shared.with<BackendLayout, LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+    run Vector.append<LayoutFieldInput>(&mut inputs, LayoutFieldInput {ty: move fieldType, metrics: metrics})
+    at = at + usize.ONE
+  }
+  let computed = run BackendLayout.record(Vector.asSlice<LayoutFieldInput>(&inputs))
+  return run storeLayout(&mut resolver.*, move computed, move dependencies)
 }
 
 struct LayoutDemand {
@@ -23413,10 +23490,10 @@ effect fn resolveInstance(
         )
       }
     }
-    let resolvedLayouts = Vector.asSlice<BackendLayout>(&resolver.layoutValues)
+    let resolvedLayouts = Vector.asSlice<Shared<BackendLayout>>(&resolver.layoutValues)
     run Vector.append<TypeLayout>(
       &mut layouts,
-      TypeLayout {ty: Shared.clone<Type>(&needed[at].ty), layout: resolvedLayouts[layoutIndex]},
+      TypeLayout {ty: Shared.clone<Type>(&needed[at].ty), layout: Shared.clone<BackendLayout>(&resolvedLayouts[layoutIndex])},
     )
     at = at + usize.ONE
   }
@@ -27003,7 +27080,7 @@ impl Semantic {
         source: SourceIndex.make(move revision),
         target: target,
         mirValues: Vector.make<MirFunction>(),
-        layoutValues: Vector.make<BackendLayout>(),
+        layoutValues: Vector.make<Shared<BackendLayout>>(),
         instanceTexts: Vector.make<Bytes>(),
         instanceSymbols: Vector.make<Bytes>(),
         modules: Vector.make<ModuleId>(),
@@ -28047,6 +28124,27 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Mir, module, name, &answer)
     return move answer
   }
+  /// Demands backend-neutral target layout facts for one runtime type.
+  pub effect fn demandLayout(self: &mut Self, request: &mut Request, module: &ModuleId, ty: &Shared<Type>) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    let application = run internLayoutType(&mut self.resolver, ty)
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, Key {
+      family: Family.Layout, module: moduleOrdinal, name: application,
+      declaration: usize.ZERO, member: usize.ZERO, external: false,
+    }, Span.make(usize.ZERO, usize.ZERO))
+    run recordRoot(&mut request.*, Family.Layout, module, b"", &answer)
+    return move answer
+  }
+
+  /// Returns an owned handle to one cached layout answer.
+  pub fn layoutAt(self: &Self, index: usize) -> Option<Shared<BackendLayout>> {
+    let layouts = Vector.asSlice<Shared<BackendLayout>>(&self.resolver.layoutValues)
+    if index >= layouts.length { return Option.none<Shared<BackendLayout>>() }
+    return Option.some<Shared<BackendLayout>>(Shared.clone<BackendLayout>(&layouts[index]))
+  }
+
   /// Borrows a MIR graph named by a `Value.Mir` answer from this store.
   pub fn mirAt(self: &Self, index: usize) -> Option<&MirFunction> {
     let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
