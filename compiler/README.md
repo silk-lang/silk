@@ -762,10 +762,10 @@ them back to a local owner, as required by Silk's ownership rules.
 
 ## Verification
 
-Build this checkout's bootstrap CLI, then run the M1 source-written cases. The M1 query root
-imports query and source-index cases; the semantic cases use their own root to keep each native
-compilation within the CI heap limit. The focused HIR run checks exact integer magnitudes and
-fingerprints without pulling the full HIR suite into the semantic binary.
+Build this checkout's bootstrap CLI, then run the source-written cases. The M1 query root
+imports query and source-index cases; the semantic and frozen-target cases use their own roots to
+keep each native compilation within the CI heap limit. The HIR root runs the lowering, fingerprint,
+and parser cases without pulling the semantic engine into their binary.
 `--no-cache` executes assertions even if a previous run stored passing results. The focused Linux
 workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
 Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
@@ -775,7 +775,8 @@ named `selfhost-*`; pushing one does not start a second CI run before its pull r
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
-node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --filter integer --no-cache
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/TargetCases.silk --no-cache
+node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --no-cache
 ```
 
 The cases inspect query and source events, retained request evidence, and rejection codes and byte
@@ -806,15 +807,10 @@ focused entry:
 pnpm exec silk check --manifest-path compiler/silk.toml
 ```
 
-Run the source-written parser tests with the default project root:
-
-```sh
-pnpm exec silk test --manifest-path compiler/silk.toml
-```
-
-These tests parse source strings, including malformed syntax, and assert self-hosted parser
-behavior. `src/main.silk` imports them for test discovery; normal builds do not execute tests.
-The JavaScript harness below remains the TypeScript-versus-self-hosted comparison.
+The source-written parser tests in `src/parser/ParserCases.silk` parse source strings, including
+malformed syntax, and assert self-hosted parser behavior. The HIR lowering root imports them, so
+the focused HIR run above discovers them; `src/main.silk` imports no test modules. The JavaScript
+harness below remains the TypeScript-versus-self-hosted comparison.
 
 After building the executable, run the parser corpus with its path:
 
