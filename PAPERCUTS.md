@@ -389,3 +389,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Cloud Linux container had only system LLVM 18 and no `/usr/bin/time`; a merged Semantic+Target probe root was SIGKILLed near 7 GB while other compiles ran · Fetch LLVM 22.1.8 into `.scratch/llvm-22.1.8` exactly as `.github/actions/setup-linux-llvm` does, put it first on `PATH`, sample peak RSS with `ps`, and run one native test root at a time (SemanticCases alone peaks near 11.5 GB of process-tree RSS) · selfhost test audit
 
 - 2026-09-30 · B12 nested-row oracle added an equivalent SemanticCases helper, and a broad rename retained the duplicate · Reuse the existing effectRequirements projection and delete the added copy; inspect the complete correction diff before starting a check · self-hosted compiler
+
+- 2026-10-01 · B12 receiver region assertion nested Shared.with callbacks and failed the bounded importer with SEM0199 and follow-on ownership errors · Extract named region and application projections before checking the importer; retain actual caller ownership and original slot comparisons · self-hosted compiler
