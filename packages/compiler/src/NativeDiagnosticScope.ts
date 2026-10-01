@@ -38,9 +38,7 @@ export const prepare = (context: Context) => {
       type.storage?.realization.targetArguments ??
       type.typeArguments ??
       []
-    const target = FunctionIndex.nativeCandidates(context.declared, targetId).find((candidate) =>
-      Mir.matchesInstance(candidate.fn, targetId, arguments_),
-    )
+    const target = FunctionIndex.nativeInstances(context.declared, targetId, arguments_).at(0)
     if (target === undefined || target.suspendable || target.diagnosticParameter === undefined)
       throw new RangeError('Diagnostic observer lost its direct internal target')
     const callback = Emitter.declareFunction(
@@ -112,8 +110,7 @@ export const emit = (
     throw new RangeError('Diagnostic scope lost its invocation storage')
   const { body, builder } = context
   if (operation._tag === 'LeaveDiagnosticScope') {
-    for (const outcome of diagnostic.outcomes.values())
-      NativeDiagnosticOutcome.releaseForObserver(outcome, diagnostic, scope.record)
+    NativeDiagnosticOutcome.releaseAll(diagnostic, scope.record)
 
     Emitter.store(
       body,

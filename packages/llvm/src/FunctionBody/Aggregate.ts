@@ -98,18 +98,12 @@ export const extractValueIn = (
   const resultType = aggregatePath(module, resolved.success.type, indices, operation)
   if (Result.isFailure(resultType)) return Result.fail(resultType.failure)
   const aggregateOperand = resolved.success.operand
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    resultType.success,
-    name,
-    (result, finalName) => ({
-      _tag: 'ExtractValue',
-      aggregate: aggregateOperand,
-      indices,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, resultType.success, name, (result) => ({
+    _tag: 'ExtractValue',
+    aggregate: aggregateOperand,
+    indices,
+    result,
+  }))
   return appended
 }
 
@@ -161,13 +155,12 @@ export const insertValueIn = (
     draft,
     aggregateValue.success.type,
     name,
-    (result, finalName) => ({
+    (result) => ({
       _tag: 'InsertValue',
       aggregate: aggregateOperand,
       element: elementOperand,
       indices,
       result,
-      name: finalName,
     }),
   )
   return appended
@@ -276,18 +269,12 @@ export const extractElement = Effect.fnUntraced(function* (
             }),
           )
         }
-        return yield* FunctionBodyState.appendResult(
-          draft,
-          sourceType.child,
-          name,
-          (result, finalName) => ({
-            _tag: 'ExtractElement',
-            vector: source.operand,
-            index: selected.operand,
-            result,
-            name: finalName,
-          }),
-        )
+        return yield* FunctionBodyState.appendResult(draft, sourceType.child, name, (result) => ({
+          _tag: 'ExtractElement',
+          vector: source.operand,
+          index: selected.operand,
+          result,
+        }))
       }),
   )
 })
@@ -351,19 +338,13 @@ export const insertElement = Effect.fnUntraced(function* (
             }),
           )
         }
-        return yield* FunctionBodyState.appendResult(
-          draft,
-          source.type,
-          name,
-          (result, finalName) => ({
-            _tag: 'InsertElement',
-            vector: source.operand,
-            element: inserted.operand,
-            index: selected.operand,
-            result,
-            name: finalName,
-          }),
-        )
+        return yield* FunctionBodyState.appendResult(draft, source.type, name, (result) => ({
+          _tag: 'InsertElement',
+          vector: source.operand,
+          element: inserted.operand,
+          index: selected.operand,
+          result,
+        }))
       }),
   )
 })
@@ -454,19 +435,13 @@ export const shuffleVector = Effect.fnUntraced(function* (
         'Type',
         'FunctionBody.shuffleVector',
       )
-      return yield* FunctionBodyState.appendResult(
-        draft,
-        resultTypeIndex,
-        name,
-        (result, finalName) => ({
-          _tag: 'ShuffleVector',
-          left: plan.left,
-          right: plan.right,
-          mask: plan.mask,
-          result,
-          name: finalName,
-        }),
-      )
+      return yield* FunctionBodyState.appendResult(draft, resultTypeIndex, name, (result) => ({
+        _tag: 'ShuffleVector',
+        left: plan.left,
+        right: plan.right,
+        mask: plan.mask,
+        result,
+      }))
     }),
   )
 })

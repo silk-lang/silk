@@ -341,19 +341,7 @@ export const callableValueByIdentity = (
   type: Type.Callable,
 ): Extract<Mir.Type, { readonly _tag: 'CallableValue' }> | undefined => {
   const target = Tir.callableTargetFromIdentity(identity.target)
-  const environment =
-    identity.environment === undefined
-      ? undefined
-      : layout.callableEnvironments.find(
-          (
-            candidate,
-          ): candidate is Extract<
-            Layout.CallableEnvironment,
-            { readonly _tag: 'CallableEnvironment' }
-          > =>
-            candidate._tag === 'CallableEnvironment' &&
-            FieldRealization.matchesIdentity(identity, candidate.callable),
-        )
+  const environment = Layout.callableEnvironmentMatching(layout, identity)
   if (identity.environment !== undefined && environment === undefined) return undefined
   const specializedType =
     environment === undefined
@@ -545,17 +533,10 @@ export const storedCallableValueType = (
   if (representation?._tag !== 'CallableEnvironment') return undefined
   const realization = representation.realization
   const environment =
-    realization.site === undefined
+    realization.site === undefined || realization.environment === undefined
       ? undefined
-      : layout.callableEnvironments.find(
-          (
-            candidate,
-          ): candidate is Extract<
-            Layout.CallableEnvironment,
-            { readonly _tag: 'CallableEnvironment' }
-          > =>
-            candidate._tag === 'CallableEnvironment' &&
-            FieldRealization.matchesCallable(realization, candidate.callable),
+      : Layout.callableEnvironmentsByIdentity(layout, realization.environment).find((candidate) =>
+          FieldRealization.matchesCallable(realization, candidate.callable),
         )
   if (realization.site !== undefined && environment === undefined) return undefined
   return {
@@ -778,17 +759,10 @@ export const callableValueType = (
     typeArguments: fn.owner.key.typeArguments,
     staticArgumentKeys: fn.owner.key.staticArguments.map(StaticValue.key),
   })
-  const identityKey = Type.runtimeCallableEnvironmentIdentityKey(identity)
-  const candidates = fn.layout.callableEnvironments.filter(
-    (
-      candidate,
-    ): candidate is Extract<Layout.CallableEnvironment, { readonly _tag: 'CallableEnvironment' }> =>
-      candidate._tag === 'CallableEnvironment' &&
-      Type.runtimeCallableEnvironmentIdentityKey(
-        Instances.callableEnvironmentIdentity(candidate.callable),
-      ) === identityKey &&
-      (!Type.isRuntimeConcrete(expected) ||
-        Type.runtimeKey(candidate.callable.type) === Type.runtimeKey(expected)),
+  const candidates = Layout.callableEnvironmentsByIdentity(fn.layout, identity).filter(
+    (candidate) =>
+      !Type.isRuntimeConcrete(expected) ||
+      Type.runtimeKey(candidate.callable.type) === Type.runtimeKey(expected),
   )
   const planned =
     candidates.find(
@@ -830,12 +804,8 @@ export const stagedCallableValueType = (
   site: Tir.CallableSiteId,
 ): Extract<Mir.Type, { readonly _tag: 'CallableValue' }> | undefined => {
   const expected = fn.semantic(expression.type)
-  const candidates = fn.layout.callableEnvironments.filter(
-    (
-      candidate,
-    ): candidate is Extract<Layout.CallableEnvironment, { readonly _tag: 'CallableEnvironment' }> =>
-      candidate._tag === 'CallableEnvironment' &&
-      Instances.keyText(candidate.callable.owner) === Instances.keyText(fn.owner.key) &&
+  const candidates = Layout.callableEnvironmentsByOwner(fn.layout, fn.owner.key).filter(
+    (candidate) =>
       sameSite(candidate.callable.site, site) &&
       (!Type.isRuntimeConcrete(expected) || Type.equals(candidate.callable.type, expected)),
   )

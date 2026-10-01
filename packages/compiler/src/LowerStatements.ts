@@ -64,6 +64,32 @@ export interface LoweredPatternSelection {
   readonly bindings: ReadonlyArray<Tir.LocalId>
 }
 
+/** Each loan's position in its function's ownership facts, grouped by borrow key. */
+const loanOrders = new WeakMap<
+  ReadonlyArray<Ownership.LoanFact>,
+  ReadonlyMap<
+    string,
+    ReadonlyArray<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }>
+  >
+>()
+
+const loanOrder = (loans: ReadonlyArray<Ownership.LoanFact>) => {
+  const cached = loanOrders.get(loans)
+  if (cached !== undefined) return cached
+  const order = new Map<
+    string,
+    Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }>
+  >()
+  for (const [ordinal, loan] of loans.entries()) {
+    const key = borrowKey(loan.id)
+    const entries = order.get(key)
+    if (entries === undefined) order.set(key, [{ ordinal, loan }])
+    else entries.push({ ordinal, loan })
+  }
+  loanOrders.set(loans, order)
+  return order
+}
+
 export const lowerPatternSelection = (
   fn: FunctionLowering,
   selection: Tir.PatternSelection,
@@ -1036,24 +1062,33 @@ const lowerStatement = (
       region !== undefined && !beforeOtherwise.has(region.id.ordinal) ? [region.id.ordinal] : [],
     )
     restoreDelayedEffectState(fn, branchState)
+    // Only loans held by one branch end, in the function's loan order. Visiting the held set
+    // keeps each conditional proportional to its live loans rather than to every loan issued
+    // anywhere in the function.
     const branchEndings = (
       state: DelayedEffectState,
       other: DelayedEffectState,
-    ): ReadonlyArray<Extract<Mir.Operation, { readonly _tag: 'EndLoan' }>> =>
-      (fn.ownership?.loans ?? []).flatMap((loan) => {
-        const key = borrowKey(loan.id)
-        const held = state.loanLocals.get(key)
-        return held !== undefined && !other.loanLocals.has(key)
-          ? [
-              {
-                _tag: 'EndLoan' as const,
-                borrow: loan.id,
-                slice: held,
-                provenance: generated(statement.span),
-              },
-            ]
-          : []
-      })
+    ): ReadonlyArray<Extract<Mir.Operation, { readonly _tag: 'EndLoan' }>> => {
+      const order = loanOrder(fn.ownership?.loans ?? [])
+      const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+      for (const key of state.loanLocals.keys())
+        if (!other.loanLocals.has(key)) ending.push(...(order.get(key) ?? []))
+      return ending
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .flatMap(({ loan }) => {
+          const held = state.loanLocals.get(borrowKey(loan.id))
+          return held === undefined
+            ? []
+            : [
+                {
+                  _tag: 'EndLoan' as const,
+                  borrow: loan.id,
+                  slice: held,
+                  provenance: generated(statement.span),
+                },
+              ]
+        })
+    }
     const takenEndings = branchEndings(takenState, otherwiseState).flatMap((ending) =>
       loanEndOperations(fn, ending),
     )

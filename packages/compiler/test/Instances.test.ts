@@ -13,6 +13,8 @@ import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as CleanupPlan from '../src/CleanupPlan.js'
+import * as DeclarationFacts from '../src/DeclarationFacts.js'
 import * as Backend from '../src/Backend.js'
 import * as Layout from '../src/Layout.js'
 import * as Lifetime from '../src/Lifetime.js'
@@ -834,6 +836,261 @@ pub fn main() -> () {
   }),
 )
 
+it.effect('finds a late structural cleanup field behind recursive metadata siblings', () =>
+  Effect.gen(function* () {
+    // Borrowed Shared edges retain the recursive structural graph without demanding owned
+    // payload cleanup or recursively deriving affinity through every metadata path.
+    const metadata = Array.from(
+      { length: 18 },
+      (_, owner) =>
+        `struct Metadata${owner}<'a> {
+${Array.from({ length: 18 }, (_, field) =>
+  field === owner ? '' : `  field${field}: &'a Shared<Metadata${field}<'a>>`,
+).join('\n')}
+}`,
+    ).join('\n')
+    // Distinct scalar fields exercise discovery after its optional reachability pruning
+    // gives way to the guarded search. Their contents require no cleanup specialization.
+    const padding = Array.from(
+      { length: 513 },
+      (_, field) => `  field${field}: [u8; ${field}]`,
+    ).join('\n')
+    const result = yield* snapshot(`import silk.vector { Vector }
+import silk.shared { Shared }
+${metadata}
+struct Padding {
+  marker: i32
+${padding}
+}
+struct Frame { value: i32 }
+struct Machine<'a> {
+  padding: Padding
+  metadata: &'a Shared<Metadata0<'a>>
+  active: Vector<Frame>
+}
+fn hold<'a>(anchor: &'a i32) -> () {
+  let machines = Vector.make<Machine<'a>>()
+  drop machines
+  return ()
+}
+pub fn main() -> () {
+  let anchor = 0
+  hold(&anchor)
+  return ()
+}`)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    assert.deepEqual(result.instances.violations, [])
+    const main =
+      result.instances.instances.find((instance) => instance.key.declaration.name === 'main') ??
+      unreachable('expected cleanup root')
+    assert.deepEqual(Instances.executionClosure(result.instances, main.key).gaps, [])
+    assert.isTrue(
+      result.instances.instances.some(
+        (instance) =>
+          instance.key.declaration.module === 'silk/vector' &&
+          instance.key.declaration.name === 'drop@impl#0' &&
+          instance.key.typeArguments.map(Type.encodeGenericArgument).join(', ') ===
+            'golden/program.Frame',
+      ),
+    )
+    const index = result.instances.declarationIndex ?? unreachable('expected declaration facts')
+    const struct = (name: string): DeclarationFacts.StructFact => {
+      const fact = DeclarationFacts.byCanonical(index, {
+        _tag: 'CanonicalDeclarationId',
+        module: 'golden/program',
+        name,
+      })
+      if (fact?._tag !== 'StructDeclaration') return unreachable('expected source struct')
+      return fact
+    }
+    const fieldType = (field: DeclarationFacts.FieldFact): Type.Type => {
+      if (field.declaredType._tag !== 'Resolved') return unreachable('expected resolved field')
+      return field.declaredType.type
+    }
+    const spelling = (field: DeclarationFacts.FieldFact): string =>
+      field.name._tag === 'Present' ? field.name.spelling : unreachable('expected named field')
+    const borrowedShared = (type: Type.Type, owner: string, target: string): void => {
+      if (!Type.isReference(type)) return unreachable('expected borrowed metadata')
+      const region = Lifetime.bound({ module: 'golden/program', name: owner }, 0, 'a')
+      assert.strictEqual(type.access, 'Shared')
+      assert.strictEqual(Lifetime.key(type.lifetime), Lifetime.key(region))
+      if (!Type.isNominal(type.target)) return unreachable('expected Shared referent')
+      assert.deepEqual(
+        { module: type.target.module, name: type.target.name },
+        { module: 'silk/shared', name: 'Shared' },
+      )
+      const payload = type.target.arguments.at(0) ?? unreachable('expected Shared payload')
+      if (!Type.isTypeArgument(payload) || !Type.isNominal(payload))
+        return unreachable('expected metadata payload')
+      assert.deepEqual(
+        { module: payload.module, name: payload.name },
+        { module: 'golden/program', name: target },
+      )
+      const argument = payload.arguments.at(0) ?? unreachable('expected referent lifetime')
+      if (!Lifetime.isLifetime(argument)) return unreachable('expected lifetime argument')
+      assert.strictEqual(Lifetime.key(argument), Lifetime.key(region))
+      assert.strictEqual(CleanupPlan.cleanupPlan(index, type)._tag, 'NoCleanup')
+    }
+    const machine = struct('Machine')
+    assert.deepEqual(machine.fields.map(spelling), ['padding', 'metadata', 'active'])
+    borrowedShared(
+      fieldType(machine.fields.at(1) ?? unreachable('expected metadata field')),
+      'Machine',
+      'Metadata0',
+    )
+    assert.strictEqual(
+      Type.encode(fieldType(machine.fields.at(2) ?? unreachable('expected active field'))),
+      'silk/vector.Vector<golden/program.Frame>',
+    )
+    for (let owner = 0; owner < 18; owner += 1) {
+      const fields = struct(`Metadata${owner}`).fields
+      const targets = Array.from({ length: 18 }, (_, target) => target).filter(
+        (target) => target !== owner,
+      )
+      assert.deepEqual(
+        fields.map(spelling),
+        targets.map((target) => `field${target}`),
+      )
+      for (const [position, target] of targets.entries()) {
+        borrowedShared(
+          fieldType(fields.at(position) ?? unreachable('expected metadata sibling')),
+          `Metadata${owner}`,
+          `Metadata${target}`,
+        )
+      }
+    }
+    const paddingFields = struct('Padding').fields
+    assert.deepEqual(paddingFields.map(spelling), [
+      'marker',
+      ...Array.from({ length: 513 }, (_, field) => `field${field}`),
+    ])
+    assert.strictEqual(
+      fieldType(paddingFields.at(0) ?? unreachable('expected padding marker')),
+      'i32',
+    )
+    for (let field = 0; field < 513; field += 1) {
+      const type = fieldType(paddingFields.at(field + 1) ?? unreachable('expected padding field'))
+      if (!Type.isFixedArray(type)) return unreachable('expected distinct array type')
+      assert.strictEqual(type.element, 'u8')
+      assert.strictEqual(type.length, field)
+    }
+    const frame = struct('Frame')
+    assert.deepEqual(frame.fields.map(spelling), ['value'])
+    assert.strictEqual(fieldType(frame.fields.at(0) ?? unreachable('expected frame value')), 'i32')
+    const frameArguments = (key: Instances.InstanceKey): boolean =>
+      key.typeArguments.map(Type.encodeGenericArgument).join(', ') === 'golden/program.Frame'
+    const slotCall =
+      result.instances.executionEdges.find((edge) => {
+        const payload = edge.owner.typeArguments.at(0)
+        return (
+          edge.kind === 'Runtime' &&
+          edge.owner.declaration.module === 'silk/vector' &&
+          edge.owner.declaration.name === 'releaseBuffer' &&
+          payload !== undefined &&
+          Type.isTypeArgument(payload) &&
+          Type.isNominal(payload) &&
+          payload.module === 'golden/program' &&
+          payload.name === 'Machine' &&
+          edge.target.declaration.module === 'silk/slot' &&
+          edge.target.declaration.name === 'Slot.dropValue'
+        )
+      }) ?? unreachable('expected releaseBuffer to call Slot.dropValue')
+    const releasedPayload =
+      slotCall.owner.typeArguments.at(0) ?? unreachable('expected owner payload')
+    const storage = slotCall.target.typeArguments.at(0) ?? unreachable('expected storage lifetime')
+    const slotPayload = slotCall.target.typeArguments.at(1) ?? unreachable('expected slot payload')
+    if (!Lifetime.isLifetime(storage)) return unreachable('expected storage lifetime argument')
+    if (!Type.isTypeArgument(releasedPayload) || !Type.isTypeArgument(slotPayload))
+      return unreachable('expected ordinary payload arguments')
+    assert.strictEqual(slotCall.target.typeArguments.length, 2)
+    assert.strictEqual(Type.key(slotPayload), Type.key(releasedPayload))
+    const sameSlotArguments = (key: Instances.InstanceKey): boolean => {
+      const lifetime = key.typeArguments.at(0)
+      const payload = key.typeArguments.at(1)
+      return (
+        key.typeArguments.length === 2 &&
+        lifetime !== undefined &&
+        Lifetime.isLifetime(lifetime) &&
+        Lifetime.key(lifetime) === Lifetime.key(storage) &&
+        payload !== undefined &&
+        Type.isTypeArgument(payload) &&
+        Type.key(payload) === Type.key(slotPayload)
+      )
+    }
+    const slotOwner = { module: 'silk/slot', name: 'Slot.dropValue' }
+    const slotFact = DeclarationFacts.byCanonical(index, slotCall.target.declaration)
+    if (slotFact?._tag !== 'FunctionDeclaration') return unreachable('expected slot declaration')
+    assert.deepEqual(
+      slotFact.typeParameters.map(({ type }) => ({
+        owner: type.owner,
+        ordinal: type.ordinal,
+        kind: type.kind,
+      })),
+      [
+        { owner: slotOwner, ordinal: 0, kind: 'Lifetime' },
+        { owner: slotOwner, ordinal: 1, kind: 'Value' },
+      ],
+    )
+    const slotParameter = slotFact.parameters.at(0) ?? unreachable('expected slot parameter')
+    if (slotParameter.declaredType._tag !== 'Resolved')
+      return unreachable('expected resolved slot parameter')
+    const declaredSlot = slotParameter.declaredType.type
+    if (!Type.isSlot(declaredSlot)) return unreachable('expected declared slot type')
+    assert.strictEqual(
+      Lifetime.key(declaredSlot.arguments[0]),
+      Lifetime.key(Lifetime.bound(slotOwner, 0, 'storage')),
+    )
+    const declaredPayload = declaredSlot.arguments[1]
+    if (!Type.isParameter(declaredPayload)) return unreachable('expected declared payload binder')
+    assert.deepEqual(
+      {
+        owner: declaredPayload.owner,
+        ordinal: declaredPayload.ordinal,
+        kind: declaredPayload.kind,
+      },
+      { owner: slotOwner, ordinal: 1, kind: 'Value' },
+    )
+    const slotInstance =
+      result.instances.instances.find(
+        (instance) =>
+          Instances.keyText(instance.key) === Instances.keyText(slotCall.target) &&
+          sameSlotArguments(instance.key),
+      ) ?? unreachable('expected recorded slot instance')
+    const specializedSlot = Type.substitute(declaredSlot, slotInstance.substitution)
+    if (!Type.isSlot(specializedSlot)) return unreachable('expected specialized slot type')
+    assert.strictEqual(Lifetime.key(specializedSlot.arguments[0]), Lifetime.key(storage))
+    assert.strictEqual(Type.key(specializedSlot.arguments[1]), Type.key(slotPayload))
+    assert.isTrue(
+      result.instances.executionEdges.some(
+        (edge) =>
+          edge.kind === 'Cleanup' &&
+          Instances.keyText(edge.owner) === Instances.keyText(slotCall.target) &&
+          sameSlotArguments(edge.owner) &&
+          edge.target.declaration.module === 'silk/vector' &&
+          edge.target.declaration.name === 'drop@impl#0' &&
+          frameArguments(edge.target),
+      ),
+    )
+    for (const [owner, target] of [
+      ['drop@impl#0', 'releaseFull'],
+      ['releaseFull', 'releaseBuffer'],
+    ]) {
+      assert.isTrue(
+        result.instances.executionEdges.some(
+          (edge) =>
+            edge.kind === 'Runtime' &&
+            edge.owner.declaration.module === 'silk/vector' &&
+            edge.owner.declaration.name === owner &&
+            frameArguments(edge.owner) &&
+            edge.target.declaration.module === 'silk/vector' &&
+            edge.target.declaration.name === target &&
+            frameArguments(edge.target),
+        ),
+      )
+    }
+  }),
+)
+
 it.effect('admits nested cleanup reached through a lexical service provider', () =>
   Effect.gen(function* () {
     const result = yield* snapshot(`import silk.effect { Effect }
@@ -1179,7 +1436,18 @@ it.effect('lowers discovered instances deterministically to verifier-clean MIR',
         FunctionIndex.candidates(index, fn.id).find(matches),
         functions.find(matches),
       )
+      assert.deepEqual(
+        FunctionIndex.mirInstances(
+          index,
+          fn.id,
+          fn.instance.typeArguments,
+          fn.instance.staticArguments,
+        ),
+        functions.filter(matches),
+      )
     }
+    assert.deepEqual(FunctionIndex.mirInstances(index, original.id, ['i32']), [])
+    assert.deepEqual(FunctionIndex.mirInstances(index, { ...original.id, name: 'missing' }, []), [])
     assert.deepEqual(FunctionIndex.candidates(index, { ...original.id, name: 'missing' }), [])
     assert.strictEqual(
       FunctionIndex.candidates(index, original.id).find((fn) =>

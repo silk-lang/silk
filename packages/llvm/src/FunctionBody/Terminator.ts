@@ -2,7 +2,7 @@ import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
 import * as AddrSpace from '../AddrSpace.js'
 import type * as Block from '../Block.js'
-import * as ByteString from '../ByteString.js'
+import type * as ByteString from '../ByteString.js'
 import type * as Constant from '../Constant.js'
 import * as FunctionBodyState from '../internal/FunctionBodyState.js'
 import type * as Handle from '../internal/Handle.js'
@@ -98,7 +98,6 @@ export const indirectBranch = Effect.fnUntraced(function* (
           address: resolved.operand,
           destinations: blocks,
           result: undefined,
-          name: ByteString.empty,
         })
         for (const block of blocks)
           yield* FunctionBodyState.addPredecessor(draft, block, predecessor)
@@ -140,7 +139,6 @@ export const branchIn = (
     _tag: 'Branch',
     destination: block.success,
     result: undefined,
-    name: ByteString.empty,
   })
   if (Result.isFailure(instruction)) return instruction
   const added = FunctionBodyState.addPredecessor(draft, block.success, predecessor)
@@ -218,7 +216,6 @@ export const conditionalBranchIn = (
     onFalse: falseBlock.success,
     weights,
     result: undefined,
-    name: ByteString.empty,
   })
   if (Result.isFailure(instruction)) return instruction
   const addedTrue = FunctionBodyState.addPredecessor(draft, trueBlock.success, predecessor)
@@ -304,7 +301,6 @@ export const switchTerminatorIn = (
       weights: [...weights],
       sealed: false,
       result: undefined,
-      name: ByteString.empty,
     })
     yield* FunctionBodyState.addPredecessor(draft, destination, predecessor)
     return yield* FunctionBodyState.makeSwitchHandle(draft, instruction, predecessor)
@@ -493,7 +489,6 @@ export const returnValueIn = (
     _tag: 'Return',
     value: resolved.success.operand,
     result: undefined,
-    name: ByteString.empty,
   })
 }
 
@@ -525,7 +520,6 @@ export const returnVoidIn = (
   return FunctionBodyState.appendInstruction(draft, {
     _tag: 'ReturnVoid',
     result: undefined,
-    name: ByteString.empty,
   })
 }
 
@@ -545,7 +539,6 @@ export const unreachableIn = (
   FunctionBodyState.appendInstruction(draft, {
     _tag: 'Unreachable',
     result: undefined,
-    name: ByteString.empty,
   })
 
 /**
@@ -588,10 +581,9 @@ export const cleanupLandingPadIn = (
     'FunctionBody.cleanupLandingPad',
   )
   if (Result.isFailure(typeIndex)) return Result.fail(typeIndex.failure)
-  return FunctionBodyState.appendResult(draft, typeIndex.success, name, (result, finalName) => ({
+  return FunctionBodyState.appendResult(draft, typeIndex.success, name, (result) => ({
     _tag: 'LandingPad',
     result,
-    name: finalName,
     type: typeIndex.success,
   }))
 }

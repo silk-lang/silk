@@ -4,7 +4,9 @@ import type * as AuthoredHir from './AuthoredHir.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as AuthoredWalk from './AuthoredWalk.js'
 import * as BodyLifetime from './BodyLifetime.js'
+import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Lifetime from './Lifetime.js'
+import type * as NameResolution from './NameResolution.js'
 import type * as SemanticContext from './SemanticContext.js'
 import * as Type from './Type.js'
 
@@ -166,6 +168,9 @@ const headerGenerics = (
   }
 }
 
+/** Looks up the declared parameters of the nominal one authored type names. */
+type NominalParameters = (type: AuthoredHir.Type) => ReadonlyArray<Type.Parameter> | undefined
+
 /**
  * Assigns regions using only a declaration header. Anchors locate authored occurrences; semantic
  * identities use owner and traversal ordinal and never contain source offsets.
@@ -175,8 +180,16 @@ export const forHeader = (
   owner: Lifetime.Owner,
   declaration: AuthoredHir.Declaration,
   parameters: ReadonlyMap<string, Type.Parameter>,
-  body?: BodyLifetime.BodyLifetime,
-  nominalParameters?: (type: AuthoredHir.Type) => ReadonlyArray<Type.Parameter> | undefined,
+  nominalParameters?: NominalParameters,
+): Context => elaborate(context, owner, declaration, parameters, undefined, nominalParameters)
+
+const elaborate = (
+  context: SemanticContext.SemanticContext,
+  owner: Lifetime.Owner,
+  declaration: AuthoredHir.Declaration,
+  parameters: ReadonlyMap<string, Type.Parameter>,
+  body: BodyLifetime.BodyLifetime | undefined,
+  nominalParameters: NominalParameters | undefined,
 ): Context => {
   const nominalArguments = new Map<string, ReadonlyArray<Lifetime.Lifetime>>()
   const regions = new Map<string, Lifetime.Lifetime>()
@@ -645,11 +658,89 @@ export const forHeader = (
   }
 }
 
-/** Assigns local annotation variables in the enclosing body's canonical declaration scope. */
+/**
+ * A body's lookup of the declared parameters of the nominal an annotation names.
+ *
+ * `parametersOf` must read only `scope`, `index`, the semantic context, and the elaboration's own
+ * parameters: a body shares one elaborated context per lookup identity across its annotation sites.
+ */
+export interface NominalBinders {
+  readonly scope: NameResolution.ModuleScope
+  readonly index: DeclarationIndex.Index
+  readonly parametersOf: NominalParameters
+}
+
+/** One body elaboration and every input it was computed from. */
+interface BodyElaboration {
+  readonly context: SemanticContext.SemanticContext
+  readonly declaration: AuthoredHir.Declaration
+  readonly parameters: ReadonlyArray<readonly [string, Type.Parameter]>
+  readonly scope: NameResolution.ModuleScope | undefined
+  readonly index: DeclarationIndex.Index | undefined
+  readonly elaborated: Context
+}
+
+/**
+ * Body elaborations by their analysis-scoped domain. A body elaboration allocates every region from
+ * the already registered `BodyLifetime` points and walks every annotation in the declaration, so it
+ * is pure in its inputs and each annotation site of one body reads the same result. Computing it
+ * per site made annotation-heavy bodies quadratic.
+ */
+const bodyElaborations = new WeakMap<BodyLifetime.BodyLifetime, Array<BodyElaboration>>()
+
+const sameParameters = (
+  left: ReadonlyArray<readonly [string, Type.Parameter]>,
+  right: ReadonlyMap<string, Type.Parameter>,
+): boolean => {
+  if (left.length !== right.size) return false
+  let ordinal = 0
+  for (const [name, parameter] of right) {
+    const entry = left[ordinal++]
+    if (entry === undefined || entry[0] !== name || entry[1] !== parameter) return false
+  }
+  return true
+}
+
+/**
+ * Assigns local annotation variables in the enclosing body's canonical declaration scope.
+ *
+ * Elaboration covers the whole declaration, so it is computed once per body, declaration,
+ * parameter environment, and nominal lookup, and shared by every annotation site. Its diagnostics
+ * are read only to suppress duplicates, never reported, so sharing cannot repeat one.
+ */
 export const forBody = (
   context: SemanticContext.SemanticContext,
   body: BodyLifetime.BodyLifetime,
   declaration: AuthoredHir.Declaration,
   parameters: ReadonlyMap<string, Type.Parameter>,
-  nominalParameters?: (type: AuthoredHir.Type) => ReadonlyArray<Type.Parameter> | undefined,
-): Context => forHeader(context, body.owner, declaration, parameters, body, nominalParameters)
+  nominal?: NominalBinders,
+): Context => {
+  const known = bodyElaborations.get(body) ?? []
+  const previous = known.find(
+    (entry) =>
+      entry.context === context &&
+      entry.declaration === declaration &&
+      entry.scope === nominal?.scope &&
+      entry.index === nominal?.index &&
+      sameParameters(entry.parameters, parameters),
+  )
+  if (previous !== undefined) return previous.elaborated
+  const elaborated = elaborate(
+    context,
+    body.owner,
+    declaration,
+    parameters,
+    body,
+    nominal?.parametersOf,
+  )
+  known.push({
+    context,
+    declaration,
+    parameters: [...parameters],
+    scope: nominal?.scope,
+    index: nominal?.index,
+    elaborated,
+  })
+  bodyElaborations.set(body, known)
+  return elaborated
+}

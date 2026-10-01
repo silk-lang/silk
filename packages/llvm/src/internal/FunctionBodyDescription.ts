@@ -1,6 +1,7 @@
 import type * as Alignment from '../Alignment.js'
 import type * as ByteString from '../ByteString.js'
 import type * as MemoryAccess from '../MemoryAccess.js'
+import type * as LocalName from './LocalName.js'
 import type * as MetadataDescription from './MetadataDescription.js'
 
 export type Operand =
@@ -102,12 +103,10 @@ export interface OperandBundle {
 
 interface ResultInstruction {
   readonly result: number
-  readonly name: ByteString.ByteString
 }
 
 interface VoidInstruction {
   readonly result: undefined
-  readonly name: ByteString.ByteString
 }
 
 export type Instruction =
@@ -273,7 +272,7 @@ export type Instruction =
       readonly fastMath: FastMath
       readonly sealed: boolean
     })
-  | ({ readonly result: number | undefined; readonly name: ByteString.ByteString } & {
+  | ({ readonly result: number | undefined } & {
       readonly _tag: 'Call'
       readonly functionType: number
       readonly callee: Operand
@@ -285,7 +284,7 @@ export type Instruction =
       readonly operandBundles: ReadonlyArray<OperandBundle>
     })
   | (ResultInstruction & { readonly _tag: 'LandingPad'; readonly type: number })
-  | ({ readonly result: number | undefined; readonly name: ByteString.ByteString } & {
+  | ({ readonly result: number | undefined } & {
       readonly _tag: 'Invoke'
       readonly functionType: number
       readonly callee: Operand
@@ -300,7 +299,7 @@ export type Instruction =
 
 export interface Value {
   readonly type: number
-  readonly name: ByteString.ByteString
+  readonly name: LocalName.LocalName
   readonly source:
     | { readonly _tag: 'Argument'; readonly index: number }
     | { readonly _tag: 'Instruction'; readonly instruction: number }
@@ -308,7 +307,7 @@ export interface Value {
 }
 
 export interface Block {
-  readonly name: ByteString.ByteString
+  readonly name: LocalName.LocalName
   readonly instructions: ReadonlyArray<number>
   readonly predecessors: ReadonlyArray<number>
 }

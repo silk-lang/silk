@@ -7,6 +7,7 @@ import * as ContinuationTransfer from '../src/ContinuationTransfer.js'
 import * as Emitter from '@silklang/llvm/Emitter'
 import * as LlvmFunction from '@silklang/llvm/Function'
 import * as NativeDiagnosticContext from '../src/NativeDiagnosticContext.js'
+import * as NativeDiagnosticDispatch from '../src/NativeDiagnosticDispatch.js'
 import * as NativeDiagnosticFailure from '../src/NativeDiagnosticFailure.js'
 import * as NativeCall from '../src/NativeCall.js'
 import { readFileSync } from 'node:fs'
@@ -1519,6 +1520,7 @@ it.effect('keeps failure metadata attached to its originating observer', () =>
       const pointer = yield* LlvmType.pointer(builder)
       const byte = yield* LlvmType.integer(builder, 8)
       const word = yield* LlvmType.integer(builder, bits)
+      const dispatch = NativeDiagnosticDispatch.make()
       const resultType = yield* LlvmType.structure(builder, [
         pointer,
         word,
@@ -1545,7 +1547,15 @@ it.effect('keeps failure metadata attached to its originating observer', () =>
             Emitter.argument(body, 3),
             Emitter.integerUnsigned(builder, word, 9n),
           ] as const)
-          const context = NativeDiagnosticContext.make(builder, body, pointer, byte, word, first)
+          const context = NativeDiagnosticContext.make(
+            builder,
+            body,
+            pointer,
+            byte,
+            word,
+            dispatch,
+            first,
+          )
           const failure = NativeDiagnosticFailure.produce(context, identity, origin)
           // A later lexical observer must not receive the original pool's handles.
           Emitter.store(body, second, context.current)
@@ -1583,6 +1593,7 @@ it.effect('forwards borrowed invocation causes and clears independent execution 
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
+        const dispatch = NativeDiagnosticDispatch.make()
         const causeType = yield* Emitter.module(builder, (builder) =>
           NativeDiagnosticFailure.type({ builder, pointer, word }),
         )
@@ -1599,6 +1610,7 @@ it.effect('forwards borrowed invocation causes and clears independent execution 
               pointer,
               byte,
               word,
+              dispatch,
               Emitter.argument(body, 0),
               incoming,
             )
@@ -1618,6 +1630,9 @@ it.effect('forwards borrowed invocation causes and clears independent execution 
             Emitter.callDirect(body, callee, independent, 'independent')
             Emitter.returnValue(body, result ?? unreachable('expected borrowed cause result'))
           }),
+        )
+        yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticDispatch.emitBody(dispatch, builder),
         )
         const ir = yield* LlvmIrText.render(builder)
         const aggregate = `{ ptr, i${bits}, ptr, i${bits}, ptr, i${bits} }`
@@ -1641,6 +1656,7 @@ it.effect('disables terminal dispatch for absent or foreign observer contexts', 
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
+        const dispatch = NativeDiagnosticDispatch.make()
         const causeType = yield* Emitter.module(builder, (builder) =>
           NativeDiagnosticFailure.type({ builder, pointer, word }),
         )
@@ -1658,11 +1674,15 @@ it.effect('disables terminal dispatch for absent or foreign observer contexts', 
               pointer,
               byte,
               word,
+              dispatch,
               Emitter.argument(body, 0),
               Emitter.argument(body, 1),
             )
             Emitter.returnValue(body, NativeDiagnosticContext.unhandled(context))
           }),
+        )
+        yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticDispatch.emitBody(dispatch, builder),
         )
         const ir = yield* LlvmIrText.render(builder)
         assert.include(
@@ -1673,11 +1693,16 @@ it.effect('disables terminal dispatch for absent or foreign observer contexts', 
           ir,
           '%unhandled_observer = select i1 %unhandled_selected_observer, ptr %diagnostic_failure0, ptr null',
         )
-        assert.include(ir, `icmp ne i${bits} %diagnostic_observer_address, 0`)
+        // The event site calls the module's one dispatch helper, which skips an absent observer.
         assert.include(ir, `i8 5, i${bits} %diagnostic_failure1, i${bits} 0`)
-        assert.match(ir, /phi i(?:32|64).*\[ 0, %diagnostic_disabled \]/)
+        assert.lengthOf(ir.match(/call i(?:32|64) @silk_diagnostic_dispatch\(/g) ?? [], 1)
+        assert.lengthOf(
+          ir.match(/^define internal i(?:32|64) @silk_diagnostic_dispatch\(/gm) ?? [],
+          1,
+        )
+        assert.include(ir, `icmp ne i${bits} %observer_address, 0`)
+        assert.match(ir, /phi i(?:32|64).*\[ 0, %entry \]/)
         assert.lengthOf(ir.match(/load ptr, ptr %diagnostic_observer_slot/g) ?? [], 1)
-        assert.lengthOf(ir.match(/call i(?:32|64) /g) ?? [], 1)
       }
     }),
   ),
@@ -1691,6 +1716,7 @@ it.effect('guards fatal cause handles by their originating observer', () =>
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
+        const dispatch = NativeDiagnosticDispatch.make()
         const causeType = yield* Emitter.module(builder, (builder) =>
           NativeDiagnosticFailure.type({ builder, pointer, word }),
         )
@@ -1705,6 +1731,7 @@ it.effect('guards fatal cause handles by their originating observer', () =>
               pointer,
               byte,
               word,
+              dispatch,
               Emitter.argument(body, 0),
               Emitter.argument(body, 1),
             )
@@ -1714,6 +1741,9 @@ it.effect('guards fatal cause handles by their originating observer', () =>
             ] as const)
             Emitter.returnValue(body, NativeDiagnosticContext.fatal(diagnostic, text, text))
           }),
+        )
+        yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticDispatch.emitBody(dispatch, builder),
         )
         const ir = yield* LlvmIrText.render(builder)
         assert.include(
@@ -1726,7 +1756,7 @@ it.effect('guards fatal cause handles by their originating observer', () =>
         )
         assert.include(ir, `i8 6, i${bits} %fatal_cause_handle, i${bits} 0`)
         assert.lengthOf(ir.match(/load ptr, ptr %diagnostic_observer_slot/g) ?? [], 1)
-        assert.lengthOf(ir.match(/call i(?:32|64) /g) ?? [], 1)
+        assert.lengthOf(ir.match(/call i(?:32|64) @silk_diagnostic_dispatch\(/g) ?? [], 1)
       }
     }),
   ),
@@ -1739,6 +1769,7 @@ it.effect('keeps private return metadata separate from source result lanes', () 
         const builder = yield* LlvmBuilder.make()
         const pointer = yield* LlvmType.pointer(builder)
         const word = yield* LlvmType.integer(builder, bits)
+        const dispatch = NativeDiagnosticDispatch.make()
         const payloadType = yield* LlvmType.integer(builder, 32)
         const diagnosticType = yield* Emitter.module(builder, (builder) =>
           NativeDiagnosticFailure.type({ builder, pointer, word }),
@@ -1822,6 +1853,9 @@ it.effect('keeps private return metadata separate from source result lanes', () 
             Emitter.returnValue(body, packed ?? unreachable('expected private return aggregate'))
           }),
         )
+        yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticDispatch.emitBody(dispatch, builder),
+        )
         const ir = yield* LlvmIrText.render(builder)
         const metadata = `{ ptr, i${bits}, ptr, i${bits}, ptr, i${bits} }`
         assert.include(ir, `@result_receiver(i32 %v0, ${metadata} %v1)`)
@@ -1849,6 +1883,7 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
         const pointer = yield* LlvmType.pointer(builder)
         const byte = yield* LlvmType.integer(builder, 8)
         const word = yield* LlvmType.integer(builder, bits)
+        const dispatch = NativeDiagnosticDispatch.make()
         const metadata = yield* Emitter.module(builder, (builder) =>
           NativeDiagnosticFailure.type({ builder, pointer, word }),
         )
@@ -1863,6 +1898,7 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
               pointer,
               byte,
               word,
+              dispatch,
               Emitter.nullValue(builder, pointer),
             )
             const slot = { storage: Emitter.argument(body, 0) }
@@ -1896,6 +1932,7 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
               pointer,
               byte,
               word,
+              dispatch,
               Emitter.nullValue(builder, pointer),
             )
             NativeDiagnosticOutcome.releaseForObserver(
@@ -1906,6 +1943,9 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
             Emitter.returnVoid(body)
           }),
         )
+        yield* Emitter.module(builder, (builder) =>
+          NativeDiagnosticDispatch.emitBody(dispatch, builder),
+        )
         const ir = yield* LlvmIrText.render(builder)
         const aggregate = `{ ptr, i${bits}, ptr, i${bits}, ptr, i${bits} }`
         const emptied = ir.indexOf(`store ${aggregate} zeroinitializer, ptr %v0`)
@@ -1915,7 +1955,7 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
         assert.isAbove(published, emptied)
         assert.isAbove(released, published)
         assert.isAbove(ir.lastIndexOf(`store ${aggregate} zeroinitializer, ptr %v0`), released)
-        assert.lengthOf(ir.match(/call i(?:32|64) /g) ?? [], 2)
+        assert.lengthOf(ir.match(/call i(?:32|64) @silk_diagnostic_dispatch\(/g) ?? [], 2)
         assert.include(ir, `icmp eq i${bits} %outcome_owner_address, %outcome_scope_address`)
         assert.include(ir, 'label %outcome_release_selected, label %outcome_release_following')
         assert.notInclude(ir, 'load ptr, ptr %diagnostic_observer_slot')

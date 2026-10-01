@@ -2,7 +2,7 @@ import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
 import * as AddrSpace from '../AddrSpace.js'
 import * as Alignment from '../Alignment.js'
-import * as ByteString from '../ByteString.js'
+import type * as ByteString from '../ByteString.js'
 import * as Constant from '../Constant.js'
 import * as FunctionBodyDescription from '../internal/FunctionBodyDescription.js'
 import type * as BuilderState from '../internal/BuilderState.js'
@@ -160,21 +160,15 @@ export const allocaIn = (
     )
   }
   const countOperand = countValue.success.operand
-  const allocated = FunctionBodyState.appendResult(
-    draft,
-    resultType,
-    name,
-    (result, finalName) => ({
-      _tag: 'Alloca',
-      allocationType: allocationTypeIndex.success,
-      count: countOperand,
-      addressSpace: addressSpace.value,
-      alignment: options.alignment ?? Alignment.defaultAlignment,
-      inAlloca: options.inAlloca ?? false,
-      result,
-      name: finalName,
-    }),
-  )
+  const allocated = FunctionBodyState.appendResult(draft, resultType, name, (result) => ({
+    _tag: 'Alloca',
+    allocationType: allocationTypeIndex.success,
+    count: countOperand,
+    addressSpace: addressSpace.value,
+    alignment: options.alignment ?? Alignment.defaultAlignment,
+    inAlloca: options.inAlloca ?? false,
+    result,
+  }))
   if (Result.isFailure(allocated)) return Result.fail(allocated.failure)
   if (options.placement === 'entry' && draft.cursor !== 0) {
     const current = draft.cursor === undefined ? undefined : draft.blocks.at(draft.cursor)
@@ -243,13 +237,12 @@ export const loadIn = (
   const type = Handle.resolve(draft.builder, draft.moduleOwner, valueType, 'Type', operation)
   if (Result.isFailure(type)) return Result.fail(type.failure)
   const pointerOperand = pointerValue.success.operand
-  return FunctionBodyState.appendResult(draft, type.success, name, (result, finalName) => ({
+  return FunctionBodyState.appendResult(draft, type.success, name, (result) => ({
     _tag: 'Load',
     valueType: type.success,
     pointer: pointerOperand,
     access,
     result,
-    name: finalName,
   }))
 }
 
@@ -301,7 +294,6 @@ export const storeIn = (
     pointer: destination.success.operand,
     access,
     result: undefined,
-    name: ByteString.empty,
   })
 }
 
@@ -468,7 +460,7 @@ export const getElementPtrIn = (
           scalable: vector.scalable,
         })
       : plan.success.pointerType
-  const appended = FunctionBodyState.appendResult(draft, resultType, name, (result, finalName) => ({
+  const appended = FunctionBodyState.appendResult(draft, resultType, name, (result) => ({
     _tag: 'GetElementPtr',
     sourceType: plan.success.sourceType,
     base: plan.success.base,
@@ -476,7 +468,6 @@ export const getElementPtrIn = (
     inbounds: options.inbounds ?? false,
     inrange: options.inrange,
     result,
-    name: finalName,
   }))
   return appended
 }
@@ -550,7 +541,6 @@ export const fence = Effect.fnUntraced(function* (
       syncScope,
       ordering,
       result: undefined,
-      name: ByteString.empty,
     }),
   )
 })
@@ -651,7 +641,7 @@ export const compareExchange = Effect.fnUntraced(function* (
           'Type',
           'FunctionBody.compareExchange',
         )
-        return yield* FunctionBodyState.appendResult(draft, type, name, (result, finalName) => ({
+        return yield* FunctionBodyState.appendResult(draft, type, name, (result) => ({
           _tag: 'CompareExchange',
           pointer: address.operand,
           comparison: expected.operand,
@@ -660,7 +650,6 @@ export const compareExchange = Effect.fnUntraced(function* (
           failureOrdering: options.failureOrdering,
           weak: options.weak ?? false,
           result,
-          name: finalName,
         }))
       }),
   )
@@ -730,20 +719,14 @@ export const atomicRmw = Effect.fnUntraced(function* (
           }),
         )
       }
-      return yield* FunctionBodyState.appendResult(
-        draft,
-        operand.type,
-        name,
-        (result, finalName) => ({
-          _tag: 'AtomicRmw',
-          operation,
-          pointer: address.operand,
-          value: operand.operand,
-          access,
-          result,
-          name: finalName,
-        }),
-      )
+      return yield* FunctionBodyState.appendResult(draft, operand.type, name, (result) => ({
+        _tag: 'AtomicRmw',
+        operation,
+        pointer: address.operand,
+        value: operand.operand,
+        access,
+        result,
+      }))
     }),
   )
 })
@@ -784,12 +767,11 @@ export const vaArg = Effect.fnUntraced(function* (
         'Type',
         'FunctionBody.vaArg',
       )
-      return yield* FunctionBodyState.appendResult(draft, type, name, (result, finalName) => ({
+      return yield* FunctionBodyState.appendResult(draft, type, name, (result) => ({
         _tag: 'VaArg',
         list: source.operand,
         valueType: type,
         result,
-        name: finalName,
       }))
     }),
   )

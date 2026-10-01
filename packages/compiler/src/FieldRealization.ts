@@ -2,7 +2,7 @@ import * as ConformanceProof from './ConformanceProof.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Tir from './Tir.js'
 import * as Lifetime from './Lifetime.js'
-import type * as Instances from './Instances.js'
+import * as Instances from './Instances.js'
 import * as RepresentationField from './RepresentationField.js'
 import * as SuspensionMode from './SuspensionMode.js'
 import * as StaticValue from './StaticValue.js'
@@ -361,20 +361,17 @@ const sameArguments = (
   )
 }
 
+// Environment lookups call this per candidate. The candidate's identity, and with it its runtime
+// key, is memoized per callable: rebuilding it per call put `Canonical.record` among the hottest
+// self-time frames of a large selfhost compile. The cheap target identity is checked first.
 export const matchesIdentity = (
   identity: Type.CallableIdentityArgument,
   candidate: Instances.CallableInstance,
 ): boolean =>
   identity.environment !== undefined &&
-  Type.runtimeCallableEnvironmentIdentityKey(identity.environment) ===
-    Type.runtimeCallableEnvironmentIdentityKey(
-      Tir.callableEnvironmentIdentity(candidate.site, {
-        declaration: candidate.owner.declaration,
-        typeArguments: candidate.owner.typeArguments,
-        staticArgumentKeys: candidate.owner.staticArguments.map(StaticValue.key),
-      }),
-    ) &&
   Tir.matchesCallableTargetIdentity(candidate.target, identity.target) &&
+  Type.runtimeCallableEnvironmentIdentityKey(identity.environment) ===
+    Type.runtimeCallableEnvironmentIdentityKey(Instances.callableEnvironmentIdentity(candidate)) &&
   sameArguments(identity.typeArguments, candidate.typeArguments)
 
 /** One capture shape signature, used only to detect indistinguishable environments. */
@@ -673,13 +670,7 @@ export const matchesCallable = (
   sameArguments(self.targetArguments, candidate.typeArguments) &&
   self.environment !== undefined &&
   Type.runtimeCallableEnvironmentIdentityKey(self.environment) ===
-    Type.runtimeCallableEnvironmentIdentityKey(
-      Tir.callableEnvironmentIdentity(candidate.site, {
-        declaration: candidate.owner.declaration,
-        typeArguments: candidate.owner.typeArguments,
-        staticArgumentKeys: candidate.owner.staticArguments.map(StaticValue.key),
-      }),
-    )
+    Type.runtimeCallableEnvironmentIdentityKey(Instances.callableEnvironmentIdentity(candidate))
 
 /** Structural equality for callable runtime facts owned by this actor. */
 const equalsCallable = (left: CallableRealization, right: CallableRealization): boolean =>

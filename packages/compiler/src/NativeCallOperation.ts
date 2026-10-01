@@ -51,8 +51,8 @@ export const emit = (context: Context, operation: Operation) => {
       const callableTarget =
         target._tag === 'BuiltinCallableTarget'
           ? undefined
-          : FunctionIndex.nativeCandidates(declared, target.declaration).find((candidate) =>
-              Mir.matchesInstance(candidate.fn, target.declaration, operation.typeArguments),
+          : FunctionIndex.nativeInstances(declared, target.declaration, operation.typeArguments).at(
+              0,
             )
       if (target._tag !== 'BuiltinCallableTarget' && callableTarget === undefined)
         throw new RangeError(
@@ -324,7 +324,12 @@ export const emit = (context: Context, operation: Operation) => {
       break
     }
     case 'Call': {
-      const target = FunctionIndex.nativeCandidates(declared, operation.target).find((candidate) =>
+      const target = FunctionIndex.nativeInstances(
+        declared,
+        operation.target,
+        operation.typeArguments,
+        operation.staticArguments,
+      ).find((candidate) =>
         Mir.matchesCall(
           candidate.fn,
           operation.target,

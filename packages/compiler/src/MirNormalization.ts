@@ -70,7 +70,12 @@ const directTarget = (
 ): ConstructorShape | undefined => {
   if (operation._tag === 'Call') {
     return constructorShape(
-      FunctionIndex.candidates(functions, operation.target).find((candidate) =>
+      FunctionIndex.mirInstances(
+        functions,
+        operation.target,
+        operation.typeArguments,
+        operation.staticArguments,
+      ).find((candidate) =>
         Mir.matchesCall(
           candidate,
           operation.target,
@@ -84,9 +89,7 @@ const directTarget = (
   const target = operation.target
   if (target?._tag !== 'DeclarationCallableTarget') return undefined
   return constructorShape(
-    FunctionIndex.candidates(functions, target.declaration).find((candidate) =>
-      Mir.matchesInstance(candidate, target.declaration, operation.typeArguments),
-    ),
+    FunctionIndex.mirInstances(functions, target.declaration, operation.typeArguments).at(0),
   )
 }
 
@@ -102,9 +105,7 @@ const hasConcreteTarget = (
   }
   return (
     declaration !== undefined &&
-    FunctionIndex.candidates(functions, declaration).some((candidate) =>
-      Mir.matchesInstance(candidate, declaration, operation.typeArguments),
-    )
+    FunctionIndex.mirInstances(functions, declaration, operation.typeArguments).length > 0
   )
 }
 

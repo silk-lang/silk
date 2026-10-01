@@ -45,8 +45,6 @@ export interface MutableState {
   integerConstants: Map<number, Map<bigint, Constant.Constant>>
   /** One shared function-body operand per constant; instruction descriptions retain operands. */
   constantOperands: Array<FunctionBodyDescription.Operand | undefined>
-  /** UTF-8 encodings of local value and block names, shared across function bodies. */
-  localNames: Map<string, ByteString.ByteString>
   globals: GlobalTable.GlobalTable
   buildingFunctions: Set<number>
   /** Default intrinsic resolutions keyed by intrinsic id and overload type indices. */

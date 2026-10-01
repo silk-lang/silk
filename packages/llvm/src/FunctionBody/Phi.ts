@@ -62,20 +62,14 @@ export const phiIn = (
       )
     }
   }
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    typeIndex.success,
-    name,
-    (result, finalName) => ({
-      _tag: 'Phi',
-      type: typeIndex.success,
-      incoming: [],
-      fastMath: math,
-      sealed: false,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, typeIndex.success, name, (result) => ({
+    _tag: 'Phi',
+    type: typeIndex.success,
+    incoming: [],
+    fastMath: math,
+    sealed: false,
+    result,
+  }))
   if (Result.isFailure(appended)) return Result.fail(appended.failure)
   // appendResult just pushed the phi as the draft's last instruction.
   return FunctionBodyState.makePhiHandle(draft, draft.instructions.length - 1)

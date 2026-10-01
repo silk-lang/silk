@@ -234,9 +234,7 @@ export const emitCompletion = (context: NativeSuspension.ReturnContext) => {
         'completion',
       )
     }
-    if (context.diagnostic !== undefined)
-      for (const outcome of context.diagnostic.outcomes.values())
-        NativeDiagnosticOutcome.release(outcome, context.diagnostic)
+    if (context.diagnostic !== undefined) NativeDiagnosticOutcome.releaseAll(context.diagnostic)
     Emitter.returnVoid(context.body)
     return
   }
@@ -260,9 +258,7 @@ const emitResult = (
   result: NativeResult.NativeResult,
   name: string,
 ) => {
-  if (context.diagnostic !== undefined)
-    for (const outcome of context.diagnostic.outcomes.values())
-      NativeDiagnosticOutcome.release(outcome, context.diagnostic)
+  if (context.diagnostic !== undefined) NativeDiagnosticOutcome.releaseAll(context.diagnostic)
   if (context.entry.suspendable)
     return NativeSuspension.returnStep(context, 0n, result.values, name, result.diagnostic)
   if (context.entry.resultStorage !== undefined) {

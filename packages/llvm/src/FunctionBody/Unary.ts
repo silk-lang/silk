@@ -48,19 +48,13 @@ export const unaryIn = (
         }),
       )
     }
-    return yield* FunctionBodyState.appendResult(
-      draft,
-      resolved.type,
-      name,
-      (result, finalName) => ({
-        _tag: 'Unary',
-        kind,
-        operand: resolved.operand,
-        fastMath: fastMath(options.fastMath),
-        result,
-        name: finalName,
-      }),
-    )
+    return yield* FunctionBodyState.appendResult(draft, resolved.type, name, (result) => ({
+      _tag: 'Unary',
+      kind,
+      operand: resolved.operand,
+      fastMath: fastMath(options.fastMath),
+      result,
+    }))
   })
 }
 
@@ -94,16 +88,10 @@ export const freezeIn = (
       operand,
       'FunctionBody.freeze',
     )
-    return yield* FunctionBodyState.appendResult(
-      draft,
-      resolved.type,
-      name,
-      (result, finalName) => ({
-        _tag: 'Freeze',
-        operand: resolved.operand,
-        result,
-        name: finalName,
-      }),
-    )
+    return yield* FunctionBodyState.appendResult(draft, resolved.type, name, (result) => ({
+      _tag: 'Freeze',
+      operand: resolved.operand,
+      result,
+    }))
   })
 }

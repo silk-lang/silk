@@ -7,6 +7,7 @@ import * as Instances from '../src/Instances.js'
 import * as LayoutEncode from '../src/LayoutEncode.js'
 import * as LayoutVerify from '../src/LayoutVerify.js'
 import * as Target from '../src/Target.js'
+import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
 import { unreachable } from './support/raise.js'
 
@@ -260,6 +261,35 @@ pub fn main() -> i32 {
         identity,
       ),
       second,
+    )
+    assert.deepEqual(Layout.callableEnvironmentsByIdentity(callablePlan, identity), [
+      callable,
+      second,
+    ])
+    assert.deepEqual(Layout.callableEnvironmentsByOwner(callablePlan, callable.callable.owner), [
+      callable,
+      second,
+    ])
+    const retained = Type.callableIdentityArgument(
+      '',
+      Tir.callableTargetIdentity(callable.callable.target),
+      callable.callable.typeArguments,
+      identity,
+    )
+    assert.strictEqual(Layout.callableEnvironmentMatching(callablePlan, retained), callable)
+    assert.strictEqual(
+      Layout.callableEnvironmentMatching(
+        { ...callablePlan, callableEnvironments: [second, callable] },
+        retained,
+      ),
+      second,
+    )
+    assert.strictEqual(
+      Layout.callableEnvironmentMatching(
+        callablePlan,
+        Type.callableIdentityArgument(retained.identity, retained.target, retained.typeArguments),
+      ),
+      undefined,
     )
     assert.deepEqual(yield* LayoutVerify.verify(plan), [])
   }),

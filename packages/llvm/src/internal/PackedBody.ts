@@ -135,7 +135,7 @@ class Writer {
   record(value: object): void {
     const fields = value as Readonly<Record<string, unknown>>
     const keys = Object.keys(value)
-    // Names are byte arrays on every value and block; store their bytes raw.
+    // Byte strings (byte-exact local names, bundle tags) store their bytes raw.
     if (
       keys.length === 2 &&
       keys[0] === '_tag' &&
