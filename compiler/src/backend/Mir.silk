@@ -78,6 +78,10 @@ pub struct AggregateField {
 
 pub union Rvalue {
   Aggregate {pub fields: Vector<AggregateField>},
+  /// An explicit array loan becomes a descriptor with its logical count.
+  Slice {pub data: Operand, pub count: usize},
+  /// Reads the runtime length stored in a descriptor place.
+  SliceLength {pub place: Place},
   Use {pub value: Operand},
   Ref {pub access: Access, pub place: Place},
   AddressOf {pub access: Access, pub place: Place},
@@ -166,6 +170,8 @@ union View {
   Field {value: BodyNodeId, index: usize, ty: Shared<Type>, origin: Origin},
   Index {value: BodyNodeId, index: BodyNodeId, ty: Shared<Type>, origin: Origin},
   ArrayLength {value: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
+  ArraySlice {value: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
+  SliceLength {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Aggregate {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   PlaceAssignment {target: BodyNodeId, value: BodyNodeId, origin: Origin},
   Prefix {operation: PrefixOperator, operand: BodyNodeId, ty: Shared<Type>, origin: Origin},
@@ -363,6 +369,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
+          // Pointer access weakening is the existing scalar value-copy lane, with no address change.
+          BodyExpression.PointerAccessWeaken {value} => View.Move {
+            value: value, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
           BodyExpression.Borrow {access, value} => View.Borrow {
             access: access,
             value: value,
@@ -382,6 +392,12 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           }
           BodyExpression.ArrayLength {value, count} => View.ArrayLength {
             value: value, count: count, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.ArraySlice {value, count} => View.ArraySlice {
+            value: value, count: count, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.SliceLength {value} => View.SliceLength {
+            value: value, ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.Index {value, index} => View.Index {
             value: value, index: index, ty: Shared.clone<Type>(&ty), origin: origin,
@@ -555,6 +571,24 @@ effect fn temporary(builder: &mut Builder, ty: &Shared<Type>, origin: Origin) ->
   return index
 }
 
+effect fn copyPlace(value: &Place) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = place(value.local)
+  let projections = Vector.asSlice<Projection>(&value.projections)
+  let mut at = usize.ZERO
+  while at < projections.length {
+    let selected = match &projections[at] {
+      Projection.Field {index} => Projection.Field {index: index}
+      Projection.Payload {index} => Projection.Payload {index: index}
+      Projection.Index {local} => Projection.Index {local: local}
+      Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
+      Projection.Deref => Projection.Deref
+    }
+    run Vector.append<Projection>(&mut copied.projections, move selected)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
 effect fn expressionPlace(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
@@ -577,11 +611,18 @@ effect fn expressionPlace(
         Option<Shared<Type>>.Some {value: selectedType} => move selectedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
-      let shape = match move Type.arrayShape(&subjectType) {
-        Option<ArrayShape>.Some {value: facts} => move facts
-        Option<ArrayShape>.None => { return run unsupported(&owner, origin, GapCode.IndexProjection) }
+      let mut knownLength = Option.none<usize>()
+      if let Option<ArrayShape>.Some {value: facts} = move Type.arrayShape(&subjectType) {
+        knownLength = Option.some<usize>(facts.length)
+      } else {
+        if let Option<Shared<Type>>.None = move Type.sliceElement(&subjectType) {
+          return run unsupported(&owner, origin, GapCode.IndexProjection)
+        }
+        // A descriptor is captured before evaluating the index, which may call user code.
+        let snapshot = run temporary(&mut builder.*, &subjectType, origin)
+        run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: Operand.Copy {place: move projected}}, origin)
+        projected = place(snapshot)
       }
-      let length = run Type.extentText(shape.length)
       let indexType = match move run instanceNodeType(&builder.*, body, index) {
         Option<Shared<Type>>.Some {value: selectedType} => move selectedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
@@ -589,12 +630,21 @@ effect fn expressionPlace(
       let input = run expression(&mut builder.*, body, hir, index)
       let captured = run temporary(&mut builder.*, &indexType, origin)
       run assign(&mut builder.*, place(captured), Rvalue.Use {value: move input}, origin)
+      let mut bound = Operand.Unit
+      if let Option<usize>.Some {value: count} = move knownLength {
+        bound = Operand.Integer {decimal: run Type.extentText(count), negative: false, ty: Shared.clone<Type>(&indexType)}
+      } else {
+        let lengthSlot = run temporary(&mut builder.*, &indexType, origin)
+        let lengthPlace = run copyPlace(&projected)
+        run assign(&mut builder.*, place(lengthSlot), Rvalue.SliceLength {place: move lengthPlace}, origin)
+        bound = Operand.Copy {place: place(lengthSlot)}
+      }
       let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
       let condition = run temporary(&mut builder.*, &boolean, origin)
       run assign(&mut builder.*, place(condition), Rvalue.Binary {
         operation: InfixOperator.LessThan,
         left: Operand.Copy {place: place(captured)},
-        right: Operand.Integer {decimal: move length, negative: false, ty: move indexType},
+        right: move bound,
       }, origin)
       let safe = run block(&mut builder.*, origin)
       let trap = run block(&mut builder.*, origin)
@@ -691,6 +741,18 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       drop evaluated
       return Operand.Integer {decimal: run Type.extentText(count), negative: false, ty: move ty}
     }
+    View.ArraySlice {value, count, ty, origin} => {
+      let data = run expression(&mut builder.*, body, hir, value)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Slice {data: move data, count: count}, origin)
+      return Operand.Copy {place: place(output)}
+    }
+    View.SliceLength {value, ty, origin} => {
+      let descriptor = run expressionPlace(&mut builder.*, body, hir, value)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.SliceLength {place: move descriptor}, origin)
+      return Operand.Copy {place: place(output)}
+    }
     View.Index {ty, origin, ..} => {
       let projected = run expressionPlace(&mut builder.*, body, hir, id)
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -742,6 +804,10 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     View.Borrow {access, value, ty, origin} => {
       let borrowed = run expressionPlace(&mut builder.*, body, hir, value)
       let output = run temporary(&mut builder.*, &ty, origin)
+      if let Option<Shared<Type>>.Some {value: element} = move Type.sliceElement(&ty) {
+        run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move borrowed}}, origin)
+        return Operand.Copy {place: place(output)}
+      }
       run assign(
         &mut builder.*,
         place(output),
@@ -993,6 +1059,14 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       drop ignored
     }
     View.ArrayLength {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.ArraySlice {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.SliceLength {..} => {
       let ignored = run expression(&mut builder.*, body, hir, id)
       drop ignored
     }
@@ -1348,6 +1422,12 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
       value: value,
       count: count,
       origin: origin,
+    }
+    View.ArraySlice {ty, value, count, origin} => View.ArraySlice {
+      ty: run Type.substitute(&ty, &builder.owner, arguments), value: value, count: count, origin: origin,
+    }
+    View.SliceLength {ty, value, origin} => View.SliceLength {
+      ty: run Type.substitute(&ty, &builder.owner, arguments), value: value, origin: origin,
     }
     View.Aggregate {ty, node, count, origin} => View.Aggregate {
       ty: run Type.substitute(&ty, &builder.owner, arguments),

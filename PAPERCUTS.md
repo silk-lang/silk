@@ -393,3 +393,10 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-01 · B12 receiver region assertion nested Shared.with callbacks and failed the bounded importer with SEM0199 and follow-on ownership errors · Extract named region and application projections before checking the importer; retain actual caller ownership and original slot comparisons · self-hosted compiler
 
 - 2026-10-01 · B12 receiver assertion passed body views through a local-shared application callback and retained OWN0016 after type/accessor corrections · Retain the direct application with TypedBody.directApplication, copy it through Application.copyShared, and compare the owned application against a short body borrow · self-hosted compiler
+- 2026-09-30 · A temporary SemanticCases check root inferred compiler/src/semantic as the module source root and had no main · Check through a temporary compiler/src wrapper importing SemanticCases with a main, then remove both temporary files · B9 runtime slice frontend checks
+
+- 2026-09-30 · Allocator provision on an outer Shared.make did not cover allocations evaluated in its argument fields (SEM0071) · Allocate and provide each child before constructing the descriptor type; bounded frontend check caught it before push · B9 runtime slice structured snapshot
+
+- 2026-09-30 · Runtime slice fixtures wrote &[i32; 2], which both parsers treat as damaged slice syntax, so stage-only positives did not prove array-reference reborrows · Group the fixed array as &([i32; 2]) and assert the actual fixed referent and dereference/borrow/conversion chain in the existing snapshot · B9 runtime slices
+
+- 2026-10-01 · New boundary helpers used qualified enum values inside field patterns and a unit union variant with if-let, producing parser cascades in the bounded frontend check · Bind access then compare it, and match the unit unification outcome exhaustively before publishing · B9 runtime slice/pointer boundaries

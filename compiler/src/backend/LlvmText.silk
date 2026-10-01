@@ -3,7 +3,7 @@
 import backend.CAbi
 import backend.CAbi {Extension as CExtension}
 import backend.InstanceKey {InstanceKey}
-import backend.Layout {Abi, Field, Layout, Metrics, Sequence, TypeLayout}
+import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, TypeLayout}
 import backend.Gap {Code as GapCode, Gap}
 import backend.Mir {
   AggregateField,
@@ -475,6 +475,50 @@ effect fn sequenceFact(layouts: &[TypeLayout], ty: &Shared<Type>, function: &Mir
   fail Gap.make(GapCode.IndexProjection, &owner, span)
 }
 
+struct IndexFacts {
+  element: Shared<Type>
+  stride: usize
+  borrowed: bool
+}
+
+fn indexFacts(layout: &Layout) -> Option<IndexFacts> {
+  if let Option<Sequence>.Some {value: array} = move Layout.sequenceFacts(layout) {
+    return Option.some<IndexFacts>(IndexFacts {element: move array.element, stride: array.stride, borrowed: false})
+  }
+  if let Option<SliceFacts>.Some {value: slice} = move Layout.sliceFacts(layout) {
+    return Option.some<IndexFacts>(IndexFacts {element: move slice.element, stride: slice.stride, borrowed: true})
+  }
+  return Option.none<IndexFacts>()
+}
+
+effect fn indexedFact(layouts: &[TypeLayout], ty: &Shared<Type>, function: &MirFunction,
+  span: Span) -> IndexFacts ! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < layouts.length {
+    if run Type.runtimeEqualsShared(&layouts[at].ty, ty) {
+      let selected = Shared.with<Layout, Option<IndexFacts>>(&layouts[at].layout, indexFacts)
+      if let Option<IndexFacts>.Some {value} = move selected { return move value }
+    }
+    at = at + usize.ONE
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.make(GapCode.IndexProjection, &owner, span)
+}
+
+effect fn sliceFact(layouts: &[TypeLayout], ty: &Shared<Type>, function: &MirFunction,
+  span: Span) -> SliceFacts ! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < layouts.length {
+    if run Type.runtimeEqualsShared(&layouts[at].ty, ty) {
+      let selected = Shared.with<Layout, Option<SliceFacts>>(&layouts[at].layout, Layout.sliceFacts)
+      if let Option<SliceFacts>.Some {value} = move selected { return move value }
+    }
+    at = at + usize.ONE
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.make(GapCode.SliceLayout, &owner, span)
+}
+
 // Layout alignments are powers of two. Offsets reduce the base guarantee without inventing one.
 fn offsetAlignment(alignment: usize, offset: usize) -> usize {
   let mut guarantee = alignment
@@ -582,7 +626,17 @@ effect fn emitPlace(
         alignment = field.alignment
       }
       Projection.Index {local} => {
-        let sequence = run sequenceFact(layouts, &ty, function, span)
+        let sequence = run indexedFact(layouts, &ty, function, span)
+        if sequence.borrowed {
+          let data = run temp(&mut writer.*)
+          run append(&mut writer.*, Bytes.asSlice(&data))
+          run append(&mut writer.*, b" = load ptr, ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&address))
+          run memoryAlignment(&mut writer.*, alignment)
+          address = move data
+          let elementLayout = run layoutOf(layouts, &sequence.element, function, span)
+          alignment = elementLayout.alignment
+        }
         let indexPlace = Place {local: local, projections: Vector.make<Projection>()}
         let selectedIndex = run loadPlace(&mut writer.*, function, target, layouts, &indexPlace)
         let offset = run temp(&mut writer.*)
@@ -723,6 +777,25 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
   return run emitOperand(&mut writer.*, function, target, layouts, operand)
 }
 
+effect fn descriptorLengthAddress(writer: &mut Writer, target: &Target, base: &[u8], offset: usize) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let name = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&name))
+  run append(&mut writer.*, b" = getelementptr i8, ptr ")
+  run append(&mut writer.*, base)
+  run append(&mut writer.*, b", i")
+  run decimal(&mut writer.*, u32.toUsize(Target.pointerBits(target)))
+  run append(&mut writer.*, b" ")
+  run decimal(&mut writer.*, offset)
+  run append(&mut writer.*, b"\n")
+  return move name
+}
+
+fn lengthRepresentation(target: &Target) -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: u32.toUsize(Target.pointerBits(target)),
+    signed: false, unit: false, pointer: false, floating: false}
+}
+
 effect fn emitScalarRvalue(
   writer: &mut Writer,
   function: &MirFunction,
@@ -732,6 +805,24 @@ effect fn emitScalarRvalue(
   span: Span,
 ) -> Value ! Gap | OutOfMemoryError ? &mut Allocator {
   return match & rvalue.* {
+    Rvalue.SliceLength {place} => {
+      let descriptor = run emitPlace(&mut writer.*, function, target, layouts, &place)
+      let facts = run sliceFact(layouts, &descriptor.ty, function, span)
+      let address = run descriptorLengthAddress(&mut writer.*, target, Bytes.asSlice(&descriptor.text), facts.lengthOffset)
+      let name = run temp(&mut writer.*)
+      let kind = lengthRepresentation(target)
+      run append(&mut writer.*, Bytes.asSlice(&name))
+      run append(&mut writer.*, b" = load ")
+      run typeName(&mut writer.*, kind)
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&address))
+      run memoryAlignment(&mut writer.*, offsetAlignment(descriptor.alignment, facts.lengthOffset))
+      return Value {scalar: kind, text: move name}
+    }
+    Rvalue.Slice {..} => {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.TypedForm, &owner, span)
+    }
     Rvalue.Ref {place, ..} => {
       let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
       return Value {
@@ -999,6 +1090,26 @@ effect fn emitBlock(
             run storeValue(&mut writer.*, &selectedField, &operand)
             fieldAt = fieldAt + usize.ONE
           }
+        } else if let Rvalue.Slice {data, count} = &value {
+          let facts = run sliceFact(layouts, &address.ty, function, origin.span)
+          let input = run emitOperand(&mut writer.*, function, target, layouts, &data)
+          if !input.scalar.pointer {
+            let owner = InstanceKey.identity(&function.key)
+            fail Gap.make(GapCode.SliceLayout, &owner, origin.span)
+          }
+          run append(&mut writer.*, b"store ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&input.text))
+          run append(&mut writer.*, b", ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&address.text))
+          run memoryAlignment(&mut writer.*, address.alignment)
+          let lengthAddress = run descriptorLengthAddress(&mut writer.*, target, Bytes.asSlice(&address.text), facts.lengthOffset)
+          run append(&mut writer.*, b"store ")
+          run typeName(&mut writer.*, lengthRepresentation(target))
+          run append(&mut writer.*, b" ")
+          run decimal(&mut writer.*, count)
+          run append(&mut writer.*, b", ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&lengthAddress))
+          run memoryAlignment(&mut writer.*, offsetAlignment(address.alignment, facts.lengthOffset))
         } else {
           let selected = run emitScalarRvalue(&mut writer.*, function, target, layouts, &value, origin.span)
           run storeValue(&mut writer.*, &address, &selected)
