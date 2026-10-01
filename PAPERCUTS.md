@@ -400,3 +400,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · Runtime slice fixtures wrote &[i32; 2], which both parsers treat as damaged slice syntax, so stage-only positives did not prove array-reference reborrows · Group the fixed array as &([i32; 2]) and assert the actual fixed referent and dereference/borrow/conversion chain in the existing snapshot · B9 runtime slices
 
 - 2026-10-01 · New boundary helpers used qualified enum values inside field patterns and a unit union variant with if-let, producing parser cascades in the bounded frontend check · Bind access then compare it, and match the unit unification outcome exhaustively before publishing · B9 runtime slice/pointer boundaries
+
+- 2026-10-01 · The combined array and slice fixture passed its assertions but exceeded the Linux one-second test gate after integration · Keep array diagnostics, slice region checks, and descriptor lowering in separate minimal source snapshots while retaining every assertion; CI verifies the resulting timings · B12 runtime-slice integration
