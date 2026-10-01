@@ -391,3 +391,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · B12 nested-row oracle added an equivalent SemanticCases helper, and a broad rename retained the duplicate · Reuse the existing effectRequirements projection and delete the added copy; inspect the complete correction diff before starting a check · self-hosted compiler
 
 - 2026-10-01 · B12 receiver region assertion nested Shared.with callbacks and failed the bounded importer with SEM0199 and follow-on ownership errors · Extract named region and application projections before checking the importer; retain actual caller ownership and original slot comparisons · self-hosted compiler
+
+- 2026-10-01 · B12 receiver assertion passed body views through a local-shared application callback and retained OWN0016 after type/accessor corrections · Retain the direct application with TypedBody.directApplication, copy it through Application.copyShared, and compare the owned application against a short body borrow · self-hosted compiler
