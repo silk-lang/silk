@@ -403,3 +403,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-10-01 · The combined array and slice fixture passed its assertions but exceeded the Linux one-second test gate after integration · Keep array diagnostics, slice region checks, and descriptor lowering in separate minimal source snapshots while retaining every assertion; CI verifies the resulting timings · B12 runtime-slice integration
 - 2026-09-30 · Full verification exported pinned LLVM 22 paths but Turbo strict environment filtering dropped SILK_TEST_CLANG and SILK_TEST_LLVM_AR, so NativeToolchain tests selected missing /usr/bin/llvm-ar and stopped before native acceptance · Declare both tool selections in the Turbo compiler test task environment so they reach tests and affect cache keys · CI toolchain
+
+- 2026-10-01 · The bounded B12 production check caught match-arm block results ignored, nullary if-let parser cascades, shadowed names and branch-owned borrowed slice projections · Return explicit match-block values, use nullary match, distinct bindings and owned Copy node projections; re-review immutable corrections before retry · self-hosted witness MIR
