@@ -11,6 +11,12 @@ export interface AncestorHistory {
   readonly initial: History
   readonly nodes: Map<string, History>
   readonly unions: Map<string, History>
+  /** `set` results by history, variable, and value; interned nodes make every result final. */
+  readonly assignments: Map<string, History>
+  /** `partition` results by history and variable. */
+  readonly partitions: Map<string, ReadonlyMap<string | undefined, History>>
+  /** `project` results by retained set identity, then history; retained sets are never mutated. */
+  readonly projections: WeakMap<ReadonlySet<string>, Map<number, History>>
   /** Variable and value texts as small integers, so node keys are cheap and injective. */
   readonly atoms: Map<string, number>
 }
@@ -20,6 +26,9 @@ export const make = (): AncestorHistory => ({
   initial: { id: 1, branches: new Map() },
   nodes: new Map(),
   unions: new Map(),
+  assignments: new Map(),
+  partitions: new Map(),
+  projections: new WeakMap(),
   atoms: new Map(),
 })
 
@@ -117,6 +126,9 @@ export const set = (
   variable: string,
   value: string,
 ): History => {
+  const key = `${history.id}:${atom(self, variable)}=${atom(self, value)}`
+  const cached = self.assignments.get(key)
+  if (cached !== undefined) return cached
   const memo = new Map<number, History>()
   const visit = (current: History): History => {
     if (current === self.empty) return current
@@ -137,7 +149,9 @@ export const set = (
     memo.set(current.id, result)
     return result
   }
-  return visit(history)
+  const result = visit(history)
+  self.assignments.set(key, result)
+  return result
 }
 
 /** Partitions by one ancestor while preserving the complete correlated assignments. */
@@ -146,6 +160,9 @@ export const partition = (
   history: History,
   variable: string,
 ): ReadonlyMap<string | undefined, History> => {
+  const key = `${history.id}:${atom(self, variable)}`
+  const cached = self.partitions.get(key)
+  if (cached !== undefined) return cached
   const memo = new Map<number, ReadonlyMap<string | undefined, History>>()
   const visit = (current: History): ReadonlyMap<string | undefined, History> => {
     if (current === self.empty) return new Map()
@@ -176,16 +193,23 @@ export const partition = (
     memo.set(current.id, result)
     return result
   }
-  return visit(history)
+  const result = visit(history)
+  self.partitions.set(key, result)
+  return result
 }
 
-/** Forgets every declaration outside `keep`, uniting the assignments that differed only there. */
+/**
+ * Forgets every declaration outside `keep`, uniting the assignments that differed only there.
+ * Results are retained per `keep` identity, so a caller must never mutate a set it projected onto.
+ */
 export const project = (
   self: AncestorHistory,
   history: History,
   keep: ReadonlySet<string>,
 ): History => {
-  const memo = new Map<number, History>()
+  // Every visited node's projection onto the same set is final, so the visit memo persists.
+  const memo = self.projections.get(keep) ?? new Map<number, History>()
+  if (memo.size === 0) self.projections.set(keep, memo)
   const visit = (current: History): History => {
     if (current.variable === undefined) return current
     const prior = memo.get(current.id)

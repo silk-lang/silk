@@ -2,6 +2,7 @@ import * as Emitter from '@silklang/llvm/Emitter'
 import type * as NativeDiagnosticOutcome from './NativeDiagnosticOutcome.js'
 import * as LlvmType from '@silklang/llvm/Type'
 import type * as Value from '@silklang/llvm/Value'
+import * as NativeDiagnosticDispatch from './NativeDiagnosticDispatch.js'
 import * as NativeDiagnosticFailure from './NativeDiagnosticFailure.js'
 
 /** One invocation's current lexical observer reference; never module or thread-local storage. */
@@ -15,14 +16,30 @@ export interface NativeDiagnosticContext {
   readonly callbackType: LlvmType.Type
   readonly current: Value.Input
   readonly causeType: LlvmType.Type
+  readonly incomingObserver: Value.Input
   /** Borrowed input retained by the caller; copied by value, never a pointer to its stack slot. */
   readonly incomingCause: Value.Input
   readonly cause: Value.Input
+  /**
+   * Slots that provably hold their incoming argument wherever they are read, so reads use the
+   * argument directly instead of loading the private, non-escaping slot.
+   */
+  readonly pinned: Pinning
+  /** Outcome slots by local ordinal; `NativeDiagnosticOutcome.bind` assigns them once. */
   readonly outcomes: Map<number, NativeDiagnosticOutcome.NativeDiagnosticOutcome>
+  /** Array whose consecutive elements are the outcome slots, in binding order. */
+  readonly outcomeArray: { storage: Value.Input | undefined }
   /** Interned artifact-lifetime text shared by repeated sites in this function. */
   readonly literals: Map<string, readonly [Value.Input, Value.Input]>
   /** Callback dispatch invalidates cached source values at the enclosing operation join. */
   readonly sourceState: { dirty: boolean }
+  /** The module's out-of-line observer dispatch shared by every event site. */
+  readonly dispatch: NativeDiagnosticDispatch.NativeDiagnosticDispatch
+}
+
+export interface Pinning {
+  observer: boolean
+  cause: boolean
 }
 
 /** Creates the invocation-local slot initialized from the internal call ABI. */
@@ -32,6 +49,7 @@ export const make = (
   pointer: LlvmType.Type,
   byte: LlvmType.Type,
   word: LlvmType.Type,
+  dispatch: NativeDiagnosticDispatch.NativeDiagnosticDispatch,
   initial: Value.Input,
   initialCause?: Value.Input,
 ): NativeDiagnosticContext => {
@@ -63,23 +81,45 @@ export const make = (
     callbackType,
     current,
     causeType,
+    incomingObserver: initial,
     incomingCause,
     cause,
+    pinned: { observer: false, cause: false },
     outcomes: new Map<number, NativeDiagnosticOutcome.NativeDiagnosticOutcome>(),
+    outcomeArray: { storage: undefined },
     literals: new Map<string, readonly [Value.Input, Value.Input]>(),
     sourceState: { dirty: false },
+    dispatch,
   }
 }
 
-/** Borrows the selected cause for a nested call without creating an owned reference. */
-export const currentCause = (self: NativeDiagnosticContext) => {
-  return Emitter.load(self.body, self.causeType, self.cause, 'diagnostic_cause')
+/**
+ * Pins the slots that no lexical scope or recovery region of this invocation rewrites: such a slot
+ * holds its incoming argument at every read outside an explicit `unpin` region.
+ */
+export const pin = (self: NativeDiagnosticContext, pinning: Pinning): void => {
+  self.pinned.observer = pinning.observer
+  self.pinned.cause = pinning.cause
 }
 
-/** Loads the observer selected at this call site, including any intervening lexical scope. */
-export const current = (self: NativeDiagnosticContext) => {
-  return Emitter.load(self.body, self.pointer, self.current, 'diagnostic_observer')
+/** Releases both pins for code that temporarily installs another observer or cause. */
+export const unpin = (self: NativeDiagnosticContext): Pinning => {
+  const previous = { ...self.pinned }
+  pin(self, { observer: false, cause: false })
+  return previous
 }
+
+/** Borrows the selected cause for a nested call without creating an owned reference. */
+export const currentCause = (self: NativeDiagnosticContext): Value.Input =>
+  self.pinned.cause
+    ? self.incomingCause
+    : Emitter.load(self.body, self.causeType, self.cause, 'diagnostic_cause')
+
+/** Loads the observer selected at this call site, including any intervening lexical scope. */
+export const current = (self: NativeDiagnosticContext): Value.Input =>
+  self.pinned.observer
+    ? self.incomingObserver
+    : Emitter.load(self.body, self.pointer, self.current, 'diagnostic_observer')
 
 /** Borrows the selected failure for terminal observation; unrelated or absent contexts stay silent. */
 export const unhandled = (self: NativeDiagnosticContext) => {
@@ -141,53 +181,18 @@ export const emitAt = (
   identity: readonly [Value.Input, Value.Input],
   origin: readonly [Value.Input, Value.Input],
 ) => {
-  const { body, builder, pointer, word } = self
-  const enabled = Emitter.block(body, 'diagnostic_enabled')
-  const disabled = Emitter.block(body, 'diagnostic_disabled')
-  const following = Emitter.block(body, 'diagnostic_complete')
-  const zero = Emitter.integerUnsigned(builder, word, 0n)
-  Emitter.conditionalBranch(
-    body,
-    Emitter.integerCompare(
-      body,
-      'ne',
-      Emitter.cast(body, 'ptrtoint', observer, word, 'diagnostic_observer_address'),
-      zero,
-    ),
-    enabled,
-    disabled,
+  const handle = NativeDiagnosticDispatch.call(
+    self.dispatch,
+    self,
+    observer,
+    event,
+    first,
+    second,
+    identity,
+    origin,
   )
-  Emitter.setInsertionPoint(body, enabled)
-  const dispatch = Emitter.load(body, pointer, field(self, observer, 0))
-  const state = Emitter.load(body, pointer, field(self, observer, 1))
-  const captures = Emitter.load(body, pointer, field(self, observer, 2))
-  const result = Emitter.call(
-    body,
-    self.callbackType,
-    dispatch,
-    [
-      captures,
-      state,
-      Emitter.integerUnsigned(builder, self.byte, BigInt(event)),
-      first,
-      second,
-      ...identity,
-      ...origin,
-    ],
-    'diagnostic_result',
-  )
-  if (result === undefined) throw new RangeError('Diagnostic callback returned no handle')
-  Emitter.branch(body, following)
-  Emitter.setInsertionPoint(body, disabled)
-  Emitter.branch(body, following)
-  Emitter.setInsertionPoint(body, following)
-  const joined = Emitter.phi(body, word, 'diagnostic_handle')
-  Emitter.addPhiIncoming(body, joined, result, enabled)
-  Emitter.addPhiIncoming(body, joined, zero, disabled)
-  Emitter.sealPhi(body, joined)
-  const value = Emitter.phiValue(body, joined)
   self.sourceState.dirty = true
-  return value
+  return handle
 }
 
 /** Dispatches a semantic event to the current observer; disabled observation yields zero. */

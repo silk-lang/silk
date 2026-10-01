@@ -475,7 +475,12 @@ export const emit = (context: Context, operation: Operation) => {
       break
     }
     case 'RunEffect': {
-      const target = FunctionIndex.nativeCandidates(declared, operation.target).find((candidate) =>
+      const target = FunctionIndex.nativeInstances(
+        declared,
+        operation.target,
+        operation.typeArguments,
+        operation.staticArguments,
+      ).find((candidate) =>
         Mir.matchesEffectInstance(
           candidate.fn,
           operation.target,
@@ -634,15 +639,19 @@ export const emit = (context: Context, operation: Operation) => {
           otherwise,
         )
         Emitter.setInsertionPoint(body, selected)
-        const target = FunctionIndex.nativeCandidates(declared, alternative.runner).find(
-          (candidate) =>
-            Mir.matchesEffectInstance(
-              candidate.fn,
-              alternative.runner,
-              alternative.runnerTypeArguments,
-              alternative.runnerStaticArguments,
-              alternative.type.type,
-            ),
+        const target = FunctionIndex.nativeInstances(
+          declared,
+          alternative.runner,
+          alternative.runnerTypeArguments,
+          alternative.runnerStaticArguments,
+        ).find((candidate) =>
+          Mir.matchesEffectInstance(
+            candidate.fn,
+            alternative.runner,
+            alternative.runnerTypeArguments,
+            alternative.runnerStaticArguments,
+            alternative.type.type,
+          ),
         )
         if (target === undefined)
           throw new RangeError(
@@ -847,7 +856,12 @@ export const emit = (context: Context, operation: Operation) => {
         operation._tag === 'RunStaticEffect'
           ? [...operation.captures.map((capture) => capture.source), ...operation.arguments]
           : undefined
-      const target = FunctionIndex.nativeCandidates(declared, operation.runner).find(
+      const target = FunctionIndex.nativeInstances(
+        declared,
+        operation.runner,
+        operation.runnerTypeArguments,
+        operation.runnerStaticArguments,
+      ).find(
         (candidate) =>
           Mir.matchesEffectInstance(
             candidate.fn,
@@ -1033,7 +1047,12 @@ export const emit = (context: Context, operation: Operation) => {
       break
     }
     case 'CatchEffect': {
-      const target = FunctionIndex.nativeCandidates(declared, operation.runner).find((candidate) =>
+      const target = FunctionIndex.nativeInstances(
+        declared,
+        operation.runner,
+        operation.runnerTypeArguments,
+        operation.runnerStaticArguments,
+      ).find((candidate) =>
         Mir.matchesEffectInstance(
           candidate.fn,
           operation.runner,

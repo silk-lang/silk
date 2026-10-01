@@ -1,6 +1,8 @@
 import * as Schema from 'effect/Schema'
 import { createHash } from 'node:crypto'
+import * as Clock from 'effect/Clock'
 import * as FileSystem from 'effect/FileSystem'
+import * as Option from 'effect/Option'
 import * as Stream from 'effect/Stream'
 import * as Result from 'effect/Result'
 import { ChildProcess, ChildProcessSpawner } from 'effect/unstable/process'
@@ -102,6 +104,56 @@ export const physicalPath = Effect.fn('PlatformSupplyResolver.physicalPath')(fun
   return current
 })
 
+/**
+ * A settled file's content digest, keyed by the stat identity it was observed under. Supply
+ * snapshots re-validate the same multi-hundred-megabyte tools several times per compile; any write
+ * or replacement changes the identity and forces a re-read.
+ */
+interface Observation {
+  readonly identity: string
+  readonly digest: string
+}
+
+const observations = new Map<string, Observation>()
+
+/**
+ * A file modified this recently may still change within its timestamp granularity without
+ * changing its identity, so its digest is never reused.
+ */
+const settledMillis = 2_000
+
+const statIdentity = (info: FileSystem.File.Info): string | undefined => {
+  const mtime = Option.getOrUndefined(info.mtime)
+  const ino = Option.getOrUndefined(info.ino)
+  return mtime === undefined || ino === undefined
+    ? undefined
+    : `${info.dev}:${ino}:${info.size}:${mtime.getTime()}`
+}
+
+/** Digests a canonical file, reusing a settled observation while its stat identity is unchanged. */
+const contentDigest = Effect.fnUntraced(function* (
+  path: string,
+  origin: string,
+): Effect.fn.Return<string, PlatformSupply.SupplyError, FileSystem.FileSystem> {
+  const fs = yield* FileSystem.FileSystem
+  const info = yield* fs
+    .stat(path)
+    .pipe(Effect.mapError((cause) => storageFailure(path, origin, cause)))
+  const identity = statIdentity(info)
+  const observed = observations.get(path)
+  if (identity !== undefined && observed?.identity === identity) return observed.digest
+  const value = digest(yield* read(path, origin))
+  const modified = Option.getOrUndefined(info.mtime)?.getTime()
+  if (
+    identity !== undefined &&
+    modified !== undefined &&
+    modified <= (yield* Clock.currentTimeMillis) - settledMillis
+  )
+    observations.set(path, { identity, digest: value })
+  else observations.delete(path)
+  return value
+})
+
 export const file = Effect.fn('PlatformSupplyResolver.file')(function* (
   path: string,
   role: PlatformSupply.Role,
@@ -109,14 +161,13 @@ export const file = Effect.fn('PlatformSupplyResolver.file')(function* (
   root = '/',
 ): Effect.fn.Return<PlatformSupply.File, PlatformSupply.SupplyError, FileSystem.FileSystem> {
   const canonical = yield* physicalPath(path, root)
-  const bytes = yield* read(canonical, origin)
   return {
     path: canonical,
     selectedPath: resolve(path),
     root,
     role,
     origin,
-    digest: digest(bytes),
+    digest: yield* contentDigest(canonical, origin),
   }
 })
 
@@ -126,8 +177,7 @@ export const validateFiles = Effect.fn('PlatformSupplyResolver.validateFiles')(f
 ): Effect.fn.Return<void, PlatformSupply.SupplyError, FileSystem.FileSystem> {
   for (const input of files) {
     const path = yield* physicalPath(input.selectedPath, input.root)
-    const bytes = yield* read(path, input.origin)
-    if (path !== input.path || digest(bytes) !== input.digest)
+    if (path !== input.path || (yield* contentDigest(path, input.origin)) !== input.digest)
       return yield* PlatformSupply.failure(
         'ChangedInput',
         input.path,

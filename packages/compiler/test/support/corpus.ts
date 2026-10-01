@@ -2694,6 +2694,25 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'contract-only-impl-binder',
+    source: `interface Make<T> { fn make(value: &Self, item: T) -> T }
+struct Maker {}
+impl<T> Make<T> for Maker {
+  fn make(value: &Self, item: T) -> T { return move item }
+}
+fn throughMake<T: Make<i32>>(maker: &T, item: i32) -> i32 {
+  return Make<i32>.make(maker, item)
+}
+pub fn main() -> i32 {
+  let maker = Maker {}
+  let first = throughMake(&maker, 17)
+  let second = throughMake(&maker, 25)
+  if first != 17 || second != 25 { return 1 }
+  return first + second
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'operator-interface-contract',
     source: `struct Vector { value: i32 }
 impl Vector {

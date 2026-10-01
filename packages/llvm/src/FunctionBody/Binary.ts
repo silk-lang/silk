@@ -186,21 +186,15 @@ export const binaryIn = (
         (integerMath.noUnsignedWrap ? 2 : 0) |
         (integerMath.exact ? 4 : 0)
     ] ?? integerMath
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    leftValue.type,
-    name,
-    (result, finalName) => ({
-      _tag: 'Binary',
-      kind,
-      left: leftValue.operand,
-      right: rightValue.operand,
-      integerFlags,
-      fastMath: math,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, leftValue.type, name, (result) => ({
+    _tag: 'Binary',
+    kind,
+    left: leftValue.operand,
+    right: rightValue.operand,
+    integerFlags,
+    fastMath: math,
+    result,
+  }))
   return appended
 }
 
@@ -351,21 +345,15 @@ export const integerCompareIn = (
   const type = FunctionBodyState.comparisonType(draft, module, leftValue.type)
   if (Result.isFailure(type)) return Result.fail(type.failure)
   const math = FastMathActor.none
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    type.success,
-    name,
-    (result, finalName) => ({
-      _tag: 'Compare',
-      kind: 'integer',
-      predicate,
-      left: leftValue.operand,
-      right: rightValue.operand,
-      fastMath: math,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, type.success, name, (result) => ({
+    _tag: 'Compare',
+    kind: 'integer',
+    predicate,
+    left: leftValue.operand,
+    right: rightValue.operand,
+    fastMath: math,
+    result,
+  }))
   return appended
 }
 
@@ -415,21 +403,15 @@ export const floatingCompareIn = (
   const type = FunctionBodyState.comparisonType(draft, module, leftValue.type)
   if (Result.isFailure(type)) return Result.fail(type.failure)
   const math = fastMath(options.fastMath)
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    type.success,
-    name,
-    (result, finalName) => ({
-      _tag: 'Compare',
-      kind: 'floating',
-      predicate,
-      left: leftValue.operand,
-      right: rightValue.operand,
-      fastMath: math,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, type.success, name, (result) => ({
+    _tag: 'Compare',
+    kind: 'floating',
+    predicate,
+    left: leftValue.operand,
+    right: rightValue.operand,
+    fastMath: math,
+    result,
+  }))
   return appended
 }
 
@@ -517,19 +499,13 @@ export const selectIn = (
     }
   }
   const conditionOperand = selected.success.operand
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    leftValue.type,
-    name,
-    (result, finalName) => ({
-      _tag: 'Select',
-      condition: conditionOperand,
-      onTrue: leftValue.operand,
-      onFalse: rightValue.operand,
-      fastMath: math,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, leftValue.type, name, (result) => ({
+    _tag: 'Select',
+    condition: conditionOperand,
+    onTrue: leftValue.operand,
+    onFalse: rightValue.operand,
+    fastMath: math,
+    result,
+  }))
   return appended
 }

@@ -2,6 +2,7 @@ import * as ByteString from '../ByteString.js'
 import type * as BuilderState from '../internal/BuilderState.js'
 import type * as FunctionBodyDescription from '../internal/FunctionBodyDescription.js'
 import type * as GlobalDescription from '../internal/GlobalDescription.js'
+import * as LocalName from '../internal/LocalName.js'
 import type * as MetadataDescription from '../internal/MetadataDescription.js'
 import * as MemoryAccess from '../MemoryAccess.js'
 import { renderAttributeSet } from './AttributeRenderer.js'
@@ -105,8 +106,8 @@ export const localNameCache = new WeakMap<FunctionBodyDescription.Snapshot, Loca
  */
 export const computeLocalNames = (body: FunctionBodyDescription.Snapshot): LocalNames => {
   const used = new Set<string>()
-  const assign = (name: ByteString.ByteString, fallback: string): string => {
-    const base = ByteString.isEmpty(name) ? ByteString.fromString(fallback) : name
+  const assign = (name: LocalName.LocalName, fallback: string): string => {
+    const base = LocalName.toByteString(LocalName.isEmpty(name) ? fallback : name)
     let rendered = identifier('%', base)
     let suffix = 1
     while (used.has(rendered)) {

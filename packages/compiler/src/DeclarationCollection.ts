@@ -4879,7 +4879,6 @@ export const finalizeLifetimeHeader = (
     prior.owner,
     declaration,
     environment,
-    undefined,
     (type) => {
       const analyzed = analyzeDeclaredType(context, type, environment, true, prior)
       // An applied type names its target's declaration, so `View<i32>` reports the binders of

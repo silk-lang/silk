@@ -217,10 +217,7 @@ const callTransition = (
       )
     }
   }
-  const makeInstruction = (
-    result: number | undefined,
-    finalName: ByteString.ByteString,
-  ): FunctionBodyDescription.Instruction =>
+  const makeInstruction = (result: number | undefined): FunctionBodyDescription.Instruction =>
     normal === undefined || unwind === undefined
       ? {
           _tag: 'Call',
@@ -232,7 +229,6 @@ const callTransition = (
           fastMath: callFastMath,
           operandBundles: bundles,
           result,
-          name: finalName,
           tail: options.tail ?? 'none',
         }
       : {
@@ -245,17 +241,13 @@ const callTransition = (
           fastMath: callFastMath,
           operandBundles: bundles,
           result,
-          name: finalName,
           normal,
           unwind,
         }
   const predecessor = draft.cursor
   let value: Value.Value | undefined
   if (returnType.success._tag === 'Simple' && returnType.success.tag === 'Void') {
-    const appended = FunctionBodyState.appendInstruction(
-      draft,
-      makeInstruction(undefined, ByteString.empty),
-    )
+    const appended = FunctionBodyState.appendInstruction(draft, makeInstruction(undefined))
     if (Result.isFailure(appended)) return Result.fail(appended.failure)
   } else {
     const appended = FunctionBodyState.appendResult(

@@ -13,7 +13,6 @@ import * as DeclarationFacts from './DeclarationFacts.js'
 import * as ExecutionPackage from './ExecutionPackage.js'
 import * as ExecutionTransition from './ExecutionTransition.js'
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
-import * as FieldRealization from './FieldRealization.js'
 import * as Tir from './Tir.js'
 import * as Instances from './Instances.js'
 import * as Layout from './Layout.js'
@@ -1578,11 +1577,6 @@ const cleanupTypes = (cleanup: CleanupPlan.CleanupPlan): ReadonlyArray<SilkType.
 
 type EffectEnvironment = Extract<Layout.EffectEnvironment, { readonly _tag: 'EffectEnvironment' }>
 
-type CallableEnvironment = Extract<
-  Layout.CallableEnvironment,
-  { readonly _tag: 'CallableEnvironment' }
->
-
 const effectEnvironmentByIdentity = (
   layout: Layout.Plan,
   identity: string,
@@ -1592,16 +1586,6 @@ const effectEnvironmentByIdentity = (
       candidate._tag === 'EffectEnvironment' &&
       (Instances.effectIdentity(candidate.instance, candidate.site) === identity ||
         candidate.successEffectIdentity === identity),
-  )
-
-const callableEnvironmentByIdentity = (
-  layout: Layout.Plan,
-  identity: SilkType.CallableIdentityArgument,
-): CallableEnvironment | undefined =>
-  layout.callableEnvironments.find(
-    (candidate): candidate is CallableEnvironment =>
-      candidate._tag === 'CallableEnvironment' &&
-      FieldRealization.matchesIdentity(identity, candidate.callable),
   )
 
 // Offsets must mirror the runner ABI exactly, so the count comes from the same Layout helper
@@ -1616,7 +1600,7 @@ const callableEnvironmentCleanupValid = (
   cleanup: CleanupPlan.CleanupPlan,
   active: ReadonlySet<string>,
 ): boolean => {
-  const environment = callableEnvironmentByIdentity(layout, identity)
+  const environment = Layout.callableEnvironmentMatching(layout, identity)
   if (environment === undefined || cleanup._tag !== 'CallableCleanup') return false
   const environmentIdentity = Instances.callableEnvironmentIdentity(environment.callable)
   const key = `callable:${SilkType.callableEnvironmentKey(environmentIdentity)}`
