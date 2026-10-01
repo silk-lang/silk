@@ -25,6 +25,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1691,6 +1692,16 @@ it.effect(
       const changed = yield* Effect.result(PlatformSupplyResolver.validateFiles([selected]))
       assert.strictEqual(changed._tag, 'Failure')
       if (changed._tag === 'Failure') assert.strictEqual(changed.failure.code, 'ChangedInput')
+      // A settled file's digest is reused only while its stat identity holds.
+      const settled = join(root, 'usr/lib/settled')
+      writeFileSync(settled, 'old bytes')
+      utimesSync(settled, 0, 0)
+      const snapshot = yield* PlatformSupplyResolver.file(settled, 'library', 'settled', root)
+      yield* PlatformSupplyResolver.validateFiles([snapshot])
+      writeFileSync(settled, 'new bytes')
+      const rewritten = yield* Effect.result(PlatformSupplyResolver.validateFiles([snapshot]))
+      assert.strictEqual(rewritten._tag, 'Failure')
+      if (rewritten._tag === 'Failure') assert.strictEqual(rewritten.failure.code, 'ChangedInput')
       symlinkSync('loop', join(root, 'usr/lib/loop'))
       const cycle = yield* Effect.result(
         PlatformSupplyResolver.physicalPath(join(root, 'lib/loop'), root),
