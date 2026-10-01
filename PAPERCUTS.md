@@ -383,3 +383,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler
 
 - 2026-09-30 · B12’s reserved importer retry found B9 had reclaimed the shared frontend slot after the previous B12 process released its physical lock · The atomic owner/live-process gate refused the overlap; hold the retry until an explicit coordinator handoff, and distinguish a sequential reservation from each process’s lock lifetime · self-hosted compiler
+
+- 2026-09-30 · rtk git diff --check returned exit2 without printing the whitespace diagnostic · Use rtk proxy git diff --check to retain the diagnostic, then remove the trailing blank line · B12 witness mapping
