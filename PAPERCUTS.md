@@ -388,3 +388,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-09-30 · Runtime slice fixtures wrote &[i32; 2], which both parsers treat as damaged slice syntax, so stage-only positives did not prove array-reference reborrows · Group the fixed array as &([i32; 2]) and assert the actual fixed referent and dereference/borrow/conversion chain in the existing snapshot · B9 runtime slices
 - 2026-09-30 · Cloud Linux container had only system LLVM 18 and no `/usr/bin/time`; a merged Semantic+Target probe root was SIGKILLed near 7 GB while other compiles ran · Fetch LLVM 22.1.8 into `.scratch/llvm-22.1.8` exactly as `.github/actions/setup-linux-llvm` does, put it first on `PATH`, sample peak RSS with `ps`, and run one native test root at a time (SemanticCases alone peaks near 11.5 GB of process-tree RSS) · selfhost test audit
+
+- 2026-10-01 · New boundary helpers used qualified enum values inside field patterns and a unit union variant with if-let, producing parser cascades in the bounded frontend check · Bind access then compare it, and match the unit unification outcome exhaustively before publishing · B9 runtime slice/pointer boundaries
