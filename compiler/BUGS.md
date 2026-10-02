@@ -335,3 +335,28 @@ deletes the branch in `Parser/Declaration.ts`; the surrounding field loop alread
 The regression lives in `packages/compiler/test/Parser.test.ts`, "parses an empty union variant
 field block as a braced variant with no fields". The neighbouring damaged-union case previously
 asserted the synthesized field as intended recovery and now asserts `Empty {}` parses clean.
+
+## Cleanup-subterm search exceeds the V8 map limit through a borrowed `Semantic`
+
+**Status:** open in the bootstrap. Selfhost source avoids the trigger; no limit was raised.
+
+At selfhost head `d4c8f98059e504acc8e54a6830158255352b22bf` (#671), building
+`compiler/silk.toml` fails during `Realization.discoverInstances` with
+`RangeError: Map maximum size exceeded` at `strictCleanupSubtermUnder`
+(`packages/compiler/dist/Instances.js`), before any test runs
+([Focused Linux run](https://github.com/julia-script/silk/actions/runs/36984616674)).
+The source is valid; the previous head `cb31280d` builds.
+
+The trigger was `struct ClosureDraft<'a> { semantic: &'a mut Semantic, ... }` used as an
+`Effect.useReleaseNonParking` resource. `nominalsIn` collects nominals with `Type.visit`, which
+descends through reference types, so a cleanup root holding `&mut Semantic` reaches the whole
+`Semantic` graph together with the closure draft's own nominals. Its reaching set exceeds the
+512-type budget, and the path-keyed unfolding memo of one question then grows past V8's map
+size. Even on `cb31280d`, the `Query.Entry ⊂ Semantic` question already holds about 1.2 million
+memo entries.
+
+Selfhost `c871c5ea` removed the borrowed field: the draft owns only its vectors, and the walk
+receives `Semantic` as a parameter. The bootstrap fix is to stop the cleanup-subterm search at
+reference types, since a borrow owns nothing that cleanup could release. It belongs in a main-first
+change to `Instances.ts`, with a regression that builds a resource struct holding `&mut` to a
+large nominal graph.
