@@ -44,4 +44,6 @@ export const selfhostTrack = [
   'static-parameter-finite-chains',
   'reference-projection-places',
   'structural-union-copy-members',
+  'static-parameter-array',
+  'static-parameter-aggregates',
 ] as const satisfies ReadonlyArray<string>
