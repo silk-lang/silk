@@ -125,29 +125,24 @@ Each entry records:
 
 ### Static enum and fixed-array values in selfhost static roots
 
-- **Status:** divergence recorded on 2026-10-02 for B12 task 11 (PR #671), with coordinator
-  decision A. Static aggregate production, non-scalar embedding and both corpus pins are a separate
-  follow-up task.
+- **Status:** Retired on 2026-10-02 by task 69b93cad. The divergence was recorded for B12 task 11
+  (PR #671).
 - **Rule:** a scalar-enum member such as `Mode.Slow` and a fixed-array literal such as `[4, 5]` are
-  valid static values, including as static arguments (`moded(Mode.Slow)` for
-  `fn moded(static mode: Mode)`, `tabled([4, 5], index)` for `fn tabled(static table: [i32; 2], ...)`).
-- **Compilers:** the bootstrap evaluates both. The shared corpus programs
-  `static-parameter-aggregates` and `static-parameter-array` exercise them natively. Selfhost static
-  roots produce neither from source:
-  - scalar-enum members are not typed in static roots (the qualified spelling resolves as a call
-    reference);
-  - array literals are rejected by the static-root typing guard;
-  - static execution has no enum-member or array-literal construction.
-
-  Selfhost therefore embeds only scalar static values and has no non-scalar embedding path.
-- **Source migration:** none.
-- **Diagnostics and limits:** in selfhost, a scalar-enum member or fixed-array literal in a static
-  root is `Unsupported` at that expression. Selfhost pins neither `static-parameter-aggregates` nor
-  `static-parameter-array`. Both are expected to be `Unsupported` in the selfhost corpus, never FAIL.
-- **Evidence:** `staticParametersSelectInstancesAndKeepRuntimeLanes` asserts the `Unsupported` spans
-  for `moded(Mode.Slow)` and `tabled([4, 5], index)`.
-- **Open questions:** static aggregate production needs static-root typing and static evaluation of
-  enum members and array literals, then non-scalar materialization in MIR.
+  valid static values, including as static arguments.
+- **Compilers:** both compilers now produce them.
+  - Selfhost static roots type array literals and scalar-enum members as runtime bodies do.
+  - Static execution constructs them with `StaticValue.fixedArray` and `StaticValue.enumeration`,
+    under the retained value budget.
+  - MIR materializes them where the selected callee reads them: an enum as its representation
+    integer, an array as an aggregate.
+- **Diagnostics and limits:**
+  - An array element that static execution cannot construct, such as a struct literal, stays
+    `Unsupported` at the element.
+  - A wrong-length array argument is `ArrayLengthMismatch`.
+  - Nominal aggregates, generic aggregates and drops remain out of scope.
+- **Evidence:** `staticAggregatesMaterializeAndSelectInstances` and the static array case in
+  `staticRetainedValueLimitRejectsPublication`. The corpus programs `static-parameter-array` and
+  `static-parameter-aggregates` are pinned in selfhost once they pass on the exact head.
 
 ### Omitted Effect environments elaborated from inputs
 
