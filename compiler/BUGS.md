@@ -336,7 +336,7 @@ The regression lives in `packages/compiler/test/Parser.test.ts`, "parses an empt
 field block as a braced variant with no fields". The neighbouring damaged-union case previously
 asserted the synthesized field as intended recovery and now asserts `Empty {}` parses clean.
 
-## Cleanup-subterm search exceeds the V8 map limit through a borrowed `Semantic`
+## Cleanup-subterm search exceeds the V8 map limit through a borrowed `Semantic` (fixed)
 
 **Status:** repaired in the bootstrap on `main` by
 [#675](https://github.com/julia-script/silk/pull/675) (`cf53040d`). The fix reaches selfhost
