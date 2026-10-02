@@ -9703,19 +9703,26 @@ effect fn locationOfInstance(resolver: &mut Resolver, instance: &InstanceKey) ->
   InstanceLocation,
 > ! Cycle | OutOfMemoryError ? &mut Allocator {
   let identity = InstanceKey.identity(instance)
+  return run locationOfIdentity(&mut resolver.*, &identity)
+}
+
+// The held module and index ordinal of one canonical declaration, if this store has interned it.
+effect fn locationOfIdentity(resolver: &mut Resolver, identity: &Shared<DeclarationId>) -> Option<
+  InstanceLocation,
+> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let count = Vector.length<ModuleId>(&resolver.modules)
   let mut moduleIndex = usize.ZERO
   while moduleIndex < count {
     let known = Vector.asSlice<ModuleId>(&resolver.modules)
     let sameModule = Shared.with<DeclarationId, bool>(
-      &identity,
+      identity,
       fn(id: &DeclarationId) -> bool {
         return ModuleId.equals(&known[moduleIndex], DeclarationId.moduleId(id))
       },
     )
     if sameModule {
       let module = run resolvedModule(&resolver.*, moduleIndex)
-      let found = run ordinalOfIdentity(&mut resolver.*, &module, &identity)
+      let found = run ordinalOfIdentity(&mut resolver.*, &module, identity)
       if let Option<usize>.Some {value} = move found {
         return Option.some<InstanceLocation>(
           InstanceLocation {module: moduleIndex, declaration: value},
@@ -20510,7 +20517,7 @@ union EnumSelection {
 
 fn scalarEnumMember(answer: &Result<Answer, NoRejection>, name: &[u8]) -> Option<ScalarEnumMember> {
   if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-    if let Outcome.Success {value: Value.Members {members, ..}} = &value.outcome {
+    if let Outcome.Success {value: Value.Members {members, enumRepresentation, ..}} = &value.outcome {
       let values = Vector.asSlice<Member>(&members)
       let mut at = usize.ZERO
       while at < values.length {
@@ -20520,6 +20527,7 @@ fn scalarEnumMember(answer: &Result<Answer, NoRejection>, name: &[u8]) -> Option
               return Option.some<ScalarEnumMember>(ScalarEnumMember {
                 value: BodyEnumMember {
                   ordinal: at, negative: discriminant.sign == StaticSign.Negative, magnitude: discriminant.magnitude,
+                  representation: enumRepresentation,
                 },
                 isPublic: values[at].isPublic,
               })
@@ -22753,7 +22761,6 @@ effect fn checkExpression<'scope>(
       }
     }
     Node.ArrayExpression {elements} => {
-      if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
       let mut elementType = Option.none<Shared<Type>>()
       let mut inferElement = true
       if let Option<Shared<Type>>.Some {value} = &expected.* {
@@ -22772,7 +22779,7 @@ effect fn checkExpression<'scope>(
         let child = run bodyChild(&resolver.source, cursor, elements, at)
         let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
           module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-          child, &elementType, constraints, contractBody, false, unsafeAllowed)
+          child, &elementType, constraints, contractBody, staticBody, unsafeAllowed)
         let node = match move checked {
           Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
           Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
@@ -23145,16 +23152,28 @@ effect fn checkExpression<'scope>(
         })
         return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
       }
-      // Static roots do not produce enum values yet: a scalar-enum member is a named gap at its
-      // use, not the call-reference error its qualified spelling would otherwise resolve to.
+      // A scalar-enum member is a static value: a static root types it as runtime bodies do, so
+      // static execution can construct it. Other qualified names stay call references.
       let staticQualified = run bodyQualifiedName(&resolver.source, cursor, expression)
       if let Option<QualifiedBodyName>.Some {value: written} = move staticQualified {
         let selection = run checkedEnumSelection(&mut resolver.*, &mut owner.*, &mut dependencies.*,
           module, Bytes.asSlice(&written.namespace), Bytes.asSlice(&written.member), span, false)
         if let Option<Result<EnumSelection, Shared<Rejection>>>.Some {value: selected} = move selection {
-          if let Result<EnumSelection, Shared<Rejection>>.Success {..} = &selected {
-            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+          let chosen = match move selected {
+            Result<EnumSelection, Shared<Rejection>>.Success {value: choice} => choice
+            Result<EnumSelection, Shared<Rejection>>.Failure {error} => {
+              return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+            }
           }
+          if let EnumSelection.Member {ty: enumType, member} = move chosen {
+            let index = Vector.length<BodyNode>(&nodes.*)
+            run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+              origin: BodyOrigin {syntax: expression, span: span},
+              kind: BodyNodeKind.Expression {ty: move enumType, form: BodyExpression.EnumMember {member: member}},
+            })
+            return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
+          }
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
       }
       let found = run resolvedCall(calls, expression)
@@ -29567,14 +29586,79 @@ fn staticScalarName(code: usize) -> &'static [u8] {
   return b"f64"
 }
 
-// The exact runtime type of an embedded static value. Character, enum, text and aggregate values
-// remain an explicit gap: selfhost static roots do not yet produce enum or fixed-array values from
-// source, so no non-scalar value reaches here.
-effect fn embeddedType(value: &Shared<StaticData>) -> Option<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+// The exact runtime type of an embedded static value: scalars, scalar enums, and fixed arrays of
+// embeddable values, which MIR materializes. An enum's type is the type its declaration's identity
+// answer gives, exactly as typing a member does. Character, text and nominal aggregates remain an
+// explicit gap.
+effect fn embeddedType(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  value: &Shared<StaticData>, span: Span,
+) -> Option<Shared<Type>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let code = Shared.with<StaticData, usize>(value, staticScalarCode)
-  if code == usize.ZERO { return Option.none<Shared<Type>>() }
   if code == usize.ONE { return Option.some<Shared<Type>>(run Shared.make<Type>(Type.Unit)) }
-  return Option.some<Shared<Type>>(run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(staticScalarName(code))}))
+  if code != usize.ZERO {
+    return Option.some<Shared<Type>>(run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(staticScalarName(code))}))
+  }
+  let enumOwner = Shared.with<StaticData, Option<Shared<DeclarationId>>>(value, fn(data: &StaticData) -> Option<Shared<DeclarationId>> {
+    return match & data.* {
+      StaticData.Enum {declaration, ..} => Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&declaration))
+      _ => Option.none<Shared<DeclarationId>>()
+    }
+  })
+  if let Option<Shared<DeclarationId>>.Some {value: declaration} = move enumOwner {
+    let located = run locationOfIdentity(&mut resolver.*, &declaration)
+    let location = match move located {
+      Option<InstanceLocation>.Some {value: found} => found
+      Option<InstanceLocation>.None => { return Option.none<Shared<Type>>() }
+    }
+    let identity = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+      family: Family.Identity, module: location.module, name: usize.ZERO,
+      declaration: location.declaration, member: usize.ZERO, external: false,
+    }, span)
+    let selection = run typeFromAnswer(&identity)
+    return move selection.resolved
+  }
+  let arrayType = Shared.with<StaticData, Option<Shared<Type>>>(value, embeddedArrayType)
+  if let Option<Shared<Type>>.Some {value: ty} = move arrayType {
+    let count = Shared.with<StaticData, usize>(value, aggregateFieldCount)
+    let mut at = usize.ZERO
+    while at < count {
+      let child = Shared.with<StaticData, Option<Shared<StaticData>>>(value, fn(data: &StaticData) -> Option<Shared<StaticData>> {
+        return StaticValue.field(data, at)
+      })
+      let element = match move child {
+        Option<Shared<StaticData>>.Some {value: found} => found
+        Option<Shared<StaticData>>.None => { return Option.none<Shared<Type>>() }
+      }
+      let elementType = run embeddedType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &element, span)
+      if let Option<Shared<Type>>.None = move elementType { return Option.none<Shared<Type>>() }
+      at = at + usize.ONE
+    }
+    return Option.some<Shared<Type>>(move ty)
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn aggregateFieldCount(data: &StaticData) -> usize {
+  return match & data.* {
+    StaticData.Aggregate {fields, ..} => Vector.length<Shared<StaticData>>(&fields)
+    _ => usize.ZERO
+  }
+}
+
+// The type of a fixed-array static value; a nominal aggregate is not an array.
+fn embeddedArrayType(data: &StaticData) -> Option<Shared<Type>> {
+  if let StaticData.Aggregate {ty, variant, ..} = &data.* {
+    if let Option<usize>.Some {..} = &variant { return Option.none<Shared<Type>>() }
+    let isArray = Shared.with<Type, bool>(&ty, fn(shape: &Type) -> bool {
+      return match & shape.* {
+        Type.Array {..} => true
+        _ => false
+      }
+    })
+    if isArray { return Option.some<Shared<Type>>(Shared.clone<Type>(&ty)) }
+  }
+  return Option.none<Shared<Type>>()
 }
 
 effect fn selectionBody(
@@ -29627,7 +29711,8 @@ effect fn selectionFacts(
   let embedded = Vector.asSlice<MixedEmbedded>(&selected.embedded)
   let mut at = usize.ZERO
   while at < embedded.length {
-    let ty = run embeddedType(&embedded[at].value)
+    let embeddedSpan = run staticSpan(&mut resolver.*, module, embedded[at].syntax)
+    let ty = run embeddedType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &embedded[at].value, embeddedSpan)
     let exact = match move ty {
       Option<Shared<Type>>.Some {value} => value
       Option<Shared<Type>>.None => {
