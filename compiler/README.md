@@ -17,8 +17,10 @@ equality, and member or `_` match arms with guards lower to MIR switches. Unions
 records store an unsigned tag (canonical member order) before the largest member; non-generic
 `union` declarations tag variants in declaration order and lay each variant out like a record.
 Record, structural-union and nominal-union matches bind fields as places and switch on the tag.
-Uncontextualized tuple literals, slice subranges, generic unions, block-bodied match arms and
-bindings that are assigned or borrowed remain coverage work for backend roadmap step 4.
+A tuple or `.{ ... }` literal constructs its immediately expected named tuple or struct; otherwise
+it creates an occurrence-nominal anonymous aggregate laid out as an ordinary record of its members.
+Slice subranges, generic unions, block-bodied match arms and bindings that are assigned or borrowed
+remain coverage work for backend roadmap step 4.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

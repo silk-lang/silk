@@ -30,6 +30,7 @@ export const selfhostTrack = [
   'algorithm-quicksort',
   'runtime-indexed-subplace-borrow',
   'short-circuit-counting',
+  'tuple-record-aggregates',
   'scalar-enum-lanes',
   'algorithmic-compiler-fold',
   'match-universal-fallback',
@@ -47,4 +48,5 @@ export const selfhostTrack = [
   'static-parameter-array',
   'static-parameter-aggregates',
   'match-arm-blocks-and-bindings',
+  'runtime-slice-temporary-and-lexical-borrows',
 ] as const satisfies ReadonlyArray<string>
