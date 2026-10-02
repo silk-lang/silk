@@ -30,6 +30,7 @@ export const selfhostTrack = [
   'algorithm-quicksort',
   'runtime-indexed-subplace-borrow',
   'short-circuit-counting',
+  'tuple-record-aggregates',
   'scalar-enum-lanes',
   'algorithmic-compiler-fold',
   'match-universal-fallback',
