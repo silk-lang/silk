@@ -12,6 +12,8 @@ export const selfhostTrack = [
   'recursive-aggregate-return',
   'inherent-member-over-module-projection',
   'generic-specializations',
+  'operator-interface-contract',
+  'contract-only-impl-binder',
   'generic-partial-type-arguments',
   'same-specialization-recursion',
   'array-inferred',
