@@ -572,6 +572,58 @@ pub union BackendBuild {
   Rejected {pub diagnostic: Shared<Rejection>},
 }
 
+/// The edge that reached a closure root, kept so a rejection carries the original context.
+pub struct ClosureIncoming {
+  pub caller: Option<Application>
+  pub edge: Edge
+  pub module: ModuleId
+  pub span: Span
+}
+
+/// One complete outgoing reference inside a closure: node indices, provenance and call site.
+pub struct ClosureEdge {
+  pub from: usize
+  pub to: usize
+  pub edge: Edge
+  pub module: ModuleId
+  pub span: Span
+}
+
+/// A complete reachable-key closure: every node's lowered successors are listed and included.
+pub struct FiniteClosureEvidence {
+  pub incoming: ClosureIncoming
+  pub ancestors: Vector<Application>
+  pub nodes: Vector<Application>
+  pub edges: Vector<ClosureEdge>
+}
+
+/// The outcome of one demand-local closure transaction over changing static values.
+pub union StaticClosure {
+  Certified {pub evidence: FiniteClosureEvidence},
+  /// The node budget ended construction before closure; nothing is admitted or assumed infinite.
+  NotProven {pub diagnostic: Shared<Rejection>},
+  Rejected {pub diagnostic: Shared<Rejection>},
+  Unsupported {pub gaps: Vector<Shared<BackendGap>>},
+}
+
+/// The node budget of one closure transaction during a build. A resource control, not a proof.
+pub const staticClosureNodes: usize = 256
+
+// One pending step of a closure transaction's depth-first walk.
+union ClosureVisit {
+  Enter {key: InstanceKey, from: usize, edge: Edge, module: ModuleId, span: Span},
+  Leave,
+}
+
+// The drafts one closure transaction owns; released on success, failure or interruption.
+struct ClosureDraft<'a> {
+  semantic: &'a mut Semantic
+  pending: Vector<ClosureVisit>
+  nodes: Vector<Application>
+  edges: Vector<ClosureEdge>
+  admission: Admission
+}
+
 /// A direct query dependency retained with a completed semantic answer.
 pub struct Dependency {
   /// The demanded query family.
@@ -19361,6 +19413,11 @@ effect fn checkQualifiedInterfaceCall(
   }
   let OperationCall {operation: chosenOperation, implementation, signature, proof, receiver: _} = move selectedOperation
   drop proof
+  // Static parameters reach a callee only through a direct call's selected static arguments; an
+  // operation call cannot supply them yet, so it is an explicit gap rather than a dropped value.
+  if Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureStaticCount) > usize.ZERO {
+    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
   let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
     &signature,
     signatureParameterCount,
@@ -19904,6 +19961,10 @@ effect fn checkReceiverCall(
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, memberSpan)
       }
     }
+  }
+  // A receiver call cannot supply static arguments yet: an explicit gap, never a dropped value.
+  if Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureStaticCount) > usize.ZERO {
+    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
   }
   let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
     &signature,
@@ -28542,8 +28603,9 @@ pub union CallPhase {
   /// A `static fn`: the selection pass executes it and embeds its result.
   Static,
   /// A runtime function with `static` parameters at these original indices: the selection pass
-  /// evaluates those arguments, and the call keeps only its runtime operands.
-  StaticSlots {pub slots: Vector<usize>},
+  /// evaluates those arguments, and the call keeps only its runtime operands. Each slot's closed
+  /// declared type is its argument's expected type; a type written in callee binders is absent.
+  StaticSlots {pub slots: Vector<usize>, pub types: Vector<Option<Shared<Type>>>},
 }
 
 // The phase of one resolved call, read from the callee's tracked Signature. Routing and the
@@ -28581,7 +28643,21 @@ effect fn resolvedCallPhase(
         if signature.isStatic { return Result.succeed<CallPhase, Shared<Rejection>>(CallPhase.Static) }
         if signature.staticSlots == usize.ZERO { return Result.succeed<CallPhase, Shared<Rejection>>(CallPhase.Runtime) }
         let slots = run signatureStaticSlots(&header, signature.staticSlots)
-        return Result.succeed<CallPhase, Shared<Rejection>>(CallPhase.StaticSlots {slots: move slots})
+        let mut types = Vector.make<Option<Shared<Type>>>()
+        let listed = Vector.asSlice<usize>(&slots)
+        let mut slotAt = usize.ZERO
+        while slotAt < listed.length {
+          let index = listed[slotAt]
+          let declared = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&header,
+            fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, index) })
+          let mut closedType = Option.none<Shared<Type>>()
+          if let Option<Shared<Type>>.Some {value} = move declared {
+            if !Type.hasOpenParameters(&value) { closedType = Option.some<Shared<Type>>(move value) }
+          }
+          run Vector.append<Option<Shared<Type>>>(&mut types, move closedType)
+          slotAt = slotAt + usize.ONE
+        }
+        return Result.succeed<CallPhase, Shared<Rejection>>(CallPhase.StaticSlots {slots: move slots, types: move types})
       }
       Option<SignatureFacts>.None => {
         let refused = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&header, answerRejection)
@@ -33903,6 +33979,17 @@ impl Semantic {
     }
     return Option.some<&MirFunction>(&functions[index])
   }
+  /// Builds a finite reachable-key closure rooted at one application, as a build does at a
+  /// changing-static edge. Only certified evidence admits such a chain; `limit` bounds its nodes.
+  pub effect fn closeStaticChain(self: &mut Self, request: &mut Request, root: &Application, limit: usize) -> StaticClosure
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let module = run ModuleId.copy(DeclarationId.moduleId(Application.bodyDeclaration(root)))
+    let incoming = ClosureIncoming {caller: Option.none<Application>(), edge: Edge.Direct, module: move module, span: Span.make(usize.ZERO, usize.ZERO)}
+    let ancestors = Admission.make()
+    return run closeChain(&mut self.*, &ancestors, root, move incoming, limit)
+  }
   /// Demands only reached instances, then joins their definitions in content-symbol order.
   pub effect fn buildMain(self: &mut Self, request: &mut Request, module: &ModuleId) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
@@ -33976,6 +34063,8 @@ impl Semantic {
       },
     )
     let mut admission = Admission.make()
+    // Applications admitted by a finite closure certificate during this build.
+    let mut certified = Vector.make<Application>()
     let mut visited = Vector.make<InstanceKey>()
     let mut emitted = Vector.make<usize>()
     let mut uncheckedBodies = usize.ZERO
@@ -34003,9 +34092,47 @@ impl Semantic {
       let mut leave = false
       if !InstanceKey.isEntry(&instance) {
         let application = run InstanceKey.selected(&instance)
+        let enteredEdge = Edge.copy(&entered.edge)
         let decision = run Admission.enter(&mut admission, &application, move entered.edge)
         match move decision {
           Decision.Entered => {
+            leave = true
+          }
+          Decision.ChangingStatic {..} => {
+            let mut admitted = false
+            let known = Vector.asSlice<Application>(&certified)
+            let mut knownAt = usize.ZERO
+            while knownAt < known.length {
+              if run Application.equals(&known[knownAt], &application) {
+                admitted = true
+                break
+              }
+              knownAt = knownAt + usize.ONE
+            }
+            if !admitted {
+              let ancestorPath = run Admission.path(&admission)
+              let ancestorSlice = Vector.asSlice<Application>(&ancestorPath)
+              let mut caller = Option.none<Application>()
+              if ancestorSlice.length > usize.ZERO {
+                caller = Option.some<Application>(run Application.copy(&ancestorSlice[ancestorSlice.length - usize.ONE]))
+              }
+              let incoming = ClosureIncoming {caller: move caller, edge: Edge.copy(&enteredEdge), module: run ModuleId.copy(&entered.module), span: entered.span}
+              let closure = run closeChain(&mut self.*, &admission, &application, move incoming, staticClosureNodes)
+              match move closure {
+                StaticClosure.Certified {evidence} => {
+                  let reached = Vector.asSlice<Application>(&evidence.nodes)
+                  let mut reachedAt = usize.ZERO
+                  while reachedAt < reached.length {
+                    run Vector.append<Application>(&mut certified, run Application.copy(&reached[reachedAt]))
+                    reachedAt = reachedAt + usize.ONE
+                  }
+                }
+                StaticClosure.NotProven {diagnostic} => { return BackendBuild.Rejected {diagnostic: move diagnostic} }
+                StaticClosure.Rejected {diagnostic} => { return BackendBuild.Rejected {diagnostic: move diagnostic} }
+                StaticClosure.Unsupported {gaps: found} => { return BackendBuild.Unsupported {gaps: move found} }
+              }
+            }
+            run Admission.enterChain(&mut admission, &application, move enteredEdge)
             leave = true
           }
           Decision.Reused {..} => {}
@@ -34266,6 +34393,213 @@ struct BackendRequest {
   edge: Edge
   span: Span
   module: ModuleId
+}
+
+// One demand-local finite-closure transaction rooted at a changing-static edge. It follows every
+// lowered successor of every reached node, applies the non-static growth guard from the build's
+// own ancestors, and certifies only a complete closed node set. Per-node answers are ordinary
+// cached queries and never authorize closure on their own.
+effect<'owner & 'env> fn closeChain<'owner, 'env>(semantic: &'owner mut Semantic, ancestors: &'env Admission, root: &'env Application, incoming: ClosureIncoming, limit: usize) -> StaticClosure
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let rootKey = run InstanceKey.function(run Application.copy(root))
+  let mut pending = Vector.make<ClosureVisit>()
+  run Vector.append<ClosureVisit>(&mut pending, ClosureVisit.Enter {
+    key: move rootKey, from: usize.MAX, edge: Edge.copy(&incoming.edge), module: run ModuleId.copy(&incoming.module), span: incoming.span,
+  })
+  let ancestorPath = run Admission.path(ancestors)
+  let draft = ClosureDraft {
+    semantic: move semantic,
+    pending: move pending,
+    nodes: Vector.make<Application>(),
+    edges: Vector.make<ClosureEdge>(),
+    admission: run Admission.copy(ancestors),
+  }
+  let use = effect fn(resource: &mut ClosureDraft<'owner>) -> StaticClosure
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    return run walkChain(&mut resource.*, limit, &incoming, Vector.asSlice<Application>(&ancestorPath))
+  }
+  // Drafts never outlive the transaction: success copies the evidence out first.
+  let release = effect fn(resource: &mut ClosureDraft<'owner>) -> () {
+    Vector.clear<ClosureVisit>(&mut resource.pending)
+    Vector.clear<Application>(&mut resource.nodes)
+    Vector.clear<ClosureEdge>(&mut resource.edges)
+    return ()
+  }
+  return run Effect.useReleaseNonParking(move draft, move use, move release)
+}
+
+effect fn copyClosureIncoming(incoming: &ClosureIncoming) -> ClosureIncoming ! OutOfMemoryError ? &mut Allocator {
+  let mut caller = Option.none<Application>()
+  if let Option<Application>.Some {value} = &incoming.caller { caller = Option.some<Application>(run Application.copy(&value)) }
+  return ClosureIncoming {caller: move caller, edge: Edge.copy(&incoming.edge), module: run ModuleId.copy(&incoming.module), span: incoming.span}
+}
+
+effect fn closureGap(code: GapCode, application: &Application, span: Span) -> StaticClosure ! OutOfMemoryError ? &mut Allocator {
+  let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(Application.bodyDeclaration(application)))
+  let mut gaps = Vector.make<Shared<BackendGap>>()
+  run Vector.append<Shared<BackendGap>>(&mut gaps, run Shared.make<BackendGap>(BackendGap.make(code, &identity, span)))
+  return StaticClosure.Unsupported {gaps: move gaps}
+}
+
+// Admits one reached node of a closure transaction: the growth guard, deduplication, the node
+// budget, and its complete lowered successors. A returned outcome ends the transaction.
+effect fn enterChainNode<'owner>(draft: &mut ClosureDraft<'owner>, key: InstanceKey, from: usize, edge: Edge, module: ModuleId, span: Span, limit: usize) -> Option<StaticClosure>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let application = run InstanceKey.selected(&key)
+  let decision = run Admission.enter(&mut draft.admission, &application, Edge.copy(&edge))
+  let mut leave = false
+  match move decision {
+    Decision.Entered => { leave = true }
+    Decision.ChangingStatic {..} => {
+      run Admission.enterChain(&mut draft.admission, &application, Edge.copy(&edge))
+      leave = true
+    }
+    Decision.Reused {..} => {}
+    Decision.Open => { return Option.some<StaticClosure>(run closureGap(GapCode.OpenInstance, &application, span)) }
+    Decision.Rejected {path} => {
+      return Option.some<StaticClosure>(StaticClosure.Rejected {diagnostic: run rejectSpecialization(&module, span, move path)})
+    }
+  }
+  let known = Vector.asSlice<Application>(&draft.nodes)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < known.length {
+    if run Application.equals(&known[at], &application) {
+      found = at
+      break
+    }
+    at = at + usize.ONE
+  }
+  if found != usize.MAX {
+    if from != usize.MAX {
+      run Vector.append<ClosureEdge>(&mut draft.edges, ClosureEdge {from: from, to: found, edge: Edge.copy(&edge), module: run ModuleId.copy(&module), span: span})
+    }
+    if leave { Admission.leave(&mut draft.admission) }
+    return Option.none<StaticClosure>()
+  }
+  if Vector.length<Application>(&draft.nodes) >= limit {
+    let mut path = run Admission.path(&draft.admission)
+    if !leave { run Vector.append<Application>(&mut path, run Application.copy(&application)) }
+    return Option.some<StaticClosure>(StaticClosure.NotProven {diagnostic: run rejectNotProven(&module, span, move path, limit)})
+  }
+  let node = Vector.length<Application>(&draft.nodes)
+  run Vector.append<Application>(&mut draft.nodes, run Application.copy(&application))
+  if from != usize.MAX {
+    run Vector.append<ClosureEdge>(&mut draft.edges, ClosureEdge {from: from, to: node, edge: Edge.copy(&edge), module: run ModuleId.copy(&module), span: span})
+  }
+  let located = run locationOfInstance(&mut draft.semantic.resolver, &key)
+  let location = match move located {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return Option.some<StaticClosure>(run closureGap(GapCode.CalleeModule, &application, span)) }
+  }
+  let backendName = run internBackendInstance(&mut draft.semantic.resolver, &key)
+  let instanceAnswer = run demandRaw(&mut draft.semantic.resolver, &mut draft.semantic.query, Key {
+    family: Family.Instance, module: location.module, name: backendName, declaration: location.declaration, member: usize.ZERO, external: false,
+  }, Span.make(usize.ZERO, usize.ZERO))
+  let instanceRejection = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&instanceAnswer, answerRejection)
+  if let Option<Shared<Rejection>>.Some {value} = move instanceRejection { return Option.some<StaticClosure>(StaticClosure.Rejected {diagnostic: move value}) }
+  let instanceGap = Shared.with<Result<Answer, NoRejection>, Option<Shared<BackendGap>>>(&instanceAnswer, answerBackendGap)
+  if let Option<Shared<BackendGap>>.Some {value} = move instanceGap {
+    let mut gaps = Vector.make<Shared<BackendGap>>()
+    run Vector.append<Shared<BackendGap>>(&mut gaps, move value)
+    return Option.some<StaticClosure>(StaticClosure.Unsupported {gaps: move gaps})
+  }
+  let mir = run demandRaw(&mut draft.semantic.resolver, &mut draft.semantic.query, Key {
+    family: Family.Mir, module: location.module, name: backendName, declaration: location.declaration, member: usize.ZERO, external: false,
+  }, Span.make(usize.ZERO, usize.ZERO))
+  let mirRejection = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&mir, answerRejection)
+  if let Option<Shared<Rejection>>.Some {value} = move mirRejection { return Option.some<StaticClosure>(StaticClosure.Rejected {diagnostic: move value}) }
+  let mirGap = Shared.with<Result<Answer, NoRejection>, Option<Shared<BackendGap>>>(&mir, answerBackendGap)
+  if let Option<Shared<BackendGap>>.Some {value} = move mirGap {
+    let mut gaps = Vector.make<Shared<BackendGap>>()
+    run Vector.append<Shared<BackendGap>>(&mut gaps, move value)
+    return Option.some<StaticClosure>(StaticClosure.Unsupported {gaps: move gaps})
+  }
+  let mirIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&mir, answerMirIndex)
+  let lowered = match move mirIndex {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option.some<StaticClosure>(run closureGap(GapCode.TypedForm, &application, span)) }
+  }
+  if leave { run Vector.append<ClosureVisit>(&mut draft.pending, ClosureVisit.Leave) }
+  let callerModule = run resolvedModule(&draft.semantic.resolver, location.module)
+  let functions = Vector.asSlice<MirFunction>(&draft.semantic.resolver.mirValues)
+  let references = Vector.asSlice<MirReference>(&functions[lowered].references)
+  let mut reference = usize.ZERO
+  while reference < references.length {
+    run Vector.append<ClosureVisit>(&mut draft.pending, ClosureVisit.Enter {
+      key: InstanceKey.copy(&references[reference].key), from: node, edge: Edge.copy(&references[reference].edge),
+      module: run ModuleId.copy(&callerModule), span: references[reference].origin.span,
+    })
+    reference = reference + usize.ONE
+  }
+  return Option.none<StaticClosure>()
+}
+
+effect fn walkChain<'owner>(draft: &mut ClosureDraft<'owner>, limit: usize, incoming: &ClosureIncoming, ancestors: &[Application]) -> StaticClosure
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  while Vector.length<ClosureVisit>(&draft.pending) > usize.ZERO {
+    let last = Vector.length<ClosureVisit>(&draft.pending) - usize.ONE
+    let visit = Vector.remove<ClosureVisit>(&mut draft.pending, last)
+    match move visit {
+      ClosureVisit.Leave => { Admission.leave(&mut draft.admission) }
+      ClosureVisit.Enter {key, from, edge, module, span} => {
+        let outcome = run enterChainNode(&mut draft.*, key, from, edge, module, span, limit)
+        if let Option<StaticClosure>.Some {value} = move outcome { return move value }
+      }
+    }
+  }
+  let mut nodes = Vector.make<Application>()
+  let listed = Vector.asSlice<Application>(&draft.nodes)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector.append<Application>(&mut nodes, run Application.copy(&listed[at]))
+    at = at + usize.ONE
+  }
+  let mut edges = Vector.make<ClosureEdge>()
+  let recorded = Vector.asSlice<ClosureEdge>(&draft.edges)
+  at = usize.ZERO
+  while at < recorded.length {
+    run Vector.append<ClosureEdge>(&mut edges, ClosureEdge {
+      from: recorded[at].from, to: recorded[at].to, edge: Edge.copy(&recorded[at].edge), module: run ModuleId.copy(&recorded[at].module), span: recorded[at].span,
+    })
+    at = at + usize.ONE
+  }
+  let mut path = Vector.make<Application>()
+  at = usize.ZERO
+  while at < ancestors.length {
+    run Vector.append<Application>(&mut path, run Application.copy(&ancestors[at]))
+    at = at + usize.ONE
+  }
+  return StaticClosure.Certified {evidence: FiniteClosureEvidence {
+    incoming: run copyClosureIncoming(incoming), ancestors: move path, nodes: move nodes, edges: move edges,
+  }}
+}
+
+// A closure that the node budget ended before it closed: the pending path and the budget reached.
+effect fn rejectNotProven(module: &ModuleId, span: Span, path: Vector<Application>, limit: usize) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Rejection>(
+    Rejection {
+      code: RejectionCode.StaticRecursionNotProven,
+      module: run ModuleId.copy(module),
+      span: span,
+      related: Option.none<Span>(),
+      path: Vector.make<Shared<DeclarationId>>(),
+      expected: limit,
+      supplied: limit,
+      parameterName: Bytes.make(),
+      expectedKind: GenericKind.Type,
+      suppliedKind: GenericKind.Type,
+      witness: Option.none<WitnessProblem>(),
+      termination: TerminationStep.Peer,
+      staticFailure: Option.none<StaticDiagnostic>(),
+      specialization: move path,
+    },
+  )
 }
 
 effect fn rejectSpecialization(module: &ModuleId, span: Span, path: Vector<Application>) -> Shared<
