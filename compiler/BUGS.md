@@ -338,7 +338,9 @@ asserted the synthesized field as intended recovery and now asserts `Empty {}` p
 
 ## Cleanup-subterm search exceeds the V8 map limit through a borrowed `Semantic`
 
-**Status:** open in the bootstrap. Selfhost source avoids the trigger; no limit was raised.
+**Status:** repaired in the bootstrap on `main` by
+[#675](https://github.com/julia-script/silk/pull/675) (`cf53040d`). The fix reaches selfhost
+through the next main→selfhost sync. No limit was raised.
 
 At selfhost head `d4c8f98059e504acc8e54a6830158255352b22bf` (#671), building
 `compiler/silk.toml` fails during `Realization.discoverInstances` with
@@ -355,8 +357,23 @@ descends through reference types, so a cleanup root holding `&mut Semantic` reac
 size. Even on `cb31280d`, the `Query.Entry ⊂ Semantic` question already holds about 1.2 million
 memo entries.
 
-Selfhost `c871c5ea` removed the borrowed field: the draft owns only its vectors, and the walk
-receives `Semantic` as a parameter. The bootstrap fix is to stop the cleanup-subterm search at
-reference types, since a borrow owns nothing that cleanup could release. It belongs in a main-first
-change to `Instances.ts`, with a regression that builds a resource struct holding `&mut` to a
-large nominal graph.
+Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its vectors,
+and `Semantic` reaches the walk separately.
+
+The overflow itself was in the memo key. Stopping the search at reference types was rejected: the
+cleanup subterm also feeds the hook-recursion measure (`cleanupTransition`,
+`cleanupPermitsSpecialization`). That measure is a termination argument over finite type
+structure, so reference descent is sound and cutting it would reject valid programs.
+
+#675 instead keys the per-question memo by `whole` and only the unfolding entries for declarations
+reachable below it. The reachable set is the closure of template field types over the nominals the
+type contains. The search reads and extends the unfolding only at those declarations, so no answer
+changes.
+- **Regression:** `Instances.test.ts`, "shares cleanup subterm answers across unfoldings of
+  unreachable declarations". Without the fix it overflows the same `Map.set` in
+  `strictCleanupSubtermUnder` after 128 s
+  ([run 37004791353](https://github.com/julia-script/silk/actions/runs/37004791353)). With it the
+  test passes in 2.5 s ([run 37008205332](https://github.com/julia-script/silk/actions/runs/37008205332)).
+- **Original tree:** `d4c8f980` with `cf53040d` merged builds past instance discovery with no
+  RangeError ([run 37009575278](https://github.com/julia-script/silk/actions/runs/37009575278),
+  throwaway #680).
