@@ -11,6 +11,7 @@ import hir.Hir {
   HirRef,
   InfixOperator,
   LinkageDirection,
+  MatchAccess,
   Module,
   Multiplicity,
   Node,
@@ -146,6 +147,9 @@ import semantic.TypedBody {
   Stage as BodyStage,
   TypedBody,
   AggregateField as BodyAggregateField,
+  EnumMember as BodyEnumMember,
+  MatchArm as BodyMatchArm,
+  Pattern as BodyPattern,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
@@ -17503,6 +17507,18 @@ effect fn collectCall(hir: &Module, expression: HirId, calls: &mut Vector<CallSy
     }
     return ()
   }
+  if let Node.MatchExpression {subject, arms, ..} = Module.node(hir, expression) {
+    run collectCall(hir, subject, &mut calls.*)
+    let mut at = usize.ZERO
+    while at < arms.length {
+      if let Node.MatchArm {guard, result, ..} = Module.node(hir, Module.child(hir, arms, at)) {
+        if guard.present { run collectCall(hir, guard.id, &mut calls.*) }
+        run collectCall(hir, result, &mut calls.*)
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
   if let Node.StructExpression {fields, ..} = Module.node(hir, expression) {
     let mut at = usize.ZERO
     while at < fields.length {
@@ -19999,14 +20015,8 @@ effect fn deferredCallResult(
   if let Option<usize>.Some {value: declaration} = move ordinal {
     let written = run header(&mut resolver.*, &declaredModule, declaration)
     if let Option<HeaderSyntax>.Some {value} = move written {
-      let mut code = Option.none<RejectionCode>()
-      match value.header {
-        Node.UnionHeader {..} => { code = Option.some<RejectionCode>(RejectionCode.UnionFormUnavailable) }
-        Node.EnumHeader {..} => { code = Option.some<RejectionCode>(RejectionCode.EnumFormUnavailable) }
-        _ => ()
-      }
-      if let Option<RejectionCode>.Some {value: selected} = move code {
-        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, selected, span))
+      if let Node.UnionHeader {..} = value.header {
+        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
       }
     }
   }
@@ -20033,11 +20043,11 @@ effect fn recordFieldCount(resolver: &mut Resolver, module: &ModuleId, ty: &Shar
   return Result.failResult<usize, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.NotType, span))
 }
 
-// Deferred representation is reported only after ordinary ownership and member validation.
-effect fn deferredNominalMember(
+// Deferred union representation is reported only after ordinary ownership and member validation.
+effect fn deferredUnionVariant(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId,
-  namespace: &[u8], member: &[u8], span: Span, unionVariant: bool, invocation: bool,
+  namespace: &[u8], member: &[u8], span: Span,
 ) -> Option<Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let moduleOrdinal = run internModule(&mut resolver.*, module)
@@ -20058,11 +20068,7 @@ effect fn deferredNominalMember(
   let written = run header(&mut resolver.*, &declaredModule, declaration.ordinal)
   let mut relevant = false
   if let Option<HeaderSyntax>.Some {value} = move written {
-    if unionVariant {
-      if let Node.UnionHeader {..} = value.header { relevant = true }
-    } else {
-      if let Node.EnumHeader {..} = value.header { relevant = true }
-    }
+    if let Node.UnionHeader {..} = value.header { relevant = true }
   }
   if !relevant { return Option.none<Shared<Rejection>>() }
   let names = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
@@ -20081,15 +20087,10 @@ effect fn deferredNominalMember(
           let mut at = usize.ZERO
           while at < values.length {
             if let Option<Bytes>.Some {value: name} = &values[at].name {
-              if same(Bytes.asSlice(&name), member) {
-                if invocation && !unionVariant { return Option.none<bool>() }
-                return Option.some<bool>(values[at].isPublic)
-              }
+              if same(Bytes.asSlice(&name), member) { return Option.some<bool>(values[at].isPublic) }
             }
             at = at + usize.ONE
           }
-          // The enum representation operation is defined independently of case spelling.
-          if !unionVariant && invocation && same(member, b"value") { return Option.some<bool>(true) }
         }
       }
       return Option.none<bool>()
@@ -20099,13 +20100,211 @@ effect fn deferredNominalMember(
     if !isPublic && !ModuleId.equals(module, &declaredModule) {
       return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.PrivateMember, span))
     }
-    let mut code = RejectionCode.EnumFormUnavailable
-    if unionVariant { code = RejectionCode.UnionFormUnavailable }
-    return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, code, span))
+    return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
   }
+  return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnknownMember, span))
+}
+
+// A scalar enum's nominal type and its validated Members answer, which owns every discriminant.
+struct SelectedScalarEnum {
+  ty: Shared<Type>
+  members: Shared<Result<Answer, NoRejection>>
+  module: usize
+}
+
+struct ScalarEnumMember {
+  value: BodyEnumMember
+  isPublic: bool
+}
+
+// A qualified scalar enum use: one member value, or the representation operation `Enum.value`.
+union EnumSelection {
+  Member {ty: Shared<Type>, member: BodyEnumMember},
+  Value {ty: Shared<Type>, representation: Shared<Type>},
+}
+
+fn scalarEnumMember(answer: &Result<Answer, NoRejection>, name: &[u8]) -> Option<ScalarEnumMember> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Members {members, ..}} = &value.outcome {
+      let values = Vector.asSlice<Member>(&members)
+      let mut at = usize.ZERO
+      while at < values.length {
+        if let Option<Bytes>.Some {value: written} = &values[at].name {
+          if same(Bytes.asSlice(&written), name) {
+            if let Option<EnumCase>.Some {value: discriminant} = &values[at].discriminant {
+              return Option.some<ScalarEnumMember>(ScalarEnumMember {
+                value: BodyEnumMember {
+                  ordinal: at, negative: discriminant.sign == StaticSign.Negative, magnitude: discriminant.magnitude,
+                },
+                isPublic: values[at].isPublic,
+              })
+            }
+            return Option.none<ScalarEnumMember>()
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<ScalarEnumMember>()
+}
+
+fn scalarEnumCount(answer: &Result<Answer, NoRejection>) -> usize {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Members {members, ..}} = &value.outcome {
+      return Vector.length<Member>(&members)
+    }
+  }
+  return usize.ZERO
+}
+
+fn scalarEnumRepresentation(answer: &Result<Answer, NoRejection>) -> Option<StaticIntegerType> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Members {enumRepresentation, ..}} = &value.outcome {
+      return Option.some<StaticIntegerType>(enumRepresentation)
+    }
+  }
+  return Option.none<StaticIntegerType>()
+}
+
+effect fn scalarEnumMembers(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, declaredModule: usize, declaration: usize, span: Span,
+) -> Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let names = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+    family: Family.Members, module: declaredModule, name: usize.ZERO,
+    declaration: declaration, member: usize.ZERO, external: false,
+  }, span)
+  let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&names, answerRejection)
+  if let Option<Shared<Rejection>>.Some {value} = move rejected {
+    return Result.failResult<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>(move value)
+  }
+  return Result.succeed<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>(move names)
+}
+
+// Select a scalar enum written as a namespace; absence means the name is not one.
+effect fn selectScalarEnum(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, namespace: &[u8], span: Span,
+) -> Option<Result<SelectedScalarEnum, Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let moduleOrdinal = run internModule(&mut resolver.*, module)
+  let candidate = run select(&mut resolver.*, module, namespace, false)
+  if candidate.count != usize.ONE || (candidate.kind != CandidateKind.Declaration && candidate.kind != CandidateKind.ImportMember) {
+    return Option.none<Result<SelectedScalarEnum, Shared<Rejection>>>()
+  }
+  let selected = run selectDeclaration(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+    moduleOrdinal, module, namespace, false, span, RejectionCode.NotType)
+  let declaration = match move selected {
+    Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => value
+    Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
+      drop error
+      return Option.none<Result<SelectedScalarEnum, Shared<Rejection>>>()
+    }
+  }
+  let declaredModule = run resolvedModule(&resolver.*, declaration.module)
+  let written = run header(&mut resolver.*, &declaredModule, declaration.ordinal)
+  let mut relevant = false
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    if let Node.EnumHeader {..} = value.header { relevant = true }
+  }
+  if !relevant { return Option.none<Result<SelectedScalarEnum, Shared<Rejection>>>() }
+  let demanded = run scalarEnumMembers(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+    declaration.module, declaration.ordinal, span)
+  let members = match move demanded {
+    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => value
+    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => {
+      return Option.some<Result<SelectedScalarEnum, Shared<Rejection>>>(
+        Result.failResult<SelectedScalarEnum, Shared<Rejection>>(move error))
+    }
+  }
+  let identity = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+    family: Family.Identity, module: declaration.module, name: usize.ZERO,
+    declaration: declaration.ordinal, member: usize.ZERO, external: false,
+  }, span)
+  let selectedType = run typeFromAnswer(&identity)
+  if let Option<Shared<Rejection>>.Some {value: diagnostic} = move selectedType.rejected {
+    return Option.some<Result<SelectedScalarEnum, Shared<Rejection>>>(
+      Result.failResult<SelectedScalarEnum, Shared<Rejection>>(move diagnostic))
+  }
+  return match move selectedType.resolved {
+    Option<Shared<Type>>.Some {value: ty} => Option.some<Result<SelectedScalarEnum, Shared<Rejection>>>(
+      Result.succeed<SelectedScalarEnum, Shared<Rejection>>(
+        SelectedScalarEnum {ty: move ty, members: move members, module: declaration.module},
+      ),
+    )
+    Option<Shared<Type>>.None => Option.none<Result<SelectedScalarEnum, Shared<Rejection>>>()
+  }
+}
+
+// The checked subject's own declaration supplies the members; absence means it is not a scalar enum.
+effect fn subjectScalarEnum(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, span: Span,
+) -> Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
+  if moduleOrdinal == usize.MAX { return Option.none<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>() }
+  let declaredModule = run resolvedModule(&resolver.*, moduleOrdinal)
+  let ordinal = run ordinalOfProvider(&mut resolver.*, &declaredModule, ty)
+  let declaration = match move ordinal {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option.none<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>() }
+  }
+  let written = run header(&mut resolver.*, &declaredModule, declaration)
+  let mut relevant = false
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    if let Node.EnumHeader {..} = value.header { relevant = true }
+  }
+  if !relevant { return Option.none<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>() }
+  return Option.some<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>(
+    run scalarEnumMembers(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, declaration, span))
+}
+
+// Member visibility is checked before selection; `value` names the representation operation.
+effect fn checkedEnumSelection(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId,
+  namespace: &[u8], member: &[u8], span: Span, invocation: bool,
+) -> Option<Result<EnumSelection, Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let selected = run selectScalarEnum(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, namespace, span)
+  let chosen = match move selected {
+    Option<Result<SelectedScalarEnum, Shared<Rejection>>>.Some {value: found} => match move found {
+      Result<SelectedScalarEnum, Shared<Rejection>>.Success {value} => value
+      Result<SelectedScalarEnum, Shared<Rejection>>.Failure {error} => {
+        return Option.some<Result<EnumSelection, Shared<Rejection>>>(Result.failResult<EnumSelection, Shared<Rejection>>(move error))
+      }
+    }
+    Option<Result<SelectedScalarEnum, Shared<Rejection>>>.None => { return Option.none<Result<EnumSelection, Shared<Rejection>>>() }
+  }
+  let found = Shared.with<Result<Answer, NoRejection>, Option<ScalarEnumMember>>(&chosen.members,
+    fn(answer: &Result<Answer, NoRejection>) -> Option<ScalarEnumMember> { return scalarEnumMember(answer, member) })
   let mut code = RejectionCode.UnknownMember
-  if invocation && !unionVariant { code = RejectionCode.NotCallable }
-  return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, code, span))
+  if invocation { code = RejectionCode.NotCallable }
+  if let Option<ScalarEnumMember>.Some {value} = move found {
+    let declaredModule = run resolvedModule(&resolver.*, chosen.module)
+    if invocation {
+      code = RejectionCode.NotCallable
+    } else if !value.isPublic && !ModuleId.equals(module, &declaredModule) {
+      code = RejectionCode.PrivateMember
+    } else {
+      return Option.some<Result<EnumSelection, Shared<Rejection>>>(Result.succeed<EnumSelection, Shared<Rejection>>(
+        EnumSelection.Member {ty: move chosen.ty, member: value.value},
+      ))
+    }
+  } else if invocation && same(member, b"value") {
+    let representation = Shared.with<Result<Answer, NoRejection>, Option<StaticIntegerType>>(&chosen.members, scalarEnumRepresentation)
+    if let Option<StaticIntegerType>.Some {value: integer} = move representation {
+      return Option.some<Result<EnumSelection, Shared<Rejection>>>(Result.succeed<EnumSelection, Shared<Rejection>>(
+        EnumSelection.Value {ty: move chosen.ty, representation: run primitiveType(StaticConstant.integerName(integer))},
+      ))
+    }
+    code = RejectionCode.Unsupported
+  }
+  return Option.some<Result<EnumSelection, Shared<Rejection>>>(
+    Result.failResult<EnumSelection, Shared<Rejection>>(run reject(&resolver.*, module, code, span)))
 }
 
 effect fn deferredRecordAnnotation(
@@ -20120,8 +20319,8 @@ effect fn deferredRecordAnnotation(
       let parsed = run path(&mut resolver.*, module, named)
       let segments = Vector.asSlice<Bytes>(&parsed.segments)
       if parsed.valid && segments.length == 2 {
-        return run deferredNominalMember(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-          module, Bytes.asSlice(&segments[usize.ZERO]), Bytes.asSlice(&segments[usize.ONE]), span, true, false)
+        return run deferredUnionVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          module, Bytes.asSlice(&segments[usize.ZERO]), Bytes.asSlice(&segments[usize.ONE]), span)
       }
       if parsed.valid && segments.length == usize.ONE {
         let moduleOrdinal = run internModule(&mut resolver.*, module)
@@ -21322,10 +21521,24 @@ effect fn checkExpression(
       if !staticBody {
         let qualified = run bodyQualifiedName(&resolver.source, cursor, expression)
         if let Option<QualifiedBodyName>.Some {value} = move qualified {
-          let deferred = run deferredNominalMember(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-            module, Bytes.asSlice(&value.namespace), Bytes.asSlice(&value.member), span, false, false)
-          if let Option<Shared<Rejection>>.Some {value: diagnostic} = move deferred {
-            return Result.failResult<BodyNodeId, Shared<Rejection>>(move diagnostic)
+          let selection = run checkedEnumSelection(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+            module, Bytes.asSlice(&value.namespace), Bytes.asSlice(&value.member), span, false)
+          if let Option<Result<EnumSelection, Shared<Rejection>>>.Some {value: selected} = move selection {
+            let chosen = match move selected {
+              Result<EnumSelection, Shared<Rejection>>.Success {value: choice} => choice
+              Result<EnumSelection, Shared<Rejection>>.Failure {error} => {
+                return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+              }
+            }
+            if let EnumSelection.Member {ty: enumType, member} = move chosen {
+              let index = Vector.length<BodyNode>(&nodes.*)
+              run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+                origin: BodyOrigin {syntax: expression, span: span},
+                kind: BodyNodeKind.Expression {ty: move enumType, form: BodyExpression.EnumMember {member: member}},
+              })
+              return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
+            }
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
           }
         }
         let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -21475,6 +21688,181 @@ effect fn checkExpression(
           )
         }
       }
+    }
+    Node.MatchExpression {access, subject, arms} => {
+      if staticBody || (access != MatchAccess.Default && access != MatchAccess.Place) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+      }
+      let checkedSubject = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
+        &mut dependencies.*, module, cursor, caller, locals, calls, &mut nodes.*,
+        &mut signatures.*, &mut requiredBodies.*, subject, &Option.none<Shared<Type>>(),
+        constraints, contractBody, false, unsafeAllowed)
+      let subjectNode = match move checkedSubject {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let subjectType = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &subjectNode) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
+      }
+      let subjectMembers = run subjectScalarEnum(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subjectType, span)
+      let members = match move subjectMembers {
+        Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.Some {value: selected} => match move selected {
+          Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+          }
+        }
+        Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.None => {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+        }
+      }
+      // Unguarded arms cover members; a guarded arm can still fall through to a later arm.
+      let count = Shared.with<Result<Answer, NoRejection>, usize>(&members, scalarEnumCount)
+      let mut covered = Vector.make<bool>()
+      while Vector.length<bool>(&covered) < count { run Vector.append<bool>(&mut covered, false) }
+      let mut coveredCount = usize.ZERO
+      let mut universal = false
+      let mut resultType = match &expected.* {
+        Option<Shared<Type>>.Some {value} => Option.some<Shared<Type>>(Shared.clone<Type>(&value))
+        Option<Shared<Type>>.None => Option.none<Shared<Type>>()
+      }
+      let mut checkedArms = Vector.make<BodyMatchArm>()
+      let mut at = usize.ZERO
+      while at < arms.length {
+        let armId = run bodyChild(&resolver.source, cursor, arms, at)
+        let armSpan = run bodySpan(&resolver.source, cursor, armId)
+        let mut pattern = armId
+        let mut guard = HirRef.absent()
+        let mut result = armId
+        if let Node.MatchArm {pattern: writtenPattern, guard: writtenGuard, result: writtenResult} = run bodyNode(&resolver.source, cursor, armId) {
+          pattern = writtenPattern
+          guard = writtenGuard
+          result = writtenResult
+        } else {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, armSpan)
+        }
+        let patternSpan = run bodySpan(&resolver.source, cursor, pattern)
+        if universal || coveredCount == count {
+          let mut code = RejectionCode.UnreachableMatchArm
+          if universal { code = RejectionCode.MatchArmAfterUniversal }
+          return run bodyRejection(&resolver.*, module, code, patternSpan)
+        }
+        let mut checkedPattern = BodyPattern.Universal
+        let mut ordinal = usize.MAX
+        match run bodyNode(&resolver.source, cursor, pattern) {
+          Node.UniversalPattern {name} => {
+            if name.present { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+          }
+          Node.EnumPattern {path} => {
+            let written = run bodyPathPair(&resolver.source, cursor, path)
+            let pair = match move written {
+              Option<QualifiedBodyName>.Some {value} => value
+              Option<QualifiedBodyName>.None => {
+                return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan)
+              }
+            }
+            let selection = run checkedEnumSelection(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+              module, Bytes.asSlice(&pair.namespace), Bytes.asSlice(&pair.member), patternSpan, false)
+            let selected = match move selection {
+              Option<Result<EnumSelection, Shared<Rejection>>>.Some {value} => value
+              Option<Result<EnumSelection, Shared<Rejection>>>.None => {
+                return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, patternSpan)
+              }
+            }
+            let chosen = match move selected {
+              Result<EnumSelection, Shared<Rejection>>.Success {value} => value
+              Result<EnumSelection, Shared<Rejection>>.Failure {error} => {
+                return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+              }
+            }
+            if let EnumSelection.Member {ty: patternType, member} = move chosen {
+              if !run Type.equalsShared(&patternType, &subjectType) {
+                return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, patternSpan)
+              }
+              let prior = Vector.asSlice<bool>(&covered)
+              if prior[member.ordinal] {
+                return run bodyRejection(&resolver.*, module, RejectionCode.DuplicateEnumPattern, patternSpan)
+              }
+              ordinal = member.ordinal
+              checkedPattern = BodyPattern.EnumMember {member: member}
+            } else {
+              return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, patternSpan)
+            }
+          }
+          _ => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+        }
+        let mut checkedGuard = Option.none<BodyNodeId>()
+        if guard.present {
+          let tested = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
+            &mut dependencies.*, module, cursor, caller, locals, calls, &mut nodes.*,
+            &mut signatures.*, &mut requiredBodies.*, guard.id, &Option.none<Shared<Type>>(),
+            constraints, contractBody, false, unsafeAllowed)
+          let guardNode = match move tested {
+            Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+            Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+              return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+            }
+          }
+          let guardType = bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &guardNode)
+          let boolean = run primitiveType(b"bool")
+          let isBoolean = match &guardType {
+            Option<Shared<Type>>.Some {value} => run Type.equalsShared(&value, &boolean)
+            Option<Shared<Type>>.None => false
+          }
+          if !isBoolean {
+            return run bodyRejection(&resolver.*, module, RejectionCode.ConditionNotBool,
+              run bodySpan(&resolver.source, cursor, guard.id))
+          }
+          checkedGuard = Option.some<BodyNodeId>(guardNode)
+        } else {
+          if ordinal == usize.MAX {
+            universal = true
+          } else {
+            let mut marks = Vector.asMutSlice<bool>(&mut covered)
+            marks[ordinal] = true
+            coveredCount = coveredCount + usize.ONE
+          }
+        }
+        if let Node.Block {..} = run bodyNode(&resolver.source, cursor, result) {
+          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, run bodySpan(&resolver.source, cursor, result))
+        }
+        let checkedResult = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
+          &mut dependencies.*, module, cursor, caller, locals, calls, &mut nodes.*,
+          &mut signatures.*, &mut requiredBodies.*, result, &resultType,
+          constraints, contractBody, false, unsafeAllowed)
+        let resultNode = match move checkedResult {
+          Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => node
+          Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+          }
+        }
+        let unset = match &resultType {
+          Option<Shared<Type>>.Some {..} => false
+          Option<Shared<Type>>.None => true
+        }
+        if unset { resultType = bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &resultNode) }
+        run Vector.append<BodyMatchArm>(&mut checkedArms, BodyMatchArm {
+          origin: BodyOrigin {syntax: armId, span: armSpan},
+          pattern: move checkedPattern, guard: move checkedGuard, result: resultNode,
+        })
+        at = at + usize.ONE
+      }
+      if !universal && coveredCount != count {
+        return run bodyRejection(&resolver.*, module, RejectionCode.MissingEnumMember, span)
+      }
+      let matchType = match move resultType {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
+      }
+      let index = Vector.length<BodyNode>(&nodes.*)
+      run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+        origin: BodyOrigin {syntax: expression, span: span},
+        kind: BodyNodeKind.Expression {ty: move matchType, form: BodyExpression.Match {subject: subjectNode, arms: move checkedArms}},
+      })
+      return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
     }
     Node.BorrowExpression {access, operand} => {
       let checked = run checkBorrowOperand(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -21919,10 +22307,37 @@ effect fn checkExpression(
       let qualified = run bodyQualifiedName(&resolver.source, cursor, callee)
       if !staticBody {
         if let Option<QualifiedBodyName>.Some {value} = &qualified {
-          let deferred = run deferredNominalMember(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-            module, Bytes.asSlice(&value.namespace), Bytes.asSlice(&value.member), span, false, true)
-          if let Option<Shared<Rejection>>.Some {value: diagnostic} = move deferred {
-            return Result.failResult<BodyNodeId, Shared<Rejection>>(move diagnostic)
+          let selection = run checkedEnumSelection(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+            module, Bytes.asSlice(&value.namespace), Bytes.asSlice(&value.member), span, true)
+          if let Option<Result<EnumSelection, Shared<Rejection>>>.Some {value: selected} = move selection {
+            let chosen = match move selected {
+              Result<EnumSelection, Shared<Rejection>>.Success {value: choice} => choice
+              Result<EnumSelection, Shared<Rejection>>.Failure {error} => {
+                return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+              }
+            }
+            if let EnumSelection.Value {ty: enumType, representation} = move chosen {
+              if generics.present { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
+              if arguments.length != usize.ONE { return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span) }
+              let argument = run bodyChild(&resolver.source, cursor, arguments, usize.ZERO)
+              let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
+                &mut dependencies.*, module, cursor, caller, locals, calls, &mut nodes.*,
+                &mut signatures.*, &mut requiredBodies.*, argument, &Option.some<Shared<Type>>(move enumType),
+                constraints, contractBody, false, unsafeAllowed)
+              let operand = match move checked {
+                Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => node
+                Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+                  return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+                }
+              }
+              let index = Vector.length<BodyNode>(&nodes.*)
+              run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+                origin: BodyOrigin {syntax: expression, span: span},
+                kind: BodyNodeKind.Expression {ty: move representation, form: BodyExpression.EnumValue {value: operand}},
+              })
+              return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
+            }
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
           }
         }
       }
@@ -22913,6 +23328,28 @@ effect fn bodyText(source: &SourceIndex, cursor: &AuthoredCursor, symbol: Symbol
     return run Bytes.copy(value)
   }
   fail RevisionMismatch {}
+}
+
+// A two-segment written path such as `Status.Ready` in a member pattern.
+effect fn bodyPathPair(source: &SourceIndex, cursor: &AuthoredCursor, path: HirId) -> Option<QualifiedBodyName>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Node.Path {segments} = run bodyNode(source, cursor, path) {
+    if segments.length == 2 {
+      let first = run bodyChild(source, cursor, segments, usize.ZERO)
+      let second = run bodyChild(source, cursor, segments, usize.ONE)
+      if let Node.Name {text: namespaceSymbol} = run bodyNode(source, cursor, first) {
+        if let Node.Name {text: memberSymbol} = run bodyNode(source, cursor, second) {
+          return Option.some<QualifiedBodyName>(QualifiedBodyName {
+            namespace: run bodyText(source, cursor, namespaceSymbol),
+            member: run bodyText(source, cursor, memberSymbol),
+            subjectSpan: run bodySpan(source, cursor, first),
+            application: Option.none<HirId>(),
+          })
+        }
+      }
+    }
+  }
+  return Option.none<QualifiedBodyName>()
 }
 
 effect fn bodyQualifiedName(source: &SourceIndex, cursor: &AuthoredCursor, callee: HirId) -> Option<
@@ -25778,7 +26215,6 @@ effect fn resolveMir(
   if let Option<Shared<Rejection>>.Some {value} = move bodyFailure {
     let coverageGap = Shared.with<Rejection, Option<GapCode>>(&value, fn(rejection: &Rejection) -> Option<GapCode> {
       if rejection.code == RejectionCode.UnionFormUnavailable { return Option.some<GapCode>(GapCode.UnionForm) }
-      if rejection.code == RejectionCode.EnumFormUnavailable { return Option.some<GapCode>(GapCode.EnumForm) }
       if rejection.code == RejectionCode.GenericRecordUnavailable { return Option.some<GapCode>(GapCode.GenericRecord) }
       if rejection.code == RejectionCode.BoundMethodUnavailable { return Option.some<GapCode>(GapCode.BoundMethod) }
       if rejection.code == RejectionCode.SliceRegionRelationUnavailable { return Option.some<GapCode>(GapCode.SliceRegionRelation) }
@@ -26162,6 +26598,24 @@ effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   let writtenHeader = match move written {
     Option<HeaderSyntax>.Some {value} => value
     Option<HeaderSyntax>.None => { return memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>()) }
+  }
+  // A scalar enum has exactly its representation's layout (ENUM-003) and keeps nominal identity.
+  if let Node.EnumHeader {..} = writtenHeader.header {
+    let mut dependencies = Vector.make<Dependency>()
+    let selected = run scalarEnumMembers(&mut resolver.*, &mut owner.*, &mut dependencies, moduleOrdinal, declaration, writtenHeader.span)
+    let members = match move selected {
+      Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => value
+      Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => {
+        return memberRejected(move error, move dependencies)
+      }
+    }
+    let representation = Shared.with<Result<Answer, NoRejection>, Option<StaticIntegerType>>(&members, scalarEnumRepresentation)
+    if let Option<StaticIntegerType>.Some {value: integer} = move representation {
+      let backing = run primitiveType(StaticConstant.integerName(integer))
+      let computed = BackendLayout.scalar(&backing, &resolver.target)
+      return run storeLayout(&mut resolver.*, move computed, move dependencies)
+    }
+    return memberSuccess(Value.LayoutUnsupported, move dependencies)
   }
   let mut count = usize.MAX
   if let Node.StructHeader {fields, ..} = writtenHeader.header { count = fields.length }
