@@ -9754,6 +9754,71 @@ effect fn recover(error: Intrinsic.StorageFailure) -> i32 { return 0 }
 pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // Target-selected static arms: the unselected arms are never checked.
+  {
+    name: 'static-target-selection',
+    source: `fn wordBits() -> i32 {
+  static if Intrinsic.targetPointerBits() == 64 {
+    return 64
+  } else {
+    compileError("this program requires a 64-bit target")
+  }
+}
+
+fn quiet() -> i32 {
+  static if false {
+    return missing
+  }
+  return 0
+}
+
+pub fn main() -> i32 {
+  return wordBits() - 22 + quiet()
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Runtime reads of a static local and a direct static-helper call embed their values.
+  {
+    name: 'static-local-and-helper',
+    source: `static fn amount(base: i32) -> i32 {
+  return base * 10 + 1
+}
+
+fn withLocal(value: i32) -> i32 {
+  let static scaled = amount(2)
+  return scaled + value
+}
+
+fn direct(value: i32) -> i32 {
+  return amount(2) + value
+}
+
+pub fn main() -> i32 {
+  return withLocal(0) + direct(0)
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // One generic body selects different static arms for two type arguments.
+  {
+    name: 'static-type-selection',
+    source: `import silk.reflect { Reflect }
+
+struct Named { value: i32 }
+tuple Pair(i32, i32)
+
+fn weight<T>() -> i32 {
+  static if Reflect.typeKind<T>(Reflect.typeOf<T>()) == Reflect.typeKind<Named>(Reflect.typeOf<Named>()) {
+    return 40
+  } else {
+    return 2
+  }
+}
+
+pub fn main() -> i32 {
+  return weight<Named>() + weight<Pair>()
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   // Static-composition runtime parity belongs in the shared native differential rather than a
   // feature-local compile/link loop. Trapping Drop variants causally prove the three cleanup exits.
   ...staticCompositionCorpus,

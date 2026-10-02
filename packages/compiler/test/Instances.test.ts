@@ -1903,6 +1903,42 @@ it.effect('lowers built-ins and leaves diagnosed bodies unavailable to MIR', () 
   }),
 )
 
+it.effect('materializes runtime reads of static local bindings', () =>
+  Effect.gen(function* () {
+    const result = yield* snapshot(`static fn amount(base: i32) -> i32 { return base * 10 + 1 }
+fn constant() -> i32 { let static scaled = 42 return scaled }
+fn withLocal(value: i32) -> i32 { let static scaled = amount(2) return scaled + value }
+pub fn main() -> i32 { return constant() + withLocal(0) }`)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    const mir = Analysis.loweredMir(result)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const shape = (name: string) => {
+      const fn = mir.functions.find((candidate) => candidate.id.name === name)
+      return fn === undefined
+        ? undefined
+        : {
+            operations: MirVerification.operations(fn).map((operation) => {
+              if (operation._tag === 'Literal') return `Literal:${String(operation.value)}`
+              if (operation._tag === 'Binary') return `Binary:${operation.operator}`
+              return operation._tag
+            }),
+            outcomes: fn.regions.flatMap((region) =>
+              region._tag === 'OperationRegion' ? [region.outcome._tag] : [],
+            ),
+          }
+    }
+    assert.deepEqual(shape('constant'), { operations: ['Literal:42'], outcomes: ['Return'] })
+    assert.deepEqual(shape('withLocal'), {
+      operations: ['Literal:21', 'Move', 'Binary:Add'],
+      outcomes: ['Return'],
+    })
+    assert.deepEqual(
+      mir.functions.map((fn) => fn.id.name),
+      ['main', 'constant', 'withLocal'],
+    )
+  }),
+)
+
 it.effect('discovers calls and lowers nested matches as structured acyclic operations', () =>
   Effect.gen(function* () {
     const result = yield* snapshot(nestedMatchSource)
