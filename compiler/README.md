@@ -13,9 +13,12 @@ destination. Named tuple construction and ordinal places share record storage. F
 one element layout, stride and logical length; indexing checks the logical bound before access or
 an indexed assignment's replacement expression, including for empty and zero-size storage.
 Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
-equality, and member or `_` match arms with guards lower to MIR switches. Uncontextualized tuple
-literals, slice subranges, union construction and patterns, and block-bodied match arms remain
-coverage work for backend roadmap step 4.
+equality, and member or `_` match arms with guards lower to MIR switches. Unions of argument-free
+records store an unsigned tag (canonical member order) before the largest member; non-generic
+`union` declarations tag variants in declaration order and lay each variant out like a record.
+Record, structural-union and nominal-union matches bind fields as places and switch on the tag.
+Uncontextualized tuple literals, slice subranges, generic unions, block-bodied match arms and
+bindings that are assigned or borrowed remain coverage work for backend roadmap step 4.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
