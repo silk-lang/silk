@@ -96,6 +96,31 @@ Each entry records:
   asserts known versus unknown membership and the exact backend gap span. The corpus runner check
   compares the complete committed runtime/mixed spellings with `Intrinsic.inventory()`.
 
+### Static aggregate reflection subset in selfhost
+
+- **Status:** implemented on 2026-10-02 on PR #664 (B12 c39, decision D2); verification is pending
+  that PR's exact-head CI.
+- **Rule:** `Intrinsic.reflectType<Owner>()` yields the phase-only `Intrinsic.Type<Owner>`
+  descriptor, and `Intrinsic.reflectTypeKind<Owner>(descriptor)` yields the stable `silk.reflect`
+  kind code. Both exist only during static evaluation; a descriptor has no runtime representation.
+- **Compilers:** the bootstrap implements the complete reflection family, including fields and
+  field metadata. Selfhost implements only `reflectType` and `reflectTypeKind`, and only for a
+  source-declared struct (kind 0) or tuple (kind 1), during static evaluation. It has no
+  `reflectFields`, `reflectFieldKind`, `reflectFieldLabel`, `reflectFieldOrdinal`, or
+  `borrowField`, and no occurrence-generated aggregate kinds (2 and 3).
+- **Source migration:** none. `silk.reflect` keeps its source wrappers; selfhost checks
+  `Reflect.typeOf` and `Reflect.typeKind` and leaves the others unchecked until demanded.
+- **Diagnostics and limits:** in selfhost, a reflection call outside static evaluation, a runtime
+  signature mentioning `Intrinsic.Type<Owner>`, and a descriptor reaching runtime code through a
+  selection pass are `StaticPhaseViolation`. A non-aggregate or occurrence-generated owner is an
+  `Unsupported` static evaluation at the call, never a fallback code. An unlisted reflection member
+  remains `UnknownMember`.
+- **Evidence:** `selectedTypeSelectionReadsReflectedKinds` in `compiler/src/semantic/SemanticCases.silk`
+  covers both kind codes, the two-type static selection, the unsupported owner, and each runtime
+  boundary. The shared corpus program `static-type-selection` exercises the bootstrap natively.
+- **Open questions:** when selfhost needs fields, add the remaining members with the same
+  phase-only descriptor rules.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
