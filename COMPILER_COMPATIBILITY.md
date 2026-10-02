@@ -131,7 +131,8 @@ Each entry records:
   valid static values, including as static arguments.
 - **Compilers:** both compilers now produce them.
   - Selfhost static roots type array literals and scalar-enum members as runtime bodies do.
-  - Static execution constructs them with `StaticValue.fixedArray` and `StaticValue.enumeration`,
+  - Static execution admits arrays with `StaticValue.aggregate` (every element an admitted static
+    value) and constructs enums with `StaticValue.enumeration`,
     under the retained value budget.
   - MIR materializes them where the selected callee reads them: an enum as its representation
     integer, an array as an aggregate.
