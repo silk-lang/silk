@@ -12,8 +12,10 @@ Internal aggregate calls copy parameters into callee storage and return through 
 destination. Named tuple construction and ordinal places share record storage. Fixed arrays retain
 one element layout, stride and logical length; indexing checks the logical bound before access or
 an indexed assignment's replacement expression, including for empty and zero-size storage.
-Uncontextualized tuple literals, slice descriptors/projection, enum/union construction and match
-remain coverage work for backend roadmap step 4.
+Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
+equality, and member or `_` match arms with guards lower to MIR switches. Uncontextualized tuple
+literals, slice subranges, union construction and patterns, and block-bodied match arms remain
+coverage work for backend roadmap step 4.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

@@ -20,6 +20,9 @@ import semantic.Intrinsic {Member as IntrinsicMember}
 import semantic.TypedBody {
   Expression as BodyExpression,
   AggregateField as BodyAggregateField,
+  EnumMember as BodyEnumMember,
+  MatchArm as BodyMatchArm,
+  Pattern as BodyPattern,
   NodeId as BodyNodeId,
   NodeKind as BodyNodeKind,
   Origin,
@@ -108,6 +111,15 @@ pub union Terminator {
   },
   Trap {pub origin: Origin},
   Unreachable {pub origin: Origin},
+  /// Jumps to the case whose value equals the scalar operand, or to `otherwise` for every other value.
+  Switch {pub value: Operand, pub cases: Vector<SwitchCase>, pub otherwise: usize, pub origin: Origin},
+}
+
+/// One distinct switch value in sign-magnitude decimal form and its target block.
+pub struct SwitchCase {
+  pub decimal: Bytes
+  pub negative: bool
+  pub target: usize
 }
 
 /// Direct Silk and C callees keep separate identities and worklist edges.
@@ -191,6 +203,9 @@ union View {
   ArraySlice {value: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   SliceLength {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Aggregate {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
+  EnumMember {member: BodyEnumMember, ty: Shared<Type>, origin: Origin},
+  EnumValue {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
+  Match {node: BodyNodeId, subject: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   PlaceAssignment {target: BodyNodeId, value: BodyNodeId, origin: Origin},
   Prefix {operation: PrefixOperator, operand: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Infix {
@@ -426,6 +441,16 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           }
           BodyExpression.Aggregate {fields} => View.Aggregate {
             node: id, count: Vector.length<BodyAggregateField>(&fields),
+            ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.EnumMember {member} => View.EnumMember {
+            member: member, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.EnumValue {value} => View.EnumValue {
+            value: value, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.Match {subject, arms} => View.Match {
+            node: id, subject: subject, count: Vector.length<BodyMatchArm>(&arms),
             ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.ConcretePrefix {operator, operand} => View.Prefix {
@@ -877,6 +902,21 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       )
       return Operand.Copy {place: place(output)}
     }
+    View.EnumMember {member, ty, origin} => {
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: run enumOperand(member, &ty)}, origin)
+      return Operand.Copy {place: place(output)}
+    }
+    View.EnumValue {value, ty, origin} => {
+      let input = run expression(&mut builder.*, body, hir, value)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      // A scalar enum has its representation's layout (ENUM-003), so the backing integer keeps its bits.
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
+      return Operand.Copy {place: place(output)}
+    }
+    View.Match {node, subject, count, ty, origin} => {
+      return run lowerMatch(&mut builder.*, body, hir, node, subject, count, &ty, origin)
+    }
     View.Intrinsic {member, node: callNode, ty, origin} => {
       let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, member, &ty, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -994,6 +1034,160 @@ effect fn intrinsicRvalue(
   return run unsupported(&owner, origin, GapCode.IntrinsicMember)
 }
 
+// An owned copy of one checked arm, so lowering never holds a body loan.
+struct ArmView {
+  pattern: BodyPattern
+  guard: Option<BodyNodeId>
+  result: BodyNodeId
+  origin: Origin
+}
+
+fn armView(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<ArmView> {
+  return Shared.with<TypedBody, Option<ArmView>>(body, fn(value: &TypedBody) -> Option<ArmView> {
+    let nodes = TypedBody.nodeSlice(value)
+    if let BodyNodeKind.Expression {form: BodyExpression.Match {arms, ..}, ..} = &nodes[node.index].kind {
+      let written = Vector.asSlice<BodyMatchArm>(&arms)
+      if at < written.length {
+        let pattern = match &written[at].pattern {
+          BodyPattern.Universal => BodyPattern.Universal
+          BodyPattern.EnumMember {member} => BodyPattern.EnumMember {member: member}
+        }
+        let guard = match &written[at].guard {
+          Option<BodyNodeId>.Some {value: tested} => Option.some<BodyNodeId>(tested)
+          Option<BodyNodeId>.None => Option.none<BodyNodeId>()
+        }
+        return Option.some<ArmView>(ArmView {pattern: move pattern, guard: move guard, result: written[at].result, origin: written[at].origin})
+      }
+    }
+    return Option.none<ArmView>()
+  })
+}
+
+effect fn magnitudeText(value: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if value == 0 { return run Bytes.copy(b"0") }
+  let mut reversed = Bytes.make()
+  let mut remaining = value
+  while remaining > 0 {
+    let digit = [u64.toU8(48 + u64.remainder(remaining, 10))]
+    run Bytes.append(&mut reversed, &digit)
+    remaining = remaining / 10
+  }
+  let digits = Bytes.asSlice(&reversed)
+  let mut text = Bytes.make()
+  let mut at = digits.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run Bytes.append(&mut text, &[digits[at]])
+  }
+  return move text
+}
+
+effect fn enumOperand(member: BodyEnumMember, ty: &Shared<Type>) -> Operand ! OutOfMemoryError ? &mut Allocator {
+  return Operand.Integer {decimal: run magnitudeText(member.magnitude), negative: member.negative, ty: Shared.clone<Type>(ty)}
+}
+
+// Ends the current block with one switch over arms `from..`: each member goes to the first arm
+// that can select it, and every other value to the first universal arm. Coverage was proven
+// during checking, so a missing universal arm leaves an unreachable default.
+effect fn dispatchArms(builder: &mut Builder, arms: &[ArmView], entries: &[usize], scrutinee: usize,
+  from: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut cases = Vector.make<SwitchCase>()
+  let mut seen = Vector.make<usize>()
+  let mut otherwise = usize.MAX
+  let mut at = from
+  while at < arms.length && otherwise == usize.MAX {
+    match &arms[at].pattern {
+      BodyPattern.Universal => { otherwise = entries[at] }
+      BodyPattern.EnumMember {member} => {
+        let prior = Vector.asSlice<usize>(&seen)
+        let mut repeated = false
+        let mut scan = usize.ZERO
+        while scan < prior.length {
+          if prior[scan] == member.ordinal { repeated = true }
+          scan = scan + usize.ONE
+        }
+        if !repeated {
+          run Vector.append<usize>(&mut seen, member.ordinal)
+          run Vector.append<SwitchCase>(&mut cases, SwitchCase {
+            decimal: run magnitudeText(member.magnitude), negative: member.negative, target: entries[at],
+          })
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  if otherwise == usize.MAX { otherwise = run block(&mut builder.*, origin) }
+  terminate(&mut builder.*, Terminator.Switch {
+    value: Operand.Copy {place: place(scrutinee)}, cases: move cases, otherwise: otherwise, origin: origin,
+  })
+  return ()
+}
+
+// The subject is evaluated once; a false guard resumes dispatch at the following arm.
+effect fn lowerMatch(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  node: BodyNodeId,
+  subject: BodyNodeId,
+  count: usize,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let subjectType = match move run instanceNodeType(&builder.*, body, subject) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let input = run expression(&mut builder.*, body, hir, subject)
+  let scrutinee = run temporary(&mut builder.*, &subjectType, origin)
+  run assign(&mut builder.*, place(scrutinee), Rvalue.Use {value: move input}, origin)
+  let output = run temporary(&mut builder.*, ty, origin)
+  let mut arms = Vector.make<ArmView>()
+  let mut entries = Vector.make<usize>()
+  let mut results = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < count {
+    let arm = match move armView(body, node, at) {
+      Option<ArmView>.Some {value} => value
+      Option<ArmView>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    }
+    let resultBlock = run block(&mut builder.*, arm.origin)
+    let mut entry = resultBlock
+    if let Option<BodyNodeId>.Some {..} = &arm.guard { entry = run block(&mut builder.*, arm.origin) }
+    run Vector.append<usize>(&mut entries, entry)
+    run Vector.append<usize>(&mut results, resultBlock)
+    run Vector.append<ArmView>(&mut arms, move arm)
+    at = at + usize.ONE
+  }
+  let join = run block(&mut builder.*, origin)
+  let armSlice = Vector.asSlice<ArmView>(&arms)
+  let entrySlice = Vector.asSlice<usize>(&entries)
+  let resultSlice = Vector.asSlice<usize>(&results)
+  run dispatchArms(&mut builder.*, armSlice, entrySlice, scrutinee, usize.ZERO, origin)
+  at = usize.ZERO
+  while at < count {
+    let armOrigin = armSlice[at].origin
+    let result = armSlice[at].result
+    let resultBlock = resultSlice[at]
+    if let Option<BodyNodeId>.Some {value: tested} = &armSlice[at].guard {
+      resume(&mut builder.*, entrySlice[at])
+      let condition = run expression(&mut builder.*, body, hir, tested)
+      let fallback = run block(&mut builder.*, armOrigin)
+      terminate(&mut builder.*, Terminator.Branch {condition: move condition, thenBlock: resultBlock, elseBlock: fallback, origin: armOrigin})
+      resume(&mut builder.*, fallback)
+      run dispatchArms(&mut builder.*, armSlice, entrySlice, scrutinee, at + usize.ONE, armOrigin)
+    }
+    resume(&mut builder.*, resultBlock)
+    let value = run expression(&mut builder.*, body, hir, result)
+    run assign(&mut builder.*, place(output), Rvalue.Use {value: move value}, armOrigin)
+    terminate(&mut builder.*, Terminator.Goto {target: join, origin: armOrigin})
+    at = at + usize.ONE
+  }
+  resume(&mut builder.*, join)
+  return Operand.Copy {place: place(output)}
+}
+
 effect fn shortCircuit(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
@@ -1108,6 +1302,18 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       drop ignored
     }
     View.Aggregate {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.EnumMember {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.EnumValue {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.Match {..} => {
       let ignored = run expression(&mut builder.*, body, hir, id)
       drop ignored
     }
@@ -1276,6 +1482,18 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
       }
     }
     View.Move {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.EnumValue {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.Match {node, subject, count, ..} => {
+      drop run collectCallNodes(body, subject, &mut output.*)
+      let mut at = usize.ZERO
+      while at < count {
+        if let Option<ArmView>.Some {value: arm} = move armView(body, node, at) {
+          if let Option<BodyNodeId>.Some {value: guard} = move arm.guard { drop run collectCallNodes(body, guard, &mut output.*) }
+          drop run collectCallNodes(body, arm.result, &mut output.*)
+        }
+        at = at + usize.ONE
+      }
+    }
     View.Borrow {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.Dereference {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.Field {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
@@ -1555,6 +1773,15 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
       node: node,
       count: count,
       origin: origin,
+    }
+    View.EnumMember {ty, member, origin} => View.EnumMember {
+      ty: run Type.applyBindings(&ty, bindings, true), member: member, origin: origin,
+    }
+    View.EnumValue {ty, value, origin} => View.EnumValue {
+      ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin,
+    }
+    View.Match {ty, node, subject, count, origin} => View.Match {
+      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, count: count, origin: origin,
     }
     View.Prefix {ty, operation, operand, origin} => View.Prefix {
       ty: run Type.applyBindings(&ty, bindings, true),
