@@ -3097,6 +3097,39 @@ fn inspect(input: Left | Right) -> i32 {
 pub fn main() -> i32 { return inspect(Right { value: 0 }) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // A non-generic nominal union: payload and unit variants, construction, call results, and shared
+  // and consuming matches with a guard and a universal arm.
+  {
+    name: 'nominal-union-variants',
+    source: `union Shape { Circle { radius: i32 }, Rect { width: i32, height: i32 }, Empty }
+fn make(kind: i32) -> Shape {
+  if kind == 0 { return Shape.Circle { radius: 3 } }
+  if kind == 1 { return Shape.Rect { width: 4, height: 5 } }
+  if kind == 3 { return Shape.Rect { width: 12, height: 9 } }
+  return Shape.Empty
+}
+fn area(shape: &Shape) -> i32 {
+  return match &shape.* {
+    Shape.Circle { radius } => radius * radius * 3
+    Shape.Rect { width, height } => width * height
+    Shape.Empty => 0
+  }
+}
+fn tall(shape: Shape) -> i32 {
+  return match move shape {
+    Shape.Rect { width, .. } if width > 10 => 0
+    Shape.Rect { height, .. } => height
+    _ => 1
+  }
+}
+pub fn main() -> i32 {
+  let circle = make(0)
+  let rect = make(1)
+  let empty = make(2)
+  return area(&circle) + area(&rect) + area(&empty) - tall(make(1)) + tall(make(3)) + tall(move empty) - 1
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     name: 'match-exclusive-mutable',
     source: `struct Token { value: i32 }
@@ -9752,6 +9785,71 @@ effect fn construct() -> i32 ! Intrinsic.StorageFailure {
 }
 effect fn recover(error: Intrinsic.StorageFailure) -> i32 { return 0 }
 pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Target-selected static arms: the unselected arms are never checked.
+  {
+    name: 'static-target-selection',
+    source: `fn wordBits() -> i32 {
+  static if Intrinsic.targetPointerBits() == 64 {
+    return 64
+  } else {
+    compileError("this program requires a 64-bit target")
+  }
+}
+
+fn quiet() -> i32 {
+  static if false {
+    return missing
+  }
+  return 0
+}
+
+pub fn main() -> i32 {
+  return wordBits() - 22 + quiet()
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Runtime reads of a static local and a direct static-helper call embed their values.
+  {
+    name: 'static-local-and-helper',
+    source: `static fn amount(base: i32) -> i32 {
+  return base * 10 + 1
+}
+
+fn withLocal(value: i32) -> i32 {
+  let static scaled = amount(2)
+  return scaled + value
+}
+
+fn direct(value: i32) -> i32 {
+  return amount(2) + value
+}
+
+pub fn main() -> i32 {
+  return withLocal(0) + direct(0)
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // One generic body selects different static arms for two type arguments.
+  {
+    name: 'static-type-selection',
+    source: `import silk.reflect { Reflect }
+
+struct Named { value: i32 }
+tuple Pair(i32, i32)
+
+fn weight<T>() -> i32 {
+  static if Reflect.typeKind<T>(Reflect.typeOf<T>()) == Reflect.typeKind<Named>(Reflect.typeOf<Named>()) {
+    return 40
+  } else {
+    return 2
+  }
+}
+
+pub fn main() -> i32 {
+  return weight<Named>() + weight<Pair>()
+}`,
     expected: { _tag: 'Completes', result: 42 },
   },
   // Static-composition runtime parity belongs in the shared native differential rather than a
