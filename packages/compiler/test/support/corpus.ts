@@ -3270,6 +3270,53 @@ pub fn main() -> i32 {
 }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // Scalar members in closed structural unions: i64 | bool and u8 | bool built from typed locals,
+  // passed as call results, and matched exhaustively with typed-binding arms.
+  {
+    name: 'scalar-member-unions',
+    source: `fn pick(k: i32) -> i64 | bool {
+  if k == 0 {
+    let count: i64 = 40
+    return count
+  }
+  let flag: bool = true
+  return flag
+}
+fn small(k: i32) -> u8 | bool {
+  if k == 0 {
+    let byte: u8 = 9
+    return byte
+  }
+  let flag: bool = false
+  return flag
+}
+fn truth(value: bool) -> i64 {
+  if value {
+    return 1
+  }
+  return 0
+}
+fn score(value: i64 | bool) -> i64 {
+  return match move value {
+    i64 n => n
+    bool b => truth(b)
+  }
+}
+fn tiny(value: u8 | bool) -> i64 {
+  return match move value {
+    u8 _ => 1
+    bool flag => truth(flag)
+  }
+}
+pub fn main() -> i32 {
+  let total = score(pick(0)) + score(pick(1)) + tiny(small(0)) + tiny(small(1))
+  if total == 42 {
+    return 42
+  }
+  return 1
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   // A non-generic nominal union: payload and unit variants, construction, call results, and shared
   // and consuming matches with a guard and a universal arm.
   {
