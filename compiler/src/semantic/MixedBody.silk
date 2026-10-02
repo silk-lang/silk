@@ -11,14 +11,14 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, CandidateKind, IndexedDeclaration}
 import semantic.Query {Cycle}
 import semantic.Rejection {Rejection, RejectionCode}
-import semantic.Semantic {Answer, Outcome, StaticPort, StaticRootBinder, StaticRootExpectation, Value}
+import semantic.Semantic {Answer, CallPhase, Outcome, StaticPort, StaticRootBinder, StaticRootExpectation, Value}
 import semantic.SourceIndex {AuthoredCursor, NoRejection, RevisionMismatch}
-import semantic.Specialization {Application, ScopeBinding, Target as ApplicationTarget}
+import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target as ApplicationTarget}
 import semantic.StaticExecution
 import semantic.StaticExecution {Binding as StaticBinding, Diagnostic as StaticDiagnostic, Machine as StaticMachine}
 import semantic.StaticValue
 import semantic.StaticValue {Value as StaticData}
-import semantic.Type {Argument, Type as SemanticType}
+import semantic.Type {Argument, Binding as TypeBinding, Type as SemanticType}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
@@ -89,8 +89,16 @@ pub struct Body {
   pub staticBindings: Vector<StaticBinding>
   pub embedded: Vector<Embedded>
   pub decisions: Vector<Decision>
+  pub staticArguments: Vector<StaticArguments>
   pub obligations: Vector<Obligation>
   pub root: Residual
+}
+
+/// The static argument values one reached call supplies, evaluated once in the caller's checked
+/// static context and paired with the callee's original parameter indices.
+pub struct StaticArguments {
+  pub call: HirId
+  pub slots: Vector<StaticSlot>
 }
 
 /// One held semantic source and evaluator with a separate bound on residual growth.
@@ -115,6 +123,7 @@ struct Draft {
   checkedBinders: Vector<StaticRootBinder>
   embedded: Vector<Embedded>
   decisions: Vector<Decision>
+  staticArguments: Vector<StaticArguments>
   obligations: Vector<Obligation>
   nodes: usize
 }
@@ -383,18 +392,18 @@ effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expre
   return CheckedValue {value: move value, checked: move answer}
 }
 
-// Whether a reached call names a static function, from the callee's tracked header: the same
-// fact body routing reads, so qualified and imported static helpers embed like local ones.
-effect fn staticCall<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId) -> bool
+// A reached call's phase, from the callee's tracked header: the same fact body routing reads, so
+// qualified and imported static helpers embed like local ones.
+effect fn callPhase<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId) -> CallPhase
 ! Diagnostic | OutOfMemoryError
 ? &mut Allocator {
   let module = run ModuleId.copy(&machine.module)
-  let attempted = run Effect.result(StaticPort.callIsStatic(
+  let attempted = run Effect.result(StaticPort.callPhase(
     StaticExecution.port(&mut machine.execution), &module, draft.ordinal, expression,
   ))
   let decided = match move attempted {
-    Result<Result<bool, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => value
-    Result<Result<bool, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Result<CallPhase, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => value
+    Result<Result<CallPhase, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
       OutOfMemoryError {} => { fail OutOfMemoryError {} }
       Cycle {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
       InvalidModulePath {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
@@ -402,9 +411,18 @@ effect fn staticCall<'source>(machine: &mut Machine<'source>, draft: &Draft, exp
     }
   }
   return match move decided {
-    Result<bool, Shared<Rejection>>.Success {value} => value
-    Result<bool, Shared<Rejection>>.Failure {error} => run rejectSemantic(Fault.CheckedRootRejected, move error)
+    Result<CallPhase, Shared<Rejection>>.Success {value} => value
+    Result<CallPhase, Shared<Rejection>>.Failure {error} => run rejectSemantic(Fault.CheckedRootRejected, move error)
   }
+}
+
+fn slotPosition(slots: &[usize], at: usize) -> usize {
+  let mut index = usize.ZERO
+  while index < slots.length {
+    if slots[index] == at { return index }
+    index = index + usize.ONE
+  }
+  return usize.MAX
 }
 
 effect fn condition<'source>(machine: &mut Machine<'source>, draft: &mut Draft, expression: HirId) -> bool
@@ -470,17 +488,47 @@ effect fn inspect<'source>(machine: &mut Machine<'source>, draft: &mut Draft, ex
       }
     }
     Node.CallExpression {callee, arguments, ..} => {
-      if run staticCall(&mut machine.*, &draft.*, expression) {
-        let checked = run evaluate(&mut machine.*, &draft.*, expression, StaticRootExpectation.Inferred)
-        run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move checked.value})
-        return ()
+      let phase = run callPhase(&mut machine.*, &draft.*, expression)
+      let mut staticSlots = Vector.make<usize>()
+      let mut staticTypes = Vector.make<Option<Shared<SemanticType>>>()
+      match move phase {
+        CallPhase.Static => {
+          let checked = run evaluate(&mut machine.*, &draft.*, expression, StaticRootExpectation.Inferred)
+          run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move checked.value})
+          return ()
+        }
+        CallPhase.StaticSlots {slots, types} => {
+          staticSlots = move slots
+          staticTypes = move types
+        }
+        CallPhase.Runtime => {}
       }
       run inspect(&mut machine.*, &mut draft.*, callee)
+      // Static arguments are evaluated once here, in authored order; a runtime operand in a static
+      // slot is rejected by its checked static root. Runtime arguments stay ordinary obligations.
+      let slots = Vector.asSlice<usize>(&staticSlots)
+      let mut values = Vector.make<StaticSlot>()
       let mut at = usize.ZERO
       while at < arguments.length {
         let argument = run authoredChild(&machine.*, arguments, at)
-        run inspect(&mut machine.*, &mut draft.*, argument)
+        let position = slotPosition(slots, at)
+        if position != usize.MAX {
+          // A closed declared type checks the argument as that type, so `2` for a `usize` slot is
+          // a usize; a type written in the callee's binders is inferred from the argument.
+          let mut expectation = StaticRootExpectation.Inferred
+          let declared = Vector.asSlice<Option<Shared<SemanticType>>>(&staticTypes)
+          if let Option<Shared<SemanticType>>.Some {value: expected} = &declared[position] {
+            expectation = StaticRootExpectation.Resolved {ty: Shared.clone<SemanticType>(&expected)}
+          }
+          let checked = run evaluate(&mut machine.*, &draft.*, argument, move expectation)
+          run Vector.append<StaticSlot>(&mut values, StaticSlot {ordinal: at, value: move checked.value})
+        } else {
+          run inspect(&mut machine.*, &mut draft.*, argument)
+        }
         at = at + usize.ONE
+      }
+      if slots.length > usize.ZERO {
+        run Vector.append<StaticArguments>(&mut draft.staticArguments, StaticArguments {call: expression, slots: move values})
       }
       run Vector.append<Obligation>(&mut draft.obligations, Obligation.RuntimeCall {syntax: expression})
     }
@@ -707,6 +755,7 @@ pub effect fn applicationNamed<'source>(machine: &Machine<'source>, name: &[u8])
       arguments: Vector.make<Argument>(),
       argumentOrdinals: Vector.make<usize>(),
       scopes: Vector.make<ScopeBinding>(),
+      statics: Vector.make<StaticSlot>(),
     })
     Option<IndexedDeclaration>.None => Option.none<Application>()
   }
@@ -739,7 +788,7 @@ effect fn applicationOrdinal<'source>(machine: &mut Machine<'source>, applicatio
 /// Specializes one ordinary function inside its complete semantic application: static roots
 /// reach the callees the application's bindings select. Failure drops the draft before any body
 /// can be observed.
-pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &Application, staticArguments: &[Shared<StaticData>]) -> Body
+pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &Application) -> Body
 ! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
   let ordinal = run applicationOrdinal(&mut machine.*, application)
@@ -753,9 +802,12 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
     checkedBinders: Vector.make<StaticRootBinder>(),
     embedded: Vector.make<Embedded>(),
     decisions: Vector.make<Decision>(),
+    staticArguments: Vector.make<StaticArguments>(),
     obligations: Vector.make<Obligation>(),
     nodes: usize.ZERO,
   }
+  // Static values come only from the application, each at its original parameter index.
+  let staticArguments = Vector.asSlice<StaticSlot>(&application.statics)
   let parameters = Vector.asSlice<HirId>(&selected.parameters)
   let mut supplied = usize.ZERO
   let mut at = usize.ZERO
@@ -763,7 +815,7 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
     let parameter = parameters[at]
     if let Node.Parameter {mode, ..} = run authoredNode(&machine.*, parameter) {
       if mode == ParameterMode.Static {
-        if supplied >= staticArguments.length {
+        if supplied >= staticArguments.length || staticArguments[supplied].ordinal != at {
           return run reject(Fault.StaticArity, selected.span)
         }
         let declared = Shared.with<Result<Answer, NoRejection>, Option<Shared<SemanticType>>>(
@@ -776,7 +828,9 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
           Option<Shared<SemanticType>>.Some {value} => value
           Option<Shared<SemanticType>>.None => { return run reject(Fault.InvalidHeader, span(&machine.*, parameter)) }
         }
-        if !run StaticValue.matchesType(&staticArguments[supplied], &expected) {
+        let bindings = run Application.bindings(application)
+        let applied = run SemanticType.applyBindings(&expected, Vector.asSlice<TypeBinding>(&bindings), true)
+        if !run StaticValue.matchesType(&staticArguments[supplied].value, &applied) {
           return run reject(Fault.InvalidStaticValue, span(&machine.*, parameter))
         }
         run Vector.append<StaticBinding>(
@@ -784,7 +838,7 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
           StaticBinding {
             module: run ModuleId.copy(&machine.module),
             binder: parameter,
-            value: StaticValue.copy(&staticArguments[supplied]),
+            value: StaticValue.copy(&staticArguments[supplied].value),
           },
         )
         run Vector.append<StaticRootBinder>(&mut draft.checkedBinders, StaticRootBinder.Parameter {syntax: parameter})
@@ -805,6 +859,7 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
     staticBindings: move draft.bindings,
     embedded: move draft.embedded,
     decisions: move draft.decisions,
+    staticArguments: move draft.staticArguments,
     obligations: move draft.obligations,
     root: move root,
   }
