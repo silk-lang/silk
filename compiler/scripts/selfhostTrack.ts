@@ -39,4 +39,5 @@ export const selfhostTrack = [
   'static-target-selection',
   'static-local-and-helper',
   'static-type-selection',
+  'nominal-union-variants',
 ] as const satisfies ReadonlyArray<string>
