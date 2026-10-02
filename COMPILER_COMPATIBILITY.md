@@ -123,6 +123,26 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Static enum values in selfhost static roots
+
+- **Status:** divergence recorded on 2026-10-02 for B12 task 11 (PR #671), as directed by the
+  coordinator; final scope pending reviewer contract verdict.
+- **Rule:** a scalar-enum member such as `Mode.Slow` is a valid static value, including as a static
+  argument (`moded(Mode.Slow)` for `fn moded(static mode: Mode)`).
+- **Compilers:** the bootstrap evaluates it; the shared corpus program
+  `static-parameter-aggregates` exercises that natively. Selfhost static roots do not type
+  scalar-enum members (the qualified spelling resolves as a call reference), and static execution
+  has no enum-member evaluation, so no source program produces a static enum value. Embedding a
+  static enum value therefore has no reachable lowering in selfhost.
+- **Source migration:** none.
+- **Diagnostics and limits:** in selfhost, a scalar-enum member in a static root is `Unsupported`
+  at the member expression. Selfhost does not pin `static-parameter-aggregates`; it pins the
+  array-only `static-parameter-array` once that lands.
+- **Evidence:** `staticParametersSelectInstancesAndKeepRuntimeLanes` asserts the `Unsupported`
+  span for `moded(Mode.Slow)`.
+- **Open questions:** static enum production needs both static typing and static evaluation of
+  enum members; it is follow-up work.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
