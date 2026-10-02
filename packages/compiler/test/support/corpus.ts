@@ -2635,7 +2635,7 @@ fn nested(input: &Outer) -> i32 {
 }
 struct Choices { values: [Choice; 1] }
 interface Merge { operator + fn add(left: Self, right: Self) -> Self }
-fn add(left: Choice, right: Choice) -> Choice { return move left }
+impl Choice { fn add(left: Choice, right: Choice) -> Choice { return move left } }
 impl Merge for Choice { add: Choice.add }
 fn increment(value: &mut Narrow) -> () {
   value.first = value.first + 1
