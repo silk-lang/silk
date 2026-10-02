@@ -16,6 +16,7 @@ import hir.Hir {
   Node,
   OwnerKind,
   ParameterMode,
+  ownedChildren,
   Radix,
   Range,
   RangeRef,
@@ -26901,38 +26902,32 @@ effect fn resolveInstance(
 }
 
 // Whether one function body contains static control or static state anywhere in its own
-// statements: blocks, conditionals, `if let`, loops, `unsafe` and match-arm blocks alike. The HIR
-// arena is postorder, so the body's nodes are the contiguous run just below its block and a nested
-// callable's or Effect's body follows that expression node; those separate bodies are skipped.
-// Static arms are recognized syntactically and never semantically inspected.
-fn bodyHasStaticWork(hir: &Module, block: HirId) -> bool {
-  let outer = Module.span(hir, block)
-  let mut skipStart = usize.MAX
-  let mut skipEnd = usize.ZERO
-  let mut at = block.index
-  while at > usize.ZERO {
-    at = at - usize.ONE
-    let id = HirId {index: at}
-    let span = Module.span(hir, id)
-    if span.start < outer.start || span.end > outer.end { break }
-    if span.start >= skipStart && span.end <= skipEnd { continue }
+// statements: blocks, conditionals, `if let`, loops, `unsafe` and match-arm blocks alike. The walk
+// follows owned children only (`ownedChildren`, the HIR verifier's complete field walk), so a
+// node's position or span never bounds it. A nested callable's or Effect's body is a separate body
+// and is not entered. Static arms are recognized syntactically and never semantically inspected.
+effect fn bodyHasStaticWork(hir: &Module, block: HirId) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = Vector.make<HirId>()
+  run Vector.append<HirId>(&mut pending, block)
+  while Vector.length<HirId>(&pending) > usize.ZERO {
+    let last = Vector.length<HirId>(&pending) - usize.ONE
+    let id = Vector.remove<HirId>(&mut pending, last)
     match Module.node(hir, id) {
-      Node.CallableExpression {body, ..} => {
-        let nested = Module.span(hir, body)
-        skipStart = nested.start
-        skipEnd = nested.end
-      }
-      Node.EffectExpression {body, ..} => {
-        let nested = Module.span(hir, body)
-        skipStart = nested.start
-        skipEnd = nested.end
-      }
+      Node.CallableExpression {..} => { continue }
+      Node.EffectExpression {..} => { continue }
       Node.StaticConditionalStatement {..} => { return true }
       Node.StaticForStatement {..} => { return true }
       Node.BindingStatement {isStatic, ..} => {
         if isStatic { return true }
       }
       _ => ()
+    }
+    let owned = run ownedChildren(hir, id)
+    let children = Vector.asSlice<HirId>(&owned)
+    let mut at = usize.ZERO
+    while at < children.length {
+      run Vector.append<HirId>(&mut pending, children[at])
+      at = at + usize.ONE
     }
   }
   return false
@@ -26975,7 +26970,7 @@ effect fn needsStaticResidualization(
         if let Node.CallableBody {block} = Module.node(hir, body) {
           if block.present {
             if let Node.Block {statements} = Module.node(hir, block.id) {
-              if !marked { marked = bodyHasStaticWork(hir, block.id) }
+              if !marked { marked = run bodyHasStaticWork(hir, block.id) }
               if !marked { run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls) }
             }
           }
@@ -26994,37 +26989,94 @@ effect fn needsStaticResidualization(
   let calls = Vector.asSlice<ResolvedCall>(&resolved.calls)
   let mut at = usize.ZERO
   while at < calls.length {
-    if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Function {target}} = &calls[at].result {
-      // The callee header is a tracked Signature dependency; a fresh store interns its module.
-      let callSpan = run staticSpan(&mut resolver.*, module, calls[at].id)
-      let calleeModule = run ModuleId.copy(DeclarationId.moduleId(&target.declaration))
-      let calleeModuleOrdinal = run internModule(&mut resolver.*, &calleeModule)
-      let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(&target.declaration))
-      let position = run ordinalOfIdentity(&mut resolver.*, &calleeModule, &identity)
-      let ordinal = match move position {
-        Option<usize>.Some {value} => value
-        Option<usize>.None => {
-          return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnknownMember, callSpan))
-        }
+    let decided = run resolvedCallIsStatic(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &calls[at])
+    match move decided {
+      Result<bool, Shared<Rejection>>.Success {value: calleeStatic} => {
+        if calleeStatic { return Result.succeed<bool, Shared<Rejection>>(true) }
       }
-      let header = run demandChild(
-        &mut resolver.*, &mut owner.*, &mut dependencies.*,
-        Key {family: Family.Signature, module: calleeModuleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false},
-        callSpan,
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
+    }
+    at = at + usize.ONE
+  }
+  return Result.succeed<bool, Shared<Rejection>>(false)
+}
+
+// Whether one resolved call names a static function, read from the callee's tracked Signature.
+// Routing and the selection pass share this fact; a fresh store interns the callee module, and an
+// unresolved or rejected header is a precise rejection rather than false.
+effect fn resolvedCallIsStatic(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  call: &ResolvedCall,
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Function {target}} = &call.result {
+    let callSpan = run staticSpan(&mut resolver.*, module, call.id)
+    let calleeModule = run ModuleId.copy(DeclarationId.moduleId(&target.declaration))
+    let calleeModuleOrdinal = run internModule(&mut resolver.*, &calleeModule)
+    let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(&target.declaration))
+    let position = run ordinalOfIdentity(&mut resolver.*, &calleeModule, &identity)
+    let ordinal = match move position {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => {
+        return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnknownMember, callSpan))
+      }
+    }
+    let header = run demandChild(
+      &mut resolver.*, &mut owner.*, &mut dependencies.*,
+      Key {family: Family.Signature, module: calleeModuleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false},
+      callSpan,
+    )
+    let facts = Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(&header, signatureFacts)
+    return match move facts {
+      Option<SignatureFacts>.Some {value: signature} => Result.succeed<bool, Shared<Rejection>>(signature.isStatic)
+      Option<SignatureFacts>.None => {
+        let refused = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&header, answerRejection)
+        if let Option<Shared<Rejection>>.Some {value: reason} = move refused {
+          return Result.failResult<bool, Shared<Rejection>>(move reason)
+        }
+        return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, callSpan))
+      }
+    }
+  }
+  return Result.succeed<bool, Shared<Rejection>>(false)
+}
+
+// Resolves one written call inside a declaration's body and reads whether its callee is static.
+effect fn writtenCallIsStatic(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  declaration: usize,
+  call: HirId,
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let sourceAnswer = run source(&mut resolver.*, module)
+  let mut written = Vector.make<CallSyntax>()
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+    run collectCall(IndexedSource.authored(indexed), call, &mut written)
+  }
+  let collected = Vector.asSlice<CallSyntax>(&written)
+  let mut at = usize.ZERO
+  while at < collected.length {
+    if collected[at].id.index == call.index {
+      let template = run templateBinders(&mut resolver.*, module, declaration)
+      let binders = match move template {
+        Result<Vector<Binder>, Shared<Rejection>>.Success {value} => value
+        Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
+      }
+      let moduleOrdinal = run internModule(&mut resolver.*, module)
+      let target = run callTarget(
+        &mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, &collected[at],
+        Vector.asSlice<Binder>(&binders),
       )
-      let facts = Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(&header, signatureFacts)
-      match move facts {
-        Option<SignatureFacts>.Some {value: signature} => {
-          if signature.isStatic { return Result.succeed<bool, Shared<Rejection>>(true) }
-        }
-        Option<SignatureFacts>.None => {
-          let refused = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&header, answerRejection)
-          if let Option<Shared<Rejection>>.Some {value: reason} = move refused {
-            return Result.failResult<bool, Shared<Rejection>>(move reason)
-          }
-          return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, callSpan))
-        }
-      }
+      let resolved = ResolvedCall {id: call, result: move target}
+      return run resolvedCallIsStatic(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &resolved)
     }
     at = at + usize.ONE
   }
@@ -30902,6 +30954,13 @@ impl<'source> StaticPort<'source> {
       return Option.some<Shared<Result<Answer, NoRejection>>>(move answer)
     }
     return Option.none<Shared<Result<Answer, NoRejection>>>()
+  }
+  /// Whether one reached call in a declaration's body names a static function, read from the
+  /// callee's tracked header exactly as body routing reads it.
+  pub effect fn callIsStatic(self: &mut Self, module: &ModuleId, declaration: usize, call: HirId) -> Result<bool, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    return run writtenCallIsStatic(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, module, declaration, call)
   }
   /// Checks one reached static expression through the active query, preserving its source IDs.
   /// A mixed body's inactive static arms are never checked by this demand.
