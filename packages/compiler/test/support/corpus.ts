@@ -3097,6 +3097,39 @@ fn inspect(input: Left | Right) -> i32 {
 pub fn main() -> i32 { return inspect(Right { value: 0 }) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // A non-generic nominal union: payload and unit variants, construction, call results, and shared
+  // and consuming matches with a guard and a universal arm.
+  {
+    name: 'nominal-union-variants',
+    source: `union Shape { Circle { radius: i32 }, Rect { width: i32, height: i32 }, Empty }
+fn make(kind: i32) -> Shape {
+  if kind == 0 { return Shape.Circle { radius: 3 } }
+  if kind == 1 { return Shape.Rect { width: 4, height: 5 } }
+  if kind == 3 { return Shape.Rect { width: 12, height: 9 } }
+  return Shape.Empty
+}
+fn area(shape: &Shape) -> i32 {
+  return match &shape.* {
+    Shape.Circle { radius } => radius * radius * 3
+    Shape.Rect { width, height } => width * height
+    Shape.Empty => 0
+  }
+}
+fn tall(shape: Shape) -> i32 {
+  return match move shape {
+    Shape.Rect { width, .. } if width > 10 => 0
+    Shape.Rect { height, .. } => height
+    _ => 1
+  }
+}
+pub fn main() -> i32 {
+  let circle = make(0)
+  let rect = make(1)
+  let empty = make(2)
+  return area(&circle) + area(&rect) + area(&empty) - tall(make(1)) + tall(make(3)) + tall(move empty) - 1
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     name: 'match-exclusive-mutable',
     source: `struct Token { value: i32 }
