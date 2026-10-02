@@ -255,6 +255,13 @@ export function lowerExpression(
   return result
 }
 
+/**
+ * The value type stored by a copy of a local. A borrowed pattern binding is an environment borrow
+ * of its payload place, so a copy of it holds the borrowed value, never a second borrow slot.
+ */
+export const copiedValueType = (fn: FunctionLowering, type: Mir.Type): Mir.Type | undefined =>
+  type._tag === 'EnvironmentBorrow' ? fn.type(type.type) : type
+
 /** Captures a by-value operand before evaluation continues with the next call operand. */
 export const captureCallOperand = (
   fn: FunctionLowering,
@@ -269,7 +276,7 @@ export const captureCallOperand = (
     [...locals.values()].some((local) => local.ordinal === source.ordinal),
   )
   if (type._tag !== 'EnvironmentBorrow' && !named) return source
-  const valueType = type._tag === 'EnvironmentBorrow' ? fn.type(type.type) : type
+  const valueType = copiedValueType(fn, type)
   if (valueType === undefined) return undefined
   const destination = fn.alloc(valueType)
   fn.emit({ _tag: 'Move', destination, source, provenance: authored(span) })
@@ -621,9 +628,7 @@ function lowerEnumEqualityExpression(
     | { readonly result: Mir.LocalId; readonly type: Extract<Mir.Type, { readonly _tag: 'Enum' }> }
     | undefined => {
     const sourceType = fn.localTypes.at(value.result.ordinal)
-    let type: Mir.Type | undefined
-    if (sourceType?._tag === 'Enum') type = sourceType
-    else if (sourceType?._tag === 'EnvironmentBorrow') type = fn.type(sourceType.type)
+    const type = sourceType === undefined ? undefined : copiedValueType(fn, sourceType)
     if (
       type?._tag !== 'Enum' ||
       type.representation.enum.module !== expression.enum.module ||

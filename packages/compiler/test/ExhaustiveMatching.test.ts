@@ -577,6 +577,25 @@ pub fn inspect(input: Box) -> Payload {
     ownership(borrowed).diagnostics.map((diagnostic) => diagnostic.code),
     'OWN0006',
   )
+
+  const copiedOwnerSource = `pub struct Payload {}
+pub struct Box { value: Payload }
+pub fn inspect(input: Box) -> i32 {
+  if let Box { value } = &input {
+    let held = value
+    drop held
+  }
+  return 0
+}`
+  const copiedOwner = analyze('borrowed-owner-let', copiedOwnerSource)
+  const heldStart = copiedOwnerSource.indexOf('value\n    drop')
+  assert.deepEqual(
+    [...copiedOwner.diagnostics, ...ownership(copiedOwner).diagnostics].map((diagnostic) => ({
+      code: diagnostic.code,
+      span: [diagnostic.span.start, diagnostic.span.end],
+    })),
+    [{ code: 'OWN0006', span: [heldStart, heldStart + 'value'.length] }],
+  )
 })
 
 it('plans selected-arm cleanup for omitted and unreturned moved fields', () => {
@@ -855,6 +874,14 @@ fn nested(input: &Outer) -> i32 {
 fn fallback(input: Outer | Empty) -> i32 {
   return match move input { Empty {} => 0 _ => 42 }
 }
+fn copyBinding(provider: &(Counter | Empty)) -> i32 {
+  if let Counter {value} = &provider.* {
+    let mut held = value
+    held = held + 1
+    return held
+  }
+  return 0
+}
 pub fn main() -> i32 {
   let fallbackValue = fallback(Outer.Other)
   drop fallbackValue
@@ -865,6 +892,8 @@ pub fn main() -> i32 {
   update(&mut guard)
   let whole = readWhole(&guard.provider)
   drop whole
+  let heldValue = copyBinding(&guard.provider)
+  drop heldValue
   let mut guards = Guards {values: [Guard {provider: Counter {value: 1}}]}
   let copied = readSlice(&guards.values, 0)
   drop copied
@@ -913,6 +942,27 @@ pub fn main() -> i32 {
     assert.deepEqual(
       match.selectors?.map((selector) => selector._tag),
       ['FieldSelector'],
+    )
+    const copyFn =
+      program.functions.find((candidate) => candidate.id.name === 'copyBinding') ??
+      raise('expected copied binding MIR')
+    const copyOperations = MirVerification.operations(copyFn)
+    const copyMatch =
+      copyOperations.find((operation) => operation._tag === 'Match') ??
+      raise('expected statement pattern match')
+    const borrowedValue =
+      copyMatch.arms.flatMap((arm) => arm.bindings).at(0) ?? raise('expected borrowed binding')
+    assert.strictEqual(borrowedValue.type._tag, 'EnvironmentBorrow')
+    const copiedBinding =
+      copyOperations.find(
+        (operation) =>
+          operation._tag === 'Move' &&
+          operation.source.ordinal === borrowedValue.destination.ordinal,
+      ) ?? raise('expected the binding copy')
+    if (copiedBinding._tag !== 'Move') return raise('expected move operation')
+    assert.notStrictEqual(
+      copyFn.localTypes.at(copiedBinding.destination.ordinal)?._tag,
+      'EnvironmentBorrow',
     )
     const indexed =
       program.functions.find((candidate) => candidate.id.name === 'readSlice') ??
