@@ -1,6 +1,6 @@
 //! Demand-driven execution of static function bodies and evaluator-local control flow.
 
-import hir.Hir {HirId, HirRef, InfixOperator, Module, Node, PrefixOperator, Range, Sign}
+import hir.Hir {HirId, HirRef, InfixOperator, Module, Node, OwnerKind, PrefixOperator, Range, Sign}
 import hir.Intern {Symbol}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
@@ -33,7 +33,7 @@ import semantic.StaticValue {
   Value as StaticData,
 }
 import semantic.Target {Target as MachineTarget}
-import semantic.Type {Argument, RowParameter, Type as SemanticType}
+import semantic.Type {Argument, Binding as TypeBinding, RowParameter, Type as SemanticType}
 import semantic.TypedBody {Expression as CheckedExpression, NodeId as CheckedNodeId, NodeKind as CheckedNodeKind, TypedBody}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
@@ -177,6 +177,8 @@ struct Local {
 
 struct Frame {
   application: usize
+  // The closed application this frame executes; its bindings close the calls it reaches.
+  instance: Application
   module: ModuleId
   name: Bytes
   arguments: Vector<Shared<StaticData>>
@@ -236,6 +238,8 @@ pub struct Machine<'source> {
   supplied: Vector<RetainedBinding>
   complete: Vector<Complete>
   textOrigins: Vector<TextOrigin>
+  // The closed application whose body roots are evaluated outside any active frame.
+  instance: Option<Application>
 }
 
 /// Borrows one held semantic store without demanding any static body.
@@ -257,7 +261,29 @@ pub effect fn make<'source>(port: StaticPort<'source>, root: &ModuleId, limits: 
     supplied: Vector.make<RetainedBinding>(),
     complete: Vector.make<Complete>(),
     textOrigins: Vector.make<TextOrigin>(),
+    instance: Option.none<Application>(),
   }
+}
+
+/// Evaluates later roots inside one closed application: calls written in its generic body reach
+/// the callees its bindings select.
+pub effect fn useInstance<'source>(machine: &mut Machine<'source>, application: &Application) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  machine.instance = Option.some<Application>(run Application.copy(application))
+  return ()
+}
+
+// Closes a reached call written in the executing body's binders with that body's application.
+effect fn closeCall<'source>(machine: &Machine<'source>, call: Application) -> Application
+! OutOfMemoryError ? &mut Allocator {
+  let frames = Vector.asSlice<Frame>(&machine.active)
+  if frames.length > usize.ZERO {
+    return run Application.substitute(&call, &frames[frames.length - usize.ONE].instance)
+  }
+  if let Option<Application>.Some {value: root} = &machine.instance {
+    return run Application.substitute(&call, &root)
+  }
+  return move call
 }
 
 /// Borrows the active semantic port briefly between evaluation attempts.
@@ -812,10 +838,67 @@ effect fn profileArgument<'source>(
 effect fn dispatchIntrinsic<'source>(
   machine: &mut Machine<'source>,
   member: IntrinsicMember,
+  call: HirId,
   arguments: Range,
   local: &mut Vector<Local>,
   span: Span,
 ) -> Shared<StaticData> ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  if member == IntrinsicMember.ReflectType {
+    if arguments.length != usize.ZERO { return run reject(&machine.*, Fault.InvalidValue, span) }
+    let checked = checkedIntrinsicType(&machine.*, call)
+    let written = match move checked {
+      Option<Shared<SemanticType>>.Some {value} => value
+      Option<Shared<SemanticType>>.None => run reject(&machine.*, Fault.Unavailable, span)
+    }
+    let closed = run closeType(&machine.*, &written)
+    let described = Shared.with<SemanticType, Option<Shared<SemanticType>>>(&closed, descriptorOwner)
+    let owner = match move described {
+      Option<Shared<SemanticType>>.Some {value} => value
+      Option<Shared<SemanticType>>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    if SemanticType.hasOpenParameters(&owner) {
+      let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+      failure.missing = Option.some<MissingFact>(MissingFact.TypedApplication)
+      fail move failure
+    }
+    return run retain(&mut machine.*, run StaticValue.descriptor(move owner), span)
+  }
+  if member == IntrinsicMember.ReflectTypeKind {
+    if arguments.length != usize.ONE { return run reject(&machine.*, Fault.InvalidValue, span) }
+    let argument = Module.child(run authored(&machine.*), arguments, usize.ZERO)
+    let value = run expression(&mut machine.*, &mut local.*, argument)
+    let described = Shared.with<StaticData, Option<Shared<SemanticType>>>(&value, fn(data: &StaticData) -> Option<Shared<SemanticType>> {
+      return match &data.* {
+        StaticData.Aggregate {ty, ..} => Shared.with<SemanticType, Option<Shared<SemanticType>>>(&ty, descriptorOwner)
+        _ => Option.none<Shared<SemanticType>>()
+      }
+    })
+    let owner = match move described {
+      Option<Shared<SemanticType>>.Some {value: selected} => selected
+      Option<Shared<SemanticType>>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    // The stable codes of `silk.reflect`: a source-declared named aggregate is 0 and a positional
+    // one is 1. Occurrence-generated aggregates are not modeled here and stay Unsupported.
+    let code = Shared.with<SemanticType, Option<u64>>(&owner, fn(ty: &SemanticType) -> Option<u64> {
+      return match &ty.* {
+        SemanticType.Nominal {declaration, ..} => match DeclarationId.kind(&declaration) {
+          OwnerKind.Struct => Option.some<u64>(0)
+          OwnerKind.Tuple => Option.some<u64>(1)
+          _ => Option.none<u64>()
+        }
+        _ => Option.none<u64>()
+      }
+    })
+    let kind = match move code {
+      Option<u64>.Some {value: selected} => selected
+      Option<u64>.None => {
+        let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+        failure.missing = Option.some<MissingFact>(MissingFact.IntrinsicOperation)
+        fail move failure
+      }
+    }
+    return run retain(&mut machine.*, StaticData.Integer {ty: StaticIntegerType.U8, sign: StaticSign.Positive, magnitude: kind}, span)
+  }
   if member == IntrinsicMember.ProfileText || member == IntrinsicMember.ProfileFlag || member == IntrinsicMember.ProfileContains {
     let mut count = usize.ONE
     if member == IntrinsicMember.ProfileContains { count = 2 }
@@ -1102,6 +1185,46 @@ fn checkedIntrinsicMember<'source>(machine: &Machine<'source>, id: HirId) -> Opt
   }
 }
 
+// The checked type of one reached intrinsic call, written in the executing body's binders.
+fn checkedIntrinsicType<'source>(machine: &Machine<'source>, id: HirId) -> Option<Shared<SemanticType>> {
+  return match move checkedBodyForExpression(machine) {
+    Option<Shared<TypedBody>>.Some {value: body} => Shared.with<TypedBody, Option<Shared<SemanticType>>>(&body, fn(body: &TypedBody) -> Option<Shared<SemanticType>> {
+      let nodes = TypedBody.nodeSlice(body)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        if nodes[at].origin.syntax.index == id.index {
+          if let CheckedNodeKind.Expression {ty, form: CheckedExpression.IntrinsicCall {..}} = &nodes[at].kind {
+            return Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(&ty))
+          }
+        }
+        at = at + usize.ONE
+      }
+      return Option.none<Shared<SemanticType>>()
+    })
+    Option<Shared<TypedBody>>.None => Option.none<Shared<SemanticType>>()
+  }
+}
+
+fn descriptorOwner(ty: &SemanticType) -> Option<Shared<SemanticType>> {
+  return match &ty.* {
+    SemanticType.TypeDescriptor {owner} => Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(&owner))
+    _ => Option.none<Shared<SemanticType>>()
+  }
+}
+
+// Closes a checked type written in the executing body's binders with that body's application.
+effect fn closeType<'source>(machine: &Machine<'source>, ty: &Shared<SemanticType>) -> Shared<SemanticType>
+! OutOfMemoryError ? &mut Allocator {
+  let frames = Vector.asSlice<Frame>(&machine.active)
+  let mut bindings = Vector.make<TypeBinding>()
+  if frames.length > usize.ZERO {
+    bindings = run Application.bindings(&frames[frames.length - usize.ONE].instance)
+  } else if let Option<Application>.Some {value: root} = &machine.instance {
+    bindings = run Application.bindings(&root)
+  }
+  return run SemanticType.applyBindings(ty, Vector.asSlice<TypeBinding>(&bindings), true)
+}
+
 fn selectedStaticArm<'source>(machine: &Machine<'source>, id: HirId) -> Option<HirRef> {
   return match move checkedBodyForExpression(machine) {
     Option<Shared<TypedBody>>.Some {value: body} => Shared.with<TypedBody, Option<HirRef>>(
@@ -1187,44 +1310,14 @@ fn checkedFloatType<'source>(machine: &Machine<'source>, id: HirId) -> Option<St
   }
 }
 
-fn appliedDeclaredType(
-  declared: &Shared<SemanticType>,
-  selected: &SelectedStaticFunction,
-  application: &Application,
-) -> Option<Shared<SemanticType>> {
-  let parameter = Shared.with<SemanticType, Option<usize>>(declared, fn(ty: &SemanticType) -> Option<usize> {
-    if let SemanticType.Parameter {declaration, ordinal} = &ty.* {
-      if DeclarationId.equals(&declaration, &selected.declaration) {
-        return Option.some<usize>(ordinal)
-      }
-      return Option.some<usize>(usize.MAX)
-    }
-    return Option.none<usize>()
-  })
-  return match move parameter {
-    Option<usize>.Some {value: ordinal} => {
-      let arguments = Vector.asSlice<Argument>(&application.arguments)
-      let ordinals = Vector.asSlice<usize>(&application.argumentOrdinals)
-      let mut at = usize.ZERO
-      while at < arguments.length && at < ordinals.length {
-        if ordinals[at] == ordinal {
-          if let Argument.Type {value} = &arguments[at] {
-            if SemanticType.hasOpenRuntimeParameters(&value) { return Option.none<Shared<SemanticType>>() }
-            return Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(&value))
-          }
-          return Option.none<Shared<SemanticType>>()
-        }
-        at = at + usize.ONE
-      }
-      return Option.none<Shared<SemanticType>>()
-    }
-    Option<usize>.None => {
-      if SemanticType.hasOpenRuntimeParameters(declared) {
-        return Option.none<Shared<SemanticType>>()
-      }
-      return Option.some<Shared<SemanticType>>(Shared.clone<SemanticType>(declared))
-    }
-  }
+// Closes a declared parameter or result type with the selected application's owner-qualified
+// bindings at every depth. A type left open is not a declared runtime-closed type.
+effect fn appliedDeclaredType(declared: &Shared<SemanticType>, application: &Application) -> Option<Shared<SemanticType>>
+! OutOfMemoryError ? &mut Allocator {
+  let bindings = run Application.bindings(application)
+  let applied = run SemanticType.applyBindings(declared, Vector.asSlice<TypeBinding>(&bindings), true)
+  if SemanticType.hasOpenRuntimeParameters(&applied) { return Option.none<Shared<SemanticType>>() }
+  return Option.some<Shared<SemanticType>>(move applied)
 }
 
 fn signatureType(answer: &Result<Answer, NoRejection>, parameter: Option<usize>) -> Option<Shared<SemanticType>> {
@@ -1283,12 +1376,11 @@ fn rootLifetimeArgumentCount(answer: &Result<Answer, NoRejection>) -> Option<usi
   }
 }
 
-fn selectedSignatureType(
+effect fn selectedSignatureType(
   answer: &Shared<Result<Answer, NoRejection>>,
   parameter: Option<usize>,
-  selected: &SelectedStaticFunction,
   application: &Application,
-) -> Option<Shared<SemanticType>> {
+) -> Option<Shared<SemanticType>> ! OutOfMemoryError ? &mut Allocator {
   let declared = Shared.with<Result<Answer, NoRejection>, Option<Shared<SemanticType>>>(
     answer,
     fn(value: &Result<Answer, NoRejection>) -> Option<Shared<SemanticType>> {
@@ -1296,7 +1388,7 @@ fn selectedSignatureType(
     },
   )
   return match move declared {
-    Option<Shared<SemanticType>>.Some {value} => appliedDeclaredType(&value, selected, application)
+    Option<Shared<SemanticType>>.Some {value} => run appliedDeclaredType(&value, application)
     Option<Shared<SemanticType>>.None => Option.none<Shared<SemanticType>>()
   }
 }
@@ -1433,7 +1525,10 @@ effect fn expression<'source>(machine: &mut Machine<'source>, local: &mut Vector
     }
   }
   let value = run expressionFromSource(&mut machine.*, &mut local.*, id)
-  let valid = Shared.with<SemanticType, Option<bool>>(&checked, fn(ty: &SemanticType) -> Option<bool> {
+  // The checked type is written in the executing body's binders; close it with that body's
+  // application before admitting the value.
+  let closed = run closeType(&machine.*, &checked)
+  let valid = Shared.with<SemanticType, Option<bool>>(&closed, fn(ty: &SemanticType) -> Option<bool> {
     return checkedValueType(ty, &value)
   })
   match move valid {
@@ -1444,6 +1539,9 @@ effect fn expression<'source>(machine: &mut Machine<'source>, local: &mut Vector
       return move value
     }
     Option<bool>.None => {
+      if !SemanticType.hasOpenRuntimeParameters(&closed) && run StaticValue.matchesType(&value, &closed) {
+        return move value
+      }
       let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
       failure.missing = Option.some<MissingFact>(MissingFact.DeclaredType)
       fail move failure
@@ -1606,7 +1704,7 @@ effect fn expressionFromSource<'source>(machine: &mut Machine<'source>, local: &
     }
     Node.CallExpression {arguments, ..} => {
       if let Option<IntrinsicMember>.Some {value: member} = move checkedIntrinsicMember(&machine.*, id) {
-        return run dispatchIntrinsic(&mut machine.*, member, arguments, &mut local.*, span)
+        return run dispatchIntrinsic(&mut machine.*, member, id, arguments, &mut local.*, span)
       }
       let checked = match move checkedBodyForExpression(&machine.*) {
         Option<Shared<TypedBody>>.Some {value} => value
@@ -1633,7 +1731,7 @@ effect fn expressionFromSource<'source>(machine: &mut Machine<'source>, local: &
         }
       }
       let selectedName = run Bytes.copy(DeclarationId.spelling(Application.bodyDeclaration(&call.application)))
-      let application = move call.application
+      let application = run closeCall(&machine.*, move call.application)
       let mut values = Vector.make<Shared<StaticData>>()
       let mut at = usize.ZERO
       while at < arguments.length {
@@ -1862,7 +1960,7 @@ effect fn execute<'source>(
   while at < parameters.length {
     let parameter = Module.node(run authored(&machine.*), parameters[at])
     if let Node.Parameter {annotation, ..} = parameter {
-      let declared = selectedSignatureType(signature, Option.some<usize>(at), selected, application)
+      let declared = run selectedSignatureType(signature, Option.some<usize>(at), application)
       match move declared {
         Option<Shared<SemanticType>>.Some {value: ty} => {
           if !run StaticValue.matchesType(&args[at], &ty) {
@@ -1895,7 +1993,7 @@ effect fn execute<'source>(
   if resultType.present {
     resultSpan = Module.span(run authored(&machine.*), resultType.id)
   }
-  let declaredResult = selectedSignatureType(signature, Option.none<usize>(), selected, application)
+  let declaredResult = run selectedSignatureType(signature, Option.none<usize>(), application)
   match move declaredResult {
     Option<Shared<SemanticType>>.Some {value: ty} => {
       if !run StaticValue.matchesType(&returned, &ty) {
@@ -2069,6 +2167,7 @@ effect<'owner & 'env> fn demandSelected<'owner, 'env, 'source>(
     &mut machine.active,
     Frame {
       application: identity,
+      instance: run Application.copy(application),
       module: run ModuleId.copy(DeclarationId.moduleId(&selected.declaration)),
       name: run Bytes.copy(selectedName),
       arguments: run copyArguments(args),
