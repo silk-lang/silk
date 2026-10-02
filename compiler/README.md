@@ -46,6 +46,11 @@ not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains 
 and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
 An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
 
+## Design notes
+
+- [MIR core shape](docs/mir-core-shape.md): the final MIR forms, cleanup, failure edges,
+  suspension, closures and the opt-in MIR check.
+
 ## Development branches and bootstrap
 
 `selfhost` is the integration branch for the source-written compiler. Start native compiler work on
