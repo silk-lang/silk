@@ -2648,7 +2648,6 @@ export interface CheckedUnit {
 const staticStructureOf = (
   fact: FunctionConstruction,
   index: DeclarationIndex.Index,
-  builder: BodyBuilder.BodyBuilder,
 ): StaticStructure | undefined => {
   let found: StaticStructure | undefined
   const recordNode = (expression: Tir.Expression): void => {
@@ -2666,20 +2665,9 @@ const staticStructureOf = (
         found = 'StaticCall'
     }
   }
-  visitStatements(fact.statements, {
-    statement: (statement) => {
-      if (
-        found === undefined &&
-        statement._tag === 'Bind' &&
-        (() => {
-          const binding = BodyBuilder.semanticOfLocal(builder, statement.binding)
-          return isBindingDeclarationFact(binding) && binding.phase === 'Static'
-        })()
-      )
-        found = 'StaticBinding'
-    },
-    node: recordNode,
-  })
+  // Runtime publication erases static bindings, so they are read from the construction facts.
+  if (fact.bindings.some((binding) => binding.phase === 'Static')) return 'StaticBinding'
+  visitStatements(fact.statements, { node: recordNode })
   return found
 }
 
@@ -2785,7 +2773,7 @@ export const checkedBody = (
       ? staticTirFunction(context, fact, builder)
       : runtimeTirFunction(context, fact, index, builder),
   )
-  const staticStructure = staticStructureOf(fact, index, builder)
+  const staticStructure = staticStructureOf(fact, index)
   const results: BodyResults = {
     evidence: Array.from(builder.evidence),
     causes: Array.from(builder.causes),
