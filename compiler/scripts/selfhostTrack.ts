@@ -46,4 +46,5 @@ export const selfhostTrack = [
   'structural-union-copy-members',
   'static-parameter-array',
   'static-parameter-aggregates',
+  'match-arm-blocks-and-bindings',
 ] as const satisfies ReadonlyArray<string>
