@@ -31,4 +31,9 @@ export const selfhostTrack = [
   'runtime-indexed-subplace-borrow',
   'short-circuit-counting',
   'scalar-enum-lanes',
+  'algorithmic-compiler-fold',
+  'match-universal-fallback',
+  'match-guarded-union-shared',
+  'match-exclusive-mutable',
+  'match-move-nested-cleanup',
 ] as const satisfies ReadonlyArray<string>
