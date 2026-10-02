@@ -1997,27 +1997,17 @@ export const discover = (
   }
   /**
    * The nominals already unfolded on one search path, by declaration. The answer reads the path
-   * only as this mapping, so its key is the sorted set of unfolded ordinals: paths reaching the
-   * same mapping in another order share one memo entry. The key is built once per extension.
+   * only as this mapping, so paths reaching the same mapping in another order share one answer.
    */
   interface Unfolding {
     readonly byDeclaration: ReadonlyMap<string, RuntimeType<Type.Nominal>>
-    readonly key: string
   }
-  const emptyUnfolding: Unfolding = { byDeclaration: new Map(), key: '' }
+  const emptyUnfolding: Unfolding = { byDeclaration: new Map() }
   const unfold = (
     self: Unfolding,
     declaration: string,
     nominal: RuntimeType<Type.Nominal>,
-  ): Unfolding => {
-    const byDeclaration = new Map(self.byDeclaration).set(declaration, nominal)
-    return {
-      byDeclaration,
-      key: Array.from(byDeclaration.values(), (entry) => entry.ordinal)
-        .sort((left, right) => left - right)
-        .join(','),
-    }
-  }
+  ): Unfolding => ({ byDeclaration: new Map(self.byDeclaration).set(declaration, nominal) })
   // Runtime-level facts about one type, shared by every search that reaches an equal type: the
   // distinct nominals it contains, and each nominal's field types under its arguments.
   const containedNominals = new Map<
@@ -2036,6 +2026,69 @@ export const discover = (
         nominal: { type: nominal, ordinal: runtimeOrdinal(nominal) },
       }))
       containedNominals.set(whole.ordinal, found)
+    }
+    return found
+  }
+  // Declarations whose nominals can occur in any type reached below a declaration's fields. A
+  // substituted field contains only nominals of its template or of the owner's arguments, and the
+  // owner's arguments are already inside the type that reached it, so the closure of template
+  // field types over every contained nominal covers the whole search below that type.
+  const templateDeclarations = new Map<string, ReadonlyArray<Type.Nominal>>()
+  const templateNominals = (nominal: Type.Nominal): ReadonlyArray<Type.Nominal> => {
+    const text = `${nominal.module}\u0000${nominal.name}`
+    let found = templateDeclarations.get(text)
+    if (found === undefined) {
+      const declaration = DeclarationFacts.byCanonical(index, {
+        _tag: 'CanonicalDeclarationId',
+        module: nominal.module,
+        name: nominal.name,
+      })
+      const nested: Array<Type.Nominal> = []
+      if (declaration?._tag === 'StructDeclaration' || declaration?._tag === 'UnionDeclaration') {
+        const declared =
+          declaration._tag === 'StructDeclaration'
+            ? declaration.fields
+            : declaration.variants.flatMap((variant) => variant.fields)
+        for (const field of declared)
+          if (field.declaredType._tag === 'Resolved')
+            Type.visit(field.declaredType.type, (type) => {
+              if (Type.isNominal(type)) nested.push(type)
+            })
+      }
+      found = nested
+      templateDeclarations.set(text, found)
+    }
+    return found
+  }
+  const declarationClosures = new Map<string, ReadonlySet<string>>()
+  const declarationClosure = (start: Type.Nominal): ReadonlySet<string> => {
+    const startText = `${start.module}\u0000${start.name}`
+    let found = declarationClosures.get(startText)
+    if (found === undefined) {
+      const reached = new Set<string>([startText])
+      const pending: Array<Type.Nominal> = [start]
+      for (let next = pending.pop(); next !== undefined; next = pending.pop())
+        for (const nominal of templateNominals(next)) {
+          const text = `${nominal.module}\u0000${nominal.name}`
+          if (!reached.has(text)) {
+            reached.add(text)
+            pending.push(nominal)
+          }
+        }
+      found = reached
+      declarationClosures.set(startText, found)
+    }
+    return found
+  }
+  const reachableDeclarations = new Map<number, ReadonlySet<string>>()
+  const declarationsBelow = (whole: RuntimeType): ReadonlySet<string> => {
+    let found = reachableDeclarations.get(whole.ordinal)
+    if (found === undefined) {
+      const union = new Set<string>()
+      for (const { nominal } of nominalsIn(whole))
+        for (const declaration of declarationClosure(nominal.type)) union.add(declaration)
+      found = union
+      reachableDeclarations.set(whole.ordinal, found)
     }
     return found
   }
@@ -2141,7 +2194,9 @@ export const discover = (
   }
   // A nested answer also depends on the unfolding path, which begins at the question's own root,
   // so it is rarely shared between questions. It is memoized only while one question is answered;
-  // retaining it for the whole discovery kept millions of path-keyed entries alive.
+  // retaining it for the whole discovery kept millions of path-keyed entries alive. The search
+  // below `whole` reads and extends the unfolding only at declarations reachable below it, so the
+  // key keeps just those entries: paths differing elsewhere share one answer.
   const strictCleanupSubtermUnder = (
     candidate: RuntimeType,
     whole: RuntimeType,
@@ -2149,7 +2204,11 @@ export const discover = (
     reaching: ReadonlySet<number> | undefined,
     memo: Map<string, boolean>,
   ): boolean => {
-    const memoKey = `${whole.ordinal}:${unfolding.key}`
+    const below = declarationsBelow(whole)
+    const relevant: Array<number> = []
+    for (const [declaration, nominal] of unfolding.byDeclaration)
+      if (below.has(declaration)) relevant.push(nominal.ordinal)
+    const memoKey = `${whole.ordinal}:${relevant.sort((left, right) => left - right).join(',')}`
     let memoized = memo.get(memoKey)
     if (memoized === undefined) {
       memoized = computeStrictCleanupSubterm(candidate, whole, unfolding, reaching, memo)
