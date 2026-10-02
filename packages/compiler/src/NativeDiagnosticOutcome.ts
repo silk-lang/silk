@@ -176,3 +176,96 @@ export const releaseForObserver = (
   Emitter.branch(context.body, following)
   Emitter.setInsertionPoint(context.body, following)
 }
+
+/** Binds outcome locals to consecutive elements of one array; each invocation binds once. */
+export const bind = (
+  context: Context,
+  storage: Value.Input,
+  locals: ReadonlyArray<Mir.LocalId>,
+  name: string,
+) => {
+  if (context.outcomeArray.storage !== undefined)
+    throw new RangeError('Diagnostic outcomes are already bound')
+  context.outcomeArray.storage = storage
+  for (const [index, local] of locals.entries())
+    context.outcomes.set(local.ordinal, {
+      storage:
+        index === 0
+          ? storage
+          : Emitter.getElementPtr(
+              context.body,
+              context.causeType,
+              storage,
+              [Emitter.integerUnsigned(context.builder, context.word, BigInt(index))],
+              `${name}${local.ordinal}`,
+            ),
+    })
+}
+
+/** Releases every bound outcome, or only those owned by `observer`. */
+export const releaseAll = (context: Context, observer?: Value.Input) => {
+  if (context.outcomes.size === 0) return
+  const storage = context.outcomeArray.storage
+  if (storage === undefined) throw new RangeError('Diagnostic outcomes lost their array storage')
+  releaseEach(context, storage, context.outcomes.size, observer)
+}
+
+/**
+ * Releases `count` consecutive outcome slots through one loop rather than one expansion per
+ * slot. The indexed access also keeps the slots in memory: promoting them to registers joined
+ * every slot at every exit, and the register allocator spent minutes on those joins in
+ * self-hosted functions with hundreds of outcomes.
+ */
+export const releaseEach = (
+  context: Context,
+  storage: Value.Input,
+  count: number,
+  observer?: Value.Input,
+) => {
+  const { body, builder, word } = context
+  const index = Emitter.alloca(body, word, 'outcome_release_index', { placement: 'entry' })
+  Emitter.store(body, Emitter.integerUnsigned(builder, word, 0n), index)
+  const header = Emitter.block(body, 'outcome_release_header')
+  const step = Emitter.block(body, 'outcome_release_step')
+  const done = Emitter.block(body, 'outcome_release_done')
+  Emitter.branch(body, header)
+  Emitter.setInsertionPoint(body, header)
+  const current = Emitter.load(body, word, index, 'outcome_release_current')
+  Emitter.conditionalBranch(
+    body,
+    Emitter.integerCompare(
+      body,
+      'ult',
+      current,
+      Emitter.integerUnsigned(builder, word, BigInt(count)),
+      'outcome_release_remaining',
+    ),
+    step,
+    done,
+  )
+  Emitter.setInsertionPoint(body, step)
+  const slot = {
+    storage: Emitter.getElementPtr(
+      body,
+      context.causeType,
+      storage,
+      [current],
+      'outcome_release_slot',
+    ),
+  }
+  if (observer === undefined) release(slot, context)
+  else releaseForObserver(slot, context, observer)
+  Emitter.store(
+    body,
+    Emitter.binary(
+      body,
+      'add',
+      current,
+      Emitter.integerUnsigned(builder, word, 1n),
+      'outcome_release_next',
+    ),
+    index,
+  )
+  Emitter.branch(body, header)
+  Emitter.setInsertionPoint(body, done)
+}

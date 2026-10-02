@@ -192,7 +192,6 @@ const arithmetic = (context: Context): NativeArith.LaneContext => ({
 })
 
 const storedPointer = (self: NativePlace, context: Context, offset: number, tag: string) => {
-  if (offset === 0) return base(self, context, `${tag}_base`)
   return NativeLanePointer.lanePointer(
     context.lanePointers,
     context.body,

@@ -7,14 +7,15 @@ export interface Context {
   readonly offsetType: LlvmType.Type
 }
 
-/** Projects one byte-addressed native lane from a base pointer. */
+/** Projects one byte-addressed native lane from a base pointer; lane zero is the base itself. */
 export const lanePointer = (
   self: Context,
   body: Emitter.Body,
   base: Value.Input,
   offset: number | Value.Input,
   name: string,
-) => {
+): Value.Input => {
+  if (offset === 0) return base
   const index =
     typeof offset === 'number'
       ? Emitter.integerUnsigned(body, self.offsetType, BigInt(offset))

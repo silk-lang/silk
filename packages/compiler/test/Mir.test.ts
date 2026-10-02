@@ -1271,10 +1271,9 @@ it.effect('reads narrow success fields from their stored Effect outcome payload'
     // needs two i64 fields. Read the selected fields at their own widths and offsets.
     assert.match(check, /effect_success\w+ = getelementptr i8, ptr %\w+, i32 8/)
     assert.match(check, /@llvm\.memmove[^\n]+%effect_success\w+, i32 4,/)
-    assert.match(
-      check,
-      /%(\w+) = getelementptr i8, ptr %\w+, i32 0\n\s+%\w+ = load i16, ptr %\1, align 2/,
-    )
+    // The first field is read at the payload base itself, without a zero-offset projection.
+    assert.match(check, /%\w+ = load i16, ptr %\w+, align 2/)
+    assert.notMatch(check, /getelementptr i8, ptr %\w+, i32 0\n/)
     assert.match(
       check,
       /%(\w+) = getelementptr i8, ptr %\w+, i32 2\n\s+%\w+ = load i8, ptr %\1, align 1/,

@@ -13,24 +13,28 @@ export interface Specialization {
   readonly staticArguments?: ReadonlyArray<StaticValue.Value>
 }
 
-const keyCache = new WeakMap<Specialization, string>()
+/**
+ * Memoized on the specialization object itself, like `Type.key`. Discovery keys every fresh call
+ * target once or twice; a weak map paid an ephemeron insertion per target and made every major
+ * collection trace the table.
+ */
+const cachedKey: unique symbol = Symbol('Specialization.key')
 
 /** Returns the canonical identity shared by discovery, proof dependencies, and lowering. */
 export const key = (self: Specialization): string => {
-  let cached = keyCache.get(self)
-  if (cached === undefined) {
-    cached = `${self.declaration.module}\u0000${self.declaration.name}\u0000${self.typeArguments
-      .map(Type.genericArgumentKey)
-      .join(
-        '\u0000',
-      )}${self.evidence === undefined || self.evidence.length === 0 ? '' : `\u0004${self.evidence.join('\u0000')}`}${
-      self.staticArguments === undefined || self.staticArguments.length === 0
-        ? ''
-        : `\u0001${self.staticArguments.map(StaticValue.key).join('\u0000')}`
-    }`
-    keyCache.set(self, cached)
-  }
-  return cached
+  const cached: unknown = Reflect.get(self, cachedKey)
+  if (typeof cached === 'string') return cached
+  const computed = `${self.declaration.module}\u0000${self.declaration.name}\u0000${self.typeArguments
+    .map(Type.genericArgumentKey)
+    .join(
+      '\u0000',
+    )}${self.evidence === undefined || self.evidence.length === 0 ? '' : `\u0004${self.evidence.join('\u0000')}`}${
+    self.staticArguments === undefined || self.staticArguments.length === 0
+      ? ''
+      : `\u0001${self.staticArguments.map(StaticValue.key).join('\u0000')}`
+  }`
+  if (Object.isExtensible(self)) Object.defineProperty(self, cachedKey, { value: computed })
+  return computed
 }
 
 /** Memoized on the specialization object itself, like `Type.key`. */

@@ -1120,6 +1120,34 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`)
   }),
 )
 
+it.effect('suspends where a binding scope exit runs a suspending drop hook', () =>
+  Effect.gen(function* () {
+    const self = yield* snapshot(`import silk.effect { Effect }
+struct Guard { value: i32 }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    let resumed = run Effect.suspend(effect { return () })
+    return resumed
+  }
+}
+fn hold() -> i32 {
+  let guard = Guard {value: 42}
+  return guard.value
+}
+pub fn main() -> i32 { return hold() }`)
+
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const hold = self.instances.instances.find(
+      (instance) => instance.key.declaration.name === 'hold',
+    )
+    assert.isDefined(hold)
+    if (hold === undefined) return
+    assert.isTrue(
+      SuspensionMode.has(Instances.suspensionOf(self.instances, hold.key), 'NestedTransfer'),
+    )
+  }),
+)
+
 it.effect('keeps suspension local to the selected provider through nested bindings', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }

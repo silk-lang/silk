@@ -15,6 +15,7 @@ import * as Mir from './Mir.js'
 import * as MovePath from './MovePath.js'
 import * as NativeArith from './NativeArith.js'
 import * as NativeCall from './NativeCall.js'
+import * as NativeDropGlue from './NativeDropGlue.js'
 import * as NativeResult from './NativeResult.js'
 import * as NativeExecutionOperation from './NativeExecutionOperation.js'
 import * as NativeLanePointer from './NativeLanePointer.js'
@@ -298,6 +299,8 @@ export interface Context {
   readonly initializationValues?: ReadonlyMap<number, Value.Input>
   /** The module's out-of-line Execution release; see `NativeExecutionOperation.emitReleaseHelper`. */
   readonly executionRelease?: FunctionActor.Function
+  /** Shared out-of-line glue for wholly initialized stored owners; absent expands every drop. */
+  readonly dropGlue?: NativeDropGlue.NativeDropGlue
 }
 
 /**
@@ -333,21 +336,7 @@ export const dropThroughPlan = (
   localSharedBlock?: LocalSharedControlBlock.Plan,
   initialization?: Initialization,
 ): void => {
-  const {
-    builder,
-    body,
-    program,
-    i8,
-    i32,
-    pointer,
-    usizeType,
-    free,
-    declared,
-    lanePointers,
-    call,
-    storage,
-    types,
-  } = context
+  const { body, builder, storage, i32 } = context
   if (initialization?.state.initialization === 'Missing') return
   if (initialization?.state.initialization === 'Maybe') {
     const path = initialization.path ?? []
@@ -385,6 +374,41 @@ export const dropThroughPlan = (
     NativeStorage.reloadRoots(storage, `${tag}_initialization_next`)
     return
   }
+  if (
+    context.dropGlue !== undefined &&
+    NativeDropGlue.admits(plan, initialization, localSharedBlock)
+  ) {
+    const place = NativePayload.storage(values, context)
+    if (place !== undefined && NativeDropGlue.drop(context.dropGlue, context, plan, place, tag))
+      return
+  }
+  expand(context, plan, values, tag, localSharedBlock, initialization)
+}
+
+/** Expands one selected cleanup at this site; nested owners may still call shared glue. */
+export const expand = (
+  context: Context,
+  plan: CleanupPlan.CleanupPlan,
+  values: NativePayload.NativePayload,
+  tag: string,
+  localSharedBlock?: LocalSharedControlBlock.Plan,
+  initialization?: Initialization,
+): void => {
+  const {
+    builder,
+    body,
+    program,
+    i8,
+    i32,
+    pointer,
+    usizeType,
+    free,
+    declared,
+    lanePointers,
+    call,
+    storage,
+    types,
+  } = context
   const semanticLanesOf = (type: SilkType.Type): ReadonlyArray<Layout.CallingLane> => {
     const shape = Layout.callingShape(program.layout, type)
     if (shape === undefined)
@@ -644,12 +668,11 @@ export const dropThroughPlan = (
       )
       Emitter.branch(body, following)
       Emitter.setInsertionPoint(body, last)
-      const helper = FunctionIndex.nativeCandidates(
+      const helper = FunctionIndex.nativeInstances(
         declared,
         LocalSharedPayloadCleanup.declaration,
-      ).find((candidate) =>
-        Mir.matchesInstance(candidate.fn, LocalSharedPayloadCleanup.declaration, [plan.element]),
-      )
+        [plan.element],
+      ).at(0)
       if (helper === undefined)
         throw new RangeError('LLVM local-shared cleanup lost its payload helper')
       NativeCall.callValues(
@@ -710,9 +733,7 @@ export const dropThroughPlan = (
       return
     }
     case 'HookCleanup': {
-      const target = FunctionIndex.nativeCandidates(declared, plan.hook).find((candidate) =>
-        Mir.matchesInstance(candidate.fn, plan.hook, plan.typeArguments),
-      )
+      const target = FunctionIndex.nativeInstances(declared, plan.hook, plan.typeArguments).at(0)
       if (target === undefined)
         throw new RangeError('LLVM cleanup cannot resolve its Drop hook instance')
       const layoutEntry = Layout.entry(program.layout, plan.type)

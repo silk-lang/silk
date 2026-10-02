@@ -2,7 +2,7 @@ import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
 import type * as BlockActor from '../../Block.js'
 import type * as Builder from '../../Builder.js'
-import * as ByteString from '../../ByteString.js'
+import type * as ByteString from '../../ByteString.js'
 import type * as FunctionBodyActor from '../../FunctionBody.js'
 import { invalidInput, invalidState, type LlvmError } from '../../LlvmError.js'
 import * as Type from '../../Type.js'
@@ -10,6 +10,7 @@ import type * as ValueActor from '../../Value.js'
 import * as BuilderState from '../BuilderState.js'
 import * as FunctionBodyDescription from '../FunctionBodyDescription.js'
 import * as Handle from '../Handle.js'
+import * as LocalName from '../LocalName.js'
 import type * as OwnedHandle from '../OwnedHandle.js'
 import type * as TypeDescription from '../TypeDescription.js'
 import { instructionHandleAt, validateInstructions } from './InstructionEncoder.js'
@@ -19,7 +20,6 @@ import {
   drafts,
   fail,
   localIndex,
-  localName,
   type OperandInput,
 } from './primitives.js'
 
@@ -64,7 +64,7 @@ export const makeDraft = (
     const handle = Handle.make('Value', owner, valueIndex)
     draft.values.push({
       type,
-      name: ByteString.empty,
+      name: LocalName.empty,
       source: { _tag: 'Argument', index },
     })
     draft.valueHandles.push(handle)
@@ -341,7 +341,7 @@ export const makeBlock = (
   const index = draft.blocks.length
   const handle = Handle.make('Block', draft.owner, index)
   draft.blocks.push({
-    name: localName(draft, name),
+    name: LocalName.make(name),
     instructions: [],
     predecessors: new Set(),
   })
@@ -406,7 +406,7 @@ export const forward = (
   const handle = Handle.make('Value', draft.owner, index)
   draft.values.push({
     type,
-    name: localName(draft, name),
+    name: LocalName.make(name),
     source: { _tag: 'Forward', resolved: undefined },
   })
   draft.valueHandles.push(handle)
@@ -483,16 +483,7 @@ export const setValueName = (
         }),
       )
     }
-    description.name = localName(draft, name)
-    if (description.source._tag === 'Instruction') {
-      const instruction = draft.instructions[description.source.instruction]
-      if (instruction !== undefined) {
-        draft.instructions[description.source.instruction] = {
-          ...instruction,
-          name: description.name,
-        }
-      }
-    }
+    description.name = LocalName.make(name)
   })
 
 /** @internal */
@@ -506,7 +497,7 @@ export const valueName = (
     if (description === undefined) {
       return yield* fail('Value.name', 'Value table entry is missing', value)
     }
-    return description.name
+    return LocalName.toByteString(description.name)
   })
 
 /** @internal */

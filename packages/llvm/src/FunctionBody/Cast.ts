@@ -164,20 +164,14 @@ export const castIn = (
     )
   }
   const sourceOperand = source.success.operand
-  const appended = FunctionBodyState.appendResult(
-    draft,
-    destination.success,
-    name,
-    (result, finalName) => ({
-      _tag: 'Cast',
-      kind,
-      operand: sourceOperand,
-      destinationType: destination.success,
-      noSignedWrap: options.noSignedWrap ?? false,
-      noUnsignedWrap: options.noUnsignedWrap ?? false,
-      result,
-      name: finalName,
-    }),
-  )
+  const appended = FunctionBodyState.appendResult(draft, destination.success, name, (result) => ({
+    _tag: 'Cast',
+    kind,
+    operand: sourceOperand,
+    destinationType: destination.success,
+    noSignedWrap: options.noSignedWrap ?? false,
+    noUnsignedWrap: options.noUnsignedWrap ?? false,
+    result,
+  }))
   return appended
 }

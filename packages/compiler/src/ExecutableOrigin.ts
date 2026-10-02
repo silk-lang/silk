@@ -28,6 +28,47 @@ type InstanceKey = Instances.InstanceKey
 type IntrinsicCall = Instances.IntrinsicCall
 type ForeignCall = Instances.ForeignCall
 
+interface EffectOriginContext {
+  readonly fn: Tir.TirFunction
+  readonly evidence: Elaboration.BodyResults['evidence']
+  readonly owner: InstanceKey
+  readonly substitution: Type.Substitution
+  readonly compatibility: TypeCompatibility.Context | undefined
+  readonly results: ReadonlyMap<string, Elaboration.Result>
+  readonly index: DeclarationIndex.Index
+  readonly resolving: ReadonlySet<string>
+  readonly resolveEffectIdentity?: (identity: Type.EffectIdentityArgument) => string | undefined
+  /** The call whose callee body is being traced, so a parameter resolves to its argument. */
+  readonly parameterArguments?: {
+    readonly arguments: ReadonlyArray<Tir.Expression>
+    readonly context: EffectOriginContext
+  }
+  /** Resolves the success identity of an already-minted effect identity (post-discovery). */
+  readonly successOfIdentity?: (
+    identity: string,
+    resolving: ReadonlySet<string>,
+  ) => string | undefined
+  readonly serviceRecipesOfIdentity?: (
+    identity: string,
+    resolving: ReadonlySet<string>,
+  ) => ReadonlyArray<ServiceEffectRecipe>
+  readonly resolveServiceEffectIdentity?: (
+    expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>,
+  ) => string | undefined
+  readonly recordResolvedCall?: (
+    expression: Extract<
+      Tir.Expression,
+      { readonly _tag: 'Call' | 'EffectConstruct' | 'CallableApply' }
+    >,
+    target: InstanceKey,
+  ) => void
+}
+
+interface ServiceEffectRecipe {
+  readonly expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>
+  readonly context: EffectOriginContext
+}
+
 export interface SuspensionGraph {
   readonly contextFreeTerminalObservations: ReadonlyArray<SourceSpan.SourceSpan>
   readonly diagnosticObservations: ReadonlySet<string>
@@ -43,6 +84,116 @@ export interface SuspensionGraph {
   }>
   /** Exact operations and constructor specializations selected by lexical service providers. */
   readonly providedTargets: ReadonlyArray<Omit<Instances.CallInstance, '_tag' | 'resultEffect'>>
+}
+
+/** One dependency edge an instance scan added, kept in scan order so assembly replays it. */
+interface DependencyEdge {
+  readonly owner: string
+  readonly target: string
+  readonly diagnosticContext: 'Inherited' | 'Independent'
+}
+
+/** Execution dependencies, and the subset whose target inherits the owner's diagnostic context. */
+interface Dependencies {
+  readonly all: Map<string, Set<string>>
+  readonly inherited: Map<string, Set<string>>
+}
+
+/** Adds one dependency edge and reports whether either relation gained it. */
+const addDependencyEdge = (
+  self: Dependencies,
+  owner: string,
+  target: string,
+  diagnosticContext: 'Inherited' | 'Independent',
+): boolean => {
+  let added = false
+  let targets = self.all.get(owner)
+  if (targets === undefined) {
+    targets = new Set()
+    self.all.set(owner, targets)
+  }
+  if (!targets.has(target)) {
+    targets.add(target)
+    added = true
+  }
+  if (diagnosticContext === 'Inherited') {
+    let inherited = self.inherited.get(owner)
+    if (inherited === undefined) {
+      inherited = new Set()
+      self.inherited.set(owner, inherited)
+    }
+    if (!inherited.has(target)) {
+      inherited.add(target)
+      added = true
+    }
+  }
+  return added
+}
+
+/** A call whose target is selected only once traversal reaches it with lexical providers. */
+interface DeferredCall {
+  readonly expression: Extract<Tir.Expression, { readonly _tag: 'Call' | 'EffectConstruct' }>
+  readonly context: EffectOriginContext
+}
+
+/** A service operation call, resolved against the lexical provider bindings that reach it. */
+interface ServiceCall {
+  readonly service: Type.Nominal
+  readonly role: string
+  readonly access: 'Shared' | 'Exclusive'
+  readonly operation: string
+  readonly nonParking: boolean
+  readonly expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>
+  readonly context: EffectOriginContext
+}
+
+/** One scanned instance body. */
+interface ScannedInstance {
+  readonly identity: string
+  /** Edges the scan first added while scanning this body, in insertion order. */
+  readonly edges: ReadonlyArray<DependencyEdge>
+  /** Reports, in scan order, the drop-hook edges a checked ownership proof runs at its exits. */
+  readonly ownershipCleanup: (
+    ownership: Instances.Instance['ownership'],
+    add: (execution: string, node: string) => void,
+  ) => void
+}
+
+/**
+ * The ownership-independent facts of one instance set, from which suspension graphs assemble.
+ * Discovery's last graph and its final graph cover the same instances and differ only in the
+ * cleanup edges of checked ownership, so the final graph reuses the scan instead of rescanning.
+ */
+export interface SuspensionScan {
+  readonly results: ReadonlyMap<string, Elaboration.Result>
+  readonly index: DeclarationIndex.Index
+  /** Scanned bodies in instance order; a graph replays their edges in this order. */
+  readonly instances: ReadonlyArray<ScannedInstance>
+  readonly instancesByKey: ReadonlyMap<string, Instance>
+  readonly nestedRoots: ReadonlySet<string>
+  readonly externalRoots: ReadonlySet<string>
+  readonly diagnosticObservations: ReadonlySet<string>
+  readonly recoveryExecutions: ReadonlySet<string>
+  readonly unresolvedRecovery: boolean
+  readonly unresolvedDiagnosticExecutions: ReadonlySet<string>
+  readonly readinessExecutions: ReadonlySet<string>
+  readonly readinessCallbacks: ReadonlySet<string>
+  readonly unresolvedReadiness: boolean
+  readonly terminalObservations: ReadonlyArray<{
+    readonly execution: string
+    readonly span: SourceSpan.SourceSpan
+  }>
+  readonly effectIdentities: ReadonlySet<string>
+  readonly permitted: ReadonlyMap<string, ReadonlySet<SuspensionMode.Mode>>
+  readonly unavailable: ReadonlySet<string>
+  readonly nonParkingObligations: ReadonlyMap<
+    string,
+    SuspensionGraph['nonParkingObligations'][number]
+  >
+  readonly providedTargets: ReadonlyMap<string, SuspensionGraph['providedTargets'][number]>
+  readonly deferredCalls: ReadonlyMap<string, DeferredCall>
+  readonly serviceCalls: ReadonlyMap<string, ServiceCall>
+  readonly providerBindings: ReadonlyMap<string, ProviderBinding>
 }
 
 export interface CallTarget {
@@ -1288,47 +1439,6 @@ export const make = (operations: Operations) => {
       fn.declaration.typeParameters.map((parameter) => parameter.type),
       owner.typeArguments.filter((argument) => !Type.isHiddenExecutableArgument(argument)),
     )?.compatibility
-
-  interface EffectOriginContext {
-    readonly fn: Tir.TirFunction
-    readonly evidence: Elaboration.BodyResults['evidence']
-    readonly owner: InstanceKey
-    readonly substitution: Type.Substitution
-    readonly compatibility: TypeCompatibility.Context | undefined
-    readonly results: ReadonlyMap<string, Elaboration.Result>
-    readonly index: DeclarationIndex.Index
-    readonly resolving: ReadonlySet<string>
-    readonly resolveEffectIdentity?: (identity: Type.EffectIdentityArgument) => string | undefined
-    /** The call whose callee body is being traced, so a parameter resolves to its argument. */
-    readonly parameterArguments?: {
-      readonly arguments: ReadonlyArray<Tir.Expression>
-      readonly context: EffectOriginContext
-    }
-    /** Resolves the success identity of an already-minted effect identity (post-discovery). */
-    readonly successOfIdentity?: (
-      identity: string,
-      resolving: ReadonlySet<string>,
-    ) => string | undefined
-    readonly serviceRecipesOfIdentity?: (
-      identity: string,
-      resolving: ReadonlySet<string>,
-    ) => ReadonlyArray<ServiceEffectRecipe>
-    readonly resolveServiceEffectIdentity?: (
-      expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>,
-    ) => string | undefined
-    readonly recordResolvedCall?: (
-      expression: Extract<
-        Tir.Expression,
-        { readonly _tag: 'Call' | 'EffectConstruct' | 'CallableApply' }
-      >,
-      target: InstanceKey,
-    ) => void
-  }
-
-  interface ServiceEffectRecipe {
-    readonly expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>
-    readonly context: EffectOriginContext
-  }
 
   const evidenceOf = (
     results: ReadonlyMap<string, Elaboration.Result>,
@@ -3467,12 +3577,22 @@ export const make = (operations: Operations) => {
 
   const instanceNode = (key: InstanceKey): string => `instance\u0000${keyText(key)}`
 
-  const suspensionGraph = (
+  /** An instance's execution node: its result Effect when it returns one, otherwise its body. */
+  const executionNodeIn = (
+    instancesByKey: ReadonlyMap<string, Instance>,
+    key: InstanceKey,
+  ): string => {
+    const result = instancesByKey.get(keyText(key))?.resultEffect
+    return result === undefined ? instanceNode(key) : effectNode(result)
+  }
+
+  /** Scans each instance body once for the facts every suspension graph of the set shares. */
+  const suspensionScan = (
     instances: ReadonlyArray<Instance>,
     results: ReadonlyMap<string, Elaboration.Result>,
     index: DeclarationIndex.Index,
     callables: ReadonlyArray<CallableInstance>,
-  ): SuspensionGraph => {
+  ): SuspensionScan => {
     const nestedRoots = new Set<string>()
     const diagnosticObservations = new Set<string>()
     const recoveryExecutions = new Set<string>()
@@ -3486,8 +3606,6 @@ export const make = (operations: Operations) => {
     }> = []
     let unresolvedRecovery = false
     const externalRoots = new Set<string>()
-    const dependencies = new Map<string, Set<string>>()
-    const diagnosticDependencies = new Map<string, Set<string>>()
     const effectIdentities = new Set<string>()
     const permitted = new Map<string, Set<SuspensionMode.Mode>>()
     const unavailable = new Set<string>()
@@ -3508,25 +3626,8 @@ export const make = (operations: Operations) => {
     }
     // A constructor carrying service Effects has no concrete argument identity until traversal
     // reaches it with a lexical provider. Keep that dependency so discovery can revisit the call.
-    const deferredCalls = new Map<
-      string,
-      {
-        readonly expression: Extract<Tir.Expression, { readonly _tag: 'Call' | 'EffectConstruct' }>
-        readonly context: EffectOriginContext
-      }
-    >()
-    const serviceCalls = new Map<
-      string,
-      {
-        readonly service: Type.Nominal
-        readonly role: string
-        readonly access: 'Shared' | 'Exclusive'
-        readonly operation: string
-        readonly nonParking: boolean
-        readonly expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>
-        readonly context: EffectOriginContext
-      }
-    >()
+    const deferredCalls = new Map<string, DeferredCall>()
+    const serviceCalls = new Map<string, ServiceCall>()
     const providerBindings = new Map<string, ProviderBinding>()
     // Effect blocks grouped by representation identity, in instance then body order.
     let blocksByRepresentation:
@@ -3603,19 +3704,26 @@ export const make = (operations: Operations) => {
       }
       return expressions.flatMap((expression) => serviceEffectRecipes(expression, recipeContext))
     }
+    // Only an edge new to the scan is recorded: replaying the rest would change no relation.
+    const scanned: Dependencies = { all: new Map(), inherited: new Map() }
+    let edges: Array<DependencyEdge> = []
     const addDependency = (
       owner: string,
       target: string,
       diagnosticContext: 'Inherited' | 'Independent' = 'Inherited',
     ): void => {
-      const targets = dependencies.get(owner) ?? new Set<string>()
-      targets.add(target)
-      dependencies.set(owner, targets)
-      if (diagnosticContext === 'Inherited') {
-        const inherited = diagnosticDependencies.get(owner) ?? new Set<string>()
-        inherited.add(target)
-        diagnosticDependencies.set(owner, inherited)
+      if (addDependencyEdge(scanned, owner, target, diagnosticContext))
+        edges.push({ owner, target, diagnosticContext })
+    }
+    // Drop hooks of one cleanup plan; plans are cached per type, so many drops share an entry.
+    const cleanupHooks = new Map<CleanupPlan.CleanupPlan, ReadonlyArray<CallTarget>>()
+    const cleanupHooksOf = (cleanup: CleanupPlan.CleanupPlan): ReadonlyArray<CallTarget> => {
+      let hooks = cleanupHooks.get(cleanup)
+      if (hooks === undefined) {
+        hooks = hookCalls(cleanup, index, false)
+        cleanupHooks.set(cleanup, hooks)
       }
+      return hooks
     }
     // Callables by their runtime environment key, in `callables` order, so a callback resolves its
     // captured callable from one bucket instead of rekeying every callable per argument.
@@ -3639,10 +3747,7 @@ export const make = (operations: Operations) => {
       const identity = keyText(instance.key)
       if (!instancesByKey.has(identity)) instancesByKey.set(identity, instance)
     }
-    const executionNodeForKey = (key: InstanceKey): string => {
-      const result = instancesByKey.get(keyText(key))?.resultEffect
-      return result === undefined ? instanceNode(key) : effectNode(result)
-    }
+    const executionNodeForKey = (key: InstanceKey): string => executionNodeIn(instancesByKey, key)
     const serviceCallNode = (
       owner: InstanceKey,
       expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>,
@@ -3653,7 +3758,9 @@ export const make = (operations: Operations) => {
       expression: Extract<Tir.Expression, { readonly _tag: 'EffectBindRequirement' }>,
     ): string =>
       `provider\0${keyText(owner)}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
+    const scannedInstances: Array<ScannedInstance> = []
     for (const instance of instances) {
+      edges = []
       const context: EffectOriginContext = {
         fn: instance.function,
         evidence: instance.view.evidence,
@@ -3885,6 +3992,7 @@ export const make = (operations: Operations) => {
                     Type.substitute(argument.type, instance.substitution, context.compatibility),
                   ),
                   execution,
+                  addDependency,
                 )
               }
             }
@@ -4123,10 +4231,14 @@ export const make = (operations: Operations) => {
       }
 
       const cleanupRegions = new Map<number, string>()
-      const addCleanup = (cleanup: CleanupPlan.CleanupPlan, execution: string): void => {
-        for (const hook of hookCalls(cleanup, index, false)) {
+      // Hook instance nodes of one cleanup plan under this instance's substitution, in hook order.
+      const cleanupTargets = new Map<CleanupPlan.CleanupPlan, ReadonlyArray<string>>()
+      const cleanupTargetsOf = (cleanup: CleanupPlan.CleanupPlan): ReadonlyArray<string> => {
+        let nodes = cleanupTargets.get(cleanup)
+        if (nodes !== undefined) return nodes
+        nodes = cleanupHooksOf(cleanup).flatMap((hook) => {
           const target = targetFunction(results, hook.declaration)
-          if (target === undefined) continue
+          if (target === undefined) return []
           const targetKey = keyOf(
             hook.declaration,
             target.contract,
@@ -4139,8 +4251,17 @@ export const make = (operations: Operations) => {
               ),
             ),
           )
-          addDependency(execution, instanceNode(targetKey))
-        }
+          return [instanceNode(targetKey)]
+        })
+        cleanupTargets.set(cleanup, nodes)
+        return nodes
+      }
+      const addCleanup = (
+        cleanup: CleanupPlan.CleanupPlan,
+        execution: string,
+        add: (execution: string, node: string) => void,
+      ): void => {
+        for (const node of cleanupTargetsOf(cleanup)) add(execution, node)
       }
       const recordRegions = (statement: Tir.Statement, execution: string): void => {
         cleanupRegions.set(statement.region.ordinal, execution)
@@ -4158,23 +4279,25 @@ export const make = (operations: Operations) => {
               Type.substitute(statement.expression.type, instance.substitution),
             ),
             execution,
+            addDependency,
           )
           for (const identity of effectOrigins(statement.expression))
-            addOwnedEffectCleanup(identity, execution)
+            addOwnedEffectCleanup(identity, execution, addDependency)
         }
       }
       const addOwnedEffectCleanup = (
         identity: string,
         execution: string,
+        add: (execution: string, node: string) => void,
         visited: ReadonlySet<string> = new Set(),
       ): void => {
         if (visited.has(identity)) return
         const next = new Set(visited).add(identity)
         for (const capture of effectForCleanup(identity)?.captures ?? []) {
           if (capture.access === 'Shared' || capture.access === 'Exclusive') continue
-          addCleanup(CleanupPlan.cleanupPlan(index, capture.type), execution)
+          addCleanup(CleanupPlan.cleanupPlan(index, capture.type), execution, add)
           if (capture.effectIdentity !== undefined)
-            addOwnedEffectCleanup(capture.effectIdentity, execution, next)
+            addOwnedEffectCleanup(capture.effectIdentity, execution, add, next)
         }
       }
       const scanExpression = (expression: Tir.Expression, execution: string): void => {
@@ -4382,39 +4505,96 @@ export const make = (operations: Operations) => {
       scanStatements(instance.function.statements, instanceNode(instance.key))
       // Cleanup executes in the region that exits, including deferred Effect regions.
       // Merely constructing a lazy Effect must not execute that body's destructors.
-      for (const exit of instance.ownership?.exits ?? []) {
-        const execution =
-          exit.region === undefined ? undefined : cleanupRegions.get(exit.region.ordinal)
-        if (execution === undefined) continue
-        for (const release of [...exit.releases, ...exit.temporaries])
-          addCleanup(release.cleanup, execution)
-        for (const release of exit.releases) {
-          const site = release.binding.site
-          if (site._tag === 'Let') {
-            const initializer = bindings.get(site.binding.ordinal)
-            for (const identity of initializer === undefined ? [] : effectOrigins(initializer))
-              addOwnedEffectCleanup(identity, execution)
-          } else if (site._tag === 'Parameter') {
-            const identity = parameterEffectIdentity(
-              instance.function,
-              instance.key,
-              site.parameter.ordinal,
-            )
-            if (identity !== undefined) addOwnedEffectCleanup(identity, execution)
+      const ownershipCleanup = (
+        ownership: Instances.Instance['ownership'],
+        add: (execution: string, node: string) => void,
+      ): void => {
+        for (const exit of ownership.exits) {
+          const execution =
+            exit.region === undefined ? undefined : cleanupRegions.get(exit.region.ordinal)
+          if (execution === undefined) continue
+          for (const release of [...exit.releases, ...exit.temporaries])
+            addCleanup(release.cleanup, execution, add)
+          for (const release of exit.releases) {
+            const site = release.binding.site
+            if (site._tag === 'Let') {
+              const initializer = bindings.get(site.binding.ordinal)
+              for (const identity of initializer === undefined ? [] : effectOrigins(initializer))
+                addOwnedEffectCleanup(identity, execution, add)
+            } else if (site._tag === 'Parameter') {
+              const identity = parameterEffectIdentity(
+                instance.function,
+                instance.key,
+                site.parameter.ordinal,
+              )
+              if (identity !== undefined) addOwnedEffectCleanup(identity, execution, add)
+            }
           }
+          for (const match of exit.matches)
+            for (const entry of match.cleanup) addCleanup(entry.cleanup, execution, add)
         }
-        for (const match of exit.matches)
-          for (const entry of match.cleanup) addCleanup(entry.cleanup, execution)
+        for (const replacement of ownership.replacements) {
+          const execution = cleanupRegions.get(replacement.region.ordinal)
+          if (execution !== undefined) addCleanup(replacement.cleanup, execution, add)
+        }
       }
-      for (const replacement of instance.ownership?.replacements ?? []) {
-        const execution = cleanupRegions.get(replacement.region.ordinal)
-        if (execution !== undefined) addCleanup(replacement.cleanup, execution)
-      }
+      scannedInstances.push({ identity: keyText(instance.key), edges, ownershipCleanup })
     }
+    return {
+      results,
+      index,
+      instances: scannedInstances,
+      instancesByKey,
+      nestedRoots,
+      externalRoots,
+      diagnosticObservations,
+      recoveryExecutions,
+      unresolvedRecovery,
+      unresolvedDiagnosticExecutions,
+      readinessExecutions,
+      readinessCallbacks,
+      unresolvedReadiness,
+      terminalObservations,
+      effectIdentities,
+      permitted,
+      unavailable,
+      nonParkingObligations,
+      providedTargets,
+      deferredCalls,
+      serviceCalls,
+      providerBindings,
+    }
+  }
+
+  /**
+   * Assembles one suspension graph from a scan. Ownership proofs, keyed by instance key text, add
+   * the cleanup their exits run directly after the owning body's edges, as a full scan orders them.
+   */
+  const suspensionGraph = (
+    scan: SuspensionScan,
+    ownership: ReadonlyMap<string, Instances.Instance['ownership']>,
+  ): SuspensionGraph => {
+    const { results, index, deferredCalls, serviceCalls, providerBindings } = scan
+    const dependencies: Dependencies = { all: new Map(), inherited: new Map() }
+    const addDependency = (owner: string, target: string): void => {
+      addDependencyEdge(dependencies, owner, target, 'Inherited')
+    }
+    for (const instance of scan.instances) {
+      for (const edge of instance.edges)
+        addDependencyEdge(dependencies, edge.owner, edge.target, edge.diagnosticContext)
+      const proof = ownership.get(instance.identity)
+      if (proof !== undefined) instance.ownershipCleanup(proof, addDependency)
+    }
+    const unresolvedDiagnosticExecutions = new Set(scan.unresolvedDiagnosticExecutions)
+    const unavailable = new Set(scan.unavailable)
+    const nonParkingObligations = new Map(scan.nonParkingObligations)
+    const providedTargets = new Map(scan.providedTargets)
+    const executionNodeForKey = (key: InstanceKey): string =>
+      executionNodeIn(scan.instancesByKey, key)
 
     const providers = providerWorklist(
       providerBindings.values(),
-      providerRelevance(dependencies, [...serviceCalls.keys(), ...deferredCalls.keys()]),
+      providerRelevance(dependencies.all, [...serviceCalls.keys(), ...deferredCalls.keys()]),
     )
     const selectedEdges: Array<readonly [string, string]> = []
     for (let ordinal = 0; ordinal < providers.pending.length; ordinal += 1) {
@@ -4536,53 +4716,53 @@ export const make = (operations: Operations) => {
           }
         }
       }
-      for (const target of dependencies.get(current.node) ?? [])
+      for (const target of dependencies.all.get(current.node) ?? [])
         enqueueProvider(providers, target, environment)
     }
     for (const [owner, target] of selectedEdges) addDependency(owner, target)
 
     // Package readiness is selected dynamically. Every retained endpoint is a possible
     // target, while the independently started body is never an inherited-context edge.
-    for (const execution of readinessExecutions) {
-      for (const callback of readinessCallbacks) addDependency(execution, callback)
-      if (unresolvedReadiness) unresolvedDiagnosticExecutions.add(execution)
+    for (const execution of scan.readinessExecutions) {
+      for (const callback of scan.readinessCallbacks) addDependency(execution, callback)
+      if (scan.unresolvedReadiness) unresolvedDiagnosticExecutions.add(execution)
     }
 
     // A fresh observer's protected execution cannot inherit the enclosing selected
     // failure. Argument construction and owner cleanup remain in the enclosing context.
     // Unresolved execution prevents an absence proof rather than guessing a target.
-    const potentiallySelected = new Set(recoveryExecutions)
+    const potentiallySelected = new Set(scan.recoveryExecutions)
     const pendingSelected = [...potentiallySelected]
     for (let ordinal = 0; ordinal < pendingSelected.length; ordinal++) {
       const execution = pendingSelected[ordinal]
       if (execution === undefined) continue
-      for (const target of diagnosticDependencies.get(execution) ?? []) {
+      for (const target of dependencies.inherited.get(execution) ?? []) {
         if (potentiallySelected.has(target)) continue
         potentiallySelected.add(target)
         pendingSelected.push(target)
       }
     }
     const contextFreeTerminalObservations =
-      unresolvedRecovery ||
+      scan.unresolvedRecovery ||
       [...potentiallySelected].some(
         (execution) =>
           unresolvedDiagnosticExecutions.has(execution) || deferredCalls.has(execution),
       )
         ? []
-        : terminalObservations
+        : scan.terminalObservations
             .filter(({ execution }) => !potentiallySelected.has(execution))
             .map(({ span }) => span)
 
     return {
       contextFreeTerminalObservations,
       roots: new Map<SuspensionMode.Mode, ReadonlySet<string>>([
-        ['NestedTransfer', nestedRoots],
-        ['ExternalPark', externalRoots],
+        ['NestedTransfer', scan.nestedRoots],
+        ['ExternalPark', scan.externalRoots],
       ]),
-      diagnosticObservations,
-      dependencies,
-      effectIdentities,
-      permitted,
+      diagnosticObservations: scan.diagnosticObservations,
+      dependencies: dependencies.all,
+      effectIdentities: scan.effectIdentities,
+      permitted: scan.permitted,
       unavailable,
       nonParkingObligations: [...nonParkingObligations.values()],
       providedTargets: [...providedTargets.values()],
@@ -4607,6 +4787,7 @@ export const make = (operations: Operations) => {
     effectSuccesses,
     concreteCallables,
     concreteEffects,
+    suspensionScan,
     suspensionGraph,
   }
 }

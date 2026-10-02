@@ -3,6 +3,7 @@ import type * as Builder from './Builder.js'
 import * as ByteString from './ByteString.js'
 import * as BuilderState from './internal/BuilderState.js'
 import * as FunctionBodyDescription from './internal/FunctionBodyDescription.js'
+import * as LocalName from './internal/LocalName.js'
 import type { LlvmError } from './LlvmError.js'
 import * as PackedBody from './internal/PackedBody.js'
 
@@ -54,7 +55,7 @@ const localIdentifier = (body: FunctionBodyDescription.Snapshot, index: number):
   const name = body.values[index]?.name
   return identifier(
     '%',
-    name === undefined || ByteString.isEmpty(name) ? ByteString.fromString(`v${index}`) : name,
+    LocalName.toByteString(name === undefined || LocalName.isEmpty(name) ? `v${index}` : name),
   )
 }
 
@@ -63,7 +64,7 @@ const blockIdentifier = (body: FunctionBodyDescription.Snapshot, index: number):
   const name = body.blocks[index]?.name
   return identifier(
     '%',
-    name === undefined || ByteString.isEmpty(name) ? ByteString.fromString(`bb${index}`) : name,
+    LocalName.toByteString(name === undefined || LocalName.isEmpty(name) ? `bb${index}` : name),
   )
 }
 

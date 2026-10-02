@@ -667,19 +667,20 @@ export const analyzeStatements = (
       context.nextBindingOrdinal.value += 1
       const initializerNode = element.initializer
       const declaredSyntax = element.type
+      const typeParameters = new Map(
+        context.declaration.typeParameters.flatMap((parameter) =>
+          parameter.name._tag === 'Present'
+            ? [[parameter.name.spelling, parameter.type] as const]
+            : [],
+        ),
+      )
       const analyzedDeclared =
         declaredSyntax === undefined
           ? undefined
           : DeclarationCollection.analyzeDeclaredType(
               context.context,
               declaredSyntax,
-              new Map(
-                context.declaration.typeParameters.flatMap((parameter) =>
-                  parameter.name._tag === 'Present'
-                    ? [[parameter.name.spelling, parameter.type] as const]
-                    : [],
-                ),
-              ),
+              typeParameters,
               false,
               context.resolution.bodyLifetimes === undefined ||
                 context.resolution.authoredDeclaration === undefined
@@ -688,13 +689,7 @@ export const analyzeStatements = (
                     context.context,
                     context.resolution.bodyLifetimes,
                     context.resolution.authoredDeclaration,
-                    new Map(
-                      context.declaration.typeParameters.flatMap((parameter) =>
-                        parameter.name._tag === 'Present'
-                          ? [[parameter.name.spelling, parameter.type] as const]
-                          : [],
-                      ),
-                    ),
+                    typeParameters,
                   ),
             )
       const nameResolution: NameResolution.Resolution = {

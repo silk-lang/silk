@@ -3,6 +3,7 @@ import * as Result from 'effect/Result'
 import type * as ByteString from './ByteString.js'
 import type * as FunctionBody from './FunctionBody.js'
 import * as FunctionBodyState from './internal/FunctionBodyState.js'
+import * as LocalName from './internal/LocalName.js'
 import type * as Handle from './internal/Handle.js'
 import { invalidState, type LlvmError } from './LlvmError.js'
 
@@ -118,7 +119,7 @@ export const name = Effect.fnUntraced(function* (
           }),
         )
       }
-      return block.name
+      return LocalName.toByteString(block.name)
     }),
   )
 })

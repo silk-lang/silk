@@ -521,13 +521,10 @@ export const analyzeCallTypeArguments = (
     const lifetimeContext =
       body === undefined || owningDeclaration === undefined
         ? undefined
-        : DeclarationLifetime.forHeader(
-            context,
-            body.owner,
-            owningDeclaration,
-            environment,
-            body,
-            (path) => {
+        : DeclarationLifetime.forBody(context, body, owningDeclaration, environment, {
+            scope: resolution.scope,
+            index: resolution.index,
+            parametersOf: (path) => {
               const rawPath = DeclarationCollection.analyzeDeclaredType(
                 context,
                 path,
@@ -548,7 +545,7 @@ export const analyzeCallTypeArguments = (
                   )?.typeParameters.map((parameter) => parameter.type)
                 : undefined
             },
-          )
+          })
     const raw = DeclarationCollection.analyzeDeclaredType(
       context,
       argumentNode,

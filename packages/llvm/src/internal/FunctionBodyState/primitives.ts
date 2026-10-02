@@ -2,27 +2,27 @@ import * as Result from 'effect/Result'
 import type * as BlockActor from '../../Block.js'
 import type * as Builder from '../../Builder.js'
 import type * as BuilderState from '../BuilderState.js'
-import * as ByteString from '../../ByteString.js'
 import type * as Constant from '../../Constant.js'
 import type * as FunctionBodyActor from '../../FunctionBody.js'
 import { invalidInput, type LlvmError } from '../../LlvmError.js'
 import type * as ValueActor from '../../Value.js'
 import type * as FunctionBodyDescription from '../FunctionBodyDescription.js'
 import * as Handle from '../Handle.js'
+import type * as LocalName from '../LocalName.js'
 import type * as MetadataDescription from '../MetadataDescription.js'
 import type * as OwnedHandle from '../OwnedHandle.js'
 
 export type OperandInput = ValueActor.Value | Constant.Constant
 
 export interface MutableBlock {
-  name: ByteString.ByteString
+  name: LocalName.LocalName
   instructions: Array<number>
   predecessors: Set<number>
 }
 
 export interface MutableValue {
   type: number
-  name: ByteString.ByteString
+  name: LocalName.LocalName
   source:
     | { readonly _tag: 'Argument'; readonly index: number }
     | { readonly _tag: 'Instruction'; readonly instruction: number }
@@ -71,25 +71,6 @@ export interface Draft {
 export const noAttachments: ReadonlyArray<MetadataDescription.Attachment> = []
 
 export const drafts = new WeakMap<FunctionBodyActor.FunctionBody, Draft>()
-
-/**
- * Encodes a local value or block name, sharing one encoding per distinct string: emitted names
- * repeat across functions, and every body retains its names until bitcode encoding.
- *
- * @internal
- */
-export const localName = (
-  draft: Draft,
-  name: ByteString.ByteString | Uint8Array | string | undefined,
-): ByteString.ByteString => {
-  if (typeof name !== 'string') return ByteString.coerceOrEmpty(name)
-  let encoded = draft.module.localNames.get(name)
-  if (encoded === undefined) {
-    encoded = ByteString.fromString(name)
-    draft.module.localNames.set(name, encoded)
-  }
-  return encoded
-}
 
 /** @internal */
 export const fail = (

@@ -7,6 +7,7 @@ import * as Fiber from 'effect/Fiber'
 import * as Attribute from '../src/Attribute.js'
 import * as Block from '../src/Block.js'
 import * as Builder from '../src/Builder.js'
+import * as ByteString from '../src/ByteString.js'
 import * as Constant from '../src/Constant.js'
 import * as Emitter from '../src/Emitter.js'
 import * as FunctionActor from '../src/Function.js'
@@ -388,7 +389,7 @@ it.effect('builds arithmetic, comparisons, casts, selects, and aggregate operati
       builder,
       fn,
       Effect.fnUntraced(function* (body) {
-        yield* Block.make(body, 'entry')
+        const entry = yield* Block.make(body, 'entry')
         const left = yield* Value.argument(body, 0)
         const right = yield* Value.argument(body, 1)
         const condition = yield* Value.argument(body, 2)
@@ -404,10 +405,17 @@ it.effect('builds arithmetic, comparisons, casts, selects, and aggregate operati
         const extracted = yield* FunctionBody.extractValue(body, withBoth, [1], 'extracted')
         const selected = yield* FunctionBody.select(body, condition, extracted, widened, 'selected')
         yield* FunctionBody.returnValue(body, selected)
+        // A string name and its UTF-8 bytes are one name: the second spelling is disambiguated.
+        yield* Value.setName(body, withBoth, Uint8Array.of(0xce, 0xbb))
+        yield* Value.setName(body, extracted, 'λ')
+        assert.deepStrictEqual(yield* Value.name(body, extracted), ByteString.fromString('λ'))
+        assert.deepStrictEqual(yield* Block.name(body, entry), ByteString.fromString('entry'))
       }),
     )
 
     const text = yield* IrText.render(builder)
+    assert.include(text, '%"\\CE\\BB" = insertvalue')
+    assert.include(text, '%"\\CE\\BB.1" = extractvalue')
     assert.include(text, '%sum = add nsw i32 %v0, %v1')
     assert.include(text, '%different = icmp ne i32 %v0, %v1')
     assert.include(text, '%widened = zext i32 %chosen to i64')
@@ -657,22 +665,17 @@ it('packs committed bodies without changing their data', () => {
       {
         _tag: 'GetElementPtr',
         result: 1,
-        name,
         sourceType: 2 ** 40,
         base: { _tag: 'Local', value: 0 },
         indices: [{ _tag: 'Constant', constant: -3 }],
         inbounds: true,
         inrange: undefined,
       },
-      {
-        _tag: 'ReturnVoid',
-        result: undefined,
-        name: { _tag: 'ByteString', bytes: new Uint8Array(0) },
-      },
+      { _tag: 'ReturnVoid', result: undefined },
     ],
     values: [
       { type: 0, name, source: { _tag: 'Argument', index: 0 } },
-      { type: 1, name, source: { _tag: 'Forward', resolved: undefined } },
+      { type: 1, name: 'λ.next', source: { _tag: 'Forward', resolved: undefined } },
     ],
     metadata: [[], [{ kind: 'dbg', metadata: 7 }]],
     debugLocations: [undefined, 3],

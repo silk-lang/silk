@@ -1,11 +1,12 @@
 import * as Result from 'effect/Result'
-import * as ByteString from '../../ByteString.js'
+import type * as ByteString from '../../ByteString.js'
 import type * as FunctionBodyActor from '../../FunctionBody.js'
 import type { LlvmError } from '../../LlvmError.js'
 import type * as ValueActor from '../../Value.js'
 import * as FunctionBodyDescription from '../FunctionBodyDescription.js'
 import * as Handle from '../Handle.js'
-import { type Draft, fail, localName, type MutableBlock, noAttachments } from './primitives.js'
+import * as LocalName from '../LocalName.js'
+import { type Draft, fail, type MutableBlock, noAttachments } from './primitives.js'
 
 /**
  * Construction's measured per-instruction append/validation loop. Direct Result transitions
@@ -58,24 +59,20 @@ export const appendResult = (
   draft: Draft,
   type: number,
   name: ByteString.ByteString | Uint8Array | string | undefined,
-  makeInstruction: (
-    result: number,
-    name: ByteString.ByteString,
-  ) => FunctionBodyDescription.Instruction,
+  makeInstruction: (result: number) => FunctionBodyDescription.Instruction,
 ): Result.Result<ValueActor.Value, LlvmError> => {
   const cursor = currentBlock(draft, 'FunctionBody.appendResult')
   if (Result.isFailure(cursor)) return Result.fail(cursor.failure)
   const result = draft.values.length
   const instructionIndex = draft.instructions.length
-  const finalName = localName(draft, name)
   const value = Handle.make('Value', draft.owner, result)
   draft.values.push({
     type,
-    name: finalName,
+    name: LocalName.make(name),
     source: { _tag: 'Instruction', instruction: instructionIndex },
   })
   draft.valueHandles.push(value)
-  draft.instructions.push(makeInstruction(result, finalName))
+  draft.instructions.push(makeInstruction(result))
   draft.metadata.push(noAttachments)
   draft.debugLocations.push(undefined)
   draft.instructionHandles.push(undefined)

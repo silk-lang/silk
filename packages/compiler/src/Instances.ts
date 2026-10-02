@@ -19,7 +19,6 @@ import type * as LifetimeFlow from './LifetimeFlow.js'
 import * as ExecutableOrigin from './ExecutableOrigin.js'
 import * as Tir from './Tir.js'
 import * as FunctionIndex from './internal/FunctionIndex.js'
-import * as Graph from './internal/Graph.js'
 import type * as Intrinsic from './Intrinsic.js'
 import * as TypeInference from './internal/TypeInference.js'
 import type * as NameResolution from './NameResolution.js'
@@ -1044,6 +1043,7 @@ const {
   effectSuccesses,
   concreteCallables,
   concreteEffects,
+  suspensionScan,
   suspensionGraph,
 } = ExecutableOrigin.make({
   specializeInstanceType: (type, owner, substitutions) =>
@@ -1605,8 +1605,11 @@ export const discover = (
   const declarationText = (key: InstanceKey): string =>
     `${key.declaration.module}\u0000${key.declaration.name}`
   const familiesByDeclaration = new Map<string, Set<string>>()
+  const familyOfKey = new WeakMap<InstanceKey, string>()
   /** A provider's finite callable target selects which body can continue a generic call cycle. */
   const recursionFamily = (key: InstanceKey): string => {
+    const known = familyOfKey.get(key)
+    if (known !== undefined) return known
     const declaration = declarationText(key)
     const targets = key.typeArguments
       .filter(Type.isCallableIdentityArgument)
@@ -1617,7 +1620,12 @@ export const discover = (
       families = new Set()
       familiesByDeclaration.set(declaration, families)
     }
-    families.add(family)
+    if (!families.has(family)) {
+      families.add(family)
+      const component = cycles.get(declaration)
+      if (component !== undefined) cycleFamilies.delete(component)
+    }
+    familyOfKey.set(key, family)
     return family
   }
   const variableArguments = new Map<string, boolean>()
@@ -1672,16 +1680,26 @@ export const discover = (
     discriminatingGrew = true
     return true
   }
+  // One retained text per key without a structural provider. Ancestor values and contexts are
+  // long; reusing one string reuses its cached hash in every map keyed by it.
+  const unprovidedAncestorValues = new WeakMap<InstanceKey, string>()
+  const ancestorValue = (ancestor: Ancestor): string => {
+    if (ancestor.structuralProvider !== undefined)
+      return JSON.stringify([keyText(ancestor.key), Type.key(ancestor.structuralProvider)])
+    let value = unprovidedAncestorValues.get(ancestor.key)
+    if (value === undefined) {
+      value = JSON.stringify([keyText(ancestor.key), null])
+      unprovidedAncestorValues.set(ancestor.key, value)
+    }
+    return value
+  }
   const withAncestor = (
     history: AncestorHistory.History,
     ancestor: Ancestor,
   ): AncestorHistory.History => {
     if (ancestor.structuralProvider === undefined && !needsAncestor(ancestor.key)) return history
     if (ancestor.structuralProvider === undefined && !isDiscriminating(ancestor.key)) return history
-    const value = JSON.stringify([
-      keyText(ancestor.key),
-      ancestor.structuralProvider === undefined ? null : Type.key(ancestor.structuralProvider),
-    ])
+    const value = ancestorValue(ancestor)
     ancestorValues.set(value, ancestor)
     return AncestorHistory.set(histories, history, recursionFamily(ancestor.key), value)
   }
@@ -1701,20 +1719,25 @@ export const discover = (
    * with the complete graph until no projected component grows. Only the final attempt publishes.
    */
   const callEdges = new Map<string, Set<string>>()
-  let cycles = new Map<string, ReadonlySet<string>>()
-  let cyclesCurrent = true
+  const callers = new Map<string, Set<string>>()
+  /**
+   * Each declaration's strongly connected component, maintained as edges arrive. A declaration
+   * outside every recorded cycle is its own component. Component sets are replaced, never mutated,
+   * so they key the family sets projected onto them.
+   */
+  const cycles = new Map<string, ReadonlySet<string>>()
+  const cycleFamilies = new WeakMap<ReadonlySet<string>, ReadonlySet<string>>()
   const projectedCycleSizes = new Map<string, number>()
-  const reaches = (from: string, to: string): boolean => {
+  const descendants = (from: string): ReadonlySet<string> => {
     const seen = new Set([from])
     const stack = [from]
     for (let current = stack.pop(); current !== undefined; current = stack.pop())
       for (const next of callEdges.get(current) ?? []) {
-        if (next === to) return true
         if (seen.has(next)) continue
         seen.add(next)
         stack.push(next)
       }
-    return false
+    return seen
   }
   const addCallEdge = (caller: InstanceKey, target: InstanceKey): void => {
     const from = declarationText(caller)
@@ -1726,34 +1749,52 @@ export const discover = (
     }
     if (targets.has(to)) return
     targets.add(to)
-    // A new edge merges components only when its target already reaches its caller.
+    let sources = callers.get(to)
+    if (sources === undefined) {
+      sources = new Set()
+      callers.set(to, sources)
+    }
+    sources.add(from)
+    // A new edge merges components only when its target already reaches its caller. The merged
+    // component is every declaration on such a path: reached from the target, reaching the caller.
     if (!callEdges.has(to)) {
       callEdges.set(to, new Set())
       return
     }
-    if (!cyclesCurrent || from === to) return
+    if (from === to) return
     const component = cycles.get(from)
     if (component !== undefined && component === cycles.get(to)) return
-    if (reaches(to, from)) cyclesCurrent = false
+    const reached = descendants(to)
+    if (!reached.has(from)) return
+    const members = new Set([from])
+    const stack = [from]
+    for (let current = stack.pop(); current !== undefined; current = stack.pop())
+      for (const previous of callers.get(current) ?? []) {
+        if (members.has(previous) || !reached.has(previous)) continue
+        members.add(previous)
+        stack.push(previous)
+      }
+    for (const member of members) cycles.set(member, members)
   }
   const cycleOf = (declaration: string): ReadonlySet<string> => {
-    if (!cyclesCurrent) {
-      cyclesCurrent = true
-      cycles = new Map()
-      for (const component of Graph.stronglyConnected(
-        callEdges.keys(),
-        (from) => callEdges.get(from) ?? [],
-      )) {
-        const members = new Set(component)
-        for (const member of component) cycles.set(member, members)
-      }
-    }
     let members = cycles.get(declaration)
     if (members === undefined) {
       members = new Set([declaration])
       cycles.set(declaration, members)
     }
     return members
+  }
+  /** The recursion families of one component's declarations, rebuilt when either grows. */
+  const familiesOfCycle = (cycle: ReadonlySet<string>): ReadonlySet<string> => {
+    let families = cycleFamilies.get(cycle)
+    if (families === undefined) {
+      const collected = new Set<string>()
+      for (const member of cycle)
+        for (const family of familiesByDeclaration.get(member) ?? []) collected.add(family)
+      families = collected
+      cycleFamilies.set(cycle, families)
+    }
+    return families
   }
   const successorHistory = (
     history: AncestorHistory.History,
@@ -1766,10 +1807,10 @@ export const discover = (
     // Terminal histories have no assignments to project. They accounted for 66% of the family
     // members collected by the selfhost diagnostic; retain the graph bookkeeping above first.
     if (history.variable === undefined) return withAncestor(history, ancestor)
-    const families = new Set(
-      [...cycle].flatMap((member) => [...(familiesByDeclaration.get(member) ?? [])]),
+    return withAncestor(
+      AncestorHistory.project(histories, history, familiesOfCycle(cycle)),
+      ancestor,
     )
-    return withAncestor(AncestorHistory.project(histories, history, families), ancestor)
   }
   const cycleGrewAfterProjection = (): boolean => {
     for (const [declaration, size] of projectedCycleSizes)
@@ -2116,13 +2157,10 @@ export const discover = (
     }
     return memoized
   }
-  const computeStrictCleanupSubterm = (
+  const cleanupSubtermTerminal = (
     candidate: RuntimeType,
     whole: RuntimeType,
-    unfolding: Unfolding,
-    reaching: ReadonlySet<number> | undefined,
-    memo: Map<string, boolean>,
-  ): boolean => {
+  ): boolean | undefined => {
     if (candidate.ordinal === whole.ordinal) return false
     const candidateDeclaration = nominalTypeText(candidate.type)
     const wholeDeclaration = nominalTypeText(whole.type)
@@ -2132,7 +2170,18 @@ export const discover = (
         Type.isNominal(whole.type) &&
         strictlyDescendsSameNominal(candidate.type, whole.type)
       )
-    if (isStrictRuntimeStructuralSubterm(candidate.type, whole.type)) return true
+    return isStrictRuntimeStructuralSubterm(candidate.type, whole.type) ? true : undefined
+  }
+  const computeStrictCleanupSubterm = (
+    candidate: RuntimeType,
+    whole: RuntimeType,
+    unfolding: Unfolding,
+    reaching: ReadonlySet<number> | undefined,
+    memo: Map<string, boolean>,
+  ): boolean => {
+    const terminal = cleanupSubtermTerminal(candidate, whole)
+    if (terminal !== undefined) return terminal
+    const transitions: Array<{ fields: ReadonlyArray<RuntimeType>; unfolding: Unfolding }> = []
     for (const { declaration, nominal } of nominalsIn(whole)) {
       const prior = unfolding.byDeclaration.get(declaration)
       if (
@@ -2147,13 +2196,16 @@ export const discover = (
       if (fields.some((field) => field.ordinal === candidate.ordinal)) return true
       const descend = fields.filter((field) => reaching?.has(field.ordinal) !== false)
       if (descend.length === 0) continue
-      const next = unfold(unfolding, declaration, nominal)
-      if (
-        descend.some((field) => strictCleanupSubtermUnder(candidate, field, next, reaching, memo))
-      )
-        return true
+      // A later sibling can already contain the payload structurally. Answer that same
+      // terminal question before exploring unrelated recursive metadata in an earlier field.
+      if (descend.some((field) => cleanupSubtermTerminal(candidate, field) === true)) return true
+      transitions.push({ fields: descend, unfolding: unfold(unfolding, declaration, nominal) })
     }
-    return false
+    return transitions.some((transition) =>
+      transition.fields.some((field) =>
+        strictCleanupSubtermUnder(candidate, field, transition.unfolding, reaching, memo),
+      ),
+    )
   }
   const coveredByCleanupMeasure = (measure: CleanupMeasure, candidate: Type.Type): boolean =>
     measure.roots.some(
@@ -2292,12 +2344,21 @@ export const discover = (
   // a queue bucket; a new canonical history root revisits that bucket's outgoing guards.
   // Static text origins locate diagnostics, not specializations. Retain the first caller's
   // provenance when the bucket grows, as for repeated calls with equal static values.
-  const contextText = (item: WorkItem): string =>
-    JSON.stringify([
-      keyText(item.key),
-      item.cleanupMeasure?.roots.map(Type.runtimeKey).sort() ?? null,
-      item.cleanupMeasure?.frame.map(Type.runtimeKey).sort() ?? null,
-    ])
+  const unmeasuredContexts = new WeakMap<InstanceKey, string>()
+  const contextText = (item: WorkItem): string => {
+    if (item.cleanupMeasure !== undefined)
+      return JSON.stringify([
+        keyText(item.key),
+        item.cleanupMeasure.roots.map(Type.runtimeKey).sort(),
+        item.cleanupMeasure.frame.map(Type.runtimeKey).sort(),
+      ])
+    let context = unmeasuredContexts.get(item.key)
+    if (context === undefined) {
+      context = JSON.stringify([keyText(item.key), null, null])
+      unmeasuredContexts.set(item.key, context)
+    }
+    return context
+  }
   const pending: Array<string> = []
   type StaticOrigins = ReadonlyArray<Evaluation.TextOrigin | undefined>
   /** What each call that selected an application wrote for its static text. */
@@ -2675,7 +2736,9 @@ export const discover = (
     stopAt = Number.POSITIVE_INFINITY
     for (const root of roots) schedule(root)
   }
-  trace('Instances.expandWorklist', () => {
+  // The scan behind the final attempt's last graph. That graph covers exactly the instances the
+  // attempt reached, so the final graph reassembles it with checked ownership instead of rescanning.
+  const reachedScan = trace('Instances.expandWorklist', () => {
     while (true) {
       for (let cursor = 0; cursor < pending.length; cursor += 1) {
         // A family proved discriminating leaves the guards taken without its ancestry, so this
@@ -2817,8 +2880,11 @@ export const discover = (
       const currentInstances = [...prepared]
         .filter(([text]) => recordedContexts.has(text))
         .map(([, candidate]) => candidate.instance)
+      const scan = trace('Instances.scanSuspension', () =>
+        suspensionScan(currentInstances, results, index, [...recordedCallables.values()]),
+      )
       const currentGraph = trace('Instances.rebuildSuspensionGraph', () =>
-        suspensionGraph(currentInstances, results, index, [...recordedCallables.values()]),
+        suspensionGraph(scan, new Map()),
       )
       providerCalls.clear()
       for (const provided of currentGraph.providedTargets) {
@@ -2911,7 +2977,7 @@ export const discover = (
         }
       }
       if (!scheduledProvided) {
-        if (!discriminatingGrew && !cycleGrewAfterProjection()) break
+        if (!discriminatingGrew && !cycleGrewAfterProjection()) return scan
         restartDiscovery()
       }
     }
@@ -3038,7 +3104,10 @@ export const discover = (
     return unavailableOwnership
   })
   const finalGraph = trace('Instances.buildFinalSuspensionGraph', () =>
-    suspensionGraph(instances, results, index, [...recordedCallables.values()]),
+    suspensionGraph(
+      reachedScan,
+      new Map(instances.map((instance) => [keyText(instance.key), instance.ownership])),
+    ),
   )
   const summaries = trace('Instances.summarizeSuspension', () =>
     ExecutableOrigin.suspensionSummaries(finalGraph),
