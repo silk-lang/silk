@@ -135,7 +135,8 @@ The facts that produce it come from typing and from a lowering-time cleanup stac
 4. **Temporaries** live until the end of their full expression. A temporary borrowed by a `let`
    (BORROW-006) is promoted to the enclosing block.
 5. Guarded consuming match arms bind projections of the scrutinee and move only after the guard
-   succeeds (MATCH-002).
+   succeeds ([ownership MATCH-002](../../apps/docs/content/reference/ownership-and-borrowing.md#match-002--pattern-bindings-inherit-the-selected-match-ownership);
+   functions MATCH-001).
 
 Ordinary functions cannot fail (EFF-006), so Step 6 exercises return, break and continue edges.
 Failure-edge cleanup uses the same stack and lands with Step 9's first fallible call.
@@ -204,7 +205,8 @@ suspension point structurally).
   trailing arguments. `Layout` lays it out like a record; its `DropGlue` drops the captures.
 - **Invocation.** Types are exact after monomorphization, so calling a closure is a direct
   `Call(Instance(body))` with the environment as parameter 0, passed by `&`, `&mut` or move per
-  its invocation mode (CALLABLE-002). A section call is a direct call of its target with the
+  its invocation mode ([ownership CALLABLE-002](../../apps/docs/content/reference/ownership-and-borrowing.md#callable-002--invocation-mode-derives-from-access-to-the-callable-environment);
+  functions CALLABLE-003). A section call is a direct call of its target with the
   stored arguments appended. No `Section` key, no adapter function, no function pointer.
 - **Named effect fn runners** keep their written parameters as ordinary `Parameter` locals, so
   `run f(a)` is `Call(f, [a], providers)`. Running a stored Effect built from `f` moves (`once`) or
@@ -249,7 +251,8 @@ return move current
 ```text
 bb_loop:  _c = Gt(remaining, 0); Branch(_c, bb_body, bb_exit)
 bb_body:  _fresh = Aggregate Chain{...End}
-          _taken = Intrinsic.replace(&mut current, move _fresh)   // non-failing intrinsic
+          _taken = move current         // Intrinsic.replace lowers to two moves
+          current = move _fresh
           Call Box.make<Chain>(move _taken) providers [allocator] -> _boxed,
                normal bb_ok, failure { _err: OutOfMemoryError -> bb_fail }
 bb_ok:    Call Shared.clone(counter) -> _counter, normal bb_ok2
