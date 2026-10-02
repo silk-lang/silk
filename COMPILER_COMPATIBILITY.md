@@ -113,10 +113,12 @@ Each entry records:
 - **Diagnostics and limits:** in selfhost, a reflection call outside static evaluation, a runtime
   signature mentioning `Intrinsic.Type<Owner>`, and a descriptor reaching runtime code through a
   selection pass are `StaticPhaseViolation`. A non-aggregate or occurrence-generated owner is an
-  `Unsupported` static evaluation at the call, never a fallback code. An unlisted reflection member
-  remains `UnknownMember`.
-- **Evidence:** `selectedTypeSelectionReadsReflectedKinds` in `compiler/src/semantic/SemanticCases.silk`
-  covers both kind codes, the two-type static selection, the unsupported owner, and each runtime
+  `Unsupported` static evaluation failure for a missing intrinsic operation, reported as
+  `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An unlisted reflection
+  member remains `UnknownMember`.
+- **Evidence:** in `compiler/src/semantic/SemanticCases.silk`, `selectedTypeSelectionReadsReflectedKinds`
+  covers the two-type static selection, `reflectedKindCodesMatchTheLibrary` covers both kind codes
+  and the unsupported owner, and `reflectedDescriptorsStayOutOfRuntimeCode` covers each runtime
   boundary. The shared corpus program `static-type-selection` exercises the bootstrap natively.
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
