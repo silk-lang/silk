@@ -1,6 +1,6 @@
 # Effect calling convention (native backend)
 
-**Status:** draft for review, roadmap Step 5 in
+**Status:** approved design, roadmap Step 5 in
 [#567](https://github.com/julia-script/silk/issues/567). It gates Step 9 (effects, failures and
 services). It builds on [the MIR core shape](mir-core-shape.md) (Step 4) and carries forward the
 B3 workspace draft, including Julia's decisions of 2026-09-30. Sources: selfhost `1ecaca3d`,
@@ -166,8 +166,8 @@ entry: `catchAll` and `provideMut` there lower like anywhere else.
 Selfhost today does not compile `native_start`. That needs `Execution` (coroutine frames) and the
 diagnostic observer intrinsics, which come after suspension. Instead, the `Entry { main }` key
 emits a generated C `main` that calls `fn main() -> i32`; every other signature reports
-`entry-signature`. **Open question Q1** asks whether to keep that until `native_start` compiles.
-With the recommended answer, an unhandled failure cannot reach the shim: `fn main` is an ordinary
+`entry-signature`. Decision Q1 keeps that until `native_start` compiles. An unhandled failure
+cannot reach the shim: `fn main` is an ordinary
 function, so its `run`s are closed (EFF-006), and `pub effect fn main` stays `entry-signature`.
 
 ### D6. Suspension stays a named gap
@@ -374,18 +374,17 @@ PR measures and pins the corpus programs it unlocks.
 
 Entry (Q1) and the observer and trace follow-up (Q2) come after the suspension stage, not in Step 9.
 
-## 7. Open questions for Julia
+## 7. Decisions (Julia, 2026-10-02)
 
-1. **Entry.** Keep the generated `Entry { main }` C shim, limited to `fn main() -> i32`, until
-   selfhost compiles `silk/native_start`, and record the shim as a divergence from ENTRY-001.
-   _Recommended:_ yes. Extending the shim to `effect fn main` would add a compiler entry adapter
-   that ENTRY-001 forbids, and it would have to be deleted again. The cost is that
-   `entry-signature` programs (12 today) wait for the suspension stage.
-2. **Failure context in Step 9.** On 2026-09-30 you chose to ship an origin-only `FailureContext`
-   in Step 9. With Q1's answer, nothing in selfhost reads it until the observer intrinsics land,
-   so it would be a write-only field in every failure slot. _Recommended:_ reserve the agreed
-   `FailureContext` statement and add it, origin-only, in the PR that adds its first reader (the
-   observer and trace note due before milestone (i-b)). The trace gap then belongs to that PR.
-3. **`effect-instance` deletion.** It is reached today for any non-empty row. _Recommended:_
-   delete it in Step 9 PR 4 rather than renaming it, because every remaining reason it covers
-   becomes either supported or `suspension`.
+All three recommendations accepted on PR #708:
+
+1. **Entry (Q1).** Keep the generated `Entry { main }` C shim, limited to `fn main() -> i32`,
+   until selfhost compiles `silk/native_start`. It is recorded in COMPILER_COMPATIBILITY.md as a
+   temporary difference from the bootstrap and ENTRY-001. `pub effect fn main` stays
+   `entry-signature` until then. No compiler entry adapter is added for `effect fn main`.
+2. **Failure context (Q2).** The `FailureContext` statement stays reserved. Origin-only context is
+   added by the PR that adds its first reader (the observer and trace note due before milestone
+   (i-b)), not in Step 9. The trace gap belongs to that PR. This refines the 2026-09-30 decision
+   about which PR ships it; the origin-only content is unchanged.
+3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
+   covers becomes either supported or `suspension`.

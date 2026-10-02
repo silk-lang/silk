@@ -249,10 +249,11 @@ Each entry records:
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 
-- **Status:** the first two directions below are proposed as the native design in
+- **Status:** the first two directions below are the approved native design in
   [compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md)
-  (roadmap step 5, 2026-10-02). They become approved when Julia signs off on that note. The other
-  directions remain deferred proposals. Nothing here changes the bootstrap.
+  (roadmap step 5, approved by Julia on 2026-10-02). They are not implemented yet; Step 9
+  implements them. The other directions remain deferred proposals. Nothing here changes the
+  bootstrap.
 - **Summary:** the design discussion considered several directions:
   - a target-neutral lowering boundary that turns non-suspending Effects into ordinary closures,
     provider operands, tagged outcomes, and cleanup (native step 5 design);
@@ -274,10 +275,10 @@ Each entry records:
 
 ### Native entry uses a generated C `main` until it compiles the source runtime
 
-- **Status:** divergence proposed in
-  [compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md) (D5,
-  open question 1), 2026-10-02, pending Julia's sign-off. It is retired when selfhost compiles
-  `silk/native_start` as the runtime root and the `Entry { main }` key is deleted.
+- **Status:** temporary divergence approved by Julia on 2026-10-02
+  ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
+  decision Q1). It is retired when selfhost compiles `silk/native_start` as the runtime root and
+  the `Entry { main }` key is deleted.
 - **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
   to ENTRY-003 put program entry in source. The runtime module calls the application, provides
   `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
