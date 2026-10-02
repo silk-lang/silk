@@ -1091,6 +1091,68 @@ pub fn main() -> () {
   }),
 )
 
+it.effect('shares cleanup subterm answers across unfoldings of unreachable declarations', () =>
+  Effect.gen(function* () {
+    // Each hub offers two instantiations of its layer, and every layer borrows the next hub, so the
+    // path to hub j has unfolded one of 2^(j-1) layer combinations above it. None of those
+    // declarations is reachable below the hub, so the answer there cannot depend on them.
+    // Borrowed Shared edges keep the structural unfolding without per-path affinity derivation.
+    const depth = 24
+    const hubs = Array.from({ length: depth }, (_, index) => {
+      const level = index + 1
+      if (level === depth) return `struct Hub${level}<'a> { marker: &'a i32 }`
+      return `struct Hub${level}<'a> {
+  first: Layer${level}<'a, i32>
+  second: Layer${level}<'a, u8>
+}
+struct Layer${level}<'a, T> {
+  value: T
+  next: &'a Shared<Hub${level + 1}<'a>>
+}`
+    }).join('\n')
+    // Distinct scalar fields keep the graph beyond the reachability-pruning budget.
+    const padding = Array.from(
+      { length: 513 },
+      (_, field) => `  field${field}: [u8; ${field}]`,
+    ).join('\n')
+    const result = yield* snapshot(`import silk.vector { Vector }
+import silk.shared { Shared }
+${hubs}
+struct Padding {
+  marker: i32
+${padding}
+}
+struct Frame { value: i32 }
+struct Holder { active: Vector<Frame> }
+struct Machine<'a> {
+  padding: Padding
+  layers: &'a Shared<Hub1<'a>>
+  holder: Holder
+}
+fn hold<'a>(anchor: &'a i32) -> () {
+  let machines = Vector.make<Machine<'a>>()
+  drop machines
+  return ()
+}
+pub fn main() -> () {
+  let anchor = 0
+  hold(&anchor)
+  return ()
+}`)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    assert.deepEqual(result.instances.violations, [])
+    assert.isTrue(
+      result.instances.instances.some(
+        (instance) =>
+          instance.key.declaration.module === 'silk/vector' &&
+          instance.key.declaration.name === 'drop@impl#0' &&
+          instance.key.typeArguments.map(Type.encodeGenericArgument).join(', ') ===
+            'golden/program.Frame',
+      ),
+    )
+  }),
+)
+
 it.effect('admits nested cleanup reached through a lexical service provider', () =>
   Effect.gen(function* () {
     const result = yield* snapshot(`import silk.effect { Effect }

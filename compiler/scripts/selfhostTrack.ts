@@ -40,4 +40,8 @@ export const selfhostTrack = [
   'static-local-and-helper',
   'static-type-selection',
   'nominal-union-variants',
+  'static-parameter-instances',
+  'static-parameter-finite-chains',
+  'reference-projection-places',
+  'structural-union-copy-members',
 ] as const satisfies ReadonlyArray<string>
