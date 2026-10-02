@@ -319,6 +319,22 @@ continue parsing fields. Struct literal initializers still use commas. The boots
 its comma acceptance is an intentional recorded divergence until a separately authorized repair.
 The structured parser assertion lives in `hir/LoweringCases.structFieldCommaReportsAuthoredSyntax`.
 
+### Escaping local array loans report a type mismatch in selfhost
+
+- **Status:** divergence recorded by the coordinator on 2026-10-02 for PR #688 (B9-S8). It is
+  retired when region escape checking lands with roadmap step 14.
+- **Rule:** BORROW-006 lets a borrowed array literal own hidden storage. A view of that storage
+  or of a local array cannot outlive its function, and returning it reports `OWN0019`.
+- **Compilers:** the bootstrap reports `OWN0019` at the escape. Selfhost types the loan with a
+  caller-local region, so a `'static` result rejects it as `TypeMismatch` at the borrow span. This
+  applies to `return &local` and `return &[42]` alike. Selfhost has no validity-escape code before
+  step 14.
+- **Source migration:** none; both compilers reject the program.
+- **Diagnostics and limits:** for these direct returns, only the code differs. Other escape forms
+  are step 14 scope and are not claimed here.
+- **Evidence:** `sliceConversionsRetainRegionAccessAndDiagnostics` asserts `TypeMismatch` at
+  `&local` and `&[42]`. The bootstrap's `RuntimeSliceOwnership.test.ts` asserts `OWN0019`.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or
