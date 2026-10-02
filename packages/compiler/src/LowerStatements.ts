@@ -51,7 +51,12 @@ import * as Instances from './Instances.js'
 import type { DelayedEffectState } from './Lower.js'
 import { borrowKey, i32, patternKey, spanKey } from './Lower.js'
 import type {} from './LowerExpression.js'
-import { lowerExpression, lowerExecution, lowerPatternTests } from './LowerExpression.js'
+import {
+  copiedValueType,
+  lowerExpression,
+  lowerExecution,
+  lowerPatternTests,
+} from './LowerExpression.js'
 import * as Match from './Match.js'
 import * as Mir from './Mir.js'
 import * as MovePath from './MovePath.js'
@@ -566,7 +571,10 @@ const lowerStatement = (
       const lowered = lowerExpression(fn, statement.initializer)
       if (lowered === 'Transferred') return lowered
       if (lowered === undefined) return undefined
-      const destination = fn.alloc(fn.localTypes.at(lowered.result.ordinal) ?? i32)
+      const sourceType = fn.localTypes.at(lowered.result.ordinal)
+      const valueType = sourceType === undefined ? i32 : copiedValueType(fn, sourceType)
+      if (valueType === undefined) return undefined
+      const destination = fn.alloc(valueType)
       fn.emit({
         _tag: 'Move',
         destination,

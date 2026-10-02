@@ -3097,6 +3097,50 @@ fn inspect(input: Left | Right) -> i32 {
 pub fn main() -> i32 { return inspect(Right { value: 0 }) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // A local copied from a shared pattern binding owns the borrowed value; the nested shared
+  // selection keeps the copy's storage valid while it is updated.
+  {
+    name: 'borrowed-binding-local-copy',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.vector { Vector }
+union Selector { Unit, Selected { tag: usize } }
+struct Arm { pattern: Selector }
+union Outer { Other, Pair { count: usize, items: Vector<Arm> } }
+fn largest(values: &[Outer]) -> usize {
+  let mut at: usize = 0
+  while at < values.length {
+    if let Outer.Pair { count, items } = &values[at] {
+      let written = Vector.asSlice<Arm>(&items)
+      let mut best = count
+      let mut arm: usize = 0
+      while arm < written.length {
+        let mut selected: usize = 9
+        if let Selector.Selected { tag } = &written[arm].pattern { selected = tag }
+        if selected > best { best = selected }
+        arm = arm + 1
+      }
+      return best
+    }
+    at = at + 1
+  }
+  return 0
+}
+effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut items = Vector.make<Arm>()
+  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Selected { tag: 1 } }) |> Effect.provideMut(&mut allocator)
+  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Unit }) |> Effect.provideMut(&mut allocator)
+  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Selected { tag: 7 } }) |> Effect.provideMut(&mut allocator)
+  let mut values = Vector.make<Outer>()
+  run Vector.append<Outer>(&mut values, Outer.Pair { count: 3, items: move items }) |> Effect.provideMut(&mut allocator)
+  if largest(Vector.asSlice<Outer>(&values)) == 7 { return 42 }
+  return 1
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }
+pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   // A non-generic nominal union: payload and unit variants, construction, call results, and shared
   // and consuming matches with a guard and a universal arm.
   {
