@@ -48,4 +48,5 @@ export const selfhostTrack = [
   'static-parameter-array',
   'static-parameter-aggregates',
   'match-arm-blocks-and-bindings',
+  'runtime-slice-temporary-and-lexical-borrows',
 ] as const satisfies ReadonlyArray<string>
