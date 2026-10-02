@@ -123,25 +123,31 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
-### Static enum values in selfhost static roots
+### Static enum and fixed-array values in selfhost static roots
 
-- **Status:** divergence recorded on 2026-10-02 for B12 task 11 (PR #671), as directed by the
-  coordinator; final scope pending reviewer contract verdict.
-- **Rule:** a scalar-enum member such as `Mode.Slow` is a valid static value, including as a static
-  argument (`moded(Mode.Slow)` for `fn moded(static mode: Mode)`).
-- **Compilers:** the bootstrap evaluates it; the shared corpus program
-  `static-parameter-aggregates` exercises that natively. Selfhost static roots do not type
-  scalar-enum members (the qualified spelling resolves as a call reference), and static execution
-  has no enum-member evaluation, so no source program produces a static enum value. Embedding a
-  static enum value therefore has no reachable lowering in selfhost.
+- **Status:** divergence recorded on 2026-10-02 for B12 task 11 (PR #671), with coordinator
+  decision A. Static aggregate production, non-scalar embedding and both corpus pins are a separate
+  follow-up task.
+- **Rule:** a scalar-enum member such as `Mode.Slow` and a fixed-array literal such as `[4, 5]` are
+  valid static values, including as static arguments (`moded(Mode.Slow)` for
+  `fn moded(static mode: Mode)`, `tabled([4, 5], index)` for `fn tabled(static table: [i32; 2], ...)`).
+- **Compilers:** the bootstrap evaluates both. The shared corpus programs
+  `static-parameter-aggregates` and `static-parameter-array` exercise them natively. Selfhost static
+  roots produce neither from source:
+  - scalar-enum members are not typed in static roots (the qualified spelling resolves as a call
+    reference);
+  - array literals are rejected by the static-root typing guard;
+  - static execution has no enum-member or array-literal construction.
+
+  Selfhost therefore embeds only scalar static values and has no non-scalar embedding path.
 - **Source migration:** none.
-- **Diagnostics and limits:** in selfhost, a scalar-enum member in a static root is `Unsupported`
-  at the member expression. Selfhost does not pin `static-parameter-aggregates`; it pins the
-  array-only `static-parameter-array` once that lands.
-- **Evidence:** `staticParametersSelectInstancesAndKeepRuntimeLanes` asserts the `Unsupported`
-  span for `moded(Mode.Slow)`.
-- **Open questions:** static enum production needs both static typing and static evaluation of
-  enum members; it is follow-up work.
+- **Diagnostics and limits:** in selfhost, a scalar-enum member or fixed-array literal in a static
+  root is `Unsupported` at that expression. Selfhost pins neither `static-parameter-aggregates` nor
+  `static-parameter-array`. Both are expected to be `Unsupported` in the selfhost corpus, never FAIL.
+- **Evidence:** `staticParametersSelectInstancesAndKeepRuntimeLanes` asserts the `Unsupported` spans
+  for `moded(Mode.Slow)` and `tabled([4, 5], index)`.
+- **Open questions:** static aggregate production needs static-root typing and static evaluation of
+  enum members and array literals, then non-scalar materialization in MIR.
 
 ### Omitted Effect environments elaborated from inputs
 
