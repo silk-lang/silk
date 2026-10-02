@@ -36,4 +36,7 @@ export const selfhostTrack = [
   'match-guarded-union-shared',
   'match-exclusive-mutable',
   'match-move-nested-cleanup',
+  'static-target-selection',
+  'static-local-and-helper',
+  'static-type-selection',
 ] as const satisfies ReadonlyArray<string>
