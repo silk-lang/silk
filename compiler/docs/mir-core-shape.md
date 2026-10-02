@@ -1,6 +1,6 @@
 # Selfhost MIR core shape
 
-**Status:** draft for review. Roadmap #567, Step 4. Measured against `selfhost` `1ecaca3d`.
+**Status:** decided; Julia's answers are in §12. Roadmap #567, Step 4. Measured against `selfhost` `1ecaca3d`.
 It decides the final shape of `compiler/src/backend/Mir.silk` before Steps 6 (moves and cleanup),
 8 (closures) and 9 (effects), the later suspension stage, and native borrow checking. The failure
 edge and suspension shapes are agreed with the Step 5 Effect calling-convention note.
@@ -217,8 +217,8 @@ types we already know); a separate `InstanceKey.Closure` (duplicates `Declaratio
 
 ## 8. Checking (question 7)
 
-`MirCheck` is an opt-in module that the build never imports. The corpus runner calls it in CI
-and debug runs. It checks:
+`MirCheck` is an opt-in module that `silkc` never links. Only the corpus runner calls it, in CI
+(§12). It checks:
 
 1. **Structure:** block 0 is the entry; indices are in range; every block has one terminator;
    switch values are distinct; `references` and `externs` are sorted and include every callee.
@@ -331,8 +331,8 @@ provider PR deletes `effect-instance`.
 Each field or variant lands with its first producer; nothing is reserved early.
 
 1. **Step 6a** — Typing records consumed places (receivers, partial moves, `match move`).
-2. **Step 6b** — `InstanceKey.DropGlue`, the glue producer and `Drop` emission. Emission stops
-   ignoring `Drop` (it currently drops the statement silently) and reports `cleanup` until then.
+2. **Step 6b** — `InstanceKey.DropGlue`, the glue producer and `Drop` emission, replacing the
+   separate stopgap that reports `cleanup` when emission meets `Drop` (§12).
 3. **Step 6c** — Cleanup stack, drops on fallthrough/return/break/continue, replacement drops,
    `DropFlag` locals.
 4. **Step 6d** — Partial moves, union payload flags, promoted temporaries.
@@ -344,12 +344,14 @@ Each field or variant lands with its first producer; nothing is reserved early.
 8. **Suspension stage** — SCC summary query, `Suspend`/`Abandon`, frame transform.
 9. **Borrow stage** — `Mir(Abstract)`, `Callee.Bound`, storage markers, region side table.
 
-## 12. Open questions for Julia
+## 12. Decisions (Julia, 2026-10-02)
 
-1. **`MirCheck` trigger.** Recommend: run from the corpus runner in CI only, not as a `silkc`
-   flag, so the build never links it.
-2. **Cancellation edge.** Recommend the explicit `cancel` chain on `Suspend` (§6) over deriving it
-   in the frame transform; this fixes which component owns cancellation cleanup.
+1. **`MirCheck` trigger.** It runs only from the corpus runner in CI and is never linked into
+   `silkc`.
+2. **Cancellation edge.** Each suspension point carries its own explicit `cancel` chain, written by
+   lowering (§6); the frame transform does not derive it.
+3. **Silent `Drop` emission.** A stopgap that reports `cleanup` when emission meets `Drop` lands
+   separately now; Step 6b replaces it with drop glue.
 
 ## 13. Agreed with Step 5
 
