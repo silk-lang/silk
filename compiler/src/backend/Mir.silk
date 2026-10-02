@@ -2,6 +2,7 @@
 
 import backend.Gap {Code as GapCode, Gap}
 import backend.InstanceKey {InstanceKey}
+import backend.Layout {Layout}
 import semantic.Specialization {Application, Edge}
 import semantic.RuntimeEncoding
 import hir.FloatingLiteral
@@ -23,6 +24,7 @@ import semantic.TypedBody {
   EnumMember as BodyEnumMember,
   MatchArm as BodyMatchArm,
   Pattern as BodyPattern,
+  UnionMember as BodyUnionMember,
   NodeId as BodyNodeId,
   NodeKind as BodyNodeKind,
   Origin,
@@ -57,7 +59,8 @@ pub struct Place {
 
 pub union Projection {
   Field {pub index: usize},
-  Payload {pub index: usize},
+  /// The member storage of a structural union selected by canonical tag `index`.
+  Payload {pub index: usize, pub ty: Shared<Type>},
   Index {pub local: usize},
   ConstIndex {pub index: usize},
   Deref,
@@ -90,6 +93,10 @@ pub union Rvalue {
   Unary {pub operation: PrefixOperator, pub value: Operand},
   Binary {pub operation: InfixOperator, pub left: Operand, pub right: Operand},
   Bitcast {pub value: Operand, pub ty: Shared<Type>},
+  /// Reads a structural union's tag from its place.
+  Discriminant {pub place: Place},
+  /// Stores `value` as the union member with canonical tag `tag`.
+  Inject {pub tag: usize, pub value: Operand},
 }
 
 pub union Statement {
@@ -178,6 +185,12 @@ struct ResolvedCall {
   edge: Edge
 }
 
+// The evaluated place of one match subject; arm bindings project from it.
+struct Scrutinee {
+  subject: usize
+  place: Place
+}
+
 struct Builder {
   bindings: Vector<Binding>
   calls: Vector<CallTarget>
@@ -185,6 +198,7 @@ struct Builder {
   current: usize
   live: bool
   loops: Vector<LoopTargets>
+  scrutinees: Vector<Scrutinee>
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -205,7 +219,9 @@ union View {
   Aggregate {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   EnumMember {member: BodyEnumMember, ty: Shared<Type>, origin: Origin},
   EnumValue {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
-  Match {node: BodyNodeId, subject: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
+  Match {node: BodyNodeId, subject: BodyNodeId, place: bool, count: usize, ty: Shared<Type>, origin: Origin},
+  UnionInject {tag: usize, value: BodyNodeId, ty: Shared<Type>, origin: Origin},
+  PatternBinding {node: BodyNodeId, subject: BodyNodeId, ty: Shared<Type>, origin: Origin},
   PlaceAssignment {target: BodyNodeId, value: BodyNodeId, origin: Origin},
   Prefix {operation: PrefixOperator, operand: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Infix {
@@ -449,9 +465,15 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           BodyExpression.EnumValue {value} => View.EnumValue {
             value: value, ty: Shared.clone<Type>(&ty), origin: origin,
           }
-          BodyExpression.Match {subject, arms} => View.Match {
-            node: id, subject: subject, count: Vector.length<BodyMatchArm>(&arms),
+          BodyExpression.Match {subject, place, arms} => View.Match {
+            node: id, subject: subject, place: place, count: Vector.length<BodyMatchArm>(&arms),
             ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.UnionInject {tag, value} => View.UnionInject {
+            tag: tag, value: value, ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.PatternBinding {subject, ..} => View.PatternBinding {
+            node: id, subject: subject, ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.ConcretePrefix {operator, operand} => View.Prefix {
             operation: operator,
@@ -620,7 +642,7 @@ effect fn copyPlace(value: &Place) -> Place ! OutOfMemoryError ? &mut Allocator 
   while at < projections.length {
     let selected = match &projections[at] {
       Projection.Field {index} => Projection.Field {index: index}
-      Projection.Payload {index} => Projection.Payload {index: index}
+      Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Shared.clone<Type>(&ty)}
       Projection.Index {local} => Projection.Index {local: local}
       Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
       Projection.Deref => Projection.Deref
@@ -629,6 +651,27 @@ effect fn copyPlace(value: &Place) -> Place ! OutOfMemoryError ? &mut Allocator 
     at = at + usize.ONE
   }
   return move copied
+}
+
+fn bindingMember(body: &Shared<TypedBody>, node: BodyNodeId) -> Option<BodyUnionMember> {
+  return Shared.with<TypedBody, Option<BodyUnionMember>>(body, fn(value: &TypedBody) -> Option<BodyUnionMember> {
+    let nodes = TypedBody.nodeSlice(value)
+    if let BodyNodeKind.Expression {form: BodyExpression.PatternBinding {member, ..}, ..} = &nodes[node.index].kind {
+      return copyMember(&member)
+    }
+    return Option.none<BodyUnionMember>()
+  })
+}
+
+fn bindingFieldAt(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<usize> {
+  return Shared.with<TypedBody, Option<usize>>(body, fn(value: &TypedBody) -> Option<usize> {
+    let nodes = TypedBody.nodeSlice(value)
+    if let BodyNodeKind.Expression {form: BodyExpression.PatternBinding {fields, ..}, ..} = &nodes[node.index].kind {
+      let path = Vector.asSlice<usize>(&fields)
+      if at < path.length { return Option.some<usize>(path[at]) }
+    }
+    return Option.none<usize>()
+  })
 }
 
 effect fn expressionPlace(
@@ -697,6 +740,27 @@ effect fn expressionPlace(
       terminate(&mut builder.*, Terminator.Trap {origin: origin})
       resume(&mut builder.*, safe)
       run Vector.append<Projection>(&mut projected.projections, Projection.Index {local: captured})
+      return move projected
+    }
+    View.PatternBinding {node, subject, origin, ..} => {
+      let selected = match move scrutineePlace(&builder.*, subject) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return run unsupported(&owner, origin, GapCode.ExpectedPlace) }
+      }
+      let evaluated = Vector.asSlice<Scrutinee>(&builder.scrutinees)
+      let mut projected = run copyPlace(&evaluated[selected].place)
+      if let Option<BodyUnionMember>.Some {value: member} = move bindingMember(body, node) {
+        run Vector.append<Projection>(&mut projected.projections, Projection.Payload {index: member.tag, ty: move member.ty})
+      }
+      let mut at = usize.ZERO
+      while true {
+        let field = match move bindingFieldAt(body, node, at) {
+          Option<usize>.Some {value} => value
+          Option<usize>.None => { break }
+        }
+        run Vector.append<Projection>(&mut projected.projections, Projection.Field {index: field})
+        at = at + usize.ONE
+      }
       return move projected
     }
     View.Dereference {value, origin, ..} => {
@@ -914,8 +978,20 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
       return Operand.Copy {place: place(output)}
     }
-    View.Match {node, subject, count, ty, origin} => {
-      return run lowerMatch(&mut builder.*, body, hir, node, subject, count, &ty, origin)
+    View.Match {node, subject, place: placeMatch, count, ty, origin} => {
+      return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, count, &ty, origin)
+    }
+    View.UnionInject {tag, value, ty, origin} => {
+      let input = run expression(&mut builder.*, body, hir, value)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Inject {tag: tag, value: move input}, origin)
+      return Operand.Move {place: place(output)}
+    }
+    View.PatternBinding {ty, origin, ..} => {
+      let projected = run expressionPlace(&mut builder.*, body, hir, id)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move projected}}, origin)
+      return Operand.Copy {place: place(output)}
     }
     View.Intrinsic {member, node: callNode, ty, origin} => {
       let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, member, &ty, origin)
@@ -1042,6 +1118,13 @@ struct ArmView {
   origin: Origin
 }
 
+fn copyMember(member: &Option<BodyUnionMember>) -> Option<BodyUnionMember> {
+  return match &member.* {
+    Option<BodyUnionMember>.Some {value} => Option.some<BodyUnionMember>(BodyUnionMember {tag: value.tag, ty: Shared.clone<Type>(&value.ty)})
+    Option<BodyUnionMember>.None => Option.none<BodyUnionMember>()
+  }
+}
+
 fn armView(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<ArmView> {
   return Shared.with<TypedBody, Option<ArmView>>(body, fn(value: &TypedBody) -> Option<ArmView> {
     let nodes = TypedBody.nodeSlice(value)
@@ -1050,6 +1133,7 @@ fn armView(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<ArmV
       if at < written.length {
         let mut pattern = BodyPattern.Universal
         if let BodyPattern.EnumMember {member} = &written[at].pattern { pattern = BodyPattern.EnumMember {member: member} }
+        if let BodyPattern.Record {member} = &written[at].pattern { pattern = BodyPattern.Record {member: copyMember(&member)} }
         let mut guard = Option.none<BodyNodeId>()
         if let Option<BodyNodeId>.Some {value: tested} = &written[at].guard { guard = Option.some<BodyNodeId>(tested) }
         return Option.some<ArmView>(ArmView {pattern: move pattern, guard: move guard, result: written[at].result, origin: written[at].origin})
@@ -1082,30 +1166,47 @@ effect fn enumOperand(member: BodyEnumMember, ty: &Shared<Type>) -> Operand ! Ou
   return Operand.Integer {decimal: run magnitudeText(member.magnitude), negative: member.negative, ty: Shared.clone<Type>(ty)}
 }
 
-// Ends the current block with one switch over arms `from..`: each member goes to the first arm
-// that can select it, and every other value to the first universal arm. Coverage was proven
-// during checking, so a missing universal arm leaves an unreachable default.
-effect fn dispatchArms(builder: &mut Builder, arms: &[ArmView], entries: &[usize], scrutinee: usize,
+// One dispatch choice: a distinct case value, keyed by member ordinal or tag, or every remaining value.
+union Selector {
+  Any,
+  Case {key: usize, decimal: Bytes, negative: bool},
+}
+
+effect fn selectorOf(pattern: &BodyPattern) -> Selector ! OutOfMemoryError ? &mut Allocator {
+  return match &pattern.* {
+    BodyPattern.Universal => Selector.Any
+    BodyPattern.EnumMember {member} => Selector.Case {key: member.ordinal, decimal: run magnitudeText(member.magnitude), negative: member.negative}
+    BodyPattern.Record {member} => match &member {
+      Option<BodyUnionMember>.Some {value} => Selector.Case {key: value.tag, decimal: run Type.extentText(value.tag), negative: false}
+      Option<BodyUnionMember>.None => Selector.Any
+    }
+  }
+}
+
+// Ends the current block with one switch over arms `from..`: each case value goes to the first arm
+// that can select it, and every other value to the first arm that selects any value. Coverage was
+// proven during checking, so a missing catch-all leaves an unreachable default.
+effect fn dispatchArms(builder: &mut Builder, selectors: &[Selector], entries: &[usize], switched: usize,
   from: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut cases = Vector.make<SwitchCase>()
   let mut seen = Vector.make<usize>()
   let mut otherwise = usize.MAX
   let mut at = from
-  while at < arms.length && otherwise == usize.MAX {
-    match &arms[at].pattern {
-      BodyPattern.Universal => { otherwise = entries[at] }
-      BodyPattern.EnumMember {member} => {
+  while at < selectors.length && otherwise == usize.MAX {
+    match &selectors[at] {
+      Selector.Any => { otherwise = entries[at] }
+      Selector.Case {key, decimal, negative} => {
         let prior = Vector.asSlice<usize>(&seen)
         let mut repeated = false
         let mut scan = usize.ZERO
         while scan < prior.length {
-          if prior[scan] == member.ordinal { repeated = true }
+          if prior[scan] == key { repeated = true }
           scan = scan + usize.ONE
         }
         if !repeated {
-          run Vector.append<usize>(&mut seen, member.ordinal)
+          run Vector.append<usize>(&mut seen, key)
           run Vector.append<SwitchCase>(&mut cases, SwitchCase {
-            decimal: run magnitudeText(member.magnitude), negative: member.negative, target: entries[at],
+            decimal: run Bytes.copy(Bytes.asSlice(&decimal)), negative: negative, target: entries[at],
           })
         }
       }
@@ -1113,19 +1214,51 @@ effect fn dispatchArms(builder: &mut Builder, arms: &[ArmView], entries: &[usize
     at = at + usize.ONE
   }
   if otherwise == usize.MAX { otherwise = run block(&mut builder.*, origin) }
+  if Vector.length<SwitchCase>(&cases) == usize.ZERO {
+    terminate(&mut builder.*, Terminator.Goto {target: otherwise, origin: origin})
+    return ()
+  }
   terminate(&mut builder.*, Terminator.Switch {
-    value: Operand.Copy {place: place(scrutinee)}, cases: move cases, otherwise: otherwise, origin: origin,
+    value: Operand.Copy {place: place(switched)}, cases: move cases, otherwise: otherwise, origin: origin,
   })
   return ()
 }
 
-// The subject is evaluated once; a false guard resumes dispatch at the following arm.
+fn unionCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.Union {members} => Vector.length<Shared<Type>>(&members)
+    _ => usize.ZERO
+  }
+}
+
+// The unsigned tag type whose width the structural union's layout stores at offset zero.
+effect fn tagType(subject: &Shared<Type>) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = Layout.tagBytes(Shared.with<Type, usize>(subject, unionCount))
+  if bytes == usize.ONE { return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u8")}) }
+  if bytes == 2 { return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u16")}) }
+  return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u32")})
+}
+
+fn scrutineePlace(builder: &Builder, subject: BodyNodeId) -> Option<usize> {
+  let listed = Vector.asSlice<Scrutinee>(&builder.scrutinees)
+  let mut at = listed.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if listed[at].subject == subject.index { return Option.some<usize>(at) }
+  }
+  return Option.none<usize>()
+}
+
+// The subject is evaluated once: a place match keeps its projected storage, other matches read one
+// copy. Enum values are switched directly; a union switches on its tag. A false guard resumes
+// dispatch at the following arm.
 effect fn lowerMatch(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
   hir: &Module,
   node: BodyNodeId,
   subject: BodyNodeId,
+  placeMatch: bool,
   count: usize,
   ty: &Shared<Type>,
   origin: Origin,
@@ -1135,11 +1268,28 @@ effect fn lowerMatch(
     Option<Shared<Type>>.Some {value} => value
     Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
   }
-  let input = run expression(&mut builder.*, body, hir, subject)
-  let scrutinee = run temporary(&mut builder.*, &subjectType, origin)
-  run assign(&mut builder.*, place(scrutinee), Rvalue.Use {value: move input}, origin)
+  let mut scrutinee = place(usize.ZERO)
+  if placeMatch {
+    scrutinee = run expressionPlace(&mut builder.*, body, hir, subject)
+  } else {
+    let input = run expression(&mut builder.*, body, hir, subject)
+    let copied = run temporary(&mut builder.*, &subjectType, origin)
+    run assign(&mut builder.*, place(copied), Rvalue.Use {value: move input}, origin)
+    scrutinee = place(copied)
+  }
+  let mut switched = scrutinee.local
+  if Shared.with<Type, usize>(&subjectType, unionCount) != usize.ZERO {
+    let tag = run tagType(&subjectType)
+    switched = run temporary(&mut builder.*, &tag, origin)
+    run assign(&mut builder.*, place(switched), Rvalue.Discriminant {place: run copyPlace(&scrutinee)}, origin)
+  } else if Vector.length<Projection>(&scrutinee.projections) != usize.ZERO {
+    switched = run temporary(&mut builder.*, &subjectType, origin)
+    run assign(&mut builder.*, place(switched), Rvalue.Use {value: Operand.Copy {place: run copyPlace(&scrutinee)}}, origin)
+  }
+  run Vector.append<Scrutinee>(&mut builder.*.scrutinees, Scrutinee {subject: subject.index, place: move scrutinee})
   let output = run temporary(&mut builder.*, ty, origin)
   let mut arms = Vector.make<ArmView>()
+  let mut selectors = Vector.make<Selector>()
   let mut entries = Vector.make<usize>()
   let mut results = Vector.make<usize>()
   let mut at = usize.ZERO
@@ -1151,6 +1301,7 @@ effect fn lowerMatch(
     let resultBlock = run block(&mut builder.*, arm.origin)
     let mut entry = resultBlock
     if let Option<BodyNodeId>.Some {..} = &arm.guard { entry = run block(&mut builder.*, arm.origin) }
+    run Vector.append<Selector>(&mut selectors, run selectorOf(&arm.pattern))
     run Vector.append<usize>(&mut entries, entry)
     run Vector.append<usize>(&mut results, resultBlock)
     run Vector.append<ArmView>(&mut arms, move arm)
@@ -1158,9 +1309,10 @@ effect fn lowerMatch(
   }
   let join = run block(&mut builder.*, origin)
   let armSlice = Vector.asSlice<ArmView>(&arms)
+  let selectorSlice = Vector.asSlice<Selector>(&selectors)
   let entrySlice = Vector.asSlice<usize>(&entries)
   let resultSlice = Vector.asSlice<usize>(&results)
-  run dispatchArms(&mut builder.*, armSlice, entrySlice, scrutinee, usize.ZERO, origin)
+  run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, usize.ZERO, origin)
   at = usize.ZERO
   while at < count {
     let armOrigin = armSlice[at].origin
@@ -1172,7 +1324,7 @@ effect fn lowerMatch(
       let fallback = run block(&mut builder.*, armOrigin)
       terminate(&mut builder.*, Terminator.Branch {condition: move condition, thenBlock: resultBlock, elseBlock: fallback, origin: armOrigin})
       resume(&mut builder.*, fallback)
-      run dispatchArms(&mut builder.*, armSlice, entrySlice, scrutinee, at + usize.ONE, armOrigin)
+      run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, at + usize.ONE, armOrigin)
     }
     resume(&mut builder.*, resultBlock)
     let value = run expression(&mut builder.*, body, hir, result)
@@ -1310,6 +1462,14 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       drop ignored
     }
     View.Match {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.UnionInject {..} => {
+      let ignored = run expression(&mut builder.*, body, hir, id)
+      drop ignored
+    }
+    View.PatternBinding {..} => {
       let ignored = run expression(&mut builder.*, body, hir, id)
       drop ignored
     }
@@ -1479,6 +1639,7 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
     }
     View.Move {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.EnumValue {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.UnionInject {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.Match {node, subject, count, ..} => {
       drop run collectCallNodes(body, subject, &mut output.*)
       let mut at = usize.ZERO
@@ -1680,6 +1841,7 @@ impl MirFunction {
       current: usize.ZERO,
       live: true,
       loops: Vector.make<LoopTargets>(),
+      scrutinees: Vector.make<Scrutinee>(),
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
@@ -1776,8 +1938,14 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.EnumValue {ty, value, origin} => View.EnumValue {
       ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin,
     }
-    View.Match {ty, node, subject, count, origin} => View.Match {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, count: count, origin: origin,
+    View.Match {ty, node, subject, place: placeMatch, count, origin} => View.Match {
+      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, place: placeMatch, count: count, origin: origin,
+    }
+    View.UnionInject {ty, tag, value, origin} => View.UnionInject {
+      ty: run Type.applyBindings(&ty, bindings, true), tag: tag, value: value, origin: origin,
+    }
+    View.PatternBinding {ty, node, subject, origin} => View.PatternBinding {
+      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, origin: origin,
     }
     View.Prefix {ty, operation, operand, origin} => View.Prefix {
       ty: run Type.applyBindings(&ty, bindings, true),
