@@ -437,3 +437,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 2026-10-03 · Auxiliary compiler manifest rooted inside format/ changed the module search base and made format.* imports unresolved · Keep the auxiliary entry point directly under compiler/src and delegate to format.Gate · Silk compiler formatter
 
 2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter
+
+2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter
