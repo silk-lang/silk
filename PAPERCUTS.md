@@ -433,3 +433,13 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · The shared local test script rejected an empty filter before acquiring the build slot · Give focused formatter cases a common `document` prefix and pass that nonempty filter · native formatter
 
 - 2026-10-03 · T3's generated `t3code/add-selfhost-formatter` branch was blocked by the repository push hook, so PR creation could not find its head · Push the workspace branch to `selfhost-formatter-document` with an explicit refspec · native formatter
+
+2026-10-03 · Auxiliary compiler manifest rooted inside format/ changed the module search base and made format.* imports unresolved · Keep the auxiliary entry point directly under compiler/src and delegate to format.Gate · Silk compiler formatter
+
+2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter
+
+2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter
+
+2026-10-03 · Corpus setup used exact whitespace replacements in authored Silk fixtures and failed after the formatter rewrote them · Materialize scenarios before formatting in the same verification process, then rebuild and run every scenario against the formatted compiler and live standard library · Silk compiler formatter
+
+2026-10-03 · Inline workflow configuration escaped TypeScript checking and used an obsolete Effect Config API spelling · Move configuration into the checked FormatterVerification actor and smoke-test the exact runtime entry · Silk compiler formatter
