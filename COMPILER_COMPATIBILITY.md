@@ -123,6 +123,20 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Selfhost reports owned cleanup as the `cleanup` gap until drops are lowered
+
+- **Status:** implemented on 2026-10-03 as a stopgap until Step 6 (MIR drops and drop flags)
+  replaces it.
+- **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
+  leaves scope without being moved.
+- **Compilers:** the bootstrap lowers drops. Selfhost lowers none, so a reached body that would
+  run cleanup is the backend gap `cleanup` instead of a silent leak: a return, break, continue or
+  block end with a live owned value, a move on only some paths, an assignment over a live value,
+  a partial move, or a moved `match`, `let` or `if let` subject.
+- **Source migration:** none.
+- **Evidence:** `cleanupGapNamesEveryExitThatWouldLeak` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
