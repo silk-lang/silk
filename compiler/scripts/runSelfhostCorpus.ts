@@ -204,18 +204,31 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
   try {
     writeProgram(directory, program)
     const executable = join(directory, 'program')
-    const profiles = program.nativeProfiles ?? [{ name: 'optimized', optimization: 'speed', debug: false }]
+    const profiles = program.nativeProfiles ?? [
+      { name: 'optimized', optimization: 'speed', debug: false },
+    ]
     for (const profile of profiles) {
-      const built = spawnSync(silkc, [
-        'build', 'main.silk', '-o', 'program', '--stdlib',
-        fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
-        '--optimization', profile.optimization, '--debug', String(profile.debug),
-      ], {
-        cwd: directory,
-        encoding: 'utf8',
-        timeout: processTimeoutMs,
-        maxBuffer: 4 * 1024 * 1024,
-      })
+      const built = spawnSync(
+        silkc,
+        [
+          'build',
+          'main.silk',
+          '-o',
+          'program',
+          '--stdlib',
+          fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
+          '--optimization',
+          profile.optimization,
+          '--debug',
+          String(profile.debug),
+        ],
+        {
+          cwd: directory,
+          encoding: 'utf8',
+          timeout: processTimeoutMs,
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      )
       if (built.error !== undefined || built.status !== 0 || built.signal !== null) {
         const gaps = built.error === undefined ? parseUnsupported(text(built.stderr)) : undefined
         const diagnostic =
@@ -291,18 +304,14 @@ export const summarize = (
   }
 }
 
-const main = (): void => {
-  const silkc = process.env.SILKC
-  if (silkc === undefined || silkc.length === 0)
-    throw new Error('SILKC must name the self-hosted compiler executable')
+/** Runs already-materialized scenarios against the requested compiler and its live standard library. */
+export const runCorpus = (silkc: string, corpus: ReadonlyArray<CorpusProgram>): number => {
   const selected = process.env.SILK_SELFHOST_CORPUS_CASES?.split(',')
     .map((name) => name.trim())
     .filter((name) => name.length > 0)
   const selectedSet = selected === undefined ? undefined : new Set(selected)
   const programs =
-    selectedSet === undefined
-      ? nativeCorpus
-      : nativeCorpus.filter((program) => selectedSet.has(program.name))
+    selectedSet === undefined ? corpus : corpus.filter((program) => selectedSet.has(program.name))
   if (selectedSet !== undefined && programs.length !== selectedSet.size)
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
   const track = selfhostTrack.filter((name) => selectedSet === undefined || selectedSet.has(name))
@@ -333,8 +342,16 @@ const main = (): void => {
     process.stdout.write(`Selfhost gap ${gap.code}: ${gap.count}\n`)
   if (summary.trackFailures.length > 0) {
     process.stderr.write(`Selfhost track failed: ${summary.trackFailures.join(', ')}\n`)
-    process.exitCode = 1
+    return 1
   }
+  return 0
+}
+
+const main = (): void => {
+  const silkc = process.env.SILKC
+  if (silkc === undefined || silkc.length === 0)
+    throw new Error('SILKC must name the self-hosted compiler executable')
+  process.exitCode = runCorpus(silkc, nativeCorpus)
 }
 
 if (
