@@ -121,6 +121,17 @@ dependencies. Install from that lockfile with `pnpm install --frozen-lockfile`, 
 checkout's CLI with the command below. A built `dist` CLI or native executable is an output of
 those recorded inputs, not an independent bootstrap source.
 
+## Anonymous declaration identities
+
+The syntax-only module index gives each anonymous callable and Effect literal its own
+`DeclarationId`. An unnamed `Anonymous` or `EffectBlock` owner step carries its zero-based ordinal
+among literals of that kind in the enclosing abstract body. Both `static if` arms count, and a
+nested literal starts a new owner scope. Anonymous `effect fn` literals share the `EffectBlock`
+kind with Effect blocks. Moving named declarations, changing offsets or adding unrelated bindings
+does not change these identities. Inserting a same-kind literal before another changes its ordinal.
+Literal declarations do not create module name candidates. Their written headers and body content
+have separate fingerprints; semantic capture checking and native invocation remain Step 8 work.
+
 ## In-memory semantic queries
 
 `semantic.Semantic` resolves demanded facts from a held, immutable, in-memory
