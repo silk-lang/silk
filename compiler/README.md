@@ -42,10 +42,13 @@ each incoming edge; elsewhere no flag exists. An owner that may be moved when a 
 tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
 rvalues used only as places are dropped at the end of their full expression unless a borrowing
 `let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
-path. Partial moves of values that need cleanup (roadmap step 6d), a guard that changes an owner's
-state (the bootstrap rejects such moves as OWN0008, which selfhost does not report yet), a loop
-iteration that leaves an owner changed and a borrowing match result whose arm created temporaries
-still report the `cleanup` gap.
+path. A static partial move, including a match binding moved out of a consumed subject, leaves a
+hole in its owner: the owner is then dropped child by child, skipping moved children, and writing
+a moved child back makes it whole again. A hole beneath a type with a Drop hook is rejected as
+`OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner, a write at a
+runtime index beside a moved element, a guard that changes an owner's state (the bootstrap rejects
+such moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
+changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

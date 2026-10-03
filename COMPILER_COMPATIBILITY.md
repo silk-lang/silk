@@ -138,21 +138,24 @@ Each entry records:
 
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
-- **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit.
+- **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
+  Step 6d, which lowers partial moves.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
-- **Compilers:** both lower drops, replacement drops and drop flags. Selfhost still reports the
-  backend gap `cleanup` instead of lowering a partial move of a value that needs cleanup, a binding
-  moved out of a consuming `match`, `let` or `if let`, a loop iteration that leaves an owner in a
-  different state than it found it, a guard that changes an owner's state, a borrowing match result
-  whose arm created temporaries, and drop glue for callable and Effect environments, generic
-  nominal unions and unions without a canonical member order.
+- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
+  reports the backend gap `cleanup` instead of lowering a partially moved owner whose holes differ
+  between joining paths or that is moved on only some paths, a write at a runtime index beside a
+  moved element, a loop iteration that leaves an owner in a different state than it found it, a
+  guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
+  drop glue for callable and Effect environments, generic nominal unions and unions without a
+  canonical member order.
 - **Source migration:** none.
-- **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths` and
-  `dropGlueCleansHookThenChildren` in `compiler/src/semantic/SemanticCases.silk` cover the lowered
-  forms and the partial-move, guard and loop gaps. Not checked by a test: the borrowing match
-  result gap, which current typing cannot reach because it borrows only places and Drop-free array
-  literals, and the deferred glue forms.
+- **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
+  `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
+  `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
+  guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
+  borrowing match result gap, which current typing cannot reach because it borrows only places and
+  Drop-free array literals, and the deferred glue forms.
 
 ### Selfhost does not reject moves inside match guards at typing
 
