@@ -123,6 +123,19 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Selfhost rejects moves out of `match place` bindings
+
+- **Status:** implemented on 2026-10-03 with Step 6a.
+- **Rule:** a `match place` binding denotes a refined place of the subject; an explicit move may
+  extract it after a guard succeeds (MATCH-001).
+- **Compilers:** the bootstrap treats the move as a partial move of the subject's root, checked
+  against its Drop boundary. Selfhost rejects `move` of any `match place` binding, and `drop` of a
+  non-Copy one, as `Unsupported`, because its consumed places do not yet carry the subject path's
+  owner types.
+- **Source migration:** none.
+- **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Selfhost reports owned cleanup as the `cleanup` gap until drops are lowered
 
 - **Status:** implemented on 2026-10-03 as a stopgap until Step 6 (MIR drops and drop flags)

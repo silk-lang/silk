@@ -24,6 +24,7 @@ import hir.Hir {
   Sign,
 }
 import backend.CAbi
+import backend.CleanupNeeds {CleanupNeeds}
 import backend.Gap {Code as GapCode, Gap as BackendGap}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Abi as BackendAbi, FieldInput as LayoutFieldInput, Layout as BackendLayout, Metrics as LayoutMetrics, TypeLayout}
@@ -142,6 +143,7 @@ import semantic.Type {
   Unification,
 }
 import semantic.TypedBody {
+  BindingAccess as BodyBindingAccess,
   Expression as BodyExpression,
   SelectedFact,
   InterfaceCallInputs,
@@ -162,7 +164,10 @@ import semantic.TypedBody {
   MatchArm as BodyMatchArm,
   Pattern as BodyPattern,
   UnionMember as BodyUnionMember,
-  PatternStep as BodyPatternStep,
+  PlaceStep as BodyPlaceStep,
+  ConsumedPlace as BodyConsumedPlace,
+  PlaceRoot as BodyPlaceRoot,
+  SubjectAccess as BodySubjectAccess,
   PatternTest as BodyPatternTest,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -17455,7 +17460,7 @@ fn mutablePlace(nodes: &[BodyNode], locals: &[BodyLocal], id: BodyNodeId) -> boo
   return match & nodes[id.index].kind {
     BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} => locals[local.index].mutable
     // Only a `match &mut` binding is an exclusive place; copied, moved and shared bindings are not.
-    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {exclusive, ..}, ..} => exclusive
+    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {access, ..}, ..} => access == BodyBindingAccess.Exclusive
     BodyNodeKind.Expression {form: BodyExpression.Field {value, ..}, ..} => mutablePlace(nodes, locals, value)
     BodyNodeKind.Expression {form: BodyExpression.Index {value, ..}, ..} => {
       if let BodyNodeKind.Expression {ty, ..} = &nodes[value.index].kind {
@@ -17492,6 +17497,138 @@ fn checkedPlace(nodes: &[BodyNode], id: BodyNodeId) -> bool {
     BodyNodeKind.Expression {form: BodyExpression.PatternBinding {..}, ..} => true
     _ => false
   }
+}
+
+// What a consuming site transfers out of its operand: a static owned place, an owned rvalue, a
+// complete referent behind a reference, or a projection whose extraction would leave a hole behind
+// a reference, at a runtime index or in an owned rvalue (OWN-004). A binding of a borrowing match
+// cannot leave its arm, and moving out of a `match place` binding is not lowered yet.
+union Consumption {
+  Rvalue,
+  Place {place: BodyConsumedPlace},
+  Borrowed,
+  Boundary,
+  // `binding` is the type of the borrowing match binding the place is rooted at.
+  Escape {binding: Shared<Type>},
+  PlaceBinding,
+}
+
+// The owned place a `move`, `drop`, consuming match or by-value receiver transfers out of.
+effect fn consumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[BodyNode], id: BodyNodeId) -> Consumption
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  return match &nodes[id.index].kind {
+    BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} => Consumption.Place {
+      place: BodyConsumedPlace {root: BodyPlaceRoot.Local {local: local}, steps: Vector.make<BodyPlaceStep>()},
+    }
+    BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, access}} => match access {
+      // A consuming match's binding owns its part of the evaluated subject (MATCH-002); a bare
+      // match's binding is a place of the copied subject.
+      BodyBindingAccess.Moved => Consumption.Place {
+        place: BodyConsumedPlace {root: BodyPlaceRoot.Subject {subject: subject}, steps: run copySteps(&path)},
+      }
+      BodyBindingAccess.Copied => Consumption.Place {
+        place: BodyConsumedPlace {root: BodyPlaceRoot.Subject {subject: subject}, steps: run copySteps(&path)},
+      }
+      BodyBindingAccess.Place => Consumption.PlaceBinding
+      BodyBindingAccess.Shared => Consumption.Escape {binding: Shared.clone<Type>(&ty)}
+      BodyBindingAccess.Exclusive => Consumption.Escape {binding: Shared.clone<Type>(&ty)}
+    }
+    BodyNodeKind.Expression {form: BodyExpression.Field {value, index}, ..} => run extendedConsumption(
+      run consumption(source, cursor, nodes, value), BodyPlaceStep.Field {index: index},
+    )
+    BodyNodeKind.Expression {form: BodyExpression.Index {value, index}, ..} => run indexedConsumption(source, cursor, nodes, value, index)
+    BodyNodeKind.Expression {form: BodyExpression.Dereference {..}, ..} => Consumption.Borrowed
+    _ => Consumption.Rvalue
+  }
+}
+
+// An element leaves a hole only in a fixed array at a literal in-bounds index; a slice element is
+// reached through a reference.
+effect fn indexedConsumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[BodyNode], subject: BodyNodeId,
+  index: BodyNodeId) -> Consumption ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  // A slice element is behind the slice's reference whatever the slice came from.
+  let subjectType = bodyExpressionType(nodes, &subject)
+  let sliced = match &subjectType {
+    Option<Shared<Type>>.Some {value} => Shared.with<Type, bool>(&value, sliceType)
+    Option<Shared<Type>>.None => false
+  }
+  if sliced { return Consumption.Borrowed }
+  let base = run consumption(source, cursor, nodes, subject)
+  let place = match &base {
+    Consumption.Place {..} => true
+    _ => false
+  }
+  if !place { return run extendedConsumption(move base, BodyPlaceStep.Element {index: usize.ZERO}) }
+  let fixed = match move subjectType {
+    Option<Shared<Type>>.Some {value} => match move Type.arrayShape(&value) {
+      Option<ArrayShape>.Some {..} => true
+      Option<ArrayShape>.None => false
+    }
+    Option<Shared<Type>>.None => false
+  }
+  if !fixed { return Consumption.Boundary }
+  let mut element = Option.none<usize>()
+  if let BodyNodeKind.Expression {form: BodyExpression.Integer {literal}, ..} = &nodes[index.index].kind {
+    if let Node.IntegerLiteral {sign, magnitude, ..} = run bodyNode(source, cursor, literal) {
+      let digits = run bodyText(source, cursor, magnitude)
+      if sign == Sign.Positive { element = Type.extentValue(Bytes.asSlice(&digits)) }
+    }
+  }
+  return match move element {
+    Option<usize>.Some {value: at} => run extendedConsumption(move base, BodyPlaceStep.Element {index: at})
+    Option<usize>.None => Consumption.Boundary
+  }
+}
+
+effect fn extendedConsumption(base: Consumption, step: BodyPlaceStep) -> Consumption ! OutOfMemoryError ? &mut Allocator {
+  return match move base {
+    Consumption.Place {place} => Consumption.Place {
+      place: BodyConsumedPlace {root: move place.root, steps: run extendedPath(&place.steps, move step)},
+    }
+    // A projection out of an owned rvalue would leave its remainder without an owner.
+    Consumption.Rvalue => Consumption.Boundary
+    Consumption.Borrowed => Consumption.Boundary
+    Consumption.Boundary => Consumption.Boundary
+    Consumption.Escape {binding} => Consumption.Escape {binding: move binding}
+    Consumption.PlaceBinding => Consumption.PlaceBinding
+  }
+}
+
+fn sliceType(value: &Type) -> bool {
+  return match &value.* {
+    Type.Slice {..} => true
+    _ => false
+  }
+}
+
+// The consumed place a site records, or the rejection for a place that cannot be extracted. A
+// `drop` of a Copy value behind a reference ends no owner, so it records no place (DROP-001).
+// `copyBinding` marks a `drop`, which a borrowing match binding exempts only when the binding
+// itself is Copy; a consuming match of a Copy part of that binding copies it out.
+effect fn consumedPlace(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  module: &ModuleId, cursor: &AuthoredCursor, nodes: &[BodyNode],
+  operand: BodyNodeId, copyExempt: bool, copyBinding: bool, span: Span) -> Result<Option<BodyConsumedPlace>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut code = RejectionCode.ExtractionBoundary
+  let mut exempt = copyExempt
+  match move run consumption(&resolver.source, cursor, nodes, operand) {
+    Consumption.Place {place} => { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.some<BodyConsumedPlace>(move place)) }
+    Consumption.Rvalue => { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
+    Consumption.Borrowed => { code = RejectionCode.BorrowedExtraction }
+    Consumption.Boundary => {}
+    Consumption.Escape {binding} => {
+      code = RejectionCode.MatchBorrowEscape
+      if exempt && copyBinding {
+        exempt = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &binding, span) {
+          Result<bool, Shared<Rejection>>.Success {value} => value
+          Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(move error) }
+        }
+      }
+    }
+    Consumption.PlaceBinding => { code = RejectionCode.Unsupported }
+  }
+  if exempt { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
+  return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, code, span))
 }
 
 fn signatureOutsideScalarBodies(answer: &Result<Answer, NoRejection>) -> bool {
@@ -17985,6 +18122,9 @@ effect fn collectBodySyntax(
       }
       Node.ExpressionStatement {expression} => {
         run collectCall(hir, expression, &mut annotations.*, &mut calls.*)
+      }
+      Node.DropStatement {value} => {
+        run collectCall(hir, value, &mut annotations.*, &mut calls.*)
       }
       Node.BindingStatement {isStatic, annotation, initializer, ..} => {
         if !isStatic && annotation.present {
@@ -20247,6 +20387,39 @@ effect fn checkReceiverCall<'scope>(
       },
     )
   }
+  // A by-value receiver transfers an affine place without a written `move`; a Copy receiver is
+  // copied, and an owned rvalue receiver has no place to leave.
+  if receiverPositionValue.mode == BodyReceiverPass.Take {
+    let written = match &Vector.asSlice<BodyNode>(&nodes.*)[receiverNode.index].kind {
+      BodyNodeKind.Expression {form: BodyExpression.Move {..}, ..} => true
+      _ => false
+    }
+    let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &receiverType, memberSpan) {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    if !written && !copied {
+      let receiverSpan = Vector.asSlice<BodyNode>(&nodes.*)[receiverNode.index].origin.span
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), receiverNode, false, false, receiverSpan) {
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
+      let owned = match &consumed {
+        Option<BodyConsumedPlace>.Some {..} => true
+        Option<BodyConsumedPlace>.None => false
+      }
+      if owned {
+        adaptedReceiver = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+        run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+          origin: BodyOrigin {syntax: subject, span: span},
+          kind: BodyNodeKind.Expression {
+            ty: Shared.clone<Type>(&receiverType),
+            form: BodyExpression.Move {value: receiverNode, consumed: move consumed},
+          },
+        })
+      }
+    }
+  }
   let actualReceiver = match move bodyExpressionType(
     Vector.asSlice<BodyNode>(&nodes.*),
     &adaptedReceiver,
@@ -21794,31 +21967,32 @@ effect fn copyUnionMember(member: &Option<BodyUnionMember>) -> Option<BodyUnionM
   }
 }
 
-effect fn copySteps(path: &Vector<BodyPatternStep>) -> Vector<BodyPatternStep> ! OutOfMemoryError ? &mut Allocator {
-  let mut copied = Vector.make<BodyPatternStep>()
-  let listed = Vector.asSlice<BodyPatternStep>(path)
+effect fn copySteps(path: &Vector<BodyPlaceStep>) -> Vector<BodyPlaceStep> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector.make<BodyPlaceStep>()
+  let listed = Vector.asSlice<BodyPlaceStep>(path)
   let mut at = usize.ZERO
   while at < listed.length {
-    let mut step = BodyPatternStep.Field {index: usize.ZERO}
-    if let BodyPatternStep.Member {tag, ty} = &listed[at] { step = BodyPatternStep.Member {tag: tag, ty: Shared.clone<Type>(&ty)} }
-    if let BodyPatternStep.VariantField {tag, field} = &listed[at] { step = BodyPatternStep.VariantField {tag: tag, field: field} }
-    if let BodyPatternStep.Field {index} = &listed[at] { step = BodyPatternStep.Field {index: index} }
-    run Vector.append<BodyPatternStep>(&mut copied, move step)
+    let mut step = BodyPlaceStep.Field {index: usize.ZERO}
+    if let BodyPlaceStep.Member {tag, ty} = &listed[at] { step = BodyPlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&ty)} }
+    if let BodyPlaceStep.VariantField {tag, field} = &listed[at] { step = BodyPlaceStep.VariantField {tag: tag, field: field} }
+    if let BodyPlaceStep.Field {index} = &listed[at] { step = BodyPlaceStep.Field {index: index} }
+    if let BodyPlaceStep.Element {index} = &listed[at] { step = BodyPlaceStep.Element {index: index} }
+    run Vector.append<BodyPlaceStep>(&mut copied, move step)
     at = at + usize.ONE
   }
   return move copied
 }
 
-effect fn extendedPath(path: &Vector<BodyPatternStep>, step: BodyPatternStep) -> Vector<BodyPatternStep> ! OutOfMemoryError ? &mut Allocator {
+effect fn extendedPath(path: &Vector<BodyPlaceStep>, step: BodyPlaceStep) -> Vector<BodyPlaceStep> ! OutOfMemoryError ? &mut Allocator {
   let mut extended = run copySteps(path)
-  run Vector.append<BodyPatternStep>(&mut extended, move step)
+  run Vector.append<BodyPlaceStep>(&mut extended, move step)
   return move extended
 }
 
 // Coverage mirrors the bootstrap row model: the uncovered values are rows, each a top-level member
 // plus the tags its nested union paths may still hold; an absent path may hold any tag.
 struct CoverageConstraint {
-  path: Vector<BodyPatternStep>
+  path: Vector<BodyPlaceStep>
   allowed: Vector<bool>
 }
 
@@ -21827,22 +22001,22 @@ struct CoverageRow {
   constraints: Vector<CoverageConstraint>
 }
 
-fn sameStep(left: &BodyPatternStep, right: &BodyPatternStep) -> bool {
-  if let BodyPatternStep.Member {tag, ..} = &left.* {
-    if let BodyPatternStep.Member {tag: other, ..} = &right.* { return tag == other }
+fn sameStep(left: &BodyPlaceStep, right: &BodyPlaceStep) -> bool {
+  if let BodyPlaceStep.Member {tag, ..} = &left.* {
+    if let BodyPlaceStep.Member {tag: other, ..} = &right.* { return tag == other }
   }
-  if let BodyPatternStep.VariantField {tag, field} = &left.* {
-    if let BodyPatternStep.VariantField {tag: otherTag, field: otherField} = &right.* { return tag == otherTag && field == otherField }
+  if let BodyPlaceStep.VariantField {tag, field} = &left.* {
+    if let BodyPlaceStep.VariantField {tag: otherTag, field: otherField} = &right.* { return tag == otherTag && field == otherField }
   }
-  if let BodyPatternStep.Field {index} = &left.* {
-    if let BodyPatternStep.Field {index: other} = &right.* { return index == other }
+  if let BodyPlaceStep.Field {index} = &left.* {
+    if let BodyPlaceStep.Field {index: other} = &right.* { return index == other }
   }
   return false
 }
 
-fn samePath(left: &Vector<BodyPatternStep>, right: &Vector<BodyPatternStep>) -> bool {
-  let first = Vector.asSlice<BodyPatternStep>(left)
-  let second = Vector.asSlice<BodyPatternStep>(right)
+fn samePath(left: &Vector<BodyPlaceStep>, right: &Vector<BodyPlaceStep>) -> bool {
+  let first = Vector.asSlice<BodyPlaceStep>(left)
+  let second = Vector.asSlice<BodyPlaceStep>(right)
   if first.length != second.length { return false }
   let mut at = usize.ZERO
   while at < first.length {
@@ -21968,10 +22142,10 @@ effect fn patternBindingUse(nodes: &[BodyNode], binder: HirId) -> Option<Pattern
   let mut at = usize.ZERO
   while at < nodes.length {
     if nodes[at].origin.syntax.index == binder.index {
-      if let BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, exclusive}} = &nodes[at].kind {
+      if let BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, access}} = &nodes[at].kind {
         return Option.some<PatternBindingUse>(PatternBindingUse {
           ty: Shared.clone<Type>(&ty),
-          form: BodyExpression.PatternBinding {subject: subject, path: run copySteps(&path), exclusive: exclusive},
+          form: BodyExpression.PatternBinding {subject: subject, path: run copySteps(&path), access: access},
         })
       }
     }
@@ -22311,7 +22485,7 @@ effect fn checkRecordPatternFields(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
   nodes: &mut Vector<BodyNode>, subject: BodyNodeId, origin: &FieldSource,
-  fields: Range, path: &Vector<BodyPatternStep>, exclusive: bool, tests: &mut Vector<BodyPatternTest>, span: Span,
+  fields: Range, path: &Vector<BodyPlaceStep>, access: BodyBindingAccess, tests: &mut Vector<BodyPatternTest>, span: Span,
 ) -> Option<Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut seen = Vector.make<usize>()
@@ -22339,7 +22513,7 @@ effect fn checkRecordPatternFields(
       }
       let fieldSpan = run bodySpan(&resolver.source, cursor, fieldName)
       let mut field = CheckedRecordMember {index: usize.MAX, count: usize.ZERO, ty: run Shared.make<Type>(Type.Unit)}
-      let mut step = BodyPatternStep.Field {index: usize.ZERO}
+      let mut step = BodyPlaceStep.Field {index: usize.ZERO}
       match &origin.* {
         FieldSource.Record {ty} => {
           let selected = run checkedRecordMember(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &ty, Bytes.asSlice(&text), fieldSpan)
@@ -22347,7 +22521,7 @@ effect fn checkRecordPatternFields(
             Result<CheckedRecordMember, Shared<Rejection>>.Success {value} => value
             Result<CheckedRecordMember, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
           }
-          step = BodyPatternStep.Field {index: field.index}
+          step = BodyPlaceStep.Field {index: field.index}
         }
         FieldSource.Variant {tag, names, types} => {
           let written = Vector.asSlice<Bytes>(&names)
@@ -22359,7 +22533,7 @@ effect fn checkRecordPatternFields(
           }
           if index == written.length { return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnknownMember, fieldSpan)) }
           field = CheckedRecordMember {index: index, count: written.length, ty: Shared.clone<Type>(&listed[index])}
-          step = BodyPatternStep.VariantField {tag: tag, field: index}
+          step = BodyPlaceStep.VariantField {tag: tag, field: index}
         }
       }
       let prior = Vector.asSlice<usize>(&seen)
@@ -22379,7 +22553,7 @@ effect fn checkRecordPatternFields(
           run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
             origin: BodyOrigin {syntax: subpattern, span: subpatternSpan},
             kind: BodyNodeKind.Expression {ty: Shared.clone<Type>(&field.ty),
-              form: BodyExpression.PatternBinding {subject: subject, path: move fieldPath, exclusive: exclusive}},
+              form: BodyExpression.PatternBinding {subject: subject, path: move fieldPath, access: access}},
           })
         }
         Node.UniversalPattern {name} => {
@@ -22398,7 +22572,7 @@ effect fn checkRecordPatternFields(
             run Vector.append<BodyPatternTest>(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count})
             let nestedOrigin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-              &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, exclusive, &mut tests.*, subpatternSpan)
+              &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, access, &mut tests.*, subpatternSpan)
             if let Option<Shared<Rejection>>.Some {value} = move failed { return Option.some<Shared<Rejection>>(move value) }
           } else {
             let written = run patternMemberType(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, annotation, subpatternSpan)
@@ -22422,13 +22596,13 @@ effect fn checkRecordPatternFields(
               }
               if tag == listed.length { return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.TypeMismatch, subpatternSpan)) }
               run Vector.append<BodyPatternTest>(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: tag, tags: listed.length})
-              nestedPath = run extendedPath(&fieldPath, BodyPatternStep.Member {tag: tag, ty: Shared.clone<Type>(&nestedType)})
+              nestedPath = run extendedPath(&fieldPath, BodyPlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&nestedType)})
             } else if !run Type.equalsShared(&nestedType, &field.ty) {
               return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.TypeMismatch, subpatternSpan))
             }
             let nestedOrigin = FieldSource.Record {ty: move nestedType}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-              &mut nodes.*, subject, &nestedOrigin, nested, &nestedPath, exclusive, &mut tests.*, subpatternSpan)
+              &mut nodes.*, subject, &nestedOrigin, nested, &nestedPath, access, &mut tests.*, subpatternSpan)
             if let Option<Shared<Rejection>>.Some {value} = move failed { return Option.some<Shared<Rejection>>(move value) }
           }
         }
@@ -22682,6 +22856,17 @@ fn matchArmCount(arms: MatchArms) -> usize {
   }
 }
 
+// How a binding of a match with `access` reaches its subject.
+fn bindingAccess(access: MatchAccess) -> BodyBindingAccess {
+  return match access {
+    MatchAccess.Default => BodyBindingAccess.Copied
+    MatchAccess.Move => BodyBindingAccess.Moved
+    MatchAccess.Place => BodyBindingAccess.Place
+    MatchAccess.Shared => BodyBindingAccess.Shared
+    MatchAccess.Mutable => BodyBindingAccess.Exclusive
+  }
+}
+
 effect fn checkRecordMatch<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
@@ -22704,6 +22889,24 @@ effect fn checkRecordMatch<'scope>(
   let place = access != MatchAccess.Move && access != MatchAccess.Default
   if place && !checkedPlace(Vector.asSlice<BodyNode>(&nodes.*), subjectNode) {
     return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
+  // A consuming match transfers the subject's place into the selected arm (MATCH-002).
+  let mut subjectAccess = BodySubjectAccess.Copy
+  if place { subjectAccess = BodySubjectAccess.Place }
+  if access == MatchAccess.Move {
+    // Only a non-Copy subject leaves a hole; the rejection names the subject, as in the bootstrap.
+    let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, subjectType, span) {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    let subjectSpan = Vector.asSlice<BodyNode>(&nodes.*)[subjectNode.index].origin.span
+    let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), subjectNode, copied, false, subjectSpan) {
+      Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
+      Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+      }
+    }
+    subjectAccess = BodySubjectAccess.Consume {consumed: move consumed}
   }
   let isUnion = Shared.with<Type, bool>(subjectType, closedUnion)
   let nominal = run nominalUnionOf(&mut resolver.*, subjectType)
@@ -22848,15 +23051,15 @@ effect fn checkRecordMatch<'scope>(
         if !memberUncovered(&rows, tag) { return run bodyRejection(&resolver.*, module, RejectionCode.DuplicateMatchPattern, patternSpan) }
         ordinal = tag
         let mut member = Option.none<BodyUnionMember>()
-        let mut path = Vector.make<BodyPatternStep>()
+        let mut path = Vector.make<BodyPlaceStep>()
         if isUnion {
           member = Option.some<BodyUnionMember>(BodyUnionMember {tag: tag, ty: Shared.clone<Type>(&patternType)})
-          run Vector.append<BodyPatternStep>(&mut path, BodyPatternStep.Member {tag: tag, ty: Shared.clone<Type>(&patternType)})
+          run Vector.append<BodyPlaceStep>(&mut path, BodyPlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&patternType)})
         }
         run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
           origin: BodyOrigin {syntax: pattern, span: patternSpan},
           kind: BodyNodeKind.Expression {ty: Shared.clone<Type>(&patternType),
-            form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, exclusive: access == MatchAccess.Mutable}},
+            form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, access: bindingAccess(access)}},
         })
         checkedPattern = BodyPattern.Record {member: move member}
       }
@@ -22871,9 +23074,9 @@ effect fn checkRecordMatch<'scope>(
           if !memberUncovered(&rows, variant.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.DuplicateMatchPattern, patternSpan) }
           ordinal = variant.tag
           let origin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
-          let root = Vector.make<BodyPatternStep>()
+          let root = Vector.make<BodyPlaceStep>()
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            &mut nodes.*, subjectNode, &origin, fields, &root, access == MatchAccess.Mutable, &mut armTests, patternSpan)
+            &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
           checkedPattern = BodyPattern.Variant {tag: ordinal}
         } else {
@@ -22896,14 +23099,14 @@ effect fn checkRecordMatch<'scope>(
           if !memberUncovered(&rows, tag) { return run bodyRejection(&resolver.*, module, RejectionCode.DuplicateMatchPattern, patternSpan) }
           ordinal = tag
           let mut member = Option.none<BodyUnionMember>()
-          let mut root = Vector.make<BodyPatternStep>()
+          let mut root = Vector.make<BodyPlaceStep>()
           if isUnion {
             member = Option.some<BodyUnionMember>(BodyUnionMember {tag: tag, ty: Shared.clone<Type>(&patternType)})
-            run Vector.append<BodyPatternStep>(&mut root, BodyPatternStep.Member {tag: tag, ty: Shared.clone<Type>(&patternType)})
+            run Vector.append<BodyPlaceStep>(&mut root, BodyPlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&patternType)})
           }
           let origin = FieldSource.Record {ty: Shared.clone<Type>(&patternType)}
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            &mut nodes.*, subjectNode, &origin, fields, &root, access == MatchAccess.Mutable, &mut armTests, patternSpan)
+            &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
           checkedPattern = BodyPattern.Record {member: move member}
         }
@@ -23031,7 +23234,7 @@ effect fn checkRecordMatch<'scope>(
   let index = Vector.length<BodyNode>(&nodes.*)
   run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
     origin: BodyOrigin {syntax: expression, span: span},
-    kind: BodyNodeKind.Expression {ty: move matchType, form: BodyExpression.Match {subject: subjectNode, place: place, tags: tags, arms: move checkedArms}},
+    kind: BodyNodeKind.Expression {ty: move matchType, form: BodyExpression.Match {subject: subjectNode, access: move subjectAccess, tags: tags, arms: move checkedArms}},
   })
   // A match whose arms all transfer is `never`, which every context accepts.
   if diverges { return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index}) }
@@ -24052,7 +24255,7 @@ effect fn checkExpression<'scope>(
       let index = Vector.length<BodyNode>(&nodes.*)
       run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
         origin: BodyOrigin {syntax: expression, span: span},
-        kind: BodyNodeKind.Expression {ty: move matchType, form: BodyExpression.Match {subject: subjectNode, place: false, tags: usize.ZERO, arms: move checkedArms}},
+        kind: BodyNodeKind.Expression {ty: move matchType, form: BodyExpression.Match {subject: subjectNode, access: BodySubjectAccess.Copy, tags: usize.ZERO, arms: move checkedArms}},
       })
       // A match whose arms all transfer is `never`, which every context accepts.
       if diverges { return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index}) }
@@ -24152,8 +24355,8 @@ effect fn checkExpression<'scope>(
       return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeInvocation, span)
     }
     Node.MoveExpression {operand} => {
-      // The first abstract-body subset moves a named local as a whole. A later safety stage
-      // checks that it is still owned here and that cleanup follows the resulting control flow.
+      // A move records the place it consumes; a later safety stage checks that the place is still
+      // owned here. Static bodies move only a named local as a whole.
       if staticBody {
         if let Node.IdentifierExpression {binding, ..} = run bodyNode(
           &resolver.source,
@@ -24199,7 +24402,13 @@ effect fn checkExpression<'scope>(
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
       }
-      form = BodyExpression.Move {value: operandNode}
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode, false, false, span) {
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      form = BodyExpression.Move {value: operandNode, consumed: move consumed}
     }
     Node.PrefixExpression {operator, operatorAnchor, operand} => {
       let checked = run checkExpression(
@@ -27354,6 +27563,44 @@ effect fn checkStatements(
         )
         run Vector.append<BodyNodeId>(&mut statements.*, node)
       }
+      Node.DropStatement {value} => {
+        if staticBody {
+          return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+        }
+        let checked = run checkStatementExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+          module, cursor, caller, &mut locals.*, annotations, resultType, loopDepth, calls, &mut nodes.*,
+          &mut signatures.*, &mut requiredBodies.*, value, &Option.none<Shared<Type>>(), constraints,
+          contractBody, staticBody, unsafeAllowed)
+        let operand = match move checked {
+          Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => node
+          Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<bool, Shared<Rejection>>(move error)
+          }
+        }
+        let operandType = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &operand) {
+          Option<Shared<Type>>.Some {value: selected} => selected
+          Option<Shared<Type>>.None => {
+            return Result.failResult<bool, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+          }
+        }
+        let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &operandType, span) {
+          Result<bool, Shared<Rejection>>.Success {value: answer} => answer
+          Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
+        }
+        let operandSpan = run bodySpan(&resolver.source, cursor, value)
+        let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operand, copied, true, operandSpan) {
+          Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value: place} => place
+          Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<bool, Shared<Rejection>>(move error)
+          }
+        }
+        let node = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+        run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+          origin: BodyOrigin {syntax: statement, span: span},
+          kind: BodyNodeKind.Drop {value: operand, consumed: move consumed},
+        })
+        run Vector.append<BodyNodeId>(&mut statements.*, node)
+      }
       Node.BreakStatement => {
         if loopDepth == usize.ZERO {
           return Result.failResult<bool, Shared<Rejection>>(
@@ -28942,12 +29189,11 @@ effect fn selectedRuntimeCorrespondence(
   return true
 }
 
-// Which locals and node values of a typed body need cleanup under the caller's bindings, then the
-// first place the body would run it. A body with no such value needs no walk.
-effect fn cleanupSite(
+// Which locals and node values of a typed body need cleanup under the caller's bindings.
+effect fn cleanupNeeds(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, bindings: &[Binding],
-) -> Result<Option<Span>, Shared<Rejection>>
+) -> Result<CleanupNeeds, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let span = Shared.with<TypedBody, Span>(body, fn(value: &TypedBody) -> Span {
     let nodes = TypedBody.nodeSlice(value)
@@ -28959,7 +29205,6 @@ effect fn cleanupSite(
   let mut verdicts = Vector.make<bool>()
   let mut localNeeds = Vector.make<bool>()
   let mut nodeNeeds = Vector.make<bool>()
-  let mut any = false
   let mut at = usize.ZERO
   while at < localCount + nodeCount {
     let written = Shared.with<TypedBody, Option<Shared<Type>>>(body, fn(value: &TypedBody) -> Option<Shared<Type>> {
@@ -28987,13 +29232,12 @@ effect fn cleanupSite(
         let free = run cleanupFree(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed, &mut visiting, span)
         needs = match move free {
           Result<bool, Shared<Rejection>>.Success {value} => !value
-          Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<Option<Span>, Shared<Rejection>>(move error) }
+          Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<CleanupNeeds, Shared<Rejection>>(move error) }
         }
         run Vector.append<Shared<Type>>(&mut known, move closed)
         run Vector.append<bool>(&mut verdicts, needs)
       }
     }
-    any = any || needs
     if at < localCount {
       run Vector.append<bool>(&mut localNeeds, needs)
     } else {
@@ -29001,9 +29245,7 @@ effect fn cleanupSite(
     }
     at = at + usize.ONE
   }
-  if !any { return Result.succeed<Option<Span>, Shared<Rejection>>(Option.none<Span>()) }
-  let site = run Cleanup.site(body, Vector.asSlice<bool>(&localNeeds), Vector.asSlice<bool>(&nodeNeeds))
-  return Result.succeed<Option<Span>, Shared<Rejection>>(move site)
+  return Result.succeed<CleanupNeeds, Shared<Rejection>>(CleanupNeeds {locals: move localNeeds, nodes: move nodeNeeds})
 }
 
 effect fn resolveMir(
@@ -29343,17 +29585,18 @@ effect fn resolveMir(
   // are MIR children, while target bodies remain deferred to the admitted instance worklist.
   let callerApplication = run InstanceKey.selected(&instance)
   let callerBindings = run Application.bindings(&callerApplication)
-  // Until drops are lowered (Step 6), a body that must run cleanup is the named `cleanup` gap.
-  let cleanup = run cleanupSite(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, Vector.asSlice<Binding>(&callerBindings))
-  match move cleanup {
-    Result<Option<Span>, Shared<Rejection>>.Success {value} => {
-      if let Option<Span>.Some {value: span} = move value {
-        return memberSuccess(Value.Unsupported {
-          gap: run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, span)),
-        }, move dependencies)
-      }
+  let needs = match move run cleanupNeeds(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, Vector.asSlice<Binding>(&callerBindings)) {
+    Result<CleanupNeeds, Shared<Rejection>>.Success {value} => value
+    Result<CleanupNeeds, Shared<Rejection>>.Failure {error} => { return memberRejected(move error, move dependencies) }
+  }
+  // Until scope-exit drops are lowered (Step 6c), a body that must run cleanup is the named `cleanup` gap.
+  if CleanupNeeds.any(&needs) {
+    let site = run Cleanup.site(&typed, Vector.asSlice<bool>(&needs.locals), Vector.asSlice<bool>(&needs.nodes))
+    if let Option<Span>.Some {value: span} = move site {
+      return memberSuccess(Value.Unsupported {
+        gap: run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, span)),
+      }, move dependencies)
     }
-    Result<Option<Span>, Shared<Rejection>>.Failure {error} => { return memberRejected(move error, move dependencies) }
   }
   let mut calls = Vector.make<MirCallTarget>()
   let reachedCalls = run MirFunction.callNodes(&typed)
@@ -29499,6 +29742,7 @@ effect fn resolveMir(
         &result,
         Vector.asSlice<Shared<Type>>(&parameters),
         move calls,
+        move needs,
       ),
     )
     Option<&IndexedSource>.None => {
