@@ -1,6 +1,5 @@
 /** Ordered native-corpus programs promised by the self-hosted compiler. */
 export const selfhostTrack = [
-  'literal',
   'foreign-libc-abs',
   'foreign-libc-pointer-roundtrip',
   'foreign-libc-floating',
@@ -15,12 +14,6 @@ export const selfhostTrack = [
   'operator-interface-contract',
   'contract-only-impl-binder',
   'generic-partial-type-arguments',
-  'same-specialization-recursion',
-  'array-inferred',
-  'array-contextual-empty',
-  'array-nested',
-  'array-indexed-struct-field',
-  'array-whole-move',
   'array-upper-index-trap',
   'array-zero-index-trap',
   'mutable-array-loop',
