@@ -63,6 +63,8 @@ import semantic.CaptureAvailability
 import semantic.CaptureAvailability {FailureKind as CaptureFailureKind}
 import semantic.Capture {Access as CaptureAccess}
 import semantic.CallSelection {CallSelection}
+import semantic.CallableContract
+import semantic.CallableContract {CallableContract as CallableFacts, Failure as CallableFailure}
 import semantic.CallInput {CallInput, Arguments as CallArguments}
 import semantic.BodyInput {BodyInput}
 import semantic.DeclarationId {DeclarationId}
@@ -18215,8 +18217,13 @@ effect fn inferFromBoundAt(
       return Option.none<Shared<Rejection>>()
     }
   }
-  if let Constraint.Conforms {provider, contract} = move direct {
-    return run inferFromConformance(
+  match move direct {
+    Constraint.Represents {parameter, contract} => {
+      let fresh = run DeclarationId.copyShared(callOwner)
+      return run inferCallableBound(&resolver.*, module, &fresh, declared,
+        &mut inferred.*, &parameter, &contract, span)
+    }
+    Constraint.Conforms {provider, contract} => { return run inferFromConformance(
       &mut resolver.*,
       &mut owner.*,
       &mut dependencies.*,
@@ -18227,7 +18234,8 @@ effect fn inferFromBoundAt(
       &provider,
       &contract,
       span,
-    )
+    ) }
+    _ => ()
   }
   return Option.none<Shared<Rejection>>()
 }
@@ -23102,6 +23110,29 @@ effect fn checkInferredCallArgument<'scope>(
     }
     return Result.failResult<BodyNodeId, Shared<Rejection>>(move value)
   }
+  // Representation bounds belong to the callable operand. Infer their signature evidence
+  // before checking later operands, and diagnose an incompatible promise at this operand.
+  let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(signature, signatureConstraintCount)
+  let mut boundAt = usize.ZERO
+  while boundAt < boundCount {
+    let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraint(answer, boundAt) })
+    if let Option<Constraint>.Some {value: Constraint.Represents {parameter: representation, contract}} = move bound {
+      if run Type.equalsShared(parameter, &representation) {
+        let rejected = run inferCallableBound(&resolver.*, module, fresh, constraints,
+          &mut inferred.*, &representation, &contract, span)
+        if let Option<Shared<Rejection>>.Some {value} = move rejected {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move value)
+        }
+        let applied = run Type.applyBindings(&contract, Vector.asSlice<Binding>(&inferred.*), true)
+        let incompatible = run proveCallableBound(&resolver.*, module, constraints, &actual, &applied, span)
+        if let Option<Shared<Rejection>>.Some {value} = move incompatible {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move value)
+        }
+      }
+    }
+    boundAt = boundAt + usize.ONE
+  }
   return Result.succeed<BodyNodeId, Shared<Rejection>>(node)
 }
 
@@ -26770,6 +26801,158 @@ effect fn checkExpression<'scope>(
   }
   return run finishExpression(&mut resolver.*, module, &mut nodes.*, expression, span, move ty, move form,
     diverges, expected, contractBody, staticBody)
+}
+
+// Environment handles can alias. Copy their member handles separately before any comparison.
+effect fn callableEnvironmentRegions(environment: &Shared<Intersection>) -> Vector<Shared<Lifetime>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut regions = Vector.make<Shared<Lifetime>>()
+  let mut at = usize.ZERO
+  while true {
+    let region = Shared.with<Intersection, Option<Shared<Lifetime>>>(environment,
+      fn(value: &Intersection) -> Option<Shared<Lifetime>> {
+        let members = Vector.asSlice<LifetimeMember>(&value.members)
+        if at < members.length { return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(&members[at].region)) }
+        return Option.none<Shared<Lifetime>>()
+      })
+    if let Option<Shared<Lifetime>>.Some {value} = move region {
+      run Vector.append<Shared<Lifetime>>(&mut regions, move value)
+    } else { break }
+    at = at + usize.ONE
+  }
+  return move regions
+}
+
+effect fn callableEnvironmentOutlives(source: &Shared<Intersection>, target: &Shared<Intersection>, declared: &[Constraint])
+  -> bool ! OutOfMemoryError ? &mut Allocator {
+  let first = run callableEnvironmentRegions(source)
+  let mut second = run callableEnvironmentRegions(target)
+  if Vector.length<Shared<Lifetime>>(&second) == usize.ZERO {
+    run Vector.append<Shared<Lifetime>>(&mut second, run Shared.make<Lifetime>(Lifetime.Static))
+  }
+  let offered = Vector.asSlice<Shared<Lifetime>>(&first)
+  let promised = Vector.asSlice<Shared<Lifetime>>(&second)
+  let mut at = usize.ZERO
+  while at < offered.length {
+    let mut found = false
+    let mut other = usize.ZERO
+    while !found && other < promised.length {
+      found = run knownOutlives(declared, &offered[at], &promised[other])
+      other = other + usize.ONE
+    }
+    if !found { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn proveCallableBound(resolver: &Resolver, module: &ModuleId, declared: &[Constraint],
+  parameter: &Shared<Type>, contract: &Shared<Type>, span: Span) -> Option<Shared<Rejection>>
+! OutOfMemoryError ? &mut Allocator {
+  let source = run valueCallableContract(parameter, declared)
+  let sourceType = match move source {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => {
+      // An abstract representation may still need substitution; a closed non-callable
+      // value is a proved signature mismatch.
+      let mut code = RejectionCode.IncompatibleCallableSignature
+      if Type.hasOpenParameters(parameter) { code = RejectionCode.Unsupported }
+      return Option.some<Shared<Rejection>>(run reject(resolver, module, code, span))
+    }
+  }
+  let sourceFacts = run CallableContract.ofType(&sourceType)
+  let targetFacts = run CallableContract.ofType(contract)
+  if let Option<CallableFacts>.Some {value: offered} = move sourceFacts {
+    if let Option<CallableFacts>.Some {value: wanted} = move targetFacts {
+      let compared = run CallableContract.compare(&offered, &wanted)
+      let relation = match move compared {
+        Result<CallableContract.Relation, CallableFailure>.Success {value} => move value
+        Result<CallableContract.Relation, CallableFailure>.Failure {error} => {
+          let code = match error { CallableFailure.Incompatible => RejectionCode.IncompatibleCallableSignature
+            CallableFailure.Unsupported => RejectionCode.Unsupported }
+          return Option.some<Shared<Rejection>>(run reject(resolver, module, code, span))
+        }
+      }
+      if !run callableEnvironmentOutlives(&relation.sourceEnvironment, &relation.targetEnvironment, declared) {
+        return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleCallableSignature, span))
+      }
+      let mut premises = run copyConstraints(declared)
+      let provided = Vector.asSlice<Outlives>(&relation.provided)
+      let mut at = usize.ZERO
+      while at < provided.length {
+        run Vector.append<Constraint>(&mut premises, Constraint.Outlives {
+          longer: Shared.clone<Lifetime>(&provided[at].longer), shorter: Shared.clone<Lifetime>(&provided[at].shorter)})
+        at = at + usize.ONE
+      }
+      let required = Vector.asSlice<Outlives>(&relation.required)
+      at = usize.ZERO
+      while at < required.length {
+        if !run knownOutlives(Vector.asSlice<Constraint>(&premises), &required[at].longer, &required[at].shorter) {
+          return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleCallableSignature, span))
+        }
+        at = at + usize.ONE
+      }
+      return Option.none<Shared<Rejection>>()
+    }
+  }
+  // Effect representation contracts belong to Step 9.
+  return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span))
+}
+
+// A representation parameter first acquires its exact value type from an operand. Its
+// promised signature can then infer ordinary type parameters and an elided environment.
+effect fn inferCallableBound(resolver: &Resolver, module: &ModuleId, fresh: &DeclarationId,
+  declared: &[Constraint], inferred: &mut Vector<Binding>, parameter: &Shared<Type>, contract: &Shared<Type>, span: Span)
+  -> Option<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let actual = run Type.applyBindings(parameter, Vector.asSlice<Binding>(&inferred.*), true)
+  let source = run valueCallableContract(&actual, declared)
+  let sourceType = match move source {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { return Option.none<Shared<Rejection>>() }
+  }
+  let promised = run Type.applyBindings(contract, Vector.asSlice<Binding>(&inferred.*), true)
+  let sourceFacts = run CallableContract.ofType(&sourceType)
+  let targetFacts = run CallableContract.ofType(&promised)
+  if let Option<CallableFacts>.Some {value: offered} = move sourceFacts {
+    if let Option<CallableFacts>.Some {value: wanted} = move targetFacts {
+      if offered.invocationBinders != wanted.invocationBinders { return Option.none<Shared<Rejection>>() }
+      let mut variables = Vector.make<Shared<DeclarationId>>()
+      run Vector.append<Shared<DeclarationId>>(&mut variables, run Shared.make<DeclarationId>(run DeclarationId.copy(fresh)))
+      let provided = Vector.asSlice<Shared<Type>>(&offered.parameters)
+      let expected = Vector.asSlice<Shared<Type>>(&wanted.parameters)
+      let mut at = usize.ZERO
+      while at < provided.length && at < expected.length {
+        let compared = run Type.unify(&expected[at], &provided[at], Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut inferred.*)
+        drop compared
+        at = at + usize.ONE
+      }
+      let compared = run Type.unify(&wanted.result, &offered.result, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut inferred.*)
+      drop compared
+      let regions = run callableEnvironmentRegions(&wanted.environment)
+      let given = run callableEnvironmentRegions(&offered.environment)
+      let targets = Vector.asSlice<Shared<Lifetime>>(&regions)
+      let sources = Vector.asSlice<Shared<Lifetime>>(&given)
+      at = usize.ZERO
+      while at < targets.length {
+        let ordinal = ownedLifetimeOrdinal(&targets[at], fresh)
+        if ordinal != usize.MAX {
+          let known = bindingArgument(Vector.asSlice<Binding>(&inferred.*), fresh, ordinal)
+          if let Option<Argument>.None = move known {
+            if sources.length > usize.ONE {
+              return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span))
+            }
+            let mut region = run Shared.make<Lifetime>(Lifetime.Static)
+            if sources.length == usize.ONE { region = Shared.clone<Lifetime>(&sources[usize.ZERO]) }
+            run Vector.append<Binding>(&mut inferred.*, Binding {
+              declaration: run Shared.make<DeclarationId>(run DeclarationId.copy(fresh)), ordinal: ordinal,
+              value: Argument.Lifetime {value: move region}})
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<Shared<Rejection>>()
 }
 
 // A callable use contract belongs to an exact value or one declared representation bound.
@@ -38755,6 +38938,13 @@ effect fn proveAppliedBounds(
         }
         return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
       }
+      at = at + usize.ONE
+      continue
+    }
+    if let Constraint.Represents {parameter, contract} = &bounds[at] {
+      let failed = run proveCallableBound(&resolver.*, module, Vector.asSlice<Constraint>(declared),
+        &parameter, &contract, span)
+      if let Option<Shared<Rejection>>.Some {value} = move failed { return Option.some<Shared<Rejection>>(move value) }
       at = at + usize.ONE
       continue
     }
