@@ -143,6 +143,7 @@ import semantic.Type {
   Unification,
 }
 import semantic.TypedBody {
+  BindingAccess as BodyBindingAccess,
   Expression as BodyExpression,
   SelectedFact,
   InterfaceCallInputs,
@@ -17459,7 +17460,7 @@ fn mutablePlace(nodes: &[BodyNode], locals: &[BodyLocal], id: BodyNodeId) -> boo
   return match & nodes[id.index].kind {
     BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} => locals[local.index].mutable
     // Only a `match &mut` binding is an exclusive place; copied, moved and shared bindings are not.
-    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {exclusive, ..}, ..} => exclusive
+    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {access, ..}, ..} => access == BodyBindingAccess.Exclusive
     BodyNodeKind.Expression {form: BodyExpression.Field {value, ..}, ..} => mutablePlace(nodes, locals, value)
     BodyNodeKind.Expression {form: BodyExpression.Index {value, ..}, ..} => {
       if let BodyNodeKind.Expression {ty, ..} = &nodes[value.index].kind {
@@ -17500,13 +17501,16 @@ fn checkedPlace(nodes: &[BodyNode], id: BodyNodeId) -> bool {
 
 // What a consuming site transfers out of its operand: a static owned place, an owned rvalue, a
 // complete referent behind a reference, or a projection whose extraction would leave a hole behind
-// a reference or at a runtime index (OWN-004).
+// a reference, at a runtime index or in an owned rvalue (OWN-004). A binding of a borrowing match
+// cannot leave its arm, and moving out of a `match place` binding is not lowered yet.
 union Consumption {
   Rvalue,
   // `ancestors` are the types of the owners a non-empty path passes through.
   Place {place: BodyConsumedPlace, ancestors: Vector<Shared<Type>>},
   Borrowed,
   Boundary,
+  Escape,
+  PlaceBinding,
 }
 
 // The owned place a `move`, `drop`, consuming match or by-value receiver transfers out of.
@@ -17517,10 +17521,16 @@ effect fn consumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[Bo
       place: BodyConsumedPlace {root: BodyPlaceRoot.Local {local: local}, steps: Vector.make<BodyPlaceStep>()},
       ancestors: Vector.make<Shared<Type>>(),
     }
-    // A consuming match's arm owns the whole payload (MATCH-002); its bindings are not partial moves.
-    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {subject, path, ..}, ..} => Consumption.Place {
-      place: BodyConsumedPlace {root: BodyPlaceRoot.Subject {subject: subject}, steps: run copySteps(&path)},
-      ancestors: Vector.make<Shared<Type>>(),
+    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {subject, path, access}, ..} => match access {
+      // A consuming match's binding owns its part of the evaluated subject (MATCH-002).
+      BodyBindingAccess.Moved => Consumption.Place {
+        place: BodyConsumedPlace {root: BodyPlaceRoot.Subject {subject: subject}, steps: run copySteps(&path)},
+        ancestors: Vector.make<Shared<Type>>(),
+      }
+      BodyBindingAccess.Copied => Consumption.Rvalue
+      BodyBindingAccess.Place => Consumption.PlaceBinding
+      BodyBindingAccess.Shared => Consumption.Escape
+      BodyBindingAccess.Exclusive => Consumption.Escape
     }
     BodyNodeKind.Expression {form: BodyExpression.Field {value, index}, ..} => run extendedConsumption(
       run consumption(source, cursor, nodes, value), BodyPlaceStep.Field {index: index}, bodyExpressionType(nodes, &value),
@@ -17536,13 +17546,19 @@ effect fn consumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[Bo
 effect fn indexedConsumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[BodyNode], subject: BodyNodeId,
   index: BodyNodeId) -> Consumption ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let base = run consumption(source, cursor, nodes, subject)
-  let owned = match &base {
-    Consumption.Rvalue => false
-    _ => true
+  let place = match &base {
+    Consumption.Place {..} => true
+    _ => false
   }
-  if !owned { return move base }
-  let fixed = match move bodyExpressionType(nodes, &subject) {
-    Option<Shared<Type>>.Some {value: subjectType} => match move Type.arrayShape(&subjectType) {
+  if !place { return run extendedConsumption(move base, BodyPlaceStep.Element {index: usize.ZERO}, Option.none<Shared<Type>>()) }
+  let subjectType = bodyExpressionType(nodes, &subject)
+  let sliced = match &subjectType {
+    Option<Shared<Type>>.Some {value} => Shared.with<Type, bool>(&value, sliceType)
+    Option<Shared<Type>>.None => false
+  }
+  if sliced { return Consumption.Borrowed }
+  let fixed = match move subjectType {
+    Option<Shared<Type>>.Some {value} => match move Type.arrayShape(&value) {
       Option<ArrayShape>.Some {..} => true
       Option<ArrayShape>.None => false
     }
@@ -17571,18 +17587,29 @@ effect fn extendedConsumption(base: Consumption, step: BodyPlaceStep, parent: Op
         place: BodyConsumedPlace {root: move place.root, steps: run extendedPath(&place.steps, move step)}, ancestors: move owners,
       }
     }
-    Consumption.Rvalue => Consumption.Rvalue
+    // A projection out of an owned rvalue would leave its remainder without an owner.
+    Consumption.Rvalue => Consumption.Boundary
     Consumption.Borrowed => Consumption.Boundary
     Consumption.Boundary => Consumption.Boundary
+    Consumption.Escape => Consumption.Escape
+    Consumption.PlaceBinding => Consumption.PlaceBinding
+  }
+}
+
+fn sliceType(value: &Type) -> bool {
+  return match &value.* {
+    Type.Slice {..} => true
+    _ => false
   }
 }
 
 // The consumed place a site records, or the rejection for a place that cannot be extracted. A
 // `drop` of a Copy value behind a reference ends no owner, so it records no place (DROP-001). A
-// partial move cannot leave a hole beneath an owner with a `Drop` hook (OWN-004).
+// partial move cannot leave a hole beneath an owner with a `Drop` hook (OWN-004); that check runs
+// unless `hookExempt` and is reported at `hookSpan`.
 effect fn consumedPlace(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
   module: &ModuleId, cursor: &AuthoredCursor, nodes: &[BodyNode],
-  operand: BodyNodeId, copyExempt: bool, span: Span) -> Result<Option<BodyConsumedPlace>, Shared<Rejection>>
+  operand: BodyNodeId, copyExempt: bool, span: Span, hookExempt: bool, hookSpan: Span) -> Result<Option<BodyConsumedPlace>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut code = RejectionCode.ExtractionBoundary
   match move run consumption(&resolver.source, cursor, nodes, operand) {
@@ -17596,8 +17623,8 @@ effect fn consumedPlace(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
               Option<Shared<DeclarationId>>.Some {..} => true
               Option<Shared<DeclarationId>>.None => false
             }
-            if hooked && !copyExempt {
-              return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.ExtractionBoundary, span))
+            if hooked && !hookExempt {
+              return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.ExtractionBoundary, hookSpan))
             }
           }
           Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Failure {error} => {
@@ -17611,6 +17638,8 @@ effect fn consumedPlace(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
     Consumption.Rvalue => { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
     Consumption.Borrowed => { code = RejectionCode.BorrowedExtraction }
     Consumption.Boundary => {}
+    Consumption.Escape => { code = RejectionCode.MatchBorrowEscape }
+    Consumption.PlaceBinding => { code = RejectionCode.Unsupported }
   }
   if copyExempt { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
   return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, code, span))
@@ -20384,7 +20413,8 @@ effect fn checkReceiverCall<'scope>(
       Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
     }
     if !written && !copied {
-      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), receiverNode, false, memberSpan) {
+      let receiverSpan = Vector.asSlice<BodyNode>(&nodes.*)[receiverNode.index].origin.span
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), receiverNode, false, receiverSpan, false, receiverSpan) {
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
       }
@@ -22126,10 +22156,10 @@ effect fn patternBindingUse(nodes: &[BodyNode], binder: HirId) -> Option<Pattern
   let mut at = usize.ZERO
   while at < nodes.length {
     if nodes[at].origin.syntax.index == binder.index {
-      if let BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, exclusive}} = &nodes[at].kind {
+      if let BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, access}} = &nodes[at].kind {
         return Option.some<PatternBindingUse>(PatternBindingUse {
           ty: Shared.clone<Type>(&ty),
-          form: BodyExpression.PatternBinding {subject: subject, path: run copySteps(&path), exclusive: exclusive},
+          form: BodyExpression.PatternBinding {subject: subject, path: run copySteps(&path), access: access},
         })
       }
     }
@@ -22469,7 +22499,7 @@ effect fn checkRecordPatternFields(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
   nodes: &mut Vector<BodyNode>, subject: BodyNodeId, origin: &FieldSource,
-  fields: Range, path: &Vector<BodyPlaceStep>, exclusive: bool, tests: &mut Vector<BodyPatternTest>, span: Span,
+  fields: Range, path: &Vector<BodyPlaceStep>, access: BodyBindingAccess, tests: &mut Vector<BodyPatternTest>, span: Span,
 ) -> Option<Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut seen = Vector.make<usize>()
@@ -22537,7 +22567,7 @@ effect fn checkRecordPatternFields(
           run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
             origin: BodyOrigin {syntax: subpattern, span: subpatternSpan},
             kind: BodyNodeKind.Expression {ty: Shared.clone<Type>(&field.ty),
-              form: BodyExpression.PatternBinding {subject: subject, path: move fieldPath, exclusive: exclusive}},
+              form: BodyExpression.PatternBinding {subject: subject, path: move fieldPath, access: access}},
           })
         }
         Node.UniversalPattern {name} => {
@@ -22556,7 +22586,7 @@ effect fn checkRecordPatternFields(
             run Vector.append<BodyPatternTest>(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count})
             let nestedOrigin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-              &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, exclusive, &mut tests.*, subpatternSpan)
+              &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, access, &mut tests.*, subpatternSpan)
             if let Option<Shared<Rejection>>.Some {value} = move failed { return Option.some<Shared<Rejection>>(move value) }
           } else {
             let written = run patternMemberType(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, annotation, subpatternSpan)
@@ -22586,7 +22616,7 @@ effect fn checkRecordPatternFields(
             }
             let nestedOrigin = FieldSource.Record {ty: move nestedType}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-              &mut nodes.*, subject, &nestedOrigin, nested, &nestedPath, exclusive, &mut tests.*, subpatternSpan)
+              &mut nodes.*, subject, &nestedOrigin, nested, &nestedPath, access, &mut tests.*, subpatternSpan)
             if let Option<Shared<Rejection>>.Some {value} = move failed { return Option.some<Shared<Rejection>>(move value) }
           }
         }
@@ -22840,6 +22870,17 @@ fn matchArmCount(arms: MatchArms) -> usize {
   }
 }
 
+// How a binding of a match with `access` reaches its subject.
+fn bindingAccess(access: MatchAccess) -> BodyBindingAccess {
+  return match access {
+    MatchAccess.Default => BodyBindingAccess.Copied
+    MatchAccess.Move => BodyBindingAccess.Moved
+    MatchAccess.Place => BodyBindingAccess.Place
+    MatchAccess.Shared => BodyBindingAccess.Shared
+    MatchAccess.Mutable => BodyBindingAccess.Exclusive
+  }
+}
+
 effect fn checkRecordMatch<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
@@ -22867,7 +22908,13 @@ effect fn checkRecordMatch<'scope>(
   let mut subjectAccess = BodySubjectAccess.Copy
   if place { subjectAccess = BodySubjectAccess.Place }
   if access == MatchAccess.Move {
-    let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), subjectNode, false, span) {
+    // Only a non-Copy subject leaves a hole; the rejection names the subject, as in the bootstrap.
+    let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, subjectType, span) {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    let subjectSpan = Vector.asSlice<BodyNode>(&nodes.*)[subjectNode.index].origin.span
+    let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), subjectNode, copied, subjectSpan, copied, subjectSpan) {
       Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
       Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
         return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
@@ -23026,7 +23073,7 @@ effect fn checkRecordMatch<'scope>(
         run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
           origin: BodyOrigin {syntax: pattern, span: patternSpan},
           kind: BodyNodeKind.Expression {ty: Shared.clone<Type>(&patternType),
-            form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, exclusive: access == MatchAccess.Mutable}},
+            form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, access: bindingAccess(access)}},
         })
         checkedPattern = BodyPattern.Record {member: move member}
       }
@@ -23043,7 +23090,7 @@ effect fn checkRecordMatch<'scope>(
           let origin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
           let root = Vector.make<BodyPlaceStep>()
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            &mut nodes.*, subjectNode, &origin, fields, &root, access == MatchAccess.Mutable, &mut armTests, patternSpan)
+            &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
           checkedPattern = BodyPattern.Variant {tag: ordinal}
         } else {
@@ -23073,7 +23120,7 @@ effect fn checkRecordMatch<'scope>(
           }
           let origin = FieldSource.Record {ty: Shared.clone<Type>(&patternType)}
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            &mut nodes.*, subjectNode, &origin, fields, &root, access == MatchAccess.Mutable, &mut armTests, patternSpan)
+            &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
           checkedPattern = BodyPattern.Record {member: move member}
         }
@@ -24369,7 +24416,7 @@ effect fn checkExpression<'scope>(
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
       }
-      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode, false, span) {
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode, false, span, false, span) {
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
           return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
@@ -27555,7 +27602,7 @@ effect fn checkStatements(
           Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
         }
         let operandSpan = run bodySpan(&resolver.source, cursor, value)
-        let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operand, copied, operandSpan) {
+        let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operand, copied, operandSpan, false, span) {
           Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value: place} => place
           Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
             return Result.failResult<bool, Shared<Rejection>>(move error)
@@ -36513,7 +36560,8 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Body, module, name, &answer)
     return move answer
   }
-  /// Demands the drop glue MIR of one type, as the build worklist reaches it from a `Drop`.
+  /// Demands the drop glue MIR of one type through the `Family.Mir` key the instance worklist
+  /// interns for it. A type that mentions no declaration has no glue and answers `LayoutUnsupported`.
   pub effect fn demandGlueMir(self: &mut Self, request: &mut Request, ty: &Shared<Type>) -> Shared<Result<Answer, NoRejection>>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
     run selectRequest(&mut self.resolver, &request.*)

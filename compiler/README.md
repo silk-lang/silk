@@ -23,9 +23,11 @@ Slice subranges, generic unions, block-bodied match arms and bindings that are a
 remain coverage work for backend roadmap step 4.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
 by-value receiver of an affine place. The place is a local or match subject plus static field,
-element and union steps; an owned rvalue records none. A runtime index or a reference boundary is
-rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`), and moving a whole non-Copy referent
-as `OWN0012` (`BorrowedExtraction`). Semantic analysis decides which locals and values need cleanup: those
+element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
+projection out of an owned rvalue is rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`),
+moving a whole non-Copy referent or a slice element as `OWN0012` (`BorrowedExtraction`), and moving
+a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). Moving out
+of a `match place` binding is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
 whose owned structure carries `impl Drop`, found through the implementation query. `drop` of any
 other value emits nothing; a drop that needs cleanup calls the drop glue of the value's type. Glue is
 its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
@@ -36,12 +38,15 @@ stack: bindings and by-value parameters that need cleanup are owners of their sc
 mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,
 innermost first and in reverse acquisition order. Replacement drops the displaced value first.
 Where paths reach a join with different ownership, the owner gets a `DropFlag` local written on
-each incoming edge; elsewhere no flag exists. Owned rvalues used only as places are dropped at the
-end of their full expression unless a borrowing `let` keeps them. A static partial move, including
-a match binding moved out of a consumed subject, leaves a hole in its owner: the owner is then
-dropped child by child, skipping moved children, and writing a moved child back makes it whole
-again. A hole beneath a type with a Drop hook is rejected as `OWN0002`. Holes that differ between
-joining paths still report the `cleanup` gap.
+each incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
+tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
+rvalues used only as places are dropped at the end of their full expression unless a borrowing
+`let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
+path. A static partial move, including a match binding moved out of a consumed subject, leaves a
+hole in its owner: the owner is then dropped child by child, skipping moved children, and writing
+a moved child back makes it whole again. A hole beneath a type with a Drop hook is rejected as
+`OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner and a write at a
+runtime index beside a moved element still report the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
@@ -55,6 +60,21 @@ imports may omit it. The nearest `silk.toml` selects `[package].root`, whose con
 is the root for local module paths. Without a manifest, the entry file's directory is the module
 root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
+
+`silkc format [paths] [--check]` formats source without semantic analysis or code generation.
+The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
+directory is the source root. With no paths the command recursively selects that root. Explicit
+files and directories are resolved against the working directory, must stay inside the source
+root, and select only exact `.silk` extensions. Selection is sorted by normalized path bytes and
+deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
+filename beginning with a dash.
+
+Write mode replaces changed files; `--check` reports changes without writing. Damaged source is
+reported with its first offending byte offset and remains untouched. Other readable selected
+files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
+drift, and `2` for project, selection, filesystem, allocation, or diagnostic-output failures.
+The portable filesystem uses complete create-or-truncate writes; an interrupted or failed write
+can leave a partial file, so formatter writes currently have the same limitation.
 
 `driver.ModuleSources` reads only modules observed as absent by a reached semantic demand. It
 publishes each file's exact bytes or absence as a separate `SourceRevision` mapping, then resumes
