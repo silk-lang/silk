@@ -123,6 +123,17 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Selfhost does not lower moves out of `match place` bindings
+
+- **Status:** implemented on 2026-10-03 with Step 6a.
+- **Rule:** a `match place` binding denotes a refined place of the subject; an explicit move may
+  extract it after a guard succeeds (MATCH-001).
+- **Compilers:** the bootstrap treats the move as a partial move of the subject's root, checked
+  against its Drop boundary. Selfhost rejects `move` or `drop` of a non-Copy `match place` binding
+  as `Unsupported`, because its consumed places do not yet carry the subject path's owner types.
+- **Source migration:** none.
+- **Evidence:** `consumingSitesRecordConsumedPlaces` in `compiler/src/semantic/SemanticCases.silk`.
+
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit.
@@ -130,12 +141,12 @@ Each entry records:
   leaves scope without being moved.
 - **Compilers:** both lower drops, replacement drops and drop flags. Selfhost still reports the
   backend gap `cleanup` instead of lowering a partial move of a value that needs cleanup, a binding
-  moved out of a consuming `match`, `let` or `if let`, a projection moved out of an owned rvalue,
-  and drop glue for callable and Effect environments, generic nominal unions and unions without a
-  canonical member order.
+  moved out of a consuming `match`, `let` or `if let`, a loop iteration that leaves an owner in a
+  different state than it found it, and drop glue for callable and Effect environments, generic
+  nominal unions and unions without a canonical member order.
 - **Source migration:** none.
-- **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
-  `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths` and
+  `dropGlueCleansHookThenChildren` in `compiler/src/semantic/SemanticCases.silk`.
 
 ### Omitted Effect environments elaborated from inputs
 
