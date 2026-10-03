@@ -1,44 +1,50 @@
-# Gates: Step 7c generic inherent members
+# Gates: Step 7d generic-instance corpus sweep
 
-OWNS: GATES.md, compiler/**, COMPILER_COMPATIBILITY.md, PAPERCUTS.md
+OWNS: GATES.md, compiler/**, .github/workflows/selfhost.yml, COMPILER_COMPATIBILITY.md, PAPERCUTS.md
 
-Scope: select inherent methods and associated functions on complete generic nominal instances, preserving declaration-owned and member-owned arguments in one canonical application without privileged Option or Result handling
+Scope: pin every corpus program newly enabled by Step 7, replace generic first-blocker labels with precise later gaps and owners, re-audit Option and Result compiler privilege, and close the Step 7 roadmap only after exact-head CI has zero failures
 
 - [x] G0: this ledger states outcomes that can fail
   CHECK: node /Users/juliaortiz/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
   EXPECT: LINT OK
-  EVIDENCE: 2026-10-03 LINT OK with only the three declared manual-gate warnings
+  EVIDENCE: 2026-10-03 LINT OK with only the six declared manual or unmeasured gate warnings
 
-- [x] G1: Step 7c starts from the published Step 7b implementation and retains the Step 6 cleanup foundation
-  CHECK: git merge-base --is-ancestor 7fb329743 HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+- [x] G1: Step 7d starts from the published Step 7c implementation and retains the Step 6 cleanup foundation
+  CHECK: git merge-base --is-ancestor 6584c2b09 HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
   EXPECT: prerequisite verification passed
   EVIDENCE: exact branch ancestry and source search passed after rebasing onto origin/selfhost 9e74bdf25 on 2026-10-03
 
-- [x] G2: prefix and applied-owner associated calls select the same complete application, with owner and member-owned arguments in their declared scopes
-  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericInherent src/semantic/SemanticCases.silk
-  EXPECT: Tests  1 passed, 0 failed
-  EVIDENCE: exact rebased-source PASS in 570 ms; inferred Box.choose(42, true) and Box<i32>.choose<bool> publish equal applications with owner i32 in the impl scope and member-owned bool in own arguments
+- [ ] G2: the full corpus has zero failures, loses no baseline PASS, and reports the final PASS, unsupported, and track counts
+  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+  EXPECT: Selfhost corpus reports fail=0 and no selfhost track failure
+  EVIDENCE: exact selfhost 9e74bdf25 sweep pass=65 fail=1 unsupported=323 track=49 with no lost baseline PASS; two additional PASS belong to upstream Step 8c, and the only failure is the stale generic-service-stabilization-contracts fixture fixed on main in prerequisite PR #738
 
-- [x] G3: equal complete inherent-member instances share a key and symbol while distinct owner instances do not alias
-  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericInherent src/semantic/SemanticCases.silk
-  EXPECT: Tests  1 passed, 0 failed
-  EVIDENCE: exact rebased-source PASS in 570 ms; equal inferred-prefix/applied instances have equal InstanceKey.function values and symbols, while inferred Box<bool>.choose<i32> is distinct
+- [x] G3: every existing corpus program newly passing because of Step 7 is pinned in both hard-coded acceptance lists after an exact native PASS
+  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler SILK_SELFHOST_CORPUS_CASES=retained-if-let-match-binding,scalar-enum-equality-from-borrowed-variant,while-entry-backedge pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+  EXPECT: Selfhost corpus: pass=3 fail=0 unsupported=0 track=3
+  EVIDENCE: after rebasing onto selfhost 9e74bdf25, the exact release compiler reports pass=3 fail=0 unsupported=0 track=3 in 336 ms, 326 ms, and 302 ms; both hard-coded lists pin the same names
 
-- [x] G4: direct receiver calls on a generic nominal instance retain the complete owner scope; bound method values remain the named Step 8 gap
-  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericInherent src/semantic/SemanticCases.silk
-  EXPECT: Tests  1 passed, 0 failed
-  EVIDENCE: exact rebased-source PASS in 570 ms plus direct receiver runtime exit 42; the take call has no own arguments and one complete i32 impl scope
+- [x] G4: every remaining program whose earlier first blocker was a generic instance has a precise next blocker owned by Step 8, Step 9, or a named follow-up
+  EVIDENCE: the normalized before/after audit records the following ownership; the exact 65/1/323 sweep has no generic-record gap, 290 typed-form reports, and only two union-form reports, both in the ordinary-union follow-up
 
-- [x] G5: stdlib Option and Result constructors use the ordinary generic inherent-member path without name-based compiler privilege
-  EVIDENCE: exact rebased release probe using Box.make<i32>, Option.some<i32>, and Result.succeed<i32, i32> builds and exits 42; compiler-source audit finds no Option, Result, module-path, variant-shape, layout or effect identity recognition beyond ordinary implementation imports and unrelated generic labels
+  | Owner | Programs and exact current blocker |
+  | --- | --- |
+  | Step 8 callable values | generic-interface-runtime-contracts (typed-form in function-value calls), closed-operator-surface (typed-form at a checked-operation section), staged-callable-section (typed-form), option-result-combinators (typed-form at callable argument), method-call-matrix (pipeline-callable) |
+  | Step 9 effects and services | borrowed-outcome-stream, borrowed-outcome-affine-stream, generic-inline-effect-conformance, generic-service-stabilization-contracts after its main fixture sync; x25519 also reaches its provider run after intrinsic gaps |
+  | intrinsic/static-value follow-up | integer-operation-matrix and arith-convergence-checked-remainder-min-none (intrinsic-member); checked-conversion-f32/f64 (typed-form at primitive static INFINITY); checked-conversion-pointer-width (typed-form at pointerBits); chacha20-poly1305 and rsa-verification (intrinsic-member/unit-parameter plus typed-form) |
+  | ordinary union/pattern follow-up | nominal-union-represented-copy-drop and ordinary-union-droppable-array (union-form); nominal-result-compound-error (typed-form at the nominal arm inside a structural union) |
+  | borrowed aggregate/string follow-up | ecdsa-p256-verification (typed-form at the borrowed array-to-slice Option payload); http-values (typed-form at a string header-name operand) |
 
-- [x] G6: the full corpus has zero new failures, loses no baseline PASS, and every remaining generic-member blocker has a precise later gap
-  EVIDENCE: exact rebased release sweep pass=63 fail=1 unsupported=325 track=46 with no lost baseline PASS; the three gains over the 60-PASS baseline are retained-if-let-match-binding, scalar-enum-equality-from-borrowed-variant, and while-entry-backedge; the sole FAIL is the unchanged stale generic-service-stabilization-contracts fixture fixed in prerequisite PR #738; http-values and borrowed-outcome-affine-stream advance to typed-form, method-call-matrix advances to Step 8 pipeline-callable
+- [x] G5: Option and Result receive no direct or indirect compiler privilege, and a user-defined Option-shaped generic union has identical layout and behavior
+  EVIDENCE: source audit found no Option, Result, module-path, success/failure-shape, effect, try-sugar, layout, or niche recognition; the user-defined Maybe<T> structural/runtime claim is staged in prerequisite PR #738 and the exact ordinary-path probes exit 42
 
-- [x] G7: the task diff is structurally clean
-  CHECK: git diff --check && echo 'diff hygiene verified'
-  EXPECT: diff hygiene verified
-  EVIDENCE: recovered the formatter's unrelated whole-file rewrite, reconciled Step 8's extracted call and field actors, then git diff --check and the whole-compiler source check passed on the scoped rebased 7c diff
+- [ ] G6: the generic-record and user-defined generic-union native corpus acceptances land on main, sync to selfhost, pass exactly, and are pinned
+  EVIDENCE: prerequisite draft main PR #738 is green and awaiting review/merge before the required selfhost sync
 
-- [ ] G8: independent review and required PR CI accept the exact final head
+- [x] G7: the task diff is structurally clean and changes every hard-coded corpus-name list together
+  CHECK: git diff --check && rg -q "'retained-if-let-match-binding'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && rg -q "'scalar-enum-equality-from-borrowed-variant'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && rg -q "'while-entry-backedge'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && echo 'diff hygiene and pin lists verified'
+  EXPECT: diff hygiene and pin lists verified
+  EVIDENCE: the whole compiler source check and exact release build pass on selfhost 9e74bdf25; record filters pass in 393 ms and 674 ms, union filters in 666 ms and 363 ms, and inherent selection in 664 ms; diff hygiene and both pin-list membership checks pass
+
+- [ ] G8: independent review and required PR CI accept the exact final head, and #567 records the Step 7 link plus final PASS and pin counts
   EVIDENCE: pending
