@@ -46,9 +46,9 @@ path. A static partial move, including a match binding moved out of a consumed s
 hole in its owner: the owner is then dropped child by child, skipping moved children, and writing
 a moved child back makes it whole again. A hole beneath a type with a Drop hook is rejected as
 `OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner, a write at a
-runtime index beside a moved element, a guard that changes an owner's state, a loop iteration that
-leaves an owner changed and a borrowing match result whose arm created temporaries still report
-the `cleanup` gap.
+runtime index beside a moved element, a guard that changes an owner's state (the bootstrap rejects
+such moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
+changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
