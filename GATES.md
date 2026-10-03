@@ -1,36 +1,44 @@
-# Gates: Step 7a generic records
+# Gates: Step 7b generic nominal unions
 
 OWNS: GATES.md, compiler/**, COMPILER_COMPATIBILITY.md, PAPERCUTS.md
 
-Scope: complete generic record instances in the native self-hosted compiler, including typing, per-instance layout, construction, projection, patterns, symbols, Copy or affine classification, and drop glue
+Scope: complete generic nominal-union instances in the native self-hosted compiler, including typing, construction, match and patterns, per-instance layout, symbols, interning, Copy or affine classification, and drop glue
 
 - [x] G0: this ledger states outcomes that can fail
   CHECK: node /Users/juliaortiz/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
   EXPECT: LINT OK
-  EVIDENCE: automatic-evidence=v1; definition-sha256=e97e98aff7aaee51752dd5ef3f4e7fa147597fddd0198b6448ec0640be12a199; exit=0; EXPECT=matched; output-sha256=b96c4ecb07bf998298c90e78caa44c7211447dca4e8e15be1268ad9605608589; output-bytes=930; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
+  EVIDENCE: 2026-10-03 LINT OK with only the three declared manual-gate warnings
 
-- [x] G1: the implementation retains the complete Step 6 cleanup foundation
-  CHECK: git merge-base --is-ancestor 22196f43d HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+- [x] G1: Step 7b starts from the published Step 7a implementation and retains the Step 6 cleanup foundation
+  CHECK: git merge-base --is-ancestor 5aaa08aa6 HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
   EXPECT: prerequisite verification passed
-  EVIDENCE: the Step 6 ancestor, InstanceKey.DropGlue, and cleanup stack remain present after rebasing onto origin/selfhost 9e74bdf25 on 2026-10-03
+  EVIDENCE: exact branch ancestry and source search passed after rebasing onto origin/selfhost 9e74bdf25 on 2026-10-03
 
-- [x] G2: distinct complete generic record instances have independently verified layout, construction, projection, patterns, symbols, interning, Copy or affine classification, and drop glue
-  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericRecordInstances src/semantic/SemanticCases.silk
+- [x] G2: complete generic union instances construct every variant and match payload and payload-free patterns with coverage checked over the instantiated union
+  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericNominalUnion src/semantic/SemanticCases.silk
   EXPECT: Tests  2 passed, 0 failed
-  EVIDENCE: 2026-10-03 exact source PASS; genericRecordInstancesClassifyCopyAndShareDropGlue 386 ms; genericRecordInstancesInferAndLayoutSeparately 502 ms; native explicit-pattern probe built and exited 42
+  EVIDENCE: exact rebased-source PASS; construct/match/layout test 362 ms and combined exact filter PASS
 
-- [ ] G3: inferred generic record construction and projection execute with exactly-once payload cleanup in the native corpus
-  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler SILK_SELFHOST_CORPUS_CASES=generic-record-instances pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
-  EXPECT: Selfhost corpus: pass=1 fail=0 unsupported=0 track=1
-  EVIDENCE: pending
+- [x] G3: distinct complete generic union instances have independently verified layout facts, canonical instance keys, interning, and symbols
+  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericNominalUnion src/semantic/SemanticCases.silk
+  EXPECT: Tests  2 passed, 0 failed
+  EVIDENCE: exact-source structural assertions cover Choice<u8> versus Choice<i64>, repeated layout interning, and Slot instance keys/symbols
 
-- [ ] G4: the full corpus has zero failures, loses no baseline PASS, and every still-blocked generic-record program has a precise non-7a gap
-  EVIDENCE: staged exact-source sweep pass=60 fail=1 unsupported=328 track=46 with no lost PASS; the sole failure is the stale generic-service fixture corrected in prerequisite PR #738, while the other four former generic-record cases report typed-form
+- [x] G4: generic union instances classify Copy versus affine per payload and run exactly one payload drop through per-instance DropGlue
+  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericNominalUnion src/semantic/SemanticCases.silk
+  EXPECT: Tests  2 passed, 0 failed
+  EVIDENCE: exact rebased-source PASS 665 ms; native Maybe<Token> double-drop trap probe built and exited 85 with exactly one hook call
 
-- [x] G5: the task diff is structurally clean
+- [ ] G5: the full corpus has zero failures, loses no baseline PASS, and every remaining generic-union blocker has a precise later gap
+  EVIDENCE: staged sweep pass=62 fail=1 unsupported=326 track=46; no lost baseline PASS and two new PASS; sole failure is the stale fixture fixed in prerequisite PR #738; remaining union-form cases are nominal-union-represented-copy-drop and ordinary-union-droppable-array
+
+- [x] G6: a user-defined generic Option-shaped union has the same layout and runtime behavior as the ordinary stdlib mechanism without name-based compiler privilege
+  EVIDENCE: exact native probe constructed and matched user-defined Maybe<T> and stdlib Option<T> through the same path and exited 85
+
+- [x] G7: the task diff is structurally clean
   CHECK: git diff --check && echo 'diff hygiene verified'
   EXPECT: diff hygiene verified
-  EVIDENCE: automatic-evidence=v1; definition-sha256=4e76a74b37d3ffa61be47f5f019f748a3b3bd3149a8f59b91967696fcea9cb34; exit=0; EXPECT=matched; output-sha256=f75ed0216b2ff9635ca2c2cbf8640d29f934c6a2a73bacda84c208d88669dcc4; output-bytes=22; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
+  EVIDENCE: git diff --check passed on 2026-10-03
 
-- [ ] G6: independent review and required PR CI accept the exact final head
+- [ ] G8: independent review and required PR CI accept the exact final head
   EVIDENCE: pending
