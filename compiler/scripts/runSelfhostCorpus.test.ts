@@ -5,10 +5,19 @@ import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
 import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
-import { parseBuildDiagnostic, parseUnsupported, runCase, summarize } from './runSelfhostCorpus.js'
+import {
+  parseBuildDiagnostic,
+  parseUnsupported,
+  runCase,
+  runCorpus,
+  summarize,
+} from './runSelfhostCorpus.js'
 
 it('keeps the selfhost runtime-member list equal to the canonical intrinsic catalog', () => {
-  const source = readFileSync(new URL('../src/semantic/IntrinsicCatalog.silk', import.meta.url), 'utf8')
+  const source = readFileSync(
+    new URL('../src/semantic/IntrinsicCatalog.silk', import.meta.url),
+    'utf8',
+  )
   const encoded = source.split('let members = b"').at(1)?.split('"').at(0)
   assert.ok(encoded !== undefined)
   assert.deepStrictEqual(
@@ -56,12 +65,18 @@ it('runs a pinned native corpus program through the build command', () => {
         { name: 'optimized', optimization: 'speed', debug: false },
       ],
     } as const
-    withStub(`if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
+    withStub(
+      `if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
 printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
-${compiled}`, (profileSilkc) => {
-      assert.deepStrictEqual(runCase(profileSilkc, profiled), { name: 'literal', status: 'pass' })
-      assert.strictEqual(readFileSync(`${profileSilkc}.profiles`, 'utf8'), 'none:true\nspeed:false\n')
-    })
+${compiled}`,
+      (profileSilkc) => {
+        assert.deepStrictEqual(runCase(profileSilkc, profiled), { name: 'literal', status: 'pass' })
+        assert.strictEqual(
+          readFileSync(`${profileSilkc}.profiles`, 'utf8'),
+          'none:true\nspeed:false\n',
+        )
+      },
+    )
     assert.deepStrictEqual(runCase(silkc, { ...literal, nativeDynamicLibraries: ['c', 'm'] }), {
       name: 'literal',
       status: 'pass',
@@ -69,6 +84,15 @@ ${compiled}`, (profileSilkc) => {
     assert.strictEqual(
       runCase(silkc, { ...literal, nativeDynamicLibraries: ['custom'] }).status,
       'unsupported',
+    )
+  })
+})
+
+it('requires the full track in supplied materialized scenarios', () => {
+  withStub(compiled, (silkc) => {
+    assert.throws(
+      () => runCorpus(silkc, [literal]),
+      /selfhost track names absent from corpus: trivial-features,/,
     )
   })
 })
