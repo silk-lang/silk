@@ -50,6 +50,8 @@ An unknown spelling remains `UnknownMember`. This classification adds no primiti
 
 - [MIR core shape](docs/mir-core-shape.md): the final MIR forms, cleanup, failure edges,
   suspension, closures and the opt-in MIR check.
+- [Effect calling convention](docs/effect-calling-convention.md): how native code receives Effect
+  providers, returns typed failures, and expands the Effect composition intrinsics (roadmap step 5).
 
 ## Development branches and bootstrap
 

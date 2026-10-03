@@ -249,25 +249,50 @@ Each entry records:
 
 ### Effect lowering, execution storage, `Exit`, and panic behavior
 
-- **Status:** Deferred proposals. Nothing here is approved as an implementation change, and neither
-  compiler has changed because of it.
+- **Status:** the first two directions below are the approved native design in
+  [compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md)
+  (roadmap step 5, approved by Julia on 2026-10-02). They are not implemented yet; Step 9
+  implements them. The other directions remain deferred proposals. Nothing here changes the
+  bootstrap.
 - **Summary:** the design discussion considered several directions:
   - a target-neutral lowering boundary that turns non-suspending Effects into ordinary closures,
-    provider operands, tagged outcomes, and cleanup;
-  - keeping coroutine lowering for suspension;
+    provider operands, tagged outcomes, and cleanup (native step 5 design);
+  - keeping coroutine lowering for suspension (native step 5 design reserves it; reached
+    suspension reports the `suspension` gap until then);
   - letting source execution infrastructure choose frame storage;
   - reifying completed outcomes, and how panics and traps relate to Effect outcomes.
 
   None of these changes current language rules.
 
-- **Compilers:** unchanged. Today's lowering, storage, and failure behavior are what the bootstrap
-  implements and what the reference already states, including
+- **Compilers:** the bootstrap is unchanged. Its lowering, storage, and failure behavior are what
+  the reference already states, including
   [FAIL-007](apps/docs/content/reference/typed-failures.md#fail-007--a-trap-is-fatal-and-remains-outside-effect-outcomes)
   for traps.
 - **Source migration:** none. Do not write code that relies on these proposals.
 - **Background:** the workspace design-checkpoint note "Effect architecture — design checkpoint"
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
+
+### Native entry uses a generated C `main` until it compiles the source runtime
+
+- **Status:** temporary divergence approved by Julia on 2026-10-02
+  ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
+  decision Q1). It is retired when selfhost compiles `silk/native_start` as the runtime root and
+  the `Entry { main }` key is deleted.
+- **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
+  to ENTRY-003 put program entry in source. The runtime module calls the application, provides
+  `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
+  generated invocation adapter.
+- **Compilers:** the bootstrap follows the rule through `silk/native_start`. Selfhost's
+  `Entry { main }` key emits a C `main` that calls `fn main() -> i32` directly and reports
+  `entry-signature` for every other signature, including `pub effect fn main`. Compiling
+  `native_start` needs `Execution` frames and the diagnostic observer intrinsics, which follow the
+  suspension stage.
+- **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
+  compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
+  reaches the generated `main`.
+- **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
+- **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
 
 ### Nominal qualification requires an inherent member
 
