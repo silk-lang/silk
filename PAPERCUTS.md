@@ -441,3 +441,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter
 
 2026-10-03 · Corpus setup used exact whitespace replacements in authored Silk fixtures and failed after the formatter rewrote them · Materialize scenarios before formatting in the same verification process, then rebuild and run every scenario against the formatted compiler and live standard library · Silk compiler formatter
+
+2026-10-03 · Inline workflow configuration escaped TypeScript checking and used an obsolete Effect Config API spelling · Move configuration into the checked FormatterVerification actor and smoke-test the exact runtime entry · Silk compiler formatter

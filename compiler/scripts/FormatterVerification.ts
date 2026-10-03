@@ -1,7 +1,9 @@
 import * as Console from 'effect/Console'
+import * as Config from 'effect/Config'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
+import * as Path from 'effect/Path'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Stream from 'effect/Stream'
 import * as ChildProcess from 'effect/unstable/process/ChildProcess'
@@ -126,4 +128,28 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
       operation: 'verify native corpus',
       reason: { _tag: 'Exit', code: result },
     })
+})
+
+/** Resolves CI configuration from the compiler package directory, then runs verification. */
+export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(function* (
+  node: string,
+): Effect.fn.Return<
+  void,
+  Config.ConfigError | VerificationError | PlatformError.PlatformError,
+  Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+> {
+  const path = yield* Path.Path
+  const repository = path.resolve('../..')
+  const temporary = yield* Config.String('RUNNER_TEMP')
+  const compiler = yield* Config.String('SILKC')
+  return yield* run({
+    repository,
+    node,
+    gate: path.join(
+      repository,
+      'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
+    ),
+    compiler,
+    safetyLog: path.join(temporary, 'formatter-safety.log'),
+  })
 })
