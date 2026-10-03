@@ -451,3 +451,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · A mechanical rewrite-context edit left a double comma in a multiline signature, producing downstream stable-owner errors in unrelated callers · Check parameter-list punctuation first when a signature edit causes a cluster of borrow diagnostics; bind optional rewrite contexts to owned locals before borrowing them · self-hosted compiler Step 8b
 
 - 2026-10-03 · The capture-flow prototype tried to move an Option field through `&mut`, match a dereferenced Option exclusively, and move a value while its match binding remained borrowed · Use `Intrinsic.replace` to retain a complete owned local, end match scopes before moving it, and compute owned failure facts before mutating the containing flow · self-hosted compiler Step 8b
+
+- 2026-10-03 · The bootstrap backend could not resolve `TypedBody.environmentOf` when its borrowed result was used directly as a match subject · Bind the returned view to a stable local before matching it · self-hosted compiler
