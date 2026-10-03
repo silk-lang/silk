@@ -2,6 +2,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-10-03 · Closure emission trapped while structured MIR and layout demands passed because exact callable comparison borrowed one shared runtime-key buffer twice · Compare buffer allocation addresses before nested `Shared.with`, and assert same-handle and copied-type equality in the production environment fixture · self-hosted compiler
+
 - 2026-09-29 · Codebase Memory could not index the U8 checkout because a pre-coordination or unverified generation was active · Use targeted source searches until the index is available; do not retry concurrent indexing · self-hosted compiler
 
 - 2026-09-28 · The shared checkout's CLI dependency links pointed into another unit's worktree and became dangling during parallel setup · Run frontend checks with the intact main checkout's CLI, then build and test from an isolated worktree after acquiring the shared build slot · self-hosted compiler
@@ -451,5 +453,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · A mechanical rewrite-context edit left a double comma in a multiline signature, producing downstream stable-owner errors in unrelated callers · Check parameter-list punctuation first when a signature edit causes a cluster of borrow diagnostics; bind optional rewrite contexts to owned locals before borrowing them · self-hosted compiler Step 8b
 
 - 2026-10-03 · The capture-flow prototype tried to move an Option field through `&mut`, match a dereferenced Option exclusively, and move a value while its match binding remained borrowed · Use `Intrinsic.replace` to retain a complete owned local, end match scopes before moving it, and compute owned failure facts before mutating the containing flow · self-hosted compiler Step 8b
+
+- 2026-10-03 · The bootstrap backend could not resolve `TypedBody.environmentOf` when its borrowed result was used directly as a match subject · Bind the returned view to a stable local before matching it · self-hosted compiler
 - 2026-10-03 · Background agents spawned with worktree isolation from a `selfhost` checkout got worktrees on `origin/main`, where the selfhost compiler sources are missing, and some later could not run git against any other worktree · Have each agent verify `git log -1` against the intended base before editing and `git reset --hard <base>` in its own clean worktree; create follow-up branches inside the agent's own worktree · self-hosted compiler
 - 2026-10-03 · A long multi-agent refactor of `compiler/src` went stale when `selfhost` advanced ~430 commits mid-session, and the old bootstrap CLI could not validate ports onto the new tip · Build a second bootstrap CLI from the new tip in a separate worktree, port each commit onto it, and serialize the ~5 min, ~8 GB `silk check` runs with `flock` on a 4-core host · self-hosted compiler
