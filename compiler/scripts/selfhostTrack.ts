@@ -44,4 +44,5 @@ export const selfhostTrack = [
   'runtime-slice-temporary-and-lexical-borrows',
   'scalar-member-unions',
   'nominal-union-operator-provider',
+  'pattern-conditionals-and-destructuring',
 ] as const satisfies ReadonlyArray<string>
