@@ -123,6 +123,21 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
+
+- **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
+  Step 6d, which lowers partial moves.
+- **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
+  leaves scope without being moved.
+- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
+  reports the backend gap `cleanup` instead of lowering a partially moved owner whose holes differ
+  between joining paths or that is moved on only some paths, a projection moved out of an owned
+  rvalue, and drop glue for callable and Effect environments, generic nominal unions and unions
+  without a canonical member order.
+- **Source migration:** none.
+- **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned

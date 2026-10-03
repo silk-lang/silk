@@ -1,6 +1,7 @@
 //! Backend-neutral control flow for one checked scalar function instance.
 
 import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder, RemainderLevel, Variant as GlueVariant}
+import backend.CleanupNeeds {CleanupNeeds}
 import backend.Gap {Code as GapCode, Gap}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Layout}
@@ -268,6 +269,8 @@ struct Builder {
   temporaries: Vector<usize>
   // The remaining children of each partial consuming site, keyed by body node.
   remainders: Vector<Remainder>
+  // Which typed-body locals and node values need cleanup, answered by semantic analysis.
+  needs: CleanupNeeds
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -805,10 +808,9 @@ fn ownerIndex(builder: &Builder, local: usize) -> usize {
   return usize.MAX
 }
 
-// A local of a type that is not cleanup-free becomes a live owner of the innermost scope.
-effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let free = Shared.with<Type, bool>(ty, Type.cleanupFree)
-  if free { return () }
+// A local whose value needs cleanup becomes a live owner of the innermost scope.
+effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>, needed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !needed { return () }
   return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX, holes: Vector.make<usize>()})
 }
 
@@ -828,7 +830,7 @@ fn setState(builder: &mut Builder, index: usize, state: OwnerState) -> () {
 
 // Applies one consuming site. A partial move of a value that needs cleanup leaves a hole in its
 // owner, which is then dropped child by child (OWN-004, MATCH-002).
-effect fn applyRelease(builder: &mut Builder, release: &Release, moved: &Shared<Type>, origin: Origin) -> ()
+effect fn applyRelease(builder: &mut Builder, release: &Release, needed: bool, origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
   let mut root = usize.MAX
   let mut site = usize.MAX
@@ -852,8 +854,7 @@ effect fn applyRelease(builder: &mut Builder, release: &Release, moved: &Shared<
       site = node
     }
   }
-  let free = Shared.with<Type, bool>(moved, Type.cleanupFree)
-  if free { return () }
+  if !needed { return () }
   let owner = InstanceKey.identity(&builder.function.key)
   let index = ownerIndex(&builder.*, root)
   let remainder = remainderIndex(&builder.*, site)
@@ -1344,9 +1345,8 @@ effect fn expressionPlace(
       if ownedRvalue(body, id) && Vector.length<Projection>(&storage.projections) == usize.ZERO {
         let selectedType = run instanceNodeType(&builder.*, body, id)
         if let Option<Shared<Type>>.Some {value: ty} = move selectedType {
-          let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
           let local = storage.local
-          if !free { run Vector.append<usize>(&mut builder.*.temporaries, local) }
+          if CleanupNeeds.node(&builder.needs, id.index) { run Vector.append<usize>(&mut builder.*.temporaries, local) }
         }
       }
       return move storage
@@ -1539,10 +1539,10 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
         Release.Value => true
         _ => false
       }
-      let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
-      if fromValue && !free && !ownedRvalue(body, value) { return run unsupported(&owner, origin, GapCode.Cleanup) }
+      let needed = CleanupNeeds.node(&builder.needs, value.index)
+      if fromValue && needed && !ownedRvalue(body, value) { return run unsupported(&owner, origin, GapCode.Cleanup) }
       let input = run expression(&mut builder.*, body, hir, value)
-      run applyRelease(&mut builder.*, &release, &ty, origin)
+      run applyRelease(&mut builder.*, &release, needed, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
       return Operand.Move {place: place(output)}
@@ -1723,8 +1723,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
             // Capture an arbitrary owned rvalue exactly once before lending its storage.
             let captured = run temporary(&mut builder.*, &operand.value, origin)
             run assign(&mut builder.*, place(captured), Rvalue.Use {value: move argument}, origin)
-            let free = Shared.with<Type, bool>(&operand.value, Type.cleanupFree)
-            if ownedRvalue(body, child) && !free { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
+            if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
             let reference = run temporary(&mut builder.*, &operand.parameter, origin)
             run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: place(captured)}, origin)
             argument = Operand.Copy {place: place(reference)}
@@ -2021,10 +2020,11 @@ effect fn lowerMatch(
   // until the selected arm ends (MATCH-002).
   let mut scrutineeOwner = usize.MAX
   if consumes {
-    run applyRelease(&mut builder.*, release, &subjectType, origin)
+    let needed = CleanupNeeds.node(&builder.needs, subject.index)
+    run applyRelease(&mut builder.*, release, needed, origin)
     run openScope(&mut builder.*)
     let before = Vector.length<Owner>(&builder.owners)
-    run acquire(&mut builder.*, scrutinee.local, &subjectType)
+    run acquire(&mut builder.*, scrutinee.local, &subjectType, needed)
     if Vector.length<Owner>(&builder.owners) > before { scrutineeOwner = before }
   }
   let mut switched = scrutinee.local
@@ -2242,8 +2242,7 @@ effect fn discard(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
   let value = run expression(&mut builder.*, body, hir, id)
   if !builder.live || !ownedRvalue(body, id) { return () }
   if let Option<Shared<Type>>.Some {value: ty} = move selectedType {
-    let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
-    if !free {
+    if CleanupNeeds.node(&builder.needs, id.index) {
       let owner = InstanceKey.identity(&builder.function.key)
       match move value {
         Operand.Copy {place: stored} => { run dropPlace(&mut builder.*, move stored, &ty, &owner, nodeOrigin(body, id)) }
@@ -2341,8 +2340,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       // Replacement drops the displaced value before the new value becomes live (CLEANUP-001).
       let targetType = run instanceNodeType(&builder.*, body, target)
       if let Option<Shared<Type>>.Some {value: replaced} = move targetType {
-        let free = Shared.with<Type, bool>(&replaced, Type.cleanupFree)
-        if !free {
+        if CleanupNeeds.node(&builder.needs, target.index) {
           // Writing a moved child back re-initializes it; writing beside holes replaces a live child.
           let root = ownerIndex(&builder.*, destination.local)
           let mut whole = true
@@ -2398,12 +2396,14 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
         while at < Vector.length<usize>(&builder.temporaries) {
           let local = Vector.asSlice<usize>(&builder.temporaries)[at]
           let held = localType(&builder.*, local)
-          run acquire(&mut builder.*, local, &held)
+          // Only temporaries that need cleanup are pending.
+          run acquire(&mut builder.*, local, &held, true)
           at = at + usize.ONE
         }
         truncateTemporaries(&mut builder.*, pending)
       }
-      run acquire(&mut builder.*, index + usize.ONE, &ty)
+      let needed = CleanupNeeds.local(&builder.needs, index)
+      run acquire(&mut builder.*, index + usize.ONE, &ty, needed)
     }
     View.Assignment {index, value, origin} => {
       let assigned = run expression(&mut builder.*, body, hir, value)
@@ -2523,15 +2523,15 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       terminate(&mut builder.*, Terminator.Goto {target: exit, origin: origin})
     }
     View.Drop {value, release, origin} => {
-      // The operand is evaluated, then its owned value is cleaned by its type's glue (DROP-001).
+      // The operand is evaluated, then a value that needs cleanup is cleaned by its type's glue (DROP-001).
       let dropped = match move run instanceNodeType(&builder.*, body, value) {
         Option<Shared<Type>>.Some {value: droppedType} => droppedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
       let operand = run expression(&mut builder.*, body, hir, value)
-      run applyRelease(&mut builder.*, &release, &dropped, origin)
-      let cleanupFree = Shared.with<Type, bool>(&dropped, Type.cleanupFree)
-      if !cleanupFree {
+      let needed = CleanupNeeds.node(&builder.needs, value.index)
+      run applyRelease(&mut builder.*, &release, needed, origin)
+      if CleanupNeeds.node(&builder.needs, value.index) {
         let storage = match move operand {
           Operand.Copy {place: stored} => move stored
           Operand.Move {place: stored} => move stored
@@ -2788,6 +2788,7 @@ impl MirFunction {
     parameters: &[Shared<Type>],
     calls: Vector<CallTarget>,
     remainders: Vector<Remainder>,
+    needs: CleanupNeeds,
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
     let identity = InstanceKey.identity(&key)
     let application = run InstanceKey.selected(&key)
@@ -2869,6 +2870,7 @@ impl MirFunction {
       scopes: Vector.make<usize>(),
       temporaries: Vector.make<usize>(),
       remainders: move remainders,
+      needs: move needs,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
@@ -2877,7 +2879,8 @@ impl MirFunction {
     at = usize.ZERO
     while at < parameters.length {
       let ty = localType(&builder, at + usize.ONE)
-      run acquire(&mut builder, at + usize.ONE, &ty)
+      let needed = CleanupNeeds.local(&builder.needs, at)
+      run acquire(&mut builder, at + usize.ONE, &ty, needed)
       at = at + usize.ONE
     }
     run statement(&mut builder, body, hir, root)
