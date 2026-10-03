@@ -429,3 +429,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-02 · Cloud `gh` API calls were forbidden while Git fetch and push worked · Use the connected GitHub tools for PR creation and CI metadata · selfhost pipe operator
 - 2026-10-02 · A gap assertion nested a `Shared.with` callback inside another anonymous callable and hit bootstrap `SEM0199` · Read the shared owner first and make the owner and gap assertions in sibling callbacks · selfhost pipe operator
 - 2026-10-02 · The native selfhost CLI defaults to absent `/usr/bin/clang` and launches it with an empty environment, so the prepared LLVM binary also cannot find `ld` · Set `SILKC_CLANG` to a local wrapper invoking prepared LLVM 22 with `--ld-path=/usr/bin/ld` · selfhost pipe operator
+
+- 2026-10-03 · The shared local test script rejected an empty filter before acquiring the build slot · Give focused formatter cases a common `document` prefix and pass that nonempty filter · native formatter
