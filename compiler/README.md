@@ -41,8 +41,8 @@ Where paths reach a join with different ownership, the owner gets a `DropFlag` l
 each incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
 tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
 rvalues used only as places are dropped at the end of their full expression unless a borrowing
-`let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that path. Partial moves of values that need
-cleanup still report the `cleanup` gap (roadmap step 6d).
+`let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
+path. Partial moves of values that need cleanup still report the `cleanup` gap (roadmap step 6d).
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
