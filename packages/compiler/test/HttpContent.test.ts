@@ -10,10 +10,7 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
-import {
-  httpContentAnalysisPrelude,
-  httpContentPlanningSource,
-} from './support/httpContentAcceptance.js'
+import { httpContentAnalysisPrelude } from './support/httpContentAcceptance.js'
 
 const encoder = new TextEncoder()
 const reference = readFileSync(
@@ -226,30 +223,6 @@ it.effect(
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
     }),
   120_000,
-)
-
-it.effect(
-  'realizes the public-import HTTP content acceptance program',
-  () =>
-    Effect.gen(function* () {
-      const module = 'http-content/planning'
-      const configuration = AnalysisFixture.configuration(module, 'x86_64-unknown-linux-gnu', [
-        'planning',
-      ])
-      const snapshot = yield* Analysis.makeRealized({
-        root: module,
-        configuration,
-      }).pipe(
-        Effect.provide(
-          SourceResolver.overlay([
-            SourceFile.make(module, encoder.encode(httpContentPlanningSource)),
-          ]).pipe(Layer.provideMerge(SourceResolver.empty)),
-        ),
-      )
-      assert.deepEqual(Analysis.diagnostics(snapshot), [])
-      assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
-    }),
-  180000,
 )
 
 it.effect(

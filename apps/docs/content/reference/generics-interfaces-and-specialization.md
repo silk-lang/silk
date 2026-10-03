@@ -1568,7 +1568,7 @@ generic call failure.
 same provider/interface goal for interfaces and services, with deterministic static selection.
 
 **Evidence:** [concrete proof requirement](../../../../openspec/specs/bootstrap-conditional-interface-conformance/spec.md),
-[conditional proof determinism](../../../../packages/compiler/test/ConditionalConformanceDeterminism.test.ts),
+[conditional proof order independence](../../../../packages/compiler/test/ConditionalConformance.test.ts),
 [finite specialization](#gen-005--every-reachable-generic-application-becomes-finite-monomorphic-code).
 
 ## Interface operation selection

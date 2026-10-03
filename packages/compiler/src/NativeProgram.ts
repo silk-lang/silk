@@ -292,7 +292,7 @@ export const emit = Effect.fn('NativeProgram.emit')(function* (
   if (needsFrameCleanup || originThunks.size > 0 || resumeThunks.size > 0)
     runtimeFeatures.add('NestedSuspensionRuntime')
 
-  yield* verifyModule(builder, program)
+  if (request.verifyIr === true) yield* verifyModule(builder, program)
   return yield* encodeArtifact({
     builder,
     program,
@@ -861,8 +861,8 @@ const verifyModule = Effect.fn('NativeProgram.verifyModule')(function* (
   builder: Builder.Builder,
   program: Mir.Module,
 ) {
-  // The module is verified before it is encoded: what reaches Clang has already been checked
-  // for the SSA invariants Clang itself will not check on `-x ir` input.
+  // The compiler-development audit reports SSA violations against the emitted module before it
+  // is encoded; without it, Clang's module verifier still rejects them at the object step.
   const violations = yield* Verify.verify(builder)
   if (violations.length > 0) {
     return yield* new BackendError({

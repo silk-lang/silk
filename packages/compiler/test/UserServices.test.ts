@@ -1,11 +1,16 @@
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as AnalysisFixture from './support/AnalysisFixture.js'
 
 const encoder = new TextEncoder()
 
-const snapshot = (source: string, target?: string) =>
-  Analysis.ofSourceRealized('user-services/main', encoder.encode(source), target)
+const sourceId = 'user-services/main'
+
+const snapshot = (source: string) => Analysis.ofSource(sourceId, encoder.encode(source))
+
+const realized = (source: string, target?: string) =>
+  AnalysisFixture.retainingMain(sourceId, encoder.encode(source), target)
 
 const sharedSource = `import silk.effect { Effect }
 service Counter { effect fn get() -> i32 ? &Counter }
@@ -20,7 +25,7 @@ pub fn main() -> i32 {
 
 it.effect('lowers shared source service dispatch through native LLVM', () =>
   Effect.gen(function* () {
-    const native = yield* snapshot(sharedSource, 'aarch64-apple-darwin')
+    const native = yield* realized(sharedSource, 'aarch64-apple-darwin')
     assert.deepEqual(Analysis.diagnostics(native), [])
     const llvm = yield* Analysis.codegen(native, { mode: 'release' })
     assert.include(llvm.ir, 'define')
@@ -30,7 +35,7 @@ it.effect('lowers shared source service dispatch through native LLVM', () =>
 
 it.effect('lowers a generic service witness that names its retained environment', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`import silk.effect { Effect }
+    const self = yield* realized(`import silk.effect { Effect }
 service Dispatch<H> { effect<'env> fn with<'env>(handler: H) -> i32 ? &mut Dispatch<H> }
 struct Provider<H> {}
 impl<H> Dispatch<H> for Provider<H> {
@@ -87,7 +92,7 @@ pub fn main() -> i32 { return 0 }`)
 
 it.effect('keeps InsecureSeed fields private', () =>
   Effect.gen(function* () {
-    const self = yield* Analysis.ofSourceRealized(
+    const self = yield* Analysis.ofSource(
       'insecure-seed/private',
       encoder.encode(`import silk.insecure_seed { InsecureSeed }
 pub fn main() -> i32 {
@@ -104,8 +109,12 @@ pub fn main() -> i32 {
 
 it.effect('keeps ordinary Report conformance static and out of requirement rows', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`pub struct Problem {}
-pub effect fn main() -> () ! Problem { return () }`)
+    // The default runtime's startup is what would reject a requirement row leaking onto main.
+    const self = yield* Analysis.ofSourceRealized(
+      sourceId,
+      encoder.encode(`pub struct Problem {}
+pub effect fn main() -> () ! Problem { return () }`),
+    )
     assert.deepEqual(Analysis.diagnostics(self), [])
   }),
 )

@@ -373,11 +373,19 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
   const executionSourcesFrom = (
     instance: Instances.Instance,
     expression: Tir.Expression,
-    visited: Set<string>,
+    visited: Map<string, Set<string>>,
   ): ReadonlyArray<Instances.Instance> => {
-    const key = `${ownerKey(instance)}:${expression._tag}:${expression.span.start}:${expression.span.end}`
-    if (visited.has(key)) return []
-    visited.add(key)
+    // Keyed by owner first: the owner key is a long cached string whose hash V8 memoizes, while a
+    // concatenated composite key would be rehashed in full on every visit.
+    const ownerIdentity = ownerKey(instance)
+    let visitedSites = visited.get(ownerIdentity)
+    if (visitedSites === undefined) {
+      visitedSites = new Set()
+      visited.set(ownerIdentity, visitedSites)
+    }
+    const site = `${expression._tag}:${expression.span.start}:${expression.span.end}`
+    if (visitedSites.has(site)) return []
+    visitedSites.add(site)
     if (expression._tag === 'Move')
       return executionSourcesFrom(instance, expression.subject, visited)
     if (expression._tag === 'UnionConvert')
@@ -385,7 +393,7 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
     if (expression._tag === 'EffectBindRequirement')
       return executionSourcesFrom(instance, expression.protected, visited)
     if (expression._tag === 'BindingReference') {
-      const context = contexts.get(ownerKey(instance))
+      const context = contexts.get(ownerIdentity)
       if (context?.writtenBindings.has(expression.binding.ordinal)) return []
       const initializer = context?.bindings.get(expression.binding.ordinal)
       return initializer === undefined ? [] : executionSourcesFrom(instance, initializer, visited)
@@ -400,8 +408,8 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
       const owner =
         effect === undefined ? undefined : instances.get(Instances.keyText(effect.owner))
       return owner === undefined
-        ? (incoming.get(ownerKey(instance))?.get(expression.parameter.ordinal) ?? []).flatMap(
-            (source) => executionSourcesFrom(source.owner, source.expression, visited),
+        ? (incoming.get(ownerIdentity)?.get(expression.parameter.ordinal) ?? []).flatMap((source) =>
+            executionSourcesFrom(source.owner, source.expression, visited),
           )
         : [owner]
     }
@@ -434,7 +442,7 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
     const owner = ownerKey(instance)
     let sources = byOwner.get(owner)
     if (sources === undefined) {
-      sources = executionSourcesFrom(instance, expression, new Set())
+      sources = executionSourcesFrom(instance, expression, new Map())
       byOwner.set(owner, sources)
     }
     return sources

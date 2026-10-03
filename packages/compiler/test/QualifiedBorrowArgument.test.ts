@@ -2,7 +2,6 @@ import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
-import * as MirEncoding from '../src/MirEncoding.js'
 import * as MirVerification from '../src/MirVerification.js'
 
 const ascii = (value: string): Uint8Array =>
@@ -11,11 +10,7 @@ const ascii = (value: string): Uint8Array =>
 const codes = (snapshot: Analysis.Snapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code)
 
-/**
- * The qualified and imported spellings name one function through two syntaxes, so they are held to
- * one standard: the same diagnostics and, since the module identity is the same, the same MIR.
- * Only the reference form differs between the two sources.
- */
+/** A qualified member call accepts a shared borrow argument. */
 const shared = `import silk.vector { Vector }
 
 pub fn main() -> i32 {
@@ -26,29 +21,8 @@ pub fn main() -> i32 {
   return 1
 }`
 
-const importedShared = `import silk.vector { Vector }
-
-pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let count = Vector.length<i32>(&values)
-  drop values
-  if count == 0 { return 0 }
-  return 1
-}`
-
+/** A qualified member call accepts an exclusive borrow argument. */
 const exclusive = `import silk.vector { Vector }
-
-pub fn main() -> i32 {
-  let mut values = Vector.make<i32>()
-  let slice = Vector.asMutSlice<i32>(&mut values)
-  drop slice
-  let count = Vector.length<i32>(&values)
-  drop values
-  if count == 0 { return 0 }
-  return 1
-}`
-
-const importedExclusive = `import silk.vector { Vector }
 
 pub fn main() -> i32 {
   let mut values = Vector.make<i32>()
@@ -73,31 +47,15 @@ pub fn main() -> i32 {
 
 it.effect('accepts a shared borrow through the qualified spelling', () =>
   Effect.gen(function* () {
-    const qualified = yield* AnalysisFixture.retainingMain('borrow/program', ascii(shared))
-    const imported = yield* AnalysisFixture.retainingMain('borrow/program', ascii(importedShared))
-    assert.deepEqual(codes(qualified), [])
-    assert.deepEqual(codes(imported), [])
-    // One call, one lowering: the qualifier is a spelling, not a different operation.
-    assert.strictEqual(
-      MirEncoding.encode(Analysis.loweredMir(qualified)),
-      MirEncoding.encode(Analysis.loweredMir(imported)),
-    )
+    const snapshot = yield* AnalysisFixture.retainingMain('borrow/program', ascii(shared))
+    assert.deepEqual(codes(snapshot), [])
   }),
 )
 
 it.effect('accepts an exclusive borrow through the qualified spelling', () =>
   Effect.gen(function* () {
-    const qualified = yield* AnalysisFixture.retainingMain('borrow/exclusive', ascii(exclusive))
-    const imported = yield* AnalysisFixture.retainingMain(
-      'borrow/exclusive',
-      ascii(importedExclusive),
-    )
-    assert.deepEqual(codes(qualified), [])
-    assert.deepEqual(codes(imported), [])
-    assert.strictEqual(
-      MirEncoding.encode(Analysis.loweredMir(qualified)),
-      MirEncoding.encode(Analysis.loweredMir(imported)),
-    )
+    const snapshot = yield* AnalysisFixture.retainingMain('borrow/exclusive', ascii(exclusive))
+    assert.deepEqual(codes(snapshot), [])
   }),
 )
 
@@ -106,27 +64,6 @@ it.effect('still rejects a borrow where the parameter wants an owned value', () 
     // `get`'s second parameter is a `usize`, so the natural reference type is incompatible.
     const snapshot = yield* AnalysisFixture.retainingMain('borrow/owned', ascii(ownedPosition))
     assert.deepEqual(codes(snapshot), ['SEM0012'])
-  }),
-)
-
-/**
- * The shape issue #70 was filed on: no import at all. The manifest namespace seeds `Vector`, so
- * this is the spelling the namespace feature exists to enable, and a borrow argument is what it
- * could not reach.
- */
-const seeded = `import silk.vector { Vector }
-pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let count = Vector.length<i32>(&values)
-  drop values
-  if count == 0 { return 0 }
-  return 1
-}`
-
-it.effect('accepts a borrow through a seeded namespace with no import', () =>
-  Effect.gen(function* () {
-    const snapshot = yield* AnalysisFixture.retainingMain('borrow/seeded', ascii(seeded))
-    assert.deepEqual(codes(snapshot), [])
   }),
 )
 

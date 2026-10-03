@@ -803,39 +803,20 @@ it.effect('returns source and toolchain failure classes without leaving executab
   }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
 )
 
-it.effect(
-  'builds and returns the compiled program exact exit status',
-  () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem
-      const root = yield* fileSystem.makeTempDirectoryScoped()
-      yield* makeProject(root)
+it.effect('removes the build artifacts and keeps the source files', () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem
+    const root = yield* fileSystem.makeTempDirectoryScoped()
+    yield* makeProject(root)
+    yield* writeFile(`${root}/build/hello`, 'artifact')
 
-      const status = yield* Workflow.run(options(root), ['--literal', 'argument'])
+    const status = yield* Workflow.clean(options(root))
 
-      assert.strictEqual(status, 42)
-    }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  Timeouts.nativeBuild,
-)
-
-it.effect(
-  'removes the build artifacts and keeps the source files',
-  () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem
-      const root = yield* fileSystem.makeTempDirectoryScoped()
-      yield* makeProject(root)
-      assert.strictEqual(yield* Workflow.build(options(root)), 0)
-      assert.strictEqual(yield* fileSystem.exists(`${root}/build`), true)
-
-      const status = yield* Workflow.clean(options(root))
-
-      assert.strictEqual(status, 0)
-      assert.strictEqual(yield* fileSystem.exists(`${root}/build`), false)
-      assert.strictEqual(yield* fileSystem.exists(`${root}/src/Main.silk`), true)
-      assert.strictEqual(yield* fileSystem.exists(`${root}/silk.toml`), true)
-    }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  Timeouts.nativeBuild,
+    assert.strictEqual(status, 0)
+    assert.strictEqual(yield* fileSystem.exists(`${root}/build`), false)
+    assert.strictEqual(yield* fileSystem.exists(`${root}/src/Main.silk`), true)
+    assert.strictEqual(yield* fileSystem.exists(`${root}/silk.toml`), true)
+  }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
 )
 
 it.effect('exits zero cleaning a project that was never built', () =>
@@ -848,33 +829,6 @@ it.effect('exits zero cleaning a project that was never built', () =>
     assert.strictEqual(yield* Workflow.clean(options(root)), 0)
     assert.strictEqual(yield* fileSystem.exists(`${root}/src/Main.silk`), true)
   }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-)
-
-it.live(
-  'checks again after a watched source file changes',
-  () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem
-      const root = yield* fileSystem.makeTempDirectoryScoped()
-      yield* makeProject(root)
-      const passes: Array<Workflow.ExitStatus> = []
-      const record = (project: Project.Project, selection: Workflow.ProjectSelection) =>
-        Workflow.checkProject(project, selection).pipe(
-          Effect.tap((status) => Effect.sync(() => passes.push(status))),
-        )
-
-      const watching = yield* Effect.forkChild(Workflow.watch(record, options(root)))
-      yield* waitUntil(() => passes.length >= 1)
-      yield* editUntilRecompiled(
-        `${root}/src/Main.silk`,
-        'pub fn main() -> i32 { return 7 }',
-        () => passes.length >= 2,
-      )
-      yield* Fiber.interrupt(watching)
-
-      assert.deepStrictEqual(passes.slice(0, 2), [0, 0])
-    }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  Timeouts.nativeBuild,
 )
 
 it.live(
@@ -957,35 +911,30 @@ it.live(
   Timeouts.nativeBuild,
 )
 
-it.live(
-  'checks again after a nested module in the source graph changes',
-  () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem
-      const root = yield* fileSystem.makeTempDirectoryScoped()
-      yield* makeProject(
-        root,
-        'import library.Answer { answer }\npub fn main() -> i32 { return answer() }',
-      )
-      yield* writeFile(`${root}/src/library/Answer.silk`, 'pub fn answer() -> i32 { return 42 }')
-      const passes: Array<Workflow.ExitStatus> = []
-      const record = (project: Project.Project, selection: Workflow.ProjectSelection) =>
-        Workflow.checkProject(project, selection).pipe(
-          Effect.tap((status) => Effect.sync(() => passes.push(status))),
-        )
+it.live('checks again after a nested module in the source graph changes', () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem
+    const root = yield* fileSystem.makeTempDirectoryScoped()
+    const nested = `${root}/src/library/Answer.silk`
+    yield* makeProject(
+      root,
+      'import library.Answer { answer }\npub fn main() -> i32 { return answer() }',
+    )
+    yield* writeFile(nested, 'pub fn answer() -> i32 { return 42 }')
+    const observed: Array<string> = []
+    const record = Effect.fnUntraced(function* () {
+      observed.push(yield* fileSystem.readFileString(nested))
+      return 0 as const
+    }, Effect.orDie)
 
-      const watching = yield* Effect.forkChild(Workflow.watch(record, options(root)))
-      yield* waitUntil(() => passes.length >= 1)
-      yield* editUntilRecompiled(
-        `${root}/src/library/Answer.silk`,
-        'pub fn answer() -> i32 { return 7 }',
-        () => passes.length >= 2,
-      )
-      yield* Fiber.interrupt(watching)
+    const watching = yield* Effect.forkChild(Workflow.watch(record, options(root)))
+    yield* waitUntil(() => observed.length >= 1)
+    const edited = 'pub fn answer() -> i32 { return 7 }'
+    yield* editUntilRecompiled(nested, edited, () => observed.length >= 2)
+    yield* Fiber.interrupt(watching)
 
-      assert.deepStrictEqual(passes.slice(0, 2), [0, 0])
-    }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  Timeouts.nativeBuild,
+    assert.deepStrictEqual(observed.slice(0, 2), ['pub fn answer() -> i32 { return 42 }', edited])
+  }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
 )
 
 /**
@@ -1113,29 +1062,30 @@ it.live(
   Timeouts.nativeBuild,
 )
 
-it.live(
-  'keeps watching after a compilation that reports a diagnostic',
-  () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem
-      const root = yield* fileSystem.makeTempDirectoryScoped()
-      yield* makeProject(root, 'pub fn main() -> Mystery { return 42 }')
-      const passes: Array<Workflow.ExitStatus> = []
-      const record = (project: Project.Project, selection: Workflow.ProjectSelection) =>
-        Workflow.checkProject(project, selection).pipe(
-          Effect.tap((status) => Effect.sync(() => passes.push(status))),
-        )
+it.live('keeps watching after a pass that returns a nonzero status', () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem
+    const root = yield* fileSystem.makeTempDirectoryScoped()
+    yield* makeProject(root)
+    const passes: Array<Workflow.ExitStatus> = []
+    const record = () =>
+      Effect.sync(() => {
+        const status: Workflow.ExitStatus = passes.length === 0 ? 1 : 0
+        passes.push(status)
+        return status
+      })
 
-      const watching = yield* Effect.forkChild(Workflow.watch(record, options(root)))
-      yield* waitUntil(() => passes.length >= 1)
-      assert.strictEqual(passes[0], 1)
+    const watching = yield* Effect.forkChild(Workflow.watch(record, options(root)))
+    yield* waitUntil(() => passes.length >= 1)
+    yield* editUntilRecompiled(
+      `${root}/src/Main.silk`,
+      'pub fn main() -> i32 { return 7 }',
+      () => passes.length >= 2,
+    )
+    yield* Fiber.interrupt(watching)
 
-      yield* editUntilRecompiled(`${root}/src/Main.silk`, source, () => passes.length >= 2)
-
-      assert.strictEqual(passes[1], 0)
-      yield* Fiber.interrupt(watching)
-    }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  Timeouts.nativeBuild,
+    assert.deepStrictEqual(passes.slice(0, 2), [1, 0])
+  }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
 )
 
 it.effect('reports a missing selected root as an operational failure without output', () =>

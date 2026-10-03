@@ -268,10 +268,27 @@ export const hasAppliedMember = (state: State): boolean => {
   const compactOpening = state.lexical.tokens.at(index)?.kind === 'Less'
   if (significant()?.kind !== 'Less') return false
   let depth = 0
+  // A closing bracket without its opener inside the scan ends the enclosing group, so no
+  // argument list can continue past it. Stopping there keeps `i < n` comparisons from scanning
+  // to the end of every enclosing body.
+  let nesting = 0
   while (index < state.lexical.tokens.length) {
     const token = significant()
     if (token === undefined) return false
-    if (token.kind === 'Less') depth += 1
+    if (
+      token.kind === 'LeftParenthesis' ||
+      token.kind === 'LeftBracket' ||
+      token.kind === 'LeftBrace'
+    )
+      nesting += 1
+    else if (
+      token.kind === 'RightParenthesis' ||
+      token.kind === 'RightBracket' ||
+      token.kind === 'RightBrace'
+    ) {
+      if (nesting === 0) return false
+      nesting -= 1
+    } else if (token.kind === 'Less') depth += 1
     else if (token.kind === 'Greater') {
       depth -= 1
       if (depth === 0) {

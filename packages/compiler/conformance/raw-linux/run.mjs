@@ -214,18 +214,22 @@ const program = Effect.gen(function* () {
             scope,
             profile,
             object.helpers,
+            {
+              _tag: 'Disabled',
+            },
           )
+          const helperObjects = support === undefined ? [] : [support.object]
           const destination = path.join(output, name)
           const plan = yield* NativeToolchain.planNativeLink(
             tools,
             scope,
             'NativeExecutable',
             profile,
-            [object.artifact, ...support.map((entry) => entry.artifact)],
+            [object.artifact, ...helperObjects.map((entry) => entry.artifact)],
             HelperCapability.linkInputs([object.helpers]),
             destination,
             analysis.artifactPlan.composition.loader,
-            [object.helpers, ...support.map((entry) => entry.helpers)],
+            [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
           )
           yield* Linker.link({
             scope,

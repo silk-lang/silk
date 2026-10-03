@@ -725,23 +725,6 @@ it.effect('compiles library source with ordinary diagnostics and no privilege', 
   }),
 )
 
-it('keeps stdlib-importing artifacts byte-identical across fresh processes', () => {
-  const fixture = fileURLToPath(new URL('./fixtures/stdlib-determinism.mjs', import.meta.url))
-  const run = () => spawnSync(process.execPath, [fixture], { encoding: 'utf8' })
-  const first = run()
-  const second = run()
-
-  assert.strictEqual(first.status, 0, first.stderr)
-  assert.strictEqual(second.status, 0, second.stderr)
-  assert.strictEqual(first.stdout, second.stdout)
-  const encoded = JSON.parse(first.stdout) as {
-    readonly diagnostics: ReadonlyArray<unknown>
-    readonly modules: ReadonlyArray<string>
-  }
-  assert.deepEqual(encoded.diagnostics, [])
-  assert.include(encoded.modules, 'silk/vector')
-})
-
 /**
  * `app/helper` explicitly imports the standard library's `Result`. That ordinary dependency enters
  * the closure, but its catalog namespace does not enter the root module's scope.

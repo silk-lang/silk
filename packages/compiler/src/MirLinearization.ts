@@ -1060,8 +1060,11 @@ export const llvmControl = (program: Mir.Module): ReadonlyArray<ControlProvenanc
   program.functions.flatMap((fn) =>
     (() => {
       const linear = linearize(fn)
+      const origins = new Map<number, Mir.RegionId>()
+      for (const block of linear)
+        if (!origins.has(block.id.ordinal)) origins.set(block.id.ordinal, block.origin)
       const originOf = (target: Mir.RegionId): Mir.RegionId | undefined =>
-        linear.find((candidate) => candidate.id.ordinal === target.ordinal)?.origin
+        origins.get(target.ordinal)
       return linear.map((block): ControlProvenance => {
         const terminator = block.terminator
         let targets: Array<Mir.RegionId | undefined> = []

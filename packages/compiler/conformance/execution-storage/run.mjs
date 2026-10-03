@@ -231,9 +231,13 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
             scope,
             profile,
             object.helpers,
+            {
+              _tag: 'Disabled',
+            },
           )
+          const helperObjects = support === undefined ? [] : [support.object]
           const helperInspections = []
-          for (const [index, helper] of support.entries()) {
+          for (const [index, helper] of helperObjects.entries()) {
             helperInspections.push(
               yield* run(inspect, ['--symbols', '--relocations', helper.artifact.path]),
             )
@@ -280,7 +284,7 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
             profile,
             [
               object.artifact,
-              ...support.map((entry) => entry.artifact),
+              ...helperObjects.map((entry) => entry.artifact),
               c.artifact,
               runtime.artifact,
             ],
@@ -291,7 +295,7 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
               composition: { kind: 'default' },
               resolved: { kind: 'default' },
             },
-            [object.helpers, ...support.map((entry) => entry.helpers)],
+            [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
           )
           yield* Linker.link({
             scope,

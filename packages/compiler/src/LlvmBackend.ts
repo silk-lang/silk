@@ -2,7 +2,6 @@ import * as Effect from 'effect/Effect'
 import type * as Backend from './Backend.js'
 import { BackendError } from './Backend.js'
 import type * as Mir from './Mir.js'
-import { llvmControl } from './MirLinearization.js'
 import * as NativeProgram from './NativeProgram.js'
 import * as Target from './Target.js'
 
@@ -40,7 +39,6 @@ export const LlvmBackend: Backend.Backend<Backend.LlvmBitcodeArtifact> = {
       foreignImports: output.foreignImports,
       foreignExports: output.foreignExports,
       foreignStatics: output.foreignStatics,
-      control: llvmControl(program),
       bitcode: output.bitcode,
     }
     // Textual IR is rendered only when read: it is a full extra pass over the module and most

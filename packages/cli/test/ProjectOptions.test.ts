@@ -24,13 +24,13 @@ it('preserves explicit project selection flags', () => {
       manifestPath: 'nested/silk.toml',
       targets: ['aarch64-apple-darwin', 'wasm32-unknown-unknown'],
       optimization: 'release-with-debug',
-      verifyMir: true,
+      verifyIr: true,
     }),
     Result.succeed({
       manifestPath: 'nested/silk.toml',
       targets: ['aarch64-apple-darwin', 'wasm32-unknown-unknown'],
       optimization: 'release-with-debug',
-      verifyMir: true,
+      verifyIr: true,
     }),
   )
 })

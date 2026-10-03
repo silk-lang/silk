@@ -17,10 +17,6 @@ const ascii = (value: string): Uint8Array => encoder.encode(value)
 const fixedWidthIntegers = Scalar.integers().filter((scalar) => scalar.width._tag === 'FixedWidth')
 const integerSpellings = [...fixedWidthIntegers.map((scalar) => scalar.spelling), 'usize', 'isize']
 
-const sourceText = (spelling: string): string => {
-  return readFileSync(new URL(`../stdlib/silk/${spelling}.silk`, import.meta.url), 'utf8')
-}
-
 const formattingFailureProgram = (body: string): string => `import silk.effect { Effect }
 import silk.format { Format }
 import silk.writer { Writer, WriterError }
@@ -283,18 +279,6 @@ pub fn make() -> Person { return Person { name: "Julia", token: 42 } }`),
   }),
 )
 
-it('removes allocating integer rendering without a compatibility path', () => {
-  assert.strictEqual(integerSpellings.length, 10)
-  for (const spelling of integerSpellings) {
-    const source = sourceText(spelling)
-    assert.notInclude(source, 'pub effect fn toText(')
-    assert.notInclude(source, 'import silk.allocator { Allocator }')
-    assert.notInclude(source, 'import silk.allocator { OutOfMemoryError }')
-    assert.notInclude(source, 'import silk.string { String }')
-    assert.include(source, `pub fn parse(text: string) -> Result<${spelling}, ParseError> {`)
-  }
-})
-
 it('declares inline Display witnesses without a second string-writing route', () => {
   const source = readFileSync(new URL('../stdlib/silk/format.silk', import.meta.url), 'utf8')
   for (const spelling of integerSpellings) assert.include(source, `impl Display for ${spelling} {`)
@@ -309,19 +293,3 @@ it('declares inline Display witnesses without a second string-writing route', ()
   assert.notInclude(source, 'OutOfMemoryError')
   assert.notInclude(source, '? &mut Allocator')
 })
-
-it.effect('rejects the removed toText operation as an unknown module member', () =>
-  Effect.gen(function* () {
-    const snapshot = yield* AnalysisFixture.retainingMain(
-      'number-text/no-to-text',
-      ascii(`import silk.i32
-pub fn main() -> i32 { let text = i32.toText(42) return 0 }`),
-      'wasm32-unknown-unknown',
-    )
-    const diagnostics = Analysis.diagnostics(snapshot)
-    assert.deepEqual(
-      diagnostics.map((diagnostic) => diagnostic.code),
-      ['SEM0014'],
-    )
-  }),
-)

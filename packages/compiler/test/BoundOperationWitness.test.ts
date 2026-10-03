@@ -1,4 +1,3 @@
-import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
@@ -7,7 +6,6 @@ import * as Tir from '../src/Tir.js'
 import * as InstanceDiagnostics from '../src/InstanceDiagnostics.js'
 import * as Mir from '../src/Mir.js'
 import * as MirVerification from '../src/MirVerification.js'
-import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
 import { unreachable } from './support/raise.js'
@@ -34,6 +32,25 @@ const analyzed = (
 ) => AnalysisFixture.retainingMain(name, ascii(source), target, options)
 
 const frontend = (name: string, source: string) => Analysis.ofSource(name, ascii(source))
+
+const encodable = (head: string) => `${head} Encodable<A> { fn encode(value: &Self) -> A }
+pub struct Age { pub value: i32 }
+impl Encodable<i32> for Age {
+  fn encode(value: &Self) -> i32 { return value.value }
+}`
+
+/** Analyzes a root beside one imported model module; the claims are frontend facts. */
+const withModel = (root: string, source: string, model: string, modelSource: string) =>
+  Analysis.make({ root }).pipe(
+    Effect.provide(
+      SourceResolver.memory(
+        new Map([
+          [root, ascii(source)],
+          [model, ascii(modelSource)],
+        ]),
+      ),
+    ),
+  )
 
 const messages = (snapshot: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.message)
@@ -283,28 +300,7 @@ pub fn main() -> i32 {
   let encoded = Encoding.Encodable<i32>.encode(&age)
   return (&age) |> Encoding.Encodable<i32>.encode
 }`
-    const snapshot = yield* Analysis.makeRealized({
-      root: module,
-    }).pipe(
-      Effect.provide(
-        SourceResolver.overlay([SourceFile.make(module, ascii(source))]).pipe(
-          Layer.provideMerge(
-            SourceResolver.memory(
-              new Map([
-                [
-                  'model/Encoding',
-                  ascii(`pub interface Encodable<A> { fn encode(value: &Self) -> A }
-pub struct Age { pub value: i32 }
-impl Encodable<i32> for Age {
-  fn encode(value: &Self) -> i32 { return value.value }
-}`),
-                ],
-              ]),
-            ),
-          ),
-        ),
-      ),
-    )
+    const snapshot = yield* withModel(module, source, 'model/Encoding', encodable('pub interface'))
     assert.deepEqual(messages(snapshot), [])
 
     const appliedOffset = source.indexOf('Encoding.Encodable<i32>.encode')
@@ -326,36 +322,15 @@ impl Encodable<i32> for Age {
     assert.strictEqual(operation?.role, 'Operation')
     assert.strictEqual(operation?.resolution._tag, 'Available')
 
-    const inaccessible = yield* Analysis.makeRealized({
-      root: `${module}/inaccessible`,
-    }).pipe(
-      Effect.provide(
-        SourceResolver.overlay([
-          SourceFile.make(
-            `${module}/inaccessible`,
-            ascii(`import model.Hidden
+    const inaccessible = yield* withModel(
+      `${module}/inaccessible`,
+      `import model.Hidden
 pub fn main() -> i32 {
   let age = Hidden.Age { value: 42 }
   return Hidden.Encodable<i32>.encode(&age)
-}`),
-          ),
-        ]).pipe(
-          Layer.provideMerge(
-            SourceResolver.memory(
-              new Map([
-                [
-                  'model/Hidden',
-                  ascii(`interface Encodable<A> { fn encode(value: &Self) -> A }
-pub struct Age { pub value: i32 }
-impl Encodable<i32> for Age {
-  fn encode(value: &Self) -> i32 { return value.value }
-}`),
-                ],
-              ]),
-            ),
-          ),
-        ),
-      ),
+}`,
+      'model/Hidden',
+      encodable('interface'),
     )
     assert.include(
       Analysis.diagnostics(inaccessible).map((diagnostic) => diagnostic.code),

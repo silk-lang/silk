@@ -188,11 +188,13 @@ export const nonParkingOfSummary = (summary: SuspensionMode.Summary): Verdict =>
       )
     : satisfied
 
+const runtimeArgumentsText = (self: ReadonlyArray<Type.GenericArgument>): string =>
+  Type.runtimeArgumentKeys(self).join('\0')
+
 const sameArguments = (
   left: ReadonlyArray<Type.GenericArgument>,
   right: ReadonlyArray<Type.GenericArgument>,
-): boolean =>
-  Type.runtimeArgumentKeys(left).join('\0') === Type.runtimeArgumentKeys(right).join('\0')
+): boolean => runtimeArgumentsText(left) === runtimeArgumentsText(right)
 
 const callableSubjectOf = (
   discovery: Instances.Discovery,
@@ -320,6 +322,17 @@ export const derive = (
     ownerAssumptions.set(key, assumptions)
     return assumptions
   }
+  // Each callable's NonParking reads the first instance of its declaration and runtime arguments
+  // and that instance's suspension; both are indexed once instead of searched per callable.
+  const instancesByTarget = new Map<string, Instances.Instance>()
+  for (const instance of discovery.instances) {
+    const target = `${instance.key.declaration.module}\0${instance.key.declaration.name}\0${runtimeArgumentsText(instance.key.typeArguments)}`
+    if (!instancesByTarget.has(target)) instancesByTarget.set(target, instance)
+  }
+  const instanceSuspension = new Map<Instances.InstanceKey, SuspensionMode.Summary>()
+  for (const fact of discovery.suspension)
+    if (fact.subject._tag === 'Instance' && !instanceSuspension.has(fact.subject.key))
+      instanceSuspension.set(fact.subject.key, fact.summary)
   const effects = discovery.effects.map((effect): Fact => ({
     _tag: 'ExecutablePropertyFact',
     subject: { _tag: 'Effect', identity: effect.identity },
@@ -347,19 +360,12 @@ export const derive = (
       nonParking: (() => {
         if (callable.target._tag !== 'DeclarationCallableTarget') return satisfied
         const declaration = callable.target.declaration
-        const target = discovery.instances.find(
-          (instance) =>
-            instance.key.declaration.module === declaration.module &&
-            instance.key.declaration.name === declaration.name &&
-            sameArguments(instance.key.typeArguments, callable.typeArguments),
+        const target = instancesByTarget.get(
+          `${declaration.module}\0${declaration.name}\0${runtimeArgumentsText(callable.typeArguments)}`,
         )
         return target === undefined
           ? verdict([cause('Unavailable', [`callable:${identity}`])])
-          : nonParkingOfSummary(
-              discovery.suspension.find(
-                (fact) => fact.subject._tag === 'Instance' && fact.subject.key === target.key,
-              )?.summary ?? SuspensionMode.direct,
-            )
+          : nonParkingOfSummary(instanceSuspension.get(target.key) ?? SuspensionMode.direct)
       })(),
     }
   })

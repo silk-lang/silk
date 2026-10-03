@@ -281,50 +281,69 @@ const operationClassification = (
   return ProvisionalMir.classificationOfRun(provisional, fn.instance, operation.provenance.span)
 }
 
-/** Applies normalization within every explicit execution without flattening its control flow. */
+/**
+ * Applies normalization within every explicit execution without flattening its control flow.
+ * Unchanged regions, operations, and region lists keep their identity, so a function the
+ * transform leaves alone allocates nothing.
+ */
 const mapRegions = (
   regions: ReadonlyArray<Mir.Region>,
   transform: (region: Mir.Region) => Mir.Region,
 ): ReadonlyArray<Mir.Region> => {
-  const execution = (value: Mir.Execution): Mir.Execution => ({
-    ...value,
-    regions: mapRegions(value.regions, transform),
-  })
+  const execution = (value: Mir.Execution): Mir.Execution => {
+    const mapped = mapRegions(value.regions, transform)
+    return mapped === value.regions ? value : { ...value, regions: mapped }
+  }
   const operation = (value: Mir.Operation): Mir.Operation => {
-    if (value._tag === 'Match')
-      return {
-        ...value,
-        arms: value.arms.map((arm) => ({
+    if (value._tag === 'Match') {
+      let changed = false
+      const arms = value.arms.map((arm) => {
+        const guard = arm.guard === undefined ? undefined : execution(arm.guard.execution)
+        const selected = execution(arm.selected.execution)
+        if (guard === arm.guard?.execution && selected === arm.selected.execution) return arm
+        changed = true
+        return {
           ...arm,
-          ...(arm.guard === undefined
-            ? {}
-            : { guard: { execution: execution(arm.guard.execution) } }),
-          selected: {
-            ...arm.selected,
-            execution: execution(arm.selected.execution),
-          },
-        })),
-      }
-    if (value._tag === 'DiagnosticScope') return { ...value, body: execution(value.body) }
-    if (value._tag === 'Conditional')
-      return {
-        ...value,
-        taken: execution(value.taken),
-        otherwise: execution(value.otherwise),
-      }
-    if (value._tag === 'ShortCircuit') return { ...value, right: execution(value.right) }
+          ...(guard === undefined ? {} : { guard: { execution: guard } }),
+          selected: { ...arm.selected, execution: selected },
+        }
+      })
+      return changed ? { ...value, arms } : value
+    }
+    if (value._tag === 'DiagnosticScope') {
+      const body = execution(value.body)
+      return body === value.body ? value : { ...value, body }
+    }
+    if (value._tag === 'Conditional') {
+      const taken = execution(value.taken)
+      const otherwise = execution(value.otherwise)
+      return taken === value.taken && otherwise === value.otherwise
+        ? value
+        : { ...value, taken, otherwise }
+    }
+    if (value._tag === 'ShortCircuit') {
+      const right = execution(value.right)
+      return right === value.right ? value : { ...value, right }
+    }
     return value
   }
-  return regions.map((region) =>
-    transform(
-      region._tag === 'OperationRegion'
-        ? {
-            ...region,
-            operations: region.operations.map(operation),
-          }
-        : region,
-    ),
-  )
+  let changed = false
+  const mapped = regions.map((region) => {
+    let input = region
+    if (region._tag === 'OperationRegion') {
+      const operations = region.operations.map(operation)
+      if (
+        operations.some(
+          (mappedOperation, ordinal) => mappedOperation !== region.operations.at(ordinal),
+        )
+      )
+        input = { ...region, operations }
+    }
+    const output = transform(input)
+    if (output !== region) changed = true
+    return output
+  })
+  return changed ? mapped : regions
 }
 
 /** Normalizes one target-aware MIR module from exact provisional runner facts. */
@@ -340,6 +359,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
     const constructorGuards = new Map<number, ConstructorGuard>()
     const foldedRegions = mapRegions(fn.regions, (region) => {
       if (region._tag !== 'OperationRegion') return region
+      let regionChanged = false
       const operations = region.operations.map((operation) => {
         const target =
           operation._tag === 'Call' || operation._tag === 'ApplyCallable'
@@ -373,6 +393,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
           }
           return operation
         }
+        regionChanged = true
         functionChanged = true
         changed = true
         const guard = target === undefined ? 'SingleRegion' : constructorGuardOf(target)
@@ -388,7 +409,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
         })
         return folded
       })
-      return functionChanged ? { ...region, operations: operations } : region
+      return regionChanged ? { ...region, operations } : region
     })
     const folded = functionChanged ? { ...fn, regions: foldedRegions } : fn
     for (const region of Mir.regionsTree(folded.regions)) {

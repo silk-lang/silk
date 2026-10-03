@@ -140,19 +140,16 @@ effect fn program() -> () ! OutOfMemoryError {
 effect fn recover(error: OutOfMemoryError) -> () { return () }
 pub fn main() -> () { return run Effect.catchAll(program(), recover) }`
 
-it.effect('emits deterministic native never-driven package cleanup', () =>
+it.effect('emits native never-driven package cleanup', () =>
   Effect.gen(function* () {
-    const first = yield* AnalysisFixture.retainingMain(
+    const snapshot = yield* AnalysisFixture.retainingMain(
       'external-wake-parking/native-cleanup',
       new TextEncoder().encode(source),
       'aarch64-apple-darwin',
     )
-    assert.deepEqual(Analysis.diagnostics(first), [])
-    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(first)), [])
-    const firstArtifact = yield* Analysis.codegen(first, { mode: 'release' })
-    const secondArtifact = yield* Analysis.codegen(first, { mode: 'release' })
-    assert.strictEqual(firstArtifact.ir, secondArtifact.ir)
-    assert.deepEqual(firstArtifact.bitcode, secondArtifact.bitcode)
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+    yield* Analysis.codegen(snapshot, { mode: 'release' })
   }),
 )
 

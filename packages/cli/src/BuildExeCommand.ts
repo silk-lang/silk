@@ -72,7 +72,7 @@ const timings = Flag.Boolean('timings').pipe(
 )
 
 export interface Options {
-  readonly verifyMir?: boolean
+  readonly verifyIr?: boolean
   readonly source: string
   readonly sourceRoot: string | undefined
   readonly output: string
@@ -169,7 +169,7 @@ export const run = Effect.fn('BuildExeCommand.run')(function* (
     },
     scopeName: 'silk-build-exe',
     saveTemps: options.saveTemps,
-    verifyMir: options.verifyMir ?? false,
+    verifyIr: options.verifyIr ?? false,
     timings: options.timings,
   })
   return attempted.status
@@ -187,7 +187,7 @@ export const command = Command.make(
     platformSupply,
     clang,
     saveTemps,
-    verifyMir: ProjectOptions.verifyMir,
+    verifyIr: ProjectOptions.verifyIr,
     timings,
   },
   Effect.fnUntraced(function* (config) {
@@ -207,7 +207,7 @@ export const command = Command.make(
       }),
       clang: config.clang,
       saveTemps: config.saveTemps,
-      verifyMir: config.verifyMir,
+      verifyIr: config.verifyIr,
       timings: config.timings,
     })
     yield* CommandExit.complete(status)

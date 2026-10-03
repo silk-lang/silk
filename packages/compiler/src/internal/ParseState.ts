@@ -23,14 +23,11 @@ export interface NodeResult {
   readonly node: SyntaxTree.Node
 }
 
-const triviaKinds: ReadonlyArray<Token.TokenKind> = [
-  'Whitespace',
-  'LineComment',
-  'DocComment',
-  'ModuleDocComment',
-]
-
-export const isTrivia = (kind: Token.TokenKind): boolean => triviaKinds.includes(kind)
+export const isTrivia = (kind: Token.TokenKind): boolean =>
+  kind === 'Whitespace' ||
+  kind === 'LineComment' ||
+  kind === 'DocComment' ||
+  kind === 'ModuleDocComment'
 
 export const currentToken = (state: State): Token.Token | undefined =>
   state.lexical.tokens.at(state.index)

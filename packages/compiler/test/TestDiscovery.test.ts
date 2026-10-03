@@ -11,6 +11,7 @@ import * as SourceResolver from '../src/SourceResolver.js'
 import * as TestExecution from '../src/TestExecution.js'
 import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
+import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { unreachable } from './support/raise.js'
 
 const encoder = new TextEncoder()
@@ -45,7 +46,7 @@ fn helper() -> () { ${helper} }`,
   ]
   return Analysis.make({
     root: 'runner/Main',
-    target: 'x86_64-unknown-linux-gnu',
+    configuration: AnalysisFixture.configuration('runner/Main'),
     discovery: {
       root: 'suite/Root',
       logicalRoot: 'src',
@@ -64,7 +65,6 @@ fn helper() -> () { ${helper} }`,
 const fingerprintSnapshot = (text: string) =>
   Analysis.make({
     root: 'Cases',
-    target: 'x86_64-unknown-linux-gnu',
     discovery: { root: 'Cases' },
   }).pipe(
     Effect.provide(
@@ -96,13 +96,11 @@ const manifestOf = Effect.fnUntraced(function* (
   )
 })
 
-const executionSnapshot = Effect.fnUntraced(function* (
-  text: string,
-  environment: TestExecution.Environment = defaultEnvironment,
-) {
+/** Realizes `Cases` with its `main` runner retained and no default executable runtime. */
+const realizedCases = Effect.fnUntraced(function* (text: string) {
   const analysis = yield* Analysis.makeRealized({
     root: 'Cases',
-    target: 'x86_64-unknown-linux-gnu',
+    configuration: AnalysisFixture.configuration('Cases'),
     discovery: { root: 'Cases' },
   }).pipe(
     Effect.provide(
@@ -112,6 +110,14 @@ const executionSnapshot = Effect.fnUntraced(function* (
     ),
   )
   assert.deepEqual(Analysis.diagnostics(analysis), [])
+  return analysis
+})
+
+const executionSnapshot = Effect.fnUntraced(function* (
+  text: string,
+  environment: TestExecution.Environment = defaultEnvironment,
+) {
+  const analysis = yield* realizedCases(text)
   const manifest = yield* manifestOf(analysis, environment)
   return { analysis, manifest }
 })
@@ -133,18 +139,7 @@ const eligibleIdentities = (manifest: TestExecution.Manifest): ReadonlyMap<strin
   )
 
 const runnerExecutionIdentity = Effect.fnUntraced(function* (text: string) {
-  const analysis = yield* Analysis.makeRealized({
-    root: 'Cases',
-    target: 'x86_64-unknown-linux-gnu',
-    discovery: { root: 'Cases' },
-  }).pipe(
-    Effect.provide(
-      SourceResolver.overlay([source('Cases', text)]).pipe(
-        Layer.provideMerge(SourceResolver.empty),
-      ),
-    ),
-  )
-  assert.deepEqual(Analysis.diagnostics(analysis), [])
+  const analysis = yield* realizedCases(text)
   const catalog = analysis.testCatalog
   if (catalog === undefined) return unreachable('expected test catalog')
   return yield* TestExecution.runnerIdentity(
@@ -197,6 +192,8 @@ test fn alpha() -> () { let value=1
   drop value }
 test fn beta() -> () { helper() }
 fn helper() -> () { let value = 2 drop value }`)
+      for (const analysis of [before, bodyAndHelperEdit, headerEdit, movedAndTriviaEdit])
+        assert.deepEqual(analysis.diagnostics, [])
       const fingerprints = (analysis: Analysis.SingleRootFrontendSnapshot) =>
         new Map(
           analysis.testCatalog?.entries.map((entry) => [

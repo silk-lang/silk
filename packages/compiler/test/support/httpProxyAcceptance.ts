@@ -523,10 +523,12 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     }
   }
 
-  let largeOne = run proxyFilled(8160)
-  let largeTwo = run proxyFilled(8160)
-  let largeThree = run proxyFilled(8160)
-  let largeFour = run proxyFilled(8160)
+  // The wire head fits 32768 bytes, but payload plus four field records exceeds the 32768-byte
+  // owned bound even with 32-bit records, so the overflow holds on native and wasm32 targets.
+  let largeOne = run proxyFilled(8178)
+  let largeTwo = run proxyFilled(8178)
+  let largeThree = run proxyFilled(8178)
+  let largeFour = run proxyFilled(8178)
   let overflowOne = match move Header.make("A", Bytes.asSlice(&largeOne), proxyConnectInputLimits()) {
     Result.Failure {error} => { return false }
     Result.Success {value} => value
@@ -592,7 +594,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   }
   if !proxyBytesEqual(
     PreparedRequest.bytes(&forwardedHttp10),
-    b"GET http://example.com/a?b HTTP/1.0\\r\\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\\r\\nHost: example.com\\r\\n\\r\\n",
+    b"GET http://example.com/a?b HTTP/1.0\\r\\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\\r\\nHost: example.com\\r\\nConnection: close\\r\\n\\r\\n",
   ) {
     return false
   }

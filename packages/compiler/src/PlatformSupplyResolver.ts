@@ -122,6 +122,13 @@ const observations = new Map<string, Observation>()
  */
 const settledMillis = 2_000
 
+/**
+ * Effect's live clock, the host wall clock that stamps mtime. Settledness is never judged against
+ * the provided fiber Clock: a virtual one (`TestClock` starts at epoch 0) would disable the memo or
+ * memoize a file still within its timestamp granularity.
+ */
+const hostClock = Clock.Clock.defaultValue()
+
 const statIdentity = (info: FileSystem.File.Info): string | undefined => {
   const mtime = Option.getOrUndefined(info.mtime)
   const ino = Option.getOrUndefined(info.ino)
@@ -147,7 +154,7 @@ const contentDigest = Effect.fnUntraced(function* (
   if (
     identity !== undefined &&
     modified !== undefined &&
-    modified <= (yield* Clock.currentTimeMillis) - settledMillis
+    modified <= (yield* hostClock.currentTimeMillis) - settledMillis
   )
     observations.set(path, { identity, digest: value })
   else observations.delete(path)

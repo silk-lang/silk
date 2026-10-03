@@ -297,13 +297,20 @@ export const closure = Effect.fn('HelperCapability.closure')(function* (
   return selected
 })
 
+/**
+ * The symbol classes an object's emitting artifact declared. Accounting reads only their names, so
+ * a reused object carries these instead of its whole backend artifact.
+ */
+export interface Declarations {
+  readonly foreignImports: ReadonlyArray<Pick<Backend.ForeignImport, 'symbol'>>
+  readonly foreignStatics: ReadonlyArray<Pick<Backend.ForeignStatic, 'symbol' | 'direction'>>
+  readonly nativeRuntimeSymbols: ReadonlyArray<string>
+}
+
 /** Accounts actual object references against explicit source/runtime contracts and helper ABIs. */
 export const reconcile = Effect.fn('HelperCapability.reconcile')(function* (
   inventory: ObjectSymbols.Inventory,
-  artifact: Pick<
-    Backend.LlvmBitcodeArtifact,
-    'foreignImports' | 'foreignStatics' | 'nativeRuntimeSymbols'
-  >,
+  artifact: Declarations,
   profile: CompilationProfile.Facts,
   object: string,
   objectDigest: string,

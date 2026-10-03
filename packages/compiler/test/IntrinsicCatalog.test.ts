@@ -14,9 +14,9 @@ import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
-import * as CallableContract from '../src/CallableContract.js'
 import * as Intrinsic from '../src/Intrinsic.js'
 import * as Lifetime from '../src/Lifetime.js'
+import * as ProjectAnalysis from '../src/ProjectAnalysis.js'
 import * as Scalar from '../src/Scalar.js'
 import * as Type from '../src/Type.js'
 import * as SourceResolver from '../src/SourceResolver.js'
@@ -349,10 +349,6 @@ it('uses one binding contract for inventory, admission, and the proof-only post 
     if (operation.rule._tag !== 'ContractRule') continue
     assert.strictEqual(operation.rule.post, 'BindRequirement')
     assert.strictEqual(entry.signature, Intrinsic.signature(operation))
-    assert.strictEqual(
-      CallableContract.key(operation.rule.contract),
-      CallableContract.key(operation.rule.contract),
-    )
     assert.deepEqual(Object.keys(operation.rule).sort(), [
       '_tag',
       'contract',
@@ -362,35 +358,35 @@ it('uses one binding contract for inventory, admission, and the proof-only post 
   }
 })
 
-it.effect(
-  'pairs every intrinsic presentation with accepted semantic analysis',
-  () =>
-    Effect.gen(function* () {
-      const observed = new Set<string>()
-      for (const [ordinal, source] of acceptedSources.entries()) {
-        const snapshot = yield* Analysis.ofSource(
-          `intrinsic/accepted-${ordinal}`,
-          encoder.encode(source),
-        )
-        assert.deepEqual(
-          Analysis.diagnostics(snapshot),
-          [],
-          `accepted intrinsic fixture ${ordinal}`,
-        )
-        for (const operation of operationKeys(snapshot)) observed.add(operation)
-      }
-      const catalog = Intrinsic.all().flatMap((actor) =>
-        actor.operations.flatMap((operation) =>
-          operation.rule._tag === 'EnumValueRule' || operation.phase !== 'Runtime'
-            ? []
-            : [key(actor.spelling, operation.spelling)],
-        ),
-      )
-      assert.deepEqual([...observed].sort(), [...catalog].sort())
-    }),
-  // This sweep takes about 45s in isolation but can exceed 180s while all four compiler shards
-  // saturate the CI host; the timeout is contention headroom, not a performance assertion.
-  300_000,
+it.effect('pairs every intrinsic presentation with accepted semantic analysis', () =>
+  Effect.gen(function* () {
+    // One project analyzes the shared standard-library closure once; each fixture stays its own
+    // root module, so a diagnostic names its fixture through `span.sourceId`.
+    const fixtures = new Map(
+      acceptedSources.map((source, ordinal) => [
+        `intrinsic/accepted-${ordinal}`,
+        encoder.encode(source),
+      ]),
+    )
+    const project = yield* ProjectAnalysis.make([...fixtures.keys()]).pipe(
+      Effect.provide(SourceResolver.memory(fixtures)),
+    )
+    const observed = new Set<string>()
+    for (const fixture of fixtures.keys()) {
+      const view =
+        ProjectAnalysis.view(project, fixture) ?? unreachable(`expected a view for ${fixture}`)
+      assert.deepEqual(Analysis.diagnostics(view), [], fixture)
+      for (const operation of operationKeys(view)) observed.add(operation)
+    }
+    const catalog = Intrinsic.all().flatMap((actor) =>
+      actor.operations.flatMap((operation) =>
+        operation.rule._tag === 'EnumValueRule' || operation.phase !== 'Runtime'
+          ? []
+          : [key(actor.spelling, operation.spelling)],
+      ),
+    )
+    assert.deepEqual([...observed].sort(), [...catalog].sort())
+  }),
 )
 
 it.effect('keeps every intrinsic identifiable and presentable in rejected calls', () =>

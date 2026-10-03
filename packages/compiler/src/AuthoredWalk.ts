@@ -30,24 +30,55 @@ const emptyBlock = (anchor: AuthoredHir.Anchor): AuthoredHir.Block => ({
 export const moduleName = (context: SemanticContext.SemanticContext): string =>
   context.module.owner.module
 
-/** The authored declaration one owner identity names, at any nesting depth of the module. */
-export const declarationOf = (
-  module: AuthoredHir.Module,
-  owner: AuthoredIdentity.Identity,
-): AuthoredHir.Declaration | undefined => {
+type CallableExpression = Extract<AuthoredHir.Expression, { readonly _tag: 'CallableExpression' }>
+
+/** Every owner a module names, keyed by `AuthoredIdentity.key`. */
+interface OwnerIndex {
+  readonly declarations: ReadonlyMap<string, AuthoredHir.Declaration>
+  readonly callables: ReadonlyMap<string, CallableExpression>
+}
+
+// Authored modules are never edited after lowering, and body analysis resolves one owner per
+// analyzed body (twice per anonymous callable), so each module's owners are indexed once instead
+// of rescanning every declaration and body per lookup.
+const ownerIndexes = new WeakMap<AuthoredHir.Module, OwnerIndex>()
+
+const ownerIndex = (module: AuthoredHir.Module): OwnerIndex => {
+  const cached = ownerIndexes.get(module)
+  if (cached !== undefined) return cached
+  const declarations = new Map<string, AuthoredHir.Declaration>()
+  const callables = new Map<string, CallableExpression>()
   const pending = [...module.declarations]
   while (pending.length > 0) {
     const declaration = pending.pop()
     if (declaration === undefined) break
-    if (AuthoredIdentity.equals(declaration.owner, owner)) return declaration
+    const key = AuthoredIdentity.key(declaration.owner)
+    if (!declarations.has(key)) declarations.set(key, declaration)
     if (declaration.body._tag === 'MembersBody') pending.push(...declaration.body.members)
     else if (declaration.body._tag === 'ConditionalBody') {
       pending.push(declaration.body.thenBranch)
       if (declaration.body.elseBranch !== undefined) pending.push(declaration.body.elseBranch)
     }
   }
-  return undefined
+  const visit = (block: AuthoredHir.Block): void => {
+    for (const callable of callableExpressions(block)) {
+      const key = AuthoredIdentity.key(callable.anchor.owner)
+      if (!callables.has(key)) callables.set(key, callable)
+      visit(callable.body)
+    }
+  }
+  for (const block of callableBlocks(module)) visit(block)
+  const index: OwnerIndex = { declarations, callables }
+  ownerIndexes.set(module, index)
+  return index
 }
+
+/** The authored declaration one owner identity names, at any nesting depth of the module. */
+export const declarationOf = (
+  module: AuthoredHir.Module,
+  owner: AuthoredIdentity.Identity,
+): AuthoredHir.Declaration | undefined =>
+  ownerIndex(module).declarations.get(AuthoredIdentity.key(owner))
 
 /** The authored block a callable declaration elaborates, empty when the body is absent. */
 export const bodyBlock = (
@@ -85,23 +116,7 @@ const callableBlocks = (module: AuthoredHir.Module): ReadonlyArray<AuthoredHir.B
 export const callableOf = (
   module: AuthoredHir.Module,
   owner: AuthoredIdentity.Identity,
-): Extract<AuthoredHir.Expression, { readonly _tag: 'CallableExpression' }> | undefined => {
-  const search = (
-    block: AuthoredHir.Block,
-  ): Extract<AuthoredHir.Expression, { readonly _tag: 'CallableExpression' }> | undefined => {
-    for (const callable of callableExpressions(block)) {
-      if (AuthoredIdentity.equals(callable.anchor.owner, owner)) return callable
-      const nested = search(callable.body)
-      if (nested !== undefined) return nested
-    }
-    return undefined
-  }
-  for (const block of callableBlocks(module)) {
-    const found = search(block)
-    if (found !== undefined) return found
-  }
-  return undefined
-}
+): CallableExpression | undefined => ownerIndex(module).callables.get(AuthoredIdentity.key(owner))
 
 const blocksOf = (
   statement: AuthoredHir.Statement,
@@ -337,8 +352,8 @@ export const expressionChildren = (
 /** Anonymous callables below one body, in traversal order; their ordinal names `$callable$N`. */
 export const callableExpressions = (
   block: AuthoredHir.Block,
-): ReadonlyArray<Extract<AuthoredHir.Expression, { readonly _tag: 'CallableExpression' }>> => {
-  const found: Array<Extract<AuthoredHir.Expression, { readonly _tag: 'CallableExpression' }>> = []
+): ReadonlyArray<CallableExpression> => {
+  const found: Array<CallableExpression> = []
   const visit = (expression: AuthoredHir.Expression): void => {
     if (expression._tag === 'CallableExpression') {
       found.push(expression)

@@ -1,23 +1,14 @@
-import * as Layer from 'effect/Layer'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as AnalysisFixture from './support/AnalysisFixture.js'
 import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
-import * as SourceFile from '../src/SourceFile.js'
-import * as SourceResolver from '../src/SourceResolver.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
 
-const analyze = (text: string) =>
-  Analysis.makeRealized({ root: 'root' }).pipe(
-    Effect.provide(
-      SourceResolver.overlay([SourceFile.make('root', ascii(text))]).pipe(
-        Layer.provideMerge(SourceResolver.memory(new Map())),
-      ),
-    ),
-  )
+const analyze = (text: string) => Analysis.ofSource('root', ascii(text))
 
 const codes = (self: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(self).map((diagnostic) => diagnostic.code)
@@ -188,11 +179,14 @@ pub fn main() -> i32 { return 42 }`)
 
 it.effect('retains failure and service rows of operations run inside a deferred block', () =>
   Effect.gen(function* () {
-    const self = yield* analyze(`import silk.host_input { HostInput, HostInputError }
+    const self = yield* AnalysisFixture.retainingMain(
+      'root',
+      ascii(`import silk.host_input { HostInput, HostInputError }
 effect fn deferred() -> Effect<'static; usize ! HostInputError ? &mut HostInput> ! HostInputError ? &mut HostInput {
   return effect { return run HostInput.argumentCount() }
 }
-pub fn main() -> i32 { let value = deferred() drop value return 42 }`)
+pub fn main() -> i32 { let value = deferred() drop value return 42 }`),
+    )
     assert.deepEqual(codes(self), [])
     const blocks = self.instances.instances
       .flatMap((instance) => instance.function.statements)

@@ -1,10 +1,12 @@
 import { assert, it } from '@effect/vitest'
+import * as NativeToolchain from '@silklang/compiler/NativeToolchain'
 import * as Console from 'effect/Console'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Result from 'effect/Result'
 import { Command } from 'effect/unstable/cli'
 import * as Cli from '../src/Cli.js'
+import * as Program from '../src/Program.js'
 import * as CompilerHost from './CompilerHost.js'
 import * as Timeouts from './timeouts.js'
 
@@ -49,11 +51,13 @@ it.effect(
       assert.strictEqual(Result.isSuccess(loaded), true)
       const built = yield* execute(['build', '--manifest-path', `${projectRoot}/silk.toml`])
       assert.strictEqual(Result.isSuccess(built), true)
-      const ran = yield* execute(['run', '--manifest-path', `${projectRoot}/silk.toml`])
-      assert.strictEqual(Result.isSuccess(ran), true)
+      // `run` would compile the project a second time; its argument and exit-status mapping is
+      // covered below, so the built executable runs directly.
+      const host = yield* NativeToolchain.hostTarget()
+      assert.strictEqual(yield* Program.run(`${projectRoot}/build/llvm/${host.id}/debug/hello`), 0)
     }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  // Check, build and run each drive a compiler pipeline; CI exceeds one build budget.
-  3 * Timeouts.nativeBuild,
+  // Check and build each drive a compiler pipeline; CI exceeds one build budget.
+  2 * Timeouts.nativeBuild,
 )
 
 it.effect(
@@ -145,8 +149,12 @@ test effect fn locallyProvided() -> () ! bool {
   Timeouts.nativeBuild,
 )
 
+// Edit invalidation, failure non-caching and filters are owned by Workflow.test.ts,
+// TestResult.test.ts, the compiler's TestDiscovery.test.ts and the filter test above. Each `silk
+// test` run here compiles natively, so this keeps only the runs that prove the end-to-end cache
+// contract: a cold run executes, a warm run reuses, and `--no-cache` executes without the cache.
 it.effect(
-  'reuses only passing tests whose complete execution identity is unchanged',
+  'reuses an unchanged passing test and bypasses the result cache with --no-cache',
   () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem
@@ -157,43 +165,20 @@ it.effect(
         '[package]\nname = "test-result-cache"\nversion = "0.1.0"\nroot = "Main.silk"\n',
       )
       yield* fileSystem.writeFileString(`${root}/Main.silk`, 'pub fn main() -> i32 { return 0 }')
-      yield* fileSystem.writeFileString(`${root}/Tests.silk`, 'import Cases')
-      const source = (
-        alphaExclusive: number,
-        shared: number,
-      ) => `import silk.allocator { Allocator, OutOfMemoryError }
+      yield* fileSystem.writeFileString(
+        `${root}/Tests.silk`,
+        `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.filesystem { FileError, FileSystem, Path }
 import silk.os_filesystem { OsFileSystem }
 
-effect fn observe(path: string) -> () ! FileError | OutOfMemoryError {
+test effect fn removesMarker() -> () ! FileError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut fs = run OsFileSystem.make(b"${nativeRoot}") |> Effect.provideMut(&mut allocator)
-  let marker = run Path.make(path) |> Effect.provideMut(&mut allocator)
+  let marker = run Path.make("/marker") |> Effect.provideMut(&mut allocator)
   run FileSystem.removeFile(&marker) |> Effect.provideMut(&mut fs)
-}
-
-fn sharedHelper() -> i32 { return ${shared} }
-fn alphaHelper() -> i32 { return sharedHelper() + ${alphaExclusive} }
-fn betaHelper() -> i32 { return sharedHelper() + 2 }
-
-test effect fn alphaPass() -> () ! FileError | OutOfMemoryError {
-  let observed = alphaHelper()
-  drop observed
-  run observe("/alpha-marker")
-}
-
-test effect fn betaPass() -> () ! FileError | OutOfMemoryError {
-  let observed = betaHelper()
-  drop observed
-  run observe("/beta-marker")
-}
-
-test effect fn failsEveryTime() -> () ! bool | FileError | OutOfMemoryError {
-  run observe("/failure-marker")
-  fail false
-}`
-      yield* fileSystem.writeFileString(`${root}/Cases.silk`, source(1, 40))
+}`,
+      )
 
       const run = (arguments_: ReadonlyArray<string>) =>
         Effect.result(
@@ -206,10 +191,8 @@ test effect fn failsEveryTime() -> () ! bool | FileError | OutOfMemoryError {
             ...arguments_,
           ]),
         )
-      const seed = Effect.fnUntraced(function* (names: ReadonlyArray<string>) {
-        for (const name of names) yield* fileSystem.writeFileString(`${root}/${name}`, name)
-      })
-      const exists = (name: string) => fileSystem.exists(`${root}/${name}`)
+      const seed = fileSystem.writeFileString(`${root}/marker`, 'marker')
+      const executed = Effect.map(fileSystem.exists(`${root}/marker`), (exists) => !exists)
       const resultRecords = Effect.fnUntraced(function* () {
         const directory = `${root}/build/.silk-cache/test-results-v1`
         const names = (yield* fileSystem.readDirectory(directory)).toSorted()
@@ -220,63 +203,26 @@ test effect fn failsEveryTime() -> () ! bool | FileError | OutOfMemoryError {
         )
       })
 
-      yield* seed(['alpha-marker', 'beta-marker'])
-      const firstRun = yield* run(['--filter', 'Pass'])
+      yield* seed
+      const cold = yield* run([])
       assert.isTrue(
-        Result.isSuccess(firstRun),
-        Result.isFailure(firstRun) ? String(firstRun.failure) : undefined,
+        Result.isSuccess(cold),
+        Result.isFailure(cold) ? String(cold.failure) : undefined,
       )
-      assert.isFalse(yield* exists('alpha-marker'))
-      assert.isFalse(yield* exists('beta-marker'))
+      assert.isTrue(yield* executed)
+      const records = yield* resultRecords()
+      assert.lengthOf(records, 1)
 
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'pass'])))
-      assert.isTrue(yield* exists('alpha-marker'))
-      assert.isTrue(yield* exists('beta-marker'))
+      yield* seed
+      assert.isTrue(Result.isSuccess(yield* run([])))
+      assert.isFalse(yield* executed)
 
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        yield* seed(['failure-marker'])
-        const failed = yield* run(['--filter', 'failsEveryTime'])
-        assert.isTrue(Result.isFailure(failed))
-        if (Result.isFailure(failed)) {
-          assert.strictEqual(failed.failure._tag, 'CommandExit')
-          if (failed.failure._tag === 'CommandExit') assert.strictEqual(failed.failure.status, 1)
-        }
-        assert.isFalse(yield* exists('failure-marker'))
-      }
-
-      yield* fileSystem.writeFileString(`${root}/Cases.silk`, source(7, 40))
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'Pass'])))
-      assert.isFalse(yield* exists('alpha-marker'))
-      assert.isTrue(yield* exists('beta-marker'))
-
-      yield* fileSystem.writeFileString(`${root}/Cases.silk`, source(7, 41))
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'Pass'])))
-      assert.isFalse(yield* exists('alpha-marker'))
-      assert.isFalse(yield* exists('beta-marker'))
-
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'BETAPASS'])))
-      assert.isTrue(yield* exists('alpha-marker'))
-      assert.isTrue(yield* exists('beta-marker'))
-
-      const recordsBeforeBypass = yield* resultRecords()
-      assert.strictEqual(recordsBeforeBypass.length, 5)
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'Pass', '--no-cache'])))
-      assert.isFalse(yield* exists('alpha-marker'))
-      assert.isFalse(yield* exists('beta-marker'))
-      assert.deepStrictEqual(yield* resultRecords(), recordsBeforeBypass)
-
-      yield* seed(['alpha-marker', 'beta-marker'])
-      assert.isTrue(Result.isSuccess(yield* run(['--filter', 'Pass'])))
-      assert.isTrue(yield* exists('alpha-marker'))
-      assert.isTrue(yield* exists('beta-marker'))
+      assert.isTrue(Result.isSuccess(yield* run(['--no-cache'])))
+      assert.isTrue(yield* executed)
+      assert.deepStrictEqual(yield* resultRecords(), records)
     }).pipe(Effect.scoped, Effect.provide(CompilerHost.layer)),
-  // One scenario intentionally covers successive runner processes and compiler-cache reuse.
-  9 * Timeouts.nativeBuild,
+  // Three successive runner processes each compile the project natively.
+  3 * Timeouts.nativeBuild,
 )
 
 it.effect(

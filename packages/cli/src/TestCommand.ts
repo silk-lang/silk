@@ -36,7 +36,7 @@ export const command = Command.make(
     profile: ProjectOptions.profile,
     profileInput: ProjectOptions.profileInput,
     release: ProjectOptions.release,
-    verifyMir: ProjectOptions.verifyMir,
+    verifyIr: ProjectOptions.verifyIr,
     root,
     file,
     filter,
@@ -51,7 +51,7 @@ export const command = Command.make(
       ...(Option.isNone(config.profile) ? {} : { profile: config.profile.value }),
       ...(Option.isNone(config.profileInput) ? {} : { profileInput: config.profileInput.value }),
       release: config.release,
-      verifyMir: config.verifyMir,
+      verifyIr: config.verifyIr,
       ...(typeof config.trace === 'undefined' ? {} : { trace: config.trace }),
     })
     if (Result.isFailure(options)) {

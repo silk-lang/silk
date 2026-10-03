@@ -9,6 +9,14 @@ import * as Result from 'effect/Result'
 import * as HelperCapability from '../src/HelperCapability.js'
 import * as ObjectSymbols from '../src/internal/ObjectSymbols.js'
 import * as Schema from 'effect/Schema'
+import * as LlvmBitcode from '@silklang/llvm/Bitcode'
+import * as LlvmBlock from '@silklang/llvm/Block'
+import * as LlvmBuilder from '@silklang/llvm/Builder'
+import * as LlvmConstant from '@silklang/llvm/Constant'
+import * as LlvmFunction from '@silklang/llvm/Function'
+import * as LlvmFunctionBody from '@silklang/llvm/FunctionBody'
+import * as LlvmType from '@silklang/llvm/Type'
+import * as LlvmValue from '@silklang/llvm/Value'
 import { NodeServices } from '@effect/platform-node'
 import * as PlatformSupply from '../src/PlatformSupply.js'
 import * as PlatformSupplyResolver from '../src/PlatformSupplyResolver.js'
@@ -31,10 +39,12 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterAll, assert, it } from '@effect/vitest'
+import * as Clock from 'effect/Clock'
 import * as Config from 'effect/Config'
 import * as Effect from 'effect/Effect'
 import * as Fiber from 'effect/Fiber'
 import * as Option from 'effect/Option'
+import * as TestClock from 'effect/testing/TestClock'
 import * as Analysis from '../src/Analysis.js'
 import * as NativeLinkInput from '../src/NativeLinkInput.js'
 import * as NativeToolchain from '../src/NativeToolchain.js'
@@ -505,6 +515,69 @@ it.effect('yields a typed spawn failure with command, stage, and arbitrary cause
     assert.strictEqual(result.failure.reason.planned.command, '/nonexistent/clang')
     assert.instanceOf(result.failure.reason.cause, Error)
     assert.strictEqual(existsSync(scopeRoot), false)
+  }),
+)
+
+/**
+ * A diamond whose join reads a value defined only in one arm: the dominance violation #130
+ * emitted. `Bitcode.encode` does not run the in-process verifier, so the bytes reach clang as-is.
+ */
+const diamondBitcode = Effect.fnUntraced(function* (escapes: boolean) {
+  const builder = yield* LlvmBuilder.make()
+  const i32 = yield* LlvmType.integer(builder, 32)
+  const type = yield* LlvmType.functionType(builder, i32, [i32])
+  const fn = yield* LlvmFunction.declare(builder, 'diamond', type)
+  yield* LlvmFunction.buildBody(
+    builder,
+    fn,
+    Effect.fnUntraced(function* (body) {
+      const entry = yield* LlvmBlock.make(body, 'entry')
+      const taken = yield* LlvmBlock.make(body, 'taken')
+      const otherwise = yield* LlvmBlock.make(body, 'otherwise')
+      const join = yield* LlvmBlock.make(body, 'join')
+      const argument = yield* LlvmValue.argument(body, 0)
+      const zero = yield* LlvmConstant.integerSigned(builder, i32, 0n)
+      yield* LlvmBlock.setInsertionPoint(body, entry)
+      const condition = yield* LlvmFunctionBody.integerCompare(body, 'ne', argument, zero, 'cond')
+      yield* LlvmFunctionBody.conditionalBranch(body, condition, taken, otherwise)
+      yield* LlvmBlock.setInsertionPoint(body, taken)
+      const armLocal = yield* LlvmFunctionBody.binary(body, 'add', argument, argument, 'armLocal')
+      yield* LlvmFunctionBody.branch(body, join)
+      yield* LlvmBlock.setInsertionPoint(body, otherwise)
+      yield* LlvmFunctionBody.branch(body, join)
+      yield* LlvmBlock.setInsertionPoint(body, join)
+      const used = escapes ? armLocal : argument
+      const result = yield* LlvmFunctionBody.binary(body, 'add', used, argument, 'result')
+      yield* LlvmFunctionBody.returnValue(body, result)
+    }),
+  )
+  return yield* LlvmBitcode.encode(builder)
+})
+
+it.effect('rejects bitcode that fails LLVM module verification at the object step', () =>
+  Effect.gen(function* () {
+    const target = yield* NativeToolchain.hostTarget()
+    const profile = yield* profileFor(target)
+    const artifact = yield* artifactFor(target, 'release')
+    const emit = Effect.fnUntraced(function* (escapes: boolean) {
+      const bitcode = yield* diamondBitcode(escapes)
+      return yield* NativeToolchain.withBuildScope('verifier-control', (scope) =>
+        ObjectEmission.materialize({
+          toolchain,
+          scope,
+          artifact: { ...artifact, bitcode },
+          profile,
+        }),
+      ).pipe(Effect.result)
+    })
+    // The well-formed twin proves the encoding itself reaches codegen; only dominance differs.
+    assert.strictEqual((yield* emit(false))._tag, 'Success')
+    const rejected = yield* emit(true)
+    assert.strictEqual(rejected._tag, 'Failure')
+    if (rejected._tag !== 'Failure') return
+    assert.strictEqual(rejected.failure._tag, 'ToolchainError')
+    assert.strictEqual(rejected.failure.stage, 'object')
+    assert.strictEqual(rejected.failure.reason._tag, 'SpawnFailed')
   }),
 )
 
@@ -1388,6 +1461,13 @@ it.effect(
       const target = yield* NativeToolchain.hostTarget()
       const profile = yield* profileFor(target)
       const selected = yield* NativeToolchain.resolveToolchain(toolchain, profile)
+      // A passed supply, not a stale tool spelling, selects the tools that run.
+      const reselected = yield* NativeToolchain.resolveToolchain(
+        { ...selected, clang: 'unvalidated-clang', llvmAr: 'unvalidated-llvm-ar' },
+        profile,
+      )
+      assert.strictEqual(reselected.clang, selected.supply?.compiler.command)
+      assert.strictEqual(reselected.llvmAr, selected.supply?.archiver.command)
       yield* NativeToolchain.withBuildScope(
         'supply-identities',
         Effect.fnUntraced(function* (scope) {
@@ -1692,16 +1772,33 @@ it.effect(
       const changed = yield* Effect.result(PlatformSupplyResolver.validateFiles([selected]))
       assert.strictEqual(changed._tag, 'Failure')
       if (changed._tag === 'Failure') assert.strictEqual(changed.failure.code, 'ChangedInput')
-      // A settled file's digest is reused only while its stat identity holds.
+      // A settled file's digest is reused while its stat identity holds, even across an
+      // identity-preserving rewrite, and is re-read once the identity changes.
       const settled = join(root, 'usr/lib/settled')
       writeFileSync(settled, 'old bytes')
       utimesSync(settled, 0, 0)
       const snapshot = yield* PlatformSupplyResolver.file(settled, 'library', 'settled', root)
+      writeFileSync(settled, 'new bytes')
+      utimesSync(settled, 0, 0)
       yield* PlatformSupplyResolver.validateFiles([snapshot])
       writeFileSync(settled, 'new bytes')
       const rewritten = yield* Effect.result(PlatformSupplyResolver.validateFiles([snapshot]))
       assert.strictEqual(rewritten._tag, 'Failure')
       if (rewritten._tag === 'Failure') assert.strictEqual(rewritten.failure.code, 'ChangedInput')
+      // Settledness follows the host clock that stamps mtime, not the fiber Clock: a file modified
+      // in the host's future is never memoized, however far the TestClock runs ahead.
+      const future = join(root, 'usr/lib/future')
+      const hostNow = yield* TestClock.withLive(Clock.currentTimeMillis)
+      const futureSeconds = hostNow / 1000 + 60
+      writeFileSync(future, 'old bytes')
+      utimesSync(future, futureSeconds, futureSeconds)
+      yield* TestClock.setTime(hostNow + 120_000)
+      const pending = yield* PlatformSupplyResolver.file(future, 'library', 'future', root)
+      writeFileSync(future, 'new bytes')
+      utimesSync(future, futureSeconds, futureSeconds)
+      const unsettled = yield* Effect.result(PlatformSupplyResolver.validateFiles([pending]))
+      assert.strictEqual(unsettled._tag, 'Failure')
+      if (unsettled._tag === 'Failure') assert.strictEqual(unsettled.failure.code, 'ChangedInput')
       symlinkSync('loop', join(root, 'usr/lib/loop'))
       const cycle = yield* Effect.result(
         PlatformSupplyResolver.physicalPath(join(root, 'lib/loop'), root),
@@ -1778,6 +1875,52 @@ it.effect(
           assert.isTrue(Result.isFailure(ObjectSymbols.inspect(bytes.subarray(0, length), target)))
       }
     }),
+)
+
+it.effect('keys a reusable helper object by every input that shapes it, and only those', () =>
+  Effect.gen(function* () {
+    const profile = yield* CompilationProfile.normalize({ target: 'x86_64-unknown-linux-gnu' })
+    const arm = yield* CompilationProfile.normalize({ target: 'aarch64-unknown-linux-gnu' })
+    const memcpy = yield* HelperCapability.provider('memcpy', profile)
+    const memset = yield* HelperCapability.provider('memset', profile)
+    const compiler = { digest: 'clang-digest', version: 'clang version 22.1.8' }
+    const key = (
+      facts: CompilationProfile.Facts,
+      overrides: {
+        readonly distribution?: string
+        readonly backend?: string
+        readonly providers?: ReadonlyArray<HelperCapability.Provider>
+        readonly compiler?: typeof compiler
+      } = {},
+    ) =>
+      NativeToolchain.helperCacheKey(
+        overrides.distribution ?? 'distribution',
+        overrides.backend ?? 'llvm',
+        overrides.providers ?? [memcpy, memset],
+        facts,
+        overrides.compiler ?? compiler,
+      )
+    const base = key(profile)
+    // Provider order and program-only facts do not split the cache across programs.
+    assert.strictEqual(key(profile, { providers: [memset, memcpy] }), base)
+    assert.strictEqual(key({ ...profile, safety: 'unchecked', artifact: 'loadable-module' }), base)
+    const variants = [
+      key(profile, { providers: [memcpy] }),
+      key(profile, { distribution: 'other-distribution' }),
+      key(profile, { backend: 'other-backend' }),
+      key({ ...profile, target: arm.target }),
+      key({ ...profile, cpu: { ...profile.cpu, model: 'x86-64-v3' } }),
+      key({ ...profile, cpu: { ...profile.cpu, features: ['+avx2'] } }),
+      key({ ...profile, deployment: '12.0.0' }),
+      key({ ...profile, relocation: profile.relocation === 'pic' ? 'static' : 'pic' }),
+      key({ ...profile, codeModel: profile.codeModel === 'small' ? 'large' : 'small' }),
+      key({ ...profile, optimization: profile.optimization === 'none' ? 'speed' : 'none' }),
+      key({ ...profile, debug: !profile.debug }),
+      key(profile, { compiler: { ...compiler, digest: 'other-clang-digest' } }),
+      key(profile, { compiler: { ...compiler, version: 'clang version 22.1.9' } }),
+    ]
+    assert.strictEqual(new Set([base, ...variants]).size, variants.length + 1)
+  }),
 )
 
 it.effect(

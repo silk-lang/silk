@@ -67,7 +67,8 @@ export const elaborate = (syntax: SyntaxFile.SyntaxFile): Elaborated => {
   const scope = NameResolution.scopeOf(analyzed.resolution, name)
   if (headers === undefined || scope === undefined)
     throw new RangeError('Single-module elaboration fixture lost its module')
-  const session = Semantic.makeSession(name, index, analyzed.resolution)
+  // Fixtures assert editor results beside compiled ones, so they check bodies for tooling.
+  const session = Semantic.makeSession(name, index, analyzed.resolution, { tooling: true })
   const result = Elaboration.elaborateModule({ authored, headers, scope, index, session })
   const inspected = records(result)
   indices.set(result, index)

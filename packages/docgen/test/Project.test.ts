@@ -5,8 +5,11 @@ import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import * as SourceFile from '@silklang/compiler/SourceFile'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as Effect from 'effect/Effect'
+import * as Example from '../src/Example.js'
 import * as Json from '../src/Json.js'
+import * as Model from '../src/Model.js'
 import * as Project from '../src/Project.js'
+import * as Site from '../src/Site.js'
 
 const encode = (value: string): Uint8Array => new TextEncoder().encode(value)
 
@@ -193,5 +196,38 @@ pub fn answer() -> i32 { return 42 }
     assert.strictEqual(closure?.inputs, 2)
     assert.strictEqual(closure?.outputs, 3)
     assert.strictEqual(closure?.diagnostics, 0)
+  }),
+)
+
+// A two-module slice of the real standard library owns the emitter-to-renderer JSON boundary on
+// real documentation. `documentation:examples` (`silk doctest --stdlib`) documents and decodes the
+// whole shipped manifest; Site.test.ts covers writer details on a synthetic document.
+it.effect('renders encoded standard-library documentation through the JSON boundary', () =>
+  Effect.gen(function* () {
+    const analysis = yield* ProjectAnalysis.make(['silk/base64', 'silk/option'], {
+      configuration: { profile: { target: 'wasm32-unknown-unknown' } },
+    }).pipe(Effect.provide(SourceResolver.empty))
+    const documentation = Project.fromProjectAnalysis(analysis, { includePrivate: true })
+    const modules = documentation.modules.map((module) => module.name)
+    const parsed = Json.decodeSync(Json.encode(documentation))
+    const examples = Example.collect(parsed)
+    assert.isAbove(examples.length, 0)
+    assert.deepStrictEqual(examples, Example.collect(documentation))
+    const decoded = Model.decode(parsed)
+    assert.strictEqual(decoded._tag, 'Decoded')
+    if (decoded._tag !== 'Decoded') return
+    assert.deepStrictEqual(
+      decoded.documentation.modules.map((module) => module.name),
+      modules,
+    )
+    const site = Site.render(decoded.documentation, { title: 'Silk standard library' })
+    const pages = site.files.filter((file) => file.path.endsWith('.html'))
+    assert.lengthOf(pages, modules.length + 1)
+    const index = pages.find((file) => file.path === 'index.html')
+    assert.isDefined(index)
+    for (const module of modules) assert.include(index.contents, module)
+    const option = pages.find((file) => file.path === 'silk-option.html')
+    assert.isDefined(option)
+    assert.include(option.contents, 'unwrapOr')
   }),
 )

@@ -156,7 +156,7 @@ const decodeCachedEmission = (
       return undefined
     if (header.foreignExports.some((entry) => entry.variadic)) return undefined
     const bitcode = bytes.slice(4 + jsonLength)
-    // The driver cache does not expose IR or control-flow inspection to callers.
+    // The driver cache does not expose IR inspection to callers.
     return {
       _tag: 'LlvmBitcodeArtifact',
       backend: 'llvm',
@@ -168,7 +168,6 @@ const decodeCachedEmission = (
       foreignImports: header.foreignImports,
       foreignExports: header.foreignExports,
       foreignStatics: header.foreignStatics,
-      control: [],
       bitcode,
       ir: '',
     }
@@ -179,8 +178,11 @@ const decodeCachedEmission = (
 
 /** One driver request. */
 export interface CompileRequest {
-  /** Audit compiler MIR invariants before emission/cache reuse. Defaults to false. */
-  readonly verifyMir?: boolean
+  /**
+   * Audit compiler IR invariants (compiler development): lowered MIR before emission or cache
+   * reuse, and the emitted LLVM module before encoding. Defaults to false.
+   */
+  readonly verifyIr?: boolean
   readonly nativeBindings?: ReadonlyArray<NativeRequirementBinding.NativeRequirementBinding>
   readonly stage?: ArtifactPlan.Stage
   readonly compilation: ModuleClosure.CompilationRequest
@@ -508,7 +510,7 @@ const prepareEmission = Effect.fnUntraced(function* (
       report: [...report],
     }
   // Explicit audits run even when a later emission-cache lookup can reuse the artifact.
-  if (request.verifyMir === true) {
+  if (request.verifyIr === true) {
     const verified = yield* PhaseReport.measureEffectInto(
       report,
       'mir-verification',
@@ -697,11 +699,12 @@ export const compile = Effect.fn('Driver.compile')(
     // Reuse cached emission or ask LLVM to emit the prepared MIR, recording which path ran.
     // Pass source bytes for backend source information and convert BackendError to an outcome.
     // Native toolchain resolution only queries installed tools, so it runs during emission.
+    const resolveSupply = Effect.result(
+      NativeToolchain.resolveToolchain(request.toolchain, staged.profile),
+    )
     const pendingToolchain =
       stage === 'final' && target.kind === 'Native' && request.artifactKind !== 'WebAssemblyModule'
-        ? yield* Effect.forkChild(
-            Effect.result(NativeToolchain.resolveToolchain(request.toolchain, staged.profile)),
-          )
+        ? yield* Effect.forkChild(resolveSupply)
         : undefined
     const emitted =
       cachedEmission !== undefined
@@ -720,6 +723,7 @@ export const compile = Effect.fn('Driver.compile')(
             program.functions.length,
             Backend.emit(backend, program, {
               mode,
+              verifyIr: request.verifyIr ?? false,
               sources: new Map(
                 [...staged.sources].map(([module, source]) => [
                   module,
@@ -971,10 +975,18 @@ export const compile = Effect.fn('Driver.compile')(
 
           // 14. Resolve the native toolchain for the profile and turn LLVM bitcode into an object.
           // Track both generated object files and any helper capabilities reported by emission.
-          const toolchain =
-            pendingToolchain === undefined
-              ? yield* NativeToolchain.resolveToolchain(request.toolchain, staged.profile)
-              : yield* Effect.fromResult(yield* Fiber.join(pendingToolchain))
+          // The `supply` phase is the time this build waits for resolution; work that overlapped
+          // emission is not counted twice.
+          const supply = yield* PhaseReport.measureEffectInto(
+            report,
+            'supply',
+            1,
+            pendingToolchain === undefined ? resolveSupply : Fiber.join(pendingToolchain),
+            (result) => (Result.isSuccess(result) ? 1 : 0),
+            () => 0,
+            { heapBytes },
+          )
+          const toolchain = yield* Effect.fromResult(supply)
           const object = yield* PhaseReport.measureEffectInto(
             report,
             'object',
@@ -992,19 +1004,41 @@ export const compile = Effect.fn('Driver.compile')(
           const generatedObjects: Array<NativeToolchain.PathArtifact> = [object.artifact]
           const helpers = object.helpers === undefined ? [] : [object.helpers]
           // Executables and shared libraries need helper implementations at this link step.
-          // Compile those helpers and include their required native libraries in the link inputs.
+          // Compile those helpers, or reuse an object for the same providers, profile, compiler,
+          // and distribution, and include their required native libraries in the link inputs.
           const final = cacheKind === 'NativeExecutable' || cacheKind === 'NativeSharedLibrary'
           if (final && object.helpers !== undefined) {
-            const support = yield* NativeToolchain.compileHelpers(
-              toolchain,
-              scope,
-              staged.profile,
-              object.helpers,
+            const support = yield* PhaseReport.measureEffect(
+              'helpers',
+              object.helpers.requirements.length,
+              NativeToolchain.compileHelpers(
+                toolchain,
+                scope,
+                staged.profile,
+                object.helpers,
+                artifactStorage === undefined
+                  ? { _tag: 'Disabled' }
+                  : {
+                      _tag: 'ReadWrite',
+                      store: artifactStorage,
+                      distribution: distribution.digest,
+                    },
+              ),
+              (result) => (result === undefined ? 0 : 1),
+              () => 0,
+              { heapBytes },
             )
-            generatedObjects.push(...support.map((entry) => entry.artifact))
-            helpers.push(
-              ...support.flatMap((entry) => (entry.helpers === undefined ? [] : [entry.helpers])),
-            )
+            const compiled = support.value
+            if (compiled !== undefined) {
+              report.push(
+                phaseWithHeap({
+                  ...support.report,
+                  phase: compiled.reused ? 'helpers-cache' : 'helpers',
+                }),
+              )
+              generatedObjects.push(compiled.object.artifact)
+              if (compiled.object.helpers !== undefined) helpers.push(compiled.object.helpers)
+            }
           }
           const selectedNativeInputs = final
             ? [...nativeLinkInputs, ...HelperCapability.linkInputs(helpers)]

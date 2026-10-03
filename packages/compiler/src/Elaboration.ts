@@ -1385,12 +1385,18 @@ export interface FunctionConstruction {
   readonly generatedAggregates: ReadonlyArray<DeclarationFacts.StructFact>
   /** Static-only authored loops and their independently elaborated target-selected scopes. */
   readonly staticIterations: ReadonlyArray<StaticIterationFact>
+  /** Editor-only analysis facts, present when the semantic session serves tooling. */
+  readonly tooling?: FunctionTooling
+  /** What each returned expression shows about the opaque result this body produces. */
+  readonly opaqueEvidence: ReadonlyArray<import('./OpaqueRealization.js').Evidence>
+}
+
+/** What body analysis publishes only for editors: nothing compiles or executes from it. */
+export interface FunctionTooling {
   /** The authored names this body resolves, published for navigation and never executed. */
   readonly occurrences: ReadonlyArray<import('./SemanticOccurrence.js').LocatedOccurrence>
   /** What the body infers that its author did not write, published for editor hints. */
   readonly hints: ReadonlyArray<import('./TypeHint.js').Row>
-  /** What each returned expression shows about the opaque result this body produces. */
-  readonly opaqueEvidence: ReadonlyArray<import('./OpaqueRealization.js').Evidence>
 }
 
 /** Narrows construction-only local metadata recovered from the private body builder. */
@@ -1445,26 +1451,35 @@ export interface BodyResults {
   readonly evidence: ReadonlyArray<Tir.SelectedEvidence>
   /** Authoritative revision-free unavailable causes, addressed densely by executable nodes. */
   readonly causes: ReadonlyArray<Diagnostic.Identity<Location.Location>>
-  /** The authored names the body resolves: navigation reads these and never the body. */
-  readonly occurrences: ReadonlyArray<import('./SemanticOccurrence.js').LocatedOccurrence>
-  /** What the body infers that its author did not write, for editor hints. */
-  readonly hints: ReadonlyArray<import('./TypeHint.js').Row>
+  /** Editor-only results, present when the semantic session serves tooling. */
+  readonly tooling?: BodyTooling
   /** What each returned expression shows about the opaque result this body produces. */
   readonly opaqueEvidence: ReadonlyArray<import('./OpaqueRealization.js').Evidence>
   /** The finite region proof of the body, which ownership replays at cleanup. */
   readonly lifetimes?: import('./LifetimeFlow.js').LifetimeFlow
-  /** The body's lexical scopes and the locals each one introduces, for completion and hover. */
-  readonly scopes: ReadonlyArray<LexicalScopeFact>
   /** Aggregates the body generated, which layout and later stages declare beside source ones. */
   readonly aggregates: ReadonlyArray<DeclarationFacts.StructFact>
   /** The body's half of the module's constrained-callable escape rule. */
   readonly callables: CallableFlow
   /** Why an application of this body must be specialized, when its own statements say so. */
   readonly staticStructure?: StaticStructure
-  /** The type each authored expression was given, in source order, for hover. */
-  readonly expressionTypes: ReadonlyArray<ExpressionTypeRow>
   /** How each authored `static for` ended, outermost first. */
   readonly staticIterations: ReadonlyArray<StaticIterationRow>
+}
+
+/**
+ * What a checked body publishes only for editors. Every row names authored nodes and declaration
+ * ids, so a reused body keeps these unchanged as well.
+ */
+export interface BodyTooling {
+  /** The authored names the body resolves: navigation reads these and never the body. */
+  readonly occurrences: ReadonlyArray<import('./SemanticOccurrence.js').LocatedOccurrence>
+  /** What the body infers that its author did not write, for editor hints. */
+  readonly hints: ReadonlyArray<import('./TypeHint.js').Row>
+  /** The body's lexical scopes and the locals each one introduces, for completion and hover. */
+  readonly scopes: ReadonlyArray<LexicalScopeFact>
+  /** The type each authored expression was given, in source order, for hover. */
+  readonly expressionTypes: ReadonlyArray<ExpressionTypeRow>
 }
 
 /** One `static for` of a body: whether it was expanded, and the element each expansion bound. */
@@ -2777,15 +2792,21 @@ export const checkedBody = (
   const results: BodyResults = {
     evidence: Array.from(builder.evidence),
     causes: Array.from(builder.causes),
-    occurrences: fact.occurrences,
-    hints: fact.hints,
+    ...(fact.tooling === undefined
+      ? {}
+      : {
+          tooling: {
+            occurrences: fact.tooling.occurrences,
+            hints: fact.tooling.hints,
+            scopes: lexicalScopesOf(fact, builder),
+            expressionTypes: expressionTypesOf(fact, builder),
+          },
+        }),
     opaqueEvidence: fact.opaqueEvidence,
     ...(fact.lifetimeFlow === undefined ? {} : { lifetimes: fact.lifetimeFlow }),
-    scopes: lexicalScopesOf(fact, builder),
     aggregates: fact.generatedAggregates,
     callables: callableFlowOf(fact, index, builder),
     ...(staticStructure === undefined ? {} : { staticStructure }),
-    expressionTypes: expressionTypesOf(fact, builder),
     staticIterations: staticIterationRows(fact.staticIterations),
   }
   return {
@@ -2835,7 +2856,7 @@ export const elaborateModule = (input: Input): Result => {
     _tag: 'Elaboration',
     authored,
     generatedAggregates: bodies.flatMap((body) => body.results.aggregates),
-    lexicalScopes: bodies.flatMap((body) => body.results.scopes),
+    lexicalScopes: bodies.flatMap((body) => body.results.tooling?.scopes ?? []),
     tir,
     bodies,
     diagnostics: [

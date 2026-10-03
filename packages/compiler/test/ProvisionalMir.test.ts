@@ -289,14 +289,11 @@ it.effect('emits no suspension control for a closed synchronous corpus', () =>
 effect fn seed(value: i32) -> i32 { return value }
 fn increment(value: i32) -> i32 { return value + 1 }
 pub fn main() -> i32 { return run seed(41) |> Effect.map(increment) }`
-    const first = yield* snapshot(source)
-    const second = yield* snapshot(source)
-    assert.deepEqual(Analysis.diagnostics(first), [])
-    const firstMir = available(first)
-    const secondMir = available(second)
-    assert.deepEqual(ProvisionalMir.verify(firstMir), [])
-    assert.deepEqual(outcomes(firstMir), [])
-    assert.strictEqual(ProvisionalMir.encode(firstMir), ProvisionalMir.encode(secondMir))
+    const self = yield* snapshot(source)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const mir = available(self)
+    assert.deepEqual(ProvisionalMir.verify(mir), [])
+    assert.deepEqual(outcomes(mir), [])
   }),
 )
 

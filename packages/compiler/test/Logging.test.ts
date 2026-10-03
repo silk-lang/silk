@@ -1,20 +1,22 @@
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as AnalysisFixture from './support/AnalysisFixture.js'
 import * as RowAlgebra from '../src/RowAlgebra.js'
 import * as Type from '../src/Type.js'
 
 const encoder = new TextEncoder()
 
-const snapshot = (source: string, target = 'aarch64-apple-darwin') =>
-  Analysis.ofSourceRealized('logging/main', encoder.encode(source), target)
+const analyze = (source: string) => Analysis.ofSource('logging/main', encoder.encode(source))
 
-it.effect(
-  'lowers logger entrypoints with dense runtime parameters after static arguments',
-  () =>
-    Effect.gen(function* () {
-      const frontend = yield* snapshot(
-        `import silk.effect { Effect }
+/** Realizes the retained main without the default runtime; `silk.os_logger` needs a target. */
+const realized = (source: string, target = 'aarch64-apple-darwin') =>
+  AnalysisFixture.retainingMain('logging/main', encoder.encode(source), target)
+
+it.effect('lowers logger entrypoints with dense runtime parameters after static arguments', () =>
+  Effect.gen(function* () {
+    const self = yield* realized(
+      `import silk.effect { Effect }
 import silk.logger { LogError }
 import silk.os_logger { StdoutLogger }
 
@@ -24,19 +26,16 @@ pub effect fn main() -> () ! LogError {
   run Effect.log("Hello, world!", &())
     |> Effect.provideMut(&mut logger)
 }`,
-        'x86_64-unknown-linux-gnu',
-      )
-      assert.deepEqual(Analysis.diagnostics(frontend), [])
-      yield* Analysis.codegen(frontend, { mode: 'release' })
-    }),
-  // The two realization passes take about 8s in isolation and can approach 30s when the four
-  // compiler shards saturate the CI host; this is contention headroom, not a performance gate.
-  { timeout: 90_000 },
+      'x86_64-unknown-linux-gnu',
+    )
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    yield* Analysis.codegen(self, { mode: 'release' })
+  }),
 )
 
 it.effect('specializes static logging templates without exposing formatting requirements', () =>
   Effect.gen(function* () {
-    const frontend = yield* snapshot(`import silk.effect { Effect }
+    const self = yield* realized(`import silk.effect { Effect }
 import silk.logger { LogError, LogLevel, Logger }
 
 effect fn exercise(level: LogLevel) -> () ! LogError ? &mut Logger {
@@ -58,14 +57,15 @@ pub fn main() -> i32 {
   run Effect.catchAll(program(), ignore)
   return 42
 }`)
-    assert.deepEqual(Analysis.diagnostics(frontend), [])
-    assert.strictEqual(frontend.mir._tag, 'Available')
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    assert.strictEqual(self.mir._tag, 'Available')
   }),
 )
 
 it.effect('applies Format template and Display diagnostics to logging calls', () =>
   Effect.gen(function* () {
-    const frontend = yield* snapshot(`import silk.effect { Effect }
+    // Template diagnostics come from static specialization, which only realization performs.
+    const self = yield* realized(`import silk.effect { Effect }
 import silk.logger { LogError, Logger }
 effect fn invalid() -> () ! LogError ? &mut Logger {
   run Effect.log("open {", &(1,))
@@ -83,7 +83,7 @@ pub fn main() -> i32 {
   return 42
 }`)
     assert.deepEqual(
-      Analysis.diagnostics(frontend).map((diagnostic) => ({
+      Analysis.diagnostics(self).map((diagnostic) => ({
         code: diagnostic.code,
         span: [diagnostic.span.sourceId, diagnostic.span.start, diagnostic.span.end],
       })),
@@ -101,7 +101,7 @@ it.effect(
   'keeps missing providers and invalid logging inputs explicit',
   () =>
     Effect.gen(function* () {
-      const missing = yield* snapshot(`import silk.effect { Effect }
+      const missing = yield* analyze(`import silk.effect { Effect }
 import silk.logger { LogError }
 pub effect fn main() -> () ! LogError {
   return run Effect.log("missing", &())
@@ -111,14 +111,14 @@ pub effect fn main() -> () ! LogError {
         'SEM0071',
       )
 
-      const invalidMessage = yield* snapshot(`import silk.effect { Effect }
+      const invalidMessage = yield* analyze(`import silk.effect { Effect }
 pub fn main() -> i32 {
   let effect = Effect.log(42, &())
   return 0
 }`)
       assert.isAbove(Analysis.diagnostics(invalidMessage).length, 0)
 
-      const invalidLevel = yield* snapshot(`import silk.effect { Effect }
+      const invalidLevel = yield* analyze(`import silk.effect { Effect }
 pub fn main() -> i32 {
   let effect = Effect.logAt(42, "message", &())
   return 0
@@ -151,7 +151,7 @@ pub effect fn main() -> () ! LogError {
   return run bind(read(), &mut logger)
 }`
 
-    const constrained = yield* snapshot(wrapper('where &mut P provides S from R'))
+    const constrained = yield* realized(wrapper('where &mut P provides S from R'))
     assert.deepEqual(Analysis.diagnostics(constrained), [])
     const bind = Analysis.instancesOf(constrained).instances.find(
       (instance) => instance.key.declaration.name === 'bind',
@@ -173,14 +173,14 @@ pub effect fn main() -> () ! LogError {
       )
     }
 
-    const unconstrained = yield* snapshot(wrapper(''))
+    const unconstrained = yield* realized(wrapper(''))
     assert.isAbove(Analysis.diagnostics(unconstrained).length, 0)
   }),
 )
 
 it.effect('rejects a callable relay whose leading binding has observable work', () =>
   Effect.gen(function* () {
-    const frontend = yield* snapshot(`import silk.logger { InMemoryLogger }
+    const self = yield* realized(`import silk.logger { InMemoryLogger }
 import silk.effect { Effect }
 import silk.logger { Logger }
 
@@ -197,10 +197,10 @@ pub fn main() -> i32 {
   return run bind(read())
 }`)
     assert.include(
-      Analysis.diagnostics(frontend).map((diagnostic) => diagnostic.code),
+      Analysis.diagnostics(self).map((diagnostic) => diagnostic.code),
       'SEM0122',
     )
-    assert.strictEqual(frontend.mir._tag, 'Unavailable')
+    assert.strictEqual(self.mir._tag, 'Unavailable')
   }),
 )
 
@@ -250,15 +250,15 @@ pub fn main() -> i32 {
 }`,
       ]
       for (const [ordinal, body] of cases.entries()) {
-        const frontend = yield* snapshot(`import silk.effect { Effect }
+        const self = yield* realized(`import silk.effect { Effect }
 import silk.logger { Logger, LogError }
 ${body}`)
         assert.include(
-          Analysis.diagnostics(frontend).map((diagnostic) => diagnostic.code),
+          Analysis.diagnostics(self).map((diagnostic) => diagnostic.code),
           'SEM0122',
           `case ${ordinal}`,
         )
-        assert.strictEqual(frontend.mir._tag, 'Unavailable')
+        assert.strictEqual(self.mir._tag, 'Unavailable')
       }
     }),
   { timeout: 60_000 },

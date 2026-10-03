@@ -8,7 +8,7 @@ import * as Json from '../src/Json.js'
 import * as Model from '../src/Model.js'
 import * as Search from '../src/Search.js'
 import * as Site from '../src/Site.js'
-// The real manifest-to-site integration lives in Stdlib.test.ts. This compact DTO exercises
+// The real standard-library-to-site integration lives in Project.test.ts. This compact DTO exercises
 // writer contracts without repeating whole-toolchain semantic analysis in another worker.
 const fixtureModules = ['silk/option', 'project/empty']
 const encoded = Json.encodeValue({

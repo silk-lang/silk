@@ -1,9 +1,11 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as ConformanceProof from '../src/ConformanceProof.js'
 import * as ConformanceGoal from '../src/ConformanceGoal.js'
+import * as ConformanceHead from '../src/ConformanceHead.js'
 import * as DeclarationIndex from '../src/DeclarationIndex.js'
 import * as Tir from '../src/Tir.js'
 import * as Lifetime from '../src/Lifetime.js'
@@ -14,6 +16,9 @@ import * as Projections from './support/projections.js'
 import { raise } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array => Uint8Array.from(value, (unit) => unit.charCodeAt(0))
+
+const golden = (name: string): string =>
+  readFileSync(new URL(`./goldens/${name}`, import.meta.url), 'utf8')
 
 const analyze = (name: string, source: string) =>
   AnalysisFixture.retainingMain(name, ascii(source), 'wasm32-unknown-unknown')
@@ -944,4 +949,277 @@ pub fn main() -> i32 { return 0 }`
       [{ code: 'SEM0083', source: 'decode: Cell.decodeTyped' }],
     )
   }),
+)
+
+/**
+ * One base interface, one base witness for each of two unrelated types, and two wrappers whose
+ * decoder conformances hold exactly when their source type has one.
+ *
+ * The declarations are written in a deliberately unhelpful order: the outer wrapper precedes the
+ * inner one, and both precede every base witness they can only be proved through. Nothing here may
+ * be answered by reading the file top to bottom, so a canonical fact that survives this ordering
+ * survives any ordering. Each wrapper also adds a distinct amount to what its source decodes, so a
+ * specialization that reached the wrong witness cannot produce the expected number by accident.
+ */
+const scrambledDecoders = `interface Decoder {
+  fn decode(value: &Self) -> i32
+}
+
+struct OptionalSchema<S> { source: S }
+
+fn optionalDecode<S: Decoder>(value: &OptionalSchema<S>) -> i32 {
+  return Decoder.decode(&value.source) + 2
+}
+
+impl<S: Decoder> Decoder for OptionalSchema<S> {
+  decode: OptionalSchema.optionalDecode
+}
+
+struct MappedSchema<S> { source: S }
+
+fn mappedDecode<S: Decoder>(value: &MappedSchema<S>) -> i32 {
+  return Decoder.decode(&value.source) + 1
+}
+
+impl<S: Decoder> Decoder for MappedSchema<S> {
+  decode: MappedSchema.mappedDecode
+}
+
+struct Loose { weight: i32 }
+
+struct Tally { count: i32 }
+
+fn tallyDecode(value: &Tally) -> i32 { return value.count }
+
+impl Decoder for Tally { decode: Tally.tallyDecode }
+
+struct Schema { tag: i32 }
+
+fn schemaDecode(value: &Schema) -> i32 { return value.tag }
+
+impl Decoder for Schema { decode: Schema.schemaDecode }
+
+fn decodeOf<T: Decoder>(value: T) -> i32 { return Decoder.decode(&value) }
+
+pub fn main() -> i32 {
+  let nested = decodeOf<OptionalSchema<MappedSchema<Schema>>>(
+    OptionalSchema<MappedSchema<Schema>> {
+      source: MappedSchema<Schema> { source: Schema { tag: 41 } }
+    }
+  )
+  let plain = decodeOf<MappedSchema<Tally>>(MappedSchema<Tally> { source: Tally { count: 7 } })
+  return nested + plain
+}`
+
+it.effect(
+  'answers conditional proofs, heads, and instances independently of declaration and asking order',
+  () =>
+    Effect.gen(function* () {
+      const module = 'conditional-conformance/order'
+      const qualified = (spelling: string): string => `${module}.${spelling}`
+      const nominal = (name: string, arguments_: ReadonlyArray<Type.Type> = []) =>
+        Type.nominal(module, name, arguments_)
+      const snapshot = yield* analyze(module, scrambledDecoders)
+      assert.deepEqual(
+        Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
+        [],
+      )
+      const index = Analysis.declarationIndex(snapshot)
+      const decoder = nominal('Decoder')
+      const schema = nominal('Schema')
+      const tally = nominal('Tally')
+      const mappedSchema = nominal('MappedSchema', [schema])
+      const nestedSchema = nominal('OptionalSchema', [mappedSchema])
+      const optionalLoose = nominal('OptionalSchema', [nominal('Loose')])
+      const mappedTally = nominal('MappedSchema', [tally])
+
+      // The deepest goal comes first, so every memo entry a shallower goal could reuse is written by
+      // a proof already in flight; the unprovable goal sits between two provable ones; and one base
+      // goal is asked before the wrapper that descends into it while the other is asked after.
+      const askedProviders = [nestedSchema, schema, optionalLoose, mappedTally, tally, mappedSchema]
+      const dependencies = (proof: ConformanceGoal.Proof): ReadonlyArray<string> => {
+        const found = new Set<string>()
+        const visit = (current: ConformanceGoal.Proof): void => {
+          if (current._tag !== 'Proved') return
+          for (const requirement of current.requirements) visit(requirement)
+          found.add(ConformanceGoal.key(current.goal))
+        }
+        visit(proof)
+        return [...found]
+      }
+      // Answers are listed in canonical goal-key order: asking order is provenance and must not
+      // reach any recorded fact.
+      const proveAll = (self: DeclarationIndex.Index, providers: ReadonlyArray<Type.Type>) =>
+        providers
+          .map((provider) => {
+            const goal = ConformanceGoal.make(decoder, provider)
+            const proof = ConformanceProof.prove(self, provider, decoder)
+            return {
+              goal: ConformanceGoal.key(goal),
+              encoded: ConformanceGoal.encode(goal),
+              proved: proof._tag === 'Proved',
+              selection: proof._tag === 'Proved' ? proof.selection._tag : proof.failure._tag,
+              typeArguments:
+                proof._tag === 'Proved' ? proof.typeArguments.map(Type.genericArgumentKey) : [],
+              dependencies: dependencies(proof),
+              trace: ConformanceGoal.traceLines(proof),
+            }
+          })
+          .toSorted(
+            (left, right) => Number(left.goal > right.goal) - Number(left.goal < right.goal),
+          )
+      const proofs = proveAll(index, askedProviders)
+      // Proof memoization is per index, so a fresh index over a fresh module collection reaches the
+      // search with an empty memo. The same goals asked backwards must produce the same answers.
+      const unwarmed = DeclarationIndex.make(
+        index.stage,
+        [...index.modules],
+        index.diagnostics,
+        index.generatedAggregates,
+      )
+      assert.deepEqual(proveAll(unwarmed, askedProviders.toReversed()), proofs)
+
+      assert.strictEqual(proofs.length, 6)
+      assert.strictEqual(proofs.filter((proof) => proof.proved).length, 5)
+      const proofOf = (provider: Type.Type) =>
+        proofs.find(
+          (proof) => proof.goal === ConformanceGoal.key(ConformanceGoal.make(decoder, provider)),
+        ) ?? raise(`expected a proof for ${Type.key(provider)}`)
+      const nested = proofOf(nestedSchema)
+      assert.strictEqual(nested.proved, true)
+      assert.strictEqual(nested.selection, 'SourceSelection')
+      assert.strictEqual(nested.typeArguments.length, 1)
+      // The depth-2 chain: the mapped wrapper, then the base schema, then the goal itself.
+      assert.strictEqual(nested.dependencies.length, 3)
+      const mapped = proofOf(mappedSchema)
+      const tallied = proofOf(mappedTally)
+      assert.strictEqual(mapped.dependencies.length, 2)
+      assert.strictEqual(tallied.dependencies.length, 2)
+      assert.notStrictEqual(mapped.typeArguments.at(0), tallied.typeArguments.at(0))
+      const base = proofOf(schema)
+      assert.strictEqual(base.dependencies.length, 1)
+      assert.strictEqual(base.typeArguments.length, 0)
+      const missing = proofOf(optionalLoose)
+      assert.strictEqual(missing.proved, false)
+      assert.strictEqual(missing.selection, 'MissingWitness')
+      assert.deepEqual(missing.trace, [
+        `required by Decoder for ${qualified('OptionalSchema')}<${qualified('Loose')}>`,
+        `  Decoder for ${qualified('Loose')}: no conformance declares this specialization`,
+      ])
+
+      const conformances =
+        index.modules.find((headers) => headers.module === module)?.conformances ??
+        raise('expected the root module headers')
+      assert.strictEqual(conformances.length, 4)
+      const conditional = conformances.filter(
+        (conformance) => conformance.requirements.length === 1,
+      )
+      const headOf = (conformance: (typeof conformances)[number]) =>
+        conformance.head ?? raise('expected a declared head')
+      assert.deepEqual(
+        conditional.map((conformance) => ({
+          coherence: conformance.coherence._tag,
+          termination: conformance.termination._tag,
+          requirement: conformance.requirements.at(0)?.spelling,
+          requirementProviders: headOf(conformance).requirements.length,
+          parameters: headOf(conformance).parameters.length,
+        })),
+        Array.from({ length: 2 }, () => ({
+          coherence: 'Coherent' as const,
+          termination: 'Terminating' as const,
+          requirement: 'Decoder',
+          requirementProviders: 1,
+          parameters: 1,
+        })),
+      )
+      // Both spellings of the normalized binder: identity renumbers it, prose renames it.
+      assert.isTrue(
+        conditional.every((conformance) =>
+          ConformanceHead.key(headOf(conformance)).includes('.impl:0'),
+        ),
+      )
+      assert.deepEqual(
+        conditional.map((conformance) => ConformanceHead.encode(headOf(conformance))),
+        [
+          `${qualified('Decoder')} for ${qualified('OptionalSchema')}<%0>`,
+          `${qualified('Decoder')} for ${qualified('MappedSchema')}<%0>`,
+        ],
+      )
+
+      // Binder spelling, owner, and ordinal are provenance: two heads that differ only there are one.
+      // The second spelling declares its binders under a different owner, at different ordinals,
+      // with different names, and mentions them in the opposite order.
+      const pairHead = (
+        owner: { readonly module: string; readonly name: string },
+        first: { readonly ordinal: number; readonly name: string },
+        second: { readonly ordinal: number; readonly name: string },
+      ) => {
+        const left = Type.parameter(owner, first.ordinal, first.name)
+        const right = Type.parameter(owner, second.ordinal, second.name)
+        const provider = nominal('Pair', [left, right])
+        return ConformanceHead.make(decoder, provider, [
+          { capability: decoder, provider: right },
+          { capability: decoder, provider: left },
+        ])
+      }
+      const canonicalHead = pairHead(
+        { module, name: 'impl#0' },
+        { ordinal: 0, name: 'S' },
+        { ordinal: 1, name: 'T' },
+      )
+      const scrambledHead = pairHead(
+        { module: 'other/module', name: 'impl#41' },
+        { ordinal: 7, name: 'Zeta' },
+        { ordinal: 2, name: 'Alpha' },
+      )
+      assert.strictEqual(ConformanceHead.key(canonicalHead), ConformanceHead.key(scrambledHead))
+      assert.deepEqual(
+        canonicalHead.requirements.map((requirement) => Type.key(requirement.provider)),
+        scrambledHead.requirements.map((requirement) => Type.key(requirement.provider)),
+      )
+      // Every distinct ordered pair of declared heads, so an asymmetric overlap answer cannot hide
+      // behind one arbitrary orientation.
+      const heads = conformances.flatMap((conformance) =>
+        conformance.head === undefined ? [] : [conformance.head],
+      )
+      const overlaps = heads.flatMap((left, leftOrdinal) =>
+        heads.flatMap((right, rightOrdinal) =>
+          leftOrdinal === rightOrdinal ? [] : [ConformanceHead.mayOverlap(left, right)],
+        ),
+      )
+      assert.deepEqual(
+        overlaps,
+        Array.from({ length: 12 }, () => false),
+      )
+
+      // Two concrete specializations of one conditional conformance, and one of the other.
+      const instances = Analysis.instancesOf(snapshot).instances.filter(
+        (instance) => instance.key.declaration.module === module,
+      )
+      const mappedInstances = instances.filter(
+        (instance) => instance.key.declaration.name === 'mappedDecode',
+      )
+      assert.strictEqual(mappedInstances.length, 2)
+      assert.strictEqual(
+        new Set(
+          mappedInstances.map((instance) =>
+            Type.genericArgumentKey(
+              instance.key.typeArguments.at(0) ?? raise('expected an argument'),
+            ),
+          ),
+        ).size,
+        2,
+      )
+      assert.strictEqual(
+        instances.filter((instance) => instance.key.declaration.name === 'optionalDecode').length,
+        1,
+      )
+      assert.strictEqual(instances.length, 8)
+
+      // The committed MIR pins witness selection and instance order byte for byte.
+      assert.strictEqual(
+        MirEncoding.encode(Analysis.loweredMir(snapshot)),
+        golden('conditional-conformance.mir.txt'),
+      )
+    }),
 )

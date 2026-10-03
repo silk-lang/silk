@@ -671,7 +671,7 @@ fn broken() -> i32 { return missing() }`
         oldResult.bodies.find((body) => body.hidden) ?? raise('original anonymous body')
       assert.strictEqual(hidden.declaration.id.ordinal - oldHidden.declaration.id.ordinal, 65536)
       // The reused body names its pattern binding where the binding now stands.
-      const bound = callback.results.occurrences.filter(
+      const bound = (callback.results.tooling?.occurrences ?? []).filter(
         (occurrence) =>
           occurrence.resolution._tag === 'Available' &&
           occurrence.resolution.identity._tag === 'PatternBindingIdentity',

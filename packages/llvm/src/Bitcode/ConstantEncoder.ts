@@ -172,7 +172,9 @@ export const writeConstants = (
         break
       }
       case 'String': {
-        const trailingNull = constant.bytes.bytes.at(-1) === 0
+        // A C-string record stores the bytes before its implicit terminator, and LLVM rejects an
+        // empty one, so a lone NUL byte is written as an ordinary one-element string record.
+        const trailingNull = constant.bytes.bytes.length > 1 && constant.bytes.bytes.at(-1) === 0
         Bitstream.writeRecord(block, trailingNull ? schema.cString : schema.string, [
           trailingNull ? constant.bytes.bytes.slice(0, -1) : constant.bytes.bytes,
         ])
