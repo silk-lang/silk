@@ -26,8 +26,8 @@ by-value receiver of an affine place. The place is a local or match subject plus
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
 projection out of an owned rvalue is rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`),
 moving a whole non-Copy referent or a slice element as `OWN0012` (`BorrowedExtraction`), and moving
-a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). Moving out
-of a `match place` binding is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
+a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). `move` of
+any `match place` binding, and `drop` of a non-Copy one, is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
 whose owned structure carries `impl Drop`, found through the implementation query. `drop` of any
 other value lowers now; a drop that needs cleanup reports the `cleanup` gap until drop glue exists
 (roadmap step 6).
