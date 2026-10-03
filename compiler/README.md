@@ -21,6 +21,13 @@ A tuple or `.{ ... }` literal constructs its immediately expected named tuple or
 it creates an occurrence-nominal anonymous aggregate laid out as an ordinary record of its members.
 Slice subranges, generic unions, block-bodied match arms and bindings that are assigned or borrowed
 remain coverage work for backend roadmap step 4.
+Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
+by-value receiver of an affine place. The place is a local or match subject plus static field,
+element and union steps; an owned rvalue records none. A runtime index or a reference boundary is
+rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`), and moving a whole non-Copy referent
+as `OWN0012` (`BorrowedExtraction`). `drop` of a cleanup-free value (unit, runtime primitives and
+arrays of them) lowers now; any other drop reports the `cleanup` gap until drop glue exists
+(roadmap step 6).
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
