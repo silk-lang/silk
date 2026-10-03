@@ -25,6 +25,7 @@ import hir.Hir {
 }
 import backend.CAbi
 import backend.Gap {Code as GapCode, Gap as BackendGap}
+import backend.DropGlue {Child as GlueChild, Children as GlueChildren, DropGlue, Variant as GlueVariant}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Abi as BackendAbi, FieldInput as LayoutFieldInput, Layout as BackendLayout, Metrics as LayoutMetrics, TypeLayout}
 import backend.LlvmText
@@ -28517,6 +28518,270 @@ effect fn selectedRuntimeCorrespondence(
   return true
 }
 
+// The query member that selects an instance's MIR producer: an ordinary or selected body, the C
+// entry shim, or drop glue.
+fn instanceMember(instance: &InstanceKey) -> usize {
+  return match &instance.* {
+    InstanceKey.Function {..} => usize.ZERO
+    InstanceKey.Entry {..} => usize.MAX
+    InstanceKey.DropGlue {..} => usize.MAX - usize.ONE
+  }
+}
+
+// One glue child, or absence when its type mentions no declaration that could own cleanup.
+effect fn glueChild(index: usize, ty: &Shared<Type>) -> Option<GlueChild> ! OutOfMemoryError ? &mut Allocator {
+  return match move run InstanceKey.dropGlue(ty) {
+    Option<InstanceKey>.Some {value} => Option.some<GlueChild>(GlueChild {index: index, ty: Shared.clone<Type>(ty), glue: move value})
+    Option<InstanceKey>.None => Option.none<GlueChild>()
+  }
+}
+
+// Appends the children among `types` that need cleanup, keyed by position; false when one has no glue.
+effect fn appendGlueChildren(children: &mut Vector<GlueChild>, types: &[Shared<Type>]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < types.length {
+    if !Shared.with<Type, bool>(&types[at], Type.cleanupFree) {
+      let child = match move run glueChild(at, &types[at]) {
+        Option<GlueChild>.Some {value} => value
+        Option<GlueChild>.None => { return false }
+      }
+      run Vector.append<GlueChild>(&mut children.*, move child)
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The children a value of `ty` cleans after its Drop hook. Failure without a rejection is a cleanup
+// form this backend cannot lower yet: a callable or Effect environment, a generic nominal union, or
+// a type whose member shapes have no layout.
+effect fn glueChildren(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  ty: &Shared<Type>) -> Result<GlueChildren, Option<Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let unsupported = Result.failResult<GlueChildren, Option<Shared<Rejection>>>(Option.none<Shared<Rejection>>())
+  let node = run Type.copy(ty)
+  if let Type.Array {element, ..} = &node {
+    let count = match move Type.arrayShape(ty) {
+      Option<ArrayShape>.Some {value: shape} => shape.length
+      Option<ArrayShape>.None => { return move unsupported }
+    }
+    if Shared.with<Type, bool>(&element, Type.cleanupFree) {
+      return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Fields {fields: Vector.make<GlueChild>()})
+    }
+    return match move run glueChild(usize.ZERO, &element) {
+      Option<GlueChild>.Some {value} => Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Elements {element: move value, count: count})
+      Option<GlueChild>.None => move unsupported
+    }
+  }
+  if let Type.Union {..} = &node {
+    let members = match move run Type.canonicalUnionMembers(ty) {
+      Option<Vector<Shared<Type>>>.Some {value} => value
+      Option<Vector<Shared<Type>>>.None => { return move unsupported }
+    }
+    let mut children = Vector.make<GlueChild>()
+    if !run appendGlueChildren(&mut children, Vector.asSlice<Shared<Type>>(&members)) { return move unsupported }
+    return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Members {
+      members: move children, count: Vector.length<Shared<Type>>(&members),
+    })
+  }
+  if let Type.Anonymous {members, ..} = &node {
+    let mut children = Vector.make<GlueChild>()
+    if !run appendGlueChildren(&mut children, Vector.asSlice<Shared<Type>>(&members)) { return move unsupported }
+    return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Fields {fields: move children})
+  }
+  if !Shared.with<Type, bool>(ty, isNominalType) { return move unsupported }
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
+  if moduleOrdinal == usize.MAX { return move unsupported }
+  let module = run resolvedModule(&resolver.*, moduleOrdinal)
+  let declaration = match move run ordinalOfProvider(&mut resolver.*, &module, ty) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return move unsupported }
+  }
+  let written = match move run header(&mut resolver.*, &module, declaration) {
+    Option<HeaderSyntax>.Some {value} => value
+    Option<HeaderSyntax>.None => { return move unsupported }
+  }
+  // A scalar enum is Copy and never admits a Drop hook (ENUM-003).
+  if let Node.EnumHeader {..} = written.header {
+    return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Fields {fields: Vector.make<GlueChild>()})
+  }
+  if let Node.UnionHeader {generics, variants, ..} = written.header {
+    if generics.length > usize.ZERO { return move unsupported }
+    let nominal = NominalUnion {module: moduleOrdinal, declaration: declaration, count: variants.length}
+    let mut listed = Vector.make<GlueVariant>()
+    let mut tag = usize.ZERO
+    while tag < nominal.count {
+      let shape = match move run variantShape(&mut resolver.*, &mut owner.*, &mut dependencies.*, &module, ty, &nominal, tag, written.span) {
+        Result<VariantShape, Shared<Rejection>>.Success {value} => value
+        Result<VariantShape, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<GlueChildren, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move error))
+        }
+      }
+      let mut fields = Vector.make<GlueChild>()
+      if !run appendGlueChildren(&mut fields, Vector.asSlice<Shared<Type>>(&shape.types)) { return move unsupported }
+      if Vector.length<GlueChild>(&fields) > usize.ZERO {
+        run Vector.append<GlueVariant>(&mut listed, GlueVariant {tag: tag, fields: move fields})
+      }
+      tag = tag + usize.ONE
+    }
+    return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Variants {variants: move listed, count: nominal.count})
+  }
+  let mut count = usize.MAX
+  if let Node.StructHeader {fields, ..} = written.header { count = fields.length }
+  if let Node.TupleHeader {elements, ..} = written.header { count = elements.length }
+  if count == usize.MAX { return move unsupported }
+  let application = run internApplication(&mut resolver.*, ty)
+  let mut types = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let shaped = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+      family: Family.MemberShape, module: moduleOrdinal, name: application, declaration: declaration, member: at, external: false,
+    }, written.span)
+    let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&shaped, answerRejection)
+    if let Option<Shared<Rejection>>.Some {value} = move rejected {
+      return Result.failResult<GlueChildren, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move value))
+    }
+    let field = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&shaped, singleMemberType) {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return move unsupported }
+    }
+    run Vector.append<Shared<Type>>(&mut types, move field)
+    at = at + usize.ONE
+  }
+  let mut children = Vector.make<GlueChild>()
+  if !run appendGlueChildren(&mut children, Vector.asSlice<Shared<Type>>(&types)) { return move unsupported }
+  return Result.succeed<GlueChildren, Option<Shared<Rejection>>>(GlueChildren.Fields {fields: move children})
+}
+
+fn dropMember(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.ImplementationMembers {members}} = &value.outcome {
+      let listed = Vector.asSlice<ImplementationMember>(&members)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if let ImplementationMember.Inline {declaration, ..} = &listed[at] {
+          if Shared.with<DeclarationId, bool>(&declaration, fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, b"drop") }) {
+            return Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&declaration))
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<Shared<DeclarationId>>()
+}
+
+// The instance of the provider's `impl Drop` hook, found through the sealed-property implementation
+// query rather than by spelling. The hook's own elided borrow lifetime takes `'static`, which the
+// runtime identity erases; the impl's binders come from the provider's arguments.
+effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  ty: &Shared<Type>) -> Result<Option<InstanceKey>, Option<Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  if !Shared.with<Type, bool>(ty, isNominalType) { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
+  if moduleOrdinal == usize.MAX { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+    family: Family.Implementations, module: moduleOrdinal, name: usize.ZERO, declaration: usize.ZERO, member: usize.ZERO, external: false,
+  }, span)
+  let failed = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&listed, answerRejection)
+  if let Option<Shared<Rejection>>.Some {value} = move failed {
+    return Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move value))
+  }
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(&listed, implementationCount)
+  let mut hookImpl = Option.none<Shared<DeclarationId>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let candidate = Shared.with<Result<Answer, NoRejection>, Option<Shared<ImplementationHead>>>(&listed,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<ImplementationHead>> { return implementationAt(answer, at) })
+    if let Option<Shared<ImplementationHead>>.Some {value: head} = move candidate {
+      let selected = Shared.with<ImplementationHead, Option<Shared<DeclarationId>>>(&head, fn(implementation: &ImplementationHead) -> Option<Shared<DeclarationId>> {
+        if let ImplementationKind.Sealed {property} = &implementation.kind {
+          if property == SealedProperty.Drop && sameProviderShared(&implementation.provider, ty) {
+            return Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&implementation.declaration))
+          }
+        }
+        return Option.none<Shared<DeclarationId>>()
+      })
+      let found = match &selected {
+        Option<Shared<DeclarationId>>.Some {..} => true
+        Option<Shared<DeclarationId>>.None => false
+      }
+      if found { hookImpl = move selected }
+    }
+    at = at + usize.ONE
+  }
+  let implementation = match move hookImpl {
+    Option<Shared<DeclarationId>>.Some {value} => value
+    Option<Shared<DeclarationId>>.None => { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  }
+  let unsupported = Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<Shared<Rejection>>())
+  let module = run resolvedModule(&resolver.*, moduleOrdinal)
+  let implOrdinal = match move run ordinalOfIdentity(&mut resolver.*, &module, &implementation) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return move unsupported }
+  }
+  let members = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
+    family: Family.ImplementationMembers, module: moduleOrdinal, name: usize.ZERO, declaration: implOrdinal, member: usize.ZERO, external: false,
+  }, span)
+  let membersFailed = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&members, answerRejection)
+  if let Option<Shared<Rejection>>.Some {value} = move membersFailed {
+    return Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move value))
+  }
+  let hook = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<DeclarationId>>>(&members, dropMember) {
+    Option<Shared<DeclarationId>>.Some {value} => run DeclarationId.copyShared(&value)
+    Option<Shared<DeclarationId>>.None => { return move unsupported }
+  }
+  let mut request = Request.make()
+  let schema = match move run resolveTargetSchema(&mut resolver.*, &mut owner.*, &mut request, &mut dependencies.*, true, &hook, span) {
+    Option<TargetSchema>.Some {value} => value
+    Option<TargetSchema>.None => { return move unsupported }
+  }
+  let hookIdentity = run Shared.make<DeclarationId>(run DeclarationId.copy(&hook))
+  let slots = Vector.asSlice<ApplicationSlot>(&schema.own)
+  let mut inferred = Vector.make<Binding>()
+  at = usize.ZERO
+  while at < slots.length {
+    if slots[at].kind != GenericKind.Lifetime { return move unsupported }
+    run Vector.append<Binding>(&mut inferred, Binding {
+      declaration: Shared.clone<DeclarationId>(&hookIdentity), ordinal: slots[at].ordinal,
+      value: Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Static)},
+    })
+    at = at + usize.ONE
+  }
+  let application = match move run checkedReceiverApplication(&mut resolver.*, &mut owner.*, &mut request, &mut dependencies.*,
+    &hook, ty, Vector.asSlice<Binding>(&inferred), &module, span) {
+    Result<Application, Shared<Rejection>>.Success {value} => value
+    Result<Application, Shared<Rejection>>.Failure {..} => { return move unsupported }
+  }
+  return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<InstanceKey>(run InstanceKey.function(move application)))
+}
+
+// Drop glue reads its type's Drop hook and member shapes, never a function body. A cleanup form
+// this backend cannot lower yet is the `cleanup` gap, attributed to the glue's owner declaration.
+effect fn resolveGlueMir(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, instance: InstanceKey, ty: &Shared<Type>) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut dependencies = Vector.make<Dependency>()
+  let identity = InstanceKey.identity(&instance)
+  let gap = Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, Span.make(usize.ZERO, usize.ZERO)))}
+  let hook = match move run dropHook(&mut resolver.*, &mut owner.*, &mut dependencies, ty) {
+    Result<Option<InstanceKey>, Option<Shared<Rejection>>>.Success {value} => value
+    Result<Option<InstanceKey>, Option<Shared<Rejection>>>.Failure {error} => match move error {
+      Option<Shared<Rejection>>.Some {value} => { return memberRejected(move value, move dependencies) }
+      Option<Shared<Rejection>>.None => { return memberSuccess(move gap, move dependencies) }
+    }
+  }
+  let children = match move run glueChildren(&mut resolver.*, &mut owner.*, &mut dependencies, ty) {
+    Result<GlueChildren, Option<Shared<Rejection>>>.Success {value} => value
+    Result<GlueChildren, Option<Shared<Rejection>>>.Failure {error} => match move error {
+      Option<Shared<Rejection>>.Some {value} => { return memberRejected(move value, move dependencies) }
+      Option<Shared<Rejection>>.None => { return memberSuccess(move gap, move dependencies) }
+    }
+  }
+  let function = run DropGlue.lower(DropGlue {key: move instance, ty: Shared.clone<Type>(ty), hook: move hook, children: move children})
+  return run storeMir(&mut resolver.*, move function, move dependencies)
+}
+
 effect fn resolveMir(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -28524,6 +28789,9 @@ effect fn resolveMir(
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let instances = Vector.asSlice<InstanceKey>(&resolver.backendInstances)
   let instance = InstanceKey.copy(&instances[key.name])
+  if let Option<Shared<Type>>.Some {value: glued} = move InstanceKey.glueType(&instance) {
+    return run resolveGlueMir(&mut resolver.*, &mut owner.*, move instance, &glued)
+  }
   let module = run resolvedModule(&resolver.*, key.module)
   let declared = run declarationAt(&mut resolver.*, &module, key.declaration)
   let identity = match move declared {
@@ -35279,6 +35547,34 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Body, module, name, &answer)
     return move answer
   }
+  /// Demands the drop glue MIR of one type, as the build worklist reaches it from a `Drop`.
+  pub effect fn demandGlueMir(self: &mut Self, request: &mut Request, ty: &Shared<Type>) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let span = Span.make(usize.ZERO, usize.ZERO)
+    let instance = match move run InstanceKey.dropGlue(ty) {
+      Option<InstanceKey>.Some {value} => value
+      Option<InstanceKey>.None => {
+        return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(memberSuccess(Value.LayoutUnsupported, Vector.make<Dependency>())))
+      }
+    }
+    let identity = InstanceKey.identity(&instance)
+    let owner = run DeclarationId.copyShared(&identity)
+    let module = run ModuleId.copy(DeclarationId.moduleId(&owner))
+    let location = match move run locationOfInstance(&mut self.resolver, &instance) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => {
+        return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(memberRejected(
+          run reject(&self.resolver, &module, RejectionCode.UnknownMember, span), Vector.make<Dependency>())))
+      }
+    }
+    let name = run internBackendInstance(&mut self.resolver, &instance)
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, Key {
+      family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(&instance), external: false,
+    }, span)
+    run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
+    return move answer
+  }
   /// Demands MIR for one complete semantic environment before runtime identity can be reused.
   /// Header validation and admission precede the exact-application query cache; target callees
   /// remain body-lazy. This retains actual lifetime evidence even when emitted symbols coincide.
@@ -35499,7 +35795,8 @@ impl Semantic {
       }
       let instance = move entered.key
       let mut leave = false
-      if !InstanceKey.isEntry(&instance) {
+      // Entry shims and drop glue carry no application to admit; only function instances specialize.
+      if let Option<Shared<Application>>.Some {..} = move InstanceKey.application(&instance) {
         let application = run InstanceKey.selected(&instance)
         let enteredEdge = Edge.copy(&entered.edge)
         let decision = run Admission.enter(&mut admission, &application, move entered.edge)
@@ -35617,10 +35914,7 @@ impl Semantic {
           continue
         }
       }
-      let mut member = usize.ZERO
-      if InstanceKey.isEntry(&instance) {
-        member = usize.MAX
-      }
+      let member = instanceMember(&instance)
       let backendName = run internBackendInstance(&mut self.resolver, &instance)
       let key = Key {
         family: Family.Instance,
@@ -35857,6 +36151,9 @@ effect fn closureGap(code: GapCode, application: &Application, span: Span) -> St
 effect fn enterChainNode(semantic: &mut Semantic, draft: &mut ClosureDraft, key: InstanceKey, from: usize, edge: Edge, module: ModuleId, span: Span, incoming: &ClosureIncoming, limit: usize) -> Option<StaticClosure>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
+  // Drop glue carries no static arguments, so it never extends a changing-static chain; the build
+  // worklist reaches it and the hooks it calls.
+  if let Option<Shared<Type>>.Some {..} = move InstanceKey.glueType(&key) { return Option.none<StaticClosure>() }
   let application = run InstanceKey.selected(&key)
   let root = RelatedSite {module: run ModuleId.copy(&incoming.module), span: incoming.span}
   let decision = run Admission.enter(&mut draft.admission, &application, Edge.copy(&edge))

@@ -663,6 +663,19 @@ effect fn temporary(builder: &mut Builder, ty: &Shared<Type>, origin: Origin) ->
   return index
 }
 
+// Cleans one complete owned value through its type's glue, which the instance now references.
+effect fn dropPlace(builder: &mut Builder, destination: Place, ty: &Shared<Type>, owner: &Shared<DeclarationId>, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let glue = match move run InstanceKey.dropGlue(ty) {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run unsupported(owner, origin, GapCode.Cleanup) }
+  }
+  run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: move glue, edge: Edge.Direct, origin: origin})
+  let current = builder.current
+  let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.function.blocks)
+  return run Vector.append<Statement>(&mut blocks[current].statements, Statement.Drop {destination: move destination, origin: origin})
+}
+
 effect fn copyPlace(value: &Place) -> Place ! OutOfMemoryError ? &mut Allocator {
   let mut copied = place(value.local)
   let projections = Vector.asSlice<Projection>(&value.projections)
@@ -1384,14 +1397,6 @@ effect fn dispatchArms(builder: &mut Builder, selectors: &[Selector], entries: &
   return ()
 }
 
-// The unsigned tag type whose width the structural union's layout stores at offset zero.
-effect fn tagType(tags: usize) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
-  let bytes = Layout.tagBytes(tags)
-  if bytes == usize.ONE { return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u8")}) }
-  if bytes == 2 { return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u16")}) }
-  return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u32")})
-}
-
 fn scrutineePlace(builder: &Builder, subject: BodyNodeId) -> Option<usize> {
   let listed = Vector.asSlice<Scrutinee>(&builder.scrutinees)
   let mut at = listed.length
@@ -1433,7 +1438,7 @@ effect fn lowerMatch(
   }
   let mut switched = scrutinee.local
   if tags != usize.ZERO {
-    let tag = run tagType(tags)
+    let tag = run Layout.tagType(tags)
     switched = run temporary(&mut builder.*, &tag, origin)
     run assign(&mut builder.*, place(switched), Rvalue.Discriminant {place: run copyPlace(&scrutinee)}, origin)
   } else if Vector.length<Projection>(&scrutinee.projections) != usize.ZERO {
@@ -1777,15 +1782,21 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       terminate(&mut builder.*, Terminator.Goto {target: exit, origin: origin})
     }
     View.Drop {value, origin} => {
-      // The operand is evaluated for its effects. Only cleanup-free values end without drop glue.
+      // The operand is evaluated, then its owned value is cleaned by its type's glue (DROP-001).
       let dropped = match move run instanceNodeType(&builder.*, body, value) {
         Option<Shared<Type>>.Some {value: droppedType} => droppedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
+      let operand = run expression(&mut builder.*, body, hir, value)
       let cleanupFree = Shared.with<Type, bool>(&dropped, Type.cleanupFree)
-      if !cleanupFree { return run unsupported(&owner, origin, GapCode.Cleanup) }
-      let ignored = run expression(&mut builder.*, body, hir, value)
-      drop ignored
+      if !cleanupFree {
+        let storage = match move operand {
+          Operand.Copy {place: stored} => move stored
+          Operand.Move {place: stored} => move stored
+          _ => { return run unsupported(&owner, origin, GapCode.ExpectedPlace) }
+        }
+        run dropPlace(&mut builder.*, move storage, &dropped, &owner, origin)
+      }
     }
     View.Continue {origin} => {
       let loops = Vector.asSlice<LoopTargets>(&builder.loops)
@@ -1921,6 +1932,54 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
 }
 
 impl MirFunction {
+  /// Orders reached instances by symbol so worklist edges are deterministic.
+  pub effect fn sortReferences(references: &mut Vector<Reference>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let listed = Vector.asSlice<Reference>(&references.*)
+    let mut symbols = Vector.make<Bytes>()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector.append<Bytes>(&mut symbols, run InstanceKey.symbol(&listed[at].key))
+      at = at + usize.ONE
+    }
+    let mut order = Vector.make<usize>()
+    at = usize.ZERO
+    while at < listed.length {
+      run Vector.append<usize>(&mut order, at)
+      at = at + usize.ONE
+    }
+    let sorted = Vector.asMutSlice<usize>(&mut order)
+    let names = Vector.asSlice<Bytes>(&symbols)
+    at = usize.ONE
+    while at < sorted.length {
+      let mut next = at
+      while next > usize.ZERO && RuntimeEncoding.less(
+        Bytes.asSlice(&names[sorted[next]]),
+        Bytes.asSlice(&names[sorted[next - usize.ONE]]),
+      ) {
+        let prior = sorted[next - usize.ONE]
+        sorted[next - usize.ONE] = sorted[next]
+        sorted[next] = prior
+        next = next - usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let mut output = Vector.make<Reference>()
+    at = usize.ZERO
+    while at < sorted.length {
+      let current = &listed[sorted[at]]
+      run Vector.append<Reference>(
+        &mut output,
+        Reference {
+          key: InstanceKey.copy(&current.key),
+          edge: Edge.copy(&current.edge),
+          origin: current.origin,
+        },
+      )
+      at = at + usize.ONE
+    }
+    references.* = move output
+    return ()
+  }
   /// Lists only calls reached by ordinary MIR control-flow lowering, in evaluation order.
   pub effect fn callNodes(body: &Shared<TypedBody>) -> Vector<BodyNodeId> ! OutOfMemoryError ? &mut Allocator {
     let mut output = Vector.make<BodyNodeId>()
@@ -2067,7 +2126,7 @@ impl MirFunction {
       // Unit may fall through. A non-unit missing return was rejected by body typing.
       terminate(&mut builder, Terminator.Return {origin: origin})
     }
-    run sortReferences(&mut builder.function.references)
+    run MirFunction.sortReferences(&mut builder.function.references)
     return move builder.function
   }
 }
@@ -2263,56 +2322,6 @@ fn resolvedCallOperand(builder: &Builder, node: BodyNodeId, index: usize) -> Opt
     at = at + usize.ONE
   }
   return Option.none<CallOperand>()
-}
-
-effect fn sortReferences(references: &mut Vector<Reference>) -> ()
-! OutOfMemoryError
-? &mut Allocator {
-  let listed = Vector.asSlice<Reference>(&references.*)
-  let mut symbols = Vector.make<Bytes>()
-  let mut at = usize.ZERO
-  while at < listed.length {
-    run Vector.append<Bytes>(&mut symbols, run InstanceKey.symbol(&listed[at].key))
-    at = at + usize.ONE
-  }
-  let mut order = Vector.make<usize>()
-  at = usize.ZERO
-  while at < listed.length {
-    run Vector.append<usize>(&mut order, at)
-    at = at + usize.ONE
-  }
-  let sorted = Vector.asMutSlice<usize>(&mut order)
-  let names = Vector.asSlice<Bytes>(&symbols)
-  at = usize.ONE
-  while at < sorted.length {
-    let mut next = at
-    while next > usize.ZERO && RuntimeEncoding.less(
-      Bytes.asSlice(&names[sorted[next]]),
-      Bytes.asSlice(&names[sorted[next - usize.ONE]]),
-    ) {
-      let prior = sorted[next - usize.ONE]
-      sorted[next - usize.ONE] = sorted[next]
-      sorted[next] = prior
-      next = next - usize.ONE
-    }
-    at = at + usize.ONE
-  }
-  let mut output = Vector.make<Reference>()
-  at = usize.ZERO
-  while at < sorted.length {
-    let current = &listed[sorted[at]]
-    run Vector.append<Reference>(
-      &mut output,
-      Reference {
-        key: InstanceKey.copy(&current.key),
-        edge: Edge.copy(&current.edge),
-        origin: current.origin,
-      },
-    )
-    at = at + usize.ONE
-  }
-  references.* = move output
-  return ()
 }
 
 fn absurd<T>() -> T {
