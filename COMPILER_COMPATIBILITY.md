@@ -123,14 +123,15 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
-### Selfhost does not lower moves out of `match place` bindings
+### Selfhost rejects moves out of `match place` bindings
 
 - **Status:** implemented on 2026-10-03 with Step 6a.
 - **Rule:** a `match place` binding denotes a refined place of the subject; an explicit move may
   extract it after a guard succeeds (MATCH-001).
 - **Compilers:** the bootstrap treats the move as a partial move of the subject's root, checked
-  against its Drop boundary. Selfhost rejects `move` or `drop` of a non-Copy `match place` binding
-  as `Unsupported`, because its consumed places do not yet carry the subject path's owner types.
+  against its Drop boundary. Selfhost rejects `move` of any `match place` binding, and `drop` of a
+  non-Copy one, as `Unsupported`, because its consumed places do not yet carry the subject path's
+  owner types.
 - **Source migration:** none.
 - **Evidence:** `consumingSitesRecordConsumedPlaces` in `compiler/src/semantic/SemanticCases.silk`.
 
@@ -143,13 +144,17 @@ Each entry records:
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
   reports the backend gap `cleanup` instead of lowering a partially moved owner whose holes differ
   between joining paths or that is moved on only some paths, a write at a runtime index beside a
-  moved element, a loop iteration that leaves an owner in a different state than it found it, and
+  moved element, a loop iteration that leaves an owner in a different state than it found it, a
+  guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
   drop glue for callable and Effect environments, generic nominal unions and unions without a
   canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
+  guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
+  borrowing match result gap, which current typing cannot reach because it borrows only places and
+  Drop-free array literals, and the deferred glue forms.
 
 ### Omitted Effect environments elaborated from inputs
 

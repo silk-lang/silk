@@ -26,8 +26,8 @@ by-value receiver of an affine place. The place is a local or match subject plus
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
 projection out of an owned rvalue is rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`),
 moving a whole non-Copy referent or a slice element as `OWN0012` (`BorrowedExtraction`), and moving
-a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). Moving out
-of a `match place` binding is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
+a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). `move` of
+any `match place` binding, and `drop` of a non-Copy one, is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
 whose owned structure carries `impl Drop`, found through the implementation query. `drop` of any
 other value emits nothing; a drop that needs cleanup calls the drop glue of the value's type. Glue is
 its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
@@ -45,8 +45,10 @@ rvalues used only as places are dropped at the end of their full expression unle
 path. A static partial move, including a match binding moved out of a consumed subject, leaves a
 hole in its owner: the owner is then dropped child by child, skipping moved children, and writing
 a moved child back makes it whole again. A hole beneath a type with a Drop hook is rejected as
-`OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner and a write at a
-runtime index beside a moved element still report the `cleanup` gap.
+`OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner, a write at a
+runtime index beside a moved element, a guard that changes an owner's state, a loop iteration that
+leaves an owner changed and a borrowing match result whose arm created temporaries still report
+the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 
