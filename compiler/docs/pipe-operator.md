@@ -13,6 +13,10 @@ expression. Call collection, selection, body checking, static execution, and sta
 selection consume that representation. `checkInvocation` produces the existing typed direct-call
 form, whose MIR lowering evaluates arguments before invoking the selected callee.
 
+Qualified call references retain the authored owner application separately from call-site
+generics. Nominal applications use ordinary type resolution before inherent member selection;
+unknown or excess type arguments are rejected, and module qualifiers cannot take type arguments.
+
 Callable-value targets remain deferred to Step 8 as `pipeline-callable`; interface-operation
 pipelines report `pipeline-interface`. Both are structured gaps anchored at the complete pipe
 expression, including the canonical owning declaration.
@@ -21,5 +25,6 @@ expression, including the canonical owning declaration.
 
 `namedPipelinesShareDirectCallTypingAndOrder` in `SemanticCases.silk` uses one held source snapshot
 for contextual input typing, selected targets, input-before-call MIR, block match arms, static
-calls and slots, and both gap codes and spans. Runtime behavior is also exercised by the pinned
-`trivial-features` native corpus program and its B11 baseline entry.
+calls and slots, both gap codes and spans, and applied-qualifier validation for both call forms.
+Runtime behavior is also exercised by the pinned `trivial-features` native corpus program and its
+B11 baseline entry.
