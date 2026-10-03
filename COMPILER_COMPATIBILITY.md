@@ -153,6 +153,21 @@ Each entry records:
   result gap, which current typing cannot reach because it borrows only places and Drop-free array
   literals, and the deferred glue forms.
 
+### Selfhost does not reject moves inside match guards at typing
+
+- **Status:** recorded on 2026-10-03 with Step 6c.
+- **Rule:** the reference reports OWN0008 for moving a provisional pattern binding inside its guard
+  (ownership-and-borrowing.md, MATCH-002); it states no rule for other places a guard moves.
+- **Compilers:** the bootstrap checks every guard in guard mode and reports OWN0008 for any place a
+  guard moves, including an ordinary local, which is broader than the reference. Selfhost has no
+  OWN0008 yet. It types a guard that moves an owner, and MIR lowering then reports the `cleanup`
+  gap for a guard that changes an owner's state, so no program it accepts here reaches codegen.
+- **Source migration:** none.
+- **Evidence:** the `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` in
+  `compiler/src/semantic/SemanticCases.silk`.
+- **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
+  reference should widen it, before selfhost implements the code.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
