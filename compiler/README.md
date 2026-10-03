@@ -45,6 +45,21 @@ is the root for local module paths. Without a manifest, the entry file's directo
 root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
+`silkc format [paths] [--check]` formats source without semantic analysis or code generation.
+The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
+directory is the source root. With no paths the command recursively selects that root. Explicit
+files and directories are resolved against the working directory, must stay inside the source
+root, and select only exact `.silk` extensions. Selection is sorted by normalized path bytes and
+deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
+filename beginning with a dash.
+
+Write mode replaces changed files; `--check` reports changes without writing. Damaged source is
+reported with its first offending byte offset and remains untouched. Other readable selected
+files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
+drift, and `2` for project, selection, filesystem, allocation, or diagnostic-output failures.
+The portable filesystem uses complete create-or-truncate writes; an interrupted or failed write
+can leave a partial file, so formatter writes currently have the same limitation.
+
 `driver.ModuleSources` reads only modules observed as absent by a reached semantic demand. It
 publishes each file's exact bytes or absence as a separate `SourceRevision` mapping, then resumes
 through `Semantic.revise`. Unused imports stay unread and unchanged per-file observations remain

@@ -1,0 +1,372 @@
+//! Project source selection and the native formatter command's stable exit classes.
+
+import format.FormatError {FormatError}
+import format.SyntaxFormatter
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.filesystem {DirectoryEntry, DirectoryInfo, FileError, FileInfo, FileSystem, Path}
+import silk.format {Format}
+import silk.host_input {HostInput, HostInputError}
+import silk.option {Option}
+import silk.result {Result}
+import silk.slice {Slice}
+import silk.string {InvalidUtf8, String}
+import silk.toml_scanner {TomlError}
+import silk.toml_value {Toml}
+import silk.usize
+import silk.vector {Vector}
+import silk.writer {Writer, WriterError}
+
+/// A parsed format request. Paths are relative to the caller's working directory.
+pub struct Command {
+  pub paths: Vector<Bytes>
+  pub check: bool
+}
+
+pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, OutsideRoot, InvalidSelection, InvalidEncoding }
+
+/// A request or project-selection failure before any source is rewritten.
+pub struct CommandError {
+  pub reason: Reason
+  pub path: Bytes
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+fn begins(value: &[u8], prefix: &[u8]) -> bool {
+  if value.length < prefix.length { return false }
+  let mut at: usize = 0
+  while at < prefix.length {
+    if value[at] != prefix[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+effect fn reject(reason: Reason, path: &[u8]) -> never
+! CommandError | OutOfMemoryError ? &mut Allocator {
+  fail CommandError {reason: reason, path: run Bytes.copy(path)}
+}
+
+/// Parses arguments following `format`; `--` permits filenames beginning with a dash.
+pub effect fn make(arguments: Vector<Bytes>) -> Command
+! CommandError | OutOfMemoryError ? &mut Allocator {
+  let mut paths = move arguments
+  let mut check = false
+  let mut literal = false
+  let mut at: usize = 0
+  while at < Vector.length<Bytes>(&paths) {
+    let values = Vector.asSlice<Bytes>(&paths)
+    let argument = Bytes.asSlice(&values[at])
+    if !literal && same(argument, b"--") {
+      literal = true
+      drop Vector.remove<Bytes>(&mut paths, at)
+    } else if !literal && same(argument, b"--check") {
+      check = true
+      drop Vector.remove<Bytes>(&mut paths, at)
+    } else {
+      if !literal && begins(argument, b"-") {
+        return run reject(Reason.InvalidArgument, argument)
+      }
+      at = at + 1
+    }
+  }
+  return Command {paths: move paths, check: check}
+}
+
+effect fn resolve(base: &Path, bytes: &[u8]) -> Path
+! CommandError | FileError | OutOfMemoryError ? &mut Allocator {
+  let text = match move String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success {value} => value
+    Result<string, InvalidUtf8>.Failure {error: _} => {
+      return run reject(Reason.InvalidEncoding, bytes)
+    }
+  }
+  if begins(bytes, b"/") {
+    let root = run Path.root()
+    let relative = Slice.view<u8>(String.utf8Bytes(text), 1, bytes.length - 1)
+    let decoded = match move String.fromUtf8(relative) {
+      Result<string, InvalidUtf8>.Success {value} => value
+      Result<string, InvalidUtf8>.Failure {error: _} => {
+        return run reject(Reason.InvalidEncoding, bytes)
+      }
+    }
+    return run Path.resolve(&root, decoded)
+  }
+  return run Path.resolve(base, text)
+}
+
+effect fn readOptional(path: &Path) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let loaded = run Effect.result(FileSystem.readFile(path))
+  return match move loaded {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option.some<Bytes>(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        if failure.reason.code == FileSystem.notFound().code { return Option.none<Bytes>() }
+        fail move failure
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn sourceRoot(working: &Path) -> Path
+! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut directory = run Path.fromBytes(Path.rawBytes(working))
+  while true {
+    let manifest = run Path.join(&directory, "silk.toml")
+    let contents = run readOptional(&manifest)
+    if let Option<Bytes>.Some {value} = move contents {
+      let document = run Toml.parse(Bytes.asSlice(&value))
+      let package = Toml.field(&document, "package")
+      let configured = Toml.asString(Toml.fieldAt(move package, "root"))
+      if let Option<string>.Some {value: text} = move configured {
+        if String.byteLength(text) == 0 || begins(String.utf8Bytes(text), b"/") {
+          return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
+        }
+        let entry = run Path.resolve(&directory, text)
+        if !within(&directory, &entry) || !silkFile(&entry) {
+          return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
+        }
+        let parent = run Path.parent(&entry)
+        if let Option<Path>.Some {value: root} = move parent { return move root }
+      }
+      return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
+    }
+    let parent = run Path.parent(&directory)
+    if let Option<Path>.Some {value} = move parent {
+      directory = move value
+    } else {
+      return run reject(Reason.MissingProject, Path.rawBytes(working))
+    }
+  }
+  return run reject(Reason.MissingProject, Path.rawBytes(working))
+}
+
+fn within(root: &Path, candidate: &Path) -> bool {
+  let prefix = Path.rawBytes(root)
+  let value = Path.rawBytes(candidate)
+  if !begins(value, prefix) { return false }
+  return Path.isRoot(root) || value.length == prefix.length || value[prefix.length] == 47
+}
+
+fn silkFile(path: &Path) -> bool {
+  let bytes = Path.rawBytes(path)
+  if bytes.length < 5 { return false }
+  return same(Slice.view<u8>(bytes, bytes.length - 5, 5), b".silk")
+}
+
+fn compare(left: &[u8], right: &[u8]) -> i32 {
+  let mut at: usize = 0
+  while at < left.length && at < right.length {
+    if left[at] < right[at] { return -1 }
+    if left[at] > right[at] { return 1 }
+    at = at + 1
+  }
+  if left.length < right.length { return -1 }
+  if left.length > right.length { return 1 }
+  return 0
+}
+
+effect fn include(selected: &mut Vector<Path>, path: Path) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let paths = Vector.asSlice<Path>(&selected.*)
+  let mut at: usize = 0
+  while at < paths.length {
+    let order = compare(Path.rawBytes(&path), Path.rawBytes(&paths[at]))
+    if order == 0 { return () }
+    if order < 0 { break }
+    at = at + 1
+  }
+  run Vector.insert<Path>(&mut selected.*, at, move path)
+}
+
+effect fn walk(selected: &mut Vector<Path>, root: &Path, directory: &Path) -> ()
+! CommandError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut entries = run FileSystem.listDirectory(directory)
+  while Vector.length<DirectoryEntry>(&entries) > 0 {
+    let popped = Vector.pop<DirectoryEntry>(&mut entries)
+    let child = match move popped {
+      Option<DirectoryEntry>.Some {value} => move value
+      Option<DirectoryEntry>.None => { return () }
+    }
+    if !within(root, &child.path) || same(Path.rawBytes(directory), Path.rawBytes(&child.path)) {
+      return run reject(Reason.OutsideRoot, Path.rawBytes(&child.path))
+    }
+    if child.kind.code == FileSystem.directory().code {
+      run walk(&mut selected.*, root, &child.path)
+    } else if child.kind.code == FileSystem.file().code && silkFile(&child.path) {
+      run include(&mut selected.*, move child.path)
+    }
+  }
+}
+
+/// Selects sorted, duplicate-free exact `.silk` files under the nearest package's source root.
+pub effect fn select(self: &Command, working: &Path) -> Vector<Path>
+! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let root = run sourceRoot(working)
+  let mut selected = Vector.make<Path>()
+  let arguments = Vector.asSlice<Bytes>(&self.paths)
+  if arguments.length == 0 {
+    run walk(&mut selected, &root, &root)
+    return move selected
+  }
+  let mut at: usize = 0
+  while at < arguments.length {
+    let path = run resolve(working, Bytes.asSlice(&arguments[at]))
+    if !within(&root, &path) { return run reject(Reason.OutsideRoot, Path.rawBytes(&path)) }
+    let info = run FileSystem.stat(&path)
+    match move info {
+      DirectoryInfo directory => { run walk(&mut selected, &root, &path) }
+      FileInfo file => {
+        if !silkFile(&path) { return run reject(Reason.InvalidSelection, Path.rawBytes(&path)) }
+        run include(&mut selected, move path)
+      }
+    }
+    at = at + 1
+  }
+  return move selected
+}
+
+effect fn report(path: &Path, message: &[u8]) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(Path.rawBytes(path))
+  run Writer.writeAll(b": ")
+  run Writer.writeAll(message)
+}
+
+effect fn fileFailure(error: &FileError) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"filesystem failure (operation ")
+  run Format.display<i32>(&error.operation.code)
+  run Writer.writeAll(b", reason ")
+  run Format.display<i32>(&error.reason.code)
+  let code = FileSystem.providerCode(error)
+  if let Option<i32>.Some {value} = move code {
+    run Writer.writeAll(b", provider ")
+    run Format.display<i32>(&value)
+  }
+  run Writer.writeAll(b")")
+}
+
+effect fn formatFile(path: &Path, check: bool) -> i32
+! FileError | FormatError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator | &mut Writer {
+  let source = run FileSystem.readFile(path)
+  let formatted = run SyntaxFormatter.format(Bytes.asSlice(&source))
+  if same(Bytes.asSlice(&source), Bytes.asSlice(&formatted)) { return 0 }
+  if check {
+    run report(path, b"would format\n")
+    return 1
+  }
+  run FileSystem.writeFile(path, Bytes.asSlice(&formatted))
+  run report(path, b"formatted\n")
+  return 0
+}
+
+effect fn process(path: &Path, check: bool) -> i32
+! WriterError ? &mut FileSystem | &mut Allocator | &mut Writer {
+  let attempted = run Effect.result(formatFile(path, check))
+  return match move attempted {
+    Result<i32, FileError | FormatError | OutOfMemoryError | WriterError>.Success {value} => value
+    Result<i32, FileError | FormatError | OutOfMemoryError | WriterError>.Failure {error} => match move error {
+      FormatError damaged => {
+        run report(path, b"damaged syntax at byte ")
+        run Format.display<usize>(&damaged.span.start)
+        run Writer.writeAll(b"\n")
+        return 1
+      }
+      FileError failure => { run report(path, b"")
+        run fileFailure(&failure)
+        run Writer.writeAll(b"\n")
+        return 2 }
+      OutOfMemoryError exhausted => { run report(path, b"allocation failure\n")
+        return 2 }
+      WriterError failure => { fail move failure }
+    }
+  }
+}
+
+/// Formats every selected file, continuing after file failures; infrastructure failures take priority.
+pub effect fn execute(self: &Command, working: &Path) -> i32
+! CommandError | FileError | TomlError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Allocator | &mut Writer {
+  let selected = run select(self, working)
+  let paths = Vector.asSlice<Path>(&selected)
+  let mut status = 0
+  let mut at: usize = 0
+  while at < paths.length {
+    let outcome = run process(&paths[at], self.check)
+    if outcome > status { status = outcome }
+    at = at + 1
+  }
+  return status
+}
+
+effect fn fromHost() -> i32
+! CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer {
+  let mut arguments = run HostInput.arguments()
+  if Vector.length<Bytes>(&arguments) < 2 { return run reject(Reason.InvalidArgument, b"format") }
+  drop Vector.remove<Bytes>(&mut arguments, 0)
+  drop Vector.remove<Bytes>(&mut arguments, 0)
+  let command = run make(move arguments)
+  let directory = run HostInput.workingDirectory()
+  let working = run Path.fromBytes(Bytes.asSlice(&directory))
+  return run execute(&command, &working)
+}
+
+fn reasonName(reason: Reason) -> &'static [u8] {
+  return match reason {
+    Reason.InvalidArgument => b"unknown option (usage: silkc format [paths] [--check])"
+    Reason.MissingProject => b"no silk.toml found"
+    Reason.InvalidRoot => b"invalid [package].root"
+    Reason.OutsideRoot => b"selection is outside the package source root"
+    Reason.InvalidSelection => b"expected a directory or exact .silk file"
+    Reason.InvalidEncoding => b"path is not valid UTF-8"
+  }
+}
+
+effect fn reportFailure(error: CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError) -> ()
+! WriterError ? &mut Writer {
+  run Writer.writeAll(b"silkc format: ")
+  match move error {
+    CommandError failure => {
+      run Writer.writeAll(Bytes.asSlice(&failure.path))
+      run Writer.writeAll(b": ")
+      run Writer.writeAll(reasonName(failure.reason))
+    }
+    FileError failure => { run fileFailure(&failure)
+      run Writer.writeAll(b" during project discovery or selection") }
+    TomlError failure => { run Writer.writeAll(b"invalid silk.toml at byte ")
+      run Format.display<usize>(&failure.offset) }
+    HostInputError failure => { run Writer.writeAll(b"cannot read process arguments or working directory") }
+    OutOfMemoryError exhausted => { run Writer.writeAll(b"allocation failure") }
+    WriterError failure => { fail move failure }
+  }
+  run Writer.writeAll(b"\n")
+}
+
+/// Runs `format` through supplied host, filesystem and diagnostic writer providers.
+pub effect fn runHost() -> i32
+? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer {
+  let attempted = run Effect.result(fromHost())
+  return match move attempted {
+    Result<i32, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Success {value} => value
+    Result<i32, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} => {
+      let reported = run Effect.result(reportFailure(move error))
+      match move reported {
+        Result<(), WriterError>.Success {value: _} => {}
+        Result<(), WriterError>.Failure {error: _} => { return 2 }
+      }
+      return 2
+    }
+  }
+}
