@@ -16,10 +16,10 @@ import silk.format {ParseError}
 import silk.result {Result}
 import silk.u32
 import silk.u64
-import hir.Hir {Access, HirId, InfixOperator, Module, Node as HirNode, PrefixOperator, Sign}
+import hir.Hir {Access, CallableMode, HirId, InfixOperator, Module, Node as HirNode, OwnerKind, PrefixOperator, Sign}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.Type {Argument, Binding, ArrayShape, Requirement, Row, RowParameter, Type}
+import semantic.Type {Argument, Binding, ArrayShape, CallableFieldInput, Requirement, Row, RowParameter, Type}
 import semantic.Lifetime {Intersection, Member as Region}
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.Intrinsic {Member as IntrinsicMember}
@@ -251,8 +251,24 @@ pub struct CallTarget {
 }
 
 pub struct StoredArguments {
+  pub environment: Option<StoredEnvironment>
   pub fields: Vector<usize>
   pub consumes: bool
+}
+
+/// A staged anonymous target keeps its original environment as one capture field.
+pub struct StoredEnvironment {
+  pub field: usize
+  pub parameter: Shared<Type>
+  pub borrow: Option<Access>
+}
+
+fn copyAccess(value: &Option<Access>) -> Option<Access> {
+  return match &value.* { Option<Access>.Some {value: access} => Option.some<Access>(access) _ => Option.none<Access>() }
+}
+
+fn anonymousApplication(value: &Application) -> bool {
+  return DeclarationId.kind(Application.bodyDeclaration(value)) == OwnerKind.Anonymous
 }
 
 struct ResolvedCall {
@@ -302,6 +318,7 @@ union View {
   ArraySlice {value: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   SliceLength {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Aggregate {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
+  StagedCallable {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   EnumMember {member: BodyEnumMember, ty: Shared<Type>, origin: Origin},
   EnumValue {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Match {node: BodyNodeId, subject: BodyNodeId, place: bool, consumes: bool, release: Release, tags: usize, count: usize, ty: Shared<Type>, origin: Origin},
@@ -437,6 +454,12 @@ fn childAt(body: &Shared<TypedBody>, id: BodyNodeId, index: usize) -> Option<Bod
           return Option.none<BodyNodeId>()
         }
         BodyNodeKind.Expression {form: BodyExpression.CallableCall {callee, arguments, ..}, ..} => {
+          if index == usize.ZERO { return Option.some<BodyNodeId>(callee) }
+          let children = Vector.asSlice<BodyNodeId>(&arguments)
+          if index - usize.ONE < children.length { return Option.some<BodyNodeId>(children[index - usize.ONE]) }
+          return Option.none<BodyNodeId>()
+        }
+        BodyNodeKind.Expression {form: BodyExpression.StagedCallable {callee, arguments, ..}, ..} => {
           if index == usize.ZERO { return Option.some<BodyNodeId>(callee) }
           let children = Vector.asSlice<BodyNodeId>(&arguments)
           if index - usize.ONE < children.length { return Option.some<BodyNodeId>(children[index - usize.ONE]) }
@@ -588,6 +611,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           }
           BodyExpression.Callable {fields, ..} => View.Aggregate {
             node: id, count: Vector.length<BodyAggregateField>(&fields),
+            ty: Shared.clone<Type>(&ty), origin: origin,
+          }
+          BodyExpression.StagedCallable {arguments, ..} => View.StagedCallable {
+            node: id, count: Vector.length<BodyNodeId>(&arguments) + usize.ONE,
             ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.EnumMember {member} => View.EnumMember {
@@ -1364,6 +1391,7 @@ fn ownedRvalue(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
         BodyExpression.DirectCall {..} => true
         BodyExpression.CallableCall {..} => true
         BodyExpression.Callable {..} => true
+        BodyExpression.StagedCallable {..} => true
         BodyExpression.InterfaceCall {..} => true
         BodyExpression.ForeignCall {..} => true
         BodyExpression.IntrinsicCall {..} => true
@@ -1759,12 +1787,116 @@ effect fn storedCallArguments(builder: &Builder, node: BodyNodeId) -> Option<Sto
           run Vector.append<usize>(&mut fields, listed[fieldAt])
           fieldAt = fieldAt + usize.ONE
         }
-        return Option.some<StoredArguments>(StoredArguments {fields: move fields, consumes: value.consumes})
+        let mut environment = Option.none<StoredEnvironment>()
+        if let Option<StoredEnvironment>.Some {value: input} = &value.environment {
+          environment = Option.some<StoredEnvironment>(StoredEnvironment {field: input.field,
+            parameter: Shared.clone<Type>(&input.parameter), borrow: copyAccess(&input.borrow)})
+        }
+        return Option.some<StoredArguments>(StoredArguments {environment: move environment, fields: move fields, consumes: value.consumes})
       }
     }
     at = at + usize.ONE
   }
   return Option.none<StoredArguments>()
+}
+
+// Release only the cleanup owner transferred into a new aggregate, retaining any other
+// temporaries whose referents must remain live through this full expression.
+fn transferTemporary(builder: &mut Builder, local: usize) -> () {
+  let mut at = Vector.length<usize>(&builder.temporaries)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if Vector.asSlice<usize>(&builder.temporaries)[at] == local {
+      drop Vector.remove<usize>(&mut builder.*.temporaries, at)
+      return ()
+    }
+  }
+  return ()
+}
+
+effect fn stagedCallableFields(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
+  node: BodyNodeId, count: usize, origin: Origin) -> Vector<AggregateField>
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let callee = match move childAt(body, node, usize.ZERO) {
+    Option<BodyNodeId>.Some {value} => value
+    _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+  }
+  let baseType = match move run instanceNodeType(&builder.*, body, callee) {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let consumes = Shared.with<TypedBody, bool>(body, fn(value: &TypedBody) -> bool {
+    return match &TypedBody.nodeSlice(value)[node.index].kind {
+      BodyNodeKind.Expression {form: BodyExpression.StagedCallable {mode, ..}, ..} => mode != CallableMode.Shared
+      _ => false
+    }
+  })
+  let selectedCount = Shared.with<Type, Option<usize>>(&baseType, fn(value: &Type) -> Option<usize> {
+    if let Type.CallableValue {application, captures, fieldInputs, ..} = &value.* {
+      let nested = Vector.length<CallableFieldInput>(&fieldInputs) == usize.ZERO && Shared.with<Application, bool>(&application,
+        anonymousApplication)
+      if nested { return Option.some<usize>(usize.MAX) }
+      return Option.some<usize>(Vector.length<Shared<Type>>(&captures))
+    }
+    return Option.none<usize>()
+  })
+  let baseCount = match move selectedCount {
+    Option<usize>.Some {value} => value
+    _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let input = run expression(&mut builder.*, body, hir, callee)
+  let mut fields = Vector.make<AggregateField>()
+  if !builder.live { return move fields }
+  // Own a stable snapshot before evaluating any newly supplied argument.
+  let snapshot = run temporary(&mut builder.*, &baseType, origin)
+  run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: move input}, origin)
+  let mut transferred = Vector.make<usize>()
+  if consumes && CleanupNeeds.node(&builder.needs, callee.index) {
+    run Vector.append<usize>(&mut builder.*.temporaries, snapshot)
+    run Vector.append<usize>(&mut transferred, snapshot)
+  }
+  let mut retained = baseCount
+  if baseCount == usize.MAX { retained = usize.ONE }
+  let mut at = usize.ZERO
+  while at < retained {
+    let mut field = place(snapshot)
+    if baseCount != usize.MAX { run Vector.append<Projection>(&mut field.projections, Projection.Field {index: at}) }
+    let mut value = Operand.Unit
+    if consumes { value = Operand.Move {place: move field} } else { value = Operand.Copy {place: move field} }
+    run Vector.append<AggregateField>(&mut fields, AggregateField {index: at, value: move value})
+    at = at + usize.ONE
+  }
+  at = usize.ONE
+  while at < count {
+    let child = match move childAt(body, node, at) {
+      Option<BodyNodeId>.Some {value} => value
+      _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+    }
+    let produced = run expression(&mut builder.*, body, hir, child)
+    if !builder.live { return move fields }
+    let mut value = Operand.Unit
+    if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) {
+      let ty = match move run instanceNodeType(&builder.*, body, child) {
+        Option<Shared<Type>>.Some {value: selectedType} => move selectedType
+        _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+      }
+      let captured = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(captured), Rvalue.Use {value: move produced}, origin)
+      run Vector.append<usize>(&mut builder.*.temporaries, captured)
+      run Vector.append<usize>(&mut transferred, captured)
+      value = Operand.Move {place: place(captured)}
+    } else { value = move produced }
+    run Vector.append<AggregateField>(&mut fields, AggregateField {index: retained + at - usize.ONE, value: move value})
+    at = at + usize.ONE
+  }
+  let guarded = Vector.asSlice<usize>(&transferred)
+  let mut guardAt = usize.ZERO
+  while guardAt < guarded.length {
+    transferTemporary(&mut builder.*, guarded[guardAt])
+    guardAt = guardAt + usize.ONE
+  }
+  return move fields
 }
 
 effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
@@ -1777,7 +1909,24 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   }
   // Read the environment before written arguments can replace its stored binding. A mutable
   // section snapshots loan descriptors, so repeated invocation still reaches the same referents.
-  let evaluated = run expression(&mut builder.*, body, hir, callee)
+  let mut original = Option.none<Place>()
+  if !stored.consumes {
+    if let Option<StoredEnvironment>.Some {value: input} = &stored.environment {
+      if let Option<Access>.Some {..} = &input.borrow {
+        original = Option.some<Place>(run expressionPlace(&mut builder.*, body, hir, callee))
+      }
+    }
+  }
+  let mut evaluated = Operand.Unit
+  if let Option<Place>.Some {value} = &original {
+    let ty = match move run instanceNodeType(&builder.*, body, callee) {
+      Option<Shared<Type>>.Some {value: selectedType} => move selectedType
+      _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    }
+    let snapshot = run temporary(&mut builder.*, &ty, origin)
+    run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: Operand.Copy {place: run copyPlace(&value)}}, origin)
+    evaluated = Operand.Copy {place: place(snapshot)}
+  } else { evaluated = run expression(&mut builder.*, body, hir, callee) }
   let environment = match move evaluated {
     Operand.Copy {place: value} => move value
     Operand.Move {place: value} => move value
@@ -1787,6 +1936,18 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   let guarded = stored.consumes && CleanupNeeds.node(&builder.needs, callee.index)
   if guarded { run Vector.append<usize>(&mut builder.*.temporaries, environment.local) }
   let mut values = Vector.make<Operand>()
+  if let Option<StoredEnvironment>.Some {value: input} = &stored.environment {
+    let mut field = run copyPlace(&environment)
+    if let Option<Place>.Some {value} = &original { field = run copyPlace(&value) }
+    run Vector.append<Projection>(&mut field.projections, Projection.Field {index: input.field})
+    let mut operand = Operand.Unit
+    if let Option<Access>.Some {value: access} = &input.borrow {
+      let reference = run temporary(&mut builder.*, &input.parameter, origin)
+      run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: move field}, origin)
+      operand = Operand.Copy {place: place(reference)}
+    } else { operand = Operand.Move {place: move field} }
+    run Vector.append<Operand>(&mut values, move operand)
+  }
   let mut at = usize.ONE
   while at < count {
     let child = match move childAt(body, node, at) {
@@ -1927,6 +2088,13 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     }
     View.Aggregate {node, count, ty, origin} => {
       let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: move fields}, origin)
+      return Operand.Move {place: place(output)}
+    }
+    View.StagedCallable {node, count, ty, origin} => {
+      let fields = run stagedCallableFields(&mut builder.*, body, hir, node, count, origin)
+      if !builder.live { return Operand.Unit }
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: move fields}, origin)
       return Operand.Move {place: place(output)}
@@ -2696,6 +2864,9 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     View.Aggregate {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
+    View.StagedCallable {..} => {
+      run discard(&mut builder.*, body, hir, id)
+    }
     View.EnumMember {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
@@ -2998,6 +3169,14 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
       while true {
         let child = match move childAt(body, node, at) { Option<BodyNodeId>.Some {value} => value _ => { break } }
         drop run collectCallNodes(body, child, &mut output.*)
+        at = at + usize.ONE
+      }
+    }
+    View.StagedCallable {node, ..} => {
+      let mut at = usize.ZERO
+      while true {
+        let child = match move childAt(body, node, at) { Option<BodyNodeId>.Some {value} => value _ => { break } }
+        if !run collectCallNodes(body, child, &mut output.*) { return false }
         at = at + usize.ONE
       }
     }
@@ -3370,6 +3549,9 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
       node: node,
       count: count,
       origin: origin,
+    }
+    View.StagedCallable {ty, node, count, origin} => View.StagedCallable {
+      ty: run Type.applyBindings(&ty, bindings, true), node: node, count: count, origin: origin,
     }
     View.EnumMember {ty, member, origin} => View.EnumMember {
       ty: run Type.applyBindings(&ty, bindings, true), member: member, origin: origin,

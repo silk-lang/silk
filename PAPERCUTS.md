@@ -459,3 +459,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · A long multi-agent refactor of `compiler/src` went stale when `selfhost` advanced ~430 commits mid-session, and the old bootstrap CLI could not validate ports onto the new tip · Build a second bootstrap CLI from the new tip in a separate worktree, port each commit onto it, and serialize the ~5 min, ~8 GB `silk check` runs with `flock` on a 4-core host · self-hosted compiler
 
 - 2026-10-03 · Boolean literal patterns in a new MIR helper were rejected by the bootstrap parser, failing draft CI before compiler construction · Use `if`/`else` to select boolean-dependent operand transport · self-hosted compiler Step 8d
+
+- 2026-10-03 · Staged-callable helpers used `let value = if ...`, producing parser and downstream type errors because Silk conditionals are statements · Initialize an owned result and assign it in each conditional branch; use a named callback instead of nesting anonymous callbacks in bootstrap-built source · self-hosted compiler Step 8d
