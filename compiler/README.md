@@ -933,3 +933,14 @@ typecheck. `recovery.silk` deliberately contains syntax errors. The other files 
 `fixtures/` exercise lexical categories and are not necessarily complete Silk programs.
 
 Bootstrap issues encountered while developing this frontend are recorded in [BUGS.md](BUGS.md).
+
+### Step 8 capture typing
+
+Anonymous body checking retains one exact callable value type: an ordinary function application,
+its callable use contract and capture field types. Capture fields follow first lexical use and
+retain the strongest checked access. Copy values are snapshots; affine reads retain shared loans;
+mutation and exclusive forwarding retain exclusive loans; affine moves produce once invocation.
+The typed literal retains its separately checked body and environment aliases for MIR lowering.
+The application retains enclosing generic scopes, including inputs used only by the body, and the
+use contract quantifies the anonymous parameters' invocation lifetimes. Runtime construction,
+invocation and capture glue are the next Step 8 layer.
