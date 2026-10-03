@@ -1,0 +1,129 @@
+import * as Console from 'effect/Console'
+import * as Data from 'effect/Data'
+import * as Effect from 'effect/Effect'
+import * as FileSystem from 'effect/FileSystem'
+import type * as PlatformError from 'effect/PlatformError'
+import * as Stream from 'effect/Stream'
+import * as ChildProcess from 'effect/unstable/process/ChildProcess'
+import * as ChildProcessSpawner from 'effect/unstable/process/ChildProcessSpawner'
+
+export interface FormatterVerification {
+  readonly repository: string
+  readonly node: string
+  readonly gate: string
+  readonly compiler: string
+  readonly safetyLog: string
+}
+
+export class VerificationError extends Data.TaggedError('FormatterVerificationError')<{
+  readonly message: string
+  readonly operation: string
+  readonly reason:
+    | { readonly _tag: 'Exit'; readonly code: number }
+    | { readonly _tag: 'WrappedFailure'; readonly cause: unknown }
+}> {}
+
+const capture = Effect.fnUntraced(function* (command: ChildProcess.Command) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const handle = yield* spawner.spawn(command)
+  const output = yield* Stream.mkString(Stream.decodeText(handle.stdout))
+  const code = yield* handle.exitCode
+  return { output, code }
+}, Effect.scoped)
+
+/** Verifies the formatted checkout while preserving authored corpus templates as test inputs. */
+export const run = Effect.fn('FormatterVerification.run')(function* (
+  self: FormatterVerification,
+): Effect.fn.Return<
+  void,
+  VerificationError | PlatformError.PlatformError,
+  FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+> {
+  // Corpus construction uses literal whitespace replacements in authored fixtures.
+  // Materialize it once before formatting; its runner still reads the live stdlib.
+  const { nativeCorpus } = yield* Effect.tryPromise({
+    try: () => import('../../packages/compiler/test/support/corpus.js'),
+    catch: (cause) =>
+      new VerificationError({
+        message: 'Could not materialize native corpus scenarios',
+        operation: 'materialize corpus',
+        reason: { _tag: 'WrappedFailure', cause },
+      }),
+  })
+  const { runCorpus } = yield* Effect.tryPromise({
+    try: () => import('./runSelfhostCorpus.js'),
+    catch: (cause) =>
+      new VerificationError({
+        message: 'Could not load the native corpus runner',
+        operation: 'load corpus runner',
+        reason: { _tag: 'WrappedFailure', cause },
+      }),
+  })
+  const fs = yield* FileSystem.FileSystem
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const tracked = yield* capture(
+    ChildProcess.make('git', ['ls-files', '-z', '--', '*.silk'], {
+      cwd: self.repository,
+      stderr: 'inherit',
+    }),
+  )
+  if (tracked.code !== 0)
+    return yield* new VerificationError({
+      message: `Repository source selection exited with ${tracked.code}`,
+      operation: 'list repository sources',
+      reason: { _tag: 'Exit', code: tracked.code },
+    })
+  const sources = tracked.output
+    .split('\0')
+    .filter((source) => source.length > 0)
+    .sort()
+  const formatted = yield* capture(
+    ChildProcess.make(self.gate, sources, {
+      cwd: self.repository,
+      stderr: 'inherit',
+    }),
+  )
+  yield* fs.writeFileString(self.safetyLog, formatted.output)
+  yield* Console.log(formatted.output)
+  if (formatted.code !== 0)
+    return yield* new VerificationError({
+      message: `Native formatting safety gate exited with ${formatted.code}`,
+      operation: 'verify repository formatting',
+      reason: { _tag: 'Exit', code: formatted.code },
+    })
+  const rebuilt = yield* spawner.exitCode(
+    ChildProcess.make(
+      self.node,
+      [
+        'packages/cli/dist/bin.js',
+        'build',
+        '--manifest-path',
+        'compiler/silk.toml',
+        '--optimization',
+        'release-with-debug',
+      ],
+      { cwd: self.repository, stdout: 'inherit', stderr: 'inherit' },
+    ),
+  )
+  if (rebuilt !== 0)
+    return yield* new VerificationError({
+      message: `Formatted compiler rebuild exited with ${rebuilt}`,
+      operation: 'rebuild formatted compiler',
+      reason: { _tag: 'Exit', code: rebuilt },
+    })
+  const result = yield* Effect.try({
+    try: () => runCorpus(self.compiler, nativeCorpus),
+    catch: (cause) =>
+      new VerificationError({
+        message: 'Native corpus execution failed',
+        operation: 'run native corpus',
+        reason: { _tag: 'WrappedFailure', cause },
+      }),
+  })
+  if (result !== 0)
+    return yield* new VerificationError({
+      message: `Native corpus verification exited with ${result}`,
+      operation: 'verify native corpus',
+      reason: { _tag: 'Exit', code: result },
+    })
+})

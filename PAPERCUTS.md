@@ -439,3 +439,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter
 
 2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter
+
+2026-10-03 · Corpus setup used exact whitespace replacements in authored Silk fixtures and failed after the formatter rewrote them · Materialize scenarios before formatting in the same verification process, then rebuild and run every scenario against the formatted compiler and live standard library · Silk compiler formatter
