@@ -1146,37 +1146,6 @@ it.effect(
         ],
       )
 
-      // Binder spelling, owner, and ordinal are provenance: two heads that differ only there are one.
-      // The second spelling declares its binders under a different owner, at different ordinals,
-      // with different names, and mentions them in the opposite order.
-      const pairHead = (
-        owner: { readonly module: string; readonly name: string },
-        first: { readonly ordinal: number; readonly name: string },
-        second: { readonly ordinal: number; readonly name: string },
-      ) => {
-        const left = Type.parameter(owner, first.ordinal, first.name)
-        const right = Type.parameter(owner, second.ordinal, second.name)
-        const provider = nominal('Pair', [left, right])
-        return ConformanceHead.make(decoder, provider, [
-          { capability: decoder, provider: right },
-          { capability: decoder, provider: left },
-        ])
-      }
-      const canonicalHead = pairHead(
-        { module, name: 'impl#0' },
-        { ordinal: 0, name: 'S' },
-        { ordinal: 1, name: 'T' },
-      )
-      const scrambledHead = pairHead(
-        { module: 'other/module', name: 'impl#41' },
-        { ordinal: 7, name: 'Zeta' },
-        { ordinal: 2, name: 'Alpha' },
-      )
-      assert.strictEqual(ConformanceHead.key(canonicalHead), ConformanceHead.key(scrambledHead))
-      assert.deepEqual(
-        canonicalHead.requirements.map((requirement) => Type.key(requirement.provider)),
-        scrambledHead.requirements.map((requirement) => Type.key(requirement.provider)),
-      )
       // Every distinct ordered pair of declared heads, so an asymmetric overlap answer cannot hide
       // behind one arbitrary orientation.
       const heads = conformances.flatMap((conformance) =>

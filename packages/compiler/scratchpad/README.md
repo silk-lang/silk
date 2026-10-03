@@ -37,9 +37,11 @@ entries intact. Delete `dist/cache/` when you want an empty cache. Enabled runs
 still prepare current sources and headers and validate cached results.
 
 After editing compiler TypeScript, run `pnpm toolchain:generate` in
-`packages/compiler` before a cached launch (or rerun `scratchpad:prepare`). Cache
-identity uses the generated compiler fingerprint; uncached debugging does not
-reuse results from that fingerprint.
+`packages/compiler` before a cached launch. After editing `@silklang/llvm`, rerun
+`scratchpad:prepare`, which rebuilds it before regenerating. Cache identity uses
+the generated compiler distribution fingerprint, which covers the compiler sources
+and the built `@silklang/llvm` JavaScript; uncached debugging does not reuse
+results from that fingerprint.
 
 ## Jaeger tracing
 

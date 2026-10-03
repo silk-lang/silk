@@ -439,6 +439,8 @@ export const unsatisfiedLifetimeBoundCode = 'SEM0212' as const
 export const unsatisfiedTypeOutlivesCode = 'SEM0213' as const
 /** A `test` qualifier marks a function outside the finite executable test contract. */
 export const invalidTestDeclarationCode = 'SEM0218' as const
+/** Emitted code references a function instance whose valid body native lowering does not support yet. */
+export const unsupportedLoweringCode = 'SEM0219' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -481,6 +483,7 @@ export type Code =
   | typeof unsatisfiedLifetimeBoundCode
   | typeof unsatisfiedTypeOutlivesCode
   | typeof invalidTestDeclarationCode
+  | typeof unsupportedLoweringCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -916,6 +919,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
     }
   | { readonly _tag: 'InvalidServiceDeclaration'; readonly detail: string }
   | { readonly _tag: 'InvalidTestDeclaration'; readonly detail: string }
+  | { readonly _tag: 'UnsupportedLowering' }
   | {
       readonly _tag: 'InvalidMutableParameter'
       readonly context: 'BorrowedView' | 'Contract'
@@ -4957,6 +4961,17 @@ export const invalidTestDeclaration = <L>(detail: string, span: L): Diagnostic<L
   severity: 'error',
   message: `Invalid test declaration: ${detail}`,
   reason: { _tag: 'InvalidTestDeclaration' as const, detail },
+  span,
+})
+
+/** Reports a function instance emitted code references whose valid body native lowering lacks. */
+export const unsupportedLowering = <L>(span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: unsupportedLoweringCode,
+  severity: 'error',
+  message: 'Native lowering does not support this function body yet',
+  reason: { _tag: 'UnsupportedLowering' as const },
   span,
 })
 

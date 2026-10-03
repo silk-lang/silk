@@ -12,6 +12,7 @@ import * as NativeDiagnosticFailure from '../src/NativeDiagnosticFailure.js'
 import * as NativeCall from '../src/NativeCall.js'
 import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as Intrinsic from '../src/Intrinsic.js'
@@ -49,7 +50,7 @@ const observationWrapper = `fn observing<'env, S, A, ?R, F: fn<'static>(&mut S, 
   return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
 }`
 
-const acceptedSources = Object.freeze([
+const acceptedSources: Arr.NonEmptyReadonlyArray<string> = Object.freeze([
   `struct Failure {}
 effect fn failed() -> i32 ! Failure { fail Failure {} }
 effect fn recover(error: Failure) -> i32 {
@@ -362,17 +363,15 @@ it.effect('pairs every intrinsic presentation with accepted semantic analysis', 
   Effect.gen(function* () {
     // One project analyzes the shared standard-library closure once; each fixture stays its own
     // root module, so a diagnostic names its fixture through `span.sourceId`.
-    const fixtures = new Map(
-      acceptedSources.map((source, ordinal) => [
-        `intrinsic/accepted-${ordinal}`,
-        encoder.encode(source),
-      ]),
+    const fixtures = Arr.map(
+      acceptedSources,
+      (source, ordinal) => [`intrinsic/accepted-${ordinal}`, encoder.encode(source)] as const,
     )
-    const project = yield* ProjectAnalysis.make([...fixtures.keys()]).pipe(
-      Effect.provide(SourceResolver.memory(fixtures)),
+    const project = yield* ProjectAnalysis.make(Arr.map(fixtures, ([module]) => module)).pipe(
+      Effect.provide(SourceResolver.memory(new Map(fixtures))),
     )
     const observed = new Set<string>()
-    for (const fixture of fixtures.keys()) {
+    for (const [fixture] of fixtures) {
       const view =
         ProjectAnalysis.view(project, fixture) ?? unreachable(`expected a view for ${fixture}`)
       assert.deepEqual(Analysis.diagnostics(view), [], fixture)

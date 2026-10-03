@@ -1,4 +1,5 @@
 import { assert, it } from '@effect/vitest'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as OpaqueRealization from '../src/OpaqueRealization.js'
@@ -16,7 +17,7 @@ const sources = (entries: Readonly<Record<string, string>>): ReadonlyMap<string,
 
 const analyze = Effect.fnUntraced(function* (
   currentSources: ReadonlyMap<string, Uint8Array>,
-  rootModules: ReadonlyArray<string>,
+  rootModules: Arr.NonEmptyReadonlyArray<string>,
   previous?: ProjectAnalysis.ProjectAnalysis,
 ) {
   const roots = rootModules.map((module) =>
@@ -24,13 +25,10 @@ const analyze = Effect.fnUntraced(function* (
   )
   const effect =
     previous === undefined
-      ? ProjectAnalysis.make(roots.map((source) => source.id)).pipe(
+      ? ProjectAnalysis.make(rootModules).pipe(Effect.provide(SourceResolver.overlay(roots)))
+      : ProjectAnalysis.revise(previous, rootModules).pipe(
           Effect.provide(SourceResolver.overlay(roots)),
         )
-      : ProjectAnalysis.revise(
-          previous,
-          roots.map((source) => source.id),
-        ).pipe(Effect.provide(SourceResolver.overlay(roots)))
   return yield* effect.pipe(Effect.provide(SourceResolver.memory(currentSources)))
 })
 

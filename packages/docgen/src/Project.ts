@@ -2,7 +2,7 @@ import * as Analysis from '@silklang/compiler/Analysis'
 import * as DeclarationFacts from '@silklang/compiler/DeclarationFacts'
 import * as SemanticDisplay from '@silklang/compiler/SemanticDisplay'
 import * as Type from '@silklang/compiler/Type'
-import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
+import type * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import type * as SourceFile from '@silklang/compiler/SourceFile'
 import type * as AuthoredHir from '@silklang/compiler/AuthoredHir'
 import type * as SemanticContext from '@silklang/compiler/SemanticContext'
@@ -739,11 +739,4 @@ export const make = (snapshot: Analysis.FrontendSnapshot, options: Options = {})
 export const fromProjectAnalysis = (
   self: ProjectAnalysis.ProjectAnalysis,
   options: Options = {},
-): Project => {
-  const root = self.roots.at(0)
-  if (root === undefined) throw new RangeError('Documentation requires at least one project root')
-  const snapshot = ProjectAnalysis.view(self, root)
-  if (snapshot === undefined)
-    throw new RangeError(`Documentation could not find project root ${root}`)
-  return make(snapshot, options)
-}
+): Project => make(self.primary, options)

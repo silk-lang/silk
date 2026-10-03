@@ -14,8 +14,8 @@ Read these project-local references completely before acting:
 
 This is an inspection and intake skill. It may create or enrich Linear issues. It must not edit
 repository source, change GitHub state, switch branches, fetch, or clean the working tree.
-It must not run `pnpm check`, the full test suite, native differential acceptance, or
-`pnpm release:candidate` unless Julia explicitly requests broader validation. Focused tests and
+It must not run `pnpm check`, the full test suite, or native differential acceptance unless Julia
+explicitly requests broader validation. Focused tests and
 minimal reproducers are allowed only to give one lead a concrete breadcrumb.
 
 Follow `DISCOVERY.md`'s required three-subagent fan-out, coordinator assignment, coverage ledger,

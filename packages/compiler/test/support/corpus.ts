@@ -3191,7 +3191,10 @@ pub fn main() -> i32 {
     name: 'pattern-conditionals-and-destructuring',
     source: `struct Left { value: i32 }
 struct Right {}
-struct Point { x: i32, y: i32 }
+struct Point {
+  x: i32
+  y: i32
+}
 struct Token { value: i32 }
 impl Copy for Token {}
 union Shape { Circle { radius: i32 }, Empty }
@@ -7200,6 +7203,86 @@ export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'generic-record-instances',
+    source: `struct Token<'data> { drops: &'data mut i32 }
+impl<'data> Drop for Token<'data> {
+  fn drop(self: &mut Token<'data>) -> () {
+    if self.drops.* != 0 {
+      let trapped = 1 / 0
+      drop trapped
+    }
+    self.drops.* = self.drops.* + 1
+    return ()
+  }
+}
+struct Box<T> { value: T }
+impl<T: Copy> Copy for Box<T> {}
+fn copied(boxed: Box<i32>) -> i32 {
+  let duplicate = boxed
+  return match move duplicate {
+    Box<i32> { value } => boxed.value + value
+  }
+}
+pub fn main() -> i32 {
+  let mut drops = 0
+  let boxed = Box { value: Token { drops: &mut drops } }
+  drop boxed
+  if drops != 1 { return 1 }
+  return copied(Box { value: 21 })
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // A user-defined Option-shaped union follows the same generic construction and match path.
+    name: 'generic-union-instances',
+    source: `import silk.option { Option }
+struct Token<'data> { drops: &'data mut i32 }
+impl<'data> Drop for Token<'data> {
+  fn drop(self: &mut Token<'data>) -> () {
+    if self.drops.* != 0 {
+      let trapped = 1 / 0
+      drop trapped
+    }
+    self.drops.* = self.drops.* + 1
+    return ()
+  }
+}
+union Maybe<T> {
+  None,
+  Some { value: T },
+}
+fn some<T>(value: T) -> Maybe<T> {
+  return Maybe<T>.Some { value: move value }
+}
+fn none<T>() -> Maybe<T> {
+  return Maybe<T>.None
+}
+fn wrapped<'data>(drops: &'data mut i32) -> Maybe<Token<'data>> {
+  return Maybe<Token<'data>>.Some { value: Token { drops: move drops } }
+}
+pub fn main() -> i32 {
+  let mut drops = 0
+  let droppable = wrapped(&mut drops)
+  drop droppable
+  if drops != 1 { return 1 }
+  let custom = match move some<i32>(20) {
+    Maybe<i32>.Some { value } => value
+    Maybe<i32>.None => 0
+  }
+  let ordinaryValue = Option<i32>.Some { value: 22 }
+  let ordinary = match move ordinaryValue {
+    Option<i32>.Some { value } => value
+    Option<i32>.None => 0
+  }
+  let empty = match move none<i32>() {
+    Maybe<i32>.Some { value } => value
+    Maybe<i32>.None => 0
+  }
+  return custom + ordinary + empty
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'foreign-libc-pointer-roundtrip',
     source: `pub fn main() -> i32 {
   return 42
@@ -8028,67 +8111,6 @@ pub fn main() -> i32 { return taskIdBoundary() }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
-    name: 'execution-unused-nominal-union-callback-cleanup',
-    source: `import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.execution { Execution }
-import silk.i8
-import silk.layout { Layout }
-import silk.shared { Shared }
-struct Counter { value: i32 }
-fn increment(counter: &mut Counter) -> i32 {
-  counter.value = counter.value + 1
-  return counter.value
-}
-fn read(counter: &Counter) -> i32 { return counter.value }
-struct Guard { left: i8 right: i8 storage: Allocation counter: Shared<Counter> }
-impl Drop for Guard {
-  fn drop(self: &mut Guard) -> () {
-    if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
-    return ()
-  }
-}
-union Choice { Small { marker: i8, guard: Guard }, Wide { value: i64 } }
-fn ready(state: &()) -> () { return () }
-fn complete(state: (), value: i32) -> () { return () }
-fn suspend(state: (), execution: Intrinsic.Execution<i32>, choice: Choice) -> () {
-  let unexpected = 1 / 0
-  drop execution
-  drop choice
-  return ()
-}
-fn suspendWith(choice: Choice) -> some<F: once fn((), Intrinsic.Execution<i32>) -> ()> F {
-  return suspend(move choice)
-}
-effect fn packaged(counter: &Shared<Counter>) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let storage = run Allocator.allocate(Layout.of<i32>())
-  let choice = Choice.Small {
-    marker: i8.toI8(7),
-    guard: Guard {
-      left: i8.toI8(19), right: i8.toI8(23), storage: move storage,
-      counter: Shared.clone<Counter>(counter),
-    },
-  }
-  let execution = run Execution.make(effect { return 42 }, (), ready)
-  let driven = run Execution.drive(move execution, (), complete, suspendWith(move choice))
-  let count = Shared.with<Counter, i32>(counter, read)
-  if count != 1 { return 1 }
-  return 42
-}
-effect fn program() -> i32 ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
-    |> Effect.provideMut<Allocator>(&mut allocator)
-  let result = run packaged(&counter) |> Effect.provideMut<Allocator>(&mut allocator)
-  drop counter
-  return result
-}
-effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }
-pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
     name: 'generic-inline-effect-conformance',
     source: `interface Marker { effect fn mark(value: &Self) -> i32 }
 struct Box<T> { value: T }
@@ -8178,8 +8200,12 @@ service SchemaService {
 }
 struct InterfaceSchema {}
 struct ServiceSchema {}
-fn interfaceWidth(value: &InterfaceSchema) -> i32 { return 32 }
-fn serviceWidth(value: &ServiceSchema) -> i32 { return 32 }
+impl InterfaceSchema {
+  fn interfaceWidth(value: &Self) -> i32 { return 32 }
+}
+impl ServiceSchema {
+  fn serviceWidth(value: &Self) -> i32 { return 32 }
+}
 impl SchemaInterface for InterfaceSchema {
   fn decode(value: &Self) -> i32 { return 42 }
   width: InterfaceSchema.interfaceWidth
@@ -10289,6 +10315,70 @@ pub fn main() -> i32 {
   // feature-local compile/link loop. Trapping Drop variants causally prove the three cleanup exits.
   ...staticCompositionCorpus,
 ]
+
+/**
+ * A valid program whose generated runner statically calls an `Execution.drive` instance with an
+ * opaque callback, which native lowering does not support yet. The TypeScript compiler reports
+ * SEM0219 at that body instead of emitting a trap stub; the program returns to the native corpus
+ * through the new compiler's lowering (#567 Step 9).
+ */
+export const executionDriveOpaqueCallbackSource = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution }
+import silk.i8
+import silk.layout { Layout }
+import silk.shared { Shared }
+struct Counter { value: i32 }
+fn increment(counter: &mut Counter) -> i32 {
+  counter.value = counter.value + 1
+  return counter.value
+}
+fn read(counter: &Counter) -> i32 { return counter.value }
+struct Guard { left: i8 right: i8 storage: Allocation counter: Shared<Counter> }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
+    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    return ()
+  }
+}
+union Choice { Small { marker: i8, guard: Guard }, Wide { value: i64 } }
+fn ready(state: &()) -> () { return () }
+fn complete(state: (), value: i32) -> () { return () }
+fn suspend(state: (), execution: Intrinsic.Execution<i32>, choice: Choice) -> () {
+  let unexpected = 1 / 0
+  drop execution
+  drop choice
+  return ()
+}
+fn suspendWith(choice: Choice) -> some<F: once fn((), Intrinsic.Execution<i32>) -> ()> F {
+  return suspend(move choice)
+}
+effect fn packaged(counter: &Shared<Counter>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let storage = run Allocator.allocate(Layout.of<i32>())
+  let choice = Choice.Small {
+    marker: i8.toI8(7),
+    guard: Guard {
+      left: i8.toI8(19), right: i8.toI8(23), storage: move storage,
+      counter: Shared.clone<Counter>(counter),
+    },
+  }
+  let execution = run Execution.make(effect { return 42 }, (), ready)
+  let driven = run Execution.drive(move execution, (), complete, suspendWith(move choice))
+  let count = Shared.with<Counter, i32>(counter, read)
+  if count != 1 { return 1 }
+  return 42
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let counter = run Shared.make<Counter>(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run packaged(&counter) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop counter
+  return result
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 
 /**
  * Invalid generic programs that must stop before target layout and MIR. One frontend rejection
