@@ -12,7 +12,7 @@ Scope: complete generic record instances in the native self-hosted compiler, inc
 - [x] G1: the implementation retains the complete Step 6 cleanup foundation
   CHECK: git merge-base --is-ancestor 22196f43d HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
   EXPECT: prerequisite verification passed
-  EVIDENCE: automatic-evidence=v1; definition-sha256=56e2e1f9667c2d6be3cd64df8855c9f9f08c7ba3a40b4f4e0e9ec38bb4457db8; exit=0; EXPECT=matched; output-sha256=b4631f004dd0d4a8340502a8c59de610b335263ef98fb7cb18fe53221ccf6875; output-bytes=33; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
+  EVIDENCE: the Step 6 ancestor, InstanceKey.DropGlue, and cleanup stack remain present after rebasing onto origin/selfhost 9e74bdf25 on 2026-10-03
 
 - [x] G2: distinct complete generic record instances have independently verified layout, construction, projection, patterns, symbols, interning, Copy or affine classification, and drop glue
   CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericRecordInstances src/semantic/SemanticCases.silk
