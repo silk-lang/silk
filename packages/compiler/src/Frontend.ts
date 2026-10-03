@@ -39,6 +39,11 @@ import * as TestDiscovery from './TestDiscovery.js'
 /** Optional environment-specific observations attached to compiler phase reports. */
 export interface Options {
   readonly heapBytes?: () => number
+  /**
+   * Publish the editor-only results of checked bodies: name occurrences, inferred-type hints,
+   * lexical scopes, and expression types. Analysis requests them; a build leaves them out.
+   */
+  readonly tooling?: boolean
   /** Internal differential-test escape hatch; production paths normalize shared MIR. */
   readonly normalizeMir?: boolean
 }
@@ -183,7 +188,10 @@ const analyzeHeaders = Effect.fn('Frontend.analyzeHeaders')(function* (
           previous,
         ).pipe(Effect.orDie)
   // Install the completed headers and reusable records; body checking is performed by later queries.
-  const session = Semantic.makeSession(epoch, index, resolution, 'default', availablePrevious)
+  const session = Semantic.makeSession(epoch, index, resolution, {
+    ...(availablePrevious === undefined ? {} : { previous: availablePrevious }),
+    tooling: options.tooling === true,
+  })
   return { index, resolution, session, surfaces }
 })
 

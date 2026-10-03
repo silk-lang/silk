@@ -214,7 +214,7 @@ const occurrenceTarget = (
   expression: Tir.Expression,
 ): DeclarationFacts.CanonicalId | undefined => {
   const key = AuthoredIdentity.anchorKey(expression.origin.anchor)
-  const occurrence = body.results.occurrences.find(
+  const occurrence = body.results.tooling?.occurrences.find(
     (candidate) =>
       AuthoredIdentity.anchorKey(candidate.at) === key &&
       candidate.resolution._tag === 'Available' &&

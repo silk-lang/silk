@@ -63,7 +63,7 @@ export interface ProjectSelection extends ProjectOptions.ProjectOptions {
 export interface CompileOptions {
   /** Compute test-result reuse identities by default, independently of artifact caching. */
   readonly testResultCache?: boolean
-  readonly verifyMir?: boolean
+  readonly verifyIr?: boolean
   readonly nativeBindings?: ReadonlyArray<NativeRequirementBinding.NativeRequirementBinding>
   readonly stage?: ArtifactPlan.Stage
   readonly entry: SourceEntry.SourceEntry
@@ -194,7 +194,7 @@ export const compile = Effect.fn('Workflow.compile')(function* (
       destination: options.destination,
       scopeName: options.scopeName,
       saveTemps: options.saveTemps ?? false,
-      verifyMir: options.verifyMir ?? false,
+      verifyIr: options.verifyIr ?? false,
       ...(options.testResultCache === undefined
         ? {}
         : { testResultCache: options.testResultCache }),
@@ -351,7 +351,7 @@ export const buildProject = Effect.fn('Workflow.buildProject')(function* (
     planned.success.plans,
     (plan) =>
       compile({
-        verifyMir: options.verifyMir ?? false,
+        verifyIr: options.verifyIr ?? false,
         entry: plan.project.entry,
         displayRoot: plan.project.directory,
         target: plan.target.id,
@@ -652,7 +652,7 @@ export const run = Effect.fn('Workflow.run')(function* (
   if (Result.isFailure(planned)) return yield* reportPreparationFailure(planned.failure)
   const [plan] = planned.success.plans
   const attempted = yield* compile({
-    verifyMir: options.verifyMir ?? false,
+    verifyIr: options.verifyIr ?? false,
     entry: plan.project.entry,
     displayRoot: plan.project.directory,
     target: plan.target.id,
@@ -862,7 +862,7 @@ export const test = Effect.fn('Workflow.test')(function* (
   if (Result.isFailure(planned)) return yield* reportPreparationFailure(planned.failure)
   const [plan] = planned.success.plans
   const attempted = yield* compile({
-    verifyMir: options.verifyMir ?? false,
+    verifyIr: options.verifyIr ?? false,
     testResultCache: options.cacheResults ?? true,
     entry: discoveryEntry.success,
     displayRoot: project.directory,

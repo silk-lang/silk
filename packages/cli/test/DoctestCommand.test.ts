@@ -102,7 +102,6 @@ it.effect('refuses an input that is missing, malformed, or absent altogether', (
   }).pipe(Effect.provide(NodeServices.layer)),
 )
 
-// `--stdlib` is deliberately not exercised here. It would build the whole standard library's
-// documentation a second time in a second worker — minutes of CPU that `Stdlib.test.ts` already
-// spends on the same value — to cover a three-line branch whose two halves, `Stdlib.documentation`
-// and `Stdlib.sources`, that file covers directly.
+// `--stdlib` is deliberately not exercised here. The `documentation:examples` script runs
+// `silk doctest --stdlib` over the whole shipped standard library in CI, which covers this branch
+// and `Stdlib.documentation` on the real manifest.

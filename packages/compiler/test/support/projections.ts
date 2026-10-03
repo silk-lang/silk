@@ -1,7 +1,6 @@
 import { records } from './records.js'
 import * as OpaqueRealization from '../../src/OpaqueRealization.js'
 import * as Analysis from '../../src/Analysis.js'
-import type * as Backend from '../../src/Backend.js'
 import type * as DeclarationFacts from '../../src/DeclarationFacts.js'
 import * as Tir from '../../src/Tir.js'
 import * as Layout from '../../src/Layout.js'
@@ -223,5 +222,3 @@ export const controlEdgesOf = (self: Analysis.Snapshot): ReadonlyArray<ControlEd
           Mir.controlEdges(fn).map((edge) => Object.freeze({ function: fn.id, edge })),
         ),
       )
-
-export const backendControlOf = (artifact: Backend.Artifact) => artifact.control

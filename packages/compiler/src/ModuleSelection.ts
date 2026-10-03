@@ -287,7 +287,7 @@ const coordinator = (
     `module-selection:${completion.profile.identity}`,
     index,
     resolution,
-    completion.profile.identity,
+    { configuration: completion.profile.identity },
   )
   const results = new Map<string, Elaboration.Result>()
   for (const module of closure.modules) {

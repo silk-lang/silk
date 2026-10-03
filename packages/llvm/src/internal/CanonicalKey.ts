@@ -6,18 +6,19 @@ export type CanonicalKey = string
 // Reuse keys for immutable byte arrays and avoid formatting every byte on each first visit.
 const byteKeys = new WeakMap<ByteString.ReadonlyBytes, CanonicalKey>()
 
+// The WHATWG `latin1` decoder (windows-1252) maps each of the 256 byte values to a distinct single
+// UTF-16 code unit, so a decoded key is injective over byte sequences. Native decoding measured
+// over 10x faster than spreading bytes into `String.fromCharCode` for long native symbols, which
+// dominated global declaration and literal emission in the self-hosted compiler.
+const byteDecoder = new TextDecoder('latin1')
+
 /** @internal */
 export const bytes = (value: ByteString.ByteString): CanonicalKey => {
   const cached = byteKeys.get(value.bytes)
   if (cached !== undefined) return cached
-  // SemanticCases declares 27.5M characters of symbols. Packing each byte into one code unit
-  // avoids hex expansion and measured ~19x faster than per-byte mapping for those first visits.
-  // Bounded argument lists handle arbitrary name lengths; joining keeps the retained key flat.
-  const chunks: Array<string> = []
-  for (let index = 0; index < value.bytes.length; index += 8192) {
-    chunks.push(String.fromCharCode(...value.bytes.subarray(index, index + 8192)))
-  }
-  const key = `${value.bytes.length}:${chunks.join('')}`
+  // Byte strings own a Uint8Array; the read-only interface only hides its mutators.
+  const view = value.bytes instanceof Uint8Array ? value.bytes : Uint8Array.from(value.bytes)
+  const key = `${value.bytes.length}:${byteDecoder.decode(view)}`
   byteKeys.set(value.bytes, key)
   return key
 }

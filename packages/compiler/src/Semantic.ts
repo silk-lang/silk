@@ -24,6 +24,11 @@ export interface Session {
   readonly configuration: string
   readonly index: DeclarationIndex.Index
   readonly resolution: NameResolution.Resolution
+  /**
+   * Whether checked bodies publish their editor-only results (name occurrences, inferred-type
+   * hints, lexical scopes, expression types). A build session leaves them out.
+   */
+  readonly tooling: boolean
   readonly queries: SemanticQuery.Session
 }
 
@@ -33,13 +38,21 @@ interface RecordedEvaluation<A> {
   readonly reusable: boolean
 }
 
+/** A body input fingerprint derived once, when revision validation or persistence first reads it. */
+type Fingerprint = () => string
+
+const derivedOnce = (compute: () => string): Fingerprint => {
+  let value: string | undefined
+  return () => (value ??= compute())
+}
+
 interface Runtime {
   readonly bodies: Map<
     string,
     {
-      readonly header: string
-      readonly implementation: string
-      readonly scope: string
+      readonly header: Fingerprint
+      readonly implementation: Fingerprint
+      readonly scope: Fingerprint
       readonly build?: () => Elaboration.CheckedUnit
     }
   >
@@ -250,33 +263,36 @@ const associatedCandidatesFingerprint = (
     ).sort(),
   )
 
+// Header and scope inputs derive from this session's immutable index and resolution, and a body's
+// fingerprints from its registered inputs, so each derivation is deferred until a revision
+// validation or persistence reads it.
 const readInput = (
   index: DeclarationIndex.Index,
   resolution: NameResolution.Resolution,
   configuration: string,
   runtime: Runtime,
   address: SemanticQuery.InputAddress,
-): string | undefined => {
+): SemanticQuery.InputFingerprint => {
   const parts = partsOf(address.address)
   switch (address.family) {
     case 'Configuration':
       return parts[0] === 'semantic-session' ? configuration : undefined
     case 'Namespace':
-      return namespaceFingerprint(resolution, parts[0] ?? '', parts[1] ?? '')
+      return () => namespaceFingerprint(resolution, parts[0] ?? '', parts[1] ?? '')
     case 'ImportSelection':
-      return importSelectionFingerprint(resolution, parts[0] ?? '', parts[1] ?? '')
+      return () => importSelectionFingerprint(resolution, parts[0] ?? '', parts[1] ?? '')
     case 'Header':
     case 'Alias':
     case 'Bound':
-      return headerFingerprint(index, parts[0] ?? '', parts[1] ?? '')
+      return () => headerFingerprint(index, parts[0] ?? '', parts[1] ?? '')
     case 'AssociatedCandidates':
-      return associatedCandidatesFingerprint(index, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '')
-    case 'ConformanceCandidates': {
-      runtime.conformanceCandidatesFingerprint ??= ToolchainIntegrity.contentDigest(
-        ModuleSurface.resolutionSignature(index),
-      )
-      return runtime.conformanceCandidatesFingerprint
-    }
+      return () =>
+        associatedCandidatesFingerprint(index, parts[0] ?? '', parts[1] ?? '', parts[2] ?? '')
+    case 'ConformanceCandidates':
+      return () =>
+        (runtime.conformanceCandidatesFingerprint ??= ToolchainIntegrity.contentDigest(
+          ModuleSurface.resolutionSignature(index),
+        ))
     case 'BodyHeader':
       return runtime.bodies.get(parts[0] ?? '')?.header
     case 'BodyImplementation':
@@ -538,14 +554,24 @@ const makeProvider = (
   read: (address) => readInput(index, resolution, configuration, runtime, address),
 })
 
+export interface SessionOptions {
+  /** The selection the session reads under; records from another configuration never validate. */
+  readonly configuration?: string
+  /** Reusable records of one prior revision. */
+  readonly previous?: SemanticQuery.Snapshot
+  /** Whether checked bodies publish their editor-only results. */
+  readonly tooling?: boolean
+}
+
 /** Builds one current session and optionally admits records from one prior snapshot. */
 export const makeSession = (
   epoch: string,
   index: DeclarationIndex.Index,
   resolution: NameResolution.Resolution,
-  configuration = 'default',
-  previous?: SemanticQuery.Snapshot,
+  options: SessionOptions = {},
 ): Session => {
+  const configuration = options.configuration ?? 'default'
+  const tooling = options.tooling === true
   const runtime: Runtime = {
     bodies: new Map(),
     ownership: new Map(),
@@ -554,8 +580,9 @@ export const makeSession = (
   }
   const queries = SemanticQuery.make(
     epoch + '\u0000' + configuration,
-    makeProvider(index, resolution, configuration, runtime),
-    previous,
+    // A checked unit's tooling results depend on the session purpose, so it is configuration.
+    makeProvider(index, resolution, tooling ? configuration + ':tooling' : configuration, runtime),
+    options.previous,
   )
   runtime.queries = queries
   const session = {
@@ -564,6 +591,7 @@ export const makeSession = (
     configuration,
     index,
     resolution,
+    tooling,
     queries,
   }
   runtimes.set(session, runtime)
@@ -732,13 +760,17 @@ export const checkBody = (bodyInput: BodyInput): Elaboration.CheckedUnit => {
   const request = checkBodyDescriptor(bodyInput.declaration)
   const runtime = runtimeOf(bodyInput.session)
   const provider = {
-    header: BodyQuery.headerFingerprint(bodyInput.index, bodyInput.declaration),
-    implementation: BodyQuery.implementationFingerprint(bodyInput.authored, bodyInput.declaration),
-    scope: BodyQuery.scopeFingerprint(
-      bodyInput.index,
-      bodyInput.authored,
-      bodyInput.declaration,
-      bodyInput.scope,
+    header: derivedOnce(() => BodyQuery.headerFingerprint(bodyInput.index, bodyInput.declaration)),
+    implementation: derivedOnce(() =>
+      BodyQuery.implementationFingerprint(bodyInput.authored, bodyInput.declaration),
+    ),
+    scope: derivedOnce(() =>
+      BodyQuery.scopeFingerprint(
+        bodyInput.index,
+        bodyInput.authored,
+        bodyInput.declaration,
+        bodyInput.scope,
+      ),
     ),
     build: () =>
       bodyInput.query === undefined
@@ -795,7 +827,7 @@ export const checkBodyFresh = (bodyInput: BodyInput): Elaboration.CheckedUnit =>
     bodyInput.session.epoch + ':fresh',
     bodyInput.session.index,
     bodyInput.session.resolution,
-    bodyInput.session.configuration,
+    { configuration: bodyInput.session.configuration, tooling: bodyInput.session.tooling },
   )
   const { query: _query, ...fresh } = bodyInput
   return checkBody({ ...fresh, session: isolated })

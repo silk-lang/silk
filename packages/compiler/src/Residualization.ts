@@ -226,7 +226,7 @@ const makeState = (
     `residualization:${sourceIdentity}:${compilation.target.id}`,
     index,
     resolution,
-    compilation.target.id,
+    { configuration: compilation.target.id },
   )
   return {
     target: compilation.target,

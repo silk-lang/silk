@@ -34,9 +34,7 @@ export const optimizationFor = (
 }
 
 /** Lowers logical code-generation choices into deterministic Clang arguments. */
-export const compilationArguments = (
-  profile: CompilationProfile.CompilationProfile,
-): ReadonlyArray<string> => [
+export const compilationArguments = (profile: CompilationProfile.Facts): ReadonlyArray<string> => [
   profile.optimization === 'none' ? '-O0' : '-O2',
   ...(profile.debug ? ['-g'] : []),
   ...(profile.target.kind === 'Native' && profile.codeModel === 'large' ? ['-mcmodel=large'] : []),
@@ -48,7 +46,7 @@ export const compilationArguments = (
 /** Plans the pinned Clang `-c` invocation that turns bitcode into a target object. */
 export const objectCommand = (
   clang: string,
-  profile: CompilationProfile.CompilationProfile,
+  profile: CompilationProfile.Facts,
   bitcodePath: string,
   objectPath: string,
 ): PlannedCommand => ({

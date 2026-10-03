@@ -447,7 +447,8 @@ policies. Those differences cannot change source-visible results or cleanup.
 honor the suspension contract is unavailable for that reachable executable closure.
 
 **Evidence:** [target availability](unsafe-intrinsics-and-targets.md#target-003--target-unavailability-is-a-compile-time-compatibility-error),
-[native suspension tests](../../../../packages/compiler/test/EffectSuspensionNative.test.ts).
+[native suspension depth corpus row `suspension-native-depth-and-unit-retry`](../../../../packages/compiler/test/support/corpus.ts),
+[coroutine-frame lowering tests](../../../../packages/compiler/test/EffectSuspensionNative.test.ts).
 
 ### SUSP-018 — Non-suspending call graphs pay no coroutine cost
 

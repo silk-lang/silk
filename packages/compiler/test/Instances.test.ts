@@ -416,7 +416,10 @@ pub fn main() -> i32 { return 0 }`),
       ['increment'],
     )
     assert.deepStrictEqual(yield* MirVerification.verify(prepared.program), [])
-    const artifact = yield* LlvmBackend.LlvmBackend.emit(prepared.program, { mode: 'release' })
+    const artifact = yield* LlvmBackend.LlvmBackend.emit(prepared.program, {
+      mode: 'release',
+      verifyIr: true,
+    })
     assert.match(artifact.ir, /define hidden i32 @silk_/)
     assert.match(artifact.ir, /define i32 @increment\(/)
     assert.notMatch(artifact.ir, /define hidden i32 @increment\(/)
@@ -438,7 +441,10 @@ it.effect('emits an empty native library without retaining unrelated public func
     assert.strictEqual(prepared._tag, 'Prepared')
     if (prepared._tag === 'Prepared') {
       assert.deepEqual(prepared.program.functions, [])
-      const artifact = yield* LlvmBackend.LlvmBackend.emit(prepared.program, { mode: 'release' })
+      const artifact = yield* LlvmBackend.LlvmBackend.emit(prepared.program, {
+        mode: 'release',
+        verifyIr: true,
+      })
       assert.deepEqual(artifact.foreignExports, [])
     }
   }),
@@ -1517,10 +1523,7 @@ it.effect('lowers discovered instances deterministically to verifier-clean MIR',
       ),
       undefined,
     )
-    const first = MirEncoding.encode(program)
-    const second = MirEncoding.encode(Analysis.loweredMir(yield* snapshot(nestedSource)))
-    assert.strictEqual(first, golden('lowered.mir.txt'))
-    assert.strictEqual(first, second)
+    assert.strictEqual(MirEncoding.encode(program), golden('lowered.mir.txt'))
   }),
 )
 
@@ -1596,7 +1599,7 @@ pub fn main() -> i32 { return 40 |> add(2) }`),
   }),
 )
 
-it.effect('retains deterministic hidden anonymous targets and exact capture ordinals', () =>
+it.effect('retains canonical hidden anonymous targets and exact capture ordinals', () =>
   Effect.gen(function* () {
     const source = `struct Token { value: i32 }
 fn consume(value: i32, token: Token) -> i32 { return value + token.value }
@@ -1608,14 +1611,10 @@ pub fn main() -> i32 {
   let combined = fn(value: i32) -> i32 { return consume(value + copied, move owned) }
   return combined(1)
 }`
-    const first = yield* snapshot(source)
-    const second = yield* snapshot(source)
-    assert.deepEqual(Analysis.diagnostics(first), [])
-    assert.deepEqual(Analysis.diagnostics(second), [])
+    const analysis = yield* snapshot(source)
+    assert.deepEqual(Analysis.diagnostics(analysis), [])
 
-    const firstTir = Analysis.rootAnalysis(first).tir
-    const secondTir = Analysis.rootAnalysis(second).tir
-    assert.strictEqual(Tir.encode(firstTir), Tir.encode(secondTir))
+    const tir = Analysis.rootAnalysis(analysis).tir
     const hiddenNames = (tir: Tir.Module) =>
       tir.functions.flatMap((fn) =>
         fn.declaration.canonical._tag === 'Canonical' &&
@@ -1623,14 +1622,9 @@ pub fn main() -> i32 {
           ? [fn.declaration.canonical.id.name]
           : [],
       )
-    assert.deepEqual(hiddenNames(firstTir), [
-      'main$callable$0',
-      'main$callable$1',
-      'main$callable$2',
-    ])
-    assert.deepEqual(hiddenNames(firstTir), hiddenNames(secondTir))
+    assert.deepEqual(hiddenNames(tir), ['main$callable$0', 'main$callable$1', 'main$callable$2'])
 
-    const main = firstTir.functions.find(
+    const main = tir.functions.find(
       (fn) =>
         fn.declaration.canonical._tag === 'Canonical' &&
         fn.declaration.canonical.id.name === 'main',
@@ -1695,7 +1689,7 @@ pub fn main() -> i32 {
       ],
     )
 
-    const hidden = firstTir.functions.find(
+    const hidden = tir.functions.find(
       (fn) =>
         fn.declaration.canonical._tag === 'Canonical' &&
         fn.declaration.canonical.id.name === 'main$callable$2',
@@ -1720,7 +1714,7 @@ pub fn main() -> i32 {
     ])
     assert.strictEqual(Type.encode(hidden.contract.result), 'i32')
 
-    const mir = Analysis.loweredMir(first)
+    const mir = Analysis.loweredMir(analysis)
     assert.deepEqual(yield* MirVerification.verify(mir), [])
     const mainMir = mir.functions.find((fn) => fn.id.name === 'main')
     assert.isDefined(mainMir)
@@ -1866,7 +1860,7 @@ pub fn main() -> i32 { return (run work()) |> Intrinsic.i32Add(1) }`),
     }),
 )
 
-it.effect('encodes generic, consuming, and grouped-run callable MIR deterministically', () =>
+it.effect('encodes generic, consuming, and grouped-run callable MIR', () =>
   Effect.gen(function* () {
     const sources = [
       `fn select<T>(value: T, enabled: bool) -> T { return move value }
@@ -1882,12 +1876,9 @@ pub fn main() -> i32 {
 pub fn main() -> i32 { return (run work()) |> Intrinsic.i32Add(1) }`,
     ]
     for (const source of sources) {
-      const first = Analysis.loweredMir(yield* snapshot(source))
-      const second = Analysis.loweredMir(yield* snapshot(source))
-      assert.deepEqual(yield* MirVerification.verify(first), [])
-      assert.deepEqual(yield* MirVerification.verify(second), [])
-      const encoded = MirEncoding.encode(first)
-      assert.strictEqual(encoded, MirEncoding.encode(second))
+      const mir = Analysis.loweredMir(yield* snapshot(source))
+      assert.deepEqual(yield* MirVerification.verify(mir), [])
+      const encoded = MirEncoding.encode(mir)
       assert.include(encoded, 'apply-callable')
       if (source === sources.at(0)) assert.strictEqual(encoded, golden('generic.mir.txt'))
     }
@@ -2079,13 +2070,11 @@ it.effect('rejects hand-built match decisions before LLVM emission', () =>
 const branchProgram =
   'pub fn main() -> i32 { let base = 40 if base == 40 { let bonus = 2 return base + bonus } return 0 }'
 
-it.effect('lowers branch diamonds identically across runs', () =>
+it.effect('lowers branch diamonds to the committed MIR golden', () =>
   Effect.gen(function* () {
-    const first = Analysis.loweredMir(yield* snapshot(branchProgram))
-    const second = Analysis.loweredMir(yield* snapshot(branchProgram))
-    assert.deepEqual(yield* MirVerification.verify(first), [])
-    assert.strictEqual(MirEncoding.encode(first), golden('branch-program.mir.txt'))
-    assert.strictEqual(MirEncoding.encode(first), MirEncoding.encode(second))
+    const mir = Analysis.loweredMir(yield* snapshot(branchProgram))
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    assert.strictEqual(MirEncoding.encode(mir), golden('branch-program.mir.txt'))
   }),
 )
 
@@ -2406,7 +2395,10 @@ it.effect(
         program.retainedRoots?.map((root) => root.declaration.name),
         ['keep'],
       )
-      const artifact = yield* LlvmBackend.LlvmBackend.emit(program, { mode: 'release' })
+      const artifact = yield* LlvmBackend.LlvmBackend.emit(program, {
+        mode: 'release',
+        verifyIr: true,
+      })
       assert.match(artifact.ir, /@llvm.used = appending global \[1 x ptr\]/)
       assert.match(artifact.ir, /section "llvm.metadata"/)
       assert.deepEqual(

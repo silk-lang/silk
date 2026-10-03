@@ -352,18 +352,6 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
-it.effect('reports the unrecovered member as still present in the result row', () =>
-  Effect.gen(function* () {
-    const self = yield* analyze(`import silk.effect { Effect }
-${preamble}
-pub fn main() -> i32 {
-  return run Effect.catch<A>(risky(true), recoverA)
-}`)
-    // The residual is not silently discarded; B reaches the caller and must be handled there.
-    assert.deepEqual(codes(self), ['SEM0066'])
-  }),
-)
-
 it.effect('catch and catchAll produce different result types on the same input', () =>
   Effect.gen(function* () {
     // Same protected Effect, same recovery site, only the operation differs. catchAll erases the

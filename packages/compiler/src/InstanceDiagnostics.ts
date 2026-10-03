@@ -158,6 +158,9 @@ export const representedNominals = (
   index: DeclarationIndex.Index,
 ): ReadonlyArray<Type.Nominal> => {
   const found = new Map<string, Type.Nominal>()
+  // A walk visits everything reachable from each type it marks, so one marked set serves every
+  // construction: types reached by an earlier construction add nothing to `found` again.
+  const seen = new Set<string>()
   for (const instance of self.instances) {
     const expressions = instance.function.statements
       .flatMap(Tir.statementExpressions)
@@ -173,7 +176,7 @@ export const representedNominals = (
         index,
         Specialization.specializeType(instance.key, expression.type, [instance.substitution]),
         found,
-        new Set(),
+        seen,
       )
     }
   }
@@ -279,17 +282,20 @@ export const storedExecutableViolations = (
     Callable: [] as Array<StoredExecutableViolationKey>,
     Effect: [] as Array<StoredExecutableViolationKey>,
   }
-  // Most constructions retain no executable storage, and one aggregate type recurs across many
-  // constructions; remember which types were proved free of it.
-  const executableFree = { Callable: new Set<string>(), Effect: new Set<string>() }
+  // One aggregate type recurs across many constructions; its stored executable is found once.
+  const storedByType = {
+    Callable: new Map<string, StoredExecutable | undefined>(),
+    Effect: new Map<string, StoredExecutable | undefined>(),
+  }
   const storedExecutableOf = (
     type: Type.Type,
     kind: 'Callable' | 'Effect',
   ): StoredExecutable | undefined => {
     const typeKey = Type.key(type)
-    if (executableFree[kind].has(typeKey)) return undefined
+    const known = storedByType[kind]
+    if (known.has(typeKey)) return known.get(typeKey)
     const stored = storedExecutable(index, type, kind)
-    if (stored === undefined) executableFree[kind].add(typeKey)
+    known.set(typeKey, stored)
     return stored
   }
   const violation = (

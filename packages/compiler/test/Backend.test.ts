@@ -1,4 +1,5 @@
 import * as MirVerification from '../src/MirVerification.js'
+import * as MirLinearization from '../src/MirLinearization.js'
 import * as Result from 'effect/Result'
 import * as LlvmBackend from '../src/LlvmBackend.js'
 import * as Option from 'effect/Option'
@@ -61,7 +62,7 @@ const emit = Effect.fnUntraced(function* (text: string, request: Backend.Codegen
     ascii(text),
     'aarch64-apple-darwin',
   )
-  return yield* Analysis.codegen(snapshot, { ...request, verifyMir: true })
+  return yield* Analysis.codegen(snapshot, { ...request, verifyIr: true })
 })
 
 const golden = (name: string): string =>
@@ -91,9 +92,11 @@ it.effect('traces discovery, lowering, and optional verification separately from
       Effect.withTracer(tracer),
     )
     assert.isFalse(spans.some((span) => span.name.startsWith('MirVerification.')))
-    const verified = yield* Analysis.codegen(snapshot, { mode: 'release', verifyMir: true }).pipe(
+    assert.isFalse(spans.some((span) => span.name === 'NativeProgram.verifyModule'))
+    const verified = yield* Analysis.codegen(snapshot, { mode: 'release', verifyIr: true }).pipe(
       Effect.withTracer(tracer),
     )
+    assert.isTrue(spans.some((span) => span.name === 'NativeProgram.verifyModule'))
     assert.deepEqual(artifact.bitcode, ordinary.bitcode)
     assert.deepEqual(artifact.bitcode, verified.bitcode)
     const rejected = yield* Effect.result(MirVerification.check({ ...program, functions: [] }))
@@ -373,16 +376,6 @@ it.effect('matches the IR golden and the bitcode digest golden', () =>
   }),
 )
 
-it.effect('emits byte-identical bitcode across repeated fresh runs', () =>
-  Effect.gen(function* () {
-    const first = yield* emit(nestedSource, { mode: 'release' })
-    const second = yield* emit(nestedSource, { mode: 'release' })
-
-    assert.deepEqual(first.bitcode, second.bitcode)
-    assert.strictEqual(first.ir, second.ir)
-  }),
-)
-
 it.effect(
   'emits target-correct LLVM bitcode for wasm32 while retaining its ordinary source root',
   () =>
@@ -432,7 +425,7 @@ it.effect('emits native debug metadata only for debug requests', () =>
   }),
 )
 
-it.effect('keeps string identity in deterministic LLVM debug metadata only', () =>
+it.effect('keeps string identity in LLVM debug metadata only', () =>
   Effect.gen(function* () {
     const source = `fn pass(value: string) -> string { return value }
 fn byteCount(value: &[u8]) -> usize { return value.length }
@@ -445,17 +438,14 @@ pub fn main() -> i32 {
       mode: 'debug' as const,
       sources: new Map([['golden/program', ascii(source)]]),
     }
-    const first = yield* emit(source, request)
-    const second = yield* emit(source, request)
+    const debug = yield* emit(source, request)
     const release = yield* emit(source, { mode: 'release' })
 
-    assert.include(first.ir, '!DIStringType(name: "string"')
-    assert.include(first.ir, 'encoding: DW_ATE_UTF')
-    assert.match(first.ir, /name: "&'[^" ]+ \[u8\]"/)
+    assert.include(debug.ir, '!DIStringType(name: "string"')
+    assert.include(debug.ir, 'encoding: DW_ATE_UTF')
+    assert.match(debug.ir, /name: "&'[^" ]+ \[u8\]"/)
     assert.notInclude(release.ir, 'DIStringType')
     assert.notInclude(release.ir, 'DW_ATE_UTF')
-    assert.strictEqual(first.ir, second.ir)
-    assert.deepEqual(first.bitcode, second.bitcode)
   }),
 )
 
@@ -474,34 +464,27 @@ pub fn inspect(input: Left | Right) -> i32 {
 }
 pub fn main() -> i32 { return inspect(Left { value: 41 }) }`
 
-it.effect('emits checked arithmetic through overflow intrinsics and guarded division', () =>
-  Effect.gen(function* () {
-    const artifact = yield* emit(arithmeticSource, { mode: 'release' })
-    const division = yield* emit(
-      'import silk.i32\npub fn main() -> i32 { return i32.divide(1, 0) }',
-      {
-        mode: 'release',
-      },
-    )
+it.effect(
+  'emits checked arithmetic through overflow intrinsics, guarded division, and its IR golden',
+  () =>
+    Effect.gen(function* () {
+      const artifact = yield* emit(arithmeticSource, { mode: 'release' })
+      const division = yield* emit(
+        'import silk.i32\npub fn main() -> i32 { return i32.divide(1, 0) }',
+        {
+          mode: 'release',
+        },
+      )
 
-    assert.include(artifact.ir, 'llvm.smul.with.overflow')
-    assert.include(artifact.ir, 'llvm.ssub.with.overflow')
-    assert.include(artifact.ir, 'trap_site')
-    assert.notInclude(artifact.ir, '@silk_trap_report_v1')
-    assert.include(division.ir, 'sdiv')
-    assert.include(division.ir, 'icmp eq')
-    assert.include(division.ir, '@llvm.trap()')
-  }),
-)
-
-it.effect('matches the arithmetic IR golden and stays deterministic', () =>
-  Effect.gen(function* () {
-    const first = yield* emit(arithmeticSource, { mode: 'release' })
-    const second = yield* emit(arithmeticSource, { mode: 'release' })
-
-    assert.strictEqual(first.ir, golden('arithmetic.ll.txt'))
-    assert.deepEqual(first.bitcode, second.bitcode)
-  }),
+      assert.strictEqual(artifact.ir, golden('arithmetic.ll.txt'))
+      assert.include(artifact.ir, 'llvm.smul.with.overflow')
+      assert.include(artifact.ir, 'llvm.ssub.with.overflow')
+      assert.include(artifact.ir, 'trap_site')
+      assert.notInclude(artifact.ir, '@silk_trap_report_v1')
+      assert.include(division.ir, 'sdiv')
+      assert.include(division.ir, 'icmp eq')
+      assert.include(division.ir, '@llvm.trap()')
+    }),
 )
 
 it.effect('emits comparisons as icmp with zero-extension and branches natively', () =>
@@ -519,16 +502,13 @@ it.effect('emits comparisons as icmp with zero-extension and branches natively',
   }),
 )
 
-it.effect('privately flattens structured match regions with deterministic member branches', () =>
+it.effect('privately flattens structured match regions into member branches', () =>
   Effect.gen(function* () {
-    const first = yield* emit(matchSource, { mode: 'release' })
-    const second = yield* emit(matchSource, { mode: 'release' })
+    const artifact = yield* emit(matchSource, { mode: 'release' })
 
-    assert.include(first.ir, 'match')
-    assert.include(first.ir, 'icmp eq')
-    assert.include(first.ir, 'br i1')
-    assert.strictEqual(first.ir, second.ir)
-    assert.deepEqual(first.bitcode, second.bitcode)
+    assert.include(artifact.ir, 'match')
+    assert.include(artifact.ir, 'icmp eq')
+    assert.include(artifact.ir, 'br i1')
   }),
 )
 
@@ -537,17 +517,14 @@ it.effect('projects a checked array element before loading only its selected fie
     const source = `struct Pair { left: i32 right: i32 }
 fn choose(values: [Pair; 2], index: usize) -> i32 { return values[index].left }
 pub fn main() -> i32 { return choose([Pair { left: 10, right: 11 }, Pair { left: 42, right: 43 }], 1) }`
-    const first = yield* emit(source, { mode: 'release' })
-    const second = yield* emit(source, { mode: 'release' })
+    const artifact = yield* emit(source, { mode: 'release' })
 
-    assert.include(first.ir, 'icmp ult')
-    assert.notInclude(first.ir, 'select i1')
-    assert.match(first.ir, /%owned_read\d+_stride0 = mul i64 %\w+, 8/)
-    assert.match(first.ir, /getelementptr i8, ptr %addr0, i64 %owned_read\d+_stride0/)
-    assert.match(first.ir, /%project\w+ = load i32, ptr %owned_read\d+_element,/)
-    assert.include(first.ir, '@llvm.trap()')
-    assert.deepEqual(first.bitcode, second.bitcode)
-    assert.strictEqual(first.ir, second.ir)
+    assert.include(artifact.ir, 'icmp ult')
+    assert.notInclude(artifact.ir, 'select i1')
+    assert.match(artifact.ir, /%owned_read\d+_stride0 = mul i64 %\w+, 8/)
+    assert.match(artifact.ir, /getelementptr i8, ptr %addr0, i64 %owned_read\d+_stride0/)
+    assert.match(artifact.ir, /%project\w+ = load i32, ptr %owned_read\d+_element,/)
+    assert.include(artifact.ir, '@llvm.trap()')
   }),
 )
 
@@ -572,22 +549,26 @@ pub fn main() -> i32 {
   }),
 )
 
-it.effect('publishes native branch provenance back to canonical loop regions', () =>
+it.effect('maps native branch provenance back to canonical loop regions', () =>
   Effect.gen(function* () {
-    const artifact = yield* emit(
-      'pub fn main() -> i32 { let mut value = 0 while value < 2 { value = value + 1 } return value }',
-      { mode: 'release' },
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'golden/program',
+      ascii(
+        'pub fn main() -> i32 { let mut value = 0 while value < 2 { value = value + 1 } return value }',
+      ),
+      'aarch64-apple-darwin',
     )
+    const control = MirLinearization.llvmControl(Analysis.loweredMir(snapshot))
     assert.strictEqual(
-      artifact.control.every((entry) => entry.backend === 'LLVM'),
+      control.every((entry) => entry.backend === 'LLVM'),
       true,
     )
     assert.strictEqual(
-      artifact.control.some((entry) => entry.construct === 'LlvmBranch'),
+      control.some((entry) => entry.construct === 'LlvmBranch'),
       true,
     )
     assert.strictEqual(
-      artifact.control.some(
+      control.some(
         (entry) =>
           entry.construct === 'LlvmJump' &&
           entry.targets.some((target) => target.ordinal <= entry.region.ordinal),

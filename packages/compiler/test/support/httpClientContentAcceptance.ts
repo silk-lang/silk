@@ -161,11 +161,11 @@ impl ConnectionHandler<ClientContentTransport, i32, ClientError | OutOfMemoryErr
     return match move eligibility {
       ReuseEligibility.Eligible => {
         if corrupt || connection.phase() != ConnectionPhase.Ready { return 412 }
-        0
+        return 0
       }
       ReuseEligibility.NotReady => {
         if !corrupt || connection.phase() != ConnectionPhase.Closed { return 413 }
-        0
+        return 0
       }
       _ => 418
     }
@@ -347,7 +347,7 @@ effect<'call> fn clientContentExchange<'call, 'exchange: 'call>(
     Result.Success {value} => match move value {
       DiscardOutcome.Completed => {
         if status == 201 { return 118 }
-        0
+        return 0
       }
       DiscardOutcome.CapReached => 119
     }

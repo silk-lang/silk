@@ -17,6 +17,10 @@ export interface InputAddress {
   readonly address: string
 }
 
+/**
+ * A recorded dependency. A record derives a deferred `fingerprint` on first access, so a one-shot
+ * session that never validates or persists records never pays for result or input identity.
+ */
 export interface QueryRead {
   readonly _tag: 'QueryRead'
   readonly descriptor: Descriptor
@@ -32,6 +36,13 @@ export interface InputRead {
 export type Observation = QueryRead | InputRead
 export type Observe = (input: InputAddress) => void
 
+/**
+ * What a provider reads for one input: its fingerprint, `undefined` when the input is absent, or a
+ * deferred derivation of either. A deferred derivation must depend only on what was current when
+ * the input was read, because it runs when a validation or persistence first needs it.
+ */
+export type InputFingerprint = string | undefined | (() => string | undefined)
+
 /** The single dispatcher for one semantic environment. */
 export interface Provider {
   readonly execute: (descriptor: Descriptor, observe: Observe) => unknown
@@ -40,7 +51,7 @@ export interface Provider {
     answer: unknown,
     observations: ReadonlyArray<Observation>,
   ) => string
-  readonly read: (input: InputAddress) => string | undefined
+  readonly read: (input: InputAddress) => InputFingerprint
   /** Whether a successfully returned answer may enter current or revision snapshots. */
   readonly cacheable?: (descriptor: Descriptor, answer: unknown) => boolean
   /** Whether a callback-backed descriptor can execute before its current demand is registered. */
@@ -86,7 +97,7 @@ export interface Session {
 interface Active {
   readonly key: string
   readonly observations: Array<Observation>
-  /** Encoded observation keys, so recording a dependency stays constant-time. */
+  /** Query and input keys already recorded, so recording a dependency stays constant-time. */
   readonly observed: Set<string>
 }
 
@@ -121,8 +132,8 @@ export const keyOf = (descriptor: Descriptor): string =>
 const inputKey = (input: InputAddress): string =>
   input.family + ':' + input.schema + ':' + input.address.length + ':' + input.address
 
-const readFingerprint = (state: State, input: InputAddress): string =>
-  state.provider.read(input) ?? missingFingerprint
+const fingerprintOf = (read: InputFingerprint): string =>
+  (typeof read === 'function' ? read() : read) ?? missingFingerprint
 
 export const make = (epoch: string, provider: Provider, previous?: Snapshot): Session => {
   const session = { _tag: 'SemanticQuerySession' as const, epoch }
@@ -138,21 +149,49 @@ export const make = (epoch: string, provider: Provider, previous?: Snapshot): Se
   return session
 }
 
-const observationKey = (observation: Observation): string =>
-  observation._tag === 'QueryRead'
-    ? observation._tag + ':' + keyOf(observation.descriptor) + ':' + observation.fingerprint
-    : observation._tag + ':' + inputKey(observation.input) + ':' + observation.fingerprint
-
-const observeInto = (active: Active, observation: Observation): void => {
-  const encoded = observationKey(observation)
+// A session reads each input and query answer once as one value, so a dependency is recorded once
+// per address and its fingerprint is derived only when a validation or persistence reads it.
+const observeInput = (state: State, active: Active, input: InputAddress): void => {
+  const encoded = 'InputRead:' + inputKey(input)
   if (active.observed.has(encoded)) return
   active.observed.add(encoded)
-  active.observations.push(observation)
+  const read = state.provider.read(input)
+  if (typeof read !== 'function') {
+    active.observations.push({
+      _tag: 'InputRead',
+      input,
+      fingerprint: read ?? missingFingerprint,
+    })
+    return
+  }
+  let fingerprint: string | undefined
+  active.observations.push({
+    _tag: 'InputRead',
+    input,
+    get fingerprint() {
+      return (fingerprint ??= fingerprintOf(read))
+    },
+  })
 }
 
-const observeParent = (state: State, descriptor: Descriptor, fingerprint: string): void => {
+const observeParent = (
+  state: State,
+  descriptor: Descriptor,
+  key: string,
+  completed: Completed<unknown>,
+): void => {
   const parent = state.active.at(-1)
-  if (parent !== undefined) observeInto(parent, { _tag: 'QueryRead', descriptor, fingerprint })
+  if (parent === undefined) return
+  const encoded = 'QueryRead:' + key
+  if (parent.observed.has(encoded)) return
+  parent.observed.add(encoded)
+  parent.observations.push({
+    _tag: 'QueryRead',
+    descriptor,
+    get fingerprint() {
+      return completed.fingerprint
+    },
+  })
 }
 
 const cycle = (state: State, key: string): Result<never> => {
@@ -174,7 +213,7 @@ const storedAs = <A>(stored: Completed<unknown>): Completed<A> =>
 const validateObservation = (self: Session, observation: Observation): boolean => {
   const state = stateOf(self)
   if (observation._tag === 'InputRead')
-    return readFingerprint(state, observation.input) === observation.fingerprint
+    return fingerprintOf(state.provider.read(observation.input)) === observation.fingerprint
   if (state.provider.available?.(observation.descriptor) === false) {
     const key = keyOf(observation.descriptor)
     const current = state.current.get(key)
@@ -218,11 +257,7 @@ const executeProvider = <A>(self: Session, descriptor: Descriptor, publish: bool
     state.counters.executions += 1
     state.executions.set(key, (state.executions.get(key) ?? 0) + 1)
     const answer = state.provider.execute(descriptor, (input) =>
-      observeInto(active, {
-        _tag: 'InputRead',
-        input,
-        fingerprint: readFingerprint(state, input),
-      }),
+      observeInput(state, active, input),
     ) as A
     const observations = active.observations
     // Result identity walks the whole answer; only a dependent read or persistence needs it, so a
@@ -241,7 +276,7 @@ const executeProvider = <A>(self: Session, descriptor: Descriptor, publish: bool
       state.current.set(key, completed)
     const removed = state.active.pop()
     if (removed !== active) throw new RangeError('Semantic query reservation stack is corrupted')
-    if (state.active.length > 0) observeParent(state, descriptor, completed.fingerprint)
+    observeParent(state, descriptor, key, completed)
     return { _tag: 'Completed', completed, reused: false }
   } catch (cause) {
     if (state.active.at(-1) === active) state.active.pop()
@@ -258,7 +293,7 @@ const execute = <A>(self: Session, descriptor: Descriptor, allowReuse: boolean):
     const current = state.current.get(key)
     if (current !== undefined) {
       state.counters.reuses += 1
-      observeParent(state, descriptor, current.fingerprint)
+      observeParent(state, descriptor, key, current)
       return { _tag: 'Completed', completed: storedAs<A>(current), reused: true }
     }
     const previous = descriptor.reuse === 'Revision' ? state.previous.get(key) : undefined
@@ -277,7 +312,7 @@ const execute = <A>(self: Session, descriptor: Descriptor, allowReuse: boolean):
       if (valid) {
         state.current.set(key, previous)
         state.counters.reuses += 1
-        observeParent(state, descriptor, previous.fingerprint)
+        observeParent(state, descriptor, key, previous)
         return {
           _tag: 'Completed',
           completed: storedAs<A>(previous),
@@ -338,10 +373,5 @@ export const isActive = (self: Session, descriptor: Descriptor): boolean =>
 export const observe = (self: Session, input: InputAddress): void => {
   const state = stateOf(self)
   const active = state.active.at(-1)
-  if (active !== undefined)
-    observeInto(active, {
-      _tag: 'InputRead',
-      input,
-      fingerprint: readFingerprint(state, input),
-    })
+  if (active !== undefined) observeInput(state, active, input)
 }

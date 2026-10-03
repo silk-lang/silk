@@ -38,7 +38,7 @@ export const anonymousExpressionIndex = (
   const found = new Map<string, AnonymousExpression>()
   for (const body of semantics.elaboration.bodies) {
     if (body.hidden) continue
-    for (const row of body.results.expressionTypes) {
+    for (const row of body.results.tooling?.expressionTypes ?? []) {
       const span = context.spanOf(row.at)
       found.set(`${span.start}:${span.end}`, {
         span,

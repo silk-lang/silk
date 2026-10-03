@@ -194,11 +194,29 @@ const plansOfInternal = (
   })
 }
 
+// Plans depend only on the declaration, never on a nominal's arguments, yet target layout asks
+// once per aggregate field and instance diagnostics once per represented type. Retain each
+// declaration's plans per immutable index instead of re-deriving the nested walk every time.
+const plansCache = new WeakMap<DeclarationIndex.Index, Map<string, ReadonlyArray<Plan>>>()
+
 /** Collects source-ordered represented-field plans, including forwarded nested representations. */
 export const plansOf = (
   declarations: DeclarationIndex.Index,
   nominal: DeclarationFacts.CanonicalId | Type.Nominal,
-): ReadonlyArray<Plan> => plansOfInternal(declarations, nominal, new Set())
+): ReadonlyArray<Plan> => {
+  let cache = plansCache.get(declarations)
+  if (cache === undefined) {
+    cache = new Map()
+    plansCache.set(declarations, cache)
+  }
+  const key = `${nominal.module}\u0000${nominal.name}`
+  let plans = cache.get(key)
+  if (plans === undefined) {
+    plans = plansOfInternal(declarations, nominal, new Set())
+    cache.set(key, plans)
+  }
+  return plans
+}
 
 const provenanceOf = (declarations: DeclarationIndex.Index, plan: Plan): Provenance | undefined => {
   const declaration = declarationOf(declarations, plan.id.nominal)

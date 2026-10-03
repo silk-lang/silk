@@ -111,7 +111,9 @@ const expectedPhases = [
   'toolchain-target',
   'mir-verification',
   'backend',
+  'supply',
   'object',
+  'helpers',
   'runtime',
   'link',
 ]
@@ -704,17 +706,25 @@ it.effect(
           }),
       })
       const source = 'pub fn main() -> i32 { return 42 }'
-      for (const name of ['admission-first', 'admission-second']) {
-        const outcome = yield* compileSource(name, source, { cache: true }).pipe(
+      // An unchanged rebuild reuses emission, helpers, and the final artifact; a different
+      // program with the same profile still reuses the helper object compiled by the first.
+      for (const [name, text] of [
+        ['admission-first', source],
+        ['admission-second', source],
+        ['admission-other', 'pub fn main() -> i32 { return 41 }'],
+      ] as const) {
+        const outcome = yield* compileSource(name, text, { cache: true }).pipe(
           Effect.provideService(NativeToolchain.ArtifactStorage, artifactStorage),
         )
         assert.strictEqual(outcome._tag, 'Compiled')
         if (outcome._tag !== 'Compiled') return
         const phases = outcome.report.map((entry) => entry.phase)
-        assert.include(phases, name === 'admission-first' ? 'link' : 'artifact-cache')
+        assert.include(phases, name === 'admission-second' ? 'artifact-cache' : 'link')
         assert.isDefined(outcome.linkPlan)
         assert.isFalse(outcome.linkPlan?.command.arguments.includes('-lm') ?? true)
         if (name === 'admission-second') assert.include(phases, 'backend-cache')
+        assert.include(phases, name === 'admission-first' ? 'helpers' : 'helpers-cache')
+        assert.notInclude(phases, name === 'admission-first' ? 'helpers-cache' : 'helpers')
       }
       const nativeReads = reads.filter((key) => key.startsWith('native-')).length
       const failed = yield* Effect.result(
@@ -730,10 +740,13 @@ it.effect(
       if (failed.failure.reason._tag === 'SupplyFailed')
         assert.strictEqual(failed.failure.reason.failure.code, 'MissingCapability')
       assert.strictEqual(reads.filter((key) => key.startsWith('native-')).length, nativeReads)
-      assert.strictEqual(writes.filter((key) => key.startsWith('native-')).length, 1)
+      // One final artifact per distinct program; one helper object for the whole profile.
+      assert.strictEqual(writes.filter((key) => key.startsWith('native-')).length, 2)
+      assert.strictEqual(writes.filter((key) => key.startsWith('helpers-')).length, 1)
     }),
-  // Cold emission, cache reuse and a rejected supply took 39.9s locally on 2026-09-23;
-  // the three complete source runtime pipelines exceeded 120s in CI shard 4.
+  // Cold emission, a second program reusing the helper object, cache reuse and a rejected
+  // supply took 21s locally on 2026-10-02; the complete source runtime pipelines exceeded 120s
+  // in CI shard 4 before helper reuse.
   240_000,
 )
 
@@ -838,7 +851,7 @@ it.effect(
           // so nothing is shared between them but the directory.
           const source = 'pub fn main() -> i32 { return 40 + 2 }'
           const first = yield* compileSource('default-cache-first', source, {
-            verifyMir: false,
+            verifyIr: false,
             toolchain: Object.freeze({ _tag: 'Toolchain', clang, llvmAr: 'llvm-ar' }),
             cache: true,
           })

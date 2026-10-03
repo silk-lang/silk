@@ -1,41 +1,28 @@
-import * as Layer from 'effect/Layer'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as SemanticOccurrence from '../src/SemanticOccurrence.js'
-import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
 
-const analyze = (text: string) =>
-  Analysis.makeRealized({ root: 'main' }).pipe(
+const analyze = (text: string) => Analysis.ofSource('main', ascii(text))
+
+const analyzeModules = (rootModule: string, entries: ReadonlyArray<readonly [string, string]>) =>
+  Analysis.make({ root: rootModule }).pipe(
     Effect.provide(
-      SourceResolver.overlay([SourceFile.make('main', ascii(text))]).pipe(
-        Layer.provideMerge(SourceResolver.memory(new Map())),
+      SourceResolver.memory(
+        new Map(entries.map(([module, text]) => [module, ascii(text)] as const)),
       ),
     ),
   )
 
-const analyzeModules = (rootModule: string, entries: ReadonlyArray<readonly [string, string]>) => {
-  const sources = new Map(entries.map(([module, text]) => [module, ascii(text)] as const))
-  const root = sources.get(rootModule)
-  if (root === undefined) throw new Error(`missing root module ${rootModule}`)
-  return Analysis.makeRealized({ root: rootModule }).pipe(
-    Effect.provide(
-      SourceResolver.overlay([SourceFile.make(rootModule, root)]).pipe(
-        Layer.provideMerge(SourceResolver.memory(sources)),
-      ),
-    ),
-  )
-}
-
-const codes = (self: Analysis.Snapshot): ReadonlyArray<string> =>
+const codes = (self: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(self).map((diagnostic) => diagnostic.code)
 
 const identityAt = (
-  snapshot: Analysis.Snapshot,
+  snapshot: Analysis.FrontendSnapshot,
   source: string,
   spelling: string,
   occurrence = 0,
@@ -92,15 +79,12 @@ impl Printable for Document { fn print(value: &Self) -> i32 { return value.size 
 
 it.effect('opens both receiver and written argument lifetimes before checking a member call', () =>
   Effect.gen(function* () {
-    const self = yield* Analysis.ofSource(
-      'main',
-      ascii(`${counter}
+    const self = yield* analyze(`${counter}
 pub fn main() -> i32 {
   let left = Counter { value: 20 }
   let right = Counter { value: 22 }
   return left.add(&right)
-}`),
-    )
+}`)
     assert.deepEqual(Analysis.diagnostics(self), [])
   }),
 )
@@ -263,16 +247,6 @@ pub fn main() -> i32 {
   }),
 )
 
-const analyzeFrontend = Effect.fnUntraced(function* (text: string) {
-  return yield* Analysis.make({ root: 'main' }).pipe(
-    Effect.provide(
-      SourceResolver.overlay([SourceFile.make('main', ascii(text))]).pipe(
-        Layer.provideMerge(SourceResolver.memory(new Map())),
-      ),
-    ),
-  )
-})
-
 const borrowedHolder = `struct Holder {
   slice: &[i32]
   index: usize
@@ -290,7 +264,7 @@ impl Holder {
 it.effect('keeps repeated receiver loans on a holder separate from its stored shared slice', () =>
   Effect.gen(function* () {
     for (const call of ['holder.next()', 'Holder.next(&mut holder)']) {
-      const snapshot = yield* analyzeFrontend(`${borrowedHolder}
+      const snapshot = yield* analyze(`${borrowedHolder}
 pub fn main() -> i32 {
   let values: [i32; 2] = [20, 22]
   let mut holder = Holder { slice: &values, index: 0 }
@@ -316,7 +290,7 @@ pub fn main() -> i32 {
   let first = holder.next()
   ${after}
 }`
-      const snapshot = yield* analyzeFrontend(source)
+      const snapshot = yield* analyze(source)
       assert.deepEqual(
         Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
         [...expectedCodes],

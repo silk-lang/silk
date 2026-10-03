@@ -2977,10 +2977,6 @@ effect fn planning() -> i32 ! OutOfMemoryError ? &mut Allocator {
   return overflow
 }`
 
-/** The planning graph runs once in the native acceptance program. */
-export const httpContentPlanningSource = `${httpContentAnalysisPrelude}
-${httpContentPlanningDeclarations}`
-
 /** One corpus source keeps planning on the native path and portable decoding on both targets. */
 export const httpContentAcceptanceSource = `${httpContentRuntimeSource}
 ${httpContentPlanningDeclarations}`

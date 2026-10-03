@@ -2053,6 +2053,8 @@ export const analyzeFunctionBody = (
     outlivesScope.parameterBounds,
   )
   const authoredDeclaration = AuthoredWalk.declarationOf(semantic.module, declaration.owner)
+  // Occurrences and hints serve only editors, so a build session never collects them.
+  const tooling = resolution.semantic.tooling
   const occurrences = new Map<string, SemanticOccurrence.LocatedOccurrence>()
   const publishOccurrence = (occurrence: SemanticOccurrence.LocatedOccurrence): void => {
     occurrences.set(
@@ -2083,14 +2085,18 @@ export const analyzeFunctionBody = (
       NominalVariance.derive(resolution.index).summaries,
     ),
     writtenCallableBindings: new Set<number>(),
-    publishExpressionDecision: (decision: ExpressionDecision) => {
-      for (const occurrence of SemanticOccurrence.ofExpressionDecision(
-        decision,
-        resolution.index,
-        resolution.scope,
-      ))
-        publishOccurrence(occurrence)
-    },
+    ...(tooling
+      ? {
+          publishExpressionDecision: (decision: ExpressionDecision) => {
+            for (const occurrence of SemanticOccurrence.ofExpressionDecision(
+              decision,
+              resolution.index,
+              resolution.scope,
+            ))
+              publishOccurrence(occurrence)
+          },
+        }
+      : {}),
     generatedAggregates: new Map(),
     ...(staticContext === undefined ? {} : { staticContext }),
   }
@@ -2274,13 +2280,14 @@ export const analyzeFunctionBody = (
     ...(resultRepresentation === undefined ? {} : { resultRepresentation }),
     functionId: declaration.id,
   })
-  for (const occurrence of SemanticOccurrence.ofStatements(
-    statements,
-    resolution.index,
-    resolution.scope,
-    builder,
-  ))
-    publishOccurrence(occurrence)
+  if (tooling)
+    for (const occurrence of SemanticOccurrence.ofStatements(
+      statements,
+      resolution.index,
+      resolution.scope,
+      builder,
+    ))
+      publishOccurrence(occurrence)
   return {
     fact: {
       _tag: 'FunctionConstruction',
@@ -2297,8 +2304,14 @@ export const analyzeFunctionBody = (
       ...(resultRepresentation === undefined ? {} : { resultRepresentation }),
       generatedAggregates: [...(bodyResolution.generatedAggregates?.values() ?? [])],
       staticIterations: [...context.staticIterations],
-      occurrences: [...occurrences.values()],
-      hints: TypeHint.rows(context.bindings, statements, builder),
+      ...(tooling
+        ? {
+            tooling: {
+              occurrences: [...occurrences.values()],
+              hints: TypeHint.rows(context.bindings, statements, builder),
+            },
+          }
+        : {}),
       opaqueEvidence: OpaqueRealization.evidenceOfBody(semantic, declaration, statements, builder),
     },
     diagnostics: [...context.diagnostics],

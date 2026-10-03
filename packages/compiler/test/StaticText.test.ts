@@ -250,8 +250,7 @@ it.effect(
         'shared-evaluation-two',
         analyzed.index,
         analyzed.resolution,
-        'default',
-        Semantic.snapshot(first),
+        { previous: Semantic.snapshot(first) },
       )
       const admitted = Semantic.evaluate(
         second,
@@ -283,8 +282,7 @@ it.effect(
         'shared-evaluation-policy',
         analyzed.index,
         analyzed.resolution,
-        'default',
-        Semantic.snapshot(first),
+        { previous: Semantic.snapshot(first) },
       )
       const recomputed = Semantic.evaluate(
         changedPolicy,

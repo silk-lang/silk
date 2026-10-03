@@ -111,6 +111,7 @@ pub fn main() -> i32 { return identity(42) }`,
   )
   const main = result.bodies.at(1) ?? raise('expected main body')
 
-  assert.isTrue(main.results.occurrences.some((occurrence) => occurrence.role === 'Value'))
-  assert.isTrue(main.results.expressionTypes.length > 0)
+  const tooling = main.results.tooling ?? raise('expected editor results')
+  assert.isTrue(tooling.occurrences.some((occurrence) => occurrence.role === 'Value'))
+  assert.isTrue(tooling.expressionTypes.length > 0)
 })

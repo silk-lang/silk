@@ -3,8 +3,32 @@ import * as Analysis from './Analysis.js'
 import type * as Backend from './Backend.js'
 import * as CompilationProfile from './CompilationProfile.js'
 import * as HelperCapability from './HelperCapability.js'
+import * as LlvmBackend from './LlvmBackend.js'
 import * as Preparation from './Preparation.js'
 import * as SourceResolver from './SourceResolver.js'
+
+/** The backend {@link compile} emits helpers through (`Analysis.codegen` selects LLVM). */
+export const backend: Backend.Id = LlvmBackend.LlvmBackend.id
+
+/**
+ * The restricted object profile helpers are realized under: the build's code-generation facts with
+ * no entry, runtime, libc, unwinding, or sanitizers.
+ */
+export const profileInput = (profile: CompilationProfile.Facts): CompilationProfile.Input => ({
+  target: profile.target.id,
+  cpu: profile.cpu,
+  ...(profile.deployment === undefined ? {} : { deployment: profile.deployment }),
+  artifact: 'object',
+  entry: { kind: 'none' },
+  runtime: { kind: 'none' },
+  libc: 'none',
+  relocation: profile.relocation,
+  codeModel: profile.codeModel,
+  optimization: profile.optimization,
+  debug: profile.debug,
+  unwind: 'none',
+  sanitizers: [],
+})
 
 /**
  * Compiles the selected source providers as one program without an application or runtime root.
@@ -30,24 +54,9 @@ export const compile = Effect.fn('HelperSource.compile')(function* (
   for (const provider of providers)
     if (provider.kind !== 'source' || !provider.targets.includes(profile.target.id))
       return yield* invalid(`Provider ${provider.id} is not a compatible source provider`)
-  const input: CompilationProfile.Input = {
-    target: profile.target.id,
-    cpu: profile.cpu,
-    ...(profile.deployment === undefined ? {} : { deployment: profile.deployment }),
-    artifact: 'object',
-    entry: { kind: 'none' },
-    runtime: { kind: 'none' },
-    libc: 'none',
-    relocation: profile.relocation,
-    codeModel: profile.codeModel,
-    optimization: profile.optimization,
-    debug: profile.debug,
-    unwind: 'none',
-    sanitizers: [],
-  }
   // Codegen needs the realized program only: editor indexes (FrontendTooling) are not built.
   const bundle = yield* Preparation.prepare(
-    { root: 'compiler-support/root', configuration: { profile: input } },
+    { root: 'compiler-support/root', configuration: { profile: profileInput(profile) } },
     'executable',
   ).pipe(
     Effect.provide(

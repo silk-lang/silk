@@ -226,6 +226,12 @@ const collidingModule = Effect.fnUntraced(function* (options: { readonly named: 
       ]) {
         yield* FunctionBody.store(body, yield* Constant.nullValue(builder, type), destination)
       }
+      // A lone NUL is the one byte string whose C-string record would be empty.
+      yield* FunctionBody.store(
+        body,
+        yield* Constant.string(builder, Uint8Array.of(0)),
+        destination,
+      )
       // Both loads request `same`, which the entry block already holds.
       yield* FunctionBody.load(body, i32, destination, 'same')
       yield* FunctionBody.load(body, i32, destination, 'same')

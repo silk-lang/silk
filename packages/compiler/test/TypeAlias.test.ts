@@ -1,10 +1,7 @@
-import * as Layer from 'effect/Layer'
-import type * as ModuleClosure from '../src/ModuleClosure.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as Diagnostic from '../src/Diagnostic.js'
-import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
 import * as Json from './support/Json.js'
@@ -12,46 +9,25 @@ import * as Json from './support/Json.js'
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
 
-const analyze = (text: string, target?: string) =>
-  Analysis.makeRealized({
-    root: 'root',
-    ...(target === undefined ? {} : { target }),
-  }).pipe(
+const analyze = (text: string) => Analysis.ofSource('root', ascii(text))
+
+const analyzeModules = (entries: ReadonlyArray<readonly [string, string]>) =>
+  Analysis.make({ root: 'root' }).pipe(
     Effect.provide(
-      SourceResolver.overlay([SourceFile.make('root', ascii(text))]).pipe(
-        Layer.provideMerge(SourceResolver.memory(new Map())),
+      SourceResolver.memory(
+        new Map(entries.map(([module, text]) => [module, ascii(text)] as const)),
       ),
     ),
   )
 
-const analyzeModules = (
-  rootModule: string,
-  entries: ReadonlyArray<readonly [string, string]>,
-): Effect.Effect<Analysis.Snapshot, ModuleClosure.ModuleClosureError> => {
-  const rootText = entries.find(([name]) => name === rootModule)?.[1]
-  if (rootText === undefined) throw new RangeError(`Fixture has no root source ${rootModule}`)
-  const imports = new Map(
-    entries
-      .filter(([name]) => name !== rootModule)
-      .map(([name, text]) => [name, ascii(text)] as const),
-  )
-  return Analysis.makeRealized({ root: rootModule }).pipe(
-    Effect.provide(
-      SourceResolver.overlay([SourceFile.make(rootModule, ascii(rootText))]).pipe(
-        Layer.provideMerge(SourceResolver.memory(imports)),
-      ),
-    ),
-  )
-}
-
-const codes = (self: Analysis.Snapshot): ReadonlyArray<string> =>
+const codes = (self: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(self).map((diagnostic) => diagnostic.code)
 
-const messages = (self: Analysis.Snapshot): ReadonlyArray<string> =>
+const messages = (self: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(self).map((diagnostic) => diagnostic.message)
 
 const memberType = (
-  self: Analysis.Snapshot,
+  self: Analysis.FrontendSnapshot,
   module: string,
   spelling: string,
 ): string | undefined => {
@@ -76,7 +52,7 @@ const memberType = (
 }
 
 const failureMembers = (
-  self: Analysis.Snapshot,
+  self: Analysis.FrontendSnapshot,
   module: string,
   spelling: string,
 ): ReadonlyArray<string> => {
@@ -258,7 +234,7 @@ pub struct JsonError {}
 pub type FetchError = HttpError | JsonError
 type Secret = i32
 pub effect fn fetch() -> i32 ! FetchError { fail HttpError {} }`
-    const self = yield* analyzeModules('root', [
+    const self = yield* analyzeModules([
       [
         'root',
         `import lib
@@ -275,7 +251,7 @@ pub fn main() -> i32 { return 0 }`,
       failureMembers(self, 'root', 'qualified'),
       failureMembers(self, 'lib', 'fetch'),
     )
-    const hidden = yield* analyzeModules('root', [
+    const hidden = yield* analyzeModules([
       [
         'root',
         `import lib\nfn use(value: lib.Secret) -> i32 { return 0 }\npub fn main() -> i32 { return 0 }`,

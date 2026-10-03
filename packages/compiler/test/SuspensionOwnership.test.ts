@@ -8,7 +8,9 @@ import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { unreachable } from './support/raise.js'
 import { partialSuspension } from './support/partialSuspension.js'
 import { assert, it } from '@effect/vitest'
+import * as Context from 'effect/Context'
 import * as Effect from 'effect/Effect'
+import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import * as Instances from '../src/Instances.js'
 import * as Diagnostic from '../src/Diagnostic.js'
@@ -86,156 +88,160 @@ pub fn main() -> i32 {
   return scalarValue + ownedValue + borrowedValue + sharedValue + branchedValue
 }`
 
-it.effect('classifies exact post-normalization MIR locals across relay', () =>
-  Effect.gen(function* () {
-    const self = yield* snapshot(source)
-    assert.deepEqual(Analysis.diagnostics(self), [])
-    const ownership = available(self)
-    const sharedStart = source.indexOf('run shared(&owner)')
-    const caller = Analysis.loweredMir(self).functions.find((fn) => fn.id.name === 'main')
-    const loan =
-      caller === undefined
-        ? undefined
-        : MirVerification.operations(caller).find(
-            (operation) =>
-              operation._tag === 'BeginLoan' &&
-              operation.access === 'Shared' &&
-              operation.sourceType._tag === 'Nominal' &&
-              operation.sourceType.type.name === 'Owner',
-          )
-    const callerPlan = ownership.plans.find((plan) => plan.span.start === sharedStart)
-    assert.isTrue(
-      loan?._tag === 'BeginLoan' &&
-        callerPlan?.slots.some(
-          (slot) => slot.local.ordinal === loan.root.ordinal && slot.type._tag === 'Nominal',
-        ),
-      'the last shared loan retains its actual owner storage independently of cleanup',
-    )
-    const scalar = plansFor(ownership, 'scalar').find((plan) => plan.frame === 'StatefulRelay')
-    const owned = plansFor(ownership, 'owned').find(
-      (plan) =>
-        plan.frame === 'StatefulRelay' &&
-        plan.slots.filter((slot) => slot.access._tag === 'AffineTransfer').length === 2,
-    )
-    const borrowed = plansFor(ownership, 'borrowed').find((plan) => plan.frame === 'StatefulRelay')
-    const shared = plansFor(ownership, 'shared').find((plan) => plan.frame === 'StatefulRelay')
-    const branched = plansFor(ownership, 'branched').find((plan) => plan.frame === 'StatefulRelay')
-    assert.isDefined(scalar, SuspensionOwnership.encode(ownership))
-    assert.isDefined(owned, SuspensionOwnership.encode(ownership))
-    assert.isDefined(borrowed, SuspensionOwnership.encode(ownership))
-    assert.isDefined(shared, SuspensionOwnership.encode(ownership))
-    assert.isDefined(branched, SuspensionOwnership.encode(ownership))
-    if (
-      scalar === undefined ||
-      owned === undefined ||
-      borrowed === undefined ||
-      shared === undefined ||
-      branched === undefined
-    )
-      return
-    const copiedScalars = scalar.slots.filter(
-      (slot) => slot.access._tag === 'Copy' && slot.type._tag === 'i32',
-    )
-    assert.lengthOf(copiedScalars, 1, SuspensionOwnership.encode(ownership))
-    assert.isTrue(
-      owned.slots.some(
-        (slot) => slot.access._tag === 'AffineTransfer' && slot.type._tag === 'Nominal',
-      ),
-      SuspensionOwnership.encode(ownership),
-    )
-    assert.isTrue(
-      borrowed.slots.some(
-        (slot) =>
-          slot.access._tag === 'BorrowedDependency' &&
-          slot.access.access === 'Exclusive' &&
-          slot.access.loan._tag === 'BorrowedParameter',
-      ),
-      SuspensionOwnership.encode(ownership),
-    )
-    assert.isTrue(
-      shared.slots.some(
-        (slot) =>
-          slot.access._tag === 'BorrowedDependency' &&
-          slot.access.access === 'Shared' &&
-          slot.access.loan._tag === 'BorrowedParameter',
-      ),
-      SuspensionOwnership.encode(ownership),
-    )
-    const affine = owned.slots.filter((slot) => slot.access._tag === 'AffineTransfer')
-    const dependency =
-      borrowed.slots.find((slot) => slot.access._tag === 'BorrowedDependency') ??
-      unreachable('expected borrowed dependency')
-    const module = Analysis.loweredMir(self)
-    // Lifetime authority cannot truncate the transported descriptor to one pointer.
-    for (const target of [Target.wasm32UnknownUnknown, Target.aarch64AppleDarwin]) {
-      const slice = Type.slice('Shared', 'i32', Lifetime.staticLifetime)
-      const layout = {
-        ...module.layout,
-        target,
-        entries: [Layout.sliceEntry(target, slice, Layout.scalarEntry(target, 'i32'))],
-      }
-      assert.deepEqual(
-        CoroutineFrame.storageOf(
-          { ...module, layout },
-          { ...dependency, type: { _tag: 'Slice', type: slice } },
-        ),
-        {
-          size: target.pointerSize * 2,
-          alignment: target.pointerAlignment,
-        },
-      )
-      assert.deepEqual(
-        CoroutineFrame.storageOf(
-          { ...module, layout },
-          { ...dependency, type: { _tag: 'EnvironmentBorrow', type: slice, access: 'Shared' } },
-        ),
-        {
-          size: target.pointerSize,
-          alignment: target.pointerAlignment,
-        },
-      )
-    }
-    assert.lengthOf(affine, 2)
-    const affineLocals = affine.map((slot) => slot.local.ordinal)
-    assert.deepEqual(
-      owned.failure.releases
-        .map((release) => release.local.ordinal)
-        .filter((local) => affineLocals.includes(local)),
-      [...affineLocals].reverse(),
-    )
-    // Only the user borrow is retained; private frame storage is not a source dependency.
-    assert.lengthOf(
-      borrowed.slots.filter((slot) => slot.access._tag === 'BorrowedDependency'),
-      1,
-    )
-    assert.lengthOf(borrowed.failure.loanEnds, 1)
-    assert.lengthOf(borrowed.success.loanEnds, 0)
-    assert.deepEqual(
-      branched.slots
-        .filter((slot) => slot.local.ordinal < 3 && slot.access._tag === 'Copy')
-        .map((slot) => slot.local.ordinal),
-      [0, 1, 2],
-    )
-    assert.deepEqual(ownership.violations, [])
-  }),
-)
+/** One realization of the relay program, shared by the tests that inspect it. */
+const Relayed = Context.Service<Analysis.Snapshot>('SuspensionOwnership/relayed')
 
-it.effect('publishes deterministic state ownership and restoration', () =>
-  Effect.gen(function* () {
-    const first = yield* snapshot(source)
-    const second = yield* snapshot(source)
-    const left = available(first)
-    const right = available(second)
-    assert.strictEqual(SuspensionOwnership.encode(left), SuspensionOwnership.encode(right))
-    for (const plan of left.plans) {
-      assert.deepEqual(
-        plan.success.restores,
-        plan.slots.map((slot) => slot.ordinal),
-        Instances.keyText(plan.function),
+it.layer(Layer.effect(Relayed, snapshot(source)))((it) => {
+  it.effect('classifies exact post-normalization MIR locals across relay', () =>
+    Effect.gen(function* () {
+      const self = yield* Relayed
+      assert.deepEqual(Analysis.diagnostics(self), [])
+      const ownership = available(self)
+      const sharedStart = source.indexOf('run shared(&owner)')
+      const caller = Analysis.loweredMir(self).functions.find((fn) => fn.id.name === 'main')
+      const loan =
+        caller === undefined
+          ? undefined
+          : MirVerification.operations(caller).find(
+              (operation) =>
+                operation._tag === 'BeginLoan' &&
+                operation.access === 'Shared' &&
+                operation.sourceType._tag === 'Nominal' &&
+                operation.sourceType.type.name === 'Owner',
+            )
+      const callerPlan = ownership.plans.find((plan) => plan.span.start === sharedStart)
+      assert.isTrue(
+        loan?._tag === 'BeginLoan' &&
+          callerPlan?.slots.some(
+            (slot) => slot.local.ordinal === loan.root.ordinal && slot.type._tag === 'Nominal',
+          ),
+        'the last shared loan retains its actual owner storage independently of cleanup',
       )
-    }
-  }),
-)
+      const scalar = plansFor(ownership, 'scalar').find((plan) => plan.frame === 'StatefulRelay')
+      const owned = plansFor(ownership, 'owned').find(
+        (plan) =>
+          plan.frame === 'StatefulRelay' &&
+          plan.slots.filter((slot) => slot.access._tag === 'AffineTransfer').length === 2,
+      )
+      const borrowed = plansFor(ownership, 'borrowed').find(
+        (plan) => plan.frame === 'StatefulRelay',
+      )
+      const shared = plansFor(ownership, 'shared').find((plan) => plan.frame === 'StatefulRelay')
+      const branched = plansFor(ownership, 'branched').find(
+        (plan) => plan.frame === 'StatefulRelay',
+      )
+      assert.isDefined(scalar, SuspensionOwnership.encode(ownership))
+      assert.isDefined(owned, SuspensionOwnership.encode(ownership))
+      assert.isDefined(borrowed, SuspensionOwnership.encode(ownership))
+      assert.isDefined(shared, SuspensionOwnership.encode(ownership))
+      assert.isDefined(branched, SuspensionOwnership.encode(ownership))
+      if (
+        scalar === undefined ||
+        owned === undefined ||
+        borrowed === undefined ||
+        shared === undefined ||
+        branched === undefined
+      )
+        return
+      const copiedScalars = scalar.slots.filter(
+        (slot) => slot.access._tag === 'Copy' && slot.type._tag === 'i32',
+      )
+      assert.lengthOf(copiedScalars, 1, SuspensionOwnership.encode(ownership))
+      assert.isTrue(
+        owned.slots.some(
+          (slot) => slot.access._tag === 'AffineTransfer' && slot.type._tag === 'Nominal',
+        ),
+        SuspensionOwnership.encode(ownership),
+      )
+      assert.isTrue(
+        borrowed.slots.some(
+          (slot) =>
+            slot.access._tag === 'BorrowedDependency' &&
+            slot.access.access === 'Exclusive' &&
+            slot.access.loan._tag === 'BorrowedParameter',
+        ),
+        SuspensionOwnership.encode(ownership),
+      )
+      assert.isTrue(
+        shared.slots.some(
+          (slot) =>
+            slot.access._tag === 'BorrowedDependency' &&
+            slot.access.access === 'Shared' &&
+            slot.access.loan._tag === 'BorrowedParameter',
+        ),
+        SuspensionOwnership.encode(ownership),
+      )
+      const affine = owned.slots.filter((slot) => slot.access._tag === 'AffineTransfer')
+      const dependency =
+        borrowed.slots.find((slot) => slot.access._tag === 'BorrowedDependency') ??
+        unreachable('expected borrowed dependency')
+      const module = Analysis.loweredMir(self)
+      // Lifetime authority cannot truncate the transported descriptor to one pointer.
+      for (const target of [Target.wasm32UnknownUnknown, Target.aarch64AppleDarwin]) {
+        const slice = Type.slice('Shared', 'i32', Lifetime.staticLifetime)
+        const layout = {
+          ...module.layout,
+          target,
+          entries: [Layout.sliceEntry(target, slice, Layout.scalarEntry(target, 'i32'))],
+        }
+        assert.deepEqual(
+          CoroutineFrame.storageOf(
+            { ...module, layout },
+            { ...dependency, type: { _tag: 'Slice', type: slice } },
+          ),
+          {
+            size: target.pointerSize * 2,
+            alignment: target.pointerAlignment,
+          },
+        )
+        assert.deepEqual(
+          CoroutineFrame.storageOf(
+            { ...module, layout },
+            { ...dependency, type: { _tag: 'EnvironmentBorrow', type: slice, access: 'Shared' } },
+          ),
+          {
+            size: target.pointerSize,
+            alignment: target.pointerAlignment,
+          },
+        )
+      }
+      assert.lengthOf(affine, 2)
+      const affineLocals = affine.map((slot) => slot.local.ordinal)
+      assert.deepEqual(
+        owned.failure.releases
+          .map((release) => release.local.ordinal)
+          .filter((local) => affineLocals.includes(local)),
+        [...affineLocals].reverse(),
+      )
+      // Only the user borrow is retained; private frame storage is not a source dependency.
+      assert.lengthOf(
+        borrowed.slots.filter((slot) => slot.access._tag === 'BorrowedDependency'),
+        1,
+      )
+      assert.lengthOf(borrowed.failure.loanEnds, 1)
+      assert.lengthOf(borrowed.success.loanEnds, 0)
+      assert.deepEqual(
+        branched.slots
+          .filter((slot) => slot.local.ordinal < 3 && slot.access._tag === 'Copy')
+          .map((slot) => slot.local.ordinal),
+        [0, 1, 2],
+      )
+      assert.deepEqual(ownership.violations, [])
+    }),
+  )
+
+  it.effect('restores every retained state slot on success', () =>
+    Effect.gen(function* () {
+      for (const plan of available(yield* Relayed).plans) {
+        assert.deepEqual(
+          plan.success.restores,
+          plan.slots.map((slot) => slot.ordinal),
+          Instances.keyText(plan.function),
+        )
+      }
+    }),
+  )
+})
 
 it.effect('preserves partial owner state across suspension and cancellation', () =>
   Effect.gen(function* () {

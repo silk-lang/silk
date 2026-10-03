@@ -133,7 +133,10 @@ it.effect('lowers the same stored-callable matrix through static native LLVM tar
         testCase.source,
         target,
       )
-      const artifact = yield* Backend.emit(LlvmBackend.LlvmBackend, module, { mode: 'release' })
+      const artifact = yield* Backend.emit(LlvmBackend.LlvmBackend, module, {
+        mode: 'release',
+        verifyIr: true,
+      })
       assert.strictEqual(artifact._tag, 'LlvmBitcodeArtifact')
       if (artifact._tag !== 'LlvmBitcodeArtifact') return
       assert.isTrue(artifact.symbols.some((entry) => entry.declaration.name === 'main'))

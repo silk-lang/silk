@@ -134,7 +134,7 @@ it('presents the region proof of a moved body where the next revision builds it'
       presented.results.lifetimes?.controlFlow.spans,
       current.results.lifetimes?.controlFlow.spans,
     )
-    assert.deepEqual(presented.results.scopes, current.results.scopes)
-    assert.deepEqual(presented.results.occurrences, current.results.occurrences)
+    assert.deepEqual(presented.results.tooling?.scopes, current.results.tooling?.scopes)
+    assert.deepEqual(presented.results.tooling?.occurrences, current.results.tooling?.occurrences)
   }
 })

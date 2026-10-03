@@ -225,9 +225,18 @@ const runLane = Effect.fnUntraced(
           artifact,
           profile,
         })
-        const support = yield* NativeToolchain.compileHelpers(tools, scope, profile, object.helpers)
+        const support = yield* NativeToolchain.compileHelpers(
+          tools,
+          scope,
+          profile,
+          object.helpers,
+          {
+            _tag: 'Disabled',
+          },
+        )
+        const helperObjects = support === undefined ? [] : [support.object]
         const helperInspections = []
-        for (const [index, helper] of support.entries()) {
+        for (const [index, helper] of helperObjects.entries()) {
           helperInspections.push(
             yield* run(inspect, ['--symbols', '--relocations', helper.artifact.path]),
           )
@@ -271,7 +280,7 @@ const runLane = Effect.fnUntraced(
           profile,
           [
             object.artifact,
-            ...support.map((entry) => entry.artifact),
+            ...helperObjects.map((entry) => entry.artifact),
             c.artifact,
             runtime.artifact,
           ],
@@ -282,7 +291,7 @@ const runLane = Effect.fnUntraced(
             composition: { kind: 'default' },
             resolved: { kind: 'default' },
           },
-          [object.helpers, ...support.map((entry) => entry.helpers)],
+          [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
         )
         yield* Linker.link({
           scope,

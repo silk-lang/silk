@@ -21,6 +21,12 @@ export interface CodegenRequest {
   readonly support?: boolean
   readonly sources?: ReadonlyMap<string, Uint8Array>
   readonly privateExecutionStackPages?: number
+  /**
+   * Audit the emitted module's SSA invariants before encoding (compiler development), so a
+   * violation is reported against the emitted module instead of at Clang's object step, whose own
+   * module verifier rejects it otherwise. Defaults to false.
+   */
+  readonly verifyIr?: boolean
 }
 
 export interface SymbolEntry {
@@ -29,6 +35,7 @@ export interface SymbolEntry {
   readonly symbol: string
 }
 
+/** How the LLVM backend lowers one linearized MIR block's terminator; a pure function of MIR. */
 export interface ControlProvenance {
   readonly _tag: 'BackendControlProvenance'
   readonly backend: 'LLVM'
@@ -93,7 +100,6 @@ interface ArtifactBase {
   readonly foreignExports: ReadonlyArray<ForeignExport>
   /** Imported and exported C data symbols, sorted by symbol and direction. */
   readonly foreignStatics: ReadonlyArray<ForeignStatic>
-  readonly control: ReadonlyArray<ControlProvenance>
 }
 
 export interface LlvmBitcodeArtifact extends ArtifactBase {

@@ -1,6 +1,5 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
-import { corpus, narrowEffectRecord } from './support/corpus.js'
-import { outputStorageSource } from './support/corpus.js'
+import { nativeCorpus, narrowEffectRecord, outputStorageSource } from './support/corpus.js'
 import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
@@ -67,7 +66,7 @@ const operationRegion = (region: Mir.Region | undefined): Mir.OperationRegion =>
 it.effect('captures by-value call arguments before later arguments mutate their source', () =>
   Effect.gen(function* () {
     const program =
-      corpus.find((entry) => entry.name === 'scalar-reference-argument-order') ??
+      nativeCorpus.find((entry) => entry.name === 'scalar-reference-argument-order') ??
       raise('expected argument-order corpus case')
     const snapshot = yield* AnalysisFixture.retainingMain(
       'mir/call-argument-order',

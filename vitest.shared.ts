@@ -21,12 +21,11 @@ import { defineConfig, mergeConfig, type ViteUserConfig } from 'vitest/config'
  * The floor is 60 s because 30 s was measured to be too low, not because 60 is a round number.
  * `pnpm check` saturates the runner end to end — the compiler suite alone is ~2,580 s of test CPU
  * on a 4-core host — and at that saturation the slowest tests in `packages/compiler` legitimately
- * run 30–38 s: `StackVmPressureDeterminism` 37.6 s, `ModuleVerification` 31.4 s,
- * `LexerPressureDeterminism` 30.3 s. Those pass only because each carries an explicit timeout;
- * `ChildProcess.test.ts > lowers the native execution to reachable native-only runtime symbols`
- * carries none, inherited a 30 s floor, and was reported as a timeout on CI. A floor a test in the
- * workspace already exceeds is not a floor. 60 s also matches the value `packages/cli`
- * arrived at independently from its own measurement.
+ * run 30–38 s: `StackVmPressureDeterminism` 37.6 s and `LexerPressureDeterminism` 30.3 s. Those
+ * pass only because each carries an explicit timeout; `ChildProcess.test.ts > lowers the native
+ * execution to reachable native-only runtime symbols` carries none, inherited a 30 s floor, and
+ * was reported as a timeout on CI. A floor a test in the workspace already exceeds is not a floor.
+ * 60 s also matches the value `packages/cli` arrived at independently from its own measurement.
  *
  * This is not a performance gate and nothing here asserts how fast anything is. It exists so that
  * a correctness assertion is never reported as a timeout. The cost of raising it is that a test

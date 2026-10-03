@@ -1,6 +1,8 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
+import * as Context from 'effect/Context'
 import * as Effect from 'effect/Effect'
+import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import type * as Mir from '../src/Mir.js'
 import * as MirEncoding from '../src/MirEncoding.js'
@@ -25,6 +27,9 @@ const snapshot = (input = source) =>
     encoder.encode(input),
     'wasm32-unknown-unknown',
   )
+
+/** One realization of the default suspended program, shared by the tests that inspect it. */
+const Suspended = Context.Service<Analysis.Snapshot>('SuspensionMir/suspended')
 
 const suspensionRegions = (program: Mir.Module): ReadonlyArray<Mir.SuspensionRegion> =>
   program.functions.flatMap((fn) => fn.suspension?.regions ?? [])
@@ -95,26 +100,21 @@ it.effect('keeps synchronous recovery out of its protected recipe suspension reg
   }),
 )
 
-it.effect(
-  'finalizes deterministic target-neutral origin, relay, resume, and logical layout facts',
-  () =>
+it.layer(Layer.effect(Suspended, snapshot()))((it) => {
+  it.effect('finalizes target-neutral origin, relay, resume, and logical layout facts', () =>
     Effect.gen(function* () {
-      const first = yield* snapshot()
-      const second = yield* snapshot()
-      assert.deepEqual(Analysis.diagnostics(first), [])
-      const left = Analysis.loweredMir(first)
-      const right = Analysis.loweredMir(second)
-      assert.deepEqual(yield* MirVerification.verify(left), [], SuspensionMir.summary(left))
-      assert.strictEqual(MirEncoding.encode(left), MirEncoding.encode(right))
-      assert.strictEqual(SuspensionMir.summary(left), SuspensionMir.summary(right))
+      const self = yield* Suspended
+      assert.deepEqual(Analysis.diagnostics(self), [])
+      const mir = Analysis.loweredMir(self)
+      assert.deepEqual(yield* MirVerification.verify(mir), [], SuspensionMir.summary(mir))
       // A conservative discovery result for a synchronous constructor must not acquire a
       // transfer ABI merely because a separate retained runner originates suspension.
-      const constructor = left.functions.find((fn) => fn.id.name === 'program')
+      const constructor = mir.functions.find((fn) => fn.id.name === 'program')
       assert.isDefined(constructor)
       if (constructor === undefined) return
       assert.isUndefined(constructor.suspension)
       const conservative = SuspensionMir.finalize(
-        left,
+        mir,
         {
           _tag: 'ProvisionalMirModule',
           module: 'suspension-mir/main',
@@ -139,13 +139,13 @@ it.effect(
           executionPackages: [],
           violations: [],
         },
-        first.index,
+        self.index,
       )
       assert.isUndefined(conservative.functions.find((fn) => fn.id === constructor.id)?.suspension)
       assert.isTrue(
         suspensionRegions(conservative).some((region) => region._tag === 'SuspendEffectRegion'),
       )
-      const regions = suspensionRegions(left)
+      const regions = suspensionRegions(mir)
       assert.lengthOf(
         regions.filter((region) => region._tag === 'SuspendEffectRegion'),
         1,
@@ -154,7 +154,7 @@ it.effect(
         regions.filter((region) => region._tag === 'RunSuspendableEffectRegion').length,
         1,
       )
-      const [, relay] = stateful(left)
+      const [, relay] = stateful(mir)
       assert.deepEqual(relay.relay.preserves, ['Child', 'Origin', 'TypedOutcome'])
       assert.strictEqual(relay.complete._tag, 'CompleteInCurrentActivation')
       assert.strictEqual(relay.relay.frame, 'StatefulRelay')
@@ -164,7 +164,189 @@ it.effect(
         relay.liveLocals.map((local) => local.ordinal),
       )
     }),
-)
+  )
+
+  it.effect(
+    'rejects malformed logical layouts, resumes, runner contracts, and orphan machinery',
+    () =>
+      Effect.gen(function* () {
+        const self = yield* Suspended
+        const program = Analysis.loweredMir(self)
+        const [owner, relay] = stateful(program)
+        const descriptor = relay.relay.state
+        assert.isDefined(descriptor)
+        if (descriptor === undefined) return
+
+        const omitted = Object.freeze({
+          ...relay,
+          relay: Object.freeze({
+            ...relay.relay,
+            state: Object.freeze({
+              ...descriptor,
+              slots: Object.freeze(descriptor.slots.slice(1)),
+            }),
+          }),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, omitted),
+            'InvalidCoroutineFrame',
+          ),
+        )
+
+        const firstSlot = descriptor.slots.at(0)
+        if (firstSlot !== undefined) {
+          const incompatibleAccess = Object.freeze({
+            ...relay,
+            relay: Object.freeze({
+              ...relay.relay,
+              state: Object.freeze({
+                ...descriptor,
+                slots: Object.freeze([
+                  Object.freeze({
+                    ...firstSlot,
+                    type: Object.freeze({
+                      _tag: firstSlot.type._tag === 'bool' ? 'i32' : 'bool',
+                    }),
+                  }),
+                  ...descriptor.slots.slice(1),
+                ]),
+              }),
+            }),
+          })
+          assert.isTrue(
+            yield* hasRule(
+              replaceSuspensionRegion(program, owner, relay, incompatibleAccess),
+              'InvalidCoroutineFrame',
+            ),
+          )
+        }
+
+        const duplicate = Object.freeze({
+          ...relay,
+          liveLocals: Object.freeze([...relay.liveLocals, ...relay.liveLocals.slice(0, 1)]),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, duplicate),
+            'InvalidCoroutineFrame',
+          ),
+        )
+
+        const undeclared = Object.freeze({
+          ...relay,
+          liveLocals: Object.freeze([
+            ...relay.liveLocals,
+            Object.freeze({ _tag: 'Local' as const, ordinal: owner.localTypes.length }),
+          ]),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, undeclared),
+            'InvalidCoroutineFrame',
+          ),
+        )
+
+        const badResume = Object.freeze({
+          ...relay,
+          relay: Object.freeze({
+            ...relay.relay,
+            state: Object.freeze({
+              ...descriptor,
+              success: Object.freeze({
+                ...descriptor.success,
+                resume: Object.freeze({ ...descriptor.success.resume, path: 'Failure' as const }),
+              }),
+            }),
+          }),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, badResume),
+            'InvalidCoroutineFrame',
+          ),
+        )
+
+        const badRunner = Object.freeze({
+          ...relay,
+          runner: Object.freeze({ ...relay.runner, classification: 'Synchronous' as const }),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, badRunner),
+            'InvalidSuspension',
+          ),
+        )
+
+        const badOutcome = Object.freeze({
+          ...relay,
+          runner: Object.freeze({
+            ...relay.runner,
+            outcome: Object.freeze({ ...relay.runner.outcome, success: 'bool' as const }),
+          }),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, badOutcome),
+            'InvalidSuspension',
+          ),
+        )
+
+        const differentOwner = program.functions.find((fn) => fn !== owner)
+        assert.isDefined(differentOwner)
+        if (differentOwner !== undefined) {
+          const badIdentity = Object.freeze({
+            ...relay,
+            point: Object.freeze({ ...relay.point, owner: differentOwner.instance }),
+          })
+          assert.isTrue(
+            yield* hasRule(
+              replaceSuspensionRegion(program, owner, relay, badIdentity),
+              'InvalidSuspension',
+            ),
+          )
+        }
+
+        const noDescriptor = Object.freeze({
+          ...relay,
+          relay: Object.freeze({
+            _tag: 'RelayExistingTransfer' as const,
+            preserves: relay.relay.preserves,
+            frame: 'StatefulRelay' as const,
+          }),
+        })
+        assert.isTrue(
+          yield* hasRule(
+            replaceSuspensionRegion(program, owner, relay, noDescriptor),
+            'InvalidCoroutineFrame',
+          ),
+        )
+
+        const orphan: Mir.Module = Object.freeze({
+          ...program,
+          functions: Object.freeze(
+            program.functions.map((fn) =>
+              fn.suspension === undefined
+                ? fn
+                : Object.freeze({
+                    ...fn,
+                    suspension: Object.freeze({
+                      ...fn.suspension,
+                      regions: Object.freeze(
+                        fn.suspension.regions.filter(
+                          (region) => region._tag !== 'SuspendEffectRegion',
+                        ),
+                      ),
+                    }),
+                  }),
+            ),
+          ),
+        })
+        assert.isTrue(yield* hasRule(orphan, 'OrphanSuspensionMachinery'))
+        assert.notInclude(MirEncoding.encode(program), 'provisional-mir')
+      }),
+  )
+})
 
 it.effect('keeps final synchronous MIR free of suspension machinery', () =>
   Effect.gen(function* () {
@@ -194,187 +376,6 @@ pub fn main() -> i32 {
     const program = Analysis.loweredMir(self)
     assert.deepEqual(yield* MirVerification.verify(program), [])
   }),
-)
-
-it.effect(
-  'rejects malformed logical layouts, resumes, runner contracts, and orphan machinery',
-  () =>
-    Effect.gen(function* () {
-      const self = yield* snapshot()
-      const program = Analysis.loweredMir(self)
-      const [owner, relay] = stateful(program)
-      const descriptor = relay.relay.state
-      assert.isDefined(descriptor)
-      if (descriptor === undefined) return
-
-      const omitted = Object.freeze({
-        ...relay,
-        relay: Object.freeze({
-          ...relay.relay,
-          state: Object.freeze({
-            ...descriptor,
-            slots: Object.freeze(descriptor.slots.slice(1)),
-          }),
-        }),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, omitted),
-          'InvalidCoroutineFrame',
-        ),
-      )
-
-      const firstSlot = descriptor.slots.at(0)
-      if (firstSlot !== undefined) {
-        const incompatibleAccess = Object.freeze({
-          ...relay,
-          relay: Object.freeze({
-            ...relay.relay,
-            state: Object.freeze({
-              ...descriptor,
-              slots: Object.freeze([
-                Object.freeze({
-                  ...firstSlot,
-                  type: Object.freeze({
-                    _tag: firstSlot.type._tag === 'bool' ? 'i32' : 'bool',
-                  }),
-                }),
-                ...descriptor.slots.slice(1),
-              ]),
-            }),
-          }),
-        })
-        assert.isTrue(
-          yield* hasRule(
-            replaceSuspensionRegion(program, owner, relay, incompatibleAccess),
-            'InvalidCoroutineFrame',
-          ),
-        )
-      }
-
-      const duplicate = Object.freeze({
-        ...relay,
-        liveLocals: Object.freeze([...relay.liveLocals, ...relay.liveLocals.slice(0, 1)]),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, duplicate),
-          'InvalidCoroutineFrame',
-        ),
-      )
-
-      const undeclared = Object.freeze({
-        ...relay,
-        liveLocals: Object.freeze([
-          ...relay.liveLocals,
-          Object.freeze({ _tag: 'Local' as const, ordinal: owner.localTypes.length }),
-        ]),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, undeclared),
-          'InvalidCoroutineFrame',
-        ),
-      )
-
-      const badResume = Object.freeze({
-        ...relay,
-        relay: Object.freeze({
-          ...relay.relay,
-          state: Object.freeze({
-            ...descriptor,
-            success: Object.freeze({
-              ...descriptor.success,
-              resume: Object.freeze({ ...descriptor.success.resume, path: 'Failure' as const }),
-            }),
-          }),
-        }),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, badResume),
-          'InvalidCoroutineFrame',
-        ),
-      )
-
-      const badRunner = Object.freeze({
-        ...relay,
-        runner: Object.freeze({ ...relay.runner, classification: 'Synchronous' as const }),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, badRunner),
-          'InvalidSuspension',
-        ),
-      )
-
-      const badOutcome = Object.freeze({
-        ...relay,
-        runner: Object.freeze({
-          ...relay.runner,
-          outcome: Object.freeze({ ...relay.runner.outcome, success: 'bool' as const }),
-        }),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, badOutcome),
-          'InvalidSuspension',
-        ),
-      )
-
-      const differentOwner = program.functions.find((fn) => fn !== owner)
-      assert.isDefined(differentOwner)
-      if (differentOwner !== undefined) {
-        const badIdentity = Object.freeze({
-          ...relay,
-          point: Object.freeze({ ...relay.point, owner: differentOwner.instance }),
-        })
-        assert.isTrue(
-          yield* hasRule(
-            replaceSuspensionRegion(program, owner, relay, badIdentity),
-            'InvalidSuspension',
-          ),
-        )
-      }
-
-      const noDescriptor = Object.freeze({
-        ...relay,
-        relay: Object.freeze({
-          _tag: 'RelayExistingTransfer' as const,
-          preserves: relay.relay.preserves,
-          frame: 'StatefulRelay' as const,
-        }),
-      })
-      assert.isTrue(
-        yield* hasRule(
-          replaceSuspensionRegion(program, owner, relay, noDescriptor),
-          'InvalidCoroutineFrame',
-        ),
-      )
-
-      const orphan: Mir.Module = Object.freeze({
-        ...program,
-        functions: Object.freeze(
-          program.functions.map((fn) =>
-            fn.suspension === undefined
-              ? fn
-              : Object.freeze({
-                  ...fn,
-                  suspension: Object.freeze({
-                    ...fn.suspension,
-                    regions: Object.freeze(
-                      fn.suspension.regions.filter(
-                        (region) => region._tag !== 'SuspendEffectRegion',
-                      ),
-                    ),
-                  }),
-                }),
-          ),
-        ),
-      })
-      assert.isTrue(yield* hasRule(orphan, 'OrphanSuspensionMachinery'))
-      assert.notInclude(MirEncoding.encode(program), 'provisional-mir')
-    }),
 )
 
 it.effect('retains the caller continuation after a direct suspension primitive', () =>

@@ -1,20 +1,12 @@
-import * as Layer from 'effect/Layer'
 import { unreachable } from './support/raise.js'
-import * as TestToolchain from './support/TestToolchain.js'
-import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { afterAll, assert, it } from '@effect/vitest'
+import { nativeCorpus } from './support/corpus.js'
+import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as Layout from '../src/Layout.js'
 import * as LayoutVerify from '../src/LayoutVerify.js'
 import type * as Mir from '../src/Mir.js'
 import * as MirVerification from '../src/MirVerification.js'
-import * as SourceFile from '../src/SourceFile.js'
-import * as SourceResolver from '../src/SourceResolver.js'
-import * as Driver from './support/TestDriver.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -22,17 +14,9 @@ const ascii = (value: string): Uint8Array =>
 const source = (text: string, target: string) =>
   Analysis.ofSourceRealized('usize/program', ascii(text), target)
 
-const destinationRoot = mkdtempSync(join(tmpdir(), 'silk-usize-'))
-afterAll(() => {
-  rmSync(destinationRoot, { recursive: true, force: true })
-})
-
-const nativeExact = `import silk.usize
-fn increment(value: usize) -> usize { return usize.add(value, 1) }
-pub fn main() -> i32 {
-  if increment(9007199254740993) == 9007199254740994 { return 42 }
-  return 0
-}`
+const nativeExact =
+  nativeCorpus.find((program) => program.name === 'usize-exact-native-i64-call')?.source ??
+  unreachable('expected the usize-exact-native-i64-call native corpus case')
 
 const sharedUnsigned = `import silk.usize
 fn maximum() -> usize { return 4294967293 |> usize.add(2) }
@@ -139,26 +123,8 @@ pub fn main() -> i32 { if invalid() == 0 { return 1 } return 0 }`,
   }),
 )
 
-it.effect('executes an exact native i64 call and rejects it for the WebAssembly target', () =>
+it.effect('rejects the exact native i64 magnitude for the WebAssembly target', () =>
   Effect.gen(function* () {
-    const native = yield* Driver.compile({
-      compilation: { root: 'usize/program' },
-      toolchain: yield* TestToolchain.configured,
-      optimization: 'release',
-      artifactKind: 'NativeExecutable',
-      destination: join(destinationRoot, 'native-exact'),
-    }).pipe(
-      Effect.provide(
-        SourceResolver.overlay([SourceFile.make('usize/program', ascii(nativeExact))]).pipe(
-          Layer.provideMerge(SourceResolver.empty),
-        ),
-      ),
-    )
-    assert.strictEqual(native._tag, 'Compiled')
-    if (native._tag !== 'Compiled') return
-    const executed = spawnSync(native.path, [], { encoding: 'utf8' })
-    assert.strictEqual(executed.status, 42, executed.stderr)
-
     const wasm = yield* source(nativeExact, 'wasm32-unknown-unknown')
     assert.include(
       wasm.diagnostics.map((diagnostic) => diagnostic.code),

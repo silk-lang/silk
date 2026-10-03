@@ -71,8 +71,8 @@ import {
   httpClientAcceptanceSource,
   httpClientBoundariesAcceptanceSource,
   httpClientOutputFailuresAcceptanceSource,
-  httpRedirectAcceptanceSource,
 } from './httpClientAcceptance.js'
+import { httpRedirectAcceptanceSource } from './httpRedirectAcceptance.js'
 import { httpClientContentAcceptanceSource } from './httpClientContentAcceptance.js'
 import { httpTransportAcceptanceSource } from './httpTransportAcceptance.js'
 import { networkAddressResolutionCorpusProgram } from './networkAddressResolutionAcceptance.js'
@@ -1736,12 +1736,53 @@ const withTrappingStaticCompositionDrop = (source: string): string =>
     return ()`,
   )
 
+const staticCompositionRequestUnion = sourceSection(
+  staticCompositionFixture,
+  'RunRequest | HelpRequest',
+  ' {\n  return RunRequest {value: 40}',
+)
+
+const camelCase = (name: string): string =>
+  name.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase())
+
+const staticCompositionSelector = (name: string): string => camelCase(`select-${name}-scenario`)
+
+// All completing scenarios share one compile: the fixture's request union is a runtime value and
+// every dispatch arm is compiled in each variant. The fixture's `main` is replaced by one that
+// selects each scenario's request through a selector returning that union, as the fixture's
+// `selectSuccess` does, and dispatches it through its named arm. Scenario `n` (1-based, in table
+// order) fails with exit `n`, and an out-of-memory recovery exits 0.
+const staticCompositionScenariosProgram = `${sourceSection(
+  staticCompositionFixture,
+  'import',
+  'pub fn main() -> i32 {',
+)}${staticCompositionScenarios
+  .map(
+    ({ name, selection }) =>
+      `fn ${staticCompositionSelector(name)}() -> ${staticCompositionRequestUnion} {\n  return ${selection}\n}\n\n`,
+  )
+  .join('')}effect fn scenarios() -> i32 ! OutOfMemoryError ? &mut Allocator {
+${staticCompositionScenarios
+  .map(({ name, result }, index) => {
+    const binding = camelCase(`${name}-result`)
+    return `  let ${binding} = run dispatch(${staticCompositionSelector(name)}())\n  if ${binding} != ${result} { return ${index + 1} }`
+  })
+  .join('\n')}
+  return 42
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(scenarios() |> Effect.provideMut(&mut allocator), recoverOutOfMemory)
+}
+`
+
 const staticCompositionCorpus: ReadonlyArray<CorpusProgram> = [
-  ...staticCompositionScenarios.map((scenario): CorpusProgram => ({
-    name: `static-composition-${scenario.name}`,
-    source: selectStaticCompositionScenario(scenario.selection),
-    expected: { _tag: 'Completes', result: scenario.result },
-  })),
+  {
+    name: 'static-composition-scenarios',
+    source: staticCompositionScenariosProgram,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   ...staticCompositionScenarios
     .filter((scenario) => scenario.cleanupWitness)
     .map((scenario): CorpusProgram => ({
@@ -1789,10 +1830,8 @@ pub fn main() -> i32 {
   return result
 }`
 
-const hashedMapOrder = (
-  seed: number,
-  digest: number,
-): string => `import silk.allocator { OutOfMemoryError }
+// One seeded map program checks each seed's committed bucket-order digest with its own exit code.
+const hashedMapSeededOrder = `import silk.allocator { OutOfMemoryError }
 import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
@@ -1802,9 +1841,9 @@ import silk.i32
 import silk.u64
 import silk.usize
 
-effect fn build() -> i32 ! OutOfMemoryError {
+effect fn seededOrderDigest(seed: u64) -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Word, i32>(Hash.seed(${seed}))
+  let mut map = HashMap.make<Word, i32>(Hash.seed(seed))
   let mut key = 0
   while key < 12 {
     let previous = run HashMap.insert<Word, i32>(&mut map, Hash.word(i32.toU64(key * 7 + 1)), key)
@@ -1821,11 +1860,17 @@ effect fn build() -> i32 ! OutOfMemoryError {
     }
     index = index + usize.ONE
   }
-  if u64.toI32(u64.remainder(folded, 1000000007)) != ${digest} { return 1 }
+  return u64.toI32(u64.remainder(folded, 1000000007))
+}
+effect fn checkSeeds() -> i32 ! OutOfMemoryError {
+  let first = run seededOrderDigest(12345)
+  if first != 971199974 { return 1 }
+  let second = run seededOrderDigest(6789)
+  if second != 434552010 { return 2 }
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 99 }
-pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`
+pub fn main() -> i32 { return run Effect.catchAll(checkSeeds(), recover) }`
 
 const ownedAllocationTrap = (
   body: string,
@@ -1938,6 +1983,100 @@ ${integerParsingRanges
   return 42
 }`
 
+// Trivial language-feature checks share one native compile. Each keeps its own named function and
+// exit code so a failure names the feature; `forwardCall` is declared after `main` to keep the
+// forward reference.
+const trivialFeatures = `import silk.bool
+import silk.i32
+
+struct Pair { left: i32 right: i32 }
+struct Token { value: i32 }
+
+pub fn identityOf(value: i32) -> i32 { return value }
+pub fn pickSecond(left: i32, right: i32) -> i32 { return right }
+pub fn chooseRight(left: i32, right: i32) -> i32 { return right }
+fn recurse<T>(value: T, remaining: i32) -> i32 {
+  if remaining > 0 { return recurse<T>(move value, remaining - 1) }
+  return 42
+}
+fn countdown(value: i32) -> i32 {
+  if value == 0 { return 42 }
+  return countdown(value - 1)
+}
+fn even(value: i32) -> i32 {
+  if value == 0 { return 42 }
+  return odd(value - 1)
+}
+fn odd(value: i32) -> i32 { return even(value - 1) }
+pub fn check(flag: bool) -> i32 { if flag { return 42 } return 0 }
+fn empty() -> [i32; 0] { return [] }
+fn consume(values: [i32; 0]) -> i32 { return 42 }
+fn chooseNested(values: [[i32; 2]; 2], outer: usize, inner: usize) -> i32 { return values[outer][inner] }
+fn chooseLeft(values: [Pair; 2], index: usize) -> i32 { return values[index].left }
+
+fn literal() -> i32 { return 42 }
+fn identity() -> i32 { return identityOf(42) }
+fn secondParameter() -> i32 { return pickSecond(10, 42) }
+fn nested() -> i32 { return identityOf(identityOf(42)) }
+fn nestedSiblings() -> i32 { return chooseRight(identityOf(1), identityOf(2)) }
+fn sameSpecializationRecursion() -> i32 { return recurse<i32>(1, 4) }
+fn directRecursion() -> i32 { return countdown(4) }
+fn mutualRecursion() -> i32 { return odd(5) }
+fn binding() -> i32 { let value = identityOf(42) return value }
+fn bindingChain() -> i32 { let first = 40 let second = 2 return first }
+fn movedBinding() -> i32 { let value = 42 return identityOf(move value) }
+fn arithmetic() -> i32 { return i32.subtract(i32.multiply(6, 7), 0) }
+fn branchTaken() -> i32 { if i32.equals(1, 1) { return 42 } return 0 }
+fn branchOtherwise() -> i32 { if i32.equals(1, 2) { return 0 } return 42 }
+fn branchElse() -> i32 { if i32.lessThan(2, 1) { return 1 } else { return 42 } return 0 }
+fn boolNot() -> i32 { if bool.not(i32.equals(1, 2)) { return 42 } return 0 }
+// Imports never activate operators (modules-names-and-visibility.md), so the silk.bool and
+// silk.i32 imports above do not supply the ! and == used here.
+fn operatorBoolNot() -> i32 { if !(1 == 2) { return 42 } return 0 }
+fn boolThroughFunction() -> i32 { return check(i32.greaterOrEqual(3, 3)) }
+fn unaryBoolPipeline() -> i32 { if true |> bool.not { return 0 } return 42 }
+fn armBinding() -> i32 { let base = 40 if i32.equals(base, 40) { let bonus = 2 return i32.add(base, bonus) } return 0 }
+fn arrayInferred() -> i32 { let values = [10, 42] return values[1] }
+fn arrayContextualEmpty() -> i32 { return consume(empty()) }
+fn arrayNested() -> i32 { return chooseNested([[10, 11], [42, 43]], 1, 0) }
+fn arrayIndexedStructField() -> i32 { return chooseLeft([Pair { left: 10, right: 11 }, Pair { left: 42, right: 43 }], 1) }
+fn arrayWholeMove() -> i32 {
+  let tokens = [Token { value: 10 }, Token { value: 42 }]
+  let moved = move tokens
+  return moved[1].value
+}
+
+pub fn main() -> i32 {
+  if literal() != 42 { return 1 }
+  if identity() != 42 { return 2 }
+  if secondParameter() != 42 { return 3 }
+  if nested() != 42 { return 4 }
+  if nestedSiblings() != 2 { return 5 }
+  if sameSpecializationRecursion() != 42 { return 6 }
+  if forwardCall() != 42 { return 7 }
+  if directRecursion() != 42 { return 8 }
+  if mutualRecursion() != 42 { return 9 }
+  if binding() != 42 { return 10 }
+  if bindingChain() != 40 { return 11 }
+  if movedBinding() != 42 { return 12 }
+  if arithmetic() != 42 { return 13 }
+  if branchTaken() != 42 { return 14 }
+  if branchOtherwise() != 42 { return 15 }
+  if branchElse() != 42 { return 16 }
+  if boolNot() != 42 { return 17 }
+  if operatorBoolNot() != 42 { return 18 }
+  if boolThroughFunction() != 42 { return 19 }
+  if unaryBoolPipeline() != 42 { return 20 }
+  if armBinding() != 42 { return 21 }
+  if arrayInferred() != 42 { return 22 }
+  if arrayContextualEmpty() != 42 { return 23 }
+  if arrayNested() != 42 { return 24 }
+  if arrayIndexedStructField() != 42 { return 25 }
+  if arrayWholeMove() != 42 { return 26 }
+  return 42
+}
+pub fn forwardCall() -> i32 { return 42 }`
+
 export const narrowEffectRecord = `import silk.effect { Effect }
 import silk.u16
 import silk.u8
@@ -1955,7 +2094,7 @@ effect fn check() -> i32 ! WideFailure {
 effect fn recover(error: WideFailure) -> i32 { return 1 }
 pub fn main() -> i32 { return run Effect.catchAll(check(), recover) }`
 
-export const corpus: ReadonlyArray<CorpusProgram> = [
+const corpus: ReadonlyArray<CorpusProgram> = [
   {
     name: 'scalar-reference-read',
     source: `fn read(value: &i32) -> i32 { return value.* }
@@ -2018,8 +2157,8 @@ pub fn main() -> i32 { return answer }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
-    name: 'literal',
-    source: 'pub fn main() -> i32 { return 42 }',
+    name: 'trivial-features',
+    source: trivialFeatures,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
@@ -2425,31 +2564,6 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   {
-    name: 'identity',
-    source: `pub fn identity(value: i32) -> i32 { return value }
-pub fn main() -> i32 { return identity(42) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'second-parameter',
-    source: `pub fn second(left: i32, right: i32) -> i32 { return right }
-pub fn main() -> i32 { return second(10, 42) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'nested',
-    source: `pub fn identity(value: i32) -> i32 { return value }
-pub fn main() -> i32 { return identity(identity(42)) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'nested-siblings',
-    source: `pub fn identity(value: i32) -> i32 { return value }
-pub fn choose(left: i32, right: i32) -> i32 { return right }
-pub fn main() -> i32 { return choose(identity(1), identity(2)) }`,
-    expected: { _tag: 'Completes', result: 2 },
-  },
-  {
     name: 'generic-specializations',
     source: `struct Pair { left: i32 right: i32 }
 struct Box<T> { value: T }
@@ -2471,15 +2585,6 @@ pub fn main() -> i32 {
   let boxed = pick<Box<i32>>(Box<i32> { value: 1 }, picked)
   return picked + boxed.value + phantom<i32, bool>(1)
 }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'same-specialization-recursion',
-    source: `fn recurse<T>(value: T, remaining: i32) -> i32 {
-  if remaining > 0 { return recurse<T>(move value, remaining - 1) }
-  return 42
-}
-pub fn main() -> i32 { return recurse<i32>(1, 4) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
@@ -2507,53 +2612,6 @@ pub fn main() -> i32 {
   let mut values = [0, 0, 0, 0]
   return fill(&mut values, 0)
 }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'forward-call',
-    source: `pub fn main() -> i32 { return answer() }
-pub fn answer() -> i32 { return 42 }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'direct-recursion',
-    source: `fn countdown(value: i32) -> i32 {
-  if value == 0 { return 42 }
-  return countdown(value - 1)
-}
-pub fn main() -> i32 { return countdown(4) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'mutual-recursion',
-    source: `fn even(value: i32) -> i32 {
-  if value == 0 { return 42 }
-  return odd(value - 1)
-}
-fn odd(value: i32) -> i32 { return even(value - 1) }
-pub fn main() -> i32 { return odd(5) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'binding',
-    source: `pub fn identity(value: i32) -> i32 { return value }
-pub fn main() -> i32 { let value = identity(42) return value }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'binding-chain',
-    source: `pub fn main() -> i32 { let first = 40 let second = 2 return first }`,
-    expected: { _tag: 'Completes', result: 40 },
-  },
-  {
-    name: 'moved-binding',
-    source: `pub fn identity(value: i32) -> i32 { return value }
-pub fn main() -> i32 { let value = 42 return identity(move value) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'arithmetic',
-    source: 'import silk.i32\npub fn main() -> i32 { return i32.subtract(i32.multiply(6, 7), 0) }',
     expected: { _tag: 'Completes', result: 42 },
   },
   {
@@ -2801,11 +2859,6 @@ return (40 + 2) * 1
     expected: { _tag: 'Completes', result: 42 },
   },
   {
-    name: 'unary-bool-pipeline',
-    source: 'import silk.bool\npub fn main() -> i32 { if true |> bool.not { return 0 } return 42 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
     name: 'signed-truncation',
     source: 'import silk.i32\npub fn main() -> i32 { return i32.add(i32.divide(-7, 2), 45) }',
     expected: { _tag: 'Completes', result: 42 },
@@ -2926,81 +2979,6 @@ pub fn main() -> i32 {
     name: 'minimum-division-trap',
     source: 'import silk.i32\npub fn main() -> i32 { return i32.divide(-2147483648, -1) }',
     expected: { _tag: 'Trap' },
-  },
-  {
-    name: 'branch-taken',
-    source: 'import silk.i32\npub fn main() -> i32 { if i32.equals(1, 1) { return 42 } return 0 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'branch-otherwise',
-    source: 'import silk.i32\npub fn main() -> i32 { if i32.equals(1, 2) { return 0 } return 42 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'branch-else',
-    source:
-      'import silk.i32\npub fn main() -> i32 { if i32.lessThan(2, 1) { return 1 } else { return 42 } return 0 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'bool-not',
-    source:
-      'import silk.bool\nimport silk.i32\npub fn main() -> i32 { if bool.not(i32.equals(1, 2)) { return 42 } return 0 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'operator-bool-not',
-    source: 'pub fn main() -> i32 { if !(1 == 2) { return 42 } return 0 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'bool-through-function',
-    source: `import silk.i32
-pub fn check(flag: bool) -> i32 { if flag { return 42 } return 0 }
-pub fn main() -> i32 { return check(i32.greaterOrEqual(3, 3)) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'arm-binding',
-    source:
-      'import silk.i32\npub fn main() -> i32 { let base = 40 if i32.equals(base, 40) { let bonus = 2 return i32.add(base, bonus) } return 0 }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'array-inferred',
-    source: 'pub fn main() -> i32 { let values = [10, 42] return values[1] }',
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'array-contextual-empty',
-    source: `fn empty() -> [i32; 0] { return [] }
-fn consume(values: [i32; 0]) -> i32 { return 42 }
-pub fn main() -> i32 { return consume(empty()) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'array-nested',
-    source: `fn choose(values: [[i32; 2]; 2], outer: usize, inner: usize) -> i32 { return values[outer][inner] }
-pub fn main() -> i32 { return choose([[10, 11], [42, 43]], 1, 0) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'array-indexed-struct-field',
-    source: `struct Pair { left: i32 right: i32 }
-fn choose(values: [Pair; 2], index: usize) -> i32 { return values[index].left }
-pub fn main() -> i32 { return choose([Pair { left: 10, right: 11 }, Pair { left: 42, right: 43 }], 1) }`,
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'array-whole-move',
-    source: `struct Token { value: i32 }
-pub fn main() -> i32 {
-  let tokens = [Token { value: 10 }, Token { value: 42 }]
-  let moved = move tokens
-  return moved[1].value
-}`,
-    expected: { _tag: 'Completes', result: 42 },
   },
   {
     name: 'array-upper-index-trap',
@@ -3202,6 +3180,74 @@ pub fn main() -> i32 {
   if loops(10) != 5 { return 6 }
   if whole(Left { value: 4 }) != 4 || whole(Right {}) != 0 { return 7 }
   if copied(Token { value: 42 }) != 42 { return 8 }
+  return 42
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Pattern conditionals and destructuring: `if let` with shared, exclusive, moved and bare-Copy
+  // initializers, else-if chains mixing `if` and `if let`, a completing `if let` without `else`, a
+  // redundant irrefutable `if let`, a nominal variant `if let`, and an irrefutable `let` record pattern.
+  {
+    name: 'pattern-conditionals-and-destructuring',
+    source: `struct Left { value: i32 }
+struct Right {}
+struct Point { x: i32, y: i32 }
+struct Token { value: i32 }
+impl Copy for Token {}
+union Shape { Circle { radius: i32 }, Empty }
+fn shared(input: Left | Right) -> i32 {
+  if let Left { value } = &input { return value } else { return 0 }
+}
+fn moved(input: Left | Right) -> i32 {
+  if let Left held = move input { return held.value }
+  return 1
+}
+fn chained(input: Left | Right, flag: bool) -> i32 {
+  if let Left { value } = &input {
+    return value
+  } else if flag {
+    return 2
+  } else if let Right {} = &input {
+    return 3
+  }
+  return 4
+}
+fn completes(input: Left | Right) -> i32 {
+  let mut total = 10
+  if let Left { value } = &input { total = total + value }
+  return total
+}
+fn exclusive(input: Left | Right) -> i32 {
+  let mut held = move input
+  if let Left { value } = &mut held { return value }
+  return 0
+}
+fn redundant(point: Point) -> i32 {
+  if let Point { x, y } = move point { return x + y }
+  return 0
+}
+fn destructured(point: Point) -> i32 {
+  let Point { x, y } = move point
+  return x * y
+}
+fn copied(token: Token) -> i32 {
+  let Token { value } = token
+  return value + token.value
+}
+fn variant(shape: Shape) -> i32 {
+  if let Shape.Circle { radius } = &shape { return radius }
+  return 5
+}
+pub fn main() -> i32 {
+  if shared(Left { value: 7 }) != 7 || shared(Right {}) != 0 { return 1 }
+  if moved(Left { value: 8 }) != 8 || moved(Right {}) != 1 { return 2 }
+  if chained(Left { value: 9 }, true) != 9 || chained(Right {}, true) != 2 || chained(Right {}, false) != 3 { return 3 }
+  if completes(Left { value: 4 }) != 14 || completes(Right {}) != 10 { return 4 }
+  if exclusive(Left { value: 6 }) != 6 || exclusive(Right {}) != 0 { return 5 }
+  if redundant(Point { x: 2, y: 3 }) != 5 { return 6 }
+  if destructured(Point { x: 4, y: 5 }) != 20 { return 7 }
+  if copied(Token { value: 21 }) != 42 { return 8 }
+  if variant(Shape.Circle { radius: 11 }) != 11 || variant(Shape.Empty) != 5 { return 9 }
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
@@ -4172,13 +4218,8 @@ pub fn main() -> i32 {
   },
   // folded from HashedCollections.test.ts: seeded map growth with checked reads.
   {
-    name: 'hashed-map-seeded-order-12345',
-    source: hashedMapOrder(12345, 971199974),
-    expected: { _tag: 'Completes', result: 42 },
-  },
-  {
-    name: 'hashed-map-seeded-order-6789',
-    source: hashedMapOrder(6789, 434552010),
+    name: 'hashed-map-seeded-order',
+    source: hashedMapSeededOrder,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
@@ -9323,6 +9364,81 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recoverAllocation) 
     source: inflateAcceptanceSource,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // One million suspended recursive frames must complete without growing the machine stack (an
+  // unbounded native frame protocol overflows it and dies on a signal). The same executable then
+  // covers the unit-valued sibling of `suspension-retry-failure`: a resumed unit suspend, one retry
+  // and a payload-free failure still reach the handler.
+  {
+    name: 'suspension-native-depth-and-unit-retry',
+    source: `import silk.effect { Effect }
+struct Owner { value: i32 }
+effect fn count(value: i32) -> i32 {
+  if value == 0 { return 0 }
+  let next = run Effect.suspend(effect { return value - 1 })
+  let inner = run count(next)
+  return inner + 1
+}
+effect fn retainOwner(owner: &mut Owner, value: i32) -> i32 {
+  let answer = run count(value)
+  return owner.value + answer - answer + 1
+}
+struct Problem {}
+effect fn attempt() -> i32 ! Problem {
+  let resumed = run Effect.suspend(effect { return () })
+  fail Problem {}
+}
+effect fn recover(error: Problem) -> i32 { return 7 }
+pub fn main() -> i32 {
+  let mut owner = Owner { value: 41 }
+  let deep = run retainOwner(&mut owner, 1000000)
+  if deep != 42 { return 1 }
+  let recovered = run Effect.catchAll(
+    attempt() |> Effect.retry(1),
+    recover
+  )
+  if recovered != 7 { return 2 }
+  return 42
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // SERV-009 / EFF-004: provision applies to one Effect layer, so the inner Effect returned by a
+  // provided outer execution observes its own provider (2), never the outer one (1).
+  {
+    name: 'nested-effect-row-provide-each-layer',
+    source: `import silk.effect { Effect }
+service Counter {
+  effect fn get() -> i32 ? &Counter
+}
+struct Cell { n: i32 }
+impl Cell {
+  effect fn getImpl(self: &Self) -> i32 { return self.n }
+}
+impl Counter for Cell { get: Cell.getImpl }
+effect fn read() -> i32 ? &Counter { return run Counter.get() }
+effect fn outer() -> Effect<'static; i32 ? &Counter> ? &Counter {
+  return read()
+}
+pub fn main() -> i32 {
+  let a = Cell { n: 1 }
+  let b = Cell { n: 2 }
+  let inner = run Effect.provide<Counter>(outer(), &a)
+  return run Effect.provide<Counter>(move inner, &b)
+}`,
+    expected: { _tag: 'Completes', result: 2 },
+  },
+  // A usize literal beyond 2^53 survives exactly through a native i64 call. Wasm rejects the
+  // same program with LAY0001, so this row is native-only by contract. Usize.test.ts reads this
+  // source for its layout, lowering and Wasm-rejection analyses.
+  {
+    name: 'usize-exact-native-i64-call',
+    source: `import silk.usize
+fn increment(value: usize) -> usize { return usize.add(value, 1) }
+pub fn main() -> i32 {
+  if increment(9007199254740993) == 9007199254740994 { return 42 }
+  return 0
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   ...corpus,
   ...algorithmExamples,
   algorithmicCompilerFold,
@@ -10174,37 +10290,17 @@ pub fn main() -> i32 {
   ...staticCompositionCorpus,
 ]
 
-/** Invalid generic programs that must stop before target layout and MIR. */
+/**
+ * Invalid generic programs that must stop before target layout and MIR. One frontend rejection
+ * proves the stop precedes instance discovery; polymorphic recursion is rejected by instance
+ * discovery itself. TypeGenerics owns each generic diagnostic at the analysis tier.
+ */
 export const invalidGenericCorpus: ReadonlyArray<InvalidCorpusProgram> = [
   {
     name: 'generic-explicit-arity',
     source:
       'fn identity<T>(value: T) -> T { return move value }\npub fn main() -> i32 { return identity<i32, bool>(42) }',
     codes: ['SEM0051'],
-  },
-  {
-    name: 'generic-explicit-arity-past-prefix',
-    source:
-      'fn pair<A, B>(left: A, right: B) -> A { return move left }\npub fn main() -> i32 { return pair<i32, bool, u8>(1, true) }',
-    codes: ['SEM0051'],
-  },
-  {
-    name: 'generic-uninferred-prefix-remainder',
-    source:
-      'fn phantom<A, B>(value: A) -> A { return move value }\npub fn main() -> i32 { return phantom<i32>(1) }',
-    codes: ['SEM0099'],
-  },
-  {
-    name: 'generic-contradicted-prefix',
-    source:
-      'fn pair<A, B>(left: A, right: B) -> A { return move left }\npub fn main() -> i32 { return pair<bool>(1, true) }',
-    codes: ['SEM0100'],
-  },
-  {
-    name: 'generic-conflicting-inference',
-    source:
-      'fn same<T>(left: T, right: T) -> T { return move left }\npub fn main() -> i32 { return same(1, true) }',
-    codes: ['SEM0052'],
   },
   {
     name: 'generic-polymorphic-recursion',

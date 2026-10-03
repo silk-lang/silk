@@ -1602,8 +1602,17 @@ export const discover = (
     /** Ordinary type arguments retained as the finite structural measure of a cleanup path. */
     readonly cleanupMeasure?: CleanupMeasure
   }
-  const declarationText = (key: InstanceKey): string =>
-    `${key.declaration.module}\u0000${key.declaration.name}`
+  // One retained text per key: the graph maps below look it up for every successor history, and a
+  // reused string keeps its cached hash.
+  const declarationTexts = new WeakMap<InstanceKey, string>()
+  const declarationText = (key: InstanceKey): string => {
+    let text = declarationTexts.get(key)
+    if (text === undefined) {
+      text = `${key.declaration.module}\u0000${key.declaration.name}`
+      declarationTexts.set(key, text)
+    }
+    return text
+  }
   const familiesByDeclaration = new Map<string, Set<string>>()
   const familyOfKey = new WeakMap<InstanceKey, string>()
   /** A provider's finite callable target selects which body can continue a generic call cycle. */
@@ -1680,12 +1689,25 @@ export const discover = (
     discriminatingGrew = true
     return true
   }
-  // One retained text per key without a structural provider. Ancestor values and contexts are
-  // long; reusing one string reuses its cached hash in every map keyed by it.
+  // One retained text per key and structural provider. Ancestor values are long; reusing one
+  // string reuses its cached hash in every map keyed by it.
   const unprovidedAncestorValues = new WeakMap<InstanceKey, string>()
+  const providedAncestorValues = new WeakMap<InstanceKey, Map<string, string>>()
   const ancestorValue = (ancestor: Ancestor): string => {
-    if (ancestor.structuralProvider !== undefined)
-      return JSON.stringify([keyText(ancestor.key), Type.key(ancestor.structuralProvider)])
+    if (ancestor.structuralProvider !== undefined) {
+      const provider = Type.key(ancestor.structuralProvider)
+      let values = providedAncestorValues.get(ancestor.key)
+      if (values === undefined) {
+        values = new Map()
+        providedAncestorValues.set(ancestor.key, values)
+      }
+      let value = values.get(provider)
+      if (value === undefined) {
+        value = JSON.stringify([keyText(ancestor.key), provider])
+        values.set(provider, value)
+      }
+      return value
+    }
     let value = unprovidedAncestorValues.get(ancestor.key)
     if (value === undefined) {
       value = JSON.stringify([keyText(ancestor.key), null])
@@ -2277,6 +2299,9 @@ export const discover = (
     roots: [...new Map(roots.map((root) => [Type.runtimeKey(root), root])).values()],
     frame,
   })
+  // Whether a measure admits a target without a selected hook depends on the two alone; every
+  // context visit and history branch reaching the same call asks it again.
+  const coveredTargets = new WeakMap<CleanupMeasure, WeakMap<InstanceKey, boolean>>()
   const cleanupTransition = (
     measure: CleanupMeasure | undefined,
     target: InstanceKey,
@@ -2309,16 +2334,23 @@ export const discover = (
         ? cleanupMeasureOf(measure.roots, typeArgumentsOf(target))
         : undefined
     }
-    const targetTypes = typeArgumentsOf(target)
-    return targetTypes.every(
-      (type) =>
-        coveredByCleanupMeasure(measure, type) ||
-        measure.frame.some(
-          (frame) => sameRuntimeType(type, frame) || isStrictCleanupSubterm(type, frame),
-        ),
-    )
-      ? measure
-      : undefined
+    let covered = coveredTargets.get(measure)
+    if (covered === undefined) {
+      covered = new WeakMap()
+      coveredTargets.set(measure, covered)
+    }
+    let admitted = covered.get(target)
+    if (admitted === undefined) {
+      admitted = typeArgumentsOf(target).every(
+        (type) =>
+          coveredByCleanupMeasure(measure, type) ||
+          measure.frame.some(
+            (frame) => sameRuntimeType(type, frame) || isStrictCleanupSubterm(type, frame),
+          ),
+      )
+      covered.set(target, admitted)
+    }
+    return admitted ? measure : undefined
   }
   const sameVisibleArguments = (left: InstanceKey, right: InstanceKey): boolean => {
     const leftVisible = left.typeArguments.filter(
@@ -2403,21 +2435,43 @@ export const discover = (
   // a queue bucket; a new canonical history root revisits that bucket's outgoing guards.
   // Static text origins locate diagnostics, not specializations. Retain the first caller's
   // provenance when the bucket grows, as for repeated calls with equal static values.
+  // A context is named by small ordinals: its key's text, and the runtime ordinals of its measure's
+  // roots and frame as sorted multisets. Contexts are compared on every schedule, so their texts
+  // stay short instead of restating whole key and type encodings.
+  const keyOrdinals = new Map<string, number>()
   const unmeasuredContexts = new WeakMap<InstanceKey, string>()
-  const contextText = (item: WorkItem): string => {
-    if (item.cleanupMeasure !== undefined)
-      return JSON.stringify([
-        keyText(item.key),
-        item.cleanupMeasure.roots.map(Type.runtimeKey).sort(),
-        item.cleanupMeasure.frame.map(Type.runtimeKey).sort(),
-      ])
-    let context = unmeasuredContexts.get(item.key)
+  const unmeasuredContext = (key: InstanceKey): string => {
+    let context = unmeasuredContexts.get(key)
     if (context === undefined) {
-      context = JSON.stringify([keyText(item.key), null, null])
-      unmeasuredContexts.set(item.key, context)
+      const text = keyText(key)
+      let ordinal = keyOrdinals.get(text)
+      if (ordinal === undefined) {
+        ordinal = keyOrdinals.size
+        keyOrdinals.set(text, ordinal)
+      }
+      context = `${ordinal}`
+      unmeasuredContexts.set(key, context)
     }
     return context
   }
+  const sortedRuntimeOrdinals = (types: ReadonlyArray<Type.Type>): string =>
+    types
+      .map(runtimeOrdinal)
+      .sort((left, right) => left - right)
+      .join(',')
+  const measureTexts = new WeakMap<CleanupMeasure, string>()
+  const measureText = (measure: CleanupMeasure): string => {
+    let text = measureTexts.get(measure)
+    if (text === undefined) {
+      text = `${sortedRuntimeOrdinals(measure.roots)}|${sortedRuntimeOrdinals(measure.frame)}`
+      measureTexts.set(measure, text)
+    }
+    return text
+  }
+  const contextText = (item: WorkItem): string =>
+    item.cleanupMeasure === undefined
+      ? unmeasuredContext(item.key)
+      : `${unmeasuredContext(item.key)}:${measureText(item.cleanupMeasure)}`
   const pending: Array<string> = []
   type StaticOrigins = ReadonlyArray<Evaluation.TextOrigin | undefined>
   /** What each call that selected an application wrote for its static text. */
@@ -2488,6 +2542,18 @@ export const discover = (
     return true
   }
   for (const root of roots) schedule(root)
+  // The hook calls of one cleanup plan depend on the plan alone, and plans are shared by type key,
+  // so every body mentioning a type reuses one traversal of its plan.
+  const planHookCalls = new WeakMap<CleanupPlan.CleanupPlan, ReadonlyArray<CallTarget>>()
+  const cleanupHookCalls = (type: Type.Type): ReadonlyArray<CallTarget> => {
+    const plan = CleanupPlan.cleanupPlan(index, type)
+    let calls = planHookCalls.get(plan)
+    if (calls === undefined) {
+      calls = hookCalls(plan, index)
+      planHookCalls.set(plan, calls)
+    }
+    return calls
+  }
   const cleanupPrepassTargets = (
     fn: Tir.TirFunction,
     substitution: Type.Substitution,
@@ -2505,14 +2571,12 @@ export const discover = (
       const type = Type.substitute(expression.type, substitution)
       types.set(Type.key(type), type)
     }
-    return [...types.values()].flatMap((type) =>
-      hookCalls(CleanupPlan.cleanupPlan(index, type), index),
-    )
+    return [...types.values()].flatMap(cleanupHookCalls)
   }
   /** Finds concrete provider-owner roots whose cleanup plans select the target. */
   const cleanupRootsOf = (ancestor: InstanceKey, target: InstanceKey): ReadonlyArray<Type.Type> =>
     typeArgumentsOf(ancestor).filter((type) =>
-      hookCalls(CleanupPlan.cleanupPlan(index, type), index).some((call) => {
+      cleanupHookCalls(type).some((call) => {
         const fn = FunctionIndex.tirByName(
           results.get(call.declaration.module)?.tir,
           call.declaration.name,
@@ -2544,7 +2608,20 @@ export const discover = (
     readonly witnessTargets: ReadonlyArray<CallTarget>
     readonly cleanupRoots: ReadonlyMap<string, ReadonlyArray<Type.Type>>
     /** Each call's concrete target, resolved once for every ancestry context of this key. */
-    readonly targetKeys: Map<CallTarget, InstanceKey | undefined>
+    readonly resolvedCalls: Map<CallTarget, ResolvedCall | undefined>
+  }
+  /**
+   * One call of an analyzed key with everything its visits share: the target, the edge kind, the
+   * cleanup roots that selected it, and the edge's text. Each visit of the key then only builds
+   * the ancestry-dependent part instead of restating these per visit and per history branch.
+   */
+  interface ResolvedCall {
+    readonly target: InstanceKey
+    readonly kind: ExecutionEdge['kind']
+    readonly selectedRoots: ReadonlyArray<Type.Type>
+    readonly edgeText: string
+    /** Whether the declaration call graph holds this edge; that graph survives restarts. */
+    linked: boolean
   }
   const analyzedKeys = new Map<string, Analyzed | undefined>()
   // Without a staged application a body's callables never consult recorded callables, so each
@@ -2772,8 +2849,43 @@ export const discover = (
       ordinaryIdentities,
       witnessTargets,
       cleanupRoots,
-      targetKeys: new Map(),
+      resolvedCalls: new Map(),
     }
+  }
+  const noRoots: ReadonlyArray<Type.Type> = []
+  const resolveCall = (
+    key: InstanceKey,
+    analyzed: Analyzed,
+    call: CallTarget,
+  ): ResolvedCall | undefined => {
+    if (analyzed.resolvedCalls.has(call)) return analyzed.resolvedCalls.get(call)
+    const target = call.declaration
+    const targetFunction = FunctionIndex.tirByName(results.get(target.module)?.tir, target.name)
+    let resolved: ResolvedCall | undefined
+    if (targetFunction !== undefined) {
+      const targetKey = keyOf(
+        target,
+        targetFunction.contract,
+        targetFunction.declaration.typeParameters.map((parameter) => parameter.type),
+        call.typeArguments.map((argument) =>
+          Type.substituteGenericArgument(argument, analyzed.substitution),
+        ),
+        call.staticArguments ?? [],
+        call.evidence ?? [],
+      )
+      const identity = analyzed.identityOfCall(call)
+      const kind = analyzed.ordinaryIdentities.has(identity) ? 'Runtime' : 'Cleanup'
+      resolved = {
+        target: targetKey,
+        kind,
+        selectedRoots:
+          kind === 'Runtime' ? noRoots : (analyzed.cleanupRoots.get(identity) ?? noRoots),
+        edgeText: `${keyText(key)}\u0005${kind}\u0005${keyText(targetKey)}`,
+        linked: false,
+      }
+    }
+    analyzed.resolvedCalls.set(call, resolved)
+    return resolved
   }
   // Contexts processed by the current attempt, and where it stops once a family grew.
   let attemptProcessed = 0
@@ -2821,8 +2933,7 @@ export const discover = (
         recordedContexts.set(keyText(key), ownerContexts)
         const analyzed = analyze(key)
         if (analyzed === undefined) continue
-        const { fn, substitution, calls, identityOfCall, ordinaryIdentities, cleanupRoots } =
-          analyzed
+        const { fn, substitution, calls } = analyzed
         let callables = stagedApplication(fn) ? undefined : contextFreeCallables.get(key)
         if (callables === undefined) {
           callables = concreteCallables(
@@ -2838,38 +2949,19 @@ export const discover = (
         for (const callable of callables)
           recordedCallables.set(callableIdentity(callable), callable)
         for (const call of calls.values()) {
-          const identity = identityOfCall(call)
-          const target = call.declaration
-          let targetKey = analyzed.targetKeys.get(call)
-          if (targetKey === undefined && !analyzed.targetKeys.has(call)) {
-            const targetFunction = FunctionIndex.tirByName(
-              results.get(target.module)?.tir,
-              target.name,
-            )
-            targetKey =
-              targetFunction === undefined
-                ? undefined
-                : keyOf(
-                    target,
-                    targetFunction.contract,
-                    targetFunction.declaration.typeParameters.map((parameter) => parameter.type),
-                    call.typeArguments.map((argument) =>
-                      Type.substituteGenericArgument(argument, substitution),
-                    ),
-                    call.staticArguments ?? [],
-                    call.evidence ?? [],
-                  )
-            analyzed.targetKeys.set(call, targetKey)
-          }
-          if (targetKey === undefined) continue
-          const edgeKind = ordinaryIdentities.has(identity) ? 'Runtime' : 'Cleanup'
-          executionEdges.set(`${keyText(key)}\u0005${edgeKind}\u0005${keyText(targetKey)}`, {
+          const resolved = resolveCall(key, analyzed, call)
+          if (resolved === undefined) continue
+          const targetKey = resolved.target
+          executionEdges.set(resolved.edgeText, {
             _tag: 'ExecutionEdge',
-            kind: edgeKind,
+            kind: resolved.kind,
             owner: key,
             target: targetKey,
           })
-          addCallEdge(key, targetKey)
+          if (!resolved.linked) {
+            addCallEdge(key, targetKey)
+            resolved.linked = true
+          }
           for (const [value, branchHistory] of AncestorHistory.partition(
             histories,
             item.ancestors,
@@ -2883,7 +2975,7 @@ export const discover = (
             const cleanup = cleanupTransition(
               item.cleanupMeasure,
               targetKey,
-              ordinaryIdentities.has(identity) ? [] : (cleanupRoots.get(identity) ?? []),
+              resolved.selectedRoots,
               ancestor?.key,
             )
             const terminalCallableSpecialization =
@@ -2979,6 +3071,10 @@ export const discover = (
             ...(provided.providers === undefined ? {} : { providers: provided.providers }),
           },
         )
+        // A cleanup implementation can select another specialization of the same lexical service
+        // operation while recursively releasing a field. Admit only targets proved reachable from
+        // the providing owner's finite cleanup plan; unrelated provider recursion stays guarded.
+        let cleanupRoots: ReadonlyArray<Type.Type> | undefined
         for (const ownerContext of recordedContexts.get(keyText(provided.owner))?.values() ?? []) {
           addCallEdge(provided.owner, provided.target)
           for (const [value, branchHistory] of AncestorHistory.partition(
@@ -2987,10 +3083,7 @@ export const discover = (
             recursionFamily(provided.target),
           )) {
             const ancestor = value === undefined ? undefined : ancestorValues.get(value)
-            // A cleanup implementation can select another specialization of the same lexical service
-            // operation while recursively releasing a field. Admit only targets proved reachable from
-            // the providing owner's finite cleanup plan; unrelated provider recursion stays guarded.
-            const cleanupRoots = cleanupRootsOf(provided.owner, provided.target)
+            cleanupRoots ??= cleanupRootsOf(provided.owner, provided.target)
             const cleanup = cleanupTransition(
               ownerContext.cleanupMeasure,
               provided.target,

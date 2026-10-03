@@ -1,5 +1,9 @@
-/** Request preflight and exact client content-storage admission without retaining codec execution. */
-export const httpRequestAcceptanceSource = `import silk.allocator {Allocator, OutOfMemoryError}
+/**
+ * Request preflight and exact client content-storage admission without retaining codec execution.
+ * The portable program runs on every target; native acquisition and proxy admission checks reach
+ * libc-only operations and therefore compose only into the native program.
+ */
+const portableImports = `import silk.allocator {Allocator, OutOfMemoryError}
 import silk.effect {Effect}
 import silk.http {Method, Version, Header, ValueError}
 import silk.http_headers {Headers, Limits}
@@ -21,29 +25,6 @@ import silk.http_basic {BasicError}
 import silk.http_origin {Origin, OriginError}
 import silk.uri_reference {ParseError}
 import silk.slice {Slice}
-import silk.http_client_native {
-  acquireOwned,
-  acquireUnixOwned,
-  NativeRedirectClient,
-  NativeRouteProvider,
-  Options,
-  NativeClientError,
-  preflight,
-  preflightProxyRoute,
-}
-import silk.native_socket {NativeSocketError}
-import silk.http_redirect as Redirect {ResponseHandler}
-import silk.http_proxy {
-  BypassPolicy,
-  ProxyAuth,
-  ProxyAuthContextId,
-  ProxyConfig,
-  ProxyConfigId,
-  ProxyError,
-  Route,
-  RouteMode,
-  selectRoute,
-}
 import silk.option {Option}
 import silk.system_clock {Instant, SystemClock}
 import silk.bytes {Bytes}
@@ -55,9 +36,7 @@ import silk.http_client {
   Exchange,
   ClientError,
   ConnectionPhase,
-  ContinuePolicy,
   RequestOptions,
-  RouteTransport,
   Limits as ClientLimits,
 }
 import silk.http_content as Content
@@ -84,15 +63,32 @@ import silk.random {Random}
 import silk.http_transport {HttpTransport, TransportError}
 import silk.vector {Vector}
 import silk.u64
-import silk.trust_source {TrustSource}
-import silk.trust_snapshot {
-  TrustConfigurationReason,
-  TrustLoadLimits,
-  TrustSnapshot,
-  TrustSourceError,
-}
+`
 
-fn bytesEqual(left: &[u8], right: &[u8]) -> bool {
+const nativeImports = `import silk.http_client_native {
+  acquireOwned,
+  acquireUnixOwned,
+  Options,
+  NativeClientError,
+  preflight,
+  preflightProxyRoute,
+}
+import silk.native_socket {NativeSocketError}
+import silk.http_proxy {
+  BypassPolicy,
+  ProxyAuth,
+  ProxyAuthContextId,
+  ProxyConfig,
+  ProxyConfigId,
+  ProxyError,
+  Route,
+  RouteMode,
+  selectRoute,
+}
+import silk.trust_snapshot {TrustSnapshot}
+`
+
+const policySupport = `fn bytesEqual(left: &[u8], right: &[u8]) -> bool {
   if left.length != right.length {
     return false
   }
@@ -284,8 +280,9 @@ fn policyChecks() -> i32 {
   }
   return 0
 }
+`
 
-fn nativeUri<'text>(text: string<'text>) -> Uri<'text> {
+const nativeSupport = `fn nativeUri<'text>(text: string<'text>) -> Uri<'text> {
   let uri = match move Uri.parse(text) {
     Result.Success {value} => value
     Result.Failure {error} => {
@@ -307,119 +304,17 @@ fn nativeOrigin(text: string) -> Origin {
   }
 }
 
-struct RedirectDeadlineResponse {}
+struct NativeWallClock {}
 
-impl RedirectDeadlineResponse {
-  effect<
-    'call,
-    'exchangeView: 'call,
-    'transport: 'exchangeView,
-    'provider: 'transport,
-    'tunnel: 'provider,
-  > fn handle<
-    'call,
-    'exchangeView: 'call,
-    'transport: 'exchangeView,
-    'provider: 'transport,
-    'tunnel: 'provider,
-  >(
-    handler: &mut Self,
-    uri: Uri<'call>,
-    hop: usize,
-    exchange: &'call mut Exchange<
-      'exchangeView,
-      RouteTransport<'transport, 'provider, 'tunnel, NativeRouteProvider>
-    >,
-  ) -> i32 {
-    drop handler
-    drop uri
-    drop hop
-    drop exchange
-    return 20
-  }
-}
-
-impl ResponseHandler<NativeRouteProvider, i32, never ? never> for RedirectDeadlineResponse {
-  handle: RedirectDeadlineResponse.handle
-}
-
-struct RedirectWallClock {}
-
-impl SystemClock for RedirectWallClock {
+impl SystemClock for NativeWallClock {
   effect fn now(self: &mut Self) -> Instant { return SystemClock.make(0, 0) }
   effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
 }
 
-struct RedirectTrustSource {}
-
-impl TrustSource for RedirectTrustSource {
-  effect fn load(
-    self: &mut Self,
-    limits: TrustLoadLimits,
-  ) -> TrustSnapshot
-  ! TrustSourceError | OutOfMemoryError
-  ? &mut Allocator {
-    drop self
-    drop limits
-    fail TrustSourceError.InvalidConfiguration {reason: TrustConfigurationReason.EmptyRoot}
-  }
-}
-
-fn expectedRedirectDeadline(error: NativeClientError) -> bool {
+fn expectedUnsupportedDeadline(error: NativeClientError) -> bool {
   return match move error {
     NativeClientError.UnsupportedDeadline => true
     _ => false
-  }
-}
-
-effect fn redirectAdapterDeadlineCheck<'configuration>(
-  route: Route<'configuration>,
-) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let uri = nativeUri("http://127.0.0.3/redirect-adapter")
-  let fields: [Header<'static>; 0] = []
-  let headers = match move Headers.make(&fields, limits()) {
-    Result.Success {value} => value
-    Result.Failure {error} => {
-      drop error
-      return 21
-    }
-  }
-  let request = Redirect.Request {
-    uri: uri,
-    method: Method.get(),
-    headers: headers,
-    headerPolicy: HeaderPolicy.defaults(),
-    version: Version.Http11,
-    continuePolicy: ContinuePolicy.Disabled,
-    limits: limits(),
-    maxHeadBytes: 4096,
-    maxCredentialBytes: 128,
-  }
-  let mut client = NativeRedirectClient.make(route, Options.defaults(), ClientLimits.defaults())
-  let policy = Redirect.Policy.defaults()
-  let mut scratch: [u8; 1] = [0]
-  let mut wall = RedirectWallClock {}
-  let mut clock = BudgetClock {}
-  let mut random = BudgetRandom {}
-  let mut trust = RedirectTrustSource {}
-  let attempted = run Effect.result(Redirect.withEmptyResponse(
-    &mut client,
-    move request,
-    &policy,
-    Option.some<Instant>(SystemClock.make(7, 0)),
-    &mut scratch,
-    RedirectDeadlineResponse {},
-  ))
-    |> Effect.provideMut<TrustSource>(&mut trust)
-    |> Effect.provideMut<SystemClock>(&mut wall)
-    |> Effect.provideMut<Random>(&mut random)
-    |> Effect.provideMut<MonotonicClock>(&mut clock)
-  return match move attempted {
-    Result.Success {value} => 22
-    Result.Failure {error} => match move error {
-      NativeClientError cause => if expectedRedirectDeadline(move cause) { 0 } else { 23 }
-      _ => 24
-    }
   }
 }
 
@@ -522,7 +417,7 @@ effect fn nativeOwnedAcquisitionChecks() -> i32
     return match move secureAttempt {
       Result.Success {value} => {
         drop value
-        7
+        return 7
       }
       Result.Failure {error} => match move error {
         NativeClientError cause => match move cause {
@@ -701,15 +596,21 @@ effect fn nativeProxyAdmissionChecks() -> i32 ! OutOfMemoryError ? &mut Allocato
     Result.Success {value} => { return 17 }
     Result.Failure {error} => match move error {
       NativeClientError cause => {
-        if !expectedRedirectDeadline(move cause) { return 18 }
+        if !expectedUnsupportedDeadline(move cause) { return 18 }
       }
       ProxyError cause => { return 19 }
     }
   }
-  return run redirectAdapterDeadlineCheck(dnsRoute)
+  return 0
 }
 
-fn limits() -> Limits {
+effect fn recoverProxyAllocation(error: OutOfMemoryError) -> i32 {
+  drop error
+  return 20
+}
+`
+
+const programSupport = `fn limits() -> Limits {
   return Limits {
     maxMethodBytes: 32,
     maxTargetBytes: 256,
@@ -1161,19 +1062,14 @@ effect fn recover(error: ClientError | RequestError | OutOfMemoryError) -> i32 {
   drop error
   return 9
 }
+`
 
-pub fn main() -> i32 {
-  let checked = policyChecks()
-  if checked != 0 {
-    return 100 + checked
-  }
-  let admitted = nativeAdmissionChecks()
+const nativeChecks = `  let admitted = nativeAdmissionChecks()
   if admitted != 0 {
     return 200 + admitted
   }
-  let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = BudgetClock {}
-  let mut wall = RedirectWallClock {}
+  let mut wall = NativeWallClock {}
   let mut random = BudgetRandom {}
   let ownedAdmitted = run nativeOwnedAcquisitionChecks()
     |> Effect.provideMut<Random>(&mut random)
@@ -1183,12 +1079,34 @@ pub fn main() -> i32 {
   if ownedAdmitted != 0 {
     return 250 + ownedAdmitted
   }
-  let proxyAdmitted = run nativeProxyAdmissionChecks()
+  let proxyAdmitted = run Effect.catchAll(nativeProxyAdmissionChecks(), recoverProxyAllocation)
     |> Effect.provideMut<Allocator>(&mut allocator)
   if proxyAdmitted != 0 {
     return 300 + proxyAdmitted
   }
-  return run Effect.catchAll(allPrograms(), recover)
+`
+
+const sourceFor = (
+  imports: string,
+  support: string,
+  checks: string,
+): string => `${portableImports}${imports}
+${policySupport}
+${support}
+${programSupport}
+pub fn main() -> i32 {
+  let checked = policyChecks()
+  if checked != 0 {
+    return 100 + checked
+  }
+  let mut allocator = Allocator.systemAllocatorProvider()
+${checks}  return run Effect.catchAll(allPrograms(), recover)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 `
+
+/** The target-neutral request program shared by native and LLVM-to-Wasm acceptance. */
+export const httpRequestPortableAcceptanceSource = sourceFor('', '', '')
+
+/** The native program: the portable checks plus libc-backed acquisition and proxy admission. */
+export const httpRequestAcceptanceSource = sourceFor(nativeImports, nativeSupport, nativeChecks)

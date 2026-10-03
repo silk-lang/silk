@@ -4602,12 +4602,16 @@ export const callingShape = (
   }
 }
 
+// Runtime planning resolves every referenced type through the catalog; index its entries once
+// instead of scanning them per lookup. The first entry for a runtime key wins, as before.
+const catalogEntryIndexCache = new WeakMap<ReadonlyArray<CatalogEntry>, Map<string, CatalogEntry>>()
+
 /** Looks up one available or unavailable nominal catalog entry. */
 export const catalogEntry = (
   self: Catalog,
   type: DeclarationFacts.SemanticType,
 ): CatalogEntry | undefined =>
-  self.entries.find((candidate) => Type.runtimeKey(candidate.type) === Type.runtimeKey(type))
+  indexByTypeKey(catalogEntryIndexCache, self.entries).get(Type.runtimeKey(type))
 
 /**
  * Plans the bit-exact movement of one nominal failure payload between two tagged carriers.

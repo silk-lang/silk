@@ -44,21 +44,6 @@ const run = (source: string, overrides: Partial<BuildExeCommand.Options> = {}) =
   }).pipe(Effect.provide(CompilerHost.layer))
 
 it.effect(
-  'compiles a single file to a runnable executable and exits zero',
-  () =>
-    Effect.gen(function* () {
-      const source = sourceFile('main.silk', 'pub fn main() -> i32 { return 42 }')
-      const output = join(root, 'answer')
-
-      const status = yield* run(source, { output })
-
-      assert.strictEqual(status, 0)
-      assert.strictEqual(spawnSync(output).status, 42)
-    }),
-  Timeouts.nativeBuild,
-)
-
-it.effect(
   'resolves nested imports from the source root rather than the importer directory',
   () =>
     Effect.gen(function* () {

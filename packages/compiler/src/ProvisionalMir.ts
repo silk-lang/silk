@@ -173,8 +173,77 @@ const executionIndex = (executions: ReadonlyArray<Execution>): Map<string, Execu
   return index
 }
 
-// Finalization asks several questions of each lowered function; both lookups below scan every
-// provisional execution, so their answers are retained per published execution list.
+const declarationText = (module: string, name: string): string => `${module}\u0000${name}`
+
+// Provided runner names resolve to their base runner's declaration. Each query used to scan every
+// provisional execution (and every region for classifications); both are bucketed by base
+// declaration once per published execution list, preserving execution and region order.
+const runnerExecutionIndexCache = new WeakMap<
+  ReadonlyArray<Execution>,
+  ReadonlyMap<string, ReadonlyArray<Execution>>
+>()
+
+const runnerExecutionIndex = (
+  executions: ReadonlyArray<Execution>,
+): ReadonlyMap<string, ReadonlyArray<Execution>> => {
+  let index = runnerExecutionIndexCache.get(executions)
+  if (index === undefined) {
+    const buckets = new Map<string, Array<Execution>>()
+    for (const execution of executions) {
+      if (execution.key._tag === 'InstanceExecution') continue
+      const declaration = executionInstance(execution.key).declaration
+      const key = declarationText(declaration.module, declaration.name)
+      const bucket = buckets.get(key)
+      if (bucket === undefined) buckets.set(key, [execution])
+      else bucket.push(execution)
+    }
+    index = buckets
+    runnerExecutionIndexCache.set(executions, index)
+  }
+  return index
+}
+
+interface ProvidedRun {
+  readonly key: Instances.InstanceKey
+  readonly classification: Classification
+}
+
+const providedRunIndexCache = new WeakMap<
+  ReadonlyArray<Execution>,
+  ReadonlyMap<string, ReadonlyArray<ProvidedRun>>
+>()
+
+const providedRunIndex = (
+  executions: ReadonlyArray<Execution>,
+): ReadonlyMap<string, ReadonlyArray<ProvidedRun>> => {
+  let index = providedRunIndexCache.get(executions)
+  if (index === undefined) {
+    const buckets = new Map<string, Array<ProvidedRun>>()
+    for (const execution of executions)
+      for (const region of execution.regions) {
+        const outcome = region.outcome
+        if (
+          outcome._tag !== 'RunSuspendableEffect' ||
+          outcome.runner.execution._tag !== 'ProvidedEffectRunnerExecution'
+        )
+          continue
+        const run = {
+          key: executionInstance(outcome.runner.execution),
+          classification: outcome.runner.classification,
+        }
+        const key = declarationText(run.key.declaration.module, run.key.declaration.name)
+        const bucket = buckets.get(key)
+        if (bucket === undefined) buckets.set(key, [run])
+        else bucket.push(run)
+      }
+    index = buckets
+    providedRunIndexCache.set(executions, index)
+  }
+  return index
+}
+
+// Finalization asks several questions of each lowered function; both lookups below compare
+// candidate keys textually, so their answers are retained per published execution list.
 const resolvedExecutions = new WeakMap<
   ReadonlyArray<Execution>,
   Map<string, Execution | undefined>
@@ -216,14 +285,10 @@ const resolveExecutionForInstance = (
   if (exact !== undefined) return exact
   const baseName = providedBaseName(instance.declaration.name)
   if (baseName === undefined) return undefined
-  const candidates = self.executions.filter((execution) => {
-    if (execution.key._tag === 'InstanceExecution') return false
-    const executionKey = executionInstance(execution.key)
-    return (
-      executionKey.declaration.module === instance.declaration.module &&
-      executionKey.declaration.name === baseName
-    )
-  })
+  const candidates =
+    runnerExecutionIndex(self.executions).get(
+      declarationText(instance.declaration.module, baseName),
+    ) ?? []
   const specialized = candidates.find((execution) => {
     const executionKey = executionInstance(execution.key)
     return (
@@ -282,23 +347,15 @@ const resolveProvidedClassification = (
 ): Classification | undefined => {
   const baseName = providedBaseName(instance.declaration.name)
   if (baseName === undefined) return undefined
-  const classifications = self.executions.flatMap((execution) =>
-    execution.regions.flatMap((region) => {
-      const outcome = region.outcome
-      if (
-        outcome._tag !== 'RunSuspendableEffect' ||
-        outcome.runner.execution._tag !== 'ProvidedEffectRunnerExecution'
-      )
-        return []
-      // Distinct providers may give the same base runner different suspension behavior.
-      const key = executionInstance(outcome.runner.execution)
-      return key.declaration.module === instance.declaration.module &&
-        key.declaration.name === baseName &&
-        Instances.keyText({ ...key, declaration: instance.declaration }) ===
-          Instances.keyText(instance)
-        ? [outcome.runner.classification]
-        : []
-    }),
+  // Distinct providers may give the same base runner different suspension behavior.
+  const classifications = (
+    providedRunIndex(self.executions).get(declarationText(instance.declaration.module, baseName)) ??
+    []
+  ).flatMap((run) =>
+    Instances.keyText({ ...run.key, declaration: instance.declaration }) ===
+    Instances.keyText(instance)
+      ? [run.classification]
+      : [],
   )
   if (classifications.length > 0) return mergeClassifications(classifications)
 

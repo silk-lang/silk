@@ -1763,7 +1763,7 @@ export const makeModule = (
   for (const head of headers?.inherentImpls ?? []) collectInherentImpl(head, index, scope, pending)
   for (const conformance of headers?.conformances ?? [])
     collectConformance(conformance, index, scope, pending)
-  for (const body of result.bodies) pending.push(...body.results.occurrences)
+  for (const body of result.bodies) pending.push(...(body.results.tooling?.occurrences ?? []))
   for (const condition of conditions) collectExpression(condition, index, scope, pending)
   collectImports(scope, index, pending)
   // The first binding of a spelling is the effective one; later ones are conflicts.

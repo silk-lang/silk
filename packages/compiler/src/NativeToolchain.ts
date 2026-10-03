@@ -2,6 +2,7 @@ import * as HelperCapability from './HelperCapability.js'
 import * as HelperSource from './HelperSource.js'
 import * as ToolchainIntegrity from './ToolchainIntegrity.js'
 import * as ObjectSymbols from './internal/ObjectSymbols.js'
+import * as Canonical from './internal/Canonical.js'
 import * as Config from 'effect/Config'
 import * as Schema from 'effect/Schema'
 import { NodeServices } from '@effect/platform-node'
@@ -216,7 +217,12 @@ export const resolveToolchain = Effect.fn('NativeToolchain.resolveToolchain')(fu
       toolchain.supply.archiver,
       ...toolchain.supply.files,
     ]).pipe(Effect.mapError(supplyError), Effect.provide(NodeServices.layer))
-    return toolchain
+    // Run exactly the validated tools: helper reuse keys objects by this compiler's digest.
+    return {
+      ...toolchain,
+      clang: toolchain.supply.compiler.command,
+      llvmAr: toolchain.supply.archiver.command,
+    }
   }
   const host = hostSelection()
   const supply = yield* PlatformSupplyResolver.resolveSupply(
@@ -854,14 +860,89 @@ const requirePath = Effect.fnUntraced(function* (
     return yield* storageError(operation, stage, path, new Error('expected output is missing'))
 })
 
-/** @internal ObjectEmission owns the public materialization operation. */
-export const materializeObject = Effect.fnUntraced(function* (
+/** Plans the scoped Clang step that turns `<baseName>.bc` into `<baseName>.o`. */
+const objectPlan = Effect.fnUntraced(function* (
+  toolchain: Toolchain,
+  scope: BuildScope,
+  profile: CompilationProfile.Facts,
+  baseName: string,
+  support: boolean,
+): Effect.fn.Return<ToolchainPlan.PlannedCommand> {
+  const base = ToolchainPlan.objectCommand(
+    toolchain.clang,
+    profile,
+    join(scope.root, `${baseName}.bc`),
+    join(scope.root, `${baseName}.o`),
+  )
+  return {
+    ...base,
+    arguments: [
+      '--no-default-config',
+      ...base.arguments,
+      ...(support
+        ? ['-mllvm', '-disable-loop-idiom-memcpy', '-mllvm', '-disable-loop-idiom-memset']
+        : []),
+    ],
+    environment: toolchain.supply?.environment ?? {
+      PATH: yield* Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie),
+      LC_ALL: 'C',
+      LANG: 'C',
+    },
+  }
+})
+
+/** Inventories one object's bytes and accounts its references against the emitting declarations. */
+const admitObject = Effect.fnUntraced(function* (
+  scope: BuildScope,
+  profile: CompilationProfile.Facts,
+  objectPath: string,
+  bytes: Uint8Array,
+  declarations: HelperCapability.Declarations,
+  planned: ToolchainPlan.PlannedCommand,
+): Effect.fn.Return<ObjectArtifact, ToolchainError> {
+  const target = profile.target
+  const inventory = ObjectSymbols.inspect(bytes, target)
+  if (Result.isFailure(inventory))
+    return yield* helperError(
+      new HelperCapability.HelperError({
+        operation: 'ObjectEmission.materialize',
+        code: 'InvalidObject',
+        subject: inventory.failure.detail,
+        origins: [objectPath, target.id],
+      }),
+    )
+  const helpers = yield* HelperCapability.reconcile(
+    inventory.success,
+    declarations,
+    profile,
+    objectPath,
+    ToolchainIntegrity.contentDigest(bytes),
+  ).pipe(Effect.mapError(helperError))
+  return {
+    _tag: 'ObjectArtifact',
+    helpers,
+    inventory: inventory.success,
+    artifact: {
+      _tag: 'PathArtifact',
+      scope: scope.name,
+      path: objectPath,
+      target,
+    },
+    planned,
+  }
+})
+
+/** Runs the Clang object step, returning the admitted object together with its exact bytes. */
+const emitObject = Effect.fnUntraced(function* (
   toolchain: Toolchain,
   scope: BuildScope,
   artifact: Backend.LlvmBitcodeArtifact,
   profile: CompilationProfile.CompilationProfile,
-  baseName = 'program',
-): Effect.fn.Return<ObjectArtifact, ToolchainError> {
+  baseName: string,
+): Effect.fn.Return<
+  { readonly object: ObjectArtifact; readonly bytes: Uint8Array },
+  ToolchainError
+> {
   if (
     profile.target.kind === 'Native' &&
     profile.libc === 'none' &&
@@ -893,24 +974,8 @@ export const materializeObject = Effect.fnUntraced(function* (
       }),
     )
   const target = profile.target
-  const bitcodePath = join(scope.root, `${baseName}.bc`)
   const objectPath = join(scope.root, `${baseName}.o`)
-  const base = ToolchainPlan.objectCommand(toolchain.clang, profile, bitcodePath, objectPath)
-  const planned = {
-    ...base,
-    arguments: [
-      '--no-default-config',
-      ...base.arguments,
-      ...(artifact.support
-        ? ['-mllvm', '-disable-loop-idiom-memcpy', '-mllvm', '-disable-loop-idiom-memset']
-        : []),
-    ],
-    environment: toolchain.supply?.environment ?? {
-      PATH: yield* Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie),
-      LC_ALL: 'C',
-      LANG: 'C',
-    },
-  }
+  const planned = yield* objectPlan(toolchain, scope, profile, baseName, artifact.support === true)
   if (artifact.target.id !== target.id) {
     return yield* processError(
       'ObjectEmission.materialize',
@@ -927,63 +992,129 @@ export const materializeObject = Effect.fnUntraced(function* (
     try: () => readFileSync(objectPath),
     catch: (cause) => storageError('ObjectEmission.materialize', 'object', objectPath, cause),
   })
-  const inventory = ObjectSymbols.inspect(bytes, target)
-  if (Result.isFailure(inventory))
-    return yield* helperError(
-      new HelperCapability.HelperError({
-        operation: 'ObjectEmission.materialize',
-        code: 'InvalidObject',
-        subject: inventory.failure.detail,
-        origins: [objectPath, target.id],
-      }),
-    )
-  const helpers = yield* HelperCapability.reconcile(
-    inventory.success,
-    artifact,
-    profile,
-    objectPath,
-    ToolchainIntegrity.contentDigest(bytes),
-  ).pipe(Effect.mapError(helperError))
-
-  return {
-    _tag: 'ObjectArtifact',
-    helpers,
-    inventory: inventory.success,
-    artifact: {
-      _tag: 'PathArtifact',
-      scope: scope.name,
-      path: objectPath,
-      target,
-    },
-    planned,
-  }
+  const object = yield* admitObject(scope, profile, objectPath, bytes, artifact, planned)
+  return { object, bytes }
 })
 
-/** Realizes the selected source helpers as one object and audits its emitted dependency closure. */
-export const compileHelpers = Effect.fn('NativeToolchain.compileHelpers')(function* (
+/** @internal ObjectEmission owns the public materialization operation. */
+export const materializeObject = Effect.fnUntraced(function* (
   toolchain: Toolchain,
   scope: BuildScope,
+  artifact: Backend.LlvmBitcodeArtifact,
+  profile: CompilationProfile.CompilationProfile,
+  baseName = 'program',
+): Effect.fn.Return<ObjectArtifact, ToolchainError> {
+  return (yield* emitObject(toolchain, scope, artifact, profile, baseName)).object
+})
+
+/**
+ * Helper-object reuse for {@link compileHelpers}: the Storage that also holds backend and final
+ * artifacts, and the digest of the compiler distribution whose embedded sources the helpers realize.
+ */
+export type HelperCache =
+  | { readonly _tag: 'Disabled' }
+  | {
+      readonly _tag: 'ReadWrite'
+      readonly store: Storage.Service
+      readonly distribution: string
+    }
+
+/** The one audited object realizing a build's selected source helpers. */
+export interface HelperObject {
+  readonly _tag: 'HelperObject'
+  readonly object: ObjectArtifact
+  /** The object came from {@link HelperCache}: neither helper realization nor Clang ran. */
+  readonly reused: boolean
+}
+
+/**
+ * Content address of one helper object. Helper realization depends only on the selected source
+ * providers (whose identities include the build's libc), the profile facts copied into the helper
+ * profile, the emitting backend, and the compiler distribution (which fixes the embedded
+ * standard-library sources); the object step adds the selected Clang binary.
+ */
+export const helperCacheKey = (
+  distribution: string,
+  backend: string,
+  providers: ReadonlyArray<HelperCapability.Provider>,
   profile: CompilationProfile.Facts,
-  report: HelperCapability.Report,
-): Effect.fn.Return<ReadonlyArray<ObjectArtifact>, ToolchainError> {
-  const providers = [
-    ...new Map(report.requirements.map((entry) => [entry.provider.id, entry.provider])).values(),
-  ]
-  const selected = yield* HelperCapability.closure(
-    report.requirements.map((entry) => entry.contract.symbol),
-    providers,
-    profile.target,
-  ).pipe(Effect.mapError(helperError))
-  const sources = selected.filter((provider) => provider.kind === 'source')
-  if (sources.length === 0) return []
-  const source = yield* HelperSource.compile(sources, profile).pipe(Effect.mapError(helperError))
-  const object = yield* materializeObject(
-    toolchain,
-    scope,
-    source.artifact,
-    source.profile,
-    'helpers',
+  compiler: Pick<PlatformSupply.Tool, 'digest' | 'version'>,
+): string =>
+  `helpers-${ToolchainIntegrity.contentDigest(
+    Canonical.record('native-helpers-v1', [
+      distribution,
+      backend,
+      Canonical.array(
+        providers
+          .map((provider) => Canonical.record(provider.id, [provider.identity]))
+          .sort(Canonical.compare),
+      ),
+      profile.target.id,
+      Canonical.record(profile.cpu.model, [Canonical.array(profile.cpu.features)]),
+      Canonical.array(profile.deployment === undefined ? [] : [profile.deployment]),
+      profile.relocation,
+      profile.codeModel,
+      profile.optimization,
+      String(profile.debug),
+      compiler.digest,
+      compiler.version,
+    ]),
+  )}.blob`
+
+const HelperRecordHeader = Schema.fromJsonString(
+  Schema.Struct({
+    foreignImports: Schema.Array(Schema.Struct({ symbol: Schema.String })),
+    foreignStatics: Schema.Array(
+      Schema.Struct({ symbol: Schema.String, direction: Schema.Literals(['Import', 'Export']) }),
+    ),
+    nativeRuntimeSymbols: Schema.Array(Schema.String),
+  }),
+)
+
+const decodeHelperRecordHeader = Schema.decodeUnknownOption(HelperRecordHeader)
+
+/** Frames the helper object after its declarations: `u32le header length, JSON header, object`. */
+const encodeHelperRecord = (
+  declarations: HelperCapability.Declarations,
+  object: Uint8Array,
+): Uint8Array => {
+  const header = new TextEncoder().encode(
+    JSON.stringify({
+      foreignImports: declarations.foreignImports.map((entry) => ({ symbol: entry.symbol })),
+      foreignStatics: declarations.foreignStatics.map((entry) => ({
+        symbol: entry.symbol,
+        direction: entry.direction,
+      })),
+      nativeRuntimeSymbols: declarations.nativeRuntimeSymbols,
+    }),
   )
+  const bytes = new Uint8Array(4 + header.length + object.length)
+  new DataView(bytes.buffer).setUint32(0, header.length, true)
+  bytes.set(header, 4)
+  bytes.set(object, 4 + header.length)
+  return bytes
+}
+
+/** Undecodable records are misses: the helper is recompiled and its record republished. */
+const decodeHelperRecord = (
+  bytes: Uint8Array,
+):
+  | { readonly declarations: HelperCapability.Declarations; readonly object: Uint8Array }
+  | undefined => {
+  if (bytes.length < 4) return undefined
+  const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getUint32(0, true)
+  if (4 + length > bytes.length) return undefined
+  const header = decodeHelperRecordHeader(new TextDecoder().decode(bytes.subarray(4, 4 + length)))
+  if (Option.isNone(header)) return undefined
+  return { declarations: header.value, object: bytes.slice(4 + length) }
+}
+
+/** Proves the object defines exactly the providers' exports and only their declared dependencies. */
+const verifyHelperObject = Effect.fnUntraced(function* (
+  sources: ReadonlyArray<HelperCapability.Provider>,
+  object: ObjectArtifact,
+  profile: CompilationProfile.Facts,
+): Effect.fn.Return<void, ToolchainError> {
   if (object.inventory === undefined)
     return yield* helperError(
       new HelperCapability.HelperError({
@@ -996,7 +1127,95 @@ export const compileHelpers = Effect.fn('NativeToolchain.compileHelpers')(functi
   yield* HelperCapability.verifyProviders(sources, object.inventory, profile.target).pipe(
     Effect.mapError(helperError),
   )
-  return [object]
+})
+
+/**
+ * Realizes the selected source helpers as one object and audits its emitted dependency closure,
+ * reusing an earlier object for the same {@link helperCacheKey}. Returns `undefined` when no source
+ * provider is selected. The toolchain must already be resolved: its supply names the compiler.
+ */
+export const compileHelpers = Effect.fn('NativeToolchain.compileHelpers')(function* (
+  toolchain: Toolchain,
+  scope: BuildScope,
+  profile: CompilationProfile.Facts,
+  report: HelperCapability.Report,
+  cache: HelperCache,
+): Effect.fn.Return<HelperObject | undefined, ToolchainError> {
+  const providers = [
+    ...new Map(report.requirements.map((entry) => [entry.provider.id, entry.provider])).values(),
+  ]
+  const selected = yield* HelperCapability.closure(
+    report.requirements.map((entry) => entry.contract.symbol),
+    providers,
+    profile.target,
+  ).pipe(Effect.mapError(helperError))
+  const sources = selected.filter((provider) => provider.kind === 'source')
+  if (sources.length === 0) return undefined
+  const supply = toolchain.supply
+  if (supply === undefined)
+    return yield* supplyError(
+      PlatformSupply.failure(
+        'MissingCapability',
+        profile.target.id,
+        'helper compilation',
+        'Resolve a native supply.',
+      ),
+    )
+  const address =
+    cache._tag === 'ReadWrite'
+      ? {
+          store: cache.store,
+          key: helperCacheKey(
+            cache.distribution,
+            HelperSource.backend,
+            sources,
+            profile,
+            supply.compiler,
+          ),
+        }
+      : undefined
+  const record =
+    address === undefined ? undefined : yield* readArtifactCache(address.store, address.key)
+  const cached = record === undefined ? undefined : decodeHelperRecord(record)
+  if (cached !== undefined) {
+    // Account the reused object under the same restricted profile a fresh realization uses.
+    const helperProfile = yield* CompilationProfile.normalize(
+      HelperSource.profileInput(profile),
+    ).pipe(
+      Effect.mapError((error) =>
+        helperError(
+          new HelperCapability.HelperError({
+            operation: 'NativeToolchain.compileHelpers',
+            code: 'InvalidSupportProfile',
+            subject: error.message,
+            origins: sources.map((provider) => provider.id),
+          }),
+        ),
+      ),
+    )
+    const written = yield* writeArtifact(scope, profile.target, 'helpers.o', cached.object)
+    const object = yield* admitObject(
+      scope,
+      helperProfile,
+      written.path,
+      cached.object,
+      cached.declarations,
+      // The Clang step that produced the reused object; its bitcode input is not rewritten.
+      yield* objectPlan(toolchain, scope, helperProfile, 'helpers', true),
+    )
+    yield* verifyHelperObject(sources, object, profile)
+    return { _tag: 'HelperObject', object, reused: true }
+  }
+  const source = yield* HelperSource.compile(sources, profile).pipe(Effect.mapError(helperError))
+  const emitted = yield* emitObject(toolchain, scope, source.artifact, source.profile, 'helpers')
+  yield* verifyHelperObject(sources, emitted.object, profile)
+  if (address !== undefined)
+    yield* writeArtifactCache(
+      address.store,
+      address.key,
+      encodeHelperRecord(source.artifact, emitted.bytes),
+    )
+  return { _tag: 'HelperObject', object: emitted.object, reused: false }
 })
 
 /**

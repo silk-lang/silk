@@ -11,6 +11,7 @@
  */
 
 import * as Analysis from './Analysis.js'
+import * as MirLinearization from './MirLinearization.js'
 import * as Elaboration from './Elaboration.js'
 import * as Tir from './Tir.js'
 import { projectDataFlow } from './InspectorFlowModel.js'
@@ -455,7 +456,8 @@ export const views: ReadonlyArray<ViewDefinition> = [
       return {
         rows: [
           ...symbolRows(artifact.symbols),
-          ...backendControlRows(artifact.control),
+          // Emission succeeded, so the snapshot's lowered MIR is available.
+          ...backendControlRows(MirLinearization.llvmControl(Analysis.loweredMir(snapshot))),
           ...backendTextRows(text),
         ],
         facts: [

@@ -1784,7 +1784,7 @@ pub struct Other {}`
   )
 })
 
-it.effect('keeps recovered Unicode-adjacent occurrence indexes compact and deterministic', () => {
+it.effect('keeps recovered Unicode-adjacent occurrence indexes compact', () => {
   const source = `import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 // π🙂
@@ -1795,23 +1795,21 @@ pub fn main() -> i32 {
 }
 fn damaged( -> {`
   return Effect.gen(function* () {
-    const first = yield* Analysis.ofSource('main', encoder.encode(source))
-    const second = yield* Analysis.ofSource('main', encoder.encode(source))
-    const firstIndex = first.semanticOccurrences.modules.get('main')
-    const secondIndex = second.semanticOccurrences.modules.get('main')
-    assert.deepEqual(secondIndex, firstIndex)
-    assert.strictEqual(firstIndex?.prefixMaximumEnd.length, firstIndex?.occurrences.length)
+    const snapshot = yield* Analysis.ofSource('main', encoder.encode(source))
+    const index = snapshot.semanticOccurrences.modules.get('main')
+    assert.isDefined(index)
+    assert.strictEqual(index?.prefixMaximumEnd.length, index?.occurrences.length)
 
     const byteOffset = encoder.encode(
       source.slice(0, source.indexOf('let mut allocator') + 'let mut '.length),
     ).length
-    const occurrence = Analysis.semanticOccurrenceAt(first, 'main', byteOffset)
+    const occurrence = Analysis.semanticOccurrenceAt(snapshot, 'main', byteOffset)
     assert.strictEqual(occurrence?.role, 'Declaration')
     assert.isDefined(occurrence?.declaration)
     assert.isUndefined(
       occurrence === undefined
         ? undefined
-        : Analysis.semanticOccurrenceAt(first, 'main', occurrence.span.end),
+        : Analysis.semanticOccurrenceAt(snapshot, 'main', occurrence.span.end),
     )
     return undefined
   })

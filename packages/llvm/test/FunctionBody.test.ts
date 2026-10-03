@@ -667,7 +667,7 @@ it('packs committed bodies without changing their data', () => {
         result: 1,
         sourceType: 2 ** 40,
         base: { _tag: 'Local', value: 0 },
-        indices: [{ _tag: 'Constant', constant: -3 }],
+        indices: [{ _tag: 'Constant', constant: 3 }],
         inbounds: true,
         inrange: undefined,
       },
@@ -675,7 +675,7 @@ it('packs committed bodies without changing their data', () => {
     ],
     values: [
       { type: 0, name, source: { _tag: 'Argument', index: 0 } },
-      { type: 1, name: 'λ.next', source: { _tag: 'Forward', resolved: undefined } },
+      { type: 1, name: '\uFEFFλ.next', source: { _tag: 'Forward', resolved: undefined } },
     ],
     metadata: [[], [{ kind: 'dbg', metadata: 7 }]],
     debugLocations: [undefined, 3],
