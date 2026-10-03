@@ -435,3 +435,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · T3's generated `t3code/add-selfhost-formatter` branch was blocked by the repository push hook, so PR creation could not find its head · Push the workspace branch to `selfhost-formatter-document` with an explicit refspec · native formatter
 
 2026-10-03 · Auxiliary compiler manifest rooted inside format/ changed the module search base and made format.* imports unresolved · Keep the auxiliary entry point directly under compiler/src and delegate to format.Gate · Silk compiler formatter
+
+2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter
