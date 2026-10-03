@@ -36,8 +36,11 @@ moved, and fallthrough, `return`, `break` and `continue` drop every scope they l
 first and in reverse acquisition order. Replacement drops the displaced value first. Where paths
 reach a join with different ownership, the owner gets a `DropFlag` local written on each incoming
 edge; elsewhere no flag exists. Owned rvalues used only as places are dropped at the end of their
-full expression unless a borrowing `let` keeps them. Partial moves of values that need cleanup
-still report the `cleanup` gap (roadmap step 6d).
+full expression unless a borrowing `let` keeps them. A static partial move, including a match
+binding moved out of a consumed subject, leaves a hole in its owner: the owner is then dropped child
+by child, skipping moved children, and writing a moved child back makes it whole again. A hole
+beneath a type with a Drop hook is rejected as `OWN0002`. Holes that differ between joining paths
+still report the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

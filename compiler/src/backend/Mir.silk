@@ -1,5 +1,6 @@
 //! Backend-neutral control flow for one checked scalar function instance.
 
+import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder, RemainderLevel, Variant as GlueVariant}
 import backend.Gap {Code as GapCode, Gap}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Layout}
@@ -198,12 +199,20 @@ struct Owner {
   state: OwnerState
   // The owner's drop flag local, allocated by the first join whose paths disagree.
   flag: usize
+  // Remainders of partial moves out of this owner (OWN-004), in move order.
+  holes: Vector<usize>
+}
+
+// One owner's cleanup state on one path.
+struct OwnerSnapshot {
+  state: OwnerState
+  holes: Vector<usize>
 }
 
 // One edge into a join: its source block and the owner states on that edge.
 struct Arrival {
   block: usize
-  states: Vector<OwnerState>
+  states: Vector<OwnerSnapshot>
 }
 
 // What a consuming site leaves without an owner.
@@ -212,10 +221,10 @@ union Release {
   Value,
   // The complete value of a local.
   Whole {local: usize},
-  // A projection of a local (OWN-004); partial owners are Step 6d.
-  Partial,
-  // A binding projected from a match subject (MATCH-002); partial owners are Step 6d.
-  Binding,
+  // A projection of a local (OWN-004), consumed at body node `node`.
+  Partial {local: usize, node: usize},
+  // A binding projected from match subject node `subject` (MATCH-002), consumed at `node`.
+  Binding {subject: usize, node: usize},
 }
 
 /// A checked call's resolved canonical target, prepared without demanding its body.
@@ -257,6 +266,8 @@ struct Builder {
   scopes: Vector<usize>
   // Owned rvalues used only as places; they live until the end of their full expression.
   temporaries: Vector<usize>
+  // The remaining children of each partial consuming site, keyed by body node.
+  remainders: Vector<Remainder>
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -492,7 +503,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           }
           BodyExpression.Move {value, consumed} => View.Move {
             value: value,
-            release: releaseOf(&consumed),
+            release: releaseOf(&consumed, id),
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
@@ -545,7 +556,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           BodyExpression.Match {subject, access, tags, arms} => View.Match {
             node: id, subject: subject, place: match &access { BodySubjectAccess.Place => true _ => false },
             consumes: match &access { BodySubjectAccess.Consume {..} => true _ => false },
-            release: match &access { BodySubjectAccess.Consume {consumed} => releaseOf(&consumed) _ => Release.Value },
+            release: match &access { BodySubjectAccess.Consume {consumed} => releaseOf(&consumed, id) _ => Release.Value },
             tags: tags, count: Vector.length<BodyMatchArm>(&arms),
             ty: Shared.clone<Type>(&ty), origin: origin,
           }
@@ -646,7 +657,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           origin: origin,
         }
         BodyNodeKind.Break => View.Break {origin: origin}
-        BodyNodeKind.Drop {value, consumed} => View.Drop {value: value, release: releaseOf(&consumed), origin: origin}
+        BodyNodeKind.Drop {value, consumed} => View.Drop {value: value, release: releaseOf(&consumed, id), origin: origin}
         BodyNodeKind.Continue => View.Continue {origin: origin}
         BodyNodeKind.Block {statements, ..} => View.Block {
           count: Vector.length<BodyNodeId>(&statements),
@@ -759,28 +770,19 @@ fn stepProjection(path: &Vector<BodyPlaceStep>, at: usize) -> Option<Projection>
   return Option.none<Projection>()
 }
 
-// The release a recorded consumed place makes, in MIR local numbering.
-fn releaseOf(consumed: &Option<BodyConsumedPlace>) -> Release {
+// The release a recorded consumed place makes at body node `node`, in MIR local numbering.
+fn releaseOf(consumed: &Option<BodyConsumedPlace>, node: BodyNodeId) -> Release {
   if let Option<BodyConsumedPlace>.Some {value} = &consumed.* {
     let whole = Vector.length<BodyPlaceStep>(&value.steps) == usize.ZERO
     return match &value.root {
       BodyPlaceRoot.Local {local} => {
         if whole { return Release.Whole {local: local.index + usize.ONE} }
-        return Release.Partial
+        return Release.Partial {local: local.index + usize.ONE, node: node.index}
       }
-      BodyPlaceRoot.Subject {..} => Release.Binding
+      BodyPlaceRoot.Subject {subject} => Release.Binding {subject: subject.index, node: node.index}
     }
   }
   return Release.Value
-}
-
-fn copyRelease(release: &Release) -> Release {
-  return match &release.* {
-    Release.Value => Release.Value
-    Release.Whole {local} => Release.Whole {local: local}
-    Release.Partial => Release.Partial
-    Release.Binding => Release.Binding
-  }
 }
 
 fn localType(builder: &Builder, local: usize) -> Shared<Type> {
@@ -807,7 +809,15 @@ fn ownerIndex(builder: &Builder, local: usize) -> usize {
 effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>) -> () ! OutOfMemoryError ? &mut Allocator {
   let free = Shared.with<Type, bool>(ty, Type.cleanupFree)
   if free { return () }
-  return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX})
+  return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX, holes: Vector.make<usize>()})
+}
+
+// A moved owner has no holes left to track.
+fn markMoved(builder: &mut Builder, index: usize) -> () {
+  let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+  owners[index].state = OwnerState.Moved
+  owners[index].holes = Vector.make<usize>()
+  return ()
 }
 
 fn setState(builder: &mut Builder, index: usize, state: OwnerState) -> () {
@@ -816,46 +826,109 @@ fn setState(builder: &mut Builder, index: usize, state: OwnerState) -> () {
   return ()
 }
 
-// Applies one consuming site. A partial move of a value that needs cleanup is Step 6d.
+// Applies one consuming site. A partial move of a value that needs cleanup leaves a hole in its
+// owner, which is then dropped child by child (OWN-004, MATCH-002).
 effect fn applyRelease(builder: &mut Builder, release: &Release, moved: &Shared<Type>, origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
-  if let Release.Whole {local} = &release.* {
-    let index = ownerIndex(&builder.*, local)
-    if index != usize.MAX { setState(&mut builder.*, index, OwnerState.Moved) }
-    return ()
-  }
-  let partial = match &release.* {
-    Release.Partial => true
-    Release.Binding => true
-    _ => false
+  let mut root = usize.MAX
+  let mut site = usize.MAX
+  match &release.* {
+    Release.Value => { return () }
+    Release.Whole {local} => {
+      let index = ownerIndex(&builder.*, local)
+      if index != usize.MAX { markMoved(&mut builder.*, index) }
+      return ()
+    }
+    Release.Partial {local, node} => {
+      root = local
+      site = node
+    }
+    Release.Binding {subject, node} => {
+      // Only a consuming match's own evaluated copy owns its bindings.
+      if let Option<usize>.Some {value: selected} = move scrutineePlace(&builder.*, BodyNodeId {index: subject}) {
+        let evaluated = Vector.asSlice<Scrutinee>(&builder.scrutinees)
+        if Vector.length<Projection>(&evaluated[selected].place.projections) == usize.ZERO { root = evaluated[selected].place.local }
+      }
+      site = node
+    }
   }
   let free = Shared.with<Type, bool>(moved, Type.cleanupFree)
-  if partial && !free {
-    let owner = InstanceKey.identity(&builder.function.key)
+  if free { return () }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let index = ownerIndex(&builder.*, root)
+  let remainder = remainderIndex(&builder.*, site)
+  if index == usize.MAX || remainder == usize.MAX || ownerState(&builder.*, index) != OwnerState.Live || remainderHooked(&builder.*, remainder) {
     return run unsupported(&owner, origin, GapCode.Cleanup)
   }
-  return ()
+  let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+  return run Vector.append<usize>(&mut owners[index].holes, remainder)
 }
 
-effect fn ownerStates(builder: &Builder) -> Vector<OwnerState> ! OutOfMemoryError ? &mut Allocator {
+fn remainderIndex(builder: &Builder, node: usize) -> usize {
+  let listed = Vector.asSlice<Remainder>(&builder.remainders)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].node == node { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn remainderHooked(builder: &Builder, remainder: usize) -> bool {
+  let remainders = Vector.asSlice<Remainder>(&builder.remainders)
+  let levels = Vector.asSlice<RemainderLevel>(&remainders[remainder].levels)
+  let mut at = usize.ZERO
+  while at < levels.length {
+    if levels[at].hooked { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn copyHoles(holes: &Vector<usize>) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector.asSlice<usize>(holes)
+  let mut copied = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector.append<usize>(&mut copied, listed[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+fn sameHoles(left: &Vector<usize>, right: &Vector<usize>) -> bool {
+  let first = Vector.asSlice<usize>(left)
+  let second = Vector.asSlice<usize>(right)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at] != second[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn ownerStates(builder: &Builder) -> Vector<OwnerSnapshot> ! OutOfMemoryError ? &mut Allocator {
   let owners = Vector.asSlice<Owner>(&builder.owners)
-  let mut states = Vector.make<OwnerState>()
+  let mut states = Vector.make<OwnerSnapshot>()
   let mut at = usize.ZERO
   while at < owners.length {
-    run Vector.append<OwnerState>(&mut states, owners[at].state)
+    run Vector.append<OwnerSnapshot>(&mut states, OwnerSnapshot {state: owners[at].state, holes: run copyHoles(&owners[at].holes)})
     at = at + usize.ONE
   }
   return move states
 }
 
 // Returns to the owners and states a branch started from.
-fn restoreOwners(builder: &mut Builder, states: &Vector<OwnerState>) -> () {
-  let saved = Vector.asSlice<OwnerState>(states)
+effect fn restoreOwners(builder: &mut Builder, states: &Vector<OwnerSnapshot>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let saved = Vector.asSlice<OwnerSnapshot>(states)
   while Vector.length<Owner>(&builder.owners) > saved.length { drop Vector.pop<Owner>(&mut builder.*.owners) }
-  let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
   let mut at = usize.ZERO
   while at < saved.length {
-    owners[at].state = saved[at]
+    let holes = run copyHoles(&saved[at].holes)
+    let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+    owners[at].state = saved[at].state
+    owners[at].holes = move holes
     at = at + usize.ONE
   }
   return ()
@@ -868,19 +941,29 @@ effect fn arrival(builder: &Builder) -> Arrival ! OutOfMemoryError ? &mut Alloca
 // Joins the owner states of every edge into the current block. An owner whose state differs
 // between edges gets a drop flag, written with its constant state at the end of each edge that
 // knows it; a place whose state agrees on every edge gets no flag.
-effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   if arrivals.length == usize.ZERO { return () }
   let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
   let count = Vector.length<Owner>(&builder.owners)
   let mut index = usize.ZERO
   while index < count {
-    let first = Vector.asSlice<OwnerState>(&arrivals[usize.ZERO].states)[index]
+    let entering = Vector.asSlice<OwnerSnapshot>(&arrivals[usize.ZERO].states)
+    let first = entering[index].state
     let mut same = true
     let mut at = usize.ONE
     while at < arrivals.length {
-      if Vector.asSlice<OwnerState>(&arrivals[at].states)[index] != first { same = false }
+      let other = Vector.asSlice<OwnerSnapshot>(&arrivals[at].states)
+      if other[index].state != first { same = false }
+      // Partial owners must agree on their holes; per-path holes are not lowered.
+      if !sameHoles(&other[index].holes, &entering[index].holes) {
+        let owner = InstanceKey.identity(&builder.function.key)
+        return run unsupported(&owner, origin, GapCode.Cleanup)
+      }
       at = at + usize.ONE
     }
+    let holes = run copyHoles(&entering[index].holes)
+    let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+    owners[index].holes = move holes
     if same {
       setState(&mut builder.*, index, first)
     } else {
@@ -894,7 +977,7 @@ effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin
       }
       at = usize.ZERO
       while at < arrivals.length {
-        let state = Vector.asSlice<OwnerState>(&arrivals[at].states)[index]
+        let state = Vector.asSlice<OwnerSnapshot>(&arrivals[at].states)[index].state
         if state != OwnerState.Maybe {
           let target = arrivals[at].block
           let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.function.blocks)
@@ -919,7 +1002,14 @@ effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () !
   let local = owners[index].local
   let flag = owners[index].flag
   let ty = Shared.clone<Type>(&owners[index].ty)
+  let partial = Vector.length<usize>(&owners[index].holes) != usize.ZERO
   let owner = InstanceKey.identity(&builder.function.key)
+  // A partial owner is never passed to its glue: its remaining children are dropped one by one.
+  if partial {
+    if state != OwnerState.Live { return run unsupported(&owner, origin, GapCode.Cleanup) }
+    let holes = run copyHoles(&owners[index].holes)
+    return run dropRemainder(&mut builder.*, place(local), Vector.asSlice<usize>(&holes), usize.ZERO, origin)
+  }
   if state == OwnerState.Live { return run dropPlace(&mut builder.*, place(local), &ty, &owner, origin) }
   let dropping = run block(&mut builder.*, origin)
   let after = run block(&mut builder.*, origin)
@@ -928,6 +1018,141 @@ effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () !
   run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
   terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
   resume(&mut builder.*, after)
+  return ()
+}
+
+fn sameProjection(left: &Projection, right: &Projection) -> bool {
+  return match &left.* {
+    Projection.Field {index} => match &right.* { Projection.Field {index: other} => index == other _ => false }
+    Projection.ConstIndex {index} => match &right.* { Projection.ConstIndex {index: other} => index == other _ => false }
+    Projection.Payload {index, ..} => match &right.* { Projection.Payload {index: other, ..} => index == other _ => false }
+    Projection.VariantField {variant, field} => match &right.* {
+      Projection.VariantField {variant: otherVariant, field: otherField} => variant == otherVariant && field == otherField
+      _ => false
+    }
+    _ => false
+  }
+}
+
+effect fn copyProjection(value: &Projection) -> Projection ! OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Projection.Field {index} => Projection.Field {index: index}
+    Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Shared.clone<Type>(&ty)}
+    Projection.VariantField {variant, field} => Projection.VariantField {variant: variant, field: field}
+    Projection.Index {local} => Projection.Index {local: local}
+    Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
+    Projection.Deref => Projection.Deref
+  }
+}
+
+// Whether hole `remainder`'s step at `depth` selects the same child as `other`.
+fn stepMatches(builder: &Builder, remainder: usize, depth: usize, other: &Projection) -> bool {
+  let remainders = Vector.asSlice<Remainder>(&builder.remainders)
+  let steps = Vector.asSlice<Projection>(&remainders[remainder].steps)
+  return sameProjection(&steps[depth], other)
+}
+
+fn remainderLength(builder: &Builder, remainder: usize) -> usize {
+  let remainders = Vector.asSlice<Remainder>(&builder.remainders)
+  return Vector.length<Projection>(&remainders[remainder].steps)
+}
+
+effect fn copyChildList(children: &Vector<GlueChild>) -> Vector<GlueChild> ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector.asSlice<GlueChild>(children)
+  let mut copied = Vector.make<GlueChild>()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector.append<GlueChild>(&mut copied, GlueChild {index: listed[at].index, ty: Shared.clone<Type>(&listed[at].ty), glue: InstanceKey.copy(&listed[at].glue)})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// The children at `depth` of the owners hole `remainder` passes through that its step can select:
+// every droppable field or element, or the active member's payload or variant's fields.
+effect fn remainderChildren(builder: &Builder, remainder: usize, depth: usize) -> Vector<GlueChild> ! OutOfMemoryError ? &mut Allocator {
+  let remainders = Vector.asSlice<Remainder>(&builder.remainders)
+  let levels = Vector.asSlice<RemainderLevel>(&remainders[remainder].levels)
+  let steps = Vector.asSlice<Projection>(&remainders[remainder].steps)
+  let level = &levels[depth]
+  let step = &steps[depth]
+  let mut selected = Vector.make<GlueChild>()
+  match &level.children {
+    GlueChildren.Fields {fields} => { selected = run copyChildList(&fields) }
+    GlueChildren.Elements {element, count} => {
+      let mut at = usize.ZERO
+      while at < count {
+        run Vector.append<GlueChild>(&mut selected, GlueChild {index: at, ty: Shared.clone<Type>(&element.ty), glue: InstanceKey.copy(&element.glue)})
+        at = at + usize.ONE
+      }
+    }
+    GlueChildren.Members {members, ..} => {
+      if let Projection.Payload {index: tag, ..} = &step.* {
+        let listed = Vector.asSlice<GlueChild>(&members)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if listed[at].index == tag {
+            run Vector.append<GlueChild>(&mut selected, GlueChild {index: tag, ty: Shared.clone<Type>(&listed[at].ty), glue: InstanceKey.copy(&listed[at].glue)})
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+    GlueChildren.Variants {variants, ..} => {
+      if let Projection.VariantField {variant, ..} = &step.* {
+        let listed = Vector.asSlice<GlueVariant>(&variants)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if listed[at].tag == variant { selected = run copyChildList(&listed[at].fields) }
+          at = at + usize.ONE
+        }
+      }
+    }
+  }
+  return move selected
+}
+
+// The projection selecting child `index` at `depth`, in the step's own form.
+effect fn childStep(builder: &Builder, remainder: usize, depth: usize, child: &GlueChild) -> Projection ! OutOfMemoryError ? &mut Allocator {
+  let remainders = Vector.asSlice<Remainder>(&builder.remainders)
+  let steps = Vector.asSlice<Projection>(&remainders[remainder].steps)
+  let step = &steps[depth]
+  return match &step.* {
+    Projection.ConstIndex {..} => Projection.ConstIndex {index: child.index}
+    Projection.Payload {..} => Projection.Payload {index: child.index, ty: Shared.clone<Type>(&child.ty)}
+    Projection.VariantField {variant, ..} => Projection.VariantField {variant: variant, field: child.index}
+    _ => Projection.Field {index: child.index}
+  }
+}
+
+// Drops what the holes `holes`, sharing their first `depth` steps below `base`, leave of `base`:
+// an untouched child as a whole, a moved child not at all, and a partly moved child recursively.
+effect fn dropRemainder(builder: &mut Builder, base: Place, holes: &[usize], depth: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let children = run remainderChildren(&builder.*, holes[usize.ZERO], depth)
+  let listed = Vector.asSlice<GlueChild>(&children)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let step = run childStep(&builder.*, holes[usize.ZERO], depth, &listed[at])
+    let mut selected = Vector.make<usize>()
+    let mut ended = false
+    let mut hole = usize.ZERO
+    while hole < holes.length {
+      if stepMatches(&builder.*, holes[hole], depth, &step) {
+        run Vector.append<usize>(&mut selected, holes[hole])
+        if remainderLength(&builder.*, holes[hole]) == depth + usize.ONE { ended = true }
+      }
+      hole = hole + usize.ONE
+    }
+    let mut child = run copyPlace(&base)
+    run Vector.append<Projection>(&mut child.projections, run copyProjection(&step))
+    if Vector.length<usize>(&selected) == usize.ZERO {
+      run dropPlace(&mut builder.*, move child, &listed[at].ty, &owner, origin)
+    } else if !ended {
+      run dropRemainder(&mut builder.*, move child, Vector.asSlice<usize>(&selected), depth + usize.ONE, origin)
+    }
+    at = at + usize.ONE
+  }
   return ()
 }
 
@@ -1855,7 +2080,7 @@ effect fn lowerMatch(
     let result = armSlice[at].result
     let resultBlock = resultSlice[at]
     // Every arm starts from the owner states at dispatch; guards and tests cannot consume.
-    restoreOwners(&mut builder.*, &entryStates)
+    run restoreOwners(&mut builder.*, &entryStates)
     // Nested tests, then the guard, run in order; the first that fails resumes dispatch at the next arm.
     if entrySlice[at] != resultBlock {
       resume(&mut builder.*, entrySlice[at])
@@ -1910,7 +2135,7 @@ effect fn lowerMatch(
     if builder.live {
       if scrutineeOwner != usize.MAX {
         run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
-        setState(&mut builder.*, scrutineeOwner, OwnerState.Moved)
+        markMoved(&mut builder.*, scrutineeOwner)
       }
       run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
       terminate(&mut builder.*, Terminator.Goto {target: join, origin: armOrigin})
@@ -2118,11 +2343,34 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       if let Option<Shared<Type>>.Some {value: replaced} = move targetType {
         let free = Shared.with<Type, bool>(&replaced, Type.cleanupFree)
         if !free {
-          // Re-initializing part of a moved or maybe-moved owner is a partial owner (Step 6d).
+          // Writing a moved child back re-initializes it; writing beside holes replaces a live child.
           let root = ownerIndex(&builder.*, destination.local)
           let mut whole = true
-          if root != usize.MAX { whole = ownerState(&builder.*, root) == OwnerState.Live }
+          let mut refilled = usize.MAX
+          if root != usize.MAX {
+            whole = ownerState(&builder.*, root) == OwnerState.Live
+            let owners = Vector.asSlice<Owner>(&builder.owners)
+            let holes = Vector.asSlice<usize>(&owners[root].holes)
+            let written = Vector.asSlice<Projection>(&destination.projections)
+            let mut at = usize.ZERO
+            while at < holes.length {
+              let length = remainderLength(&builder.*, holes[at])
+              let mut shared = usize.ZERO
+              while shared < length && shared < written.length && stepMatches(&builder.*, holes[at], shared, &written[shared]) {
+                shared = shared + usize.ONE
+              }
+              if shared == length && length == written.length { refilled = at }
+              else if shared == written.length || shared == length { whole = false }
+              at = at + usize.ONE
+            }
+          }
           if !whole { return run unsupported(&owner, origin, GapCode.Cleanup) }
+          if refilled != usize.MAX {
+            let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+            drop Vector.remove<usize>(&mut owners[root].holes, refilled)
+            run assign(&mut builder.*, move destination, Rvalue.Use {value: move assigned}, origin)
+            return ()
+          }
           run dropPlace(&mut builder.*, run copyPlace(&destination), &replaced, &owner, origin)
         }
       }
@@ -2164,6 +2412,8 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       if replaced != usize.MAX {
         run dropOwner(&mut builder.*, replaced, origin)
         setState(&mut builder.*, replaced, OwnerState.Live)
+        let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+        owners[replaced].holes = Vector.make<usize>()
       }
       run assign(
         &mut builder.*,
@@ -2206,7 +2456,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
         run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
         terminate(&mut builder.*, Terminator.Goto {target: join, origin: origin})
       }
-      restoreOwners(&mut builder.*, &entry)
+      run restoreOwners(&mut builder.*, &entry)
       resume(&mut builder.*, elseBlock)
       if let Option<BodyNodeId>.Some {value: other} = move elseBranch {
         run statement(&mut builder.*, body, hir, other)
@@ -2537,6 +2787,7 @@ impl MirFunction {
     result: &Shared<Type>,
     parameters: &[Shared<Type>],
     calls: Vector<CallTarget>,
+    remainders: Vector<Remainder>,
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
     let identity = InstanceKey.identity(&key)
     let application = run InstanceKey.selected(&key)
@@ -2617,6 +2868,7 @@ impl MirFunction {
       owners: Vector.make<Owner>(),
       scopes: Vector.make<usize>(),
       temporaries: Vector.make<usize>(),
+      remainders: move remainders,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)

@@ -25,7 +25,7 @@ import hir.Hir {
 }
 import backend.CAbi
 import backend.Gap {Code as GapCode, Gap as BackendGap}
-import backend.DropGlue {Child as GlueChild, Children as GlueChildren, DropGlue, Variant as GlueVariant}
+import backend.DropGlue {Child as GlueChild, Children as GlueChildren, DropGlue, Remainder, RemainderLevel, Variant as GlueVariant}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Abi as BackendAbi, FieldInput as LayoutFieldInput, Layout as BackendLayout, Metrics as LayoutMetrics, TypeLayout}
 import backend.LlvmText
@@ -17499,7 +17499,8 @@ fn checkedPlace(nodes: &[BodyNode], id: BodyNodeId) -> bool {
 // a reference or at a runtime index (OWN-004).
 union Consumption {
   Rvalue,
-  Place {place: BodyConsumedPlace},
+  // `ancestors` are the types of the owners a non-empty path passes through.
+  Place {place: BodyConsumedPlace, ancestors: Vector<Shared<Type>>},
   Borrowed,
   Boundary,
 }
@@ -17510,12 +17511,15 @@ effect fn consumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[Bo
   return match &nodes[id.index].kind {
     BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} => Consumption.Place {
       place: BodyConsumedPlace {root: BodyPlaceRoot.Local {local: local}, steps: Vector.make<BodyPlaceStep>()},
+      ancestors: Vector.make<Shared<Type>>(),
     }
+    // A consuming match's arm owns the whole payload (MATCH-002); its bindings are not partial moves.
     BodyNodeKind.Expression {form: BodyExpression.PatternBinding {subject, path, ..}, ..} => Consumption.Place {
       place: BodyConsumedPlace {root: BodyPlaceRoot.Subject {subject: subject}, steps: run copySteps(&path)},
+      ancestors: Vector.make<Shared<Type>>(),
     }
     BodyNodeKind.Expression {form: BodyExpression.Field {value, index}, ..} => run extendedConsumption(
-      run consumption(source, cursor, nodes, value), BodyPlaceStep.Field {index: index},
+      run consumption(source, cursor, nodes, value), BodyPlaceStep.Field {index: index}, bodyExpressionType(nodes, &value),
     )
     BodyNodeKind.Expression {form: BodyExpression.Index {value, index}, ..} => run indexedConsumption(source, cursor, nodes, value, index)
     BodyNodeKind.Expression {form: BodyExpression.Dereference {..}, ..} => Consumption.Borrowed
@@ -17549,15 +17553,19 @@ effect fn indexedConsumption(source: &SourceIndex, cursor: &AuthoredCursor, node
     }
   }
   return match move element {
-    Option<usize>.Some {value: at} => run extendedConsumption(move base, BodyPlaceStep.Element {index: at})
+    Option<usize>.Some {value: at} => run extendedConsumption(move base, BodyPlaceStep.Element {index: at}, bodyExpressionType(nodes, &subject))
     Option<usize>.None => Consumption.Boundary
   }
 }
 
-effect fn extendedConsumption(base: Consumption, step: BodyPlaceStep) -> Consumption ! OutOfMemoryError ? &mut Allocator {
+effect fn extendedConsumption(base: Consumption, step: BodyPlaceStep, parent: Option<Shared<Type>>) -> Consumption ! OutOfMemoryError ? &mut Allocator {
   return match move base {
-    Consumption.Place {place} => Consumption.Place {
-      place: BodyConsumedPlace {root: move place.root, steps: run extendedPath(&place.steps, move step)},
+    Consumption.Place {place, ancestors} => {
+      let mut owners = move ancestors
+      if let Option<Shared<Type>>.Some {value} = move parent { run Vector.append<Shared<Type>>(&mut owners, move value) }
+      return Consumption.Place {
+        place: BodyConsumedPlace {root: move place.root, steps: run extendedPath(&place.steps, move step)}, ancestors: move owners,
+      }
     }
     Consumption.Rvalue => Consumption.Rvalue
     Consumption.Borrowed => Consumption.Boundary
@@ -17566,19 +17574,42 @@ effect fn extendedConsumption(base: Consumption, step: BodyPlaceStep) -> Consump
 }
 
 // The consumed place a site records, or the rejection for a place that cannot be extracted. A
-// `drop` of a Copy value behind a reference ends no owner, so it records no place (DROP-001).
-effect fn consumedPlace(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, nodes: &[BodyNode],
+// `drop` of a Copy value behind a reference ends no owner, so it records no place (DROP-001). A
+// partial move cannot leave a hole beneath an owner with a `Drop` hook (OWN-004).
+effect fn consumedPlace(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  module: &ModuleId, cursor: &AuthoredCursor, nodes: &[BodyNode],
   operand: BodyNodeId, copyExempt: bool, span: Span) -> Result<Option<BodyConsumedPlace>, Shared<Rejection>>
-! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut code = RejectionCode.ExtractionBoundary
   match move run consumption(&resolver.source, cursor, nodes, operand) {
-    Consumption.Place {place} => { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.some<BodyConsumedPlace>(move place)) }
+    Consumption.Place {place, ancestors} => {
+      let listed = Vector.asSlice<Shared<Type>>(&ancestors)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        match move run dropImplementation(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at]) {
+          Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Success {value: hook} => {
+            let hooked = match &hook {
+              Option<Shared<DeclarationId>>.Some {..} => true
+              Option<Shared<DeclarationId>>.None => false
+            }
+            if hooked && !copyExempt {
+              return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.ExtractionBoundary, span))
+            }
+          }
+          Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Failure {error} => {
+            return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(move error)
+          }
+        }
+        at = at + usize.ONE
+      }
+      return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.some<BodyConsumedPlace>(move place))
+    }
     Consumption.Rvalue => { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
     Consumption.Borrowed => { code = RejectionCode.BorrowedExtraction }
     Consumption.Boundary => {}
   }
   if copyExempt { return Result.succeed<Option<BodyConsumedPlace>, Shared<Rejection>>(Option.none<BodyConsumedPlace>()) }
-  return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(resolver, module, code, span))
+  return Result.failResult<Option<BodyConsumedPlace>, Shared<Rejection>>(run reject(&resolver.*, module, code, span))
 }
 
 fn signatureOutsideScalarBodies(answer: &Result<Answer, NoRejection>) -> bool {
@@ -20270,7 +20301,7 @@ effect fn checkReceiverCall<'scope>(
       Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
     }
     if !written && !copied {
-      let consumed = match move run consumedPlace(&resolver.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), receiverNode, false, memberSpan) {
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), receiverNode, false, memberSpan) {
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
       }
@@ -22744,7 +22775,7 @@ effect fn checkRecordMatch<'scope>(
   let mut subjectAccess = BodySubjectAccess.Copy
   if place { subjectAccess = BodySubjectAccess.Place }
   if access == MatchAccess.Move {
-    let consumed = match move run consumedPlace(&resolver.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), subjectNode, false, span) {
+    let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), subjectNode, false, span) {
       Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
       Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
         return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
@@ -24240,7 +24271,7 @@ effect fn checkExpression<'scope>(
           return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
         }
       }
-      let consumed = match move run consumedPlace(&resolver.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode, false, span) {
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode, false, span) {
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value} => value
         Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
           return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
@@ -27270,7 +27301,7 @@ effect fn checkStatements(
           Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
         }
         let operandSpan = run bodySpan(&resolver.source, cursor, value)
-        let consumed = match move run consumedPlace(&resolver.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operand, copied, operandSpan) {
+        let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, Vector.asSlice<BodyNode>(&nodes.*), operand, copied, operandSpan) {
           Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value: place} => place
           Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => {
             return Result.failResult<bool, Shared<Rejection>>(move error)
@@ -29024,22 +29055,21 @@ fn dropMember(answer: &Result<Answer, NoRejection>) -> Option<Shared<Declaration
   return Option.none<Shared<DeclarationId>>()
 }
 
-// The instance of the provider's `impl Drop` hook, found through the sealed-property implementation
-// query rather than by spelling. The hook's own elided borrow lifetime takes `'static`, which the
-// runtime identity erases; the impl's binders come from the provider's arguments.
-effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
-  ty: &Shared<Type>) -> Result<Option<InstanceKey>, Option<Shared<Rejection>>>
+// The provider's sealed `impl Drop` head, found through the implementation query of the module
+// that may own it rather than by spelling; absence for a type with no hook (DROP-002).
+effect fn dropImplementation(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  ty: &Shared<Type>) -> Result<Option<Shared<DeclarationId>>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let span = Span.make(usize.ZERO, usize.ZERO)
-  if !Shared.with<Type, bool>(ty, isNominalType) { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  if !Shared.with<Type, bool>(ty, isNominalType) { return Result.succeed<Option<Shared<DeclarationId>>, Shared<Rejection>>(Option.none<Shared<DeclarationId>>()) }
   let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
-  if moduleOrdinal == usize.MAX { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  if moduleOrdinal == usize.MAX { return Result.succeed<Option<Shared<DeclarationId>>, Shared<Rejection>>(Option.none<Shared<DeclarationId>>()) }
   let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {
     family: Family.Implementations, module: moduleOrdinal, name: usize.ZERO, declaration: usize.ZERO, member: usize.ZERO, external: false,
   }, span)
   let failed = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&listed, answerRejection)
   if let Option<Shared<Rejection>>.Some {value} = move failed {
-    return Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move value))
+    return Result.failResult<Option<Shared<DeclarationId>>, Shared<Rejection>>(move value)
   }
   let count = Shared.with<Result<Answer, NoRejection>, usize>(&listed, implementationCount)
   let mut hookImpl = Option.none<Shared<DeclarationId>>()
@@ -29064,10 +29094,26 @@ effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRe
     }
     at = at + usize.ONE
   }
-  let implementation = match move hookImpl {
-    Option<Shared<DeclarationId>>.Some {value} => value
-    Option<Shared<DeclarationId>>.None => { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+  return Result.succeed<Option<Shared<DeclarationId>>, Shared<Rejection>>(move hookImpl)
+}
+
+// The instance of the provider's `impl Drop` hook, found through the sealed-property implementation
+// query rather than by spelling. The hook's own elided borrow lifetime takes `'static`, which the
+// runtime identity erases; the impl's binders come from the provider's arguments.
+effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  ty: &Shared<Type>) -> Result<Option<InstanceKey>, Option<Shared<Rejection>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  let implementation = match move run dropImplementation(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty) {
+    Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Success {value: found} => match move found {
+      Option<Shared<DeclarationId>>.Some {value} => value
+      Option<Shared<DeclarationId>>.None => { return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<InstanceKey>()) }
+    }
+    Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<Shared<Rejection>>(move error))
+    }
   }
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
   let unsupported = Result.failResult<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.none<Shared<Rejection>>())
   let module = run resolvedModule(&resolver.*, moduleOrdinal)
   let implOrdinal = match move run ordinalOfIdentity(&mut resolver.*, &module, &implementation) {
@@ -29093,7 +29139,7 @@ effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRe
   let hookIdentity = run Shared.make<DeclarationId>(run DeclarationId.copy(&hook))
   let slots = Vector.asSlice<ApplicationSlot>(&schema.own)
   let mut inferred = Vector.make<Binding>()
-  at = usize.ZERO
+  let mut at = usize.ZERO
   while at < slots.length {
     if slots[at].kind != GenericKind.Lifetime { return move unsupported }
     run Vector.append<Binding>(&mut inferred, Binding {
@@ -29108,6 +29154,207 @@ effect fn dropHook(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRe
     Result<Application, Shared<Rejection>>.Failure {..} => { return move unsupported }
   }
   return Result.succeed<Option<InstanceKey>, Option<Shared<Rejection>>>(Option.some<InstanceKey>(run InstanceKey.function(move application)))
+}
+
+// The root and size of one consuming site whose recorded place is a projection, read under a short
+// body borrow: its owner local (or MAX), its match subject node (or MAX), its step count and the
+// moved value's type.
+struct PartialSite {
+  local: usize
+  subject: usize
+  steps: usize
+  moved: Shared<Type>
+}
+
+fn consumedOf(kind: &BodyNodeKind) -> Option<&BodyConsumedPlace> {
+  return match &kind.* {
+    BodyNodeKind.Expression {form, ..} => match &form {
+      BodyExpression.Move {consumed, ..} => recordedPlace(&consumed)
+      BodyExpression.Match {access, ..} => match &access {
+        BodySubjectAccess.Consume {consumed} => recordedPlace(&consumed)
+        _ => Option.none<&BodyConsumedPlace>()
+      }
+      _ => Option.none<&BodyConsumedPlace>()
+    }
+    BodyNodeKind.Drop {consumed, ..} => recordedPlace(&consumed)
+    _ => Option.none<&BodyConsumedPlace>()
+  }
+}
+
+fn recordedPlace(consumed: &Option<BodyConsumedPlace>) -> Option<&BodyConsumedPlace> {
+  return match &consumed.* {
+    Option<BodyConsumedPlace>.Some {value} => Option.some<&BodyConsumedPlace>(&value)
+    Option<BodyConsumedPlace>.None => Option.none<&BodyConsumedPlace>()
+  }
+}
+
+fn partialSiteAt(body: &TypedBody, at: usize) -> Option<PartialSite> {
+  let nodes = TypedBody.nodeSlice(body)
+  let consumed = match move consumedOf(&nodes[at].kind) {
+    Option<&BodyConsumedPlace>.Some {value} => value
+    Option<&BodyConsumedPlace>.None => { return Option.none<PartialSite>() }
+  }
+  let steps = Vector.length<BodyPlaceStep>(&consumed.steps)
+  let mut local = usize.MAX
+  let mut subject = usize.MAX
+  match &consumed.root {
+    BodyPlaceRoot.Local {local: root} => { local = root.index }
+    BodyPlaceRoot.Subject {subject: root} => { subject = root.index }
+  }
+  if steps == usize.ZERO { return Option.none<PartialSite>() }
+  // A drop's moved value is its operand; a move's or match's is the node's own value.
+  let mut typed = at
+  if let BodyNodeKind.Drop {value, ..} = &nodes[at].kind { typed = value.index }
+  if let BodyNodeKind.Expression {form: BodyExpression.Match {subject: matched, ..}, ..} = &nodes[at].kind { typed = matched.index }
+  if let BodyNodeKind.Expression {ty, ..} = &nodes[typed].kind {
+    return Option.some<PartialSite>(PartialSite {local: local, subject: subject, steps: steps, moved: Shared.clone<Type>(&ty)})
+  }
+  return Option.none<PartialSite>()
+}
+
+fn partialStepAt(body: &TypedBody, at: usize, step: usize) -> Option<BodyPlaceStep> {
+  let nodes = TypedBody.nodeSlice(body)
+  if let Option<&BodyConsumedPlace>.Some {value: consumed} = move consumedOf(&nodes[at].kind) {
+    let steps = Vector.asSlice<BodyPlaceStep>(&consumed.steps)
+    if step < steps.length {
+      return match &steps[step] {
+        BodyPlaceStep.Member {tag, ty} => Option.some<BodyPlaceStep>(BodyPlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&ty)})
+        BodyPlaceStep.VariantField {tag, field} => Option.some<BodyPlaceStep>(BodyPlaceStep.VariantField {tag: tag, field: field})
+        BodyPlaceStep.Field {index} => Option.some<BodyPlaceStep>(BodyPlaceStep.Field {index: index})
+        BodyPlaceStep.Element {index} => Option.some<BodyPlaceStep>(BodyPlaceStep.Element {index: index})
+      }
+    }
+  }
+  return Option.none<BodyPlaceStep>()
+}
+
+fn localTypeAt(body: &TypedBody, local: usize) -> Shared<Type> {
+  let locals = TypedBody.localSlice(body)
+  return Shared.clone<Type>(&locals[local].ty)
+}
+
+fn nodeTypeAt(body: &TypedBody, at: usize) -> Option<Shared<Type>> {
+  let nodes = TypedBody.nodeSlice(body)
+  if let BodyNodeKind.Expression {ty, ..} = &nodes[at].kind { return Option.some<Shared<Type>>(Shared.clone<Type>(&ty)) }
+  return Option.none<Shared<Type>>()
+}
+
+// The child type one step selects among the children glue would drop, if that child needs cleanup.
+fn steppedChild(children: &GlueChildren, step: &BodyPlaceStep) -> Option<Shared<Type>> {
+  let listed = match &children.* {
+    GlueChildren.Fields {fields} => match &step.* {
+      BodyPlaceStep.Field {index} => childType(&fields, index)
+      _ => Option.none<Shared<Type>>()
+    }
+    GlueChildren.Elements {element, ..} => match &step.* {
+      BodyPlaceStep.Element {..} => Option.some<Shared<Type>>(Shared.clone<Type>(&element.ty))
+      _ => Option.none<Shared<Type>>()
+    }
+    GlueChildren.Members {members, ..} => match &step.* {
+      BodyPlaceStep.Member {tag, ..} => childType(&members, tag)
+      _ => Option.none<Shared<Type>>()
+    }
+    GlueChildren.Variants {variants, ..} => match &step.* {
+      BodyPlaceStep.VariantField {tag, field} => {
+        let listed = Vector.asSlice<GlueVariant>(&variants)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if listed[at].tag == tag { return childType(&listed[at].fields, field) }
+          at = at + usize.ONE
+        }
+        return Option.none<Shared<Type>>()
+      }
+      _ => Option.none<Shared<Type>>()
+    }
+  }
+  return move listed
+}
+
+fn childType(children: &Vector<GlueChild>, index: usize) -> Option<Shared<Type>> {
+  let listed = Vector.asSlice<GlueChild>(children)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].index == index { return Option.some<Shared<Type>>(Shared.clone<Type>(&listed[at].ty)) }
+    at = at + usize.ONE
+  }
+  return Option.none<Shared<Type>>()
+}
+
+effect fn stepProjection(step: &BodyPlaceStep) -> MirProjection ! OutOfMemoryError ? &mut Allocator {
+  return match &step.* {
+    BodyPlaceStep.Field {index} => MirProjection.Field {index: index}
+    BodyPlaceStep.Element {index} => MirProjection.ConstIndex {index: index}
+    BodyPlaceStep.Member {tag, ty} => MirProjection.Payload {index: tag, ty: Shared.clone<Type>(&ty)}
+    BodyPlaceStep.VariantField {tag, field} => MirProjection.VariantField {variant: tag, field: field}
+  }
+}
+
+// For each consuming site that moves a projection needing cleanup, the owners its path leaves and
+// the children each would still drop. A site whose owners have no recipe gets none, and lowering
+// reports the `cleanup` gap there.
+effect fn partialRemainders(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  typed: &Shared<TypedBody>, bindings: &[Binding]) -> Result<Vector<Remainder>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut remainders = Vector.make<Remainder>()
+  let count = Shared.with<TypedBody, usize>(typed, fn(body: &TypedBody) -> usize { return TypedBody.nodeSlice(body).length })
+  let mut at = usize.ZERO
+  while at < count {
+    let site = Shared.with<TypedBody, Option<PartialSite>>(typed, fn(body: &TypedBody) -> Option<PartialSite> { return partialSiteAt(body, at) })
+    if let Option<PartialSite>.Some {value: found} = move site {
+      let moved = run Type.applyBindings(&found.moved, bindings, true)
+      let free = Shared.with<Type, bool>(&moved, Type.cleanupFree)
+      let mut root = Option.none<Shared<Type>>()
+      if found.local != usize.MAX {
+        root = Option.some<Shared<Type>>(Shared.with<TypedBody, Shared<Type>>(typed, fn(body: &TypedBody) -> Shared<Type> { return localTypeAt(body, found.local) }))
+      } else {
+        root = Shared.with<TypedBody, Option<Shared<Type>>>(typed, fn(body: &TypedBody) -> Option<Shared<Type>> { return nodeTypeAt(body, found.subject) })
+      }
+      if let Option<Shared<Type>>.Some {value: written} = move root {
+        if !free {
+          let mut current = run Type.applyBindings(&written, bindings, true)
+          let mut steps = Vector.make<MirProjection>()
+          let mut levels = Vector.make<RemainderLevel>()
+          let mut complete = true
+          let mut step = usize.ZERO
+          while step < found.steps && complete {
+            let selected = Shared.with<TypedBody, Option<BodyPlaceStep>>(typed, fn(body: &TypedBody) -> Option<BodyPlaceStep> { return partialStepAt(body, at, step) })
+            let written = match move selected {
+              Option<BodyPlaceStep>.Some {value} => value
+              Option<BodyPlaceStep>.None => { complete = false continue }
+            }
+            let hook = match move run dropImplementation(&mut resolver.*, &mut owner.*, &mut dependencies.*, &current) {
+              Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Success {value} => value
+              Result<Option<Shared<DeclarationId>>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Vector<Remainder>, Shared<Rejection>>(move error) }
+            }
+            let hooked = match &hook {
+              Option<Shared<DeclarationId>>.Some {..} => true
+              Option<Shared<DeclarationId>>.None => false
+            }
+            let children = match move run glueChildren(&mut resolver.*, &mut owner.*, &mut dependencies.*, &current) {
+              Result<GlueChildren, Option<Shared<Rejection>>>.Success {value} => value
+              Result<GlueChildren, Option<Shared<Rejection>>>.Failure {error} => match move error {
+                Option<Shared<Rejection>>.Some {value} => { return Result.failResult<Vector<Remainder>, Shared<Rejection>>(move value) }
+                Option<Shared<Rejection>>.None => { complete = false continue }
+              }
+            }
+            let next = match move steppedChild(&children, &written) {
+              Option<Shared<Type>>.Some {value} => value
+              Option<Shared<Type>>.None => { complete = false continue }
+            }
+            run Vector.append<MirProjection>(&mut steps, run stepProjection(&written))
+            run Vector.append<RemainderLevel>(&mut levels, RemainderLevel {hooked: hooked, children: move children})
+            current = move next
+            step = step + usize.ONE
+          }
+          if complete {
+            run Vector.append<Remainder>(&mut remainders, Remainder {node: at, steps: move steps, levels: move levels})
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Result.succeed<Vector<Remainder>, Shared<Rejection>>(move remainders)
 }
 
 // Drop glue reads its type's Drop hook and member shapes, never a function body. A cleanup form
@@ -29607,6 +29854,10 @@ effect fn resolveMir(
     }
     at = at + usize.ONE
   }
+  let remainders = match move run partialRemainders(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, Vector.asSlice<Binding>(&callerBindings)) {
+    Result<Vector<Remainder>, Shared<Rejection>>.Success {value} => value
+    Result<Vector<Remainder>, Shared<Rejection>>.Failure {error} => { return memberRejected(move error, move dependencies) }
+  }
   let sourceAnswer = run source(&mut resolver.*, &module)
   let lowered = match move sourceOf(&resolver.*, &sourceAnswer, &module) {
     Option<&IndexedSource>.Some {value: indexed} => run Effect.result(
@@ -29617,6 +29868,7 @@ effect fn resolveMir(
         &result,
         Vector.asSlice<Shared<Type>>(&parameters),
         move calls,
+        move remainders,
       ),
     )
     Option<&IndexedSource>.None => {
