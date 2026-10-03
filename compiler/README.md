@@ -33,8 +33,19 @@ other value emits nothing; a drop that needs cleanup calls the drop glue of the 
 its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
 need cleanup, fields in declaration order, array elements in ascending order and only the active
 union member or variant. Callable and Effect environments, generic nominal unions and unions
-without a canonical member order still report the `cleanup` gap. Automatic cleanup at scope exits
-is roadmap step 6c.
+without a canonical member order still report the `cleanup` gap. MIR lowering keeps a cleanup
+stack: bindings and by-value parameters that need cleanup are owners of their scope, consuming sites
+mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,
+innermost first and in reverse acquisition order. Replacement drops the displaced value first.
+Where paths reach a join with different ownership, the owner gets a `DropFlag` local written on
+each incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
+tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
+rvalues used only as places are dropped at the end of their full expression unless a borrowing
+`let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
+path. Partial moves of values that need cleanup (roadmap step 6d), a guard that changes an owner's
+state (the bootstrap rejects such moves as OWN0008, which selfhost does not report yet), a loop
+iteration that leaves an owner changed and a borrowing match result whose arm created temporaries
+still report the `cleanup` gap.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

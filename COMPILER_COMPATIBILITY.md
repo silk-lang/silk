@@ -136,19 +136,38 @@ Each entry records:
 - **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
   `compiler/src/semantic/SemanticCases.silk`.
 
-### Selfhost reports owned cleanup as the `cleanup` gap until drops are lowered
+### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
-- **Status:** implemented on 2026-10-03 as a stopgap until Step 6 (MIR drops and drop flags)
-  replaces it.
+- **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
-- **Compilers:** the bootstrap lowers drops. Selfhost lowers none, so a reached body that would
-  run cleanup is the backend gap `cleanup` instead of a silent leak: a return, break, continue or
-  block end with a live owned value, a move on only some paths, an assignment over a live value,
-  a partial move, or a moved `match`, `let` or `if let` subject.
+- **Compilers:** both lower drops, replacement drops and drop flags. Selfhost still reports the
+  backend gap `cleanup` instead of lowering a partial move of a value that needs cleanup, a binding
+  moved out of a consuming `match`, `let` or `if let`, a loop iteration that leaves an owner in a
+  different state than it found it, a guard that changes an owner's state, a borrowing match result
+  whose arm created temporaries, and drop glue for callable and Effect environments, generic
+  nominal unions and unions without a canonical member order.
 - **Source migration:** none.
-- **Evidence:** `cleanupGapNamesEveryExitThatWouldLeak` in
+- **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths` and
+  `dropGlueCleansHookThenChildren` in `compiler/src/semantic/SemanticCases.silk` cover the lowered
+  forms and the partial-move, guard and loop gaps. Not checked by a test: the borrowing match
+  result gap, which current typing cannot reach because it borrows only places and Drop-free array
+  literals, and the deferred glue forms.
+
+### Selfhost does not reject moves inside match guards at typing
+
+- **Status:** recorded on 2026-10-03 with Step 6c.
+- **Rule:** the reference reports OWN0008 for moving a provisional pattern binding inside its guard
+  (ownership-and-borrowing.md, MATCH-002); it states no rule for other places a guard moves.
+- **Compilers:** the bootstrap checks every guard in guard mode and reports OWN0008 for any place a
+  guard moves, including an ordinary local, which is broader than the reference. Selfhost has no
+  OWN0008 yet. It types a guard that moves an owner, and MIR lowering then reports the `cleanup`
+  gap for a guard that changes an owner's state, so no program it accepts here reaches codegen.
+- **Source migration:** none.
+- **Evidence:** the `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` in
   `compiler/src/semantic/SemanticCases.silk`.
+- **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
+  reference should widen it, before selfhost implements the code.
 
 ### Omitted Effect environments elaborated from inputs
 
