@@ -1,5 +1,6 @@
 /** Ordered native-corpus programs promised by the self-hosted compiler. */
 export const selfhostTrack = [
+  'trivial-features',
   'foreign-libc-abs',
   'foreign-libc-pointer-roundtrip',
   'foreign-libc-floating',
