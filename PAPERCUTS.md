@@ -431,3 +431,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-02 · The native selfhost CLI defaults to absent `/usr/bin/clang` and launches it with an empty environment, so the prepared LLVM binary also cannot find `ld` · Set `SILKC_CLANG` to a local wrapper invoking prepared LLVM 22 with `--ld-path=/usr/bin/ld` · selfhost pipe operator
 
 - 2026-10-03 · The shared local test script rejected an empty filter before acquiring the build slot · Give focused formatter cases a common `document` prefix and pass that nonempty filter · native formatter
+
+- 2026-10-03 · T3's generated `t3code/add-selfhost-formatter` branch was blocked by the repository push hook, so PR creation could not find its head · Push the workspace branch to `selfhost-formatter-document` with an explicit refspec · native formatter
