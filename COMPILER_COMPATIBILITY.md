@@ -142,11 +142,15 @@ Each entry records:
 - **Compilers:** both lower drops, replacement drops and drop flags. Selfhost still reports the
   backend gap `cleanup` instead of lowering a partial move of a value that needs cleanup, a binding
   moved out of a consuming `match`, `let` or `if let`, a loop iteration that leaves an owner in a
-  different state than it found it, and drop glue for callable and Effect environments, generic
+  different state than it found it, a guard that changes an owner's state, a borrowing match result
+  whose arm created temporaries, and drop glue for callable and Effect environments, generic
   nominal unions and unions without a canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths` and
-  `dropGlueCleansHookThenChildren` in `compiler/src/semantic/SemanticCases.silk`.
+  `dropGlueCleansHookThenChildren` in `compiler/src/semantic/SemanticCases.silk` cover the lowered
+  forms and the partial-move, guard and loop gaps. Not checked by a test: the borrowing match
+  result gap, which current typing cannot reach because it borrows only places and Drop-free array
+  literals, and the deferred glue forms.
 
 ### Omitted Effect environments elaborated from inputs
 
