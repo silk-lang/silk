@@ -1,0 +1,869 @@
+//! Availability of places acquired by anonymous environments, before layout or drop decisions.
+//!
+//! This proof walks checked control flow, including cleanup-free and Copy owners. It retains
+//! static source paths rather than backend remainder indices. General loan validity remains a
+//! separate obligation; uncertain guard or indexed-restoration facts are never ownership errors.
+
+import hir.Hir {InfixOperator}
+import semantic.TypedBody {AggregateField, BindingAccess, ConsumedPlace, Expression, MatchArm, Node, NodeId, NodeKind, Origin, PlaceRoot, PlaceStep, SubjectAccess}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// The result that prevents an environment from acquiring one of its places.
+pub enum FailureKind { Unavailable, LoopChanged, OverlappingWrite, Unproved }
+
+/// An authored capture or control-flow edge and the earlier consuming operation, when known.
+pub struct Failure {
+  pub kind: FailureKind
+  pub origin: Origin
+  pub previous: Option<Origin>
+}
+
+enum RootKind { Local, Subject }
+struct Root { kind: RootKind id: usize }
+impl Copy for Root {}
+
+struct Hole { root: Root path: Vector<PlaceStep> origin: Origin }
+struct State { roots: Vector<Root> holes: Vector<Hole> definite: Vector<Hole> transitions: Vector<Hole> uncertain: Vector<Root> }
+struct Flow {
+  normal: Option<State>
+  breaks: Option<State>
+  continues: Option<State>
+  failure: Option<Failure>
+}
+
+fn rootOf(place: &PlaceRoot) -> Root {
+  return match &place.* {
+    PlaceRoot.Local {local} => Root {kind: RootKind.Local, id: local.index}
+    PlaceRoot.Subject {subject} => Root {kind: RootKind.Subject, id: subject.index}
+  }
+}
+fn sameRoot(left: Root, right: Root) -> bool { return left.kind == right.kind && left.id == right.id }
+fn hasRoot(roots: &[Root], wanted: Root) -> bool {
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if sameRoot(roots[at], wanted) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+fn sameStep(left: &PlaceStep, right: &PlaceStep) -> bool {
+  return match &left.* {
+    PlaceStep.Field {index} => match &right.* { PlaceStep.Field {index: other} => index == other _ => false }
+    PlaceStep.Element {index} => match &right.* { PlaceStep.Element {index: other} => index == other _ => false }
+    PlaceStep.Member {tag, ..} => match &right.* { PlaceStep.Member {tag: other, ..} => tag == other _ => false }
+    PlaceStep.VariantField {tag, field} => match &right.* { PlaceStep.VariantField {tag: other, field: otherField} => tag == other && field == otherField _ => false }
+  }
+}
+fn prefix(left: &[PlaceStep], right: &[PlaceStep]) -> bool {
+  if left.length > right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !sameStep(&left[at], &right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+effect fn copyPath(path: &[PlaceStep]) -> Vector<PlaceStep> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector.make<PlaceStep>()
+  let mut at = usize.ZERO
+  while at < path.length {
+    let step = match &path[at] {
+      PlaceStep.Field {index} => PlaceStep.Field {index: index}
+      PlaceStep.Element {index} => PlaceStep.Element {index: index}
+      PlaceStep.Member {tag, ty} => PlaceStep.Member {tag: tag, ty: Shared.clone<Type>(&ty)}
+      PlaceStep.VariantField {tag, field} => PlaceStep.VariantField {tag: tag, field: field}
+    }
+    run Vector.append<PlaceStep>(&mut copied, move step)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+effect fn copyState(value: &State) -> State ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>()}
+  let roots = Vector.asSlice<Root>(&value.roots)
+  let mut at = usize.ZERO
+  while at < roots.length { run Vector.append<Root>(&mut copied.roots, roots[at])
+    at = at + usize.ONE }
+  let holes = Vector.asSlice<Hole>(&value.holes)
+  at = usize.ZERO
+  while at < holes.length {
+    run Vector.append<Hole>(&mut copied.holes, Hole {root: holes[at].root,
+      path: run copyPath(Vector.asSlice<PlaceStep>(&holes[at].path)), origin: holes[at].origin})
+    at = at + usize.ONE
+  }
+  let certain = Vector.asSlice<Hole>(&value.definite)
+  at = usize.ZERO
+  while at < certain.length {
+    run Vector.append<Hole>(&mut copied.definite, Hole {root: certain[at].root,
+      path: run copyPath(Vector.asSlice<PlaceStep>(&certain[at].path)), origin: certain[at].origin})
+    at = at + usize.ONE
+  }
+  let transitions = Vector.asSlice<Hole>(&value.transitions)
+  at = usize.ZERO
+  while at < transitions.length {
+    run Vector.append<Hole>(&mut copied.transitions, Hole {root: transitions[at].root,
+      path: run copyPath(Vector.asSlice<PlaceStep>(&transitions[at].path)), origin: transitions[at].origin})
+    at = at + usize.ONE
+  }
+  let uncertain = Vector.asSlice<Root>(&value.uncertain)
+  at = usize.ZERO
+  while at < uncertain.length { run Vector.append<Root>(&mut copied.uncertain, uncertain[at])
+    at = at + usize.ONE }
+  return move copied
+}
+fn continuing(state: State) -> Flow {
+  return Flow {normal: Option.some<State>(move state), breaks: Option.none<State>(),
+    continues: Option.none<State>(), failure: Option.none<Failure>()}
+}
+fn emptyFlow() -> Flow {
+  return Flow {normal: Option.none<State>(), breaks: Option.none<State>(),
+    continues: Option.none<State>(), failure: Option.none<Failure>()}
+}
+effect fn uncertainRoot(state: &mut State, root: Root) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !hasRoot(Vector.asSlice<Root>(&state.uncertain), root) { run Vector.append<Root>(&mut state.uncertain, root) }
+  return ()
+}
+fn clearHoles(holes: &mut Vector<Hole>, root: Root) -> () {
+  let mut at = Vector.length<Hole>(&holes.*)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if sameRoot(Vector.asSlice<Hole>(&holes.*)[at].root, root) { drop Vector.remove<Hole>(&mut holes.*, at) }
+  }
+  return ()
+}
+fn clearRoot(state: &mut State, root: Root) -> () {
+  clearHoles(&mut state.holes, root)
+  clearHoles(&mut state.definite, root)
+  let mut at = Vector.length<Root>(&state.uncertain)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if sameRoot(Vector.get<Root>(&state.uncertain, at), root) { drop Vector.remove<Root>(&mut state.uncertain, at) }
+  }
+  return ()
+}
+effect fn declareRoot(state: &mut State, root: Root) -> () ! OutOfMemoryError ? &mut Allocator {
+  clearRoot(&mut state.*, root)
+  if !hasRoot(Vector.asSlice<Root>(&state.roots), root) { run Vector.append<Root>(&mut state.roots, root) }
+  return ()
+}
+effect fn addHole(holes: &mut Vector<Hole>, root: Root, path: &[PlaceStep], origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < Vector.length<Hole>(&holes.*) {
+    let entries = Vector.asSlice<Hole>(&holes.*)
+    if sameRoot(entries[at].root, root) && prefix(Vector.asSlice<PlaceStep>(&entries[at].path), path) { return () }
+    at = at + usize.ONE
+  }
+  at = Vector.length<Hole>(&holes.*)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let entries = Vector.asSlice<Hole>(&holes.*)
+    if sameRoot(entries[at].root, root) && prefix(path, Vector.asSlice<PlaceStep>(&entries[at].path)) {
+      drop Vector.remove<Hole>(&mut holes.*, at)
+    }
+  }
+  run Vector.append<Hole>(&mut holes.*, Hole {root: root, path: run copyPath(path), origin: origin})
+  return ()
+}
+effect fn missing(state: &mut State, root: Root, path: &[PlaceStep], origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run addHole(&mut state.holes, root, path, origin)
+  return run addHole(&mut state.definite, root, path, origin)
+}
+effect fn consume(state: &mut State, consumed: &Option<ConsumedPlace>, origin: Origin) -> Option<Failure>
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<ConsumedPlace>.Some {value} = &consumed.* {
+    let root = rootOf(&value.root)
+    let path = Vector.asSlice<PlaceStep>(&value.steps)
+    let absent = overlap(&state.*, root, path)
+    if let Option<Origin>.Some {value: previous} = move absent {
+      let mut kind = FailureKind.Unavailable
+      if hasRoot(Vector.asSlice<Root>(&state.uncertain), root) { kind = FailureKind.Unproved }
+      return Option.some<Failure>(Failure {kind: kind, origin: origin, previous: Option.some<Origin>(previous)})
+    }
+    run Vector.append<Hole>(&mut state.transitions, Hole {root: root, path: run copyPath(path), origin: origin})
+    run missing(&mut state.*, root, path, origin)
+  }
+  return Option.none<Failure>()
+}
+effect fn intersectHoles(left: &[Hole], right: &[Hole]) -> Vector<Hole>
+! OutOfMemoryError ? &mut Allocator {
+  let mut shared = Vector.make<Hole>()
+  let mut at = usize.ZERO
+  while at < left.length {
+    let a = Vector.asSlice<PlaceStep>(&left[at].path)
+    let mut next = usize.ZERO
+    while next < right.length {
+      let b = Vector.asSlice<PlaceStep>(&right[next].path)
+      if sameRoot(left[at].root, right[next].root) {
+        if prefix(a, b) { run addHole(&mut shared, left[at].root, b, right[next].origin) }
+        else if prefix(b, a) { run addHole(&mut shared, left[at].root, a, left[at].origin) }
+      }
+      next = next + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move shared
+}
+fn hasTransition(transitions: &[Hole], origin: Origin) -> bool {
+  let mut at = usize.ZERO
+  while at < transitions.length {
+    if transitions[at].origin.syntax.index == origin.syntax.index { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+effect fn unionState(left: &mut State, right: &State) -> () ! OutOfMemoryError ? &mut Allocator {
+  let shared = run intersectHoles(Vector.asSlice<Hole>(&left.definite), Vector.asSlice<Hole>(&right.definite))
+  left.definite = move shared
+  let roots = Vector.asSlice<Root>(&right.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if !hasRoot(Vector.asSlice<Root>(&left.roots), roots[at]) { run Vector.append<Root>(&mut left.roots, roots[at]) }
+    at = at + usize.ONE
+  }
+  let holes = Vector.asSlice<Hole>(&right.holes)
+  at = usize.ZERO
+  while at < holes.length {
+    run addHole(&mut left.holes, holes[at].root, Vector.asSlice<PlaceStep>(&holes[at].path), holes[at].origin)
+    at = at + usize.ONE
+  }
+  let incoming = Vector.asSlice<Hole>(&right.transitions)
+  at = usize.ZERO
+  while at < incoming.length {
+    if !hasTransition(Vector.asSlice<Hole>(&left.transitions), incoming[at].origin) {
+      run Vector.append<Hole>(&mut left.transitions, Hole {root: incoming[at].root,
+        path: run copyPath(Vector.asSlice<PlaceStep>(&incoming[at].path)), origin: incoming[at].origin})
+    }
+    at = at + usize.ONE
+  }
+  let uncertain = Vector.asSlice<Root>(&right.uncertain)
+  at = usize.ZERO
+  while at < uncertain.length { run uncertainRoot(&mut left.*, uncertain[at])
+    at = at + usize.ONE }
+  return ()
+}
+effect fn joinState(target: &mut Option<State>, incoming: Option<State>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<State>.Some {value} = move incoming {
+    let mut previous = Intrinsic.replace(target.*, Option.none<State>())
+    let present = match &previous { Option<State>.Some {..} => true _ => false }
+    if let Option<State>.Some {value: stored} = &mut previous { run unionState(&mut stored, &value) }
+    if !present { previous = Option.some<State>(move value) }
+    target.* = move previous
+  }
+  return ()
+}
+effect fn joinFlow(target: &mut Flow, incoming: Flow) -> () ! OutOfMemoryError ? &mut Allocator {
+  let Flow {normal, breaks, continues, failure} = move incoming
+  run joinState(&mut target.normal, move normal)
+  run joinState(&mut target.breaks, move breaks)
+  run joinState(&mut target.continues, move continues)
+  if noFailure(&target.failure) {
+    target.failure = move failure
+  }
+  return ()
+}
+fn scopeHoles(holes: &mut Vector<Hole>, roots: &[Root]) -> () {
+  let mut at = Vector.length<Hole>(&holes.*)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if !hasRoot(roots, Vector.asSlice<Hole>(&holes.*)[at].root) { drop Vector.remove<Hole>(&mut holes.*, at) }
+  }
+  return ()
+}
+fn scopeState(state: &mut State, roots: usize) -> () {
+  Vector.truncate<Root>(&mut state.roots, roots)
+  let active = Vector.asSlice<Root>(&state.roots)
+  scopeHoles(&mut state.holes, active)
+  scopeHoles(&mut state.definite, active)
+  let mut at = Vector.length<Root>(&state.uncertain)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if !hasRoot(active, Vector.get<Root>(&state.uncertain, at)) { drop Vector.remove<Root>(&mut state.uncertain, at) }
+  }
+  return ()
+}
+fn scopeFlow(flow: &mut Flow, roots: usize) -> () {
+  if let Option<State>.Some {value} = &mut flow.normal { scopeState(&mut value, roots) }
+  if let Option<State>.Some {value} = &mut flow.breaks { scopeState(&mut value, roots) }
+  if let Option<State>.Some {value} = &mut flow.continues { scopeState(&mut value, roots) }
+  return ()
+}
+fn equalHoles(holes: &[Hole], other: &[Hole]) -> bool {
+  if holes.length != other.length { return false }
+  let mut at = usize.ZERO
+  while at < holes.length {
+    let mut found = false
+    let mut next = usize.ZERO
+    while next < other.length && !found {
+      let a = Vector.asSlice<PlaceStep>(&holes[at].path)
+      let b = Vector.asSlice<PlaceStep>(&other[next].path)
+      found = sameRoot(holes[at].root, other[next].root) && a.length == b.length && prefix(a, b)
+      next = next + usize.ONE
+    }
+    if !found { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameHoles(left: &State, right: &State) -> bool {
+  return equalHoles(Vector.asSlice<Hole>(&left.holes), Vector.asSlice<Hole>(&right.holes)) &&
+    equalHoles(Vector.asSlice<Hole>(&left.definite), Vector.asSlice<Hole>(&right.definite))
+}
+fn exactHoles(state: &State) -> bool {
+  return equalHoles(Vector.asSlice<Hole>(&state.holes), Vector.asSlice<Hole>(&state.definite))
+}
+
+// Source pattern paths retain whether they name an evaluated subject or address source storage.
+effect fn place(nodes: &[Node], indices: &[Option<usize>], id: NodeId) -> Option<ConsumedPlace> ! OutOfMemoryError ? &mut Allocator {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    match &form {
+      Expression.Local {local} => { return Option.some<ConsumedPlace>(ConsumedPlace {
+        root: PlaceRoot.Local {local: local}, steps: Vector.make<PlaceStep>(),
+      }) }
+      Expression.Borrow {value, ..} => { return run place(nodes, indices, value) }
+      Expression.Move {value, ..} => { return run place(nodes, indices, value) }
+      Expression.Field {value, index} => {
+        let selected = run place(nodes, indices, value)
+        if let Option<ConsumedPlace>.Some {value: selectedPlace} = move selected {
+          let mut path = move selectedPlace.steps
+          run Vector.append<PlaceStep>(&mut path, PlaceStep.Field {index: index})
+          return Option.some<ConsumedPlace>(ConsumedPlace {root: move selectedPlace.root, steps: move path})
+        }
+      }
+      Expression.Dereference {value} => { return run place(nodes, indices, value) }
+      Expression.Index {value, index} => {
+        if let Option<usize>.Some {value: element} = &indices[index.index] {
+          let base = run place(nodes, indices, value)
+          if let Option<ConsumedPlace>.Some {value: selectedPlace} = move base {
+            let mut path = move selectedPlace.steps
+            run Vector.append<PlaceStep>(&mut path, PlaceStep.Element {index: element})
+            return Option.some<ConsumedPlace>(ConsumedPlace {root: move selectedPlace.root, steps: move path})
+          }
+        }
+      }
+      Expression.PatternBinding {subject, path, access} => {
+        let mut selected = Option.none<ConsumedPlace>()
+        if access == BindingAccess.Copied || access == BindingAccess.Moved {
+          selected = Option.some<ConsumedPlace>(ConsumedPlace {root: PlaceRoot.Subject {subject: subject}, steps: Vector.make<PlaceStep>()})
+        } else { selected = run place(nodes, indices, subject) }
+        if let Option<ConsumedPlace>.Some {value: selectedPlace} = move selected {
+          let mut combined = move selectedPlace.steps
+          let mut moving = run copyPath(Vector.asSlice<PlaceStep>(&path))
+          while Vector.length<PlaceStep>(&moving) > usize.ZERO { run Vector.append<PlaceStep>(&mut combined, Vector.remove<PlaceStep>(&mut moving, usize.ZERO)) }
+          return Option.some<ConsumedPlace>(ConsumedPlace {root: move selectedPlace.root, steps: move combined})
+        }
+      }
+      _ => ()
+    }
+  }
+  return Option.none<ConsumedPlace>()
+}
+fn overlap(state: &State, root: Root, path: &[PlaceStep]) -> Option<Origin> {
+  let holes = Vector.asSlice<Hole>(&state.holes)
+  let mut at = usize.ZERO
+  while at < holes.length {
+    let missingPath = Vector.asSlice<PlaceStep>(&holes[at].path)
+    if sameRoot(root, holes[at].root) && (prefix(missingPath, path) || prefix(path, missingPath)) {
+      return Option.some<Origin>(holes[at].origin)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Origin>()
+}
+effect fn acquire(nodes: &[Node], indices: &[Option<usize>], id: NodeId, state: &State) -> Option<Failure> ! OutOfMemoryError ? &mut Allocator {
+  let selected = run place(nodes, indices, id)
+  if let Option<ConsumedPlace>.Some {value} = move selected {
+    let root = rootOf(&value.root)
+    let previous = overlap(state, root, Vector.asSlice<PlaceStep>(&value.steps))
+    if let Option<Origin>.Some {value: consumed} = move previous {
+      let mut kind = FailureKind.Unavailable
+      if hasRoot(Vector.asSlice<Root>(&state.uncertain), root) { kind = FailureKind.Unproved }
+      return Option.some<Failure>(Failure {kind: kind, origin: nodes[id.index].origin, previous: Option.some<Origin>(consumed)})
+    }
+    return Option.none<Failure>()
+  }
+  let root = expressionRoot(nodes, id)
+  if let Option<Root>.Some {value} = move root {
+    let holes = Vector.asSlice<Hole>(&state.holes)
+    let mut at = usize.ZERO
+    while at < holes.length {
+      if sameRoot(value, holes[at].root) {
+        return Option.some<Failure>(Failure {kind: FailureKind.Unproved, origin: nodes[id.index].origin,
+          previous: Option.some<Origin>(holes[at].origin)})
+      }
+      at = at + usize.ONE
+    }
+    return Option.none<Failure>()
+  }
+  return Option.some<Failure>(Failure {kind: FailureKind.Unproved, origin: nodes[id.index].origin, previous: Option.none<Origin>()})
+}
+
+effect fn readFailure(nodes: &[Node], indices: &[Option<usize>], id: NodeId, origin: Origin, flow: &Flow)
+-> Option<Failure> ! OutOfMemoryError ? &mut Allocator {
+  if let Option<State>.Some {value} = &flow.normal {
+    let root = expressionRoot(nodes, id)
+    // A freshly computed rvalue has no owned storage to read. Its inputs are visited separately.
+    if let Option<Root>.None = move root { return Option.none<Failure>() }
+    let checked = run acquire(nodes, indices, id, &value)
+    if let Option<Failure>.Some {value: failed} = move checked {
+      let mut result = move failed
+      result.origin = origin
+      return Option.some<Failure>(move result)
+    }
+  }
+  return Option.none<Failure>()
+}
+effect fn readPlace(nodes: &[Node], indices: &[Option<usize>], id: NodeId, origin: Origin, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let checked = run readFailure(nodes, indices, id, origin, &flow.*)
+  if noFailure(&flow.failure) { flow.failure = move checked }
+  return ()
+}
+// Projecting storage evaluates selectors without reading the whole base. Dereferencing reads
+// the view descriptor; pattern subjects have already been evaluated once by their match.
+effect fn interior(nodes: &[Node], indices: &[Option<usize>], id: NodeId, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  return run interiorAt(nodes, indices, id, nodes[id.index].origin, false, &mut flow.*)
+}
+effect fn interiorAt(nodes: &[Node], indices: &[Option<usize>], id: NodeId, origin: Origin, borrowing: bool, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    match &form {
+      Expression.Local {..} => { return () }
+      Expression.PatternBinding {..} => { return () }
+      Expression.Field {value, ..} => { return run interiorAt(nodes, indices, value, origin, borrowing, &mut flow.*) }
+      Expression.Index {value, index} => {
+        run interiorAt(nodes, indices, value, origin, borrowing, &mut flow.*)
+        return run sequence(nodes, indices, index, &mut flow.*)
+      }
+      Expression.Dereference {value} => {
+        if borrowing {
+          run interiorAt(nodes, indices, value, origin, true, &mut flow.*)
+          return run readPlace(nodes, indices, value, origin, &mut flow.*)
+        }
+        return run sequence(nodes, indices, value, &mut flow.*)
+      }
+      _ => ()
+    }
+  }
+  return run sequence(nodes, indices, id, &mut flow.*)
+}
+fn descriptor(nodes: &[Node], id: NodeId) -> Option<NodeId> {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form: Expression.Dereference {value}, ..} => Option.some<NodeId>(value)
+    NodeKind.Expression {form: Expression.Field {value, ..}, ..} => descriptor(nodes, value)
+    NodeKind.Expression {form: Expression.Index {value, ..}, ..} => {
+      let sliced = match &nodes[value.index].kind {
+        NodeKind.Expression {ty, ..} => Shared.with<Type, bool>(&ty, sliceType)
+        _ => false
+      }
+      if sliced { return Option.some<NodeId>(value) }
+      return descriptor(nodes, value)
+    }
+    NodeKind.Expression {form: Expression.PatternBinding {subject, access, ..}, ..} => {
+      if access == BindingAccess.Shared || access == BindingAccess.Exclusive || access == BindingAccess.Place {
+        return descriptor(nodes, subject)
+      }
+      return Option.none<NodeId>()
+    }
+    NodeKind.Expression {form: Expression.Borrow {value, ..}, ..} => descriptor(nodes, value)
+    _ => Option.none<NodeId>()
+  }
+}
+fn sliceType(ty: &Type) -> bool { return match &ty.* { Type.Slice {..} => true _ => false } }
+effect fn consumeFlow(nodes: &[Node], consumed: &Option<ConsumedPlace>, origin: Origin, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut current = Intrinsic.replace(flow.normal, Option.none<State>())
+  let mut failure = Option.none<Failure>()
+  if let Option<State>.Some {value} = &mut current { failure = run consume(&mut value, consumed, origin) }
+  flow.normal = move current
+  if noFailure(&flow.failure) { flow.failure = move failure }
+  return ()
+}
+fn transitionCount(flow: &Flow) -> usize {
+  if let Option<State>.Some {value} = &flow.normal { return Vector.length<Hole>(&value.transitions) }
+  return usize.ZERO
+}
+fn writeOverlap(state: &State, root: Root, path: &[PlaceStep], since: usize, origin: Origin) -> Option<Failure> {
+  let transitions = Vector.asSlice<Hole>(&state.transitions)
+  let mut at = since
+  while at < transitions.length {
+    let consumed = Vector.asSlice<PlaceStep>(&transitions[at].path)
+    if sameRoot(root, transitions[at].root) && (prefix(path, consumed) || prefix(consumed, path)) {
+      return Option.some<Failure>(Failure {kind: FailureKind.OverlappingWrite, origin: origin,
+        previous: Option.some<Origin>(transitions[at].origin)})
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Failure>()
+}
+
+// Sequence removes the normal edge, so a return/break/continue cannot be treated as fallthrough.
+effect fn sequence(nodes: &[Node], indices: &[Option<usize>], id: NodeId, flow: &mut Flow) -> () ! OutOfMemoryError ? &mut Allocator {
+  let before = Intrinsic.replace(flow.normal, Option.none<State>())
+  if let Option<State>.Some {value} = move before { run joinFlow(&mut flow.*, run walk(nodes, indices, id, move value)) }
+  return ()
+}
+effect fn arguments(nodes: &[Node], indices: &[Option<usize>], ids: &[NodeId], flow: &mut Flow) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < ids.length { run sequence(nodes, indices, ids[at], &mut flow.*)
+    at = at + usize.ONE }
+  return ()
+}
+effect fn capturedFailure(nodes: &[Node], indices: &[Option<usize>], operand: NodeId, flow: &Flow)
+-> Option<Failure> ! OutOfMemoryError ? &mut Allocator {
+  if let Option<State>.Some {value} = &flow.normal { return run acquire(nodes, indices, operand, &value) }
+  return Option.none<Failure>()
+}
+effect fn fields(nodes: &[Node], indices: &[Option<usize>], operands: &[AggregateField], captures: bool, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < operands.length {
+    if captures {
+      let failure = run capturedFailure(nodes, indices, operands[at].value, &flow.*)
+      if let Option<Failure>.Some {value: failed} = move failure {
+        if noFailure(&flow.failure) { flow.failure = Option.some<Failure>(move failed) }
+      }
+    }
+    run sequence(nodes, indices, operands[at].value, &mut flow.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+fn restoreHoles(holes: &mut Vector<Hole>, root: Root, path: &[PlaceStep]) -> () {
+  let mut at = Vector.length<Hole>(&holes.*)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let entries = Vector.asSlice<Hole>(&holes.*)
+    if sameRoot(root, entries[at].root) && prefix(path, Vector.asSlice<PlaceStep>(&entries[at].path)) {
+      drop Vector.remove<Hole>(&mut holes.*, at)
+    }
+  }
+  return ()
+}
+fn invalidAncestor(state: &State, root: Root, path: &[PlaceStep]) -> Option<Origin> {
+  let holes = Vector.asSlice<Hole>(&state.holes)
+  let mut at = usize.ZERO
+  while at < holes.length {
+    let missingPath = Vector.asSlice<PlaceStep>(&holes[at].path)
+    if sameRoot(root, holes[at].root) && path.length > missingPath.length && prefix(missingPath, path) {
+      return Option.some<Origin>(holes[at].origin)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Origin>()
+}
+effect fn restoreState(nodes: &[Node], indices: &[Option<usize>], target: NodeId, since: usize, origin: Origin, state: &mut State)
+-> Option<Failure> ! OutOfMemoryError ? &mut Allocator {
+  let view = descriptor(nodes, target)
+  if let Option<NodeId>.Some {value} = move view { return run acquire(nodes, indices, value, &state.*) }
+  let targetPlace = run place(nodes, indices, target)
+  if let Option<ConsumedPlace>.Some {value} = move targetPlace {
+    let root = rootOf(&value.root)
+    let path = Vector.asSlice<PlaceStep>(&value.steps)
+    let overlap = writeOverlap(&state.*, root, path, since, origin)
+    if let Option<Failure>.Some {value: failed} = move overlap { return Option.some<Failure>(move failed) }
+    let previous = invalidAncestor(&state.*, root, path)
+    if let Option<Origin>.Some {value: missing} = move previous {
+      return Option.some<Failure>(Failure {kind: FailureKind.Unavailable, origin: nodes[target.index].origin,
+        previous: Option.some<Origin>(missing)})
+    }
+    restoreHoles(&mut state.holes, root, path)
+    restoreHoles(&mut state.definite, root, path)
+    return Option.none<Failure>()
+  }
+  // A runtime-index restoration may repair one missing element, but cannot prove which one.
+  let root = expressionRoot(nodes, target)
+  if let Option<Root>.Some {value} = move root { run uncertainRoot(&mut state.*, value) }
+  return Option.none<Failure>()
+}
+effect fn replaceLocal(local: usize, since: usize, origin: Origin, flow: &mut Flow) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut current = Intrinsic.replace(flow.normal, Option.none<State>())
+  let mut failure = Option.none<Failure>()
+  if let Option<State>.Some {value: state} = &mut current {
+    let empty = Vector.make<PlaceStep>()
+    failure = writeOverlap(&state, Root {kind: RootKind.Local, id: local}, Vector.asSlice<PlaceStep>(&empty), since, origin)
+    if noFailure(&failure) { clearRoot(&mut state, Root {kind: RootKind.Local, id: local}) }
+  }
+  flow.normal = move current
+  if noFailure(&flow.failure) { flow.failure = move failure }
+  return ()
+}
+effect fn restore(nodes: &[Node], indices: &[Option<usize>], target: NodeId, since: usize, origin: Origin, flow: &mut Flow) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut current = Intrinsic.replace(flow.normal, Option.none<State>())
+  let mut failure = Option.none<Failure>()
+  if let Option<State>.Some {value: state} = &mut current { failure = run restoreState(nodes, indices, target, since, origin, &mut state) }
+  flow.normal = move current
+  if noFailure(&flow.failure) { flow.failure = move failure }
+  return ()
+}
+fn expressionRoot(nodes: &[Node], id: NodeId) -> Option<Root> {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form: Expression.Local {local}, ..} => Option.some<Root>(Root {kind: RootKind.Local, id: local.index})
+    NodeKind.Expression {form: Expression.Field {value, ..}, ..} => expressionRoot(nodes, value)
+    NodeKind.Expression {form: Expression.Index {value, ..}, ..} => expressionRoot(nodes, value)
+    NodeKind.Expression {form: Expression.Borrow {value, ..}, ..} => expressionRoot(nodes, value)
+    NodeKind.Expression {form: Expression.Move {value, ..}, ..} => expressionRoot(nodes, value)
+    NodeKind.Expression {form: Expression.Dereference {value}, ..} => expressionRoot(nodes, value)
+    NodeKind.Expression {form: Expression.PatternBinding {subject, access, ..}, ..} => {
+      if access == BindingAccess.Moved || access == BindingAccess.Copied {
+        return Option.some<Root>(Root {kind: RootKind.Subject, id: subject.index})
+      }
+      return expressionRoot(nodes, subject)
+    }
+    _ => Option.none<Root>()
+  }
+}
+
+effect fn branching(nodes: &[Node], indices: &[Option<usize>], condition: NodeId, left: NodeId, right: &Option<NodeId>, state: State) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut flow = continuing(move state)
+  run sequence(nodes, indices, condition, &mut flow)
+  let before = Intrinsic.replace(flow.normal, Option.none<State>())
+  if let Option<State>.Some {value} = move before {
+    run joinFlow(&mut flow, run walk(nodes, indices, left, run copyState(&value)))
+    if let Option<NodeId>.Some {value: arm} = &right.* { run joinFlow(&mut flow, run walk(nodes, indices, arm, move value)) }
+    else { run joinState(&mut flow.normal, Option.some<State>(move value)) }
+  }
+  return move flow
+}
+effect fn looping(nodes: &[Node], indices: &[Option<usize>], id: NodeId, condition: NodeId, body: NodeId, state: State) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let entry = run copyState(&state)
+  let mut evaluated = continuing(move state)
+  run sequence(nodes, indices, condition, &mut evaluated)
+  let tested = move evaluated.normal
+  evaluated.normal = Option.none<State>()
+  if let Option<State>.Some {value} = move tested {
+    let roots = Vector.length<Root>(&value.roots)
+    let mut iteration = run walk(nodes, indices, body, run copyState(&value))
+    scopeFlow(&mut iteration, roots)
+    let normal = move iteration.normal
+    iteration.normal = Option.none<State>()
+    let repeating = move iteration.continues
+    iteration.continues = Option.none<State>()
+    let mut back = Option.none<State>()
+    run joinState(&mut back, move normal)
+    run joinState(&mut back, move repeating)
+    if let Option<State>.Some {value: after} = move back {
+      if !sameHoles(&entry, &after) || !exactHoles(&after) {
+        let mut kind = FailureKind.LoopChanged
+        if !exactHoles(&entry) || Vector.length<Root>(&after.uncertain) > usize.ZERO { kind = FailureKind.Unproved }
+        if noFailure(&iteration.failure) {
+          iteration.failure = Option.some<Failure>(Failure {kind: kind, origin: nodes[id.index].origin, previous: Option.none<Origin>()})
+        }
+      }
+    }
+    run joinState(&mut evaluated.normal, Option.some<State>(move value))
+    let exited = move iteration.breaks
+    iteration.breaks = Option.none<State>()
+    run joinState(&mut evaluated.normal, move exited)
+    run joinFlow(&mut evaluated, move iteration)
+  }
+  return move evaluated
+}
+
+effect fn changedRoots(before: &State, after: &State) -> Vector<Root>
+! OutOfMemoryError ? &mut Allocator {
+  let mut changed = Vector.make<Root>()
+  let holes = Vector.asSlice<Hole>(&before.holes)
+  let mut at = usize.ZERO
+  while at < holes.length { run Vector.append<Root>(&mut changed, holes[at].root)
+    at = at + usize.ONE }
+  let later = Vector.asSlice<Hole>(&after.holes)
+  at = usize.ZERO
+  while at < later.length { run Vector.append<Root>(&mut changed, later[at].root)
+    at = at + usize.ONE }
+  return move changed
+}
+effect fn matching(nodes: &[Node], indices: &[Option<usize>], id: NodeId, subject: NodeId, access: &SubjectAccess, arms: &[MatchArm], state: State) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut flow = continuing(move state)
+  let owned = match &access.* {
+    SubjectAccess.Consume {consumed} => match &consumed { Option<ConsumedPlace>.Some {..} => true _ => false }
+    SubjectAccess.Place {access: selected} => selected == BindingAccess.Place
+    _ => false
+  }
+  if owned {
+    run interior(nodes, indices, subject, &mut flow)
+    if let SubjectAccess.Place {..} = &access.* { run readPlace(nodes, indices, subject, nodes[id.index].origin, &mut flow) }
+  } else { run sequence(nodes, indices, subject, &mut flow) }
+  let before = Intrinsic.replace(flow.normal, Option.none<State>())
+  if let Option<State>.Some {value} = move before {
+    let mut remaining = move value
+    let roots = Vector.length<Root>(&remaining.roots)
+    if let SubjectAccess.Consume {consumed} = &access.* {
+      let checked = run consume(&mut remaining, &consumed, nodes[id.index].origin)
+      if noFailure(&flow.failure) { flow.failure = move checked }
+    }
+    let stored = match &access.* { SubjectAccess.Place {..} => true _ => false }
+    if !stored { run declareRoot(&mut remaining, Root {kind: RootKind.Subject, id: subject.index}) }
+    let mut at = usize.ZERO
+    while at < arms.length {
+      let mut candidate = continuing(run copyState(&remaining))
+      if let Option<NodeId>.Some {value: guard} = &arms[at].guard {
+        run sequence(nodes, indices, guard, &mut candidate)
+        if let Option<State>.Some {value: guarded} = &mut candidate.normal {
+          if !sameHoles(&remaining, &guarded) {
+            let changed = run changedRoots(&remaining, &guarded)
+            let changedView = Vector.asSlice<Root>(&changed)
+            let mut hole = usize.ZERO
+            while hole < changedView.length { run uncertainRoot(&mut guarded, changedView[hole])
+              hole = hole + usize.ONE }
+          }
+          run unionState(&mut remaining, &guarded)
+        }
+      }
+      run sequence(nodes, indices, arms[at].result, &mut candidate)
+      scopeFlow(&mut candidate, roots)
+      run joinFlow(&mut flow, move candidate)
+      at = at + usize.ONE
+    }
+  }
+  return move flow
+}
+
+effect fn walk(nodes: &[Node], indices: &[Option<usize>], id: NodeId, state: State) -> Flow ! OutOfMemoryError ? &mut Allocator {
+  let mut flow = continuing(move state)
+  match &nodes[id.index].kind {
+    NodeKind.Block {statements, ..} => {
+      let mut roots = usize.ZERO
+      if let Option<State>.Some {value} = &flow.normal { roots = Vector.length<Root>(&value.roots) }
+      run arguments(nodes, indices, Vector.asSlice<NodeId>(&statements), &mut flow)
+      scopeFlow(&mut flow, roots)
+    }
+    NodeKind.LocalBinding {local, initializer} => {
+      run sequence(nodes, indices, initializer, &mut flow)
+      if let Option<State>.Some {value} = &mut flow.normal { run declareRoot(&mut value, Root {kind: RootKind.Local, id: local.index}) }
+    }
+    NodeKind.MutableBinding {local, initializer} => {
+      run sequence(nodes, indices, initializer, &mut flow)
+      if let Option<State>.Some {value} = &mut flow.normal { run declareRoot(&mut value, Root {kind: RootKind.Local, id: local.index}) }
+    }
+    NodeKind.Assignment {local, value} => {
+      let since = transitionCount(&flow)
+      run sequence(nodes, indices, value, &mut flow)
+      run replaceLocal(local.index, since, nodes[id.index].origin, &mut flow)
+    }
+    NodeKind.PlaceAssignment {target, value} => {
+      run interior(nodes, indices, target, &mut flow)
+      let since = transitionCount(&flow)
+      run sequence(nodes, indices, value, &mut flow)
+      run restore(nodes, indices, target, since, nodes[id.index].origin, &mut flow)
+    }
+    NodeKind.Return {value} => {
+      if let Option<NodeId>.Some {value: returned} = &value { run sequence(nodes, indices, returned, &mut flow) }
+      drop Intrinsic.replace(flow.normal, Option.none<State>())
+    }
+    NodeKind.Break => { flow.breaks = move flow.normal
+      flow.normal = Option.none<State>() }
+    NodeKind.Continue => { flow.continues = move flow.normal
+      flow.normal = Option.none<State>() }
+    NodeKind.Drop {value, consumed} => {
+      if let Option<ConsumedPlace>.Some {..} = &consumed { run interior(nodes, indices, value, &mut flow) }
+      else { run sequence(nodes, indices, value, &mut flow) }
+      run consumeFlow(nodes, &consumed, nodes[id.index].origin, &mut flow)
+    }
+    NodeKind.Branch {condition, thenBranch, elseBranch, ..} => {
+      let before = Intrinsic.replace(flow.normal, Option.none<State>())
+      if let Option<State>.Some {value} = move before { return run branching(nodes, indices, condition, thenBranch, &elseBranch, move value) }
+    }
+    NodeKind.While {condition, body} => {
+      let before = Intrinsic.replace(flow.normal, Option.none<State>())
+      if let Option<State>.Some {value} = move before { return run looping(nodes, indices, id, condition, body, move value) }
+    }
+    NodeKind.Expression {form, ..} => match &form {
+      Expression.Move {value, consumed} => {
+        if let Option<ConsumedPlace>.Some {..} = &consumed { run interior(nodes, indices, value, &mut flow) }
+        else { run sequence(nodes, indices, value, &mut flow) }
+        run consumeFlow(nodes, &consumed, nodes[id.index].origin, &mut flow)
+      }
+      Expression.Local {..} => { run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
+      Expression.PatternBinding {..} => { run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
+      Expression.Callable {fields: captured, ..} => { run fields(nodes, indices, Vector.asSlice<AggregateField>(&captured), true, &mut flow) }
+      Expression.Aggregate {fields: operands} => { run fields(nodes, indices, Vector.asSlice<AggregateField>(&operands), false, &mut flow) }
+      Expression.VariantConstruct {fields: operands, ..} => { run fields(nodes, indices, Vector.asSlice<AggregateField>(&operands), false, &mut flow) }
+      Expression.DirectCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
+      Expression.InterfaceCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
+      Expression.ForeignCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
+      Expression.IntrinsicCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
+      Expression.CallableCall {callee, arguments: operands, pipeline, ..} => {
+        if pipeline { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow)
+          run sequence(nodes, indices, callee, &mut flow) }
+        else { run sequence(nodes, indices, callee, &mut flow)
+          run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
+      }
+      Expression.Match {subject, access, arms, ..} => {
+        let before = Intrinsic.replace(flow.normal, Option.none<State>())
+        if let Option<State>.Some {value} = move before { return run matching(nodes, indices, id, subject, &access, Vector.asSlice<MatchArm>(&arms), move value) }
+      }
+      Expression.ConcreteInfix {operator, left, right} => {
+        run sequence(nodes, indices, left, &mut flow)
+        if operator == InfixOperator.And || operator == InfixOperator.Or {
+          let before = Intrinsic.replace(flow.normal, Option.none<State>())
+          flow.normal = Option.none<State>()
+          if let Option<State>.Some {value} = move before {
+            run joinFlow(&mut flow, run walk(nodes, indices, right, run copyState(&value)))
+            run joinState(&mut flow.normal, Option.some<State>(move value))
+          }
+        } else { run sequence(nodes, indices, right, &mut flow) }
+      }
+      Expression.ConcretePrefix {operand, ..} => { run sequence(nodes, indices, operand, &mut flow) }
+      Expression.Borrow {value, ..} => {
+        run interiorAt(nodes, indices, value, nodes[id.index].origin, true, &mut flow)
+        run readPlace(nodes, indices, value, nodes[id.index].origin, &mut flow)
+      }
+      Expression.Dereference {value} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.Field {..} => { run interior(nodes, indices, id, &mut flow)
+        run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
+      Expression.Index {..} => { run interior(nodes, indices, id, &mut flow)
+        run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
+      Expression.PointerAccessWeaken {value} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.ArraySlice {value, ..} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.SliceLength {value} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.ArrayLength {value, ..} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.EnumValue {value} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.UnionInject {value, ..} => { run sequence(nodes, indices, value, &mut flow) }
+      Expression.CompileError {message} => { run sequence(nodes, indices, message, &mut flow) }
+      _ => ()
+    }
+  }
+  if let NodeKind.Expression {ty, ..} = &nodes[id.index].kind {
+    if Shared.with<Type, bool>(&ty, neverType) {
+      drop Intrinsic.replace(flow.normal, Option.none<State>())
+    }
+  }
+  return move flow
+}
+fn neverType(ty: &Type) -> bool {
+  return match &ty.* { Type.Union {members} => Vector.length<Shared<Type>>(&members) == usize.ZERO _ => false }
+}
+fn noFailure(failure: &Option<Failure>) -> bool { return match &failure.* { Option<Failure>.None => true _ => false } }
+
+/// Checks the places acquired by literals reached from this body root, independently of Drop.
+/// Delayed bodies are checked separately; unused node-list order never stands in for control flow.
+pub effect fn check(nodes: &[Node], indices: &[Option<usize>], root: NodeId, parameters: usize) -> Option<Failure>
+! OutOfMemoryError ? &mut Allocator {
+  let mut captures = false
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let NodeKind.Expression {form: Expression.Callable {..}, ..} = &nodes[at].kind { captures = true }
+    at = at + usize.ONE
+  }
+  if !captures { return Option.none<Failure>() }
+  let mut state = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>()}
+  at = usize.ZERO
+  while at < parameters { run declareRoot(&mut state, Root {kind: RootKind.Local, id: at})
+    at = at + usize.ONE }
+  let checked = run walk(nodes, indices, root, move state)
+  let Flow {failure, ..} = move checked
+  return move failure
+}

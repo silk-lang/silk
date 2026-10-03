@@ -1,0 +1,237 @@
+//! First-use capture facts from one checked anonymous body.
+//!
+//! The caller checks the body in its lexical context and supplies Copy evidence for outer locals
+//! and expression results. This actor records environment access; it does not resolve types,
+//! select functions, or check loans. Captures retain source origins while their declaration identity
+//! belongs to the syntax-only module index.
+
+import hir.Hir {Access as BorrowAccess, CallableMode}
+import semantic.TypedBody {Expression, Local, LocalId, Node, NodeId, NodeKind, Origin, SubjectAccess}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// How construction retains one outer local for delayed invocation.
+pub enum Access {
+  /// Snapshot a Copy value.
+  Copy,
+  /// Retain a shared loan of the outer place.
+  Shared,
+  /// Retain an exclusive loan of the outer place.
+  Mutable,
+  /// Transfer the outer owner into the environment.
+  Move,
+}
+
+/// One outer binding, acquired once at its first reference in the checked body.
+pub struct Capture {
+  /// The local in the preliminary body's lexical local table.
+  pub local: LocalId
+  /// The strongest access the body requests from this binding.
+  pub access: Access
+  /// The first written reference, independent of later access upgrades.
+  pub firstUse: Origin
+  /// The operation that first requested the final access, used for ownership diagnostics.
+  pub accessOrigin: Origin
+  /// The outer binding's complete type before a capture borrow is formed.
+  pub ty: Shared<Type>
+}
+
+fn rank(access: Access) -> usize {
+  return match access {
+    Access.Copy => 0
+    Access.Shared => 1
+    Access.Mutable => 2
+    Access.Move => 3
+  }
+}
+
+/// Follows the root of a checked place without following binder back references.
+fn root(nodes: &[Node], id: NodeId) -> Option<LocalId> {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form, ..} => match &form {
+      Expression.Local {local} => Option.some<LocalId>(local)
+      Expression.Field {value, ..} => root(nodes, value)
+      Expression.Index {value, ..} => root(nodes, value)
+      Expression.Dereference {value} => root(nodes, value)
+      Expression.PatternBinding {subject, ..} => root(nodes, subject)
+      Expression.Borrow {value, ..} => root(nodes, value)
+      _ => Option.none<LocalId>()
+    }
+    _ => Option.none<LocalId>()
+  }
+}
+
+effect fn upgrade(captures: &mut Vector<Capture>, local: Option<LocalId>, access: Access, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<LocalId>.Some {value: selected} = move local {
+    let mut at = usize.ZERO
+    while at < Vector.length<Capture>(&captures.*) {
+      let entries = Vector.asSlice<Capture>(&captures.*)
+      let found = &entries[at]
+      if found.local.index == selected.index && rank(access) > rank(found.access) {
+        let updated = Capture {local: found.local, access: access, firstUse: found.firstUse, accessOrigin: origin, ty: Shared.clone<Type>(&found.ty)}
+        Vector.set<Capture>(&mut captures.*, at, move updated)
+        return ()
+      }
+      at = at + usize.ONE
+    }
+  }
+  return ()
+}
+
+effect fn record(captures: &mut Vector<Capture>, local: LocalId, ty: &Shared<Type>, origin: Origin, copy: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < Vector.length<Capture>(&captures.*) {
+    let entries = Vector.asSlice<Capture>(&captures.*)
+      let found = &entries[at]
+    if found.local.index == local.index {
+      if origin.span.start < found.firstUse.span.start {
+        let updated = Capture {local: local, access: found.access, firstUse: origin, accessOrigin: origin, ty: Shared.clone<Type>(&found.ty)}
+        Vector.set<Capture>(&mut captures.*, at, move updated)
+      }
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  let mut access = Access.Shared
+  if copy { access = Access.Copy }
+  run Vector.append<Capture>(&mut captures.*, Capture {local: local, access: access, firstUse: origin, accessOrigin: origin, ty: Shared.clone<Type>(ty)})
+  return ()
+}
+
+// Stable insertion uses scalar reads and owned entries, so no loan crosses a vector mutation.
+effect fn writtenOrder(captures: Vector<Capture>) -> Vector<Capture>
+! OutOfMemoryError ? &mut Allocator {
+  let mut ordered = Vector.make<Capture>()
+  let entries = Vector.asSlice<Capture>(&captures)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let incoming = &entries[at]
+    let mut position = Vector.length<Capture>(&ordered)
+    run Vector.append<Capture>(&mut ordered, Capture {local: incoming.local, access: incoming.access, firstUse: incoming.firstUse, accessOrigin: incoming.accessOrigin, ty: Shared.clone<Type>(&incoming.ty)})
+    while position > usize.ZERO {
+      let orderedEntries = Vector.asSlice<Capture>(&ordered)
+      let previous = &orderedEntries[position - usize.ONE]
+      if previous.firstUse.span.start <= incoming.firstUse.span.start { break }
+      let shifted = Capture {local: previous.local, access: previous.access, firstUse: previous.firstUse, accessOrigin: previous.accessOrigin, ty: Shared.clone<Type>(&previous.ty)}
+      Vector.set<Capture>(&mut ordered, position, move shifted)
+      position = position - usize.ONE
+    }
+    Vector.set<Capture>(&mut ordered, position, Capture {local: incoming.local, access: incoming.access, firstUse: incoming.firstUse, accessOrigin: incoming.accessOrigin, ty: Shared.clone<Type>(&incoming.ty)})
+    at = at + usize.ONE
+  }
+  return move ordered
+}
+
+/// Discovers captures in first-reference order and derives their strongest environment access.
+///
+/// The first `outerCount` locals belong to the enclosing body. `localCopies` covers those locals;
+/// `expressionCopies` has one entry per typed node, with true only for proven Copy expressions.
+/// The remaining locals are anonymous parameters, local bindings and local pattern bindings.
+pub effect fn collect(nodes: &[Node], locals: &[Local], outerCount: usize, localCopies: &[bool], expressionCopies: &[bool]) -> Vector<Capture>
+! OutOfMemoryError ? &mut Allocator {
+  let mut captures = Vector.make<Capture>()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let NodeKind.Expression {form: Expression.Local {local}, ..} = &nodes[at].kind {
+      if local.index < outerCount {
+        run record(&mut captures, local, &locals[local.index].ty, nodes[at].origin, localCopies[local.index])
+      }
+    }
+    if let NodeKind.Assignment {local, ..} = &nodes[at].kind {
+      if local.index < outerCount {
+        run record(&mut captures, local, &locals[local.index].ty, nodes[at].origin, localCopies[local.index])
+      }
+    }
+    at = at + usize.ONE
+  }
+  run accesses(nodes, expressionCopies, &mut captures)
+  return run writtenOrder(move captures)
+}
+
+effect fn accesses(nodes: &[Node], expressionCopies: &[bool], captures: &mut Vector<Capture>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    match &nodes[at].kind {
+      NodeKind.Assignment {local, ..} => {
+        run upgrade(&mut captures.*, Option.some<LocalId>(local), Access.Mutable, nodes[at].origin)
+      }
+      NodeKind.PlaceAssignment {target, ..} => {
+        run upgrade(&mut captures.*, root(nodes, target), Access.Mutable, nodes[at].origin)
+      }
+      NodeKind.Drop {value, ..} => {
+        if !expressionCopies[value.index] && !viewExpression(nodes, value) { run upgrade(&mut captures.*, root(nodes, value), Access.Move, nodes[at].origin) }
+      }
+      NodeKind.Expression {form, ..} => match &form {
+        Expression.DirectCall {arguments, ..} => { run argumentAccesses(nodes, Vector.asSlice<NodeId>(&arguments), &mut captures.*) }
+        Expression.CallableCall {callee, mode, arguments, ..} => {
+          let requested = match mode { CallableMode.Shared => Access.Shared CallableMode.Mutable => Access.Mutable CallableMode.Once => Access.Move }
+          run upgrade(&mut captures.*, root(nodes, callee), requested, nodes[at].origin)
+          run argumentAccesses(nodes, Vector.asSlice<NodeId>(&arguments), &mut captures.*)
+        }
+        Expression.InterfaceCall {arguments, ..} => { run argumentAccesses(nodes, Vector.asSlice<NodeId>(&arguments), &mut captures.*) }
+        Expression.Borrow {access, value} => {
+          let mut requested = Access.Shared
+          if access == BorrowAccess.Mutable { requested = Access.Mutable }
+          run upgrade(&mut captures.*, root(nodes, value), requested, nodes[at].origin)
+        }
+        Expression.Move {value, ..} => {
+          if !expressionCopies[value.index] || viewExpression(nodes, value) { run upgrade(&mut captures.*, root(nodes, value), Access.Move, nodes[at].origin) }
+        }
+        Expression.Match {subject, access: SubjectAccess.Consume {..}, ..} => {
+          if !expressionCopies[subject.index] { run upgrade(&mut captures.*, root(nodes, subject), Access.Move, nodes[at].origin) }
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Derives invocation access from the retained captures, independent of new call arguments.
+pub fn invocation(captures: &[Capture]) -> CallableMode {
+  let mut mode = CallableMode.Shared
+  let mut at = usize.ZERO
+  while at < captures.length {
+    if captures[at].access == Access.Move { return CallableMode.Once }
+    if captures[at].access == Access.Mutable { mode = CallableMode.Mutable }
+    at = at + usize.ONE
+  }
+  return mode
+}
+
+// Passing an exclusive view by its bare name reborrows it for the call. A shared read through
+// the same view does not request mutation; explicit move is handled by its own typed node.
+effect fn argumentAccesses(nodes: &[Node], arguments: &[NodeId], captures: &mut Vector<Capture>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if let NodeKind.Expression {ty, ..} = &nodes[arguments[at].index].kind {
+      let exclusive = Shared.with<Type, bool>(&ty, fn(value: &Type) -> bool {
+        return match &value.* {
+          Type.Reference {access, ..} => access == BorrowAccess.Mutable
+          Type.Slice {access, ..} => access == BorrowAccess.Mutable
+          _ => false
+        }
+      })
+      if exclusive { run upgrade(&mut captures.*, root(nodes, arguments[at]), Access.Mutable, nodes[arguments[at].index].origin) }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn viewExpression(nodes: &[Node], id: NodeId) -> bool {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {ty, ..} => Type.containsViewBorrow(&ty)
+    _ => false
+  }
+}
