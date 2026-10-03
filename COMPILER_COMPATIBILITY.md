@@ -133,7 +133,8 @@ Each entry records:
   non-Copy one, as `Unsupported`, because its consumed places do not yet carry the subject path's
   owner types.
 - **Source migration:** none.
-- **Evidence:** `consumingSitesRecordConsumedPlaces` in `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
+  `compiler/src/semantic/SemanticCases.silk`.
 
 ### Selfhost reports owned cleanup as the `cleanup` gap until drops are lowered
 
