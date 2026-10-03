@@ -25,8 +25,9 @@ Typing records the owned place each consuming site transfers: `move`, `drop`, `m
 by-value receiver of an affine place. The place is a local or match subject plus static field,
 element and union steps; an owned rvalue records none. A runtime index or a reference boundary is
 rejected as the bootstrap's `OWN0002` (`ExtractionBoundary`), and moving a whole non-Copy referent
-as `OWN0012` (`BorrowedExtraction`). `drop` of a cleanup-free value (unit, runtime primitives and
-arrays of them) lowers now; any other drop reports the `cleanup` gap until drop glue exists
+as `OWN0012` (`BorrowedExtraction`). Semantic analysis decides which locals and values need cleanup: those
+whose owned structure carries `impl Drop`, found through the implementation query. `drop` of any
+other value lowers now; a drop that needs cleanup reports the `cleanup` gap until drop glue exists
 (roadmap step 6).
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
