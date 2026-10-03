@@ -2,6 +2,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-10-03 · Closure emission trapped while structured MIR and layout demands passed because exact callable comparison borrowed one shared runtime-key buffer twice · Compare buffer allocation addresses before nested `Shared.with`, and assert same-handle and copied-type equality in the production environment fixture · self-hosted compiler
+
 - 2026-09-29 · Codebase Memory could not index the U8 checkout because a pre-coordination or unverified generation was active · Use targeted source searches until the index is available; do not retry concurrent indexing · self-hosted compiler
 
 - 2026-09-28 · The shared checkout's CLI dependency links pointed into another unit's worktree and became dangling during parallel setup · Run frontend checks with the intact main checkout's CLI, then build and test from an isolated worktree after acquiring the shared build slot · self-hosted compiler
