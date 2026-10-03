@@ -480,6 +480,17 @@ fn foreignIdentityMatches(handle: &Shared<DeclarationId>, declaration: &Declarat
   })
 }
 
+fn foreignHandleIndex(identities: &[Shared<DeclarationId>], declaration: &DeclarationId) -> Option<usize> {
+  let mut at = usize.ZERO
+  while at < identities.length {
+    if foreignIdentityMatches(&identities[at], declaration) {
+      return Option.some<usize>(at)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<usize>()
+}
+
 fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
   return Shared.with<TypedBody, View>(
     body,
@@ -604,19 +615,15 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           }
           BodyExpression.ForeignCall {declaration, arguments} => {
             let identities = TypedBody.foreignHandles(bodyValue)
-            let mut at = usize.ZERO
-            while at < identities.length {
-              let matched = foreignIdentityMatches(&identities[at], &declaration)
-              if matched {
-                return View.Call {
-                  foreign: Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&identities[at])),
-                  count: Vector.length<BodyNodeId>(&arguments),
-                  node: id,
-                  ty: Shared.clone<Type>(&ty),
-                  origin: origin,
-                }
+            let found = foreignHandleIndex(identities, &declaration)
+            if let Option<usize>.Some {value: at} = move found {
+              return View.Call {
+                foreign: Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&identities[at])),
+                count: Vector.length<BodyNodeId>(&arguments),
+                node: id,
+                ty: Shared.clone<Type>(&ty),
+                origin: origin,
               }
-              at = at + usize.ONE
             }
             return View.Unsupported {origin: origin}
           }
@@ -1581,6 +1588,129 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>,
   return Option.some<Operand>(Operand.Move {place: place(output)})
 }
 
+// Lowers each child of an aggregate expression, in order, into its field value.
+effect fn aggregateFields(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  node: BodyNodeId,
+  count: usize,
+  origin: Origin,
+) -> Vector<AggregateField>
+! Gap | OutOfMemoryError
+? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut fields = Vector.make<AggregateField>()
+  let mut at = usize.ZERO
+  while at < count {
+    let child = match move childAt(body, node, at) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => {
+        return run unsupported(&owner, origin, GapCode.TypedForm)
+      }
+    }
+    let input = run expression(&mut builder.*, body, hir, child)
+    run Vector.append<AggregateField>(&mut fields, AggregateField {
+      index: aggregateFieldIndex(body, node, at), value: move input,
+    })
+    at = at + usize.ONE
+  }
+  return move fields
+}
+
+// For a call through a witness (`witness`), lends an operand by reference when the selected
+// application takes the parameter borrowed; any other call passes the operand through.
+effect fn witnessArgument(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  callNode: BodyNodeId,
+  child: BodyNodeId,
+  at: usize,
+  witness: bool,
+  argument: Operand,
+  origin: Origin,
+) -> Operand
+! Gap | OutOfMemoryError
+? &mut Allocator {
+  if !witness { return move argument }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let selected = resolvedCallOperand(&builder.*, callNode, at)
+  let operand = match move selected {
+    Option<CallOperand>.Some {value} => move value
+    _ => { return run unsupported(&owner, origin, GapCode.WitnessOperand) }
+  }
+  if let Option<Access>.Some {value: access} = move operand.borrow {
+    // Capture an arbitrary owned rvalue exactly once before lending its storage.
+    let captured = run temporary(&mut builder.*, &operand.value, origin)
+    run assign(&mut builder.*, place(captured), Rvalue.Use {value: move argument}, origin)
+    if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
+    let reference = run temporary(&mut builder.*, &operand.parameter, origin)
+    run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: place(captured)}, origin)
+    return Operand.Copy {place: place(reference)}
+  }
+  return move argument
+}
+
+// Lowers each argument of a call node, in order, into an operand.
+effect fn callArguments(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  count: usize,
+  foreign: &Option<Shared<DeclarationId>>,
+  origin: Origin,
+) -> Vector<Operand>
+! Gap | OutOfMemoryError
+? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut witness = false
+  if let Option<Shared<DeclarationId>>.None = &foreign.* { witness = true }
+  let mut values = Vector.make<Operand>()
+  let mut at = usize.ZERO
+  while at < count {
+    let child = match move childAt(body, callNode, at) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => {
+        return run unsupported(&owner, origin, GapCode.MissingCallArgument)
+      }
+    }
+    let produced = run expression(&mut builder.*, body, hir, child)
+    let argument = run witnessArgument(&mut builder.*, body, callNode, child, at, witness, move produced, origin)
+    run Vector.append<Operand>(&mut values, move argument)
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+// Returns the bit pattern of a floating literal at its written width, absent when it does not parse.
+fn floatLiteralBits(hir: &Module, literal: HirId, ty: &Shared<Type>) -> Option<u64> {
+  if let HirNode.FloatingLiteral {spelling, ..} = Module.node(hir, literal) {
+    let narrow = Shared.with<Type, bool>(
+      ty,
+      fn(value: &Type) -> bool {
+        if let Type.Primitive {name} = &value.* {
+          let text = Bytes.asSlice(&name)
+          return text.length == 3 && text[usize.ZERO] == 102 && text[usize.ONE] == 51 && text[2] == 50
+        }
+        return false
+      },
+    )
+    if narrow {
+      let parsed = FloatingLiteral.f32Bits(hir, spelling)
+      if let Result<u32, ParseError>.Success {value} = move parsed {
+        return Option.some<u64>(f64.toBits(f32.toF64(f32.fromBits(value))))
+      }
+      return Option.none<u64>()
+    }
+    let parsed = FloatingLiteral.f64Bits(hir, spelling)
+    if let Result<u64, ParseError>.Success {value} = move parsed {
+      return Option.some<u64>(value)
+    }
+  }
+  return Option.none<u64>()
+}
+
 effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | OutOfMemoryError
 ? &mut Allocator {
@@ -1596,28 +1726,9 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       _ => run unsupported(&owner, origin, GapCode.IntegerLiteral)
     }
     View.Float {ty, literal, origin} => {
-      if let HirNode.FloatingLiteral {spelling, ..} = Module.node(hir, literal) {
-        let narrow = Shared.with<Type, bool>(
-          &ty,
-          fn(value: &Type) -> bool {
-            if let Type.Primitive {name} = &value.* {
-              let text = Bytes.asSlice(&name)
-              return text.length == 3 && text[usize.ZERO] == 102 && text[usize.ONE] == 51 && text[2] == 50
-            }
-            return false
-          },
-        )
-        if narrow {
-          let parsed = FloatingLiteral.f32Bits(hir, spelling)
-          if let Result<u32, ParseError>.Success {value} = move parsed {
-            return Operand.Float {bits: f64.toBits(f32.toF64(f32.fromBits(value))), ty: move ty}
-          }
-        } else {
-          let parsed = FloatingLiteral.f64Bits(hir, spelling)
-          if let Result<u64, ParseError>.Success {value} = move parsed {
-            return Operand.Float {bits: value, ty: move ty}
-          }
-        }
+      let bits = floatLiteralBits(hir, literal, &ty)
+      if let Option<u64>.Some {value} = move bits {
+        return Operand.Float {bits: value, ty: move ty}
       }
       return run unsupported(&owner, origin, GapCode.FloatLiteral)
     }
@@ -1685,21 +1796,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Aggregate {node, count, ty, origin} => {
-      let mut fields = Vector.make<AggregateField>()
-      let mut at = usize.ZERO
-      while at < count {
-        let child = match move childAt(body, node, at) {
-          Option<BodyNodeId>.Some {value} => value
-          Option<BodyNodeId>.None => {
-            return run unsupported(&owner, origin, GapCode.TypedForm)
-          }
-        }
-        let input = run expression(&mut builder.*, body, hir, child)
-        run Vector.append<AggregateField>(&mut fields, AggregateField {
-          index: aggregateFieldIndex(body, node, at), value: move input,
-        })
-        at = at + usize.ONE
-      }
+      let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: move fields}, origin)
       return Operand.Move {place: place(output)}
@@ -1772,17 +1869,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, consumes, &release, tags, count, &ty, origin)
     }
     View.VariantConstruct {node, tag, count, ty, origin} => {
-      let mut fields = Vector.make<AggregateField>()
-      let mut at = usize.ZERO
-      while at < count {
-        let child = match move childAt(body, node, at) {
-          Option<BodyNodeId>.Some {value} => value
-          Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
-        }
-        let input = run expression(&mut builder.*, body, hir, child)
-        run Vector.append<AggregateField>(&mut fields, AggregateField {index: aggregateFieldIndex(body, node, at), value: move input})
-        at = at + usize.ONE
-      }
+      let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), Rvalue.Variant {tag: tag, fields: move fields}, origin)
       return Operand.Move {place: place(output)}
@@ -1806,35 +1893,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Call {foreign, count, node: callNode, ty, origin} => {
-      let mut values = Vector.make<Operand>()
-      let mut at = usize.ZERO
-      while at < count {
-        let child = match move childAt(body, callNode, at) {
-          Option<BodyNodeId>.Some {value} => value
-          Option<BodyNodeId>.None => {
-            return run unsupported(&owner, origin, GapCode.MissingCallArgument)
-          }
-        }
-        let mut argument = run expression(&mut builder.*, body, hir, child)
-        if let Option<Shared<DeclarationId>>.None = &foreign {
-          let selected = resolvedCallOperand(&builder.*, callNode, at)
-          let operand = match move selected {
-            Option<CallOperand>.Some {value} => move value
-            _ => { return run unsupported(&owner, origin, GapCode.WitnessOperand) }
-          }
-          if let Option<Access>.Some {value: access} = move operand.borrow {
-            // Capture an arbitrary owned rvalue exactly once before lending its storage.
-            let captured = run temporary(&mut builder.*, &operand.value, origin)
-            run assign(&mut builder.*, place(captured), Rvalue.Use {value: move argument}, origin)
-            if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
-            let reference = run temporary(&mut builder.*, &operand.parameter, origin)
-            run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: place(captured)}, origin)
-            argument = Operand.Copy {place: place(reference)}
-          }
-        }
-        run Vector.append<Operand>(&mut values, move argument)
-        at = at + usize.ONE
-      }
+      let values = run callArguments(&mut builder.*, body, hir, callNode, count, &foreign, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       let continuation = run block(&mut builder.*, origin)
       let target = run callCallee(&mut builder.*, move foreign, callNode, &owner, origin)
@@ -2348,6 +2407,32 @@ effect fn shortCircuit(
   return Operand.Copy {place: place(output)}
 }
 
+// Lowers the children of a block in order, stopping once the block can no longer be reached.
+effect fn blockStatements(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  blockNode: BodyNodeId,
+  count: usize,
+  origin: Origin,
+) -> ()
+! Gap | OutOfMemoryError
+? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut at = usize.ZERO
+  while at < count && builder.live {
+    let child = match move childAt(body, blockNode, at) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => {
+        return run unsupported(&owner, origin, GapCode.MissingBlockStatement)
+      }
+    }
+    run statement(&mut builder.*, body, hir, child)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> ()
 ! Gap | OutOfMemoryError
 ? &mut Allocator {
@@ -2744,17 +2829,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     }
     View.Block {count, node: blockNode, origin} => {
       run openScope(&mut builder.*)
-      let mut at = usize.ZERO
-      while at < count && builder.live {
-        let child = match move childAt(body, blockNode, at) {
-          Option<BodyNodeId>.Some {value} => value
-          Option<BodyNodeId>.None => {
-            return run unsupported(&owner, origin, GapCode.MissingBlockStatement)
-          }
-        }
-        run statement(&mut builder.*, body, hir, child)
-        at = at + usize.ONE
-      }
+      run blockStatements(&mut builder.*, body, hir, blockNode, count, origin)
       run closeScope(&mut builder.*, origin)
     }
     View.Unsupported {origin} => {
