@@ -30,7 +30,14 @@ views, raw pointers and arrays of them) emits nothing; any other drop calls the 
 value's type. Glue is its own instance keyed by the type: it calls the `impl Drop` hook, then drops
 fields in declaration order, array elements in ascending order and only the active union member or
 variant. Callable and Effect environments, generic nominal unions and unions without a canonical
-member order still report the `cleanup` gap. Automatic cleanup at scope exits is roadmap step 6c.
+member order still report the `cleanup` gap. MIR lowering keeps a cleanup stack: bindings and by-value
+parameters whose types are not cleanup-free are owners of their scope, consuming sites mark them
+moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave, innermost
+first and in reverse acquisition order. Replacement drops the displaced value first. Where paths
+reach a join with different ownership, the owner gets a `DropFlag` local written on each incoming
+edge; elsewhere no flag exists. Owned rvalues used only as places are dropped at the end of their
+full expression unless a borrowing `let` keeps them. Partial moves of values that need cleanup
+still report the `cleanup` gap (roadmap step 6d).
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

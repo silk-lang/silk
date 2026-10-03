@@ -21,7 +21,9 @@ import semantic.Type {Argument, Binding, ArrayShape, Requirement, Row, RowParame
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.Intrinsic {Member as IntrinsicMember}
 import semantic.TypedBody {
+  ConsumedPlace as BodyConsumedPlace,
   Expression as BodyExpression,
+  PlaceRoot as BodyPlaceRoot,
   AggregateField as BodyAggregateField,
   EnumMember as BodyEnumMember,
   MatchArm as BodyMatchArm,
@@ -55,6 +57,9 @@ pub union LocalKind {
   Parameter {pub index: usize},
   User {pub index: usize},
   Temp,
+  /// A `bool` that records whether owned local `local` still needs its drop, where ownership
+  /// differs between the paths that reach a join (MIR core shape §3).
+  DropFlag {pub local: usize},
 }
 
 pub struct Place {
@@ -172,6 +177,45 @@ pub struct Reference {
 struct LoopTargets {
   exit: usize
   repeat: usize
+  // Owners acquired before the loop; `break` and `continue` drop only the ones after them.
+  owners: usize
+  // The owner states on each edge into `exit`, joined when the loop ends.
+  exits: Vector<Arrival>
+}
+
+// The cleanup state of one owned local on the current path (MIR core shape §4).
+enum OwnerState {
+  Live,
+  Moved,
+  // Live on some incoming paths only; the owner's drop flag holds the answer at runtime.
+  Maybe,
+}
+
+// One local whose value needs cleanup, in acquisition order within its scope.
+struct Owner {
+  local: usize
+  ty: Shared<Type>
+  state: OwnerState
+  // The owner's drop flag local, allocated by the first join whose paths disagree.
+  flag: usize
+}
+
+// One edge into a join: its source block and the owner states on that edge.
+struct Arrival {
+  block: usize
+  states: Vector<OwnerState>
+}
+
+// What a consuming site leaves without an owner.
+union Release {
+  // An owned rvalue: nothing on the cleanup stack changes.
+  Value,
+  // The complete value of a local.
+  Whole {local: usize},
+  // A projection of a local (OWN-004); partial owners are Step 6d.
+  Partial,
+  // A binding projected from a match subject (MATCH-002); partial owners are Step 6d.
+  Binding,
 }
 
 /// A checked call's resolved canonical target, prepared without demanding its body.
@@ -208,6 +252,11 @@ struct Builder {
   live: bool
   loops: Vector<LoopTargets>
   scrutinees: Vector<Scrutinee>
+  // The cleanup stack: owned locals in acquisition order, and where each open scope starts.
+  owners: Vector<Owner>
+  scopes: Vector<usize>
+  // Owned rvalues used only as places; they live until the end of their full expression.
+  temporaries: Vector<usize>
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -218,7 +267,7 @@ union View {
   Boolean {value: bool, origin: Origin},
   Unit {origin: Origin},
   Local {index: usize, ty: Shared<Type>, origin: Origin},
-  Move {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
+  Move {value: BodyNodeId, release: Release, ty: Shared<Type>, origin: Origin},
   Borrow {access: Access, value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Dereference {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   Field {value: BodyNodeId, index: usize, ty: Shared<Type>, origin: Origin},
@@ -229,7 +278,7 @@ union View {
   Aggregate {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   EnumMember {member: BodyEnumMember, ty: Shared<Type>, origin: Origin},
   EnumValue {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
-  Match {node: BodyNodeId, subject: BodyNodeId, place: bool, tags: usize, count: usize, ty: Shared<Type>, origin: Origin},
+  Match {node: BodyNodeId, subject: BodyNodeId, place: bool, consumes: bool, release: Release, tags: usize, count: usize, ty: Shared<Type>, origin: Origin},
   VariantConstruct {node: BodyNodeId, tag: usize, count: usize, ty: Shared<Type>, origin: Origin},
   UnionInject {tag: usize, value: BodyNodeId, ty: Shared<Type>, origin: Origin},
   PatternBinding {node: BodyNodeId, subject: BodyNodeId, ty: Shared<Type>, origin: Origin},
@@ -262,7 +311,7 @@ union View {
   While {condition: BodyNodeId, body: BodyNodeId, origin: Origin},
   Break {origin: Origin},
   Continue {origin: Origin},
-  Drop {value: BodyNodeId, origin: Origin},
+  Drop {value: BodyNodeId, release: Release, origin: Origin},
   Block {count: usize, node: BodyNodeId, origin: Origin},
   Unsupported {origin: Origin},
 }
@@ -441,14 +490,15 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
-          BodyExpression.Move {value, ..} => View.Move {
+          BodyExpression.Move {value, consumed} => View.Move {
             value: value,
+            release: releaseOf(&consumed),
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
           // Pointer access weakening is the existing scalar value-copy lane, with no address change.
           BodyExpression.PointerAccessWeaken {value} => View.Move {
-            value: value, ty: Shared.clone<Type>(&ty), origin: origin,
+            value: value, release: Release.Value, ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.Borrow {access, value} => View.Borrow {
             access: access,
@@ -493,8 +543,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             node: id, tag: tag, count: Vector.length<BodyAggregateField>(&fields), ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.Match {subject, access, tags, arms} => View.Match {
-            node: id, subject: subject, place: match &access { BodySubjectAccess.Place => true _ => false }, tags: tags,
-            count: Vector.length<BodyMatchArm>(&arms),
+            node: id, subject: subject, place: match &access { BodySubjectAccess.Place => true _ => false },
+            consumes: match &access { BodySubjectAccess.Consume {..} => true _ => false },
+            release: match &access { BodySubjectAccess.Consume {consumed} => releaseOf(&consumed) _ => Release.Value },
+            tags: tags, count: Vector.length<BodyMatchArm>(&arms),
             ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.UnionInject {tag, value} => View.UnionInject {
@@ -594,7 +646,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           origin: origin,
         }
         BodyNodeKind.Break => View.Break {origin: origin}
-        BodyNodeKind.Drop {value, ..} => View.Drop {value: value, origin: origin}
+        BodyNodeKind.Drop {value, consumed} => View.Drop {value: value, release: releaseOf(&consumed), origin: origin}
         BodyNodeKind.Continue => View.Continue {origin: origin}
         BodyNodeKind.Block {statements, ..} => View.Block {
           count: Vector.length<BodyNodeId>(&statements),
@@ -707,6 +759,248 @@ fn stepProjection(path: &Vector<BodyPlaceStep>, at: usize) -> Option<Projection>
   return Option.none<Projection>()
 }
 
+// The release a recorded consumed place makes, in MIR local numbering.
+fn releaseOf(consumed: &Option<BodyConsumedPlace>) -> Release {
+  if let Option<BodyConsumedPlace>.Some {value} = &consumed.* {
+    let whole = Vector.length<BodyPlaceStep>(&value.steps) == usize.ZERO
+    return match &value.root {
+      BodyPlaceRoot.Local {local} => {
+        if whole { return Release.Whole {local: local.index + usize.ONE} }
+        return Release.Partial
+      }
+      BodyPlaceRoot.Subject {..} => Release.Binding
+    }
+  }
+  return Release.Value
+}
+
+fn copyRelease(release: &Release) -> Release {
+  return match &release.* {
+    Release.Value => Release.Value
+    Release.Whole {local} => Release.Whole {local: local}
+    Release.Partial => Release.Partial
+    Release.Binding => Release.Binding
+  }
+}
+
+fn localType(builder: &Builder, local: usize) -> Shared<Type> {
+  let locals = Vector.asSlice<Local>(&builder.function.locals)
+  return Shared.clone<Type>(&locals[local].ty)
+}
+
+fn ownerState(builder: &Builder, index: usize) -> OwnerState {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  return owners[index].state
+}
+
+fn ownerIndex(builder: &Builder, local: usize) -> usize {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  let mut at = owners.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if owners[at].local == local { return at }
+  }
+  return usize.MAX
+}
+
+// A local of a type that is not cleanup-free becomes a live owner of the innermost scope.
+effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let free = Shared.with<Type, bool>(ty, Type.cleanupFree)
+  if free { return () }
+  return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX})
+}
+
+fn setState(builder: &mut Builder, index: usize, state: OwnerState) -> () {
+  let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+  owners[index].state = state
+  return ()
+}
+
+// Applies one consuming site. A partial move of a value that needs cleanup is Step 6d.
+effect fn applyRelease(builder: &mut Builder, release: &Release, moved: &Shared<Type>, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  if let Release.Whole {local} = &release.* {
+    let index = ownerIndex(&builder.*, local)
+    if index != usize.MAX { setState(&mut builder.*, index, OwnerState.Moved) }
+    return ()
+  }
+  let partial = match &release.* {
+    Release.Partial => true
+    Release.Binding => true
+    _ => false
+  }
+  let free = Shared.with<Type, bool>(moved, Type.cleanupFree)
+  if partial && !free {
+    let owner = InstanceKey.identity(&builder.function.key)
+    return run unsupported(&owner, origin, GapCode.Cleanup)
+  }
+  return ()
+}
+
+effect fn ownerStates(builder: &Builder) -> Vector<OwnerState> ! OutOfMemoryError ? &mut Allocator {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  let mut states = Vector.make<OwnerState>()
+  let mut at = usize.ZERO
+  while at < owners.length {
+    run Vector.append<OwnerState>(&mut states, owners[at].state)
+    at = at + usize.ONE
+  }
+  return move states
+}
+
+// Returns to the owners and states a branch started from.
+fn restoreOwners(builder: &mut Builder, states: &Vector<OwnerState>) -> () {
+  let saved = Vector.asSlice<OwnerState>(states)
+  while Vector.length<Owner>(&builder.owners) > saved.length { drop Vector.pop<Owner>(&mut builder.*.owners) }
+  let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+  let mut at = usize.ZERO
+  while at < saved.length {
+    owners[at].state = saved[at]
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn arrival(builder: &Builder) -> Arrival ! OutOfMemoryError ? &mut Allocator {
+  return Arrival {block: builder.current, states: run ownerStates(builder)}
+}
+
+// Joins the owner states of every edge into the current block. An owner whose state differs
+// between edges gets a drop flag, written with its constant state at the end of each edge that
+// knows it; a place whose state agrees on every edge gets no flag.
+effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  if arrivals.length == usize.ZERO { return () }
+  let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let count = Vector.length<Owner>(&builder.owners)
+  let mut index = usize.ZERO
+  while index < count {
+    let first = Vector.asSlice<OwnerState>(&arrivals[usize.ZERO].states)[index]
+    let mut same = true
+    let mut at = usize.ONE
+    while at < arrivals.length {
+      if Vector.asSlice<OwnerState>(&arrivals[at].states)[index] != first { same = false }
+      at = at + usize.ONE
+    }
+    if same {
+      setState(&mut builder.*, index, first)
+    } else {
+      let mut flag = Vector.asSlice<Owner>(&builder.owners)[index].flag
+      if flag == usize.MAX {
+        flag = Vector.length<Local>(&builder.function.locals)
+        let owned = Vector.asSlice<Owner>(&builder.owners)[index].local
+        run Vector.append<Local>(&mut builder.*.function.locals, Local {ty: Shared.clone<Type>(&boolean), kind: LocalKind.DropFlag {local: owned}, origin: origin})
+        let owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+        owners[index].flag = flag
+      }
+      at = usize.ZERO
+      while at < arrivals.length {
+        let state = Vector.asSlice<OwnerState>(&arrivals[at].states)[index]
+        if state != OwnerState.Maybe {
+          let target = arrivals[at].block
+          let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.function.blocks)
+          run Vector.append<Statement>(&mut blocks[target].statements, Statement.Assign {
+            destination: place(flag), value: Rvalue.Use {value: Operand.Boolean {value: state == OwnerState.Live}}, origin: origin,
+          })
+        }
+        at = at + usize.ONE
+      }
+      setState(&mut builder.*, index, OwnerState.Maybe)
+    }
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+// Drops one owner as its current state requires; a maybe-live owner is dropped under its flag.
+effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  let state = owners[index].state
+  if state == OwnerState.Moved { return () }
+  let local = owners[index].local
+  let flag = owners[index].flag
+  let ty = Shared.clone<Type>(&owners[index].ty)
+  let owner = InstanceKey.identity(&builder.function.key)
+  if state == OwnerState.Live { return run dropPlace(&mut builder.*, place(local), &ty, &owner, origin) }
+  let dropping = run block(&mut builder.*, origin)
+  let after = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(flag)}, thenBlock: dropping, elseBlock: after, origin: origin})
+  resume(&mut builder.*, dropping)
+  run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
+  resume(&mut builder.*, after)
+  return ()
+}
+
+// Drops owners `from..` innermost first, in reverse acquisition order (CLEANUP-002).
+effect fn dropOwnersFrom(builder: &mut Builder, from: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut at = Vector.length<Owner>(&builder.owners)
+  while at > from {
+    at = at - usize.ONE
+    run dropOwner(&mut builder.*, at, origin)
+  }
+  return ()
+}
+
+// Drops owned temporaries `from..` in reverse creation order.
+effect fn dropTemporariesFrom(builder: &mut Builder, from: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut at = Vector.length<usize>(&builder.temporaries)
+  while at > from {
+    at = at - usize.ONE
+    let local = Vector.asSlice<usize>(&builder.temporaries)[at]
+    let ty = localType(&builder.*, local)
+    run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
+  }
+  return ()
+}
+
+fn truncateTemporaries(builder: &mut Builder, length: usize) -> () {
+  while Vector.length<usize>(&builder.temporaries) > length { drop Vector.pop<usize>(&mut builder.*.temporaries) }
+  return ()
+}
+
+// An exit leaves every pending temporary and every owner acquired after `owners`.
+effect fn exitTo(builder: &mut Builder, owners: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  run dropTemporariesFrom(&mut builder.*, usize.ZERO, origin)
+  return run dropOwnersFrom(&mut builder.*, owners, origin)
+}
+
+effect fn openScope(builder: &mut Builder) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Vector.append<usize>(&mut builder.*.scopes, Vector.length<Owner>(&builder.owners))
+}
+
+// Fallthrough out of a scope drops its owners; an exit already dropped them on its own path.
+effect fn closeScope(builder: &mut Builder, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let start = match move Vector.pop<usize>(&mut builder.*.scopes) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => usize.ZERO
+  }
+  if builder.live { run dropOwnersFrom(&mut builder.*, start, origin) }
+  while Vector.length<Owner>(&builder.owners) > start { drop Vector.pop<Owner>(&mut builder.*.owners) }
+  return ()
+}
+
+// Whether an expression produces a fresh owned value rather than reading an existing place.
+fn ownedRvalue(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
+  return Shared.with<TypedBody, bool>(body, fn(value: &TypedBody) -> bool {
+    if let BodyNodeKind.Expression {form, ..} = &TypedBody.nodeSlice(value)[id.index].kind {
+      return match &form {
+        BodyExpression.DirectCall {..} => true
+        BodyExpression.InterfaceCall {..} => true
+        BodyExpression.ForeignCall {..} => true
+        BodyExpression.IntrinsicCall {..} => true
+        BodyExpression.Aggregate {..} => true
+        BodyExpression.VariantConstruct {..} => true
+        BodyExpression.UnionInject {..} => true
+        BodyExpression.Move {..} => true
+        BodyExpression.Match {..} => true
+        _ => false
+      }
+    }
+    return false
+  })
+}
+
 // An owned projection step of one binding path, read under a short body borrow.
 fn bindingStepAt(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<Projection> {
   return Shared.with<TypedBody, Option<Projection>>(body, fn(value: &TypedBody) -> Option<Projection> {
@@ -816,11 +1110,21 @@ effect fn expressionPlace(
     }
     _ => {
       let input = run expression(&mut builder.*, body, hir, id)
-      return match move input {
-        Operand.Copy {place: storage} => move storage
-        Operand.Move {place: storage} => move storage
+      let storage = match move input {
+        Operand.Copy {place: stored} => move stored
+        Operand.Move {place: stored} => move stored
         _ => run unsupported(&owner, nodeOrigin(body, id), GapCode.ExpectedPlace)
       }
+      // An owned rvalue used as a place is a temporary of the enclosing full expression.
+      if ownedRvalue(body, id) && Vector.length<Projection>(&storage.projections) == usize.ZERO {
+        let selectedType = run instanceNodeType(&builder.*, body, id)
+        if let Option<Shared<Type>>.Some {value: ty} = move selectedType {
+          let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
+          let local = storage.local
+          if !free { run Vector.append<usize>(&mut builder.*.temporaries, local) }
+        }
+      }
+      return move storage
     }
   }
 }
@@ -1004,8 +1308,16 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       )
       return Operand.Copy {place: place(output)}
     }
-    View.Move {value, ty, origin} => {
+    View.Move {value, release, ty, origin} => {
+      // Moving a projection out of an owned rvalue leaves a partial temporary (Step 6d).
+      let fromValue = match &release {
+        Release.Value => true
+        _ => false
+      }
+      let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
+      if fromValue && !free && !ownedRvalue(body, value) { return run unsupported(&owner, origin, GapCode.Cleanup) }
       let input = run expression(&mut builder.*, body, hir, value)
+      run applyRelease(&mut builder.*, &release, &ty, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
       return Operand.Move {place: place(output)}
@@ -1128,8 +1440,8 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
       return Operand.Copy {place: place(output)}
     }
-    View.Match {node, subject, place: placeMatch, tags, count, ty, origin} => {
-      return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, tags, count, &ty, origin)
+    View.Match {node, subject, place: placeMatch, consumes, release, tags, count, ty, origin} => {
+      return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, consumes, &release, tags, count, &ty, origin)
     }
     View.VariantConstruct {node, tag, count, ty, origin} => {
       let mut fields = Vector.make<AggregateField>()
@@ -1186,6 +1498,8 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
             // Capture an arbitrary owned rvalue exactly once before lending its storage.
             let captured = run temporary(&mut builder.*, &operand.value, origin)
             run assign(&mut builder.*, place(captured), Rvalue.Use {value: move argument}, origin)
+            let free = Shared.with<Type, bool>(&operand.value, Type.cleanupFree)
+            if ownedRvalue(body, child) && !free { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
             let reference = run temporary(&mut builder.*, &operand.parameter, origin)
             run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: place(captured)}, origin)
             argument = Operand.Copy {place: place(reference)}
@@ -1457,6 +1771,8 @@ effect fn lowerMatch(
   node: BodyNodeId,
   subject: BodyNodeId,
   placeMatch: bool,
+  consumes: bool,
+  release: &Release,
   tags: usize,
   count: usize,
   ty: &Shared<Type>,
@@ -1475,6 +1791,16 @@ effect fn lowerMatch(
     let copied = run temporary(&mut builder.*, &subjectType, origin)
     run assign(&mut builder.*, place(copied), Rvalue.Use {value: move input}, origin)
     scrutinee = place(copied)
+  }
+  // A consuming match moves the subject into its evaluated copy, which owns the active payload
+  // until the selected arm ends (MATCH-002).
+  let mut scrutineeOwner = usize.MAX
+  if consumes {
+    run applyRelease(&mut builder.*, release, &subjectType, origin)
+    run openScope(&mut builder.*)
+    let before = Vector.length<Owner>(&builder.owners)
+    run acquire(&mut builder.*, scrutinee.local, &subjectType)
+    if Vector.length<Owner>(&builder.owners) > before { scrutineeOwner = before }
   }
   let mut switched = scrutinee.local
   if tags != usize.ZERO {
@@ -1515,6 +1841,8 @@ effect fn lowerMatch(
     at = at + usize.ONE
   }
   let join = run block(&mut builder.*, origin)
+  let entryStates = run ownerStates(&builder.*)
+  let mut arrivals = Vector.make<Arrival>()
   let armSlice = Vector.asSlice<ArmView>(&arms)
   let selectorSlice = Vector.asSlice<Selector>(&selectors)
   let entrySlice = Vector.asSlice<usize>(&entries)
@@ -1526,6 +1854,8 @@ effect fn lowerMatch(
     let armOrigin = armSlice[at].origin
     let result = armSlice[at].result
     let resultBlock = resultSlice[at]
+    // Every arm starts from the owner states at dispatch; guards and tests cannot consume.
+    restoreOwners(&mut builder.*, &entryStates)
     // Nested tests, then the guard, run in order; the first that fails resumes dispatch at the next arm.
     if entrySlice[at] != resultBlock {
       resume(&mut builder.*, entrySlice[at])
@@ -1578,13 +1908,22 @@ effect fn lowerMatch(
       }
     }
     if builder.live {
+      if scrutineeOwner != usize.MAX {
+        run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
+        setState(&mut builder.*, scrutineeOwner, OwnerState.Moved)
+      }
+      run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
       terminate(&mut builder.*, Terminator.Goto {target: join, origin: armOrigin})
       joined = true
     }
     at = at + usize.ONE
   }
+  if joined {
+    resume(&mut builder.*, join)
+    run joinOwners(&mut builder.*, Vector.asSlice<Arrival>(&arrivals), origin)
+  }
+  if consumes { run closeScope(&mut builder.*, origin) }
   if !joined { return Operand.Unit }
-  resume(&mut builder.*, join)
   if !valued { return Operand.Unit }
   return Operand.Copy {place: place(output)}
 }
@@ -1664,120 +2003,168 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
   if !builder.live {
     return ()
   }
+  let pending = Vector.length<usize>(&builder.temporaries)
+  run lowerStatement(&mut builder.*, body, hir, id, pending)
+  // Owned temporaries live until the end of their full expression.
+  if builder.live { run dropTemporariesFrom(&mut builder.*, pending, nodeOrigin(body, id)) }
+  truncateTemporaries(&mut builder.*, pending)
+  return ()
+}
+
+// An expression statement's owned value is dropped at once; a place read leaves its owner alone.
+effect fn discard(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let selectedType = run instanceNodeType(&builder.*, body, id)
+  let value = run expression(&mut builder.*, body, hir, id)
+  if !builder.live || !ownedRvalue(body, id) { return () }
+  if let Option<Shared<Type>>.Some {value: ty} = move selectedType {
+    let free = Shared.with<Type, bool>(&ty, Type.cleanupFree)
+    if !free {
+      let owner = InstanceKey.identity(&builder.function.key)
+      match move value {
+        Operand.Copy {place: stored} => { run dropPlace(&mut builder.*, move stored, &ty, &owner, nodeOrigin(body, id)) }
+        Operand.Move {place: stored} => { run dropPlace(&mut builder.*, move stored, &ty, &owner, nodeOrigin(body, id)) }
+        _ => {}
+      }
+    }
+  }
+  return ()
+}
+
+// Whether a binding of this type may borrow a temporary of its initializer, which then lives as
+// long as the binding (BORROW-006).
+fn borrowingType(value: &Type) -> bool {
+  return match &value.* {
+    Type.Reference {..} => true
+    Type.Slice {..} => true
+    Type.String {..} => true
+    _ => false
+  }
+}
+
+effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId, pending: usize) -> ()
+! Gap | OutOfMemoryError
+? &mut Allocator {
   let selected = run instanceView(&builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   match move selected {
     View.Integer {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Float {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Boolean {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Unit {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Embedded {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Local {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Move {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Borrow {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Dereference {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Field {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.ArrayLength {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.ArraySlice {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.SliceLength {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Index {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Aggregate {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.EnumMember {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.EnumValue {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Match {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.UnionInject {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.PatternBinding {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.VariantConstruct {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.PlaceAssignment {target, value, origin} => {
       let destination = run expressionPlace(&mut builder.*, body, hir, target)
       let assigned = run expression(&mut builder.*, body, hir, value)
+      // Replacement drops the displaced value before the new value becomes live (CLEANUP-001).
+      let targetType = run instanceNodeType(&builder.*, body, target)
+      if let Option<Shared<Type>>.Some {value: replaced} = move targetType {
+        let free = Shared.with<Type, bool>(&replaced, Type.cleanupFree)
+        if !free {
+          // Re-initializing part of a moved or maybe-moved owner is a partial owner (Step 6d).
+          let root = ownerIndex(&builder.*, destination.local)
+          let mut whole = true
+          if root != usize.MAX { whole = ownerState(&builder.*, root) == OwnerState.Live }
+          if !whole { return run unsupported(&owner, origin, GapCode.Cleanup) }
+          run dropPlace(&mut builder.*, run copyPlace(&destination), &replaced, &owner, origin)
+        }
+      }
       run assign(&mut builder.*, move destination, Rvalue.Use {value: move assigned}, origin)
     }
     View.Prefix {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Infix {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Intrinsic {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Call {..} => {
-      let ignored = run expression(&mut builder.*, body, hir, id)
-      drop ignored
+      run discard(&mut builder.*, body, hir, id)
     }
     View.Binding {index, initializer, origin} => {
       let value = run expression(&mut builder.*, body, hir, initializer)
       run assign(&mut builder.*, place(index + usize.ONE), Rvalue.Use {value: move value}, origin)
+      let ty = localType(&builder.*, index + usize.ONE)
+      // A borrowing binding keeps its initializer's temporaries alive for its whole scope.
+      if Shared.with<Type, bool>(&ty, borrowingType) {
+        let mut at = pending
+        while at < Vector.length<usize>(&builder.temporaries) {
+          let local = Vector.asSlice<usize>(&builder.temporaries)[at]
+          let held = localType(&builder.*, local)
+          run acquire(&mut builder.*, local, &held)
+          at = at + usize.ONE
+        }
+        truncateTemporaries(&mut builder.*, pending)
+      }
+      run acquire(&mut builder.*, index + usize.ONE, &ty)
     }
     View.Assignment {index, value, origin} => {
       let assigned = run expression(&mut builder.*, body, hir, value)
+      // Replacement drops the displaced value before the new value becomes live (CLEANUP-001).
+      let replaced = ownerIndex(&builder.*, index + usize.ONE)
+      if replaced != usize.MAX {
+        run dropOwner(&mut builder.*, replaced, origin)
+        setState(&mut builder.*, replaced, OwnerState.Live)
+      }
       run assign(
         &mut builder.*,
         place(index + usize.ONE),
@@ -1786,14 +2173,18 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       )
     }
     View.Return {value, origin} => {
+      // The returned value moves out before every scope the return leaves is dropped.
       if let Option<BodyNodeId>.Some {value: returned} = move value {
         let result = run expression(&mut builder.*, body, hir, returned)
         run assign(&mut builder.*, place(usize.ZERO), Rvalue.Use {value: move result}, origin)
       }
+      run exitTo(&mut builder.*, usize.ZERO, origin)
       terminate(&mut builder.*, Terminator.Return {origin: origin})
     }
     View.Branch {condition, thenBranch, elseBranch, origin} => {
       let tested = run expression(&mut builder.*, body, hir, condition)
+      run dropTemporariesFrom(&mut builder.*, pending, origin)
+      truncateTemporaries(&mut builder.*, pending)
       let thenBlock = run block(&mut builder.*, origin)
       let elseBlock = run block(&mut builder.*, origin)
       let join = run block(&mut builder.*, origin)
@@ -1806,22 +2197,28 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
           origin: origin,
         },
       )
+      let entry = run ownerStates(&builder.*)
+      let mut arrivals = Vector.make<Arrival>()
       resume(&mut builder.*, thenBlock)
       run statement(&mut builder.*, body, hir, thenBranch)
       let thenLive = builder.live
       if thenLive {
+        run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
         terminate(&mut builder.*, Terminator.Goto {target: join, origin: origin})
       }
+      restoreOwners(&mut builder.*, &entry)
       resume(&mut builder.*, elseBlock)
       if let Option<BodyNodeId>.Some {value: other} = move elseBranch {
         run statement(&mut builder.*, body, hir, other)
       }
       let elseLive = builder.live
       if elseLive {
+        run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
         terminate(&mut builder.*, Terminator.Goto {target: join, origin: origin})
       }
       if thenLive || elseLive {
         resume(&mut builder.*, join)
+        run joinOwners(&mut builder.*, Vector.asSlice<Arrival>(&arrivals), origin)
       }
     }
     View.While {condition, body: loopBody, origin} => {
@@ -1831,6 +2228,11 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
       terminate(&mut builder.*, Terminator.Goto {target: header, origin: origin})
       resume(&mut builder.*, header)
       let tested = run expression(&mut builder.*, body, hir, condition)
+      // The condition's temporaries end before each test of the loop.
+      run dropTemporariesFrom(&mut builder.*, pending, origin)
+      truncateTemporaries(&mut builder.*, pending)
+      let mut exits = Vector.make<Arrival>()
+      run Vector.append<Arrival>(&mut exits, run arrival(&builder.*))
       terminate(
         &mut builder.*,
         Terminator.Branch {
@@ -1840,30 +2242,44 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
           origin: origin,
         },
       )
-      run Vector.append<LoopTargets>(&mut builder.*.loops, LoopTargets {exit: exit, repeat: header})
+      run Vector.append<LoopTargets>(&mut builder.*.loops, LoopTargets {
+        exit: exit, repeat: header, owners: Vector.length<Owner>(&builder.owners), exits: move exits,
+      })
       resume(&mut builder.*, loopBlock)
       run statement(&mut builder.*, body, hir, loopBody)
       if builder.live {
         terminate(&mut builder.*, Terminator.Goto {target: header, origin: origin})
       }
-      drop Vector.pop<LoopTargets>(&mut builder.*.loops)
+      let finished = match move Vector.pop<LoopTargets>(&mut builder.*.loops) {
+        Option<LoopTargets>.Some {value} => value
+        Option<LoopTargets>.None => { return run unsupported(&owner, origin, GapCode.BreakOutsideLoop) }
+      }
       resume(&mut builder.*, exit)
+      run joinOwners(&mut builder.*, Vector.asSlice<Arrival>(&finished.exits), origin)
     }
     View.Break {origin} => {
       let loops = Vector.asSlice<LoopTargets>(&builder.loops)
       if loops.length == usize.ZERO {
         return run unsupported(&owner, origin, GapCode.BreakOutsideLoop)
       }
-      let exit = loops[loops.length - usize.ONE].exit
+      let innermost = loops.length - usize.ONE
+      let exit = loops[innermost].exit
+      let kept = loops[innermost].owners
+      // `break` drops only the scopes it leaves (CLEANUP-002), then joins the loop's exit.
+      run exitTo(&mut builder.*, kept, origin)
+      let edge = run arrival(&builder.*)
+      let mut targets = Vector.asMutSlice<LoopTargets>(&mut builder.*.loops)
+      run Vector.append<Arrival>(&mut targets[innermost].exits, move edge)
       terminate(&mut builder.*, Terminator.Goto {target: exit, origin: origin})
     }
-    View.Drop {value, origin} => {
+    View.Drop {value, release, origin} => {
       // The operand is evaluated, then its owned value is cleaned by its type's glue (DROP-001).
       let dropped = match move run instanceNodeType(&builder.*, body, value) {
         Option<Shared<Type>>.Some {value: droppedType} => droppedType
         Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
       }
       let operand = run expression(&mut builder.*, body, hir, value)
+      run applyRelease(&mut builder.*, &release, &dropped, origin)
       let cleanupFree = Shared.with<Type, bool>(&dropped, Type.cleanupFree)
       if !cleanupFree {
         let storage = match move operand {
@@ -1880,9 +2296,12 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
         return run unsupported(&owner, origin, GapCode.ContinueOutsideLoop)
       }
       let repeat = loops[loops.length - usize.ONE].repeat
+      let kept = loops[loops.length - usize.ONE].owners
+      run exitTo(&mut builder.*, kept, origin)
       terminate(&mut builder.*, Terminator.Goto {target: repeat, origin: origin})
     }
     View.Block {count, node: blockNode, origin} => {
+      run openScope(&mut builder.*)
       let mut at = usize.ZERO
       while at < count && builder.live {
         let child = match move childAt(body, blockNode, at) {
@@ -1894,6 +2313,7 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
         run statement(&mut builder.*, body, hir, child)
         at = at + usize.ONE
       }
+      run closeScope(&mut builder.*, origin)
     }
     View.Unsupported {origin} => {
       return run unsupported(&owner, origin, GapCode.TypedForm)
@@ -2194,10 +2614,22 @@ impl MirFunction {
       live: true,
       loops: Vector.make<LoopTargets>(),
       scrutinees: Vector.make<Scrutinee>(),
+      owners: Vector.make<Owner>(),
+      scopes: Vector.make<usize>(),
+      temporaries: Vector.make<usize>(),
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
+    // By-value parameters are owners of the function's outermost scope (CALL-001).
+    run openScope(&mut builder)
+    at = usize.ZERO
+    while at < parameters.length {
+      let ty = localType(&builder, at + usize.ONE)
+      run acquire(&mut builder, at + usize.ONE, &ty)
+      at = at + usize.ONE
+    }
     run statement(&mut builder, body, hir, root)
+    run closeScope(&mut builder, origin)
     if builder.live {
       // Unit may fall through. A non-unit missing return was rejected by body typing.
       terminate(&mut builder, Terminator.Return {origin: origin})
@@ -2238,9 +2670,10 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
       index: index,
       origin: origin,
     }
-    View.Move {ty, value, origin} => View.Move {
+    View.Move {ty, value, release, origin} => View.Move {
       ty: run Type.applyBindings(&ty, bindings, true),
       value: value,
+      release: move release,
       origin: origin,
     }
     View.Borrow {ty, access, value, origin} => View.Borrow {
@@ -2290,8 +2723,9 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.EnumValue {ty, value, origin} => View.EnumValue {
       ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin,
     }
-    View.Match {ty, node, subject, place: placeMatch, tags, count, origin} => View.Match {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, place: placeMatch, tags: tags, count: count, origin: origin,
+    View.Match {ty, node, subject, place: placeMatch, consumes, release, tags, count, origin} => View.Match {
+      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, place: placeMatch, consumes: consumes,
+      release: move release, tags: tags, count: count, origin: origin,
     }
     View.VariantConstruct {ty, node, tag, count, origin} => View.VariantConstruct {
       ty: run Type.applyBindings(&ty, bindings, true), node: node, tag: tag, count: count, origin: origin,
@@ -2362,7 +2796,7 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     }
     View.Break {origin} => View.Break {origin: origin}
     View.Continue {origin} => View.Continue {origin: origin}
-    View.Drop {value, origin} => View.Drop {value: value, origin: origin}
+    View.Drop {value, release, origin} => View.Drop {value: value, release: move release, origin: origin}
     View.Block {count, node, origin} => View.Block {count: count, node: node, origin: origin}
     View.Unsupported {origin} => View.Unsupported {origin: origin}
   }
