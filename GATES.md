@@ -1,35 +1,36 @@
-# Gates: compiler revision validation and persistence stack
+# Gates: Step 7a generic records
 
-OWNS: openspec/changes/jul-217-_/\**, openspec/changes/jul-218-_/**, openspec/changes/jul-219-\*/**, openspec/changes/jul-221-*/**, openspec/specs/**, packages/compiler/**, apps/docs/**, GATES.md
+OWNS: GATES.md, compiler/**, COMPILER_COMPATIBILITY.md, PAPERCUTS.md
 
-Scope: implement JUL-217, JUL-218, JUL-219, and JUL-221 as four stacked compiler changes. Full-repository CI is a workflow gate checked on the exact final PR head after all repository mutations; it is intentionally not a self-modifying ledger gate.
+Scope: complete generic record instances in the native self-hosted compiler, including typing, per-instance layout, construction, projection, patterns, symbols, Copy or affine classification, and drop glue
 
-- [x] G0: this ledger states outcome checks that can fail
-      CHECK: node /Users/juliaortiz/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
-      EXPECT: LINT OK
-      EVIDENCE: 2026-09-21 LINT OK.
+- [x] G0: this ledger states outcomes that can fail
+  CHECK: node /Users/juliaortiz/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
+  EXPECT: LINT OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=e97e98aff7aaee51752dd5ef3f4e7fa147597fddd0198b6448ec0640be12a199; exit=0; EXPECT=matched; output-sha256=b96c4ecb07bf998298c90e78caa44c7211447dca4e8e15be1268ad9605608589; output-bytes=930; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
 
-- [x] G1: JUL-217 owns reconstructible semantic query descriptors, ordered revision validation, result-fingerprint cutoffs, and current diagnostic presentation for header/name/conformance readers
-      CHECK: openspec validate jul-217-semantic-revision-validation --strict && pnpm --filter @silklang/compiler exec vitest run test/SemanticInvalidation.test.ts test/NameResolution.test.ts test/DeclarationIndex.test.ts && echo JUL217_OK
-      EXPECT: JUL217_OK
-      EVIDENCE: 2026-09-21 strict OpenSpec validation passed; 100 focused tests passed; JUL217_OK.
+- [x] G1: the implementation retains the complete Step 6 cleanup foundation
+  CHECK: git merge-base --is-ancestor 22196f43d HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+  EXPECT: prerequisite verification passed
+  EVIDENCE: automatic-evidence=v1; definition-sha256=56e2e1f9667c2d6be3cd64df8855c9f9f08c7ba3a40b4f4e0e9ec38bb4457db8; exit=0; EXPECT=matched; output-sha256=b4631f004dd0d4a8340502a8c59de610b335263ef98fb7cb18fe53221ccf6875; output-bytes=33; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
 
-- [x] G2: JUL-218 routes checked units, evaluation, residual construction, and ownership through the shared revision validator while preserving complete products and budget policy
-      CHECK: openspec validate jul-218-shared-body-evaluation-validation --strict && pnpm --filter @silklang/compiler exec vitest run test/NameResolution.test.ts test/SemanticInvalidation.test.ts test/ProjectAnalysis.test.ts test/StaticText.test.ts && echo JUL218_OK
-      EXPECT: JUL218_OK
-      EVIDENCE: 2026-09-21 strict OpenSpec validation passed; 97 focused tests passed; JUL218_OK.
+- [x] G2: distinct complete generic record instances have independently verified layout, construction, projection, patterns, symbols, interning, Copy or affine classification, and drop glue
+  CHECK: SILK_AGENT=step7 /private/tmp/silk-local-test.sh /Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records genericRecordInstances src/semantic/SemanticCases.silk
+  EXPECT: Tests  2 passed, 0 failed
+  EVIDENCE: 2026-10-03 exact source PASS; genericRecordInstancesClassifyCopyAndShareDropGlue 386 ms; genericRecordInstancesInferAndLayoutSeparately 502 ms; native explicit-pattern probe built and exited 42
 
-- [x] G3: JUL-219 supplies bounded opaque Storage with memory and atomic-filesystem providers and migrates native cache owners without retaining obsolete byte-store contracts
-      CHECK: openspec validate jul-219-compiler-storage --strict && pnpm --filter @silklang/compiler exec vitest run test/Storage.test.ts test/NativeToolchain.test.ts && pnpm --filter @silklang/compiler exec vitest run test/Driver.test.ts -t "admits native final caching|artifact Storage|rejects interface before cache reads" && echo JUL219_OK
-      EXPECT: JUL219_OK
-      EVIDENCE: 2026-09-21 strict OpenSpec validation passed; 49 Storage/NativeToolchain tests and 3 selected Driver migration tests passed; JUL219_OK.
+- [ ] G3: inferred generic record construction and projection execute with exactly-once payload cleanup in the native corpus
+  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler SILK_SELFHOST_CORPUS_CASES=generic-record-instances pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+  EXPECT: Selfhost corpus: pass=1 fail=0 unsupported=0 track=1
+  EVIDENCE: pending
 
-- [x] G4: JUL-221 persists and strictly admits complete checked units plus ordered dependency manifests through Storage and the shared validator
-      CHECK: openspec validate jul-221-persisted-checked-units --strict && pnpm --filter @silklang/compiler exec vitest run test/TirCodec.test.ts test/SemanticPersistence.test.ts test/SemanticInvalidation.test.ts && echo JUL221_OK
-      EXPECT: JUL221_OK
-      EVIDENCE: 2026-09-21 strict OpenSpec validation passed; 24 focused codec, persistence, and invalidation tests passed; JUL221_OK.
+- [ ] G4: the full corpus has zero failures, loses no baseline PASS, and every still-blocked generic-record program has a precise non-7a gap
+  EVIDENCE: staged exact-source sweep pass=60 fail=1 unsupported=328 track=46 with no lost PASS; the sole failure is the stale generic-service fixture corrected in prerequisite PR #738, while the other four former generic-record cases report typed-form
 
-- [x] G5: the final composed head keeps every new OpenSpec implementation task complete and the compiler type-safe
-      CHECK: pnpm --filter @silklang/llvm build && pnpm --filter @silklang/compiler typecheck && node -e "const fs=require('fs');for(const p of fs.readdirSync('openspec/changes').filter(x=>/^jul-(217|218|219|221)-/.test(x))){const t=fs.readFileSync('openspec/changes/'+p+'/tasks.md','utf8');if(/- \[ \]/.test(t))throw new Error('incomplete '+p)}console.log('FINAL_LOCAL_OK')"
-      EXPECT: FINAL_LOCAL_OK
-      EVIDENCE: 2026-09-21 LLVM build and compiler typecheck passed; all JUL-217/218/219/221 implementation tasks are complete; FINAL_LOCAL_OK.
+- [x] G5: the task diff is structurally clean
+  CHECK: git diff --check && echo 'diff hygiene verified'
+  EXPECT: diff hygiene verified
+  EVIDENCE: automatic-evidence=v1; definition-sha256=4e76a74b37d3ffa61be47f5f019f748a3b3bd3149a8f59b91967696fcea9cb34; exit=0; EXPECT=matched; output-sha256=f75ed0216b2ff9635ca2c2cbf8640d29f934c6a2a73bacda84c208d88669dcc4; output-bytes=22; shell=/bin/sh; cwd=/Users/juliaortiz/.t3/worktrees/silk/julia-step7a-generic-records; path=e250d9739ff8/70 entries
+
+- [ ] G6: independent review and required PR CI accept the exact final head
+  EVIDENCE: pending
