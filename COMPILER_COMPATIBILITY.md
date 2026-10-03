@@ -396,3 +396,21 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   surprising.
 - When both compilers and the reference agree and no source migration remains, retire the entry:
   delete it, or reduce it to a one-line note in the reference's evidence.
+
+### Native anonymous bodies retain nested lexical captures
+
+- **Status:** intentional native typing support in #567 Step 8b, 2026-10-03; native environment
+  construction and direct invocation follow in Step 8c.
+- **Rule:** every non-effect anonymous literal is its own function declaration and stores its
+  ordered captures in an exact environment (functions-callables.md, CAPTURE-001;
+  compiler/docs/mir-core-shape.md §7). A nested literal captures the lexical values visible in its
+  immediate checked body; the enclosing literal retains any outer values that construction needs.
+- **Compilers:** the bootstrap rejects an anonymous literal inside another anonymous body with
+  SEM0199 because its transitive capture lifting is unimplemented. Native typing keeps both
+  declaration identities, checked bodies, and capture fields. This follows the approved ordinary
+  declaration/environment design; it introduces no implicit box, code pointer, or adapter. Until
+  Step 8c supplies lowering, reaching construction still reports `typed-form`.
+- **Source migration:** none.
+- **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
+  `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
+  body queries. Native runtime execution is not claimed by this typing test.
