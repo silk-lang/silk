@@ -29,8 +29,12 @@ moving a whole non-Copy referent or a slice element as `OWN0012` (`BorrowedExtra
 a binding of `match &` or `match &mut` out of its arm as `OWN0006` (`MatchBorrowEscape`). `move` of
 any `match place` binding, and `drop` of a non-Copy one, is `Unsupported`. Semantic analysis decides which locals and values need cleanup: those
 whose owned structure carries `impl Drop`, found through the implementation query. `drop` of any
-other value lowers now; a drop that needs cleanup reports the `cleanup` gap until drop glue exists
-(roadmap step 6).
+other value emits nothing; a drop that needs cleanup calls the drop glue of the value's type. Glue is
+its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
+need cleanup, fields in declaration order, array elements in ascending order and only the active
+union member or variant. Callable and Effect environments, generic nominal unions and unions
+without a canonical member order still report the `cleanup` gap. Automatic cleanup at scope exits
+is roadmap step 6c.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

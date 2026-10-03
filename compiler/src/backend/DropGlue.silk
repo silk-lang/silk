@@ -1,0 +1,263 @@
+//! Drop glue: the MIR that cleans one complete value of a type (MIR core shape §3).
+//!
+//! # When to use
+//! Build a [`DropGlue`] recipe from a type's resolved Drop hook and member shapes, then lower it
+//! with [`DropGlue.lower`]. Every `Drop(place)` statement calls the glue of the place's type.
+//!
+//! # Details
+//! Glue receives the value through `&mut T`. It runs the Drop hook first, then drops each child
+//! that needs cleanup: fields in declaration order, array elements in ascending order, and only the
+//! active member of a structural union or the active variant's fields of a nominal union
+//! (CLEANUP-002). Children proven cleanup-free are omitted. Glue never fails and never traps.
+
+import backend.InstanceKey {InstanceKey}
+import backend.Layout {Layout}
+import backend.Mir {
+  Block,
+  Callee,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Reference,
+  Rvalue,
+  Statement,
+  SwitchCase,
+  Terminator,
+}
+import hir.Hir {Access, HirId, InfixOperator}
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime}
+import semantic.Specialization {Edge}
+import semantic.Type {Type}
+import semantic.TypedBody {Origin}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// One child that needs cleanup: its field ordinal or union tag, its type, and that type's glue.
+pub struct Child {
+  pub index: usize
+  pub ty: Shared<Type>
+  pub glue: InstanceKey
+}
+
+/// The fields of one nominal union variant that need cleanup.
+pub struct Variant {
+  pub tag: usize
+  pub fields: Vector<Child>
+}
+
+/// The children of a value that need cleanup after its Drop hook.
+pub union Children {
+  /// Record, tuple or anonymous aggregate fields in declaration order.
+  Fields {pub fields: Vector<Child>},
+  /// Every element of a fixed array, in ascending order.
+  Elements {pub element: Child, pub count: usize},
+  /// The active member of a structural union with `count` canonical members.
+  Members {pub members: Vector<Child>, pub count: usize},
+  /// The active variant's fields of a nominal union with `count` variants.
+  Variants {pub variants: Vector<Variant>, pub count: usize},
+}
+
+/// The recipe for one type's drop glue.
+pub struct DropGlue {
+  pub key: InstanceKey
+  pub ty: Shared<Type>
+  /// The resolved Drop hook instance, called with the value's address before any child.
+  pub hook: Option<InstanceKey>
+  pub children: Children
+}
+
+struct Builder {
+  locals: Vector<Local>
+  blocks: Vector<Block>
+  references: Vector<Reference>
+  origin: Origin
+}
+
+impl DropGlue {
+  /// Lowers the recipe into the glue instance's MIR. Local 1 is the `&mut T` parameter.
+  pub effect fn lower(self: DropGlue) -> MirFunction ! OutOfMemoryError ? &mut Allocator {
+    let origin = Origin {syntax: HirId {index: usize.ZERO}, span: Span.make(usize.ZERO, usize.ZERO)}
+    let unit = run Shared.make<Type>(Type.Unit)
+    let parameter = run Shared.make<Type>(Type.Reference {
+      referent: Shared.clone<Type>(&self.ty), access: Access.Mutable, lifetime: run Shared.make<Lifetime>(Lifetime.Static),
+    })
+    let mut builder = Builder {locals: Vector.make<Local>(), blocks: Vector.make<Block>(), references: Vector.make<Reference>(), origin: origin}
+    run Vector.append<Local>(&mut builder.locals, Local {ty: Shared.clone<Type>(&unit), kind: LocalKind.Return, origin: origin})
+    run Vector.append<Local>(&mut builder.locals, Local {ty: Shared.clone<Type>(&parameter), kind: LocalKind.Parameter {index: usize.ZERO}, origin: origin})
+    let mut current = run block(&mut builder)
+    if let Option<InstanceKey>.Some {value: hook} = move self.hook {
+      let result = run temporary(&mut builder, &unit)
+      let next = run block(&mut builder)
+      let mut arguments = Vector.make<Operand>()
+      run Vector.append<Operand>(&mut arguments, Operand.Copy {place: place(usize.ONE)})
+      run Vector.append<Reference>(&mut builder.references, Reference {key: InstanceKey.copy(&hook), edge: Edge.Direct, origin: origin})
+      terminate(&mut builder, current, Terminator.Call {
+        callee: Callee.Instance {key: move hook}, arguments: move arguments, destination: place(result), normal: next,
+        failure: Option.none<usize>(), origin: origin,
+      })
+      current = next
+    }
+    match move self.children {
+      Children.Fields {fields} => {
+        let listed = Vector.asSlice<Child>(&fields)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          run dropChild(&mut builder, current, &listed[at], Projection.Field {index: listed[at].index})
+          at = at + usize.ONE
+        }
+      }
+      Children.Elements {element, count} => { current = run dropElements(&mut builder, current, &element, count) }
+      Children.Members {members, count} => {
+        let listed = Vector.asSlice<Child>(&members)
+        let mut arms = Vector.make<usize>()
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let arm = run block(&mut builder)
+          run dropChild(&mut builder, arm, &listed[at], Projection.Payload {index: listed[at].index, ty: Shared.clone<Type>(&listed[at].ty)})
+          run Vector.append<usize>(&mut arms, arm)
+          at = at + usize.ONE
+        }
+        let tags = run tagsOf(listed)
+        current = run dispatch(&mut builder, current, count, Vector.asSlice<usize>(&tags), Vector.asSlice<usize>(&arms))
+      }
+      Children.Variants {variants, count} => {
+        let listed = Vector.asSlice<Variant>(&variants)
+        let mut arms = Vector.make<usize>()
+        let mut tags = Vector.make<usize>()
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let arm = run block(&mut builder)
+          let fields = Vector.asSlice<Child>(&listed[at].fields)
+          let mut field = usize.ZERO
+          while field < fields.length {
+            run dropChild(&mut builder, arm, &fields[field], Projection.VariantField {variant: listed[at].tag, field: fields[field].index})
+            field = field + usize.ONE
+          }
+          run Vector.append<usize>(&mut arms, arm)
+          run Vector.append<usize>(&mut tags, listed[at].tag)
+          at = at + usize.ONE
+        }
+        current = run dispatch(&mut builder, current, count, Vector.asSlice<usize>(&tags), Vector.asSlice<usize>(&arms))
+      }
+    }
+    terminate(&mut builder, current, Terminator.Return {origin: origin})
+    run MirFunction.sortReferences(&mut builder.references)
+    let mut parameters = Vector.make<Shared<Type>>()
+    run Vector.append<Shared<Type>>(&mut parameters, move parameter)
+    return MirFunction {
+      key: move self.key, safetyChecked: true, result: move unit, parameters: move parameters, locals: move builder.locals,
+      blocks: move builder.blocks, references: move builder.references, externs: Vector.make<Shared<DeclarationId>>(),
+    }
+  }
+}
+
+fn place(local: usize) -> Place {
+  return Place {local: local, projections: Vector.make<Projection>()}
+}
+
+// The child `step` beneath the value the parameter addresses.
+effect fn childPlace(step: Projection) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut projected = place(usize.ONE)
+  run Vector.append<Projection>(&mut projected.projections, Projection.Deref)
+  run Vector.append<Projection>(&mut projected.projections, move step)
+  return move projected
+}
+
+effect fn block(builder: &mut Builder) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let index = Vector.length<Block>(&builder.blocks)
+  run Vector.append<Block>(&mut builder.*.blocks, Block {statements: Vector.make<Statement>(), terminator: Terminator.Unreachable {origin: origin}})
+  return index
+}
+
+effect fn temporary(builder: &mut Builder, ty: &Shared<Type>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let index = Vector.length<Local>(&builder.locals)
+  run Vector.append<Local>(&mut builder.*.locals, Local {ty: Shared.clone<Type>(ty), kind: LocalKind.Temp, origin: origin})
+  return index
+}
+
+fn terminate(builder: &mut Builder, at: usize, terminator: Terminator) -> () {
+  let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.blocks)
+  blocks[at].terminator = move terminator
+  return ()
+}
+
+effect fn statement(builder: &mut Builder, at: usize, value: Statement) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.blocks)
+  return run Vector.append<Statement>(&mut blocks[at].statements, move value)
+}
+
+effect fn dropChild(builder: &mut Builder, at: usize, child: &Child, step: Projection) -> () ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  run statement(&mut builder.*, at, Statement.Drop {destination: run childPlace(move step), origin: origin})
+  return run Vector.append<Reference>(&mut builder.*.references, Reference {key: InstanceKey.copy(&child.glue), edge: Edge.Direct, origin: origin})
+}
+
+// Drops elements 0 through `count - 1` in ascending order with one counted loop.
+effect fn dropElements(builder: &mut Builder, at: usize, element: &Child, count: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let index = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let counter = run temporary(&mut builder.*, &index)
+  let condition = run temporary(&mut builder.*, &boolean)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(counter), value: Rvalue.Use {
+    value: Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: Shared.clone<Type>(&index)},
+  }, origin: origin})
+  let header = run block(&mut builder.*)
+  let body = run block(&mut builder.*)
+  let exit = run block(&mut builder.*)
+  terminate(&mut builder.*, at, Terminator.Goto {target: header, origin: origin})
+  run statement(&mut builder.*, header, Statement.Assign {destination: place(condition), value: Rvalue.Binary {
+    operation: InfixOperator.LessThan, left: Operand.Copy {place: place(counter)},
+    right: Operand.Integer {decimal: run Type.extentText(count), negative: false, ty: Shared.clone<Type>(&index)},
+  }, origin: origin})
+  terminate(&mut builder.*, header, Terminator.Branch {condition: Operand.Copy {place: place(condition)}, thenBlock: body, elseBlock: exit, origin: origin})
+  run dropChild(&mut builder.*, body, element, Projection.Index {local: counter})
+  run statement(&mut builder.*, body, Statement.Assign {destination: place(counter), value: Rvalue.Binary {
+    operation: InfixOperator.Add, left: Operand.Copy {place: place(counter)},
+    right: Operand.Integer {decimal: run Bytes.copy(b"1"), negative: false, ty: Shared.clone<Type>(&index)},
+  }, origin: origin})
+  terminate(&mut builder.*, body, Terminator.Goto {target: header, origin: origin})
+  return exit
+}
+
+effect fn tagsOf(children: &[Child]) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut tags = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < children.length {
+    run Vector.append<usize>(&mut tags, children[at].index)
+    at = at + usize.ONE
+  }
+  return move tags
+}
+
+// Switches on the union tag: each listed tag runs its arm, and every other tag cleans nothing.
+effect fn dispatch(builder: &mut Builder, at: usize, count: usize, tags: &[usize], arms: &[usize]) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let exit = run block(&mut builder.*)
+  let tagType = run Layout.tagType(count)
+  let tag = run temporary(&mut builder.*, &tagType)
+  let mut subject = place(usize.ONE)
+  run Vector.append<Projection>(&mut subject.projections, Projection.Deref)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(tag), value: Rvalue.Discriminant {place: move subject}, origin: origin})
+  let mut cases = Vector.make<SwitchCase>()
+  let mut index = usize.ZERO
+  while index < tags.length {
+    run Vector.append<SwitchCase>(&mut cases, SwitchCase {decimal: run Type.extentText(tags[index]), negative: false, target: arms[index]})
+    terminate(&mut builder.*, arms[index], Terminator.Goto {target: exit, origin: origin})
+    index = index + usize.ONE
+  }
+  terminate(&mut builder.*, at, Terminator.Switch {value: Operand.Copy {place: place(tag)}, cases: move cases, otherwise: exit, origin: origin})
+  return exit
+}
