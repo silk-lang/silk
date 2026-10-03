@@ -50,4 +50,5 @@ export const selfhostTrack = [
   'match-arm-blocks-and-bindings',
   'runtime-slice-temporary-and-lexical-borrows',
   'scalar-member-unions',
+  'nominal-union-operator-provider',
 ] as const satisfies ReadonlyArray<string>
