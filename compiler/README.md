@@ -880,7 +880,7 @@ them back to a local owner, as required by Silk's ownership rules.
 ## Verification
 
 Build this checkout's bootstrap CLI, then run the source-written cases. The M1 query root
-imports query and source-index cases; the semantic and frozen-target cases use their own roots to
+imports query and source-index cases; the semantic, callable-result and frozen-target cases use their own roots to
 keep each native compilation within the CI heap limit. The HIR root runs the lowering, fingerprint,
 and parser cases without pulling the semantic engine into their binary.
 `--no-cache` executes assertions even if a previous run stored passing results. The focused Linux
@@ -892,6 +892,7 @@ named `selfhost-*`; pushing one does not start a second CI run before its pull r
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/CallableResultCases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/TargetCases.silk --no-cache
 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --no-cache
 ```
