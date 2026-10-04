@@ -506,3 +506,9 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
   a struct literal, and reused `Some {value}` arm names conflicted with an outer pattern binding.
   Return from named match-arm helpers and use distinct binding names; check the source-written
   test root with bootstrap before starting native CI · Silk compiler Step 8.
+
+- 2026-10-04 · Step 8 capture assertions assumed a staged environment had only its new local marker,
+  and checked unavailable callable bounds at the whole call. Staging also retains F's declared
+  environment; callable argument failures preserve the operand span. Assert both retained regions
+  and the operand span independently. Native formatter probes also require a selection inside the
+  manifest source root; use a disposable source-root copy and remove it afterward. · Silk selfhost
