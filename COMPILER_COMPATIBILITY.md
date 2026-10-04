@@ -841,7 +841,8 @@ repeated invocation and capture-only drop glue.
   may return through the same public contract. Named values and constructed exact environments
   also retain known identity.
 - **Compilers:** native classifies the original parameter owner and generated representation slot
-  through its tracked Signature. Moved aliases and enclosing captures preserve that role; source
+  through its tracked function Signature. Nonfunction owners retain authored binders without
+  querying a nonexistent function signature. Moved aliases and enclosing captures preserve that role; source
   syntax at the current return is not sufficient evidence. This guard follows the existing return
   transfer check: a bare affine owner first reports OWN0003 at the operand. Bootstrap can report
   OWN0003 and SEM0081 together; native retains its single primary rejection. Effect contracts
@@ -849,6 +850,9 @@ repeated invocation and capture-only drop glue.
 - **Evidence:** `rawOwnedCallableReturnKeepsBootstrapIdentityGuard` checks full move-expression
   spans for direct mutable/once parameters, a moved alias and a nested enclosing capture, with
   independent authored-F and known-target positives. Bootstrap Analysis reaches the four SEM0081
-  sites and the bare OWN0003 site; a separate reached positive reduction has available MIR.
+  sites and the bare OWN0003 site; a separate reached function-F/known-target positive reduction
+  has available MIR. The nominal owner positive follows native whole-family owner premises;
+  bootstrap instead rejects its constrained owner implementation head with SEM0194, as already
+  documented for the nominal-domain premise difference.
 - **Source migration:** use an authored constrained type parameter when the returned owner needs
   to preserve its exact callable type, or return a known construction.
