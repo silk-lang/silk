@@ -211,6 +211,28 @@ Each entry records:
   `genericNominalConstructionAndPatternsRetainLexicalBounds` contain independent code/span
   controls; execution is not yet claimed.
 
+### Inherent members retain their bounded nominal owner's domain premises
+
+- **Status:** intentional native correction authored on 2026-10-04 during Step 7 review;
+  native execution and exact-head CI are pending.
+- **Rule:** a local whole-family `impl<T> Box<T>` for `Box<T: Copy>` operates within the
+  owner's valid domain. Its receiver/header and ordinary abstract body inherit `Copy(T)`.
+  These are substituted owner premises, not extra authored implementation bounds. Ordinary
+  applications and conformance heads must still prove the owner's bounds.
+- **Compilers:** the bootstrap accepts this inherent head but rejects returning `self.value`
+  from a borrowed `Box<T>` with `OWN0002`. Its ownership `Project` path classifies the field
+  with the member's Copy assumptions and treats it as a partial move when the owner's premise
+  is absent. Native signatures explicitly retain the validated owner's premises; this avoids
+  a concrete specialization concealing an invalid abstract body.
+- **Source migration:** keep the whole-family head `impl<T> Box<T>`; adding `T: Copy` to
+  the authored implementation binders is not a workaround for this domain-premise omission.
+- **Evidence:** bootstrap reduced probe `bounded-copied.silk` rejects `self.value`; native
+  structured control `genericBoundedOwnerSuppliesReceiverHeaderAndFieldCopy` separately checks
+  the caller's borrowed receiver, exact member header and ContractTyped field projection.
+  Native results remain pending. The unbounded-construction negative remains in
+  `genericNominalConstructionAndPatternsRetainLexicalBounds`.
+- **Owner:** bootstrap nominal-domain premise propagation follow-up; no Option/Result exception.
+
 ### Selfhost bounds inline stored-property proof recursion
 
 - **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
@@ -265,8 +287,8 @@ Each entry records:
   `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation and nested
   explicit callee moves with diagnostic spans. The
   `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
-  Source callable-bearing record patterns remain blocked by generic record typing and are not
-  claimed as native runtime coverage here.
+  Source callable-bearing record patterns are not claimed as native runtime coverage here;
+  their remaining callable availability and lowering work belongs to Step 8, not generic records.
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
   reference should widen it, before extending selfhost's general guard ownership checking.
 
