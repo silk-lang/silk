@@ -1038,8 +1038,8 @@ impl Copy for ReceiverPosition {}
 
 union CallReference {
   Named {name: Bytes},
-  // A value read with no local binding. It selects a module declaration only to reject it: reading
-  // a constant, function, or other declaration is outside the scalar body subset.
+  // A value read with no local binding. Functions construct exact environments; constants
+  // remain available only to static bodies.
   Unbound {name: Bytes},
   Qualified {namespace: Bytes, member: Bytes, subjectSpan: Span, memberSpan: Span, application: HirRef},
   NonCallable,
@@ -1303,7 +1303,6 @@ fn reusableTypeKind(value: &Type) -> usize {
     Type.Primitive {..} => usize.ONE
     Type.Unit => 2
     Type.Nominal {..} => 3
-    Type.NamedRepresentation {..} => 13
     Type.OpaqueRepresentation {..} => 14
     Type.Parameter {..} => 4
     Type.String {..} => 5
@@ -1440,16 +1439,6 @@ fn sameReusableTypeWith(value: &Type, right: &Shared<Type>) -> bool {
       return match & value.* {
         Type.Nominal {declaration, arguments, ..} => match & other.* {
           Type.Nominal {declaration: selected, arguments: supplied, ..} => DeclarationId.equals(
-            &declaration,
-            &selected,
-          ) && sameArguments(
-            Vector.asSlice<Argument>(&arguments),
-            Vector.asSlice<Argument>(&supplied),
-          )
-          _ => false
-        }
-        Type.NamedRepresentation {declaration, arguments, ..} => match & other.* {
-          Type.NamedRepresentation {declaration: selected, arguments: supplied, ..} => DeclarationId.equals(
             &declaration,
             &selected,
           ) && sameArguments(
@@ -5086,10 +5075,23 @@ fn anyPrivateArgument(arguments: &Vector<Argument>) -> bool {
   return false
 }
 
+fn privateCallableApplication(value: &Application) -> bool {
+  if anyPrivateArgument(&value.arguments) { return true }
+  let scopes = Vector.asSlice<ScopeBinding>(&value.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    if anyPrivateArgument(&scopes[at].arguments) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 fn privateNominal(resolved: &Type) -> bool {
   return match & resolved.* {
     Type.Nominal {isPublic, arguments, ..} => !isPublic || anyPrivateArgument(&arguments)
-    Type.NamedRepresentation {isPublic, arguments, ..} => !isPublic || anyPrivateArgument(&arguments)
+    Type.CallableValue {isPublic, application, contract, captures, ..} => !isPublic || anyPrivate(&captures)
+      || Shared.with<Type, bool>(&contract, privateNominal)
+      || Shared.with<Application, bool>(&application, privateCallableApplication)
     Type.OpaqueRepresentation {arguments, contract, ..} => Shared.with<Type, bool>(
       &contract,
       privateNominal,
@@ -20815,9 +20817,9 @@ effect fn callFunctionTarget(
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   let variadic = run foreignCallVariadic(&mut resolver.*, targetModule, target.ordinal, foreign)
-  if bareValue {
+  if bareValue && foreign {
     return Result.failResult<ResolvedTarget, Shared<Rejection>>(
-      run reject(&resolver.*, module, RejectionCode.FunctionValueUnavailable, span),
+      run reject(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span),
     )
   }
   let signatureKey = Key {
@@ -21207,23 +21209,65 @@ effect fn resolveNamedRepresentation(
   if Vector.length<Argument>(&target.explicit) != count {
     return run invalidExactRepresentation(&resolver.*, module, span)
   }
-  if Shared.with<Result<Answer, NoRejection>, usize>(
-    &target.signature,
-    signatureConstraintCount,
-  ) > usize.ZERO {
+  if target.foreign {
     return Result.failResult<Shared<Type>, Shared<Rejection>>(
-      run reject(&resolver.*, module, RejectionCode.Unsupported, span),
-    )
+      run reject(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span))
   }
+  if Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureOutsideScalarBodies)
+    || Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureStaticCount) != usize.ZERO
+    || Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureIsStatic) {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+  }
+  let mut request = Request.make()
+  let selectedApplication = run checkedDirectApplication(&mut resolver.*, &mut owner.*, &mut request,
+    &mut dependencies.*, &target.declaration, &target.signature,
+    run copyArguments(Vector.asSlice<Argument>(&target.explicit)), &target.scopeArguments, module, span)
+  let application = match move selectedApplication {
+    Result<Application, Shared<Rejection>>.Success {value} => move value
+    Result<Application, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
+    }
+  }
+  let bindings = run Application.bindings(&application)
+  let countBounds = Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureConstraintCount)
+  let mut applied = Vector.make<Constraint>()
+  let mut at = usize.ZERO
+  while at < countBounds {
+    let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(&target.signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraint(answer, at) })
+    if let Option<Constraint>.Some {value} = move bound {
+      run Vector.append<Constraint>(&mut applied, run bindConstraint(&value, Vector.asSlice<Binding>(&bindings)))
+    }
+    at = at + usize.ONE
+  }
+  let refused = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &constraints,
+    Vector.asSlice<Constraint>(&applied), module, span)
+  if let Option<Shared<Rejection>>.Some {value} = move refused {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(move value)
+  }
+  let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureParameterCount)
+  let mut parameters = Vector.make<Shared<Type>>()
+  at = usize.ZERO
+  while at < parameterCount {
+    let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&target.signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) })
+    if let Option<Shared<Type>>.Some {value} = move selected {
+      run Vector.append<Shared<Type>>(&mut parameters, run Type.applyBindings(&value, Vector.asSlice<Binding>(&bindings), true))
+    } else { return run invalidExactRepresentation(&resolver.*, module, span) }
+    at = at + usize.ONE
+  }
+  let result = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&target.signature, signatureResult) {
+    Option<Shared<Type>>.Some {value} => run Type.applyBindings(&value, Vector.asSlice<Binding>(&bindings), true)
+    _ => { return run invalidExactRepresentation(&resolver.*, module, span) }
+  }
+  let contract = run Shared.make<Type>(Type.Callable {mode: CallableMode.Shared,
+    isUnsafe: Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureUnsafe),
+    environment: run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&Vector.make<Shared<Lifetime>>()))),
+    invocationBinders: usize.ZERO, invocationBounds: Vector.make<Outlives>(), parameters: move parameters, result: move result})
   return Result.succeed<Shared<Type>, Shared<Rejection>>(
-    run Shared.make<Type>(
-      Type.NamedRepresentation {
-        declaration: move target.declaration,
-        isPublic: target.isPublic,
-        arguments: move target.explicit,
-      },
-    ),
-  )
+    run Type.callableValue(target.isPublic, run Shared.make<Application>(move application), move contract,
+      Vector.make<Shared<Type>>(), Vector.make<CallableFieldInput>()))
 }
 
 fn isStaticIndex(slots: &[usize], at: usize) -> bool {
@@ -21233,6 +21277,13 @@ fn isStaticIndex(slots: &[usize], at: usize) -> bool {
     index = index + usize.ONE
   }
   return false
+}
+
+fn signatureIsStatic(answer: &Result<Answer, NoRejection>) -> bool {
+  return match move signatureFacts(answer) {
+    Option<SignatureFacts>.Some {value} => value.isStatic
+    _ => false
+  }
 }
 
 fn signatureStaticCount(answer: &Result<Answer, NoRejection>) -> usize {
@@ -26868,7 +26919,7 @@ effect fn checkAnonymous<'scope>(
   let application = run Shared.make<Application>(Application {target: SpecializationTarget.Named {declaration: run DeclarationId.copy(&identity)},
     arguments: move ownArguments, argumentOrdinals: run applicationOrdinals(ownSlots), scopes: run formalCallableScopes(&schema), statics: Vector.make<StaticSlot>()})
   let contract = run anonymousUseContract(&signature, &identity, mode, Vector.asSlice<Shared<Lifetime>>(&regions))
-  let exact = run Type.callableValue(move application, move contract, move fieldTypes, Vector.make<CallableFieldInput>())
+  let exact = run Type.callableValue(false, move application, move contract, move fieldTypes, Vector.make<CallableFieldInput>())
   let selectedInput = run SourceIndex.bodyInput(&mut resolver.source, &sourceAnswer, module, ordinal)
   let input = match move selectedInput {
     Option<Shared<BodyInput>>.Some {value} => move value
@@ -26909,8 +26960,8 @@ struct CheckedIdentifier {
   form: BodyExpression
 }
 
-// An unbound identifier names a constant recorded by call resolution; a bound one names a local
-// or a pattern binder, and only runtime bodies see pattern binders.
+// Function values are handled by the construction path before this helper. An unbound identifier
+// here names a constant; a bound one names a local or runtime pattern binder.
 effect fn checkedIdentifier(
   resolver: &Resolver,
   module: &ModuleId,
@@ -27480,7 +27531,22 @@ effect fn checkExpression<'scope>(
   if let Option<CallInput>.Some {value: input} = move CallInput.ofNode(authored) {
     return run checkInvocation(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
       module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-      expression, input, expected, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged)
+      expression, input, expected, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged, false)
+  }
+  if let Node.IdentifierExpression {binding, ..} = authored {
+    if !binding.present {
+      let selected = run resolvedCall(calls, expression)
+      if let Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {
+        value: Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Function {..}},
+      } = move selected {
+        if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
+        return run checkInvocation(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+          module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
+          expression, CallInput {callee: expression, generics: HirRef.absent(),
+            arguments: CallArguments.Written {range: Range.empty()}, pipeline: false},
+          expected, constraints, contractBody, false, unsafeAllowed, false, true)
+      }
+    }
   }
   if let Node.CallableExpression {..} = authored {
     if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
@@ -29168,7 +29234,7 @@ effect fn checkInvocation<'scope>(
   caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut Vector<BodyNode>,
   signatures: &mut Vector<SignatureDependency>, requiredBodies: &mut Vector<DeclarationId>,
   expression: HirId, input: CallInput, expected: &Option<Shared<Type>>, constraints: &[Constraint],
-  contractBody: bool, staticBody: bool, unsafeAllowed: bool, callAcknowledged: bool,
+  contractBody: bool, staticBody: bool, unsafeAllowed: bool, callAcknowledged: bool, valueConstruction: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let CallInput {callee, generics, arguments, pipeline} = input
@@ -29480,7 +29546,7 @@ effect fn checkInvocation<'scope>(
   }
   let shape = callArityRejection(parameterCount, CallArguments.length(arguments))
   if let Option<RejectionCode>.Some {value: reason} = move shape {
-    return run bodyRejection(&resolver.*, module, reason, span)
+    if !valueConstruction { return run bodyRejection(&resolver.*, module, reason, span) }
   }
   if foreignCall && CallArguments.length(arguments) < parameterCount {
     return run bodyRejection(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span)
@@ -29494,7 +29560,7 @@ effect fn checkInvocation<'scope>(
     &target.signature,
     signatureUnsafe,
   )
-  if CallArguments.length(arguments) == parameterCount && unsafeCall && !unsafeAllowed && !callAcknowledged {
+  if !valueConstruction && CallArguments.length(arguments) == parameterCount && unsafeCall && !unsafeAllowed && !callAcknowledged {
     return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeAcknowledgement, span)
   }
   if CallArguments.length(arguments) == parameterCount && callAcknowledged && !unsafeCall {
@@ -29897,10 +29963,10 @@ effect fn checkInvocation<'scope>(
     if let Option<Shared<Vector<StaticSlot>>>.Some {value: slots} = &suppliedStatics {
       application.statics = run copySharedStaticSlots(&slots)
     }
-    if parameterOffset > usize.ZERO {
+    if parameterOffset > usize.ZERO || valueConstruction {
       return run finishNamedSection(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
         &mut nodes.*, expression, span, &target.signature, Vector.asSlice<Binding>(&inferred),
-        NamedSectionTarget.Application {value: move application}, parameterOffset, move typedArguments, move ty, constraints, expected, contractBody,
+        NamedSectionTarget.Application {value: move application, isPublic: target.isPublic}, parameterOffset, move typedArguments, move ty, constraints, expected, contractBody,
       )
     }
     form = BodyExpression.DirectCall {
@@ -29973,7 +30039,7 @@ effect fn finishNamedSection(resolver: &mut Resolver, owner: &mut Query<Word, An
     invocationBinders: usize.ZERO, invocationBounds: Vector.make<Outlives>(),
     parameters: move parameters, result: move result})
   let ty = match move target {
-    NamedSectionTarget.Application {value} => run Type.callableValue(run Shared.make<Application>(move value), move contract, move captures, move fieldInputs)
+    NamedSectionTarget.Application {value, isPublic} => run Type.callableValue(isPublic, run Shared.make<Application>(move value), move contract, move captures, move fieldInputs)
     NamedSectionTarget.Schema {target: identity, selected, deferred} => run Type.callableSchema(
       run Shared.make<SectionSchema>(SectionSchema {target: move identity, contract: move contract,
         selected: move selected, deferred: move deferred}), move captures, move fieldInputs)
@@ -30821,7 +30887,6 @@ effect fn cleanupFree(
   let mut parts = Vector.make<Shared<Type>>()
   match &node {
     Type.Parameter {..} => { return Result.succeed<bool, Shared<Rejection>>(false) }
-    Type.NamedRepresentation {..} => { return run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, Vector.asSlice<Constraint>(&declared), span) }
     Type.OpaqueRepresentation {..} => { return run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, Vector.asSlice<Constraint>(&declared), span) }
     Type.Array {element, ..} => { run Vector.append<Shared<Type>>(&mut parts, Shared.clone<Type>(&element)) }
     Type.Union {members} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&members)) }
@@ -35073,7 +35138,10 @@ effect fn concreteCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, 
     }
     Type.CallableValue {application, contract, captures, fieldInputs, ..} => {
       let invocationMode = Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
-      if Vector.length<CallableFieldInput>(&fieldInputs) != usize.ZERO {
+      let declaration = Shared.with<Application, OwnerKind>(&application, fn(value: &Application) -> OwnerKind {
+        return DeclarationId.kind(Application.bodyDeclaration(value))
+      })
+      if declaration != OwnerKind.Anonymous || Vector.length<CallableFieldInput>(&fieldInputs) != usize.ZERO {
         return run sectionCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
           callerBindings, move inputs, invocationMode, move application, move captures, move fieldInputs)
       }
@@ -43883,7 +43951,7 @@ effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoReject
 }
 
 union NamedSectionTarget {
-  Application {value: Application},
+  Application {value: Application, isPublic: bool},
   Schema {target: Shared<DeclarationId>, selected: Vector<Binding>, deferred: Vector<usize>},
 }
 

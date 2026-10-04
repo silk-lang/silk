@@ -620,3 +620,23 @@ checker. The native availability pass diagnoses moved places and consumption dur
 RHS; it does not claim to check outstanding loan conflicts. `genericNamedSectionsRetainMutableCaptureStorage`
 asserts retained exclusive local provenance and the explicit unchecked status, alongside direct
 repeated invocation and capture-only drop glue.
+
+### Named callable values in selfhost
+
+- **Status:** implemented with #567 Step 8d on 2026-10-04.
+- **Rule:** a named function value is an exact callable environment with no captures. `typeof`
+  resolves that same ordinary application, preserving complete selected arguments, visibility
+  and applied bounds. Invocation calls the original function directly with its written arguments.
+- **Compilers:** selfhost now uses the same canonical callable-value representation for named
+  items and anonymous bodies. Only anonymous bodies receive a hidden environment parameter.
+  Generic named values retain a schema when invocation inputs can supply deferred type evidence.
+  Uninferred result-only binders, quantified section lifetimes, runtime static parameters and
+  enclosing owner recipes keep their existing precise gaps. Unsafe acknowledgement belongs to
+  invocation, including zero-argument targets. Foreign function values remain SEM0189; callable
+  values remain forbidden source static data. Opaque callable result realization and retained
+  mutable callable parameter views remain required Step 8 work.
+- **Source migration:** none.
+- **Evidence:** `namedFunctionValuesConstructEmptyEnvironmentsAndReturnExactTypes`,
+  `genericNamedFunctionValuesSelectEachDirectInvocation` and
+  `namedCallableRepresentationsKeepExactIdentity` assert construction, original-target ABI,
+  independent applications, visibility, static-data exclusion and diagnostic codes/spans.
