@@ -996,3 +996,33 @@ repeated invocation and capture-only drop glue.
   records, authored-F control, repaired Drop fixture and descriptor-union source. Native execution
   and per-test timings have not yet run.
 - **Source migration:** none.
+
+### Native callable results from selected interface operations
+
+- **Status:** implemented in a draft Step 8 layer. Bootstrap source checking and independent
+  source review are in progress; native assertions, Linux timings and exact-head CI are pending.
+- **Rule:** an operation returning a callable retains its original operation identity, complete
+  contract/provider selection, original-owner invocation assignments, checked operand types and
+  positional optional witness loans. A concrete conformance witness resolves the ordinary original
+  implementation application before returned-origin selection. Source normalization and MIR share
+  the same target slot and loan transport; there is no interface adapter or runtime dispatch value.
+- **Lifetime evidence:** public descriptor operands cannot need owned-value witness borrowing and
+  retain their existing regions without a fresh transport slot. An owned public operand may need a
+  fresh loan after witness selection; its actual caller region fills the original target slot.
+  Exact type equality preserves all selected/transport evidence. Only private pending returned-origin
+  comparison can disregard differing transient Local loan values in two open witness recipes.
+  Every original return equation remains immutable, and every closed equation is normalized with
+  its own complete evidence and strictly compared before publication. Schema blueprints, binding
+  owners/ordinals, rows, statics and all other lifetime evidence remain exact.
+- **Bootstrap boundaries:** the two-provider and two-descriptor-return fixtures are independently
+  admitted by bootstrap Analysis. The staged generic section fixture reports SEM0052 at the whole
+  `apply(Factory.make(provider))`, an existing inference boundary; native acceptance is an intended
+  extension. The invalid arbitrary-F assignment reports bootstrap SEM0037 at exactly
+  `Factory.make(provider)` plus its existing affine-F forwarding diagnostic. Native's structured
+  assignment assertion retains its existing TypeMismatch code and exact expression span.
+- **Evidence:** seven `interfaceCallable*` controls cover original provider/implementation/leaf
+  selection, symbolic descriptor and owned return replay, deferred section evidence, universal
+  source rejection, independent loan-only source equality/substitution and optional presence, and
+  original receiver-region transport through a captured MIR temporary. These assertions have not
+  yet run natively. Unresolved recipes never have storage or an executable key.
+- **Source migration:** none.
