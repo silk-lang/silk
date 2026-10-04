@@ -10,9 +10,9 @@ Scope: pin every corpus program newly enabled by Step 7, replace generic first-b
       EVIDENCE: pending revalidation after combined review
 
 - [ ] G1: the stack contains current selfhost, the main-first corpus sync and the Step 6 cleanup foundation
-      CHECK: git merge-base --is-ancestor 8964ce9905a44841f60cd0d5387df3f8f5f85af7 HEAD && git merge-base --is-ancestor 23eb6fc956af3154df2391cfaade34a1da4e8738 HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+      CHECK: git merge-base --is-ancestor f1723a4d0d4d7acb39f4748ba3a6ead67596a0be HEAD && git merge-base --is-ancestor 23eb6fc956af3154df2391cfaade34a1da4e8738 HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
       EXPECT: prerequisite verification passed
-      EVIDENCE: pending final ancestry and source verification; current integration base is selfhost 8964ce990 plus main sync 0bf6fa25a
+      EVIDENCE: pending final ancestry and source verification; refreshed stack contains selfhost f1723a4d0 plus main 23eb6fc95 through sync dc6ce47a2
 
 - [ ] G2: the full corpus has zero failures and reports the final PASS, unsupported, and track counts
       CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
@@ -36,7 +36,7 @@ Scope: pin every corpus program newly enabled by Step 7, replace generic first-b
   | borrowed aggregate/string follow-up | ecdsa-p256-verification (typed-form at the borrowed array-to-slice Option payload); http-values (typed-form at a string header-name operand)                                                                                                                                                                               |
 
 - [ ] G5: Option and Result receive no direct or indirect compiler privilege, and a user-defined Option-shaped generic union has identical layout and behavior
-      EVIDENCE: round-1 independent source audit found no direct or indirect recognition; #738 supplies the runtime comparison, but an explicit identical-layout structured assertion is still required
+      EVIDENCE: round-1 and round-2 independent source audits found no direct or indirect recognition; #738 supplies the runtime comparison and genericOptionLibraryAndUserUnionHaveIdenticalLayout compares actual stdlib Option and authored user-union layout. Native execution and final privilege audit remain pending.
 
 - [ ] G6: the generic-record and user-defined generic-union native corpus acceptances land on main, sync to selfhost, pass exactly, and are pinned
       EVIDENCE: #738 merged on main at 23eb6fc95; reviewed sync #750 is the bottom of native stack #751; exact final native PASS and pins remain pending
