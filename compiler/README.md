@@ -70,9 +70,15 @@ enclosing failure type (`FailOutsideEffect` SEM0063, `UndeclaredFailure` SEM0064
 failure type is not `never` returns an `i1` status and writes success and failure to two
 caller-owned out-addresses after its parameters (D3); MIR gives it a `Failure` local, a `Fail`
 terminator and a `FailureEdge` on each fallible call, whose block widens the callee's failure into
-`Failure`, drops every scope it leaves and fails (D7). Running a stored Effect value, Effect blocks,
-requirement-row arguments, service operations and the composition intrinsics remain the
-`effect-form` and `effect-instance` gaps, and `effect fn main` the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
+`Failure`, drops every scope it leaves and fails (D7). A stored Effect value runs through its
+exact representation's runner, as a callable with no new arguments: a construction's stored
+arguments move (once) or copy into the target's parameters. A parameter of Effect contract type
+gets an implicit representation binder like a callable parameter, so a generic runner is
+specialized to its argument's exact Effect. A named non-generic function used as a value is a
+capture-free exact callable; invoking it is a direct call, and running an invoked `effect fn` value
+calls the instance. Effect blocks, requirement-row arguments, service operations and the
+composition intrinsics remain the `effect-form` and `effect-instance` gaps, and `effect fn main`
+the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
 sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.

@@ -23,6 +23,8 @@ export interface Gap {
 export interface BuildDiagnostic {
   readonly code: string
   readonly span: { readonly start: number; readonly end: number }
+  /** The logical module the span indexes, such as `main.silk` or a standard-library module. */
+  readonly module: string
 }
 
 export type CaseResult =
@@ -32,6 +34,7 @@ export type CaseResult =
       readonly status: 'fail'
       readonly code: string
       readonly span?: BuildDiagnostic['span']
+      readonly module?: string
       readonly reason: string
     }
   | { readonly name: string; readonly status: 'unsupported'; readonly gaps: ReadonlyArray<Gap> }
@@ -130,12 +133,15 @@ export const parseBuildDiagnostic = (stderr: string): BuildDiagnostic | undefine
       !('code' in value) ||
       typeof value.code !== 'string' ||
       value.code.length === 0 ||
-      !('span' in value)
+      !('span' in value) ||
+      !('module' in value) ||
+      typeof value.module !== 'string' ||
+      value.module.length === 0
     )
       return undefined
     const span = value.span
     if (!validSpan(span)) return undefined
-    return { code: value.code, span: { start: span.start, end: span.end } }
+    return { code: value.code, span: { start: span.start, end: span.end }, module: value.module }
   } catch {
     return undefined
   }
@@ -258,7 +264,9 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
               name: program.name,
               status: 'fail',
               code: diagnostic?.code ?? 'BUILD_PROCESS_FAILURE',
-              ...(diagnostic === undefined ? {} : { span: diagnostic.span }),
+              ...(diagnostic === undefined
+                ? {}
+                : { span: diagnostic.span, module: diagnostic.module }),
               reason: `profile ${profile.name}: build: ${processFailure(built)}`,
             }
           : { name: program.name, status: 'unsupported', gaps }
@@ -347,7 +355,7 @@ export const runCorpus = (silkc: string, corpus: ReadonlyArray<CorpusProgram>): 
   for (const result of results) {
     let detail = ''
     if (result.status === 'fail')
-      detail = `: code=${result.code} span=${result.span === undefined ? 'unavailable' : `${result.span.start}-${result.span.end}`} ${result.reason}`
+      detail = `: code=${result.code} span=${result.span === undefined ? 'unavailable' : `${result.module ?? ''}:${result.span.start}-${result.span.end}`} ${result.reason}`
     if (result.status === 'unsupported')
       detail = `: ${result.gaps
         .map(
