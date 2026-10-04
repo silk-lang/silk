@@ -519,3 +519,6 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
   borrowed union match arms, producing a non-dominating 16-byte LLVM spill even in a release build.
   A three-variant standalone probe reproduced the exact CI instruction numbers. Inspect each
   argument's kind before branching instead of indexing inside nested match arms. · Silk selfhost
+
+- 2026-10-04 · An affine staging assertion looked up the first MIR reference with its target's owner identity, selecting capture DropGlue before the ordinary Function reference and returning no application · Skip same-owner references without a Function application; retain both early-exit and normal-path cleanup assertions · Silk selfhost Step 8
+- 2026-10-04 · A read-only formatter probe exceeded execFileSync's default output buffer with the large semantic test root · Give the probe a bounded 16 MB maxBuffer · Silk selfhost Step 8 review
