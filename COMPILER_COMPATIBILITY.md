@@ -912,7 +912,10 @@ repeated invocation and capture-only drop glue.
   `higherOrderBorrowedMutableProducersPreserveOriginalTargets` and
   `higherOrderStagedSchemaProducersRetainOriginalSelection`,
   `higherOrderAffineArgumentsAndOnceResultsHaveOneCleanupOwner` and
-  `higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels` retain structured source/MIR claims.
+  `higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels` and
+  `higherOrderStagedSuffixRecipesNormalizeBeforeSchemaSelection` retain structured source/MIR claims.
+  Source canonicalization includes free exact callable contracts and staged suffix evidence before
+  target selection; schema bound blueprints keep their target declarations and quantifiers.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
