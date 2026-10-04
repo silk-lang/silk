@@ -208,7 +208,7 @@ Each entry records:
 - **Source migration:** none.
 - **Evidence:** `genericRecordConstructionPrefixesRemainFixedAndQualified`,
   `genericRecordPatternsCheckAbstractlyBeforeCompleteMir` and
-  `genericNominalConstructionAndPatternsRetainLexicalBounds` contain independent code/span
+  `genericNominalConstructionRetainsLexicalBounds` contain independent code/span
   controls; execution is not yet claimed.
 
 ### Inherent members retain their bounded nominal owner's domain premises
@@ -230,7 +230,7 @@ Each entry records:
   structured control `genericBoundedOwnerSuppliesReceiverHeaderAndFieldCopy` separately checks
   the caller's borrowed receiver, exact member header and ContractTyped field projection.
   Native results remain pending. The unbounded-construction negative remains in
-  `genericNominalConstructionAndPatternsRetainLexicalBounds`.
+  `genericNominalConstructionRetainsLexicalBounds`.
 - **Owner:** bootstrap nominal-domain premise propagation follow-up; no Option/Result exception.
 
 ### Selfhost bounds inline stored-property proof recursion
@@ -264,7 +264,7 @@ Each entry records:
   prefixes remain fixed evidence.
 - **Source migration:** none.
 - **Evidence:** positive complete/partial prefixes and the local-to-static negative in
-  `genericNominalConstructionAndPatternsRetainLexicalBounds`; corrected native execution pending.
+  `genericNominalBorrowArgumentsPreserveActualRegions`; reduced-fixture native execution pending.
 
 ### Selfhost guard ownership checking is limited to callable availability
 
