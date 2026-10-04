@@ -183,6 +183,23 @@ Each entry records:
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
   reference should widen it, before extending selfhost's general guard ownership checking.
 
+### Plain mutable callable parameter forwarding in selfhost
+
+- **Status:** incomplete native view lowering recorded on 2026-10-03 during Step 8d review.
+- **Rule:** CALLABLE-003 separates reusable exclusive environment access from ownership of newly
+  supplied arguments. Bootstrap keeps a source-written plain `mut fn` parameter as a callable
+  view: forwarding that parameter without `move` does not consume it. An exact affine closure
+  value or an authored constrained `F` argument still requires an explicit transfer.
+- **Compilers:** selfhost specializes plain callable parameters with exact environment types.
+  Bare forwarding of a direct plain mutable callable parameter reports `typed-form` at the
+  operand until retained environment reborrows are lowered. It does not diagnose that valid
+  source form as OWN0003 or make the environment Copy. This boundary does not exempt references,
+  constrained parameters, exact closure locals, explicit moves or staging from ownership rules.
+- **Evidence:** `plainCallableParameterForwardedMutableViewKeepsNamedGap` asserts the gap span;
+  `plainCallableParameterRejectsAffineArgumentCopies` retains the consuming controls. Bootstrap
+  evidence is the declared raw callable type and `Ownership.argumentConsumes` source path.
+- **Owner:** remaining Step 8d callable view and loan lowering, including escaping views.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
