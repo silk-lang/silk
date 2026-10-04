@@ -905,7 +905,7 @@ repeated invocation and capture-only drop glue.
   frontend but reaches SEM0219 when lowering the selected returned callable invocation. A generic
   stored-schema producer control is rejected with SEM0052 at its constrained `same` consumer even
   when both producers return the same original leaf. Native's source normalization is intended to
-  retain exact leaf identity there; its native assertions have not yet executed. No new acceptance
+  retain exact leaf identity there; that structured native control passed in the first isolated run. No new acceptance
   corpus program is added from these bootstrap-blocked reductions.
 - **Evidence:** `higherOrderCallableResultsKeepSelectedProducerAndLeafTargets`,
   `higherOrderCallableReturnsForwardOpenOriginsWithoutUnusedStorageDemands`,
