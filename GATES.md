@@ -17,7 +17,7 @@ claims, and historical receipts below are explicitly distinguished from final-he
 - [ ] G1: the stack contains current selfhost, the main-first corpus sync and the Step 6 cleanup foundation
       CHECK: git merge-base --is-ancestor origin/selfhost HEAD && git merge-base --is-ancestor 22de957e59470573c2bdea932392278219df139d HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
       EXPECT: prerequisite verification passed
-      EVIDENCE: merged layers throughselfhostfeb466e include Step6 cleanup; feature84b325e integrates currentselfhost51272082 including #756/#757 and main22de957e (#759). Final-head ancestry is rechecked before merge.
+      EVIDENCE: merged layers throughselfhostfeb466e include Step6 cleanup; the feature integrates selfhostba5abe4f9 including #756/#757/#760 and main22de957e (#759). Final-head ancestry is rechecked before merge.
 
 - [ ] G2: the full corpus has zero failures and reports the final PASS, unsupported, and track counts
       CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
@@ -58,4 +58,4 @@ claims, and historical receipts below are explicitly distinguished from final-he
       EVIDENCE: pending
 
 - [ ] G9: the final full corpus PASS set contains every exact baseline PASS and all newly pinned Step 7 programs
-      EVIDENCE: independent set comparison /private/tmp/step7-corpus-980ce3a13.log to /private/tmp/step7e-corpus-main-sync.log measured69→70 with lost[] and gained[generic-lifetime-selected-cleanup]. Final current-head CI must also retain any newer Step8 PASS; track membership alone does not prove the whole historical baseline.
+      EVIDENCE: independent set comparison /private/tmp/step7-corpus-980ce3a13.log to /private/tmp/step7e-corpus-main-sync.log measured69→70 with lost[] and gained[generic-lifetime-selected-cleanup]. Newer Step8 #760 receipts retain72PASS, adding borrowed-capture-section, relayed-section and constrained-section-generic-owner. Final current-head CI must preserve the union of these73 names; track membership alone does not prove the whole historical baseline.

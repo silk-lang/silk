@@ -176,16 +176,17 @@ Each entry records:
 
 ### Selfhost resolves complete selected instance recipes before emission sharing
 
-- **Status:** implemented on 2026-10-04; all60 focused generic controls executed successfully,
-  and independent full-change review round1 found no blocking source defects. Optimized-head
-  execution, subsequent review rounds and exact-head Linux CI remain acceptance gates.
+- **Status:** implemented on 2026-10-04. Execution, independent-review and exact-head Linux CI
+  acceptance receipts are published on PR #761; source implementation is not itself a CI receipt.
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
   cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
-  family alone is not emitted-code identity. The bootstrap currently compiles the reduced
+  family alone is not emitted-code identity. Generic named-section types likewise retain fixed
+  selected lifetimes and the remaining contract's free validity in exact equality, even when
+  their runtime projections agree; copied immutable schema handles remain equal. The bootstrap currently compiles the reduced
   conditional Drop fixture but its local-only execution traps; source inspection identifies a
   missing substituted impl-lifetime-bound check in conformance discovery. A fixed-lifetime local
   control succeeds alone but traps when both lifetimes reach one generic caller declaration.
