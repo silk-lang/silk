@@ -326,6 +326,24 @@ Each entry records:
   codes and pipe spans. Interface-operation and Effect pipeline coverage remain separate gaps.
 - **Source migration:** construct a unary section on the right, for example `2 |> add(3)`.
 
+### Generic named sections in selfhost
+
+- **Status:** direct invocation implemented in the Step 8 generic-section layer; broader admission
+  remains owned by #567 Step 8.
+- **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
+  result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
+  independently; immutable construction evidence keeps its original binder ordinal.
+- **Compilers:** selfhost retains contextual callable admission and further generic staging as
+  `typed-form` gaps, along with sections requiring deferred lifetime/row binders, enclosing scope
+  or static evidence. Bootstrap also rejects some closed contextual forwarding of a stored generic
+  section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
+  type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
+  [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
+  lanes remain named gaps rather than signature-mismatch diagnostics.
+- **Evidence:** `genericNamedSectionsInferEachInvocationIndependently` and
+  `genericNamedSectionsPreserveSparseSelectedOrdinals` assert ordinary direct instances for both
+  `i32` and `bool`, stored suffix operands, immutable metadata and capture-only layout.
+
 ### Reached Effect literals in selfhost
 
 - **Status:** deferred to #567 Step 9; named during the Step 8 corpus sweep on 2026-10-03.
@@ -579,3 +597,13 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
   `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
   body queries. Native runtime execution is not claimed by this typing test.
+
+### Native stored-section loans retain an explicit borrow obligation
+
+Step 8 retains each captured local reference's access and region in the exact section environment.
+Native `TypedBody.borrowStatus` remains `NotChecked`; general overlapping writes while a section
+holds that loan belong to roadmap Step 14. The bootstrap rejects those writes through its loan
+checker. The native availability pass diagnoses moved places and consumption during an assignment
+RHS; it does not claim to check outstanding loan conflicts. `genericNamedSectionsRetainMutableCaptureStorage`
+asserts retained exclusive local provenance and the explicit unchecked status, alongside direct
+repeated invocation and capture-only drop glue.
