@@ -126,15 +126,15 @@ Module-level `static if` arms belong to the containing module namespace (MODULE-
 syntax index records the innermost arm that admits each declaration and keeps conditional groups
 transparent to their members. A lookup demands each governing `Condition` query, so an inactive-only
 declaration is absent, never checked, and its imports are never read; a repeated import counts once
-among admitted candidates. A failed, non-`bool` or cyclic condition admits neither arm and fails
-every lookup it governs with its anchored rejection; a condition is a cycle member, so a condition
-that depends on its own arm is always `Cycle`. Interface scans for operator and method syntax skip
-names whose every candidate sits in an arm of a condition being evaluated, because unrelated
-declarations are not checked to determine a condition. Ceiling: an answer computed during that
-evaluation does not see an interface imported only by the condition's own arm. Package parameters
-inside an arm are rejected with `ConditionalParameter` (MODULE-STATIC-003). Static routing of mixed
-bodies reads only the syntax index, so a name with a conditional candidate there is the explicit
-`Unsupported` boundary `ConditionalName`.
+among admitted candidates. A failed, non-`bool` or cyclic condition fails every lookup and impl set
+it governs with its anchored rejection; a condition is a cycle member, so one that depends on its
+own arm is always `Cycle`. Every demand made while evaluating a condition is keyed by that
+condition, and inside that context interface scans for operator and method syntax skip names whose
+every candidate sits in the condition's own arms, because unrelated declarations are not checked to
+determine a condition. A package parameter written inside an arm is rejected by syntax with
+`ConditionalParameter` before any condition runs (MODULE-STATIC-003). Static routing of mixed bodies
+reads only the syntax index, so a name with a conditional candidate there is the explicit
+`Unsupported` boundary `ConditionalName`. See the compatibility entry for both limits.
 
 ## Design notes
 

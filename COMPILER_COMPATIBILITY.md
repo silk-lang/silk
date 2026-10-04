@@ -125,6 +125,38 @@ Each entry records:
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
+### Module static selection subset in selfhost
+
+- **Status:** implemented on 2026-10-04 on PR #773 (roadmap #567 Step 10b); verification is pending
+  that PR's exact-head CI.
+- **Rule:** declarations in module-level `static if` arms belong to the module namespace; only
+  selected arms exist, a failed or cyclic condition admits neither arm, and package parameters
+  cannot be conditional ([module static
+  selection](apps/docs/content/reference/module-static-selection.md), MODULE-STATIC-001 to 003).
+- **Compilers:** the bootstrap implements the complete rule. Selfhost selects arms for names,
+  imports, impl heads and inherent members through `Condition` queries, never reads an inactive
+  arm's imports, and rejects conditional package parameters by syntax. It does not yet select arms
+  inside mixed-body static routing, and it bounds interface scans during condition evaluation as
+  described below.
+- **Source migration:** none. Standard-library modules keep their module-level arms.
+- **Diagnostics and limits:** a non-`bool` condition is `ConditionNotBool` at the condition; a
+  condition that depends on its own arm is `Cycle`; a conditional package parameter is
+  `ConditionalParameter` at its declaration. Static routing of a mixed body (a function containing
+  `static if` or static parameters) reads only the syntax index, so naming a declaration that has
+  any conditional candidate there fails with fault `ConditionalName` and code `Unsupported` at the
+  name, even when an arm admits it. While a condition is evaluated, every demand is keyed by that
+  condition, and interface scans for operator and method syntax skip names whose every candidate
+  sits in that condition's own arms. Answers are therefore deterministic, but an operator or method
+  used by the condition or its helpers cannot be supplied by an interface that only the condition's
+  own arm imports or declares: the condition resolves as if that interface were absent instead of
+  reporting `Cycle`.
+- **Evidence:** in `compiler/src/semantic/SemanticCases.silk`, `moduleArmsSelectNativeDeclarations`,
+  `conditionOrderSelectNativeAnswers` (both demand orders in fresh stores) and
+  `mixedConditionalNameSelectNativeBoundary`.
+- **Open questions:** expose arm availability through the static port so mixed-body routing can
+  select arms, and decide whether the scan bound should instead report `Cycle` when a skipped
+  interface would apply.
+
 ### Selfhost rejects moves out of `match place` bindings
 
 - **Status:** implemented on 2026-10-03 with Step 6a.
