@@ -514,3 +514,8 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
   environment; callable argument failures preserve the operand span. Assert both retained regions
   and the operand span independently. Native formatter probes also require a selection inside the
   manifest source root; use a disposable source-root copy and remove it afterward. · Silk selfhost
+
+- 2026-10-04 · Step 8's application-kind comparison indexed a slice parameter separately inside
+  borrowed union match arms, producing a non-dominating 16-byte LLVM spill even in a release build.
+  A three-variant standalone probe reproduced the exact CI instruction numbers. Inspect each
+  argument's kind before branching instead of indexing inside nested match arms. · Silk selfhost
