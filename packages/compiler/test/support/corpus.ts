@@ -9811,6 +9811,32 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 0 },
   },
   {
+    name: 'native-descriptor-write',
+    source: 'pub fn main() -> i32 { return 42 }',
+    nativeSource: `import silk.native_descriptor { write }
+import silk.pointer { Pointer }
+import silk.isize
+
+fn emitTail(message: &[u8], offset: usize) -> i32 {
+  let mut transferred: isize = 0
+  unsafe {
+    let base = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(message))
+    let next = Pointer.assumeMany<u8>(Pointer.at<u8>(base, offset))
+    transferred = write(1, next, message.length - offset)
+  }
+  if transferred < 0 { return 1 }
+  if isize.toUsize(transferred) != message.length - offset { return 2 }
+  return 42
+}
+
+pub fn main() -> i32 {
+  let message: [u8; 3] = [104, 105, 10]
+  return emitTail(&message, 1)
+}`,
+    nativeStdout: 'i\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'secure-random-provider',
     source: deterministicSecureRandom,
     nativeSource: nativeSecureRandom,

@@ -796,8 +796,9 @@ repeated invocation and capture-only drop glue.
   It never gains Shared permission merely because hidden storage supports reusable calls.
   Bootstrap currently accepts a reached generic `same<F>` call supplied with callable results
   from different original targets when their public contracts agree. Native preserves the
-  approved exact representation identity and rejects that inference with SEM0052 at the call;
-  equal contracts cannot select one direct target for two different environments. The reduced
+  approved exact representation identity and rejects the second argument with `RejectionCode.TypeMismatch` at
+  `other()`: unconstrained `F` has already been inferred from the first argument. Equal contracts
+  cannot select one direct target for two different environments. The reduced
   bootstrap control builds successfully, so this rejection is an intentional divergence.
 - **Ownership:** returned affine values retain the existing explicit-transfer diagnostics and
   consumed places. Shared source promises may copy; weaker Once promises consume at their source
