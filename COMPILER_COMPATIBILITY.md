@@ -698,6 +698,39 @@ repeated invocation and capture-only drop glue.
   inherent values, applied-owner selections, empty construction, unsafe invocation and foreign
   callback/visibility diagnostics.
 
+### Native direct opaque callable results retain exact environments
+
+- **Status:** source implementation recorded on 2026-10-04; native assertions and exact-head CI
+  remain pending. Plain callable result contracts remain separate required Step 8 work.
+- **Rule:** each complete ordinary producer application establishes one finite exact returned
+  environment. Only its own return boundary may establish its opaque family; callers retain the
+  authored contract and family identity. Runtime projection does not mutate semantic proof keys.
+- **Ownership:** affine return operands use the existing consuming-place rules. Bare owners
+  require `move` (OWN0003), borrowed extraction rejects as OWN0012, and expression match arms
+  retain their own consumed places. Moving a computed match does not make its arms copyable.
+  Operands that never complete establish no extra outer construction.
+- **Compilers:** native gathers reachable return operands before solving forwarding components,
+  then validates physical capture and substituted nominal-field edges before publishing storage.
+  Divergence, leafless forwarding cycles, inline capture cycles and missing evidence use the
+  existing SEM0113, SEM0114, SEM0115 and SEM0117 families at the complete opaque result. Invalid
+  offered callable contracts use SEM0129 at the returned construction. Native retains the first
+  returned construction as the related divergence site; its current single-rejection model does
+  not aggregate bootstrap's multiple return sites or simultaneous realization diagnostics.
+  Discovery that exceeds the existing finite node bound stays unsupported, without claiming
+  an infinite specialization proof. Effect contracts retain their named Step 9 gap.
+- **Remaining Step 8 scope:** contextual opaque slots inside aggregate results and projected
+  structural-union tags stay explicitly unsupported, rather than inventing leaf evidence from
+  nullary variants or emitting an uninjected value. Descriptor or phantom-metadata recursion may
+  also retain the explicit projection gap after physical inline validation; it is not reported
+  as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof and
+  ordinary callable result provenance remain required work.
+- **Evidence:** `opaqueCallableReturnsRealizeOriginalSectionStorage`,
+  `opaqueCallableReturnsRejectDivergenceAndLeaflessCycles`,
+  `opaqueCallableReturnsRequireAffineTransfers` and
+  `callableReturnFlowExcludesMembersWithExitingGuards` assert storage, original-target invocation,
+  unreachable evidence exclusion, guard transfer and primary/related diagnostic spans.
+- **Source migration:** none.
+
 ### Native generic captures retain finite local contents obligations
 
 - **Status:** owned generic captures admitted for finite body use in Step 8; public escape remains
