@@ -10,9 +10,9 @@ Scope: pin every corpus program newly enabled by Step 7, replace generic first-b
       EVIDENCE: pending revalidation after combined review
 
 - [ ] G1: the stack contains current selfhost, the main-first corpus sync and the Step 6 cleanup foundation
-      CHECK: git merge-base --is-ancestor de384cd5acb84632bd5d6920372ab0d8cb545fc1 HEAD && git merge-base --is-ancestor 23eb6fc956af3154df2391cfaade34a1da4e8738 HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+      CHECK: git merge-base --is-ancestor 47aa3c636ef2d40016d5ef723b49f56c0d9486bc HEAD && git merge-base --is-ancestor 23eb6fc956af3154df2391cfaade34a1da4e8738 HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
       EXPECT: prerequisite verification passed
-      EVIDENCE: refreshed stack633587773 contains selfhost de384cd5a (#752/#753) plus main23eb6fc95 through sync8afde12b8; final prerequisite verification remains required
+      EVIDENCE: integrated stack27f256769 contains selfhost47aa3c636 (#752/#753/#754) plus main23eb6fc95 through sync0e9850460; final prerequisite verification remains required
 
 - [ ] G2: the full corpus has zero failures and reports the final PASS, unsupported, and track counts
       CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
