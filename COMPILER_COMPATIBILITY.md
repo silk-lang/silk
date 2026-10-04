@@ -19,10 +19,10 @@ diagnosis, and it may be a real bug.
 
 ## The two compilers
 
-| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                     |
-| ------------------------------ | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section). |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports.                |
+| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -173,6 +173,43 @@ Each entry records:
 - **Evidence:** `genericSealedCopyUsesLexicalAndLifetimePremises`,
   `genericSealedDropRetainsExactHeadBindings` and `genericSealedUnknownDropProofIsNotAbsence` in
   `compiler/src/semantic/SemanticCases.silk`.
+
+### Selfhost checks lifetime-sensitive erased instance recipes before emission reuse
+
+- **Status:** correction in progress on 2026-10-04 after combined Step 7 review; native
+  execution and exact-head CI are not yet verified.
+- **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
+  cleanup. MIR remains layout-free, and emitted instance keys use the canonical runtime form
+  described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
+- **Compilers:** the bootstrap can compile lifetime-sensitive conditional Drop implementations.
+  Selfhost must resolve every exact semantic glue and function application before deciding
+  whether its erased runtime symbol can be shared. Equal emitted recipes may share; incompatible
+  recipes report `instance-recipe`, never silently reuse the first application's cleanup.
+- **Source migration:** none. This is a native emitted-instance follow-up, not an Option/Result
+  exception or an effect/closure deferral.
+- **Evidence:** review counterexample: `Guard<'a>` always owns a droppable `Token`, but its own
+  `impl<'a: 'static> Drop` hook applies to a static instance and not a local one. Both demand
+  orders and an equal-recipe sharing control are being added; native results remain pending.
+- **Open questions:** canonical runtime recipe identity must support incompatible lifetime-
+  sensitive instances before the native compiler can accept that broader conditional subset.
+
+### Selfhost generic aggregate diagnostics retain existing family differences
+
+- **Status:** recorded on 2026-10-04 with Step 7 review corrections; native test execution is
+  pending.
+- **Rule:** written constructor prefixes are fixed evidence, only omitted parameters may be
+  inferred, record patterns must select the scrutinee's exact owner, and applied generic bounds
+  must follow lexical premises.
+- **Compilers:** bootstrap reports `SEM0025` for a fixed-prefix field type mismatch and `SEM0042`
+  for a different record owner in a pattern. The native frontend uses its existing `TypeMismatch`
+  family at the offending field operand and record pattern, respectively. An unresolved aggregate
+  parameter is anchored at its declaration. A missing abstract Copy proof remains `Unsupported`
+  at the constrained constructor, not a fabricated proof.
+- **Source migration:** none.
+- **Evidence:** `genericRecordConstructionPrefixesRemainFixedAndQualified`,
+  `genericRecordPatternsCheckAbstractlyBeforeCompleteMir` and
+  `genericNominalConstructionAndPatternsRetainLexicalBounds` contain independent code/span
+  controls; execution is not yet claimed.
 
 ### Selfhost does not reject moves inside match guards at typing
 
