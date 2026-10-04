@@ -731,6 +731,25 @@ repeated invocation and capture-only drop glue.
   unreachable evidence exclusion, guard transfer and primary/related diagnostic spans.
 - **Source migration:** none.
 
+### Native callable captures retain loans of owned environments
+
+- **Status:** source repair recorded on 2026-10-04; native assertions and exact-head CI pending.
+- **Rule:** an exact closure, section, staged callable or opaque returned callable owns its stored
+  environment. Shared and mutable capture access retain a reference to that owner. Copy captures
+  still take a Copy snapshot, and moved captures still transfer the environment explicitly.
+- **Compilers:** native no longer classifies exact callable representations as borrowed descriptors
+  when constructing an anonymous environment. The capture field, construction operand and body
+  alias all retain the same loan. Reference/slice/string descriptors and source raw callable views
+  retain their existing descriptor handling; raw mutable parameter view lowering remains required
+  Step 8 work. Borrow checking obligations remain visible for Step 14.
+- **Evidence:** `anonymousBorrowedCallableCapturesRetainOneCleanupOwner` checks a shared capture of
+  an owned once callable: a reference field, original-place construction borrow, dereferenced body
+  alias, one caller cleanup owner and cleanup-free outer capture glue. Bootstrap analysis accepts
+  the fixture with no diagnostics; bootstrap executable lowering retains its pre-existing SEM0219
+  gap for the plain callable-reference parameter. A stale native CLI probe establishes that this
+  fixture reaches native lowering, without claiming the repaired head's behavior.
+- **Source migration:** none.
+
 ### Native generic captures retain finite local contents obligations
 
 - **Status:** owned generic captures admitted for finite body use in Step 8; public escape remains
