@@ -501,3 +501,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · A clean upstream test merge still projected gap.span after source-preserving diagnostics made it a bound operation, failing SEM0026 before any assertions · Audit nonconflicting imported helpers against the owning Gap API and use BackendGap.span(gap) · selfhost Step 7 integration
 
 - 2026-10-04 · A formatter-shifted CI stack line was attributed to the preceding combined assertion, wasting native-call diagnosis effort · Inspect numbered lines in an exact native-formatted copy before assigning the failure; line 35511 was the later loan-conflict oracle · selfhost Step 8d
+
+- 2026-10-04 · A generic Shared.with call directly after move in an if-let condition parsed its type arguments as comparison operators · Bind the generic call result first, then match the owned local · selfhost Step 8d generic staging
