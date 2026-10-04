@@ -887,7 +887,9 @@ repeated invocation and capture-only drop glue.
 
 ### Native higher-order callable result selection
 
-- **Status:** implemented; bootstrap source checking passes, native assertions and exact-head CI pending.
+- **Status:** implemented; bootstrap source checking passes. The first isolated native run
+  executed ten assertions (seven PASS, three FAIL); corrected oracles and completed-schema
+  canonicalization await exact-head CI.
 - **Rule:** a checked invocation through an abstract callable retains its producer, public result
   contract, argument type evidence and selected invocation values/ordinals. This source recipe is
   resolved after substitution to the original returned environment before exact consumer inference.

@@ -531,3 +531,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-10-04 · Adding ten higher-order callable tests exhausted the 8 GiB Linux bootstrap heap while compiling SemanticCases, before assertion execution · Keep the callable-result tests in their own source root and run its unchanged assertions with the same Linux timing gate · Silk selfhost Step 8
 - 2026-10-04 · After Step 9b merged, the "Run M1 semantic cases" bootstrap compile of SemanticCases ran out of the 8192 MiB Node heap on every PR stacked above selfhost (9c, #775) while selfhost itself still passed · Raised that one step to 10240 MiB; measure peak live heap with --trace-gc before raising again and prefer splitting the SemanticCases root · selfhost CI
+
+- 2026-10-04 · Higher-order MIR assertions assumed source-ordered references and a move directly from a parameter; references are hash-sorted and move lowering introduces temporaries · Select by original producer identity and trace preceding unprojected Use assignments while retaining the final Move and cleanup claims · compiler

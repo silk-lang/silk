@@ -117,8 +117,9 @@ Abstract higher-order producer results remain required Step 8 verification: a co
 as `P: fn<'static>() -> fn<'static>(i32) -> i32` must retain the selected producer's exact returned
 environment after monomorphization. The higher-order layer now retains checked source selection
 recipes, normalizes closed results before exact consumer inference, and adds selected-lifetime,
-mutable-view and staged-schema controls. Bootstrap source checking passes; native MIR assertions
-and exact-head CI remain pending. Absence of an existing corpus first-gap witness does not remove it from scope.
+mutable-view and staged-schema controls. Bootstrap source checking passes. Isolated native CI executed all ten cases: seven PASS and
+three FAIL. Review identified two oracle errors (hashed reference order and temporary move
+transport) and completed-stage canonicalization; their repair awaits exact-head native CI. Absence of an existing corpus first-gap witness does not remove it from scope.
 Interface producer projections and recursive/divergent plain return origins also retain explicit
 Unsupported boundaries; they are not claimed PASS. Contextual opaque
 slots inside aggregate results and unresolved descriptor/phantom projection likewise retain explicit
