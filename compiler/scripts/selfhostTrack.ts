@@ -51,4 +51,8 @@ export const selfhostTrack = [
   'scalar-member-unions',
   'nominal-union-operator-provider',
   'pattern-conditionals-and-destructuring',
+  'anonymous-callable-capture-modes',
+  'captured-exclusive-reference-parameters',
+  'staged-callable-bindings',
+  'staged-callable-parameter',
 ] as const satisfies ReadonlyArray<string>
