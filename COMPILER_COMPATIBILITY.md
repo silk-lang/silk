@@ -671,6 +671,10 @@ repeated invocation and capture-only drop glue.
 - **Rule:** each complete ordinary producer application establishes one finite exact returned
   environment. Only its own return boundary may establish its opaque family; callers retain the
   authored contract and family identity. Runtime projection does not mutate semantic proof keys.
+- **Ownership:** affine return operands use the existing consuming-place rules. Bare owners
+  require `move` (OWN0003), borrowed extraction rejects as OWN0012, and expression match arms
+  retain their own consumed places. Moving a computed match does not make its arms copyable.
+  Operands that never complete establish no extra outer construction.
 - **Compilers:** native gathers reachable return operands before solving forwarding components,
   then validates physical capture and substituted nominal-field edges before publishing storage.
   Divergence, leafless forwarding cycles, inline capture cycles and missing evidence use the
@@ -687,7 +691,8 @@ repeated invocation and capture-only drop glue.
   as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof and
   ordinary callable result provenance remain required work.
 - **Evidence:** `opaqueCallableReturnsRealizeOriginalSectionStorage`,
-  `opaqueCallableReturnsRejectDivergenceAndLeaflessCycles` and
+  `opaqueCallableReturnsRejectDivergenceAndLeaflessCycles`,
+  `opaqueCallableReturnsRequireAffineTransfers` and
   `callableReturnFlowExcludesMembersWithExitingGuards` assert storage, original-target invocation,
   unreachable evidence exclusion, guard transfer and primary/related diagnostic spans.
 - **Source migration:** none.
