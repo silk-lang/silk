@@ -44,21 +44,22 @@ application and abstract body typing, method and eligible operator selection, an
 across held source revisions. A fresh per-request specialization Pool builds identities from those
 validated facts; cached Pool or instance answers are outside M2.3. See
 [compiler/README.md](compiler/README.md#semantic-scope-and-later-waves) and the reconciled M2
-coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped`
-body still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This
-does not claim borrow checking or general executable support. The selfhost build CLI currently
-lowers closed scalar, reference, record and sequence forms through demanded MIR and LLVM text. It emits a
+coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped` body
+still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
+claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
+scalar, reference, record and sequence forms through demanded MIR and LLVM text. It emits a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
 remain a named `intrinsic-member` gap. A repeated inferred shared-slice lifetime with distinct
 actual Local regions of the same caller requires the deferred common-validity proof and reports
 `slice-region-relation`; this does not admit fixed Static, incompatible access/element, or foreign
-owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate
-raw pointer weakening removes mutation capability and adds nullability, preserving invariant
+owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate raw
+pointer weakening removes mutation capability and adds nullability, preserving invariant
 pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
-covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup checking remains step 14. The TypeScript bootstrap
-still builds the native compiler and remains the complete language oracle.
+covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
+checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
+complete language oracle.
 
 ## Entry format
 

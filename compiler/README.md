@@ -99,19 +99,28 @@ A reached sealed runtime primitive that the canonical intrinsic catalog defines 
 not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains the exact runtime
 and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
 An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
-Selfhost implements `isizeToUsize` and the raw-pointer primitives `pointerFromSlice`, `pointerAt`,
-`pointerRead` and `pointerRequalify`, instantiated from their written type arguments. The unsafe
-members need an `unsafe` boundary or call acknowledgement; requalification keeps one invariant
-pointee, and a read requires a `Copy` pointee. A foreign declaration may narrow capture with one
-`Intrinsic.foreign(noCapture: (...))` field naming distinct written raw-pointer parameters; the
-hint creates no loan and lowering may omit it. Other foreign properties remain `foreign-contract`
-gaps.
+Selfhost implements `isizeToUsize`, which traps on a negative value (CONV-002), and the raw-pointer
+primitives `pointerFromSlice`, `pointerAt`, `pointerRead` and `pointerRequalify`, instantiated from
+their written type arguments. The unsafe members need an `unsafe` boundary or call acknowledgement;
+pointer arguments take the ordinary immediate weakening, `pointerFromSlice` takes a shared slice,
+requalification keeps one invariant pointee, and a read requires a `Copy` pointee. A foreign
+declaration may narrow capture with one `Intrinsic.foreign(noCapture: (...))` field naming distinct
+written raw-pointer parameters; the hint creates no loan and lowering may omit it. Other foreign
+properties remain `foreign-contract` gaps.
 
-Module-level `static if` arms belong to the containing module namespace (MODULE-STATIC-001/002).
-The syntax index records the innermost arm that admits each declaration and keeps conditional
-groups transparent to their members. A lookup demands each governing condition as a `Condition`
-query, so an inactive-only declaration is absent and never checked. A failed or non-`bool`
-condition admits neither arm and keeps its anchored rejection.
+Module-level `static if` arms belong to the containing module namespace (MODULE-STATIC-001/002). The
+syntax index records the innermost arm that admits each declaration and keeps conditional groups
+transparent to their members. A lookup demands each governing `Condition` query, so an inactive-only
+declaration is absent, never checked, and its imports are never read; a repeated import counts once
+among admitted candidates. A failed, non-`bool` or cyclic condition admits neither arm and fails
+every lookup it governs with its anchored rejection; a condition is a cycle member, so a condition
+that depends on its own arm is always `Cycle`. Interface scans for operator and method syntax skip
+names whose every candidate sits in an arm of a condition being evaluated, because unrelated
+declarations are not checked to determine a condition. Ceiling: an answer computed during that
+evaluation does not see an interface imported only by the condition's own arm. Package parameters
+inside an arm are rejected with `ConditionalParameter` (MODULE-STATIC-003). Static routing of mixed
+bodies reads only the syntax index, so a name with a conditional candidate there is the explicit
+`Unsupported` boundary `ConditionalName`.
 
 ## Design notes
 
