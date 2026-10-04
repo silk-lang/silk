@@ -956,13 +956,16 @@ repeated invocation and capture-only drop glue.
 
 ### Finite recursive native callable origins
 
-- **Status:** implemented in a draft Step 8 layer; bootstrap source checking passes, native
-  assertions and exact-head CI remain pending. This is not a PASS claim.
+- **Status:** implemented in a draft Step 8 layer. The latest native run passed seventeen controls
+  and failed two; nested generic inference and the inherited staged suffix are repaired for the
+  next head. Native correctness, reduced fixture timings and the exact-head gate remain pending.
 - **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
   return operands provide environment equations; other checked expressions retain validation
   dependencies. Source recipes normalize before exact inference, and every selected producer
   plus its ordinary symbolic owner schema receives strict body replay before publication.
   Canonicalization preserves the immutable original request and all converging source evidence.
+  Draft argument comparison examines earlier inferred assignments before locating a pending
+  recipe; that temporary comparison cannot bypass the final exact replay.
 - **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
   invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
   projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
