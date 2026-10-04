@@ -55,9 +55,9 @@ remain a named `intrinsic-member` gap. A repeated inferred shared-slice lifetime
 actual Local regions of the same caller requires the deferred common-validity proof and reports
 `slice-region-relation`; this does not admit fixed Static, incompatible access/element, or foreign
 owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate
-raw pointer mutation-capability weakening preserves invariant pointee/extent and identical other
-qualifiers; it does not implement reverse access, nested pointee covariance, or other qualifier
-conversions. Ownership, lifetime, and cleanup checking remains step 14. The TypeScript bootstrap
+raw pointer weakening removes mutation capability and adds nullability, preserving invariant
+pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
+covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup checking remains step 14. The TypeScript bootstrap
 still builds the native compiler and remains the complete language oracle.
 
 ## Entry format
@@ -84,8 +84,9 @@ Each entry records:
   A misspelled member is an error; a catalog-defined runtime or mixed-phase member that selfhost
   has not implemented is an explicit `intrinsic-member` build gap.
 - **Compilers:** the bootstrap catalog defines the complete membership and phase metadata.
-  Selfhost implements only its existing target/static-text subset; the new membership check adds
-  no runtime primitive, contract validation, evaluation, or lowering.
+  Selfhost implements its target/static-text subset, the scalar `i32`/`bool`/float-bit
+  primitives, `isizeToUsize`, and the raw-pointer primitives `pointerFromSlice`, `pointerAt`,
+  `pointerRead` and `pointerRequalify`; the membership check itself adds no primitive.
 - **Source migration:** none. Keep ordinary standard-library wrappers in Silk source rather than
   adding privileged library actors or substituting unsupported runtime implementations.
 - **Diagnostics and limits:** the semantic lane retains `IntrinsicUnavailable` at the authored

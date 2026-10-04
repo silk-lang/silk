@@ -519,3 +519,6 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
   borrowed union match arms, producing a non-dominating 16-byte LLVM spill even in a release build.
   A three-variant standalone probe reproduced the exact CI instruction numbers. Inspect each
   argument's kind before branching instead of indexing inside nested match arms. · Silk selfhost
+- 2026-10-04 · A baseline native-compiler build was queued from the same worktree being edited, so it would have built the modified sources rather than the baseline · Build baselines from a separate detached worktree at the base commit · selfhost Step 10b
+- 2026-10-04 · `match arm {` on an `&Option<T>` parameter failed SEM0044/SEM0042 in the bootstrap · Match the referent explicitly with `match & arm.* {`, as the rest of the compiler does · selfhost Step 10b
+- 2026-10-04 · Two focused selfhost tests needed two full SemanticCases builds because `--filter` takes one literal substring · Give tests of one slice a shared distinctive name token and filter on it once · selfhost Step 10b

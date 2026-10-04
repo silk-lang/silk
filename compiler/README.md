@@ -99,6 +99,19 @@ A reached sealed runtime primitive that the canonical intrinsic catalog defines 
 not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains the exact runtime
 and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
 An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
+Selfhost implements `isizeToUsize` and the raw-pointer primitives `pointerFromSlice`, `pointerAt`,
+`pointerRead` and `pointerRequalify`, instantiated from their written type arguments. The unsafe
+members need an `unsafe` boundary or call acknowledgement; requalification keeps one invariant
+pointee, and a read requires a `Copy` pointee. A foreign declaration may narrow capture with one
+`Intrinsic.foreign(noCapture: (...))` field naming distinct written raw-pointer parameters; the
+hint creates no loan and lowering may omit it. Other foreign properties remain `foreign-contract`
+gaps.
+
+Module-level `static if` arms belong to the containing module namespace (MODULE-STATIC-001/002).
+The syntax index records the innermost arm that admits each declaration and keeps conditional
+groups transparent to their members. A lookup demands each governing condition as a `Condition`
+query, so an inactive-only declaration is absent and never checked. A failed or non-`bool`
+condition admits neither arm and keeps its anchored rejection.
 
 ## Design notes
 
