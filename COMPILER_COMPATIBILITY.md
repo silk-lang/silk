@@ -19,10 +19,10 @@ diagnosis, and it may be a real bug.
 
 ## The two compilers
 
-| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                     |
-| ------------------------------ | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section). |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports.                |
+| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -147,7 +147,7 @@ Each entry records:
   between joining paths or that is moved on only some paths, a write at a runtime index beside a
   moved element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for callable and Effect environments, generic nominal unions and unions without a
+  drop glue for Effect environments, generic nominal unions and unions without a
   canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
@@ -399,8 +399,7 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 
 ### Native anonymous bodies retain nested lexical captures
 
-- **Status:** intentional native typing support in #567 Step 8b, 2026-10-03; native environment
-  construction and direct invocation follow in Step 8c.
+- **Status:** intentional native support in #567 Steps 8b and 8c, 2026-10-03.
 - **Rule:** every non-effect anonymous literal is its own function declaration and stores its
   ordered captures in an exact environment (functions-callables.md, CAPTURE-001;
   compiler/docs/mir-core-shape.md §7). A nested literal captures the lexical values visible in its
@@ -408,8 +407,8 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Compilers:** the bootstrap rejects an anonymous literal inside another anonymous body with
   SEM0199 because its transitive capture lifting is unimplemented. Native typing keeps both
   declaration identities, checked bodies, and capture fields. This follows the approved ordinary
-  declaration/environment design; it introduces no implicit box, code pointer, or adapter. Until
-  Step 8c supplies lowering, reaching construction still reports `typed-form`.
+  declaration/environment design; it introduces no implicit box, code pointer, or adapter. Native
+  lowering constructs those environments and directly invokes their ordinary function instances.
 - **Source migration:** none.
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
   `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production

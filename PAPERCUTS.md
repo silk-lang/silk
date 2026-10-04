@@ -461,3 +461,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · Boolean literal patterns in a new MIR helper were rejected by the bootstrap parser, failing draft CI before compiler construction · Use `if`/`else` to select boolean-dependent operand transport · self-hosted compiler Step 8d
 
 - 2026-10-03 · Staged-callable helpers used `let value = if ...`, producing parser and downstream type errors because Silk conditionals are statements · Initialize an owned result and assign it in each conditional branch; use a named callback instead of nesting anonymous callbacks in bootstrap-built source · self-hosted compiler Step 8d
+
+- 2026-10-03 · A repeated text marker put callable signature reification in the implementation-head resolver and failed the bootstrap build · Anchor edits inside the owning function and inspect the full diff before the focused run · self-hosted compiler
+
+- 2026-10-03 · Formatting the large semantic roots rewrote tens of thousands of unrelated lines · Preserve the focused source patch before formatting; use canonical byte comparison to verify a reduced diff retains the checked program · self-hosted compiler
