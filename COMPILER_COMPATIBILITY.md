@@ -806,10 +806,16 @@ repeated invocation and capture-only drop glue.
   is checked before body demands, including cached-body edges. The depth bound spans conditional
   context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
 - **Remaining Step 8 scope:** recursive origin cycles, divergent plain origins, callable-valued
-  results reached through higher-order, inherent or interface invocation, and retained mutable
-  callable parameter loans remain explicit gaps. This layer does not mark Step 8 complete.
+  results reached through abstract or invocation-selected higher-order targets and interface
+  invocation, and retained mutable callable parameter loans remain explicit gaps. Fully selected
+  stored producer values and inherent receiver methods use the same original-result query and
+  runtime ABI projection as direct producers. This layer does not mark Step 8 complete.
 - **Evidence:** `plainCallableReturnsKeepOriginalStorageAndPublicContracts`,
   `plainCallableOriginsUnifyAcrossProducers`, `plainCallableViewsKeepWeakerInvocationPermissions`
   and `plainCallableViewStagingRetainsPublicModeAndArgumentOrder` inspect original storage,
   complete relay applications, exact identity, public permission rejection and direct suffix order.
+  `plainCallableResultsFromStoredProducersAndMethodsUseOriginalTargets` covers fully selected
+  stored and inherent producer calls. `plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce`
+  checks producer/caller transfer, a moved stored-field operand, target cleanup, abandonment glue
+  and OWN0003 at a bare returned affine owner. Native execution of these assertions is pending.
 - **Source migration:** none.
