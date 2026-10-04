@@ -204,21 +204,29 @@ chmod +x "$output"`
 })
 
 it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
-  const record = 'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'
+  const record =
+    'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34},"module":"main.silk"}'
   withStub(`echo '${record}' >&2; exit 1`, (silkc) => {
     const result = runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
     if (result.status !== 'fail') throw new Error('expected rejection')
     assert.strictEqual(result.code, 'UnknownName')
     assert.deepStrictEqual(result.span, { start: 28, end: 34 })
+    assert.strictEqual(result.module, 'main.silk')
     assert.deepStrictEqual(summarize([result], []).failureCounts, [
       { code: 'UnknownName', count: 1 },
     ])
   })
   assert.strictEqual(parseBuildDiagnostic(`${record}\n${record}`), undefined)
   assert.strictEqual(
-    parseBuildDiagnostic('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28}}'),
+    parseBuildDiagnostic(
+      'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28},"module":"main.silk"}',
+    ),
     undefined,
   )
   assert.strictEqual(parseBuildDiagnostic('SILK_BUILD_ERROR=semantic-rejection'), undefined)
+  assert.strictEqual(
+    parseBuildDiagnostic('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'),
+    undefined,
+  )
 })

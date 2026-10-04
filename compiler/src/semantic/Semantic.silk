@@ -210,6 +210,7 @@ import semantic.TypedBody {
   InterfaceCallInputs,
   CallableCallInputs,
   CallArgument,
+  RunOperand,
   Local as BodyLocal,
   LocalId as BodyLocalId,
   Node as BodyNode,
@@ -20397,6 +20398,15 @@ effect fn callableBinders(
   return Result.succeed<Vector<Binder>, Shared<Rejection>>(move callable)
 }
 
+fn laterTypeBinder(formal: &[Binder], from: usize) -> bool {
+  let mut at = from
+  while at < formal.length {
+    if binderKind(&formal[at]) == GenericKind.Type { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // Resolves the written generic argument at `at` against its formal binder and appends it.
 effect fn appendWrittenArgument(
   resolver: &mut Resolver,
@@ -20664,6 +20674,17 @@ effect fn resolveCallPrefix(
     }
     let mut at = usize.ZERO
     while at < arguments.length {
+      // Written type arguments may skip omitted lifetime binders (generics reference, "Generic
+      // declarations and applications"); a call's explicit prefix cannot leave those slots open
+      // yet, so that form is a named deferral rather than a kind error.
+      if binderKind(&formal[at]) == GenericKind.Lifetime && laterTypeBinder(formal, at) {
+        let supplied = run suppliedArgument(&mut resolver.*, caller, arguments, at, value.span)
+        if supplied.kind != GenericKind.Lifetime {
+          return Result.failResult<Vector<Argument>, Shared<Rejection>>(
+            run reject(&resolver.*, caller, RejectionCode.Unsupported, supplied.span),
+          )
+        }
+      }
       let failure = run appendWrittenArgument(
         &mut resolver.*, &mut owner.*, &mut dependencies.*, callerOrdinal, caller, arguments,
         formal, at, at, scope, &mut elision, &mut explicit,
@@ -21279,6 +21300,7 @@ effect fn callFunctionTarget(
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   let variadic = run foreignCallVariadic(&mut resolver.*, targetModule, target.ordinal, foreign)
+  // A C function has no Silk callable representation (bootstrap SEM0189).
   if bareValue && foreign {
     return Result.failResult<ResolvedTarget, Shared<Rejection>>(
       run reject(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span),
@@ -24553,10 +24575,17 @@ effect fn callableArgumentFailure(
   if !inferredRepresentation || unavailableRejection(code) {
     return Shared.clone<Rejection>(failure)
   }
+  let contract = run valueCallableContract(source, constraints)
   if sourceInference {
+    // Inferring a callable bound from a value whose result is an Effect (an `effect fn` value)
+    // needs Effect environment and run-mode inference; that remains the named effect-form gap.
+    if let Option<Shared<Type>>.Some {value: offered} = &contract {
+      if Shared.with<Type, bool>(&offered, effectProducing) {
+        return run reject(resolver, module, RejectionCode.EffectFormUnavailable, callSpan)
+      }
+    }
     return run reject(resolver, module, RejectionCode.TypeArgumentInference, callSpan)
   }
-  let contract = run valueCallableContract(source, constraints)
   if let Option<Shared<Type>>.Some {..} = move contract {
     return run reject(resolver, module, RejectionCode.IncompatibleCallableSignature, span)
   }
@@ -28174,7 +28203,7 @@ effect fn currentBodyEffect(resolver: &Resolver) -> BodyEffect ! OutOfMemoryErro
 }
 
 // `run` executes one Effect layer. Its residual failures and requirements must fit the enclosing
-// body's channels (EFF-003, EFF-006, FAIL-003). A written call is checked as an immediate run.
+// body's channels (EFF-003, EFF-006, FAIL-003).
 effect fn checkRun<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
@@ -28184,17 +28213,10 @@ effect fn checkRun<'scope>(
   unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  let written = run bodyNode(&resolver.source, cursor, operand)
-  let checked = match move CallInput.ofNode(written) {
-    Option<CallInput>.Some {value: input} => run checkInvocation(&mut resolver.*, &mut owner.*, &mut request.*,
-      &mut dependencies.*, module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*,
-      &mut requiredBodies.*, operand, input, &Option.none<Shared<Type>>(), constraints, contractBody, false,
-      unsafeAllowed, false, false, true)
-    Option<CallInput>.None => run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
-      module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-      operand, &Option.none<Shared<Type>>(), constraints, contractBody, false, unsafeAllowed)
-  }
-  let value = match move checked {
+  let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+    module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
+    operand, &Option.none<Shared<Type>>(), constraints, contractBody, false, unsafeAllowed)
+  let mut value = match move checked {
     Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => node
     Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
   }
@@ -28207,6 +28229,33 @@ effect fn checkRun<'scope>(
     Option<EffectChannels>.Some {value: selected} => selected
     Option<EffectChannels>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.RunNonEffect, operandSpan) }
   }
+  // A stored Effect is run with the access its contract grants: a once Effect is consumed and an
+  // exclusive one needs a mutable place, as a callable invocation is (CALLABLE-002).
+  // The operand is the call to run only when it calls an `effect fn` (its result is that call's
+  // own construction) or invokes an `effect fn` value; any other call produced a stored Effect.
+  let immediate = immediateOperand(Vector.asSlice<BodyNode>(&nodes.*), value)
+  if !immediate {
+    let mut mode = CallableMode.Once
+    let runContract = run valueCallableContract(&operandType, constraints)
+    if let Option<Shared<Type>>.Some {value: contract} = move runContract {
+      mode = Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
+    }
+    if mode == CallableMode.Mutable && checkedPlace(Vector.asSlice<BodyNode>(&nodes.*), value) &&
+      !mutablePlace(Vector.asSlice<BodyNode>(&nodes.*), Vector.asSlice<BodyLocal>(&statementScope.locals.*), value) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.InvalidCallableInvocationAccess, operandSpan)
+    }
+    if mode == CallableMode.Once && !movedBodyValue(Vector.asSlice<BodyNode>(&nodes.*), value) {
+      let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
+        Vector.asSlice<BodyNode>(&nodes.*), value, false, false, operandSpan, operandSpan, constraints) {
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Success {value: place} => move place
+        Result<Option<BodyConsumedPlace>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
+      let moved = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+      run Vector.append<BodyNode>(&mut nodes.*, BodyNode {origin: BodyOrigin {syntax: operand, span: operandSpan},
+        kind: BodyNodeKind.Expression {ty: Shared.clone<Type>(&operandType), form: BodyExpression.Move {value: value, consumed: move consumed}}})
+      value = moved
+    }
+  }
   let enclosing = run currentBodyEffect(&resolver.*)
   if !run Type.coversFailure(&enclosing.failure, &channels.failure) {
     return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledFailure, span)
@@ -28216,7 +28265,36 @@ effect fn checkRun<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledRequirement, span)
   }
   return run finishExpression(&mut resolver.*, module, &mut nodes.*, expression, span, move channels.success,
-    BodyExpression.Run {value: value}, false, expected, contractBody, false)
+    BodyExpression.Run {value: value, immediate: immediate}, false, expected, contractBody, false)
+}
+
+fn immediateOperand(nodes: &[BodyNode], value: BodyNodeId) -> bool {
+  if let BodyNodeKind.Expression {form, ty} = &nodes[value.index].kind {
+    if let BodyExpression.DirectCall {declaration, ..} = &form {
+      return Shared.with<Type, bool>(&ty, fn(result: &Type) -> bool { return constructs(result, &declaration) })
+    }
+    if let BodyExpression.CallableCall {..} = &form { return Shared.with<Type, bool>(&ty, bareEffect) }
+  }
+  return false
+}
+
+// Whether `result` is the exact Effect constructed by calling `declaration` itself.
+fn constructs(result: &Type, declaration: &DeclarationId) -> bool {
+  if let Type.CallableValue {application, contract, ..} = &result.* {
+    if !Shared.with<Type, bool>(&contract, bareEffect) { return false }
+    return Shared.with<Application, bool>(&application, fn(selected: &Application) -> bool {
+      return DeclarationId.equals(Application.bodyDeclaration(selected), declaration)
+    })
+  }
+  return false
+}
+
+fn effectProducing(value: &Type) -> bool {
+  return match &value.* { Type.Callable {result, ..} => Shared.with<Type, bool>(&result, bareEffect) _ => false }
+}
+
+fn bareEffect(value: &Type) -> bool {
+  return match &value.* { Type.Effect {..} => true _ => false }
 }
 
 effect fn checkExpression<'scope>(
@@ -28270,7 +28348,7 @@ effect fn checkExpression<'scope>(
   if let Option<CallInput>.Some {value: input} = move CallInput.ofNode(authored) {
     return run checkInvocation(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
       module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-      expression, input, expected, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged, false, false)
+      expression, input, expected, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged, false)
   }
   let namedValue = match authored {
     Node.IdentifierExpression {binding, ..} => !binding.present
@@ -28290,7 +28368,7 @@ effect fn checkExpression<'scope>(
           module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
           expression, CallInput {callee: expression, generics: HirRef.absent(),
             arguments: CallArguments.Written {range: Range.empty()}, pipeline: false},
-          expected, constraints, contractBody, false, unsafeAllowed, false, true, false)
+          expected, constraints, contractBody, false, unsafeAllowed, false, true)
       }
       Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value: Result<ResolvedTarget, Shared<Rejection>>.Failure {error}} => {
         let rejectedValue = Shared.with<Rejection, bool>(&error, fn(value: &Rejection) -> bool {
@@ -29532,9 +29610,105 @@ effect fn proveCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
       return Option.none<Shared<Rejection>>()
     }
   }
-  // Effect representation contracts belong to Step 9.
-  return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span),
+  let effectsBound = run effectBound(&sourceType, contract)
+  if let Option<EffectBound>.Some {value: effects} = move effectsBound {
+    return run proveEffectBound(&resolver.*, module, declared, &effects, span)
+  }
+  return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.IncompatibleCallableSignature, span),
   )
+}
+
+// One offered exact Effect contract and the use contract it must satisfy.
+struct EffectBound {
+  offered: EffectParts
+  wanted: EffectParts
+}
+
+struct EffectParts {
+  mode: CallableMode
+  environment: Shared<Intersection>
+  success: Shared<Type>
+  failure: Shared<Type>
+  requirements: Shared<Row>
+}
+
+fn effectParts(value: &Type) -> Option<EffectParts> {
+  return match &value.* {
+    Type.Effect {mode, environment, success, failure, requirements} => Option.some<EffectParts>(EffectParts {
+      mode: mode, environment: Shared.clone<Intersection>(&environment), success: Shared.clone<Type>(&success),
+      failure: Shared.clone<Type>(&failure), requirements: Shared.clone<Row>(&requirements),
+    })
+    Type.CallableValue {contract, ..} => Shared.with<Type, Option<EffectParts>>(&contract, effectParts)
+    _ => Option.none<EffectParts>()
+  }
+}
+
+effect fn effectBound(source: &Shared<Type>, target: &Shared<Type>) -> Option<EffectBound> ! OutOfMemoryError ? &mut Allocator {
+  let offered = Shared.with<Type, Option<EffectParts>>(source, effectParts)
+  let wanted = Shared.with<Type, Option<EffectParts>>(target, effectParts)
+  if let Option<EffectParts>.Some {value: left} = move offered {
+    if let Option<EffectParts>.Some {value: right} = move wanted {
+      return Option.some<EffectBound>(EffectBound {offered: move left, wanted: move right})
+    }
+  }
+  return Option.none<EffectBound>()
+}
+
+fn runStrength(mode: CallableMode) -> usize {
+  return match mode { CallableMode.Shared => usize.ZERO CallableMode.Mutable => usize.ONE CallableMode.Once => 2 }
+}
+
+// An exact Effect satisfies a use contract with the same channels whose run access it permits and
+// whose environment outlives the promised one (EFF-013, REP-002).
+effect fn proveEffectBound(resolver: &Resolver, module: &ModuleId, declared: &[Constraint], bound: &EffectBound, span: Span)
+  -> Option<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let compatible = runStrength(bound.offered.mode) <= runStrength(bound.wanted.mode)
+    && (run Type.equalsShared(&bound.offered.success, &bound.wanted.success))
+    && (run Type.equalsShared(&bound.offered.failure, &bound.wanted.failure))
+    && (run Row.equalsShared(&bound.offered.requirements, &bound.wanted.requirements))
+    && (run callableEnvironmentOutlives(&bound.offered.environment, &bound.wanted.environment, declared))
+  if compatible { return Option.none<Shared<Rejection>>() }
+  return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleCallableSignature, span))
+}
+
+// The offered channels infer the promised success, failure and requirement row; its environment
+// infers an elided promised environment region.
+effect fn inferEffectBound(fresh: &DeclarationId, inferred: &mut Vector<Binding>, bound: &EffectBound)
+  -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut variables, run Shared.make<DeclarationId>(run DeclarationId.copy(fresh)))
+  let mut patterns = Vector.make<Shared<Type>>()
+  let mut evidence = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut patterns, Shared.clone<Type>(&bound.wanted.success))
+  run Vector.append<Shared<Type>>(&mut evidence, Shared.clone<Type>(&bound.offered.success))
+  run Vector.append<Shared<Type>>(&mut patterns, Shared.clone<Type>(&bound.wanted.failure))
+  run Vector.append<Shared<Type>>(&mut evidence, Shared.clone<Type>(&bound.offered.failure))
+  run Vector.append<Shared<Type>>(&mut patterns, run rowCarrier(&bound.wanted.requirements))
+  run Vector.append<Shared<Type>>(&mut evidence, run rowCarrier(&bound.offered.requirements))
+  let unified = run Type.unifyAll(Vector.asSlice<Shared<Type>>(&patterns), Vector.asSlice<Shared<Type>>(&evidence),
+    Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut inferred.*)
+  drop unified
+  let regions = run callableEnvironmentRegions(&bound.wanted.environment)
+  let given = run callableEnvironmentRegions(&bound.offered.environment)
+  let targets = Vector.asSlice<Shared<Lifetime>>(&regions)
+  let sources = Vector.asSlice<Shared<Lifetime>>(&given)
+  let mut at = usize.ZERO
+  while at < targets.length {
+    let ordinal = ownedLifetimeOrdinal(&targets[at], fresh)
+    if ordinal != usize.MAX && sources.length <= usize.ONE {
+      let known = bindingArgument(Vector.asSlice<Binding>(&inferred.*), fresh, ordinal)
+      if let Option<Argument>.None = move known {
+        let mut region = run Shared.make<Lifetime>(Lifetime.Static)
+        if sources.length == usize.ONE { region = Shared.clone<Lifetime>(&sources[usize.ZERO]) }
+        run Vector.append<Binding>(&mut inferred.*, Binding {
+          declaration: run Shared.make<DeclarationId>(run DeclarationId.copy(fresh)), ordinal: ordinal,
+          value: Argument.Lifetime {value: move region},
+        })
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 // A representation parameter first acquires its exact value type from an operand. Its
@@ -29557,6 +29731,11 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
   let sourceType = match move source {
     Option<Shared<Type>>.Some {value} => move value
     _ => { return Option.none<Shared<Rejection>>() }
+  }
+  let effectsBound = run effectBound(&sourceType, &promised)
+  if let Option<EffectBound>.Some {value: effects} = move effectsBound {
+    run inferEffectBound(fresh, &mut inferred.*, &effects)
+    return Option.none<Shared<Rejection>>()
   }
   let sourceFacts = run CallableContract.ofType(&sourceType)
   let targetFacts = run CallableContract.ofType(&promised)
@@ -29598,8 +29777,10 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
       let mut checkAt = mark
       while checkAt < added.length {
         if run argumentMentionsOwner(&added[checkAt].value, &rigid) {
-          return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.TypeArgumentInference, span),
-          )
+          let mut code = RejectionCode.TypeArgumentInference
+          // An Effect result needs Effect environment and run-mode inference (named effect-form gap).
+          if Shared.with<Type, bool>(&offered.result, bareEffect) { code = RejectionCode.EffectFormUnavailable }
+          return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, code, span))
         }
         checkAt = checkAt + usize.ONE
       }
@@ -29656,6 +29837,8 @@ effect fn valueCallableContract(value: &Shared<Type>, constraints: &[Constraint]
     Type.CallableStage {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
     Type.CallableSchema {schema, ..} => { return Option.some<Shared<Type>>(sectionSchemaContract(&schema)) }
     Type.Callable {..} => { return Option.some<Shared<Type>>(Shared.clone<Type>(value)) }
+    // An Effect produced by invoking a callable value is its own use contract.
+    Type.Effect {..} => { return Option.some<Shared<Type>>(Shared.clone<Type>(value)) }
     Type.Reference {..} => { return Option.none<Shared<Type>>() }
     Type.OpaqueRepresentation {contract, ..} => { return run valueCallableContract(&contract, constraints) }
     _ => ()
@@ -30096,7 +30279,7 @@ effect fn checkInvocation<'scope>(
   caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut Vector<BodyNode>,
   signatures: &mut Vector<SignatureDependency>, requiredBodies: &mut Vector<DeclarationId>,
   expression: HirId, input: CallInput, expected: &Option<Shared<Type>>, constraints: &[Constraint],
-  contractBody: bool, staticBody: bool, unsafeAllowed: bool, callAcknowledged: bool, valueConstruction: bool, effectRun: bool,
+  contractBody: bool, staticBody: bool, unsafeAllowed: bool, callAcknowledged: bool, valueConstruction: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let CallInput {callee, generics, arguments, pipeline} = input
@@ -30458,8 +30641,10 @@ effect fn checkInvocation<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span)
   }
   let effectTarget = Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureIsEffect)
-  // An Effect constructed without an immediate `run` stores its arguments (Step 9b).
-  if effectTarget && !effectRun {
+  // A generic `effect fn` value needs its application inferred from the use site's callable
+  // contract (for example a handler passed to `Effect.catchAll`); that stays a named gap.
+  if effectTarget && valueConstruction && Vector.length<Argument>(&target.explicit) == usize.ZERO &&
+    Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureBinderCount) != usize.ZERO {
     return run bodyRejection(&resolver.*, module, RejectionCode.EffectFormUnavailable, span)
   }
   let unsafeCall = foreignCall || Shared.with<Result<Answer, NoRejection>, bool>(
@@ -30882,13 +31067,26 @@ effect fn checkInvocation<'scope>(
       ty = run Type.finishOpaqueApplication(&ty, &application)
     }
     if parameterOffset > usize.ZERO || valueConstruction {
-      if effectTarget { return run bodyRejection(&resolver.*, module, RejectionCode.EffectFormUnavailable, span) }
+      // A section supplying some arguments of an `effect fn` remains a named form; a value supplies none.
+      if effectTarget && !valueConstruction {
+        return run bodyRejection(&resolver.*, module, RejectionCode.EffectFormUnavailable, span)
+      }
       // Dense inference slots do not retain enclosing binder ownership. The closed application
       // retains the original function and owner slots needed by the visible section contract.
       let sectionBindings = run Application.bindings(&application)
+      let mut sectionResult = Shared.clone<Type>(&ty)
+      if effectTarget {
+        // An `effect fn` value promises the Effect its invocation constructs (EFF-001). A once run
+        // is the promise every argument shape satisfies.
+        sectionResult = run Shared.make<Type>(Type.Effect {mode: CallableMode.Once,
+          environment: run Shared.make<Intersection>(Intersection {members: Vector.make<LifetimeMember>()}),
+          success: move ty,
+          failure: run Type.applyBindings(&failureType, Vector.asSlice<Binding>(&inferred), true),
+          requirements: run Row.applyBindings(&requirementRow, Vector.asSlice<Binding>(&inferred), true)})
+      }
       return run finishNamedSection(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
         &mut nodes.*, expression, span, &target.signature, Vector.asSlice<Binding>(&sectionBindings),
-        NamedSectionTarget.Application {value: move application, isPublic: target.isPublic}, parameterOffset, move typedArguments, move ty, constraints, expected, contractBody,
+        NamedSectionTarget.Application {value: move application, isPublic: target.isPublic}, parameterOffset, move typedArguments, move sectionResult, constraints, expected, contractBody,
       )
     }
     if effectTarget {
@@ -37159,13 +37357,15 @@ effect fn originalCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, 
     }
     Type.CallableValue {application, contract, captures, fieldInputs, ..} => {
       let invocationMode = Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
-      let declaration = Shared.with<Application, OwnerKind>(&application, fn(value: &Application) -> OwnerKind {
-        return DeclarationId.kind(Application.bodyDeclaration(value))
+      // A named `effect fn` construction with no written arguments is a section with no fields.
+      let named = Shared.with<Application, bool>(&application, fn(value: &Application) -> bool {
+        let kind = DeclarationId.kind(Application.bodyDeclaration(value))
+        return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock
       })
       if dereferences != usize.ZERO && invocationMode == CallableMode.Once {
         return Result.failResult<MirCallTarget, GapCode>(GapCode.TypedForm)
       }
-      if declaration != OwnerKind.Anonymous || Vector.length<CallableFieldInput>(&fieldInputs) != usize.ZERO {
+      if Vector.length<CallableFieldInput>(&fieldInputs) != usize.ZERO || named {
         return run sectionCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
           callerBindings, projections, move inputs, invocationMode, move application, move captures, move fieldInputs)
       }
@@ -37217,7 +37417,6 @@ effect fn sectionCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, A
     Option<SignatureFacts>.Some {value} => value
     _ => { return Result.failResult<MirCallTarget, GapCode>(GapCode.SignatureForm) }
   }
-  if facts.isEffect { return Result.failResult<MirCallTarget, GapCode>(GapCode.EffectInstance) }
   let fields = Vector.asSlice<Shared<Type>>(&captures)
   let slots = Vector.asSlice<CallableFieldInput>(&fieldInputs)
   let mut environmentField = usize.MAX
@@ -37242,7 +37441,12 @@ effect fn sectionCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, A
     Result<Shared<Type>, GapCode>.Success {value} => move value
     Result<Shared<Type>, GapCode>.Failure {error} => { return Result.failResult<MirCallTarget, GapCode>(error) }
   }
-  let wanted = run RuntimeType.applyBindings(&inputs.result, callerBindings, projections)
+  let mut wanted = run RuntimeType.applyBindings(&inputs.result, callerBindings, projections)
+  // Invoking an `effect fn` value constructs its Effect; only its run calls the instance (D4).
+  if facts.isEffect {
+    let promised = Shared.with<Type, Option<EffectChannels>>(&wanted, effectChannels)
+    if let Option<EffectChannels>.Some {value: channels} = move promised { wanted = move channels.success }
+  }
   if !run Type.runtimeEqualsShared(&wanted, &result) { return Result.failResult<MirCallTarget, GapCode>(GapCode.WitnessOperand) }
   let mut operands = Vector.make<MirCallOperand>()
   let mut environment = Option.none<MirStoredEnvironment>()
@@ -37363,7 +37567,6 @@ effect fn anonymousCallableCall(resolver: &mut Resolver, owner: &mut Query<Word,
     Option<SignatureFacts>.Some {value} => value
     _ => { return Result.failResult<MirCallTarget, GapCode>(GapCode.SignatureForm) }
   }
-  if target.isEffect { return Result.failResult<MirCallTarget, GapCode>(GapCode.EffectInstance) }
   if target.parameters != inputs.count { return Result.failResult<MirCallTarget, GapCode>(GapCode.WitnessOperand) }
   // anonymousUseContract numbers invocation regions by first use, independently of the
   // declaration's written generic ordinal. Map the fresh inference owner through that order.
@@ -37789,6 +37992,24 @@ effect fn resolveMir(
         node: node, receiverDereferences: usize.ZERO, key: run InstanceKey.function(move closed), edge: Edge.Direct, operands: move operands,
         stored: Option.none<MirStoredArguments>(),
       })
+    }
+    // A stored Effect runs through its exact representation's runner, like a callable with no new
+    // arguments: its environment supplies the stored arguments or the block's captures (D1).
+    let stored = TypedBody.runOperand(&typed, node)
+    if let Option<RunOperand>.Some {value: operand} = move stored {
+      let mode = Shared.with<Type, CallableMode>(&operand.receiver, callableInvocationMode)
+      let inputs = CallableCallInputs {receiver: move operand.receiver, inference: Shared.clone<DeclarationId>(&identity),
+        bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()), mode: mode, callee: operand.callee,
+        result: move operand.result, count: usize.ZERO, origin: operand.origin}
+      let selected = run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, node,
+        &callerApplication, Vector.asSlice<Binding>(&callerBindings), storageProjection, move inputs)
+      match move selected {
+        Result<MirCallTarget, GapCode>.Success {value} => { run Vector.append<MirCallTarget>(&mut calls, move value) }
+        Result<MirCallTarget, GapCode>.Failure {error} => {
+          return memberSuccess(Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(error, &identity,
+            Shared.with<TypedBody, Span>(&typed, fn(value: &TypedBody) -> Span { return TypedBody.nodeSlice(value)[node.index].origin.span })))}, move dependencies)
+        }
+      }
     }
     let callable = TypedBody.callableCall(&typed, node)
     if let Option<CallableCallInputs>.Some {value: inputs} = move callable {
@@ -46121,6 +46342,7 @@ fn absurd<T>() -> T {
 fn callableInvocationMode(value: &Type) -> CallableMode {
   return match &value.* {
     Type.Callable {mode, ..} => mode
+    Type.Effect {mode, ..} => mode
     Type.CallableValue {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
     Type.CallableStage {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
     Type.CallableSchema {schema, ..} => Shared.with<Type, CallableMode>(&sectionSchemaContract(&schema), callableInvocationMode)

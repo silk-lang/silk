@@ -505,6 +505,11 @@ fn childAt(body: &Shared<TypedBody>, id: BodyNodeId, index: usize) -> Option<Bod
           }
           return Option.none<BodyNodeId>()
         }
+        // A stored Effect's runner receives the operand as its callee, like a callable invocation.
+        BodyNodeKind.Expression {form: BodyExpression.Run {value: operand, ..}, ..} => {
+          if index == usize.ZERO { return Option.some<BodyNodeId>(operand) }
+          return Option.none<BodyNodeId>()
+        }
         BodyNodeKind.Expression {form: BodyExpression.InterfaceCall {arguments, ..}, ..} => {
           let children = Vector.asSlice<BodyNodeId>(&arguments)
           if index < children.length { return Option.some<BodyNodeId>(children[index]) }
@@ -703,7 +708,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
-          BodyExpression.Run {value} => View.Run {value: value, ty: Shared.clone<Type>(&ty), origin: origin}
+          BodyExpression.Run {value, ..} => View.Run {value: value, ty: Shared.clone<Type>(&ty), origin: origin}
           BodyExpression.ForeignCall {declaration, arguments} => {
             let identities = TypedBody.foreignHandles(bodyValue)
             let found = foreignHandleIndex(identities, &declaration)
@@ -2355,8 +2360,26 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Call {environment, foreign, count, node: callNode, ty, origin} => {
-      // Constructing an Effect without running it stores its arguments (Step 9b).
-      if Shared.with<Type, bool>(&ty, effectConstruction) { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      // An `effect fn` value invoked without `run` would construct a nested exact Effect.
+      if environment && Shared.with<Type, bool>(&ty, effectContract) { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      // Constructing an Effect stores its written arguments as its environment; nothing runs (D1).
+      if !environment && constructionCall(body, callNode, &ty) {
+        let mut fields = Vector.make<AggregateField>()
+        let mut at = usize.ZERO
+        while at < count {
+          let child = match move childAt(body, callNode, at) {
+            Option<BodyNodeId>.Some {value} => value
+            Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+          }
+          let stored = run expression(&mut builder.*, body, hir, child)
+          if !builder.live { return Operand.Unit }
+          run Vector.append<AggregateField>(&mut fields, AggregateField {index: at, value: move stored})
+          at = at + usize.ONE
+        }
+        let constructed = run temporary(&mut builder.*, &ty, origin)
+        run assign(&mut builder.*, place(constructed), Rvalue.Aggregate {fields: move fields}, origin)
+        return Operand.Move {place: place(constructed)}
+      }
       let values = run callArguments(&mut builder.*, body, hir, callNode, count, environment, &foreign, origin)
       if !builder.live { return Operand.Unit }
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -2376,7 +2399,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       resume(&mut builder.*, continuation)
       return Operand.Copy {place: place(output)}
     }
-    View.Run {value, ty, origin} => run lowerRun(&mut builder.*, body, hir, value, &ty, origin)
+    View.Run {value, ty, origin} => run lowerRun(&mut builder.*, body, hir, id, value, &ty, origin)
     View.Unsupported {origin} => run unsupported(&owner, origin, GapCode.TypedForm)
     _ => run unsupported(
       &owner,
@@ -2987,11 +3010,30 @@ fn effectContract(value: &Type) -> bool {
 }
 
 // Whether a value is an exact Effect representation built by calling an `effect fn`.
-fn effectConstruction(value: &Type) -> bool {
-  return match &value.* {
-    Type.CallableValue {contract, ..} => Shared.with<Type, bool>(&contract, effectContract)
-    _ => false
+// Whether this direct call is itself an `effect fn` construction: its result is the exact Effect
+// whose runner is the called declaration. A generic call merely returning an Effect still runs.
+fn constructionCall(body: &Shared<TypedBody>, node: BodyNodeId, ty: &Shared<Type>) -> bool {
+  return Shared.with<TypedBody, bool>(body, fn(value: &TypedBody) -> bool {
+    let nodes = TypedBody.nodeSlice(value)
+    if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {declaration, ..}, ..} = &nodes[node.index].kind {
+      return constructsDeclaration(ty, &declaration)
+    }
+    return false
+  })
+}
+
+fn constructsDeclaration(ty: &Shared<Type>, declaration: &DeclarationId) -> bool {
+  return Shared.with<Type, bool>(ty, fn(result: &Type) -> bool { return constructedBy(result, declaration) })
+}
+
+fn constructedBy(result: &Type, declaration: &DeclarationId) -> bool {
+  if let Type.CallableValue {application, contract, ..} = &result.* {
+    if !Shared.with<Type, bool>(&contract, effectContract) { return false }
+    return Shared.with<Application, bool>(&application, fn(selected: &Application) -> bool {
+      return DeclarationId.equals(Application.bodyDeclaration(selected), declaration)
+    })
   }
+  return false
 }
 
 fn effectFailure(value: &Type) -> Option<Shared<Type>> {
@@ -3005,32 +3047,45 @@ fn effectFailure(value: &Type) -> Option<Shared<Type>> {
 // `run f(a)` of a named `effect fn` is a direct call of its instance (Effect note D1). A callee
 // that can fail writes its failure to a fresh slot of its own failure type; that edge converts it
 // into this function's `Failure`, drops every scope it leaves and fails (D3, D7).
-effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, value: BodyNodeId,
+effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, runNode: BodyNodeId, value: BodyNodeId,
   ty: &Shared<Type>, origin: Origin) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
   let construction = run instanceView(&builder.*, body, value)
   let mut node = value
   let mut count = usize.ZERO
   let mut constructed = Option.none<Shared<Type>>()
+  let mut invoked = false
+  // The checker decided whether the operand is itself the call to run: an `effect fn` call or an
+  // invocation of an `effect fn` value runs as one direct call of the target instance (D1, D4).
+  let immediate = TypedBody.immediateRun(body, runNode)
   if let View.Call {environment, foreign, count: arguments, node: callNode, ty: callType, ..} = move construction {
     if let Option<Shared<DeclarationId>>.None = &foreign {
-      if !environment && Shared.with<Type, bool>(&callType, effectConstruction) {
+      let callable = environment
+      if immediate {
         node = callNode
         count = arguments
+        invoked = callable
         constructed = Option.some<Shared<Type>>(move callType)
       }
     }
   }
+  // A stored Effect value runs through its exact representation's runner (D1): the run node is
+  // the call, its operand the environment.
+  let environment = match &constructed { Option<Shared<Type>>.None => true _ => false }
+  if environment {
+    count = usize.ONE
+    node = runNode
+    constructed = run instanceNodeType(&builder.*, body, value)
+  }
   let constructionType = match move constructed {
     Option<Shared<Type>>.Some {value: selected} => selected
-    // Running a stored Effect value needs its exact runner (Step 9b).
     Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
   }
   let calleeFailure = match move Shared.with<Type, Option<Shared<Type>>>(&constructionType, effectFailure) {
     Option<Shared<Type>>.Some {value: selected} => selected
     Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
   }
-  let values = run callArguments(&mut builder.*, body, hir, node, count, false, &Option.none<Shared<DeclarationId>>(), origin)
+  let values = run callArguments(&mut builder.*, body, hir, node, count, environment || invoked, &Option.none<Shared<DeclarationId>>(), origin)
   if !builder.live { return Operand.Unit }
   let output = run temporary(&mut builder.*, ty, origin)
   let continuation = run block(&mut builder.*, origin)
@@ -3582,7 +3637,10 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
       }
     }
     View.Move {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
-    View.Run {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.Run {value, ..} => {
+      drop run collectCallNodes(body, value, &mut output.*)
+      run Vector.append<BodyNodeId>(&mut output.*, id)
+    }
     View.Fail {value, ..} => {
       drop run collectCallNodes(body, value, &mut output.*)
       return false
