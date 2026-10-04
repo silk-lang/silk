@@ -58,4 +58,5 @@ export const selfhostTrack = [
   'staged-callable-parameter',
   'operator-pipeline',
   'staged-callable-section',
+  'native-descriptor-write',
 ] as const satisfies ReadonlyArray<string>
