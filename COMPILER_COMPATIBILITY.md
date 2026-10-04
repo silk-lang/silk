@@ -217,6 +217,18 @@ Each entry records:
   codes and pipe spans. Interface-operation and Effect pipeline coverage remain separate gaps.
 - **Source migration:** construct a unary section on the right, for example `2 |> add(3)`.
 
+### Reached Effect literals in selfhost
+
+- **Status:** deferred to #567 Step 9; named during the Step 8 corpus sweep on 2026-10-03.
+- **Rule:** Effect blocks and anonymous `effect fn` values retain their indexed EffectBlock
+  identity. Constructing their executable environments requires Effect lowering.
+- **Compilers:** bootstrap lowers these values. Selfhost reports `effect-instance` when runtime
+  typing reaches either literal, at the literal's span. It does not treat an anonymous effect
+  function as an ordinary closure when the value is stored without being invoked.
+- **Evidence:** `reachedEffectLiteralsKeepPreciseStepNineGap` checks both literal kinds and their
+  gap spans, alongside an ordinary closure that still lowers successfully.
+- **Owner:** #567 Step 9. Earlier unrelated gaps may still block an enclosing program first.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
