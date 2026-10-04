@@ -4,28 +4,28 @@ OWNS: GATES.md, compiler/**, .github/workflows/selfhost.yml, COMPILER_COMPATIBIL
 
 Scope: pin every corpus program newly enabled by Step 7, replace generic first-blocker labels with precise later gaps and owners, re-audit Option and Result compiler privilege, and close the Step 7 roadmap only after exact-head CI has zero failures
 
-- [x] G0: this ledger states outcomes that can fail
+- [ ] G0: this ledger states outcomes that can fail
   CHECK: node /Users/juliaortiz/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
   EXPECT: LINT OK
-  EVIDENCE: 2026-10-03 LINT OK with only the six declared manual or unmeasured gate warnings
+  EVIDENCE: pending revalidation after combined review
 
-- [x] G1: Step 7d starts from the published Step 7c implementation and retains the Step 6 cleanup foundation
-  CHECK: git merge-base --is-ancestor 6584c2b09 HEAD && rg -q 'DropGlue' compiler/src && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+- [ ] G1: the stack contains current selfhost, the main-first corpus sync and the Step 6 cleanup foundation
+  CHECK: git merge-base --is-ancestor 8964ce9905a44841f60cd0d5387df3f8f5f85af7 HEAD && git merge-base --is-ancestor 23eb6fc956af3154df2391cfaade34a1da4e8738 HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
   EXPECT: prerequisite verification passed
-  EVIDENCE: exact branch ancestry and source search passed after rebasing onto origin/selfhost 9e74bdf25 on 2026-10-03
+  EVIDENCE: pending final ancestry and source verification; current integration base is selfhost 8964ce990 plus main sync 0bf6fa25a
 
 - [ ] G2: the full corpus has zero failures, loses no baseline PASS, and reports the final PASS, unsupported, and track counts
-  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
-  EXPECT: Selfhost corpus reports fail=0 and no selfhost track failure
-  EVIDENCE: exact selfhost 9e74bdf25 sweep pass=65 fail=1 unsupported=323 track=49 with no lost baseline PASS; two additional PASS belong to upstream Step 8c, and the only failure is the stale generic-service-stabilization-contracts fixture fixed on main in prerequisite PR #738
+  CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+  EXPECT: /Selfhost corpus: pass=[0-9]+ fail=0 unsupported=[0-9]+ track=[0-9]+/
+  EVIDENCE: pending current-head release build and full sweep; earlier 65/1/323 receipt predates Step 8d and the merged #738 fixture correction
 
-- [x] G3: every existing corpus program newly passing because of Step 7 is pinned in both hard-coded acceptance lists after an exact native PASS
-  CHECK: SILKC=compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler SILK_SELFHOST_CORPUS_CASES=retained-if-let-match-binding,scalar-enum-equality-from-borrowed-variant,while-entry-backedge pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+- [ ] G3: every corpus program newly passing because of Step 7 is pinned in both hard-coded acceptance lists after an exact native PASS
+  CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" SILK_SELFHOST_CORPUS_CASES=retained-if-let-match-binding,scalar-enum-equality-from-borrowed-variant,while-entry-backedge pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
   EXPECT: Selfhost corpus: pass=3 fail=0 unsupported=0 track=3
-  EVIDENCE: after rebasing onto selfhost 9e74bdf25, the exact release compiler reports pass=3 fail=0 unsupported=0 track=3 in 336 ms, 326 ms, and 302 ms; both hard-coded lists pin the same names
+  EVIDENCE: historical existing-program pins agree in both lists; pending final sweep and pins for main-first generic-record-instances and generic-union-instances
 
-- [x] G4: every remaining program whose earlier first blocker was a generic instance has a precise next blocker owned by Step 8, Step 9, or a named follow-up
-  EVIDENCE: the normalized before/after audit records the following ownership; the exact 65/1/323 sweep has no generic-record gap, 290 typed-form reports, and only two union-form reports, both in the ordinary-union follow-up
+- [ ] G4: every remaining program whose earlier first blocker was a generic instance has a precise next blocker owned by Step 8, Step 9, or a named follow-up
+  EVIDENCE: pending final exact-span inventory and feature-specific gap verification; the historical ownership table below is not a current completion claim
 
   | Owner | Programs and exact current blocker |
   | --- | --- |
@@ -35,16 +35,16 @@ Scope: pin every corpus program newly enabled by Step 7, replace generic first-b
   | ordinary union/pattern follow-up | nominal-union-represented-copy-drop and ordinary-union-droppable-array (union-form); nominal-result-compound-error (typed-form at the nominal arm inside a structural union) |
   | borrowed aggregate/string follow-up | ecdsa-p256-verification (typed-form at the borrowed array-to-slice Option payload); http-values (typed-form at a string header-name operand) |
 
-- [x] G5: Option and Result receive no direct or indirect compiler privilege, and a user-defined Option-shaped generic union has identical layout and behavior
-  EVIDENCE: source audit found no Option, Result, module-path, success/failure-shape, effect, try-sugar, layout, or niche recognition; the user-defined Maybe<T> structural/runtime claim is staged in prerequisite PR #738 and the exact ordinary-path probes exit 42
+- [ ] G5: Option and Result receive no direct or indirect compiler privilege, and a user-defined Option-shaped generic union has identical layout and behavior
+  EVIDENCE: round-1 independent source audit found no direct or indirect recognition; #738 supplies the runtime comparison, but an explicit identical-layout structured assertion is still required
 
 - [ ] G6: the generic-record and user-defined generic-union native corpus acceptances land on main, sync to selfhost, pass exactly, and are pinned
-  EVIDENCE: prerequisite draft main PR #738 is green and awaiting review/merge before the required selfhost sync
+  EVIDENCE: #738 merged on main at 23eb6fc95; reviewed sync #750 is the bottom of native stack #751; exact final native PASS and pins remain pending
 
-- [x] G7: the task diff is structurally clean and changes every hard-coded corpus-name list together
-  CHECK: git diff --check && rg -q "'retained-if-let-match-binding'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && rg -q "'scalar-enum-equality-from-borrowed-variant'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && rg -q "'while-entry-backedge'" compiler/scripts/selfhostTrack.ts .github/workflows/selfhost.yml && echo 'diff hygiene and pin lists verified'
+- [ ] G7: the task diff is structurally clean and changes every hard-coded corpus-name list together
+  CHECK: git diff --check && node -e "const fs = require('node:fs'); const names = ['retained-if-let-match-binding','scalar-enum-equality-from-borrowed-variant','while-entry-backedge']; for (const path of ['compiler/scripts/selfhostTrack.ts','.github/workflows/selfhost.yml']) { const text = fs.readFileSync(path, 'utf8'); for (const name of names) if (!text.includes(String.fromCharCode(39) + name + String.fromCharCode(39))) throw new Error(path + ' missing ' + name); } console.log('diff hygiene and pin lists verified')"
   EXPECT: diff hygiene and pin lists verified
-  EVIDENCE: the whole compiler source check and exact release build pass on selfhost 9e74bdf25; record filters pass in 393 ms and 674 ms, union filters in 666 ms and 363 ms, and inherent selection in 664 ms; diff hygiene and both pin-list membership checks pass
+  EVIDENCE: pending final diff and pin-list audit; earlier source/test receipts do not certify the review corrections
 
 - [ ] G8: independent review and required PR CI accept the exact final head, and #567 records the Step 7 link plus final PASS and pin counts
   EVIDENCE: pending

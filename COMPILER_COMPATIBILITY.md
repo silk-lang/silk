@@ -139,7 +139,8 @@ Each entry records:
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
-  Step 6d, which lowers partial moves.
+  Step 6d, which lowers partial moves, and Step 7, which substitutes complete generic nominal
+  instance payloads before selecting and building drop glue.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
@@ -147,8 +148,7 @@ Each entry records:
   between joining paths or that is moved on only some paths, a write at a runtime index beside a
   moved element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for callable and Effect environments, generic nominal unions and unions without a
-  canonical member order.
+  drop glue for callable and Effect environments and unions without a canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
@@ -156,6 +156,23 @@ Each entry records:
   guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
   borrowing match result gap, which current typing cannot reach because it borrows only places and
   Drop-free array literals, and the deferred glue forms.
+
+### Selfhost keeps unavailable conditional sealed-property proofs explicit
+
+- **Status:** recorded on 2026-10-04 with Step 7 review corrections.
+- **Rule:** generic Copy and Drop implementations apply only when their exact provider head and
+  substituted bounds hold. Drop hooks use the head's unification bindings, including reordered,
+  fixed and nested provider arguments, rather than nominal argument positions.
+- **Compilers:** selfhost proves lexical premises, Copy, outlives, retained-region and interface
+  conformance constraints through the ordinary semantic queries. It does not yet execute every
+  intrinsic property or representation proof supported by the bootstrap. Such an unavailable
+  concrete proof remains `Unsupported`, never absence of a required Drop hook. Without proof of
+  an abstract conditional Copy head, ordinary abstract checking conservatively keeps it affine.
+- **Source migration:** none; the remaining property/representation solver is a named follow-up,
+  not a generic-instance layout or library-constructor exception.
+- **Evidence:** `genericSealedCopyUsesLexicalAndLifetimePremises`,
+  `genericSealedDropRetainsExactHeadBindings` and `genericSealedUnknownDropProofIsNotAbsence` in
+  `compiler/src/semantic/SemanticCases.silk`.
 
 ### Selfhost does not reject moves inside match guards at typing
 
