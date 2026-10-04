@@ -208,6 +208,11 @@ suspension point structurally).
   its invocation mode ([ownership CALLABLE-002](../../apps/docs/content/reference/ownership-and-borrowing.md#callable-002--invocation-mode-derives-from-access-to-the-callable-environment);
   functions CALLABLE-003). A section call is a direct call of its target with the
   stored arguments appended. No `Section` key, no adapter function, no function pointer.
+  A section of an abstract callable parameter retains a typing recipe for its base and newly
+  supplied arguments. Substitution resolves that recipe to the original function application
+  before layout, glue or invocation. Repeated staging keeps capture order while retaining each
+  field's original argument ordinal. The resulting section's mode includes its new captures;
+  the original anonymous target still receives its environment in that target's actual mode.
 - **Named effect fn runners** keep their written parameters as ordinary `Parameter` locals, so
   `run f(a)` is `Call(f, [a], providers)`. Running a stored Effect built from `f` moves (`once`) or
   copies its fields into those arguments. Effect blocks and anonymous effect fns take the closure
