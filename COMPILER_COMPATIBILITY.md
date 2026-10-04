@@ -779,3 +779,37 @@ repeated invocation and capture-only drop glue.
   returns 42; native assertions and timing require exact-head CI.
 - **Owner:** Step 8 owns construction and direct lowering; Step 14 owns discharging local Contents
   and general borrow obligations and proving additional escaping validity.
+
+### Native plain callable results retain original storage and public permissions
+
+- **Status:** direct acyclic ordinary producers implemented during Step 8; native assertions and
+  exact-head CI remain pending.
+- **Rule:** a source-written callable result contract does not create a new function identity.
+  Returned named values, anonymous environments and sections retain their original declaration,
+  complete application and ordered captures. Producers returning the same original representation
+  unify; equal public contracts alone do not make different original targets equal.
+- **Compilers:** the native origin query checks the producer under its own declared premises and
+  applies its complete selected application to reachable return operands. A weaker public contract
+  is retained as a use view over the original storage. Exact equality compares both; runtime
+  projection removes the public view before layout, cleanup and direct invocation. Staging keeps
+  the public invocation permission while building the original target's supplied argument record.
+  It never gains Shared permission merely because hidden storage supports reusable calls.
+  Bootstrap currently accepts a reached generic `same<F>` call supplied with callable results
+  from different original targets when their public contracts agree. Native preserves the
+  approved exact representation identity and rejects that inference with SEM0052 at the call;
+  equal contracts cannot select one direct target for two different environments. The reduced
+  bootstrap control builds successfully, so this rejection is an intentional divergence.
+- **Ownership:** returned affine values retain the existing explicit-transfer diagnostics and
+  consumed places. Shared source promises may copy; weaker Once promises consume at their source
+  use boundary. This is separate from the original physical target's environment passing mode.
+- **Admission:** origin queries retain application, profile and conditional proof context. Growth
+  is checked before body demands, including cached-body edges. The depth bound spans conditional
+  context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
+- **Remaining Step 8 scope:** recursive origin cycles, divergent plain origins, callable-valued
+  results reached through higher-order, inherent or interface invocation, and retained mutable
+  callable parameter loans remain explicit gaps. This layer does not mark Step 8 complete.
+- **Evidence:** `plainCallableReturnsKeepOriginalStorageAndPublicContracts`,
+  `plainCallableOriginsUnifyAcrossProducers`, `plainCallableViewsKeepWeakerInvocationPermissions`
+  and `plainCallableViewStagingRetainsPublicModeAndArgumentOrder` inspect original storage,
+  complete relay applications, exact identity, public permission rejection and direct suffix order.
+- **Source migration:** none.
