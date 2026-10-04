@@ -200,6 +200,23 @@ Each entry records:
   evidence is the declared raw callable type and `Ownership.argumentConsumes` source path.
 - **Owner:** remaining Step 8d callable view and loan lowering, including escaping views.
 
+### Unary callable pipelines in selfhost
+
+- **Status:** PIPE-001 conformance implemented during Step 8d; verification pending exact-head CI.
+- **Rule:** a pipeline completes its input once, evaluates a unary callable, and invokes it with
+  that input. A section on the right side is constructed after the input, then invoked directly.
+- **Compilers:** selfhost lowers anonymous and stored callable pipelines with their exact ordinary
+  function target. It retains a transferred input for cleanup if evaluating the callee exits.
+  It reports `CallArity` at the complete pipe when the target is not unary. Bootstrap currently
+  also permits piping into a multi-parameter callable as partial trailing application; that
+  behavior differs from the confirmed unary PIPE-001 boundary and is not adopted by selfhost.
+- **Evidence:** `callablePipelineCompletesInputBeforeCapture`,
+  `callablePipelineStagesAndAppendsArguments` and
+  `callablePipelineDropsTransferredInputOnCalleeExit` assert source-order MIR, original-target
+  suffix appending and cleanup transfer. `callablePipelineRejectsNonUnaryTargets` checks arity
+  codes and pipe spans. Interface-operation and Effect pipeline coverage remain separate gaps.
+- **Source migration:** construct a unary section on the right, for example `2 |> add(3)`.
+
 ### Omitted Effect environments elaborated from inputs
 
 - **Status:** approved by Julia on 2026-09-26. The parameterless rule was approved first; owned
