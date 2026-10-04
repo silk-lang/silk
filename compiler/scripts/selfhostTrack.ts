@@ -17,6 +17,7 @@ export const selfhostTrack = [
   'generic-partial-type-arguments',
   'generic-record-instances',
   'generic-union-instances',
+  'generic-lifetime-selected-cleanup',
   'array-upper-index-trap',
   'array-zero-index-trap',
   'mutable-array-loop',

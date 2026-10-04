@@ -7171,6 +7171,44 @@ export const httpRedirectCorpusProgram = Object.freeze({
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
+    // Same erased Guard layout, distinct selected hooks. Counters also reject omitted cleanup.
+    // Separate callers isolate generic glue from the bootstrap's lifetime-erased caller reuse.
+    name: 'generic-lifetime-selected-cleanup',
+    source: `struct Token<'data> { value: i32 counter: &'data mut i32 }
+impl<'data> Drop for Token<'data> {
+  fn drop(self: &mut Token<'data>) -> () {
+    if self.value != 2 { let zero: i32 = 0 self.value = 1 / zero }
+    self.value = 0
+    self.counter.* = self.counter.* + 1
+    return ()
+  }
+}
+struct Guard<'a, 'data> { token: Token<'data> }
+impl<'data> Drop for Guard<'static, 'data> {
+  fn drop(self: &mut Guard<'static, 'data>) -> () {
+    self.token.value = self.token.value + 1
+    return ()
+  }
+}
+fn localGuard<'a, 'data>(value: &'a i32, counter: &'data mut i32) -> Guard<'a, 'data> {
+  return Guard<'a, 'data> { token: Token { value: 2, counter: move counter } }
+}
+fn consume<'a, 'data>(value: Guard<'a, 'data>) -> () { drop value return () }
+fn consumeStatic<'data>(value: Guard<'static, 'data>) -> () { drop value return () }
+pub fn main() -> i32 {
+  let mut staticDrops: i32 = 0
+  let mut localDrops: i32 = 0
+  let lasting = Guard<'static> { token: Token { value: 1, counter: &mut staticDrops } }
+  let local: i32 = 0
+  let short = localGuard(&local, &mut localDrops)
+  consumeStatic(move lasting)
+  consume(move short)
+  if staticDrops == 1 && localDrops == 1 { return 42 }
+  return 0
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'sealed-scalar-intrinsics',
     source: `pub fn main() -> i32 {
   let left: i32 = 40
@@ -9747,6 +9785,29 @@ pub effect fn main() -> () ! WriterError {
 }`,
     nativeStdout: 'heading\nrow\n',
     nativeStderr: 'warning\n',
+    expected: { _tag: 'Completes', result: 0 },
+  },
+  {
+    name: 'stdout-writer-hello',
+    source: 'pub fn main() -> i32 { return 0 }',
+    nativeSource: `import silk.effect { Effect }
+import silk.os_writer { StdoutWriter }
+import silk.writer { Writer, WriterError }
+
+effect fn hello() -> () ! WriterError {
+  let mut writer = StdoutWriter.make()
+  return run Writer.writeAll(b"hello\\n") |> Effect.provideMut<Writer>(&mut writer)
+}
+
+effect fn ignoreWriteFailure(error: WriterError) -> () {
+  return ()
+}
+
+pub fn main() -> i32 {
+  let completed = run Effect.catchAll(hello(), ignoreWriteFailure)
+  return 0
+}`,
+    nativeStdout: 'hello\n',
     expected: { _tag: 'Completes', result: 0 },
   },
   {

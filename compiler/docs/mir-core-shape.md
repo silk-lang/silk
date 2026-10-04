@@ -37,7 +37,7 @@ Operand     = Copy(Place) | Move(Place) | Integer | Float | Boolean | Unit
             | **FunctionAddress(InstanceKey)** (only with C callbacks)
 Rvalue      = Use | Unary | Binary | Bitcast | Ref(access, Place) | AddressOf(access, Place)
             | Aggregate | Slice | SliceLength | Discriminant | Inject | Variant
-Statement   = Assign(Place, Rvalue) | Drop(Place)
+Statement   = Assign(Place, Rvalue) | Drop(Place, InstanceKey)
             | **FailureContext(destination, source: Option<Place>)** (reserved; first reader)
             | **StorageLive(local) | StorageDead(local)** (borrow stage)
 Terminator  = Goto | Branch | Switch | Return | Trap | Unreachable
@@ -63,12 +63,26 @@ tag; `Index` reads its index from a local; `ConstIndex` is a compile-time index;
 through a reference or raw pointer.
 
 Local types are semantic `Type`s with the instance's bindings applied. Lifetimes are retained as
-evidence; the instance key alone uses the canonical runtime form. A projection's type comes from
+evidence, including in exact semantic instance keys. A projection's type comes from
 its base type and the type's `MemberShape`. Only `Payload` carries its type, because the
 structural-union member list would otherwise have to be renormalized at each use.
 
 **Relation to Layout.** MIR states _which_ field, never _where_. Emission asks `Layout` for
 offsets, tag encoding and ABI class. A Wasm backend would read the same MIR and `Layout`.
+
+**Selected instance identity.** `InstanceKey` retains the complete semantic application and a
+canonical lifetime-erased runtime family. Semantic queries validate every exact application;
+layout interning uses runtime type equality. After finite reachability closes, `InstanceRecipe`
+encodes each selected MIR body and its ordered exact call/drop targets without origins, target
+layout facts or LLVM text. `EmissionPlan` refines runtime families by these recipes and their
+callee classes, including cycles, then encodes each root's reachable minimized graph. Full bytes
+decide equality and interning; content digests shorten symbols. Equivalent lifetime instances
+share one definition; differing direct or transitive cleanup splits every affected caller.
+Root-local numbering makes identity independent of discovery order and unrelated instances.
+Definitions, calls and drops all resolve through the same completed plan. The C shim alone keeps
+the ABI name `main`; genuine digest collisions reject before emission.
+Finite-closure evidence certifies complete lowered successors, not executable backend output.
+LLVM-only restrictions are checked when the completed plan is emitted and remain build gaps.
 
 **Bounds checks are explicit.** `SliceLength` or the static array length, a compare, then `Branch`
 to a `Trap` block. `Index` is therefore a plain address step. Arithmetic overflow and division
@@ -83,7 +97,8 @@ projection duplicates `Index` + `Deref`.
 **Decision: cleanup is explicit in the graph.** Lowering writes `Drop` statements on every exit
 edge; there is no implicit unwinding and no landing pad.
 
-- `Drop(place)` drops one complete initialized value by calling `DropGlue(type)`. Glue runs the
+- `Drop(place, glue)` drops one complete initialized value through the exact selected
+  `DropGlue(type)` key retained in MIR; emission never reconstructs an erased callee name. Glue runs the
   `Drop` hook, then fields in declaration order, array elements in ascending order, or the active
   union payload only (CLEANUP-002). A partial parent is never passed to its glue: lowering expands
   it into drops of its remaining children.
