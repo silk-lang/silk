@@ -60,6 +60,20 @@ a moved child back makes it whole again. A hole beneath a type with a Drop hook 
 runtime index beside a moved element, a guard that changes an owner's state (the bootstrap rejects
 such moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
 changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
+Effect fn bodies are typed against their declared success, failure and requirement channels.
+Calling an `effect fn` builds an exact Effect whose representation is the call's application and
+written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect
+calling convention D1). `run` must leave no failure outside the enclosing failure type
+(`UnhandledFailure`, bootstrap SEM0066) and no requirement outside its row (`UnhandledRequirement`,
+SEM0071), so an ordinary `fn` runs only closed Effects. `fail value` checks the value against the
+enclosing failure type (`FailOutsideEffect` SEM0063, `UndeclaredFailure` SEM0064). A function whose
+failure type is not `never` returns an `i1` status and writes success and failure to two
+caller-owned out-addresses after its parameters (D3); MIR gives it a `Failure` local, a `Fail`
+terminator and a `FailureEdge` on each fallible call, whose block widens the callee's failure into
+`Failure`, drops every scope it leaves and fails (D7). Running a stored Effect value, Effect blocks,
+requirement-row arguments, service operations and the composition intrinsics remain the
+`effect-form` and `effect-instance` gaps, and `effect fn main` the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
+sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 

@@ -10,7 +10,9 @@ import backend.Mir {
   AggregateField,
   Block,
   Callee,
+  FailureEdge,
   Local,
+  LocalKind,
   MirFunction,
   Operand,
   Place,
@@ -1309,14 +1311,24 @@ effect fn emitReturn(
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let resultLayout = run layoutOf(layouts, &function.result, function, span)
   let kind = storageRepresentation(&function.result, target, resultLayout)
+  let fallible = failureLocal(function) != usize.MAX
   if kind.unit {
-    run append(&mut writer.*, b"ret void\n")
+    if fallible { run append(&mut writer.*, b"ret i1 0\n") }
+    else { run append(&mut writer.*, b"ret void\n") }
     return ()
   }
   let returned = Operand.Copy {
     place: Place {local: usize.ZERO, projections: Vector.make<Projection>()},
   }
   let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
+  // A fallible function returns its status and writes success to the caller's out-slot (D3).
+  if fallible {
+    let output = Address {ty: Shared.clone<Type>(&function.result), text: run Bytes.copy(b"%out"),
+      alignment: resultLayout.alignment, representation: kind}
+    run storeValue(&mut writer.*, &output, &value)
+    run append(&mut writer.*, b"ret i1 0\n")
+    return ()
+  }
   if kind.aggregate {
     let output = Address {ty: Shared.clone<Type>(&function.result), text: run Bytes.copy(b"%out"),
       alignment: resultLayout.alignment, representation: kind}
@@ -1329,6 +1341,40 @@ effect fn emitReturn(
   run append(&mut writer.*, b" ")
   run append(&mut writer.*, Bytes.asSlice(&value.text))
   run append(&mut writer.*, b"\n")
+  return ()
+}
+
+/// The `Failure` local of a fallible function, or `usize.MAX` when it cannot fail.
+fn failureLocal(function: &MirFunction) -> usize {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let failure = match &locals[at].kind { LocalKind.Failure => true _ => false }
+    if failure { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// `Fail` writes the failure value to the caller's failure out-slot and returns status 1 (D3).
+effect fn emitFail(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout], span: Span) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let local = failureLocal(function)
+  if local == usize.MAX {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.make(GapCode.TypedForm, &owner, span)
+  }
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let failureLayout = run layoutOf(layouts, &locals[local].ty, function, span)
+  let kind = storageRepresentation(&locals[local].ty, target, failureLayout)
+  if !kind.unit {
+    let failed = Operand.Copy {place: Place {local: local, projections: Vector.make<Projection>()}}
+    let value = run emitOperand(&mut writer.*, function, target, layouts, &failed)
+    let output = Address {ty: Shared.clone<Type>(&locals[local].ty), text: run Bytes.copy(b"%fail"),
+      alignment: failureLayout.alignment, representation: kind}
+    run storeValue(&mut writer.*, &output, &value)
+  }
+  run append(&mut writer.*, b"ret i1 1\n")
   return ()
 }
 
@@ -1356,6 +1402,7 @@ effect fn emitCall(
   arguments: &Vector<Operand>,
   destination: &Place,
   normal: usize,
+  failure: &Option<FailureEdge>,
   span: Span,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let mut foreignIndex = usize.MAX
@@ -1368,6 +1415,15 @@ effect fn emitCall(
   }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
+  // A fallible callee takes success and failure out-addresses after its arguments and returns a
+  // status: 0 continues at `normal`, 1 at the failure edge (D3).
+  let mut failed = Option.none<Address>()
+  let mut handler = usize.MAX
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* {
+    failed = Option.some<Address>(run emitPlace(&mut writer.*, function, target, layouts, &edge.destination))
+    handler = edge.target
+  }
+  let fallible = handler != usize.MAX
   let values = Vector.asSlice<Operand>(arguments)
   let mut evaluated = Vector.make<Value>()
   let mut index = usize.ZERO
@@ -1381,7 +1437,7 @@ effect fn emitCall(
     index = index + usize.ONE
   }
   let mut returned = Bytes.make()
-  if !kind.unit && !kind.aggregate {
+  if fallible || (!kind.unit && !kind.aggregate) {
     returned = run temp(&mut writer.*)
     run append(&mut writer.*, Bytes.asSlice(&returned))
     run append(&mut writer.*, b" = ")
@@ -1393,21 +1449,23 @@ effect fn emitCall(
     run append(&mut writer.*, b" @")
     run foreignSymbol(&mut writer.*, Bytes.asSlice(&foreign[foreignIndex].symbol))
   } else if let Callee.Instance {key} = &callee.* {
-    if kind.aggregate { run append(&mut writer.*, b"void") }
+    if fallible { run append(&mut writer.*, b"i1") }
+    else if kind.aggregate { run append(&mut writer.*, b"void") }
     else { run typeName(&mut writer.*, kind) }
     run append(&mut writer.*, b" @")
     let symbol = run EmissionPlan.symbol(plan, &key)
     run append(&mut writer.*, Bytes.asSlice(&symbol))
   }
   run append(&mut writer.*, b"(")
-  if kind.aggregate {
+  let leadingOutput = kind.aggregate && !fallible
+  if leadingOutput {
     run append(&mut writer.*, b"ptr ")
     run append(&mut writer.*, Bytes.asSlice(&output.text))
   }
   let prepared = Vector.asSlice<Value>(&evaluated)
   index = usize.ZERO
   while index < prepared.length {
-    if index > usize.ZERO || kind.aggregate {
+    if index > usize.ZERO || leadingOutput {
       run append(&mut writer.*, b", ")
     }
     if foreignIndex != usize.MAX {
@@ -1426,7 +1484,24 @@ effect fn emitCall(
     run append(&mut writer.*, Bytes.asSlice(&prepared[index].text))
     index = index + usize.ONE
   }
+  if let Option<Address>.Some {value: failureSlot} = &failed {
+    if prepared.length > usize.ZERO { run append(&mut writer.*, b", ") }
+    run append(&mut writer.*, b"ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&output.text))
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&failureSlot.text))
+  }
   run append(&mut writer.*, b")\n")
+  if fallible {
+    run append(&mut writer.*, b"br i1 ")
+    run append(&mut writer.*, Bytes.asSlice(&returned))
+    run append(&mut writer.*, b", label %")
+    run label(&mut writer.*, handler)
+    run append(&mut writer.*, b", label %")
+    run label(&mut writer.*, normal)
+    run append(&mut writer.*, b"\n")
+    return ()
+  }
   if !kind.unit && !kind.aggregate {
     let value = Value {scalar: kind, text: move returned}
     run storeValue(&mut writer.*, &output, &value)
@@ -1486,7 +1561,7 @@ effect fn emitBlock(
     Terminator.Return {origin} => {
       run emitReturn(&mut writer.*, function, target, layouts, origin.span)
     }
-    Terminator.Call {callee, arguments, destination, normal, origin, ..} => {
+    Terminator.Call {callee, arguments, destination, normal, failure, origin} => {
       run emitCall(
         &mut writer.*,
         function,
@@ -1498,9 +1573,11 @@ effect fn emitBlock(
         &arguments,
         &destination,
         normal,
+        &failure,
         origin.span,
       )
     }
+    Terminator.Fail {origin} => run emitFail(&mut writer.*, function, target, layouts, origin.span)
     Terminator.Trap {origin: _} => run append(&mut writer.*, b"unreachable\n")
     Terminator.Unreachable {origin: _} => run append(&mut writer.*, b"unreachable\n")
     Terminator.Switch {value, cases, otherwise, origin: _} => {
@@ -1607,17 +1684,20 @@ pub effect fn emit(function: &MirFunction, target: &Target, layouts: &[TypeLayou
     }
     at = at + usize.ONE
   }
+  let fallible = failureLocal(function) != usize.MAX
   run append(&mut writer, b"define ")
-  if result.aggregate { run append(&mut writer, b"void") }
+  if fallible { run append(&mut writer, b"i1") }
+  else if result.aggregate { run append(&mut writer, b"void") }
   else { run typeName(&mut writer, result) }
   run append(&mut writer, b" @")
   let symbol = run EmissionPlan.symbol(plan, &function.key)
   run append(&mut writer, Bytes.asSlice(&symbol))
   run append(&mut writer, b"(")
-  if result.aggregate { run append(&mut writer, b"ptr %out") }
+  let leadingOutput = result.aggregate && !fallible
+  if leadingOutput { run append(&mut writer, b"ptr %out") }
   at = usize.ZERO
   while at < parameters.length {
-    if at > usize.ZERO || result.aggregate {
+    if at > usize.ZERO || leadingOutput {
       run append(&mut writer, b", ")
     }
     let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.span)
@@ -1626,6 +1706,10 @@ pub effect fn emit(function: &MirFunction, target: &Target, layouts: &[TypeLayou
     run append(&mut writer, b" %p")
     run decimal(&mut writer, at)
     at = at + usize.ONE
+  }
+  if fallible {
+    if parameters.length > usize.ZERO { run append(&mut writer, b", ") }
+    run append(&mut writer, b"ptr %out, ptr %fail")
   }
   run append(&mut writer, b") {\n")
   let blocks = Vector.asSlice<Block>(&function.blocks)

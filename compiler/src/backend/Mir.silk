@@ -4,6 +4,8 @@ import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.Gap {Code as GapCode, Gap}
 import backend.InstanceKey {InstanceKey}
+import backend.RuntimeType
+import backend.RuntimeType {Projection as RuntimeProjection}
 import backend.Layout {Layout}
 import semantic.Specialization {Application, Edge}
 import semantic.RuntimeEncoding
@@ -60,6 +62,9 @@ pub union LocalKind {
   Parameter {pub index: usize},
   User {pub index: usize},
   Temp,
+  /// The caller-owned failure out-slot of a function whose failure type is not `never` (Effect
+  /// note D3). `Fail` exits with it initialized.
+  Failure,
   /// A `bool` that records whether owned local `local` still needs its drop, where ownership
   /// differs between the paths that reach a join (MIR core shape §3).
   DropFlag {pub local: usize},
@@ -136,13 +141,23 @@ pub union Terminator {
     pub arguments: Vector<Operand>,
     pub destination: Place,
     pub normal: usize,
-    pub failure: Option<usize>,
+    /// Present exactly when the callee's failure type is not `never`.
+    pub failure: Option<FailureEdge>,
     pub origin: Origin,
   },
+  /// Exits through the caller's failure out-slot with the `Failure` local initialized.
+  Fail {pub origin: Origin},
   Trap {pub origin: Origin},
   Unreachable {pub origin: Origin},
   /// Jumps to the case whose value equals the scalar operand, or to `otherwise` for every other value.
   Switch {pub value: Operand, pub cases: Vector<SwitchCase>, pub otherwise: usize, pub origin: Origin},
+}
+
+/// Where a fallible callee writes its failure value, typed by the callee's failure type, and the
+/// block that converts it and leaves the scopes it exits (MIR core shape §3).
+pub struct FailureEdge {
+  pub destination: Place
+  pub target: usize
 }
 
 /// One distinct switch value in sign-magnitude decimal form and its target block.
@@ -290,6 +305,7 @@ struct Scrutinee {
 
 struct Builder {
   bindings: Vector<Binding>
+  projections: Vector<RuntimeProjection>
   calls: Vector<CallTarget>
   function: MirFunction
   current: usize
@@ -305,6 +321,8 @@ struct Builder {
   remainders: Vector<Remainder>
   // Which typed-body locals and node values need cleanup, answered by semantic analysis.
   needs: CleanupNeeds
+  // The `Failure` local, or `usize.MAX` when this function cannot fail.
+  failure: usize
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -349,6 +367,8 @@ union View {
     origin: Origin,
   },
   Intrinsic {member: IntrinsicMember, node: BodyNodeId, ty: Shared<Type>, origin: Origin},
+  Run {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
+  Fail {value: BodyNodeId, origin: Origin},
   Binding {index: usize, initializer: BodyNodeId, origin: Origin},
   Assignment {index: usize, value: BodyNodeId, origin: Origin},
   Return {value: Option<BodyNodeId>, origin: Origin},
@@ -681,6 +701,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
             ty: Shared.clone<Type>(&ty),
             origin: origin,
           }
+          BodyExpression.Run {value} => View.Run {value: value, ty: Shared.clone<Type>(&ty), origin: origin}
           BodyExpression.ForeignCall {declaration, arguments} => {
             let identities = TypedBody.foreignHandles(bodyValue)
             let found = foreignHandleIndex(identities, &declaration)
@@ -741,6 +762,7 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
         }
         BodyNodeKind.Break => View.Break {origin: origin}
         BodyNodeKind.Drop {value, consumed} => View.Drop {value: value, release: releaseOf(&consumed, id), origin: origin}
+        BodyNodeKind.Fail {value} => View.Fail {value: value, origin: origin}
         BodyNodeKind.Continue => View.Continue {origin: origin}
         BodyNodeKind.Block {statements, ..} => View.Block {
           count: Vector.length<BodyNodeId>(&statements),
@@ -1401,6 +1423,7 @@ fn ownedRvalue(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
         BodyExpression.InterfaceCall {..} => true
         BodyExpression.ForeignCall {..} => true
         BodyExpression.IntrinsicCall {..} => true
+        BodyExpression.Run {..} => true
         BodyExpression.Aggregate {..} => true
         BodyExpression.VariantConstruct {..} => true
         BodyExpression.UnionInject {..} => true
@@ -1673,6 +1696,7 @@ effect fn aggregateFields(
 ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
   let mut fields = Vector.make<AggregateField>()
+  let mut transferred = Vector.make<usize>()
   let mut at = usize.ZERO
   while at < count {
     let child = match move childAt(body, node, at) {
@@ -1681,13 +1705,46 @@ effect fn aggregateFields(
         return run unsupported(&owner, origin, GapCode.TypedForm)
       }
     }
-    let input = run expression(&mut builder.*, body, hir, child)
+    let produced = run expression(&mut builder.*, body, hir, child)
+    let input = run guardOperand(&mut builder.*, body, child, move produced, &mut transferred, origin)
     run Vector.append<AggregateField>(&mut fields, AggregateField {
       index: aggregateFieldIndex(body, node, at), value: move input,
     })
     at = at + usize.ONE
   }
+  transferGuarded(&mut builder.*, &transferred)
   return move fields
+}
+
+// In a fallible body a later operand of the same full expression may fail; an owned operand
+// already evaluated is then a temporary its failure exit must drop (D7, FAIL-006). Ownership
+// transfers to the call or aggregate once every operand is evaluated.
+effect fn guardOperand(builder: &mut Builder, body: &Shared<TypedBody>, child: BodyNodeId, produced: Operand,
+  transferred: &mut Vector<usize>, origin: Origin) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let moved = match &produced { Operand.Move {..} => true _ => false }
+  if !moved || builder.failure == usize.MAX || !builder.live || !ownedRvalue(body, child) || !CleanupNeeds.node(&builder.needs, child.index) {
+    return move produced
+  }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let ty = match move run instanceNodeType(&builder.*, body, child) {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let captured = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(captured), Rvalue.Use {value: move produced}, origin)
+  run Vector.append<usize>(&mut builder.*.temporaries, captured)
+  run Vector.append<usize>(&mut transferred.*, captured)
+  return Operand.Move {place: place(captured)}
+}
+
+fn transferGuarded(builder: &mut Builder, transferred: &Vector<usize>) -> () {
+  let guarded = Vector.asSlice<usize>(transferred)
+  let mut at = usize.ZERO
+  while at < guarded.length {
+    transferTemporary(&mut builder.*, guarded[at])
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 // For a call through a witness (`witness`), lends an operand by reference when the selected
@@ -1821,6 +1878,7 @@ effect fn callArguments(
   let mut piped = run pipedArgument(&mut builder.*, body, hir, callNode, witness, origin)
   let mut pipedCleanup = Option.none<usize>()
   let mut values = Vector.make<Operand>()
+  let mut transferred = Vector.make<usize>()
   if !builder.live { return move values }
   let mut at = usize.ZERO
   while at < count {
@@ -1839,10 +1897,12 @@ effect fn callArguments(
       piped = Option.none<PipedArgument>()
     } else { argument = run callArgument(&mut builder.*, body, hir, callNode, child, at, environment, witness, origin) }
     if !builder.live { return move values }
-    run Vector.append<Operand>(&mut values, move argument)
+    let guarded = run guardOperand(&mut builder.*, body, child, move argument, &mut transferred, origin)
+    run Vector.append<Operand>(&mut values, move guarded)
     at = at + usize.ONE
   }
   commitPipedArgument(&mut builder.*, move pipedCleanup)
+  transferGuarded(&mut builder.*, &transferred)
   return move values
 }
 
@@ -2280,6 +2340,8 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Call {environment, foreign, count, node: callNode, ty, origin} => {
+      // Constructing an Effect without running it stores its arguments (Step 9b).
+      if Shared.with<Type, bool>(&ty, effectConstruction) { return run unsupported(&owner, origin, GapCode.EffectForm) }
       let values = run callArguments(&mut builder.*, body, hir, callNode, count, environment, &foreign, origin)
       if !builder.live { return Operand.Unit }
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -2292,13 +2354,14 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
           arguments: move values,
           destination: place(output),
           normal: continuation,
-          failure: Option.none<usize>(),
+          failure: Option.none<FailureEdge>(),
           origin: origin,
         },
       )
       resume(&mut builder.*, continuation)
       return Operand.Copy {place: place(output)}
     }
+    View.Run {value, ty, origin} => run lowerRun(&mut builder.*, body, hir, value, &ty, origin)
     View.Unsupported {origin} => run unsupported(&owner, origin, GapCode.TypedForm)
     _ => run unsupported(
       &owner,
@@ -2900,6 +2963,153 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
   return ()
 }
 
+fn neverType(value: &Type) -> bool {
+  return Type.isNever(value)
+}
+
+fn effectContract(value: &Type) -> bool {
+  return match &value.* { Type.Effect {..} => true _ => false }
+}
+
+// Whether a value is an exact Effect representation built by calling an `effect fn`.
+fn effectConstruction(value: &Type) -> bool {
+  return match &value.* {
+    Type.CallableValue {contract, ..} => Shared.with<Type, bool>(&contract, effectContract)
+    _ => false
+  }
+}
+
+fn effectFailure(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Effect {failure, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&failure))
+    Type.CallableValue {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
+    _ => Option.none<Shared<Type>>()
+  }
+}
+
+// `run f(a)` of a named `effect fn` is a direct call of its instance (Effect note D1). A callee
+// that can fail writes its failure to a fresh slot of its own failure type; that edge converts it
+// into this function's `Failure`, drops every scope it leaves and fails (D3, D7).
+effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, value: BodyNodeId,
+  ty: &Shared<Type>, origin: Origin) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let construction = run instanceView(&builder.*, body, value)
+  let mut node = value
+  let mut count = usize.ZERO
+  let mut constructed = Option.none<Shared<Type>>()
+  if let View.Call {environment, foreign, count: arguments, node: callNode, ty: callType, ..} = move construction {
+    if let Option<Shared<DeclarationId>>.None = &foreign {
+      if !environment && Shared.with<Type, bool>(&callType, effectConstruction) {
+        node = callNode
+        count = arguments
+        constructed = Option.some<Shared<Type>>(move callType)
+      }
+    }
+  }
+  let constructionType = match move constructed {
+    Option<Shared<Type>>.Some {value: selected} => selected
+    // Running a stored Effect value needs its exact runner (Step 9b).
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
+  }
+  let calleeFailure = match move Shared.with<Type, Option<Shared<Type>>>(&constructionType, effectFailure) {
+    Option<Shared<Type>>.Some {value: selected} => selected
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
+  }
+  let values = run callArguments(&mut builder.*, body, hir, node, count, false, &Option.none<Shared<DeclarationId>>(), origin)
+  if !builder.live { return Operand.Unit }
+  let output = run temporary(&mut builder.*, ty, origin)
+  let continuation = run block(&mut builder.*, origin)
+  let target = run callCallee(&mut builder.*, Option.none<Shared<DeclarationId>>(), node, &owner, origin)
+  let mut edge = Option.none<FailureEdge>()
+  let mut caught = usize.MAX
+  let mut handler = usize.MAX
+  if !Shared.with<Type, bool>(&calleeFailure, neverType) {
+    if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    caught = run temporary(&mut builder.*, &calleeFailure, origin)
+    handler = run block(&mut builder.*, origin)
+    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
+  }
+  terminate(&mut builder.*, Terminator.Call {
+    callee: move target, arguments: move values, destination: place(output), normal: continuation,
+    failure: move edge, origin: origin,
+  })
+  if handler != usize.MAX {
+    resume(&mut builder.*, handler)
+    run propagateFailure(&mut builder.*, caught, &calleeFailure, origin)
+  }
+  resume(&mut builder.*, continuation)
+  return Operand.Copy {place: place(output)}
+}
+
+// Moves a caught failure into `Failure`, widening it into the caller's failure union, then leaves
+// every open scope innermost first and fails.
+effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<Type>, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let destination = builder.failure
+  let into = localType(&builder.*, destination)
+  if run Type.runtimeEqualsShared(from, &into) {
+    run assign(&mut builder.*, place(destination), Rvalue.Use {value: Operand.Move {place: place(caught)}}, origin)
+  } else {
+    let wider = match move run Type.canonicalUnionMembers(&into) {
+      Option<Vector<Shared<Type>>>.Some {value} => value
+      Option<Vector<Shared<Type>>>.None => { return run unsupported(&owner, origin, GapCode.UnionForm) }
+    }
+    let members = Vector.asSlice<Shared<Type>>(&wider)
+    match move run Type.canonicalUnionMembers(from) {
+      Option<Vector<Shared<Type>>>.None => {
+        let tag = run memberTag(members, from)
+        if tag == usize.MAX { return run unsupported(&owner, origin, GapCode.UnionForm) }
+        run assign(&mut builder.*, place(destination), Rvalue.Inject {tag: tag, value: Operand.Move {place: place(caught)}}, origin)
+      }
+      Option<Vector<Shared<Type>>>.Some {value: narrower} => {
+        // Each member of the narrower union is re-injected under its tag in the wider one.
+        let listed = Vector.asSlice<Shared<Type>>(&narrower)
+        let tagType = run Layout.tagType(listed.length)
+        let read = run temporary(&mut builder.*, &tagType, origin)
+        run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: place(caught)}, origin)
+        let joined = run block(&mut builder.*, origin)
+        let mut cases = Vector.make<SwitchCase>()
+        let mut targets = Vector.make<usize>()
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let arm = run block(&mut builder.*, origin)
+          run Vector.append<usize>(&mut targets, arm)
+          run Vector.append<SwitchCase>(&mut cases, SwitchCase {decimal: run Type.extentText(at), negative: false, target: arm})
+          at = at + usize.ONE
+        }
+        let unreachable = run block(&mut builder.*, origin)
+        terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases,
+          otherwise: unreachable, origin: origin})
+        at = usize.ZERO
+        while at < listed.length {
+          resume(&mut builder.*, Vector.asSlice<usize>(&targets)[at])
+          let tag = run memberTag(members, &listed[at])
+          if tag == usize.MAX { return run unsupported(&owner, origin, GapCode.UnionForm) }
+          let mut payload = place(caught)
+          run Vector.append<Projection>(&mut payload.projections, Projection.Payload {index: at, ty: Shared.clone<Type>(&listed[at])})
+          run assign(&mut builder.*, place(destination), Rvalue.Inject {tag: tag, value: Operand.Move {place: move payload}}, origin)
+          terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+          at = at + usize.ONE
+        }
+        resume(&mut builder.*, joined)
+      }
+    }
+  }
+  run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
+  terminate(&mut builder.*, Terminator.Fail {origin: origin})
+  return ()
+}
+
+effect fn memberTag(members: &[Shared<Type>], member: &Shared<Type>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < members.length {
+    if run Type.runtimeEqualsShared(&members[at], member) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
 // An expression statement's owned value is dropped at once; a place read leaves its owner alone.
 effect fn discard(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let selectedType = run instanceNodeType(&builder.*, body, id)
@@ -2927,7 +3137,7 @@ fn borrowingType(value: &Type) -> bool {
     Type.Slice {..} => true
     Type.String {..} => true
     Type.Nominal {arguments, ..} => borrowingArguments(Vector.asSlice<Argument>(&arguments))
-    Type.OpaqueRepresentation {arguments, contract, ..} => borrowingArguments(Vector.asSlice<Argument>(&arguments)) ||
+    Type.OpaqueRepresentation {application, contract, ..} => Shared.with<Application, bool>(&application, borrowingApplication) ||
       Shared.with<Type, bool>(&contract, borrowingType)
     Type.Array {element, ..} => Shared.with<Type, bool>(&element, borrowingType)
     Type.CallableValue {captures, ..} => borrowingMembers(Vector.asSlice<Shared<Type>>(&captures))
@@ -3103,6 +3313,20 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     }
     View.Call {..} => {
       run discard(&mut builder.*, body, hir, id)
+    }
+    View.Run {..} => {
+      run discard(&mut builder.*, body, hir, id)
+    }
+    View.Fail {value, origin} => {
+      // The failure value moves out before every scope the exit leaves is dropped (D7).
+      let failed = run expression(&mut builder.*, body, hir, value)
+      if !builder.live { return () }
+      let owner = InstanceKey.identity(&builder.function.key)
+      if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
+      let destination = builder.failure
+      run assign(&mut builder.*, place(destination), Rvalue.Use {value: move failed}, origin)
+      run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
+      terminate(&mut builder.*, Terminator.Fail {origin: origin})
     }
     View.Binding {index, initializer, origin} => {
       let value = run expression(&mut builder.*, body, hir, initializer)
@@ -3343,6 +3567,11 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
       }
     }
     View.Move {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.Run {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
+    View.Fail {value, ..} => {
+      drop run collectCallNodes(body, value, &mut output.*)
+      return false
+    }
     View.Drop {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.EnumValue {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
     View.UnionInject {value, ..} => { drop run collectCallNodes(body, value, &mut output.*) }
@@ -3486,7 +3715,7 @@ impl MirFunction {
           arguments: Vector.make<Operand>(),
           destination: place(usize.ZERO),
           normal: usize.ONE,
-          failure: Option.none<usize>(),
+          failure: Option.none<FailureEdge>(),
           origin: origin,
         },
       },
@@ -3517,15 +3746,18 @@ impl MirFunction {
     body: &Shared<TypedBody>,
     hir: &Module,
     result: &Shared<Type>,
+    failure: &Shared<Type>,
     parameters: &[Shared<Type>],
     calls: Vector<CallTarget>,
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
+    projections: Vector<RuntimeProjection>,
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
     let identity = InstanceKey.identity(&key)
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
     let supplied = Vector.asSlice<Binding>(&bindings)
+    let selectedProjections = Vector.asSlice<RuntimeProjection>(&projections)
     let mut argumentAt = usize.ZERO
     while argumentAt < supplied.length {
       if let Argument.Row {value: row} = &supplied[argumentAt].value {
@@ -3544,7 +3776,7 @@ impl MirFunction {
       argumentAt = argumentAt + usize.ONE
     }
 
-    let closedResult = run Type.applyBindings(result, supplied, true)
+    let closedResult = run RuntimeType.applyBindings(result, supplied, selectedProjections)
     let root = bodyRoot(body)
     let origin = bodyOrigin(body)
     // ContractTyped bodies retain explicit safety obligations. Building MIR does not discharge
@@ -3554,7 +3786,7 @@ impl MirFunction {
     while at < parameters.length {
       run Vector.append<Shared<Type>>(
         &mut params,
-        run Type.applyBindings(&parameters[at], supplied, true),
+        run RuntimeType.applyBindings(&parameters[at], supplied, selectedProjections),
       )
       at = at + usize.ONE
     }
@@ -3574,15 +3806,23 @@ impl MirFunction {
       run Vector.append<Local>(
         &mut locals,
         Local {
-          ty: run Type.applyBindings(&local.ty, supplied, true),
+          ty: run RuntimeType.applyBindings(&local.ty, supplied, selectedProjections),
           kind: move kind,
           origin: local.origin,
         },
       )
       at = at + usize.ONE
     }
+    // A function that can fail writes its failure value to a caller-owned out-slot (D3).
+    let mut failureLocal = usize.MAX
+    let closedFailure = run Type.applyBindings(failure, supplied, true)
+    if !Shared.with<Type, bool>(&closedFailure, neverType) {
+      failureLocal = Vector.length<Local>(&locals)
+      run Vector.append<Local>(&mut locals, Local {ty: move closedFailure, kind: LocalKind.Failure, origin: origin})
+    }
     let mut builder = Builder {
       bindings: move bindings,
+      projections: move projections,
       calls: move calls,
       function: MirFunction {
         key: move key,
@@ -3603,6 +3843,7 @@ impl MirFunction {
       temporaries: Vector.make<usize>(),
       remainders: move remainders,
       needs: move needs,
+      failure: failureLocal,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
@@ -3630,7 +3871,7 @@ effect fn instanceNodeType(builder: &Builder, body: &Shared<TypedBody>, id: Body
 ! OutOfMemoryError ? &mut Allocator {
   return match move nodeType(body, id) {
     Option<Shared<Type>>.Some {value: ty} => Option.some<Shared<Type>>(
-      run Type.applyBindings(&ty, Vector.asSlice<Binding>(&builder.bindings), true),
+      run RuntimeType.applyBindings(&ty, Vector.asSlice<Binding>(&builder.bindings), Vector.asSlice<RuntimeProjection>(&builder.projections)),
     )
     Option<Shared<Type>>.None => Option.none<Shared<Type>>()
   }
@@ -3641,99 +3882,100 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
 ? &mut Allocator {
   let selected = view(body, id)
   let bindings = Vector.asSlice<Binding>(&builder.bindings)
+  let projections = Vector.asSlice<RuntimeProjection>(&builder.projections)
   return match move selected {
     View.Integer {ty, literal, origin} => View.Integer {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       literal: literal,
       origin: origin,
     }
     View.Float {ty, literal, origin} => View.Float {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       literal: literal,
       origin: origin,
     }
     View.Local {ty, index, origin} => View.Local {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       index: index,
       origin: origin,
     }
     View.Move {ty, value, release, origin} => View.Move {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       value: value,
       release: move release,
       origin: origin,
     }
     View.Borrow {ty, access, value, origin} => View.Borrow {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       access: access,
       value: value,
       origin: origin,
     }
     View.Dereference {ty, value, origin} => View.Dereference {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       value: value,
       origin: origin,
     }
     View.Field {ty, value, index, origin} => View.Field {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       value: value,
       index: index,
       origin: origin,
     }
     View.Index {ty, value, index, origin} => View.Index {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       value: value,
       index: index,
       origin: origin,
     }
     View.ArrayLength {ty, value, count, origin} => View.ArrayLength {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       value: value,
       count: count,
       origin: origin,
     }
     View.ArraySlice {ty, value, count, origin} => View.ArraySlice {
-      ty: run Type.applyBindings(&ty, bindings, true), value: value, count: count, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, count: count, origin: origin,
     }
     View.SliceLength {ty, value, origin} => View.SliceLength {
-      ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin,
     }
     View.Aggregate {ty, node, count, origin} => View.Aggregate {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       node: node,
       count: count,
       origin: origin,
     }
     View.StagedCallable {ty, node, count, origin} => View.StagedCallable {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, count: count, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, count: count, origin: origin,
     }
     View.EnumMember {ty, member, origin} => View.EnumMember {
-      ty: run Type.applyBindings(&ty, bindings, true), member: member, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), member: member, origin: origin,
     }
     View.EnumValue {ty, value, origin} => View.EnumValue {
-      ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin,
     }
     View.Match {ty, node, subject, place: placeMatch, consumes, release, tags, count, origin} => View.Match {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, place: placeMatch, consumes: consumes,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, subject: subject, place: placeMatch, consumes: consumes,
       release: move release, tags: tags, count: count, origin: origin,
     }
     View.VariantConstruct {ty, node, tag, count, origin} => View.VariantConstruct {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, tag: tag, count: count, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, tag: tag, count: count, origin: origin,
     }
     View.UnionInject {ty, tag, value, origin} => View.UnionInject {
-      ty: run Type.applyBindings(&ty, bindings, true), tag: tag, value: value, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), tag: tag, value: value, origin: origin,
     }
     View.PatternBinding {ty, node, subject, origin} => View.PatternBinding {
-      ty: run Type.applyBindings(&ty, bindings, true), node: node, subject: subject, origin: origin,
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, subject: subject, origin: origin,
     }
     View.Prefix {ty, operation, operand, origin} => View.Prefix {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       operation: operation,
       operand: operand,
       origin: origin,
     }
     View.Infix {ty, operation, left, right, origin} => View.Infix {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       operation: operation,
       left: left,
       right: right,
@@ -3741,22 +3983,24 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     }
     View.Call {ty, environment, foreign, count, node, origin} => View.Call {
       environment: environment,
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       foreign: move foreign,
       count: count,
       node: node,
       origin: origin,
     }
     View.Intrinsic {ty, member, node, origin} => View.Intrinsic {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
       member: member,
       node: node,
       origin: origin,
     }
+    View.Run {ty, value, origin} => View.Run {ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin}
+    View.Fail {value, origin} => View.Fail {value: value, origin: origin}
     View.Boolean {value, origin} => View.Boolean {value: value, origin: origin}
     View.Unit {origin} => View.Unit {origin: origin}
     View.Embedded {value, ty, origin} => View.Embedded {
-      value: value, ty: run Type.applyBindings(&ty, bindings, true), origin: origin,
+      value: value, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
     }
     View.PlaceAssignment {target, value, origin} => View.PlaceAssignment {
       target: target,
@@ -3828,4 +4072,19 @@ fn resolvedCallOperand(builder: &Builder, node: BodyNodeId, index: usize) -> Opt
 fn absurd<T>() -> T {
   let boom = 1 / 0
   return absurd<T>()
+}
+
+fn borrowingApplication(value: &Application) -> bool {
+  let count = Application.argumentCount(value)
+  let mut at = usize.ZERO
+  while at < count {
+    if let Option<Argument>.Some {value: argument} = move Application.argumentAt(value, at) {
+      if let Argument.Lifetime {..} = &argument { return true }
+      if let Argument.Type {value: ty} = &argument {
+        if Shared.with<Type, bool>(&ty, borrowingType) { return true }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
