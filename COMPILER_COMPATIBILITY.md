@@ -856,3 +856,23 @@ repeated invocation and capture-only drop glue.
   documented for the nominal-domain premise difference.
 - **Source migration:** use an authored constrained type parameter when the returned owner needs
   to preserve its exact callable type, or return a known construction.
+
+
+### Exact callable members in native structural unions
+
+- **Status:** implemented during Step 8 on 2026-10-04; exact native CI pending.
+- **Rule:** an exact closed callable environment is an ordinary storable structural-union member.
+  Bare callable contracts and unresolved staging recipes cannot supply its runtime representation.
+- **Compilers:** native admits runtime-closed callable values, schemas and use views in the existing
+  tagged-union lane. Canonical ordering uses each environment's original owner and runtime encoding;
+  colliding runtime identities remain unsupported. Injection, exact-member pattern binding and
+  direct invocation retain the original callable type. Union glue selects only the active member
+  and drops a captured environment through its ordinary exact glue.
+- **Evidence:** `callableUnionMembersRetainCanonicalStorageAndDirectTargets` checks injection of
+  the original empty environment, recovery/direct invocation and layout equality across reversed
+  spellings. `plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce` additionally inspects
+  active-member cleanup for a union containing a Drop-bearing section. Independent bootstrap
+  Analysis accepts the union source and a reached public-entry reduction has available MIR.
+- **Source migration:** none. Opaque and plain Effect members retain `EffectFormUnavailable`
+  at their producer call, including unions; this prevents a callable sweep from hiding the next
+  Step 9 boundary behind a generic typed-form gap.
