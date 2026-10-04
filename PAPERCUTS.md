@@ -481,3 +481,11 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · A handoff's cloud LLVM path was absent in the macOS worktree, so a bootstrap probe passed checking but failed tool selection · Verify the executable and version in this checkout; macOS LLVM 22.1.8 is at /opt/homebrew/opt/llvm/bin, including explicit test clang/ar selections · selfhost Step 7 review
 - 2026-10-04 · New structured assertions passed source review but the focused bootstrap build rejected three nested anonymous Shared.with callbacks with SEM0199 · Move the inner callback into a concept-named test helper; compiler-root success alone does not check SemanticCases · selfhost Step 7 review
 - 2026-10-04 · A generic Shared.with call directly after `if let ... = move` was parsed as comparison/template syntax, producing cascading diagnostics in a large root · Bind the call result first, then match the local; bootstrap-check the integrated root before native acceptance · selfhost Step 7 review
+
+- 2026-10-03 · A repeated text marker put callable signature reification in the implementation-head resolver and failed the bootstrap build · Anchor edits inside the owning function and inspect the full diff before the focused run · self-hosted compiler
+
+- 2026-10-03 · Formatting the large semantic roots rewrote tens of thousands of unrelated lines · Preserve the focused source patch before formatting; use canonical byte comparison to verify a reduced diff retains the checked program · self-hosted compiler
+
+- 2026-10-03 · Direct field writes on a borrowed Option<State> pattern failed SEM0036, and treating its binding as a reference failed SEM0171 · The binding denotes the borrowed place; pass `&mut value` to the owning State operation, as `scopeState` already does · self-hosted compiler Step 8d
+
+- 2026-10-03 · An `if let` assertion against the fieldless `MirLocalKind.Temp` case produced parser errors and a misleading missing-return diagnostic · Test the case with a `match` Boolean, then branch on the result · self-hosted compiler Step 8d
