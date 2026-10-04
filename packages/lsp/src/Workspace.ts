@@ -10,6 +10,7 @@ import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import * as SourceFile from '@silklang/compiler/SourceFile'
 import * as SourceOrigin from '@silklang/compiler/SourceOrigin'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Layer from 'effect/Layer'
@@ -241,8 +242,8 @@ export const analyzeProject = Effect.fn('Workspace.analyzeProject')(function* (
   ModuleClosure.ModuleClosureError,
   FileSystem.FileSystem | Path.Path
 > {
-  const first = documents.at(0)
-  if (first === undefined) return new Map()
+  if (!Arr.isReadonlyArrayNonEmpty(documents)) return new Map()
+  const first = Arr.headNonEmpty(documents)
   const overlays = new Map<string, SourceResolver.ResolvedSource>()
   for (const document of documents) {
     overlays.set(
@@ -250,7 +251,7 @@ export const analyzeProject = Effect.fn('Workspace.analyzeProject')(function* (
       SourceResolver.resolved(document.bytes, SourceOrigin.memory(document.uri)),
     )
   }
-  const roots = documents.map((document) => document.module)
+  const roots = Arr.map(documents, (document) => document.module)
   const previousProject = previous.values().next().value?.project
   const priorCatalog = previous.values().next().value?.inventory
   const previousInventory =

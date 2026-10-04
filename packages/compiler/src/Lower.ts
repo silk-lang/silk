@@ -1,6 +1,7 @@
 import * as CompilerTrace from './CompilerTrace.js'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as ConformanceProof from './ConformanceProof.js'
+import * as Diagnostic from './Diagnostic.js'
 import type * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as ExecutionPackage from './ExecutionPackage.js'
@@ -260,6 +261,7 @@ import {
   requireGeneratedEffectRunner,
   returnedEffectBlock,
   returnedValueType,
+  type UnsupportedFunction,
   unavailableReferencedEffectRunner,
 } from './EntryAssembly.js'
 import type {} from './Forwarding.js'
@@ -308,7 +310,7 @@ export const lowerProgram = (
   opaqueRealizations: OpaqueRealization.Catalog,
   registry: SemanticContext.Registry,
   trace: CompilerTrace.CompilerTrace = CompilerTrace.none,
-): Mir.Module => {
+): LoweredProgram => {
   const declaredForeignStatics = trace('Lower.collectForeignStatics', () => {
     const declaredForeignStatics = index.modules.flatMap((module) =>
       module.members.flatMap((member) =>
@@ -426,8 +428,9 @@ export const lowerProgram = (
     }
     return { effectResults, generatedRunners }
   })
+  const unsupported: Array<UnsupportedFunction> = []
   const functions = trace('Lower.lowerInstances', () => {
-    const functions = [...runtimeInstances.values()].map((instance) =>
+    const lowered = [...runtimeInstances.values()].map((instance) =>
       trace(
         'Lower.lowerInstance',
         () =>
@@ -449,6 +452,11 @@ export const lowerProgram = (
         },
       ),
     )
+    const functions: Array<Mir.MirFunction> = []
+    for (const result of lowered) {
+      if (result._tag === 'UnsupportedFunction') unsupported.push(result)
+      else functions.push(result)
+    }
     return functions
   })
   trace('Lower.lowerCleanupHelpers', () => {
@@ -731,7 +739,7 @@ export const lowerProgram = (
         left.declarationSpan.start - right.declarationSpan.start ||
         left.declarationSpan.end - right.declarationSpan.end,
     )
-  return {
+  const program: Mir.Module = {
     _tag: 'MirModule',
     module: discovery.rootModule,
     intrinsics: discovery.intrinsics,
@@ -746,5 +754,62 @@ export const lowerProgram = (
     ),
     functions: withLocalSharedDropPlans(layout, functions),
   }
+  return {
+    program,
+    diagnostics: trace('Lower.referencedUnsupportedFunctions', () =>
+      referencedUnsupportedFunctions(program, unsupported),
+    ),
+  }
+}
+
+/** One lowered program and the diagnostics for referenced instances lowering cannot support. */
+export interface LoweredProgram {
+  readonly program: Mir.Module
+  readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
+}
+
+const declarationText = (declaration: DeclarationFacts.CanonicalId): string =>
+  `${declaration.module}\u0000${declaration.name}`
+
+// Every executable reference to a function instance (direct call, callable value, witness slot,
+// Effect runner, retained root) carries the instance's canonical declaration id. Walking emitted
+// operations and module roots structurally therefore finds every reference kind without
+// enumerating them. The match is per declaration, a deliberate superset of the exact instance.
+const collectDeclarations = (value: unknown, found: Set<string>): void => {
+  if (typeof value !== 'object' || value === null) return
+  if (Array.isArray(value)) {
+    for (const item of value) collectDeclarations(item, found)
+    return
+  }
+  if (
+    '_tag' in value &&
+    value._tag === 'CanonicalDeclarationId' &&
+    'module' in value &&
+    typeof value.module === 'string' &&
+    'name' in value &&
+    typeof value.name === 'string'
+  ) {
+    found.add(`${value.module}\u0000${value.name}`)
+    return
+  }
+  for (const nested of Object.values(value)) collectDeclarations(nested, found)
+}
+
+/**
+ * Diagnoses each unsupported instance that emitted code still references. An unreferenced instance
+ * is omitted: discovery can demand a function instance that no emitted code calls.
+ */
+export const referencedUnsupportedFunctions = (
+  program: Mir.Module,
+  unsupported: ReadonlyArray<UnsupportedFunction>,
+): ReadonlyArray<Diagnostic.Diagnostic> => {
+  if (unsupported.length === 0) return []
+  const referenced = new Set<string>()
+  for (const fn of program.functions) collectDeclarations(fn.regions, referenced)
+  collectDeclarations(program.retainedRoots, referenced)
+  collectDeclarations(program.foreignExports, referenced)
+  return unsupported
+    .filter((entry) => referenced.has(declarationText(entry.instance.declaration)))
+    .map((entry) => Diagnostic.unsupportedLowering(entry.span))
 }
 import type * as SemanticContext from './SemanticContext.js'

@@ -14,13 +14,15 @@ one element layout, stride and logical length; indexing checks the logical bound
 an indexed assignment's replacement expression, including for empty and zero-size storage.
 Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
 equality, and member or `_` match arms with guards lower to MIR switches. Unions of argument-free
-records store an unsigned tag (canonical member order) before the largest member; non-generic
+records store an unsigned tag (canonical member order) before the largest member; nominal
 `union` declarations tag variants in declaration order and lay each variant out like a record.
 Record, structural-union and nominal-union matches bind fields as places and switch on the tag.
 A tuple or `.{ ... }` literal constructs its immediately expected named tuple or struct; otherwise
 it creates an occurrence-nominal anonymous aggregate laid out as an ordinary record of its members.
-Slice subranges, generic unions, block-bodied match arms and bindings that are assigned or borrowed
-remain coverage work for backend roadmap step 4.
+Generic records and nominal unions retain complete type applications through construction,
+projection and patterns. Layout, Copy classification, drop glue and inherent call instances are
+computed under those applications; standard-library Option and Result use the same ordinary path
+as user declarations. Slice subranges and unions with string or f64 members remain follow-up work.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
 by-value receiver of an affine place. The place is a local or match subject plus static field,
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
@@ -32,7 +34,7 @@ whose owned structure carries `impl Drop`, found through the implementation quer
 other value emits nothing; a drop that needs cleanup calls the drop glue of the value's type. Glue is
 its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
 need cleanup, fields in declaration order, array elements in ascending order and only the active
-union member or variant. Callable and Effect environments, generic nominal unions and unions
+union member or variant. Callable and Effect environments and unions
 without a canonical member order still report the `cleanup` gap. MIR lowering keeps a cleanup
 stack: bindings and by-value parameters that need cleanup are owners of their scope, consuming sites
 mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,

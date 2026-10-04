@@ -4,6 +4,7 @@ import * as Analysis from '@silklang/compiler/Analysis'
 import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import * as SourceFile from '@silklang/compiler/SourceFile'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Project from '../src/Project.js'
 import * as Reference from '../src/Reference.js'
@@ -14,7 +15,7 @@ it.effect(
   'separates incompatible selected documentation while sharing identical profile pages',
   () =>
     Effect.gen(function* () {
-      const roots = [
+      const roots: Arr.NonEmptyReadonlyArray<SourceFile.SourceFile> = [
         SourceFile.make(
           'platform',
           encoder.encode(`
@@ -26,8 +27,6 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
   pub fn otherOnly() -> i32 { return 2 }
 }`),
         ),
-      ]
-      roots.push(
         SourceFile.make(
           'facade',
           encoder.encode(`
@@ -37,7 +36,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
   pub import platform { otherOnly as selected }
 }`),
         ),
-      )
+      ]
       const projects = []
       for (const target of [
         'aarch64-apple-darwin',
@@ -45,7 +44,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
         'wasm32-unknown-unknown',
       ]) {
         const analysis = yield* ProjectAnalysis.make(
-          roots.map((source) => source.id),
+          Arr.map(roots, (source) => source.id),
           {
             configuration: { profile: { target, artifact: 'object', entry: { kind: 'none' } } },
           },
@@ -354,30 +353,15 @@ it('rejects deterministic module-path and declaration-anchor collisions', () => 
 
 it.effect('omits API examples from a module whose entire surface is inactive', () =>
   Effect.gen(function* () {
-    const analysis = yield* ProjectAnalysis.make(
-      [
-        SourceFile.make(
-          'empty/platform',
-          encoder.encode(`//! Native API example.
-//! \`\`\`silk
-//! import empty.platform { nativeOnly }
-//! pub fn main() -> i32 { return nativeOnly() }
-//! \`\`\`
-static if Intrinsic.targetOperatingSystem() == "darwin" {
-  pub fn nativeOnly() -> i32 { return 1 }
-}`),
-        ),
-      ].map((source) => source.id),
-      {
-        configuration: {
-          profile: {
-            target: 'wasm32-unknown-unknown',
-            artifact: 'object',
-            entry: { kind: 'none' },
-          },
+    const analysis = yield* ProjectAnalysis.make(['empty/platform'], {
+      configuration: {
+        profile: {
+          target: 'wasm32-unknown-unknown',
+          artifact: 'object',
+          entry: { kind: 'none' },
         },
       },
-    ).pipe(
+    }).pipe(
       Effect.provide(
         SourceResolver.overlay([
           SourceFile.make(

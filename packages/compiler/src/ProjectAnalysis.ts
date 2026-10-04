@@ -1,6 +1,7 @@
 import type * as CompilationProfile from './CompilationProfile.js'
 import type * as ConfigurationError from './ConfigurationError.js'
 import * as Diagnostic from './Diagnostic.js'
+import type * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import type * as Analysis from './Analysis.js'
 import * as Frontend from './Frontend.js'
@@ -53,8 +54,13 @@ export interface Options {
 export interface ProjectAnalysis {
   readonly profile?: CompilationProfile.CompilationProfile
   readonly _tag: 'ProjectAnalysis'
-  readonly roots: ReadonlyArray<string>
+  readonly roots: Arr.NonEmptyReadonlyArray<string>
   readonly closure: ModuleClosure.ProjectClosure
+  /**
+   * A view of the shared project-wide facts, rooted at the first canonical root (not the configured
+   * application); every view carries the same project facts.
+   */
+  readonly primary: View
   readonly views: ReadonlyMap<string, View>
   readonly syntaxRevisions: ReadonlyMap<string, SyntaxRevision>
   readonly surfaces: ReadonlyMap<string, ModuleSurface.ModuleSurface>
@@ -75,7 +81,7 @@ const opaqueRealizationsOf = (self: ProjectAnalysis): OpaqueRealization.Catalog 
   )
 
 const analyze = Effect.fnUntraced(function* (
-  roots: ReadonlyArray<string>,
+  roots: Arr.NonEmptyReadonlyArray<string>,
   previous: ProjectAnalysis | undefined,
   options: Options,
 ): Effect.fn.Return<
@@ -103,8 +109,7 @@ const analyze = Effect.fnUntraced(function* (
         },
   )
   const root = unconfigured.closure.rootModules[0]
-  const closure = root === undefined ? undefined : ModuleClosure.view(unconfigured.closure, root)
-  const span = closure?.modules.find((module) => module.name === root)?.syntax.root.span
+  const span = unconfigured.closure.modules.find((module) => module.name === root)?.syntax.root.span
   const diagnostics = unconfigured.diagnostics
   const frontend = {
     ...unconfigured,
@@ -149,28 +154,26 @@ const analyze = Effect.fnUntraced(function* (
     })
   }
   const report = tooling.report
-  const views = new Map<string, View>()
-  for (const [ordinal, rootModule] of frontend.closure.rootModules.entries()) {
-    if (ordinal > 0 && ordinal % 8 === 0) yield* Effect.yieldNow
-    const closure = ModuleClosure.view(frontend.closure, rootModule)
-    if (closure === undefined)
-      throw new RangeError(`Project analysis lost requested root ${rootModule}`)
-    views.set(
-      rootModule,
-      OpaqueRealization.withCatalog(
-        {
-          _tag: 'ProjectAnalysisView',
-          realization: 'ProjectView',
-          ...frontend,
-          ...(options.configuration === undefined ? {} : { configuration: options.configuration }),
-          ...tooling,
-          closure,
-          semanticInvalidation: frontend.semanticInvalidation,
-          report,
-        },
-        OpaqueRealization.catalogOf(unconfigured),
-      ),
+  const viewOf = (closure: ModuleClosure.Closure): View =>
+    OpaqueRealization.withCatalog(
+      {
+        _tag: 'ProjectAnalysisView',
+        realization: 'ProjectView',
+        ...frontend,
+        ...(options.configuration === undefined ? {} : { configuration: options.configuration }),
+        ...tooling,
+        closure,
+        semanticInvalidation: frontend.semanticInvalidation,
+        report,
+      },
+      OpaqueRealization.catalogOf(unconfigured),
     )
+  const [first, ...rest] = ModuleClosure.views(frontend.closure)
+  const primary = viewOf(first)
+  const views = new Map<string, View>([[first.rootModule, primary]])
+  for (const [ordinal, closure] of rest.entries()) {
+    if ((ordinal + 1) % 8 === 0) yield* Effect.yieldNow
+    views.set(closure.rootModule, viewOf(closure))
   }
   return OpaqueRealization.withCatalog(
     {
@@ -178,6 +181,7 @@ const analyze = Effect.fnUntraced(function* (
       ...(frontend.profile === undefined ? {} : { profile: frontend.profile }),
       roots: frontend.closure.rootModules,
       closure: frontend.closure,
+      primary,
       views,
       syntaxRevisions,
       surfaces: frontend.surfaces,
@@ -196,7 +200,7 @@ const analyze = Effect.fnUntraced(function* (
 
 /** Constructs one history-independent frontend analysis for the union closure of all roots. */
 export const make = Effect.fn('ProjectAnalysis.make')(function* (
-  roots: ReadonlyArray<string>,
+  roots: Arr.NonEmptyReadonlyArray<string>,
   options: Options = {},
 ): Effect.fn.Return<
   ProjectAnalysis,
@@ -209,7 +213,7 @@ export const make = Effect.fn('ProjectAnalysis.make')(function* (
 /** Constructs a new coherent project while reusing safe syntax from one completed prior project. */
 export const revise = Effect.fn('ProjectAnalysis.revise')(function* (
   previous: ProjectAnalysis,
-  roots: ReadonlyArray<string>,
+  roots: Arr.NonEmptyReadonlyArray<string>,
   options: Options = {},
 ): Effect.fn.Return<
   ProjectAnalysis,

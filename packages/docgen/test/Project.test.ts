@@ -4,6 +4,7 @@ import * as Analysis from '@silklang/compiler/Analysis'
 import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import * as SourceFile from '@silklang/compiler/SourceFile'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Example from '../src/Example.js'
 import * as Json from '../src/Json.js'
@@ -134,7 +135,7 @@ pub type Trouble = Problem
 
 it.effect('builds one documentation model from a shared multi-root analysis', () =>
   Effect.gen(function* () {
-    const roots = [
+    const roots: Arr.NonEmptyReadonlyArray<SourceFile.SourceFile> = [
       SourceFile.make(
         'app/A',
         encode(`import shared.Core
@@ -155,7 +156,7 @@ pub fn b() -> i32 { return Core.answer() }
 `),
       ),
     ]
-    const analysis = yield* ProjectAnalysis.make(roots.map((source) => source.id)).pipe(
+    const analysis = yield* ProjectAnalysis.make(Arr.map(roots, (source) => source.id)).pipe(
       Effect.provide(
         SourceResolver.overlay(roots).pipe(
           Layer.provideMerge(

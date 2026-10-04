@@ -653,10 +653,9 @@ it.effect('fails unavailable required roots before returning a partial project',
       module: 'broken',
       error: failure,
     })
-    const empty = yield* Effect.flip(
-      ModuleClosure.loadProject({ roots: [] }).pipe(Effect.provide(resolver)),
-    )
-    assert.deepEqual(empty.reason, { _tag: 'EmptyRoots' })
+    // Zero roots are unrepresentable; the test typecheck fails once a request accepts them.
+    // @ts-expect-error a project request needs at least one root
+    void ModuleClosure.loadProject({ roots: [] })
   }),
 )
 

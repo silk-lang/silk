@@ -46,6 +46,8 @@ import { websocketUpgradePortableAcceptanceSource } from './support/websocketUpg
 import { httpValuesAcceptanceSource } from './support/httpValuesAcceptance.js'
 import { networkAddressResolutionCorpusProgram } from './support/networkAddressResolutionAcceptance.js'
 import * as Driver from './support/TestDriver.js'
+import * as NativeWork from './support/NativeWork.js'
+import { unreachable } from './support/raise.js'
 import type * as TestExecution from '../src/TestExecution.js'
 
 const defaultClang = (): string => {
@@ -305,28 +307,6 @@ const compileCSources = Effect.fnUntraced(function* (
   )
 })
 
-/**
- * `SILK_NATIVE_SHARD=k/n` selects every n-th corpus case starting at k (1-based), and
- * `SILK_NATIVE_CORPUS_CASES` selects a comma-separated smoke set. Fixed acceptance scenarios run
- * only on shard one and can be disabled with `SILK_NATIVE_FIXED_TESTS=false`.
- */
-const shard = /^([1-9]\d*)\/([1-9]\d*)$/.exec(configured('SILK_NATIVE_SHARD'))
-const runFixedTests =
-  configured('SILK_NATIVE_FIXED_TESTS', 'true') === 'true' &&
-  (shard === null || Number(shard[1]) === 1)
-const shardedCorpus =
-  shard === null
-    ? nativeCorpus
-    : nativeCorpus.filter((_, index) => index % Number(shard[2]) === Number(shard[1]) - 1)
-const selectedNativeCases = new Set(
-  configured('SILK_NATIVE_CORPUS_CASES')
-    .split(',')
-    .map((name) => name.trim())
-    .filter((name) => name.length !== 0),
-)
-const selectedCorpus = shardedCorpus.filter(
-  (program) => selectedNativeCases.size === 0 || selectedNativeCases.has(program.name),
-)
 const portableWasmCorpus = [
   {
     name: httpRedirectCorpusProgram.name,
@@ -361,32 +341,100 @@ const portableWasmCorpus = [
     expected: 42,
   })),
 ] as const
-const selectedWasmCorpus = portableWasmCorpus.filter(({ name }) =>
-  selectedNativeCases.size === 0 ? runFixedTests : selectedNativeCases.has(name),
+
+const fixedScenarios = [
+  'relinks named archives after content and search-resolution changes',
+  'builds loadable shared/static libraries with only C exports visible',
+  'runs the bundled test runner through typed failure, cleanup, filtering, and fatal traps',
+  'runs a source-defined custom runner against a separate discovery root',
+  'fails to link a foreign symbol nothing defines and keeps the linker output',
+  'links and runs the native system and monotonic clock ABI',
+] as const
+
+const nativeWork = { native: nativeCorpus, fixed: fixedScenarios, wasm: portableWasmCorpus }
+
+/**
+ * `SILK_NATIVE_SHARD=k/n` runs shard k (1-based) of an n-way split of every native corpus case,
+ * fixed scenario, and portable Wasm case. `SILK_NATIVE_CORPUS_CASES` selects a comma-separated
+ * smoke set of native or Wasm cases, and `SILK_NATIVE_FIXED_TESTS=false` disables fixed scenarios
+ * and unrequested Wasm cases. `NativeWork.select` is the only selection path.
+ */
+const requestedShard = configured('SILK_NATIVE_SHARD')
+const requestedCases = new Set(
+  configured('SILK_NATIVE_CORPUS_CASES')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length !== 0),
 )
+const selected = NativeWork.select(nativeWork, {
+  shard:
+    requestedShard === ''
+      ? undefined
+      : (NativeWork.parseShard(requestedShard) ??
+        unreachable('SILK_NATIVE_SHARD must be k/n with 1 <= k <= n')),
+  fixed: configured('SILK_NATIVE_FIXED_TESTS', 'true') === 'true',
+  cases: requestedCases,
+})
+
+type EffectTest = Parameters<typeof it.effect>
+const fixedScenario = (
+  name: (typeof fixedScenarios)[number],
+  self: EffectTest[1],
+  timeout?: EffectTest[2],
+): void => it.effect.skipIf(!selected.fixed.includes(name))(name, self, timeout)
 
 // A requested case may name either corpus: the wasm entries are how a 32-bit regression reaches
 // the PR lane, which sets `SILK_NATIVE_FIXED_TESTS=false`.
 it('finds every requested native corpus case', () => {
   assert.deepStrictEqual(
-    [...selectedNativeCases].filter(
+    [...requestedCases].filter(
       (name) =>
-        !selectedCorpus.some((program) => program.name === name) &&
-        !selectedWasmCorpus.some((program) => program.name === name),
+        !selected.native.some((program) => program.name === name) &&
+        !selected.wasm.some((program) => program.name === name),
     ),
     [],
   )
 })
 
-it('assigns every native corpus case to exactly one CI shard', () => {
-  const assignments = Array.from({ length: 3 }, (_, shardIndex) =>
-    nativeCorpus.filter((_, index) => index % 3 === shardIndex),
-  ).flat()
-  assert.strictEqual(new Set(assignments.map((program) => program.name)).size, nativeCorpus.length)
-  assert.deepEqual(
-    assignments.map((program) => program.name).sort(),
-    nativeCorpus.map((program) => program.name).sort(),
+it('selects requested cases and deals every native, fixed, and Wasm case to exactly one shard', () => {
+  const names = (work: NativeWork.NativeWork<NativeWork.Named, string, NativeWork.Named>) => [
+    ...work.native.map((program) => `native:${program.name}`),
+    ...work.fixed.map((name) => `fixed:${name}`),
+    ...work.wasm.map((program) => `wasm:${program.name}`),
+  ]
+  // Names key build roots and case selection, so each category's names are unique.
+  assert.strictEqual(new Set(names(nativeWork)).size, names(nativeWork).length)
+  // Some cases run in both corpora; pick one name from each that the other lacks.
+  const native =
+    nativeCorpus.find((program) => !portableWasmCorpus.some(({ name }) => name === program.name)) ??
+    unreachable('expected a native-only case')
+  const wasm =
+    portableWasmCorpus.find((program) => !nativeCorpus.some(({ name }) => name === program.name)) ??
+    unreachable('expected a Wasm-only case')
+  assert.deepStrictEqual(
+    names(
+      NativeWork.select(nativeWork, {
+        shard: undefined,
+        fixed: false,
+        cases: new Set([native.name, wasm.name]),
+      }),
+    ),
+    [`native:${native.name}`, `wasm:${wasm.name}`],
   )
+  for (const count of [1, 2, 3, 4]) {
+    const shards = Array.from({ length: count }, (_, index) =>
+      NativeWork.select(nativeWork, {
+        shard: { index: index + 1, count },
+        fixed: true,
+        cases: new Set(),
+      }),
+    )
+    assert.deepStrictEqual(shards.flatMap(names).sort(), names(nativeWork).sort(), `${count}`)
+    for (const shard of shards) {
+      assert.isNotEmpty(shard.fixed, `${count}`)
+      assert.isNotEmpty(shard.wasm, `${count}`)
+    }
+  }
 })
 
 const librarySource = `unsafe extern "C" fn abs(value: i32) -> i32
@@ -398,93 +446,91 @@ const consumerSource = `#include "answer.h"
 int main(void) { return increment(40) + (int32_t)silk_abi_version; }
 `
 
-it.effect.skipIf(!runFixedTests)(
-  'relinks named archives after content and search-resolution changes',
-  () =>
-    NativeToolchain.withBuildScope('named-archive-cache', (scope) =>
-      Effect.gen(function* () {
-        const target = yield* NativeToolchain.hostTarget()
-        const earlier = join(scope.root, 'earlier')
-        const later = join(scope.root, 'later')
-        yield* Effect.sync(() => {
-          mkdirSync(earlier)
-          mkdirSync(later)
+fixedScenario('relinks named archives after content and search-resolution changes', () =>
+  NativeToolchain.withBuildScope('named-archive-cache', (scope) =>
+    Effect.gen(function* () {
+      const target = yield* NativeToolchain.hostTarget()
+      const earlier = join(scope.root, 'earlier')
+      const later = join(scope.root, 'later')
+      yield* Effect.sync(() => {
+        mkdirSync(earlier)
+        mkdirSync(later)
+      })
+      const archive = Effect.fnUntraced(function* (directory: string, value: number) {
+        const object = yield* NativeToolchain.compileCObject(
+          toolchain,
+          scope,
+          target,
+          'selected',
+          `int silk_cache_selected(void) { return ${value}; }`,
+        )
+        const destination = join(directory, 'libsilk_cache_selected.a')
+        const plan = yield* NativeToolchain.planNativeLink(
+          toolchain,
+          scope,
+          'NativeStaticLibrary',
+          yield* CompilationProfile.normalize({ target: target.id }),
+          [object.artifact],
+          [],
+          destination,
+          {
+            request: { kind: 'default' },
+            composition: { kind: 'default' },
+            resolved: { kind: 'default' },
+          },
+        )
+        yield* Linker.link({
+          scope,
+          plan,
+          artifactKind: 'NativeStaticLibrary',
+          destination,
+          cache: Object.freeze({ _tag: 'Disabled' }),
         })
-        const archive = Effect.fnUntraced(function* (directory: string, value: number) {
-          const object = yield* NativeToolchain.compileCObject(
-            toolchain,
-            scope,
-            target,
-            'selected',
-            `int silk_cache_selected(void) { return ${value}; }`,
-          )
-          const destination = join(directory, 'libsilk_cache_selected.a')
-          const plan = yield* NativeToolchain.planNativeLink(
-            toolchain,
-            scope,
-            'NativeStaticLibrary',
-            yield* CompilationProfile.normalize({ target: target.id }),
-            [object.artifact],
-            [],
-            destination,
-            {
-              request: { kind: 'default' },
-              composition: { kind: 'default' },
-              resolved: { kind: 'default' },
-            },
-          )
-          yield* Linker.link({
-            scope,
-            plan,
-            artifactKind: 'NativeStaticLibrary',
-            destination,
-            cache: Object.freeze({ _tag: 'Disabled' }),
-          })
-        })
-        const source = `unsafe extern "C" fn silk_cache_selected() -> i32
+      })
+      const source = `unsafe extern "C" fn silk_cache_selected() -> i32
 pub fn main() -> i32 { return unsafe silk_cache_selected() }`
-        const options = {
-          cache: true,
-          artifactStorage: yield* NativeToolchain.defaultArtifactStorage(
-            join(scope.root, 'cache'),
-          ).pipe(Effect.provide(NodeServices.layer)),
-          nativeLinkInputs: [
-            NativeLinkInput.searchPath(earlier),
-            NativeLinkInput.searchPath(later),
-            // Darwin's ordinary -l selection falls back to the sole .a fixture.
-            NativeLinkInput.library(
-              'silk_cache_selected',
-              platform() === 'darwin' ? 'Dynamic' : 'Static',
-            ),
-          ],
-        }
-        const statuses: Array<number | null> = []
-        const phases: Array<ReadonlyArray<string>> = []
-        for (const [directory, value] of [
-          [later, 11],
-          [later, 22],
-          [earlier, 33],
-        ] as const) {
-          yield* archive(directory, value)
-          const outcome = yield* compileSource('named-archive-cache', source, undefined, options)
-          assert.strictEqual(outcome._tag, 'Compiled')
-          if (outcome._tag !== 'Compiled') return
-          const run = yield* runCompiled(outcome.path)
-          statuses.push(run.status)
-          phases.push(outcome.report.map((entry) => entry.phase))
-        }
-        assert.deepStrictEqual(statuses, [11, 22, 33])
-        for (const report of phases) {
-          assert.include(report, 'link')
-          assert.notInclude(report, 'artifact-cache')
-        }
-        assert.include(phases[1] ?? [], 'backend-cache')
-        assert.include(phases[2] ?? [], 'backend-cache')
-      }),
-    ),
+      const options = {
+        cache: true,
+        artifactStorage: yield* NativeToolchain.defaultArtifactStorage(
+          join(scope.root, 'cache'),
+        ).pipe(Effect.provide(NodeServices.layer)),
+        nativeLinkInputs: [
+          NativeLinkInput.searchPath(earlier),
+          NativeLinkInput.searchPath(later),
+          // Darwin's ordinary -l selection falls back to the sole .a fixture.
+          NativeLinkInput.library(
+            'silk_cache_selected',
+            platform() === 'darwin' ? 'Dynamic' : 'Static',
+          ),
+        ],
+      }
+      const statuses: Array<number | null> = []
+      const phases: Array<ReadonlyArray<string>> = []
+      for (const [directory, value] of [
+        [later, 11],
+        [later, 22],
+        [earlier, 33],
+      ] as const) {
+        yield* archive(directory, value)
+        const outcome = yield* compileSource('named-archive-cache', source, undefined, options)
+        assert.strictEqual(outcome._tag, 'Compiled')
+        if (outcome._tag !== 'Compiled') return
+        const run = yield* runCompiled(outcome.path)
+        statuses.push(run.status)
+        phases.push(outcome.report.map((entry) => entry.phase))
+      }
+      assert.deepStrictEqual(statuses, [11, 22, 33])
+      for (const report of phases) {
+        assert.include(report, 'link')
+        assert.notInclude(report, 'artifact-cache')
+      }
+      assert.include(phases[1] ?? [], 'backend-cache')
+      assert.include(phases[2] ?? [], 'backend-cache')
+    }),
+  ),
 )
 
-it.effect.skipIf(!runFixedTests)(
+fixedScenario(
   'builds loadable shared/static libraries with only C exports visible',
   () =>
     Effect.gen(function* () {
@@ -607,7 +653,7 @@ it.effect.skipIf(!runFixedTests)(
   60_000,
 )
 
-it.effect.skipIf(!runFixedTests)(
+fixedScenario(
   'runs the bundled test runner through typed failure, cleanup, filtering, and fatal traps',
   () =>
     NativeToolchain.withBuildScope('source-test-runner', (scope) =>
@@ -909,7 +955,7 @@ test fn runsAfterFailure() -> () {
   120_000,
 )
 
-it.effect.skipIf(!runFixedTests)(
+fixedScenario(
   'runs a source-defined custom runner against a separate discovery root',
   () =>
     NativeToolchain.withBuildScope('custom-source-test-runner', (scope) =>
@@ -966,7 +1012,7 @@ test fn second() { unsafe silk_test_observe_second() }`,
   120_000,
 )
 
-it.effect.each(selectedCorpus)(
+it.effect.each(selected.native)(
   'runs the native corpus case $name',
   (program) =>
     Effect.gen(function* () {
@@ -1042,7 +1088,7 @@ it.effect.each(selectedCorpus)(
   1_500_000,
 )
 
-it.effect.each(selectedWasmCorpus)(
+it.effect.each(selected.wasm)(
   'runs the shared portable corpus case $name through LLVM-to-Wasm',
   ({ name, source, expected }) =>
     Effect.gen(function* () {
@@ -1084,7 +1130,7 @@ it.effect.each(selectedWasmCorpus)(
   600_000,
 )
 
-it.effect.skipIf(!runFixedTests)(
+fixedScenario(
   'fails to link a foreign symbol nothing defines and keeps the linker output',
   () =>
     Effect.gen(function* () {
@@ -1107,7 +1153,7 @@ pub fn main() -> i32 { return unsafe silk_test_missing_symbol(1) }`,
     }),
   120_000,
 )
-it.effect.skipIf(!runFixedTests)(
+fixedScenario(
   'links and runs the native system and monotonic clock ABI',
   () =>
     Effect.gen(function* () {

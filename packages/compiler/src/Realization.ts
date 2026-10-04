@@ -244,13 +244,16 @@ export const lowerMir = Effect.fn('Mir.lower')(function* (
 ): Effect.fn.Return<MirLoweringResult> {
   if (input.admission._tag === 'Rejected')
     return { program: undefined, diagnostics: input.admission.diagnostics }
-  const program = yield* lowerProgram(
+  const lowered = yield* lowerProgram(
     input.instances,
     input.layout,
     input.index,
     input.opaqueRealizations,
     input.presentation,
   )
+  if (lowered.diagnostics.length > 0)
+    return { program: undefined, diagnostics: lowered.diagnostics }
+  const program = lowered.program
   const provisional = yield* buildProvisionalMir(input.instances, input.layout, input.index)
   const finalized = yield* finalizeMir(
     program,

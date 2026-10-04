@@ -139,7 +139,8 @@ Each entry records:
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
-  Step 6d, which lowers partial moves.
+  Step 6d, which lowers partial moves, and Step 7, which substitutes complete generic nominal
+  instance payloads before selecting and building drop glue.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
@@ -147,8 +148,7 @@ Each entry records:
   between joining paths or that is moved on only some paths, a write at a runtime index beside a
   moved element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for Effect environments, generic nominal unions and unions without a
-  canonical member order.
+  drop glue for callable and Effect environments and unions without a canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
@@ -156,6 +156,115 @@ Each entry records:
   guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
   borrowing match result gap, which current typing cannot reach because it borrows only places and
   Drop-free array literals, and the deferred glue forms.
+
+### Selfhost keeps unavailable conditional sealed-property proofs explicit
+
+- **Status:** recorded on 2026-10-04 with Step 7 review corrections.
+- **Rule:** generic Copy and Drop implementations apply only when their exact provider head and
+  substituted bounds hold. Drop hooks use the head's unification bindings, including reordered,
+  fixed and nested provider arguments, rather than nominal argument positions.
+- **Compilers:** selfhost proves lexical premises, Copy, outlives, retained-region and interface
+  conformance constraints through the ordinary semantic queries. It does not yet execute every
+  intrinsic property or representation proof supported by the bootstrap. Such an unavailable
+  concrete proof remains `Unsupported`, never absence of a required Drop hook. Without proof of
+  an abstract conditional Copy head, ordinary abstract checking conservatively keeps it affine.
+- **Source migration:** none; the remaining property/representation solver is a named follow-up,
+  not a generic-instance layout or library-constructor exception.
+- **Evidence:** `genericSealedCopyUsesLexicalAndLifetimePremises`,
+  `genericSealedDropRetainsExactHeadBindings` and `genericSealedUnknownDropProofIsNotAbsence` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
+### Selfhost checks lifetime-sensitive erased instance recipes before emission reuse
+
+- **Status:** correction in progress on 2026-10-04 after combined Step 7 review; native
+  execution and exact-head CI are not yet verified.
+- **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
+  cleanup. MIR remains layout-free, and emitted instance keys use the canonical runtime form
+  described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
+- **Compilers:** the bootstrap can compile lifetime-sensitive conditional Drop implementations.
+  Selfhost must resolve every exact semantic glue and function application before deciding
+  whether its erased runtime symbol can be shared. Equal emitted recipes may share; incompatible
+  recipes report `instance-recipe`, never silently reuse the first application's cleanup.
+- **Source migration:** none. This is a native emitted-instance follow-up, not an Option/Result
+  exception or an effect/closure deferral.
+- **Evidence:** review counterexample: `Guard<'a>` always owns a droppable `Token`, but its own
+  `impl<'a: 'static> Drop` hook applies to a static instance and not a local one. Both demand
+  orders and an equal-recipe sharing control are being added; native results remain pending.
+- **Open questions:** canonical runtime recipe identity must support incompatible lifetime-
+  sensitive instances before the native compiler can accept that broader conditional subset.
+
+### Selfhost generic aggregate diagnostics retain existing family differences
+
+- **Status:** recorded on 2026-10-04 with Step 7 review corrections; native test execution is
+  pending.
+- **Rule:** written constructor prefixes are fixed evidence, only omitted parameters may be
+  inferred, record patterns must select the scrutinee's exact owner, and applied generic bounds
+  must follow lexical premises.
+- **Compilers:** bootstrap reports `SEM0025` for a fixed-prefix field type mismatch and `SEM0042`
+  for a different record owner in a pattern. The native frontend uses its existing `TypeMismatch`
+  family at the offending field operand and record pattern, respectively. An unresolved aggregate
+  parameter is anchored at its declaration. A missing abstract Copy proof remains `Unsupported`
+  at the constrained constructor, not a fabricated proof.
+- **Source migration:** none.
+- **Evidence:** `genericRecordConstructionPrefixesRemainFixedAndQualified`,
+  `genericRecordPatternsCheckAbstractlyBeforeCompleteMir` and
+  `genericNominalConstructionRetainsLexicalBounds` contain independent code/span
+  controls; execution is not yet claimed.
+
+### Inherent members retain their bounded nominal owner's domain premises
+
+- **Status:** intentional native correction authored on 2026-10-04 during Step 7 review;
+  native execution and exact-head CI are pending.
+- **Rule:** a local whole-family `impl<T> Box<T>` for `Box<T: Copy>` operates within the
+  owner's valid domain. Its receiver/header and ordinary abstract body inherit `Copy(T)`.
+  These are substituted owner premises, not extra authored implementation bounds. Ordinary
+  applications and conformance heads must still prove the owner's bounds.
+- **Compilers:** the bootstrap accepts this inherent head but rejects returning `self.value`
+  from a borrowed `Box<T>` with `OWN0002`. Its ownership `Project` path classifies the field
+  with the member's Copy assumptions and treats it as a partial move when the owner's premise
+  is absent. Native signatures explicitly retain the validated owner's premises; this avoids
+  a concrete specialization concealing an invalid abstract body.
+- **Source migration:** keep the whole-family head `impl<T> Box<T>`; adding `T: Copy` to
+  the authored implementation binders is not a workaround for this domain-premise omission.
+- **Evidence:** bootstrap reduced probe `bounded-copied.silk` rejects `self.value`; native
+  structured control `genericBoundedOwnerSuppliesReceiverHeaderAndFieldCopy` separately checks
+  the caller's borrowed receiver, exact member header and ContractTyped field projection.
+  Native results remain pending. The unbounded-construction negative remains in
+  `genericNominalConstructionRetainsLexicalBounds`.
+- **Owner:** bootstrap nominal-domain premise propagation follow-up; no Option/Result exception.
+
+### Selfhost bounds inline stored-property proof recursion
+
+- **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
+  and exact-head CI remain pending.
+- **Rule:** Copy and cleanup proofs must terminate without treating impossible inline storage as
+  Copy or cleanup-free. Consuming a strict runtime-subterm argument discharges only that ancestor
+  frame; older cycle evidence remains. Finite descent through an opaque nominal argument's fields
+  is allowed, including `A<B>` followed by `B` and `A<i32>`.
+- **Compilers:** bootstrap's declaration-completion storage SCC reports `SEM0020` at an aggregate
+  name. Native on-demand Copy validation reports its existing `InvalidCopyConformance` family at
+  the selecting Copy implementation; cleanup reports `InlineStorageUnavailable` at the repeated
+  aggregate's whole declaration with the named `inline-storage-recursion` gap. Both module and
+  span come from that same selecting declaration, including imported cycles.
+- **Source migration:** none; infinitely expanding inline storage has no finite runtime layout.
+- **Evidence:** `genericCopyRejectsAffineStoredFieldsAndOwnDrop`,
+  `genericCopyCyclesKeepCompleteImportedDiagnosticSite` and
+  `genericCleanupPropertiesKeepFiniteOpaqueDescentAndRejectGrowth`; corrected execution pending.
+
+### Selfhost keeps generic aggregate borrow regions tied to actual places
+
+- **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
+  and exact-head CI remain pending.
+- **Rule:** fixed lifetime arguments cannot be replaced by local inference or manufacture a
+  stronger loan than the borrowed storage. Reborrowing a parameter referent retains its source
+  region; a static result annotation cannot turn owned local storage into a static loan.
+- **Compilers:** bootstrap reports `SEM0212` at the invalid local borrow and `OWN0019` at its
+  enclosing return use. The native aggregate operand boundary retains `TypeMismatch` at that
+  borrow, consistent with its existing field type-mismatch family. Complete and partial written
+  prefixes remain fixed evidence.
+- **Source migration:** none.
+- **Evidence:** positive complete/partial prefixes and the local-to-static negative in
+  `genericNominalBorrowArgumentsPreserveActualRegions`; reduced-fixture native execution pending.
 
 ### Selfhost guard ownership checking is limited to callable availability
 
@@ -178,8 +287,8 @@ Each entry records:
   `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation and nested
   explicit callee moves with diagnostic spans. The
   `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
-  Source callable-bearing record patterns remain blocked by generic record typing and are not
-  claimed as native runtime coverage here.
+  Source callable-bearing record patterns are not claimed as native runtime coverage here;
+  their remaining callable availability and lowering work belongs to Step 8, not generic records.
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
   reference should widen it, before extending selfhost's general guard ownership checking.
 

@@ -5,6 +5,7 @@ import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as WorkspaceInventory from '@silklang/compiler/WorkspaceInventory'
 import * as WorkspaceCatalog from '../src/WorkspaceCatalog.js'
 import * as Deferred from 'effect/Deferred'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Inspectable from 'effect/Inspectable'
 import * as Console from 'effect/Console'
@@ -41,17 +42,17 @@ const analyze = Effect.fnUntraced(function* (
   documents: ReadonlyArray<Document.Document>,
   previous: ReadonlyMap<string, ProjectSnapshot.DocumentSnapshot>,
 ) {
+  if (!Arr.isReadonlyArrayNonEmpty(documents))
+    return new Map<string, ProjectSnapshot.DocumentSnapshot>()
+  const modules = Arr.map(documents, (document) => document.module)
   const roots = documents.map((document) => SourceFile.make(document.module, document.bytes))
   const previousProject = previous.values().next().value?.project
   const project = yield* (
     previousProject === undefined
-      ? ProjectAnalysis.make(roots.map((source) => source.id)).pipe(
+      ? ProjectAnalysis.make(modules).pipe(Effect.provide(SourceResolver.overlay(roots)))
+      : ProjectAnalysis.revise(previousProject, modules).pipe(
           Effect.provide(SourceResolver.overlay(roots)),
         )
-      : ProjectAnalysis.revise(
-          previousProject,
-          roots.map((source) => source.id),
-        ).pipe(Effect.provide(SourceResolver.overlay(roots)))
   ).pipe(Effect.provide(SourceResolver.empty))
   const moduleUris = new Map(documents.map((document) => [document.module, document.uri]))
   const inventory = yield* WorkspaceCatalog.defer(Effect.sync(() => WorkspaceInventory.make()))

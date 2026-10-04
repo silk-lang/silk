@@ -142,8 +142,8 @@ additional investigable lead.
 
 ## Test boundary
 
-Discovery does not run `pnpm check`, the full test suite, native differential acceptance, or
-`pnpm release:candidate` by default. Those commands validate solutions and release readiness; they
+Discovery does not run `pnpm check`, the full test suite, or native differential acceptance by
+default. Those commands validate solutions; they
 belong to triage when needed to decide a lead, or to work when verifying an implementation.
 
 A scout may run one focused test, package check, dry run, or minimal reproducer when that is the

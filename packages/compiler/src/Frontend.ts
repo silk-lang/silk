@@ -5,6 +5,7 @@ import type * as ProfileBootstrap from './ProfileBootstrap.js'
 import * as CompilationProfile from './CompilationProfile.js'
 import * as Result from 'effect/Result'
 import * as ConfigurationError from './ConfigurationError.js'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Option from 'effect/Option'
 import * as BodyQuery from './BodyQuery.js'
@@ -794,7 +795,7 @@ const expandProjectRoots = Effect.fnUntraced(function* (
 ): Effect.fn.Return<ModuleClosure.ProjectRequest> {
   const application = request.application ?? request.roots[0]
   const additionalRoots = new Set(request.additionalRoots ?? [])
-  if (request.configuration !== undefined && application !== undefined) {
+  if (request.configuration !== undefined) {
     const selected = yield* Effect.result(
       resolveProjectComposition(application, request.configuration),
     )
@@ -803,14 +804,11 @@ const expandProjectRoots = Effect.fnUntraced(function* (
   }
   return {
     ...request,
-    roots: [
-      ...new Set([
-        ...request.roots,
-        ...(request.application === undefined ? [] : [request.application]),
-      ]),
-    ],
+    roots: Arr.dedupe(
+      Arr.appendAll(request.roots, request.application === undefined ? [] : [request.application]),
+    ),
     additionalRoots: [...additionalRoots],
-    ...(application === undefined ? {} : { application }),
+    application,
   }
 })
 
@@ -855,7 +853,7 @@ const configureProjectSelection = Effect.fn('Frontend.configureProjectSelection'
       application !== undefined && closure.sources.has(application)
         ? application
         : closure.rootModules[0]
-    const view = first === undefined ? undefined : ModuleClosure.view(closure, first)
+    const view = ModuleClosure.view(closure, first)
     if (view === undefined) throw new RangeError('Project selection lost its root')
     const base = yield* bootstrapFacts(closure, report, options)
     if (!ModuleSelection.required(closure)) bootstrapHeaders = base
@@ -889,10 +887,8 @@ const diagnoseMissingProjectRoots = Effect.fn('Frontend.diagnoseMissingProjectRo
     missing: ReadonlyArray<string>,
   ) =>
     Effect.sync(() => {
-      const span =
-        request.roots[0] === undefined
-          ? undefined
-          : closure.modules.find((module) => module.name === request.roots[0])?.syntax.root.span
+      const span = closure.modules.find((module) => module.name === request.roots[0])?.syntax.root
+        .span
       if (missing.length > 0 && span !== undefined)
         closure = {
           ...closure,

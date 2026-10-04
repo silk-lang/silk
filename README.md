@@ -76,15 +76,13 @@ pnpm install
 pnpm dev
 pnpm build
 pnpm check
-pnpm release:candidate
 ```
 
 `pnpm dev` runs package compilers in watch mode alongside the documentation app. `pnpm build`
 creates a dependency-ordered production build of every workspace package and app.
 
 Effect-returning tests use `it.effect` from `@effect/vitest`; pure tests use ordinary `it` with
-`assert`. Package-facing changes require a Changesets entry and a validated packed release
-candidate.
+`assert`.
 
 ## License
 

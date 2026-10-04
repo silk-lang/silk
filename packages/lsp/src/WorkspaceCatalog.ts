@@ -9,6 +9,7 @@ import * as SourceOrigin from '@silklang/compiler/SourceOrigin'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as Stdlib from '@silklang/compiler/Stdlib'
 import * as WorkspaceInventory from '@silklang/compiler/WorkspaceInventory'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Option from 'effect/Option'
@@ -102,17 +103,15 @@ const summarize = (
 const toolchain = (
   previous: WorkspaceInventory.WorkspaceInventory | undefined,
   counters: Counters,
-): ReadonlyMap<string, ModuleSummary.ModuleSummary> => {
-  if (previous !== undefined && previous.toolchain.size > 0) return previous.toolchain
-  return new Map(
-    Stdlib.manifest.map((entry) => {
-      const source = SourceFile.make(
-        entry.module,
-        entry.bytes,
-        SourceOrigin.toolchainFile(entry.sourceUrl.href),
-      )
-      return [entry.module, summarize(source, undefined, counters)] as const
-    }),
+): Arr.NonEmptyReadonlyArray<ModuleSummary.ModuleSummary> => {
+  const prior = previous === undefined ? [] : [...previous.toolchain.values()]
+  if (Arr.isReadonlyArrayNonEmpty(prior)) return prior
+  return Arr.map(Stdlib.manifest, (entry) =>
+    summarize(
+      SourceFile.make(entry.module, entry.bytes, SourceOrigin.toolchainFile(entry.sourceUrl.href)),
+      undefined,
+      counters,
+    ),
   )
 }
 
@@ -201,11 +200,11 @@ export const refresh = Effect.fn('WorkspaceCatalog.refresh')(function* (
 
   const discoveryElapsedMs = performance.now() - discoveryStartedAt
   const bundled = toolchain(request.previous, counters)
-  const roots = [...project.values(), ...bundled.values()].map((summary) => summary.source)
+  const roots = Arr.map(Arr.appendAll([...project.values()], bundled), (summary) => summary.source)
   const priorAnalysis = request.previous === undefined ? undefined : analyses.get(request.previous)
   const analysis = yield* SourceCatalog.analyze(
     {
-      roots: roots.map((source) => source.id),
+      roots: Arr.map(roots, (source) => source.id),
       ...(request.configuration.application === undefined
         ? {}
         : { application: request.configuration.application }),
