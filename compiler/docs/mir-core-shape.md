@@ -213,6 +213,12 @@ suspension point structurally).
   before layout, glue or invocation. Repeated staging keeps capture order while retaining each
   field's original argument ordinal. The resulting section's mode includes its new captures;
   the original anonymous target still receives its environment in that target's actual mode.
+  A generic named section keeps an immutable bound blueprint and construction-selected evidence
+  indexed by original binder ordinal. Remaining parameter occurrences may defer target binders;
+  unused or result-only binders cannot. Each invocation opens the raw target signature before
+  inserting free caller evidence, solves independently, proves the target bounds, then constructs
+  an ordinary complete function application. The blueprint is type metadata; only supplied
+  captures occupy the environment record. It never becomes a function key or dispatch adapter.
 - **Named effect fn runners** keep their written parameters as ordinary `Parameter` locals, so
   `run f(a)` is `Call(f, [a], providers)`. Running a stored Effect built from `f` moves (`once`) or
   copies its fields into those arguments. Effect blocks and anonymous effect fns take the closure

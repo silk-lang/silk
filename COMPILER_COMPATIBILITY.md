@@ -217,6 +217,21 @@ Each entry records:
   codes and pipe spans. Interface-operation and Effect pipeline coverage remain separate gaps.
 - **Source migration:** construct a unary section on the right, for example `2 |> add(3)`.
 
+### Generic named sections in selfhost
+
+- **Status:** direct invocation implemented in the Step 8 generic-section layer; broader admission
+  remains owned by #567 Step 8.
+- **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
+  result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
+  independently; immutable construction evidence keeps its original binder ordinal.
+- **Compilers:** bootstrap additionally admits a generic section against a contextual callable
+  contract and supports its further staging. Selfhost retains those cases as `typed-form` gaps,
+  along with sections requiring deferred lifetime/row binders, enclosing scope or static evidence.
+  These gaps do not become a signature-mismatch diagnostic.
+- **Evidence:** `genericNamedSectionsInferEachInvocationIndependently` and
+  `genericNamedSectionsPreserveSparseSelectedOrdinals` assert ordinary direct instances for both
+  `i32` and `bool`, stored suffix operands, immutable metadata and capture-only layout.
+
 ### Reached Effect literals in selfhost
 
 - **Status:** deferred to #567 Step 9; named during the Step 8 corpus sweep on 2026-10-03.
