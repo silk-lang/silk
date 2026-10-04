@@ -59,4 +59,12 @@ export const selfhostTrack = [
   'operator-pipeline',
   'staged-callable-section',
   'native-descriptor-write',
+  'callable-return-and-borrow-contracts',
+  'borrowed-capture-section',
+  'relayed-section',
+  'generic-item-pipeline-in-generic-owner',
+  'constrained-section-generic-owner',
+  'owner-typed-direct-section',
+  'option-result-combinators',
+  'opaque-callable',
 ] as const satisfies ReadonlyArray<string>

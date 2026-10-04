@@ -43,8 +43,8 @@ whose owned structure carries `impl Drop`, found through the implementation quer
 other value emits nothing; a drop that needs cleanup calls the drop glue of the value's type. Glue is
 its own instance keyed by the type: it calls the `impl Drop` hook, then drops the children that
 need cleanup, fields in declaration order, array elements in ascending order and only the active
-union member or variant. Callable and Effect environments and unions
-without a canonical member order still report the `cleanup` gap. MIR lowering keeps a cleanup
+union member or variant. Exact callable environments use the same capture-ordered record glue. Effect environments and
+unions without a canonical member order still report the `cleanup` gap. MIR lowering keeps a cleanup
 stack: bindings and by-value parameters that need cleanup are owners of their scope, consuming sites
 mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,
 innermost first and in reverse acquisition order. Replacement drops the displaced value first.
@@ -177,7 +177,9 @@ nested literal starts a new owner scope. Anonymous `effect fn` literals share th
 kind with Effect blocks. Moving named declarations, changing offsets or adding unrelated bindings
 does not change these identities. Inserting a same-kind literal before another changes its ordinal.
 Literal declarations do not create module name candidates. Their written headers and body content
-have separate fingerprints; semantic capture checking and native invocation remain Step 8 work.
+have separate fingerprints. Non-effect capture checking, capture-ordered environment layout and
+drop glue, sections and direct invocation are implemented. See the
+[Step 8 coverage receipt](docs/step8-callable-sweep.md) for structured claims, pins and remaining gaps.
 
 ## In-memory semantic queries
 
@@ -990,4 +992,5 @@ mutation and exclusive forwarding retain exclusive loans; affine moves produce o
 The typed literal retains its separately checked body and environment aliases for MIR lowering.
 The application retains enclosing generic scopes, including inputs used only by the body, and the
 use contract quantifies the anonymous parameters' invocation lifetimes. Runtime construction,
-invocation and capture glue are the next Step 8 layer.
+invocation and capture glue use the exact environment type and original body instance, as
+recorded in the [Step 8 coverage receipt](docs/step8-callable-sweep.md).

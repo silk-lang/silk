@@ -332,13 +332,15 @@ Each entry records:
   explicit callee moves with diagnostic spans. The
   `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
   Source callable-bearing record patterns are not claimed as native runtime coverage here;
-  their remaining callable availability and lowering work belongs to Step 8, not generic records.
+  unexamined record-pattern combinations retain explicit callable availability/lowering follow-ups,
+  rather than being counted as proven generic-record or closure coverage.
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
   reference should widen it, before extending selfhost's general guard ownership checking.
 
 ### Plain mutable callable parameter forwarding in selfhost
 
-- **Status:** temporary native view lowering implemented on 2026-10-04; exact native CI pending.
+- **Status:** temporary native view lowering implemented on 2026-10-04 in #783;
+  the final exact-head verification receipt belongs to #567 Step 8.
 - **Rule:** CALLABLE-003 separates reusable exclusive environment access from ownership of newly
   supplied arguments. Bootstrap keeps a source-written plain `mut fn` parameter as a callable
   view: forwarding that parameter without `move` does not consume it. An exact affine closure
@@ -361,12 +363,13 @@ Each entry records:
   does not publish an explicit hidden forwarding loan; the native reference descriptor is its
   transport design rather than a claimed matching bootstrap ownership fact.
 - **Owner:** Step 8 owns view construction and direct lowering. General borrow and parent-loan
-  validity obligations remain honestly NotChecked for Step 14; raw owned-callable return
-  diagnostics and remaining callable-bearing storage are still required Step 8 work.
+  validity obligations remain honestly NotChecked for Step 14. Raw owned-callable return
+  diagnostics and exact callable union storage are implemented separately in #784 and #785.
 
 ### Unary callable pipelines in selfhost
 
-- **Status:** PIPE-001 conformance implemented during Step 8d; verification pending exact-head CI.
+- **Status:** PIPE-001 conformance implemented during Step 8d; operator-pipeline is a native
+  PASS at exact head 2eda17b (CI 37212293538).
 - **Rule:** a pipeline completes its input once, evaluates a unary callable, and invokes it with
   that input. A section on the right side is constructed after the input, then invoked directly.
 - **Compilers:** selfhost lowers anonymous and stored callable pipelines with their exact ordinary
@@ -699,7 +702,7 @@ repeated invocation and capture-only drop glue.
   enclosing owner recipes keep their existing precise gaps. Unsafe acknowledgement belongs to
   invocation, including zero-argument targets. Foreign function values remain SEM0189; callable
   values remain forbidden source static data. Opaque callable result realization and retained
-  mutable callable parameter views remain required Step 8 work.
+  mutable callable parameter views use the separate implementations documented below.
 - **Source migration:** none.
 - **Evidence:** `namedFunctionValuesConstructEmptyEnvironmentsAndReturnExactTypes`,
   `genericNamedFunctionValuesSelectEachDirectInvocation` and
@@ -711,8 +714,8 @@ repeated invocation and capture-only drop glue.
 
 ### Native direct opaque callable results retain exact environments
 
-- **Status:** source implementation recorded on 2026-10-04; native assertions and exact-head CI
-  remain pending. Plain callable result contracts remain separate required Step 8 work.
+- **Status:** implemented and verified in #776 (CI 37208391909); opaque-callable is pinned
+  after its exact-head native PASS. Plain callable result contracts use the separate origin query below.
 - **Rule:** each complete ordinary producer application establishes one finite exact returned
   environment. Only its own return boundary may establish its opaque family; callers retain the
   authored contract and family identity. Runtime projection does not mutate semantic proof keys.
@@ -729,12 +732,13 @@ repeated invocation and capture-only drop glue.
   not aggregate bootstrap's multiple return sites or simultaneous realization diagnostics.
   Discovery that exceeds the existing finite node bound stays unsupported, without claiming
   an infinite specialization proof. Effect contracts retain their named Step 9 gap.
-- **Remaining Step 8 scope:** contextual opaque slots inside aggregate results and projected
+- **Remaining projection follow-ups:** contextual opaque slots inside aggregate results and projected
   structural-union tags stay explicitly unsupported, rather than inventing leaf evidence from
   nullary variants or emitting an uninjected value. Descriptor or phantom-metadata recursion may
   also retain the explicit projection gap after physical inline validation; it is not reported
-  as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof and
-  ordinary callable result provenance remain required work.
+  as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof
+  remains Effect/property work. Ordinary callable result provenance uses the
+  separate origin query below.
 - **Evidence:** `opaqueCallableReturnsRealizeOriginalSectionStorage`,
   `opaqueCallableReturnsRejectDivergenceAndLeaflessCycles`,
   `opaqueCallableReturnsRequireAffineTransfers` and
@@ -744,21 +748,21 @@ repeated invocation and capture-only drop glue.
 
 ### Native callable captures retain loans of owned environments
 
-- **Status:** source repair recorded on 2026-10-04; native assertions and exact-head CI pending.
+- **Status:** repaired and verified in #777 (CI 37210948406).
 - **Rule:** an exact closure, section, staged callable or opaque returned callable owns its stored
   environment. Shared and mutable capture access retain a reference to that owner. Copy captures
   still take a Copy snapshot, and moved captures still transfer the environment explicitly.
 - **Compilers:** native no longer classifies exact callable representations as borrowed descriptors
   when constructing an anonymous environment. The capture field, construction operand and body
   alias all retain the same loan. Reference/slice/string descriptors and source raw callable views
-  retain their existing descriptor handling; raw mutable parameter view lowering remains required
-  Step 8 work. Borrow checking obligations remain visible for Step 14.
+  retain their existing descriptor handling; raw mutable parameter view lowering is documented
+  separately above. Borrow checking obligations remain visible for Step 14.
 - **Evidence:** `anonymousBorrowedCallableCapturesRetainOneCleanupOwner` checks a shared capture of
   an owned once callable: a reference field, original-place construction borrow, dereferenced body
   alias, one caller cleanup owner and cleanup-free outer capture glue. Bootstrap analysis accepts
   the fixture with no diagnostics; bootstrap executable lowering retains its pre-existing SEM0219
-  gap for the plain callable-reference parameter. A stale native CLI probe establishes that this
-  fixture reaches native lowering, without claiming the repaired head's behavior.
+  gap for the plain callable-reference parameter. Exact-head native CI executes the retained
+  environment, construction borrow and cleanup assertions.
 - **Source migration:** none.
 
 ### Native generic captures retain finite local contents obligations
@@ -793,8 +797,8 @@ repeated invocation and capture-only drop glue.
 
 ### Native plain callable results retain original storage and public permissions
 
-- **Status:** direct acyclic ordinary producers implemented during Step 8; native assertions and
-  exact-head CI remain pending.
+- **Status:** direct acyclic ordinary producers verified in #779 (CI 37212252807);
+  selected stored/method producers and moved-once cleanup verified in #782 (CI 37212293538).
 - **Rule:** a source-written callable result contract does not create a new function identity.
   Returned named values, anonymous environments and sections retain their original declaration,
   complete application and ordered captures. Producers returning the same original representation
@@ -817,11 +821,14 @@ repeated invocation and capture-only drop glue.
 - **Admission:** origin queries retain application, profile and conditional proof context. Growth
   is checked before body demands, including cached-body edges. The depth bound spans conditional
   context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
-- **Remaining Step 8 scope:** recursive origin cycles, divergent plain origins, callable-valued
-  results reached through abstract or invocation-selected higher-order targets and interface
-  invocation, and retained mutable callable parameter loans remain explicit gaps. Fully selected
-  stored producer values and inherent receiver methods use the same original-result query and
-  runtime ABI projection as direct producers. This layer does not mark Step 8 complete.
+- **Remaining Step 8 return-origin work:** recursive origin cycles, divergent plain origins and
+  callable-valued results reached through abstract or invocation-selected higher-order targets or
+  interface invocation remain explicitly unsupported. Fully selected stored producer values and
+  inherent receiver methods use the same original-result query and runtime ABI projection as direct
+  producers. Retained mutable parameter storage loans use #783. General escape and parent-loan
+  proof remain NotChecked for Step 14. In particular, a constrained callable parameter producing
+  another callable remains required Step 8 work; missing corpus coverage does not discharge it.
+  These limitations are not claimed as native PASS.
 - **Evidence:** `plainCallableReturnsKeepOriginalStorageAndPublicContracts`,
   `plainCallableOriginsUnifyAcrossProducers`, `plainCallableViewsKeepWeakerInvocationPermissions`
   and `plainCallableViewStagingRetainsPublicModeAndArgumentOrder` inspect original storage,
@@ -829,13 +836,14 @@ repeated invocation and capture-only drop glue.
   `plainCallableResultsFromStoredProducersAndMethodsUseOriginalTargets` covers fully selected
   stored and inherent producer calls. `plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce`
   checks producer/caller transfer, a moved stored-field operand, target cleanup, abandonment glue
-  and OWN0003 at a bare returned affine owner. Native execution of these assertions is pending.
+  and OWN0003 at a bare returned affine owner. Both exact-head CI runs execute these assertions.
 - **Source migration:** none.
 
 
 ### Native raw owned-callable return identity guard
 
-- **Status:** bootstrap parity implemented during Step 8 on 2026-10-04; exact native CI pending.
+- **Status:** bootstrap parity implemented during Step 8 on 2026-10-04 in #784;
+  the final exact-head verification receipt belongs to #567 Step 8.
 - **Rule:** returning a nonshared source-written callable parameter requires a known concrete
   callable identity (SEM0081). An authored constrained `F` retains its owned type identity and
   may return through the same public contract. Named values and constructed exact environments
@@ -860,7 +868,8 @@ repeated invocation and capture-only drop glue.
 
 ### Exact callable members in native structural unions
 
-- **Status:** implemented during Step 8 on 2026-10-04; exact native CI pending.
+- **Status:** implemented during Step 8 on 2026-10-04 in #785;
+  the final exact-head verification receipt belongs to #567 Step 8.
 - **Rule:** an exact closed callable environment is an ordinary storable structural-union member.
   Bare callable contracts and unresolved staging recipes cannot supply its runtime representation.
 - **Compilers:** native admits runtime-closed callable values, schemas and use views in the existing
