@@ -642,6 +642,12 @@ repeated invocation and capture-only drop glue.
 - **Compilers:** selfhost now uses the same canonical callable-value representation for named
   items and anonymous bodies. Only anonymous bodies receive a hidden environment parameter.
   Generic named values retain a schema when invocation inputs can supply deferred type evidence.
+  Qualified namespace and inherent function values use the same construction and direct-call
+  path, including a selected applied owner such as `Box<i32>.identity`. Bootstrap currently
+  rejects that applied-owner value form with SEM0168 (it treats the selector as a union member),
+  although the confirmed named-callable rule admits every resolved named function as a value.
+  Simple qualified inherent values build and run with the bootstrap. This native extension
+  retains exact owner evidence and does not add union-member or callback privilege.
   Authored `typeof` rejects still-open type or row selections as SEM0111, following REP-006 and
   the bootstrap; abstract applications inside checked generic bodies remain internal templates.
   Uninferred result-only binders, quantified section lifetimes, runtime static parameters and
@@ -654,6 +660,9 @@ repeated invocation and capture-only drop glue.
   `genericNamedFunctionValuesSelectEachDirectInvocation` and
   `namedCallableRepresentationsKeepExactIdentity` assert construction, original-target ABI,
   independent applications, visibility, static-data exclusion and diagnostic codes/spans.
+  `qualifiedFunctionValuesRetainOwnerSelectionAndDirectAbi` covers namespace and imported
+  inherent values, applied-owner selections, empty construction, unsafe invocation and foreign
+  callback/visibility diagnostics.
 
 ### Native generic captures retain finite local contents obligations
 
