@@ -1,0 +1,178 @@
+//! Callable contract compatibility, independent of environment representation and direct targets.
+
+import hir.Hir {Access, CallableMode}
+import semantic.Lifetime {Intersection, Lifetime}
+import semantic.Type {Outlives, Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// Owned contract facts used while comparing two source-callable values.
+pub struct CallableContract {
+  pub mode: CallableMode
+  pub isUnsafe: bool
+  pub environment: Shared<Intersection>
+  pub invocationBinders: usize
+  pub invocationBounds: Vector<Outlives>
+  pub parameters: Vector<Shared<Type>>
+  pub result: Shared<Type>
+}
+
+/// Lifetime evidence required by one otherwise compatible callable signature.
+pub struct Relation {
+  pub required: Vector<Outlives>
+  pub provided: Vector<Outlives>
+  pub sourceEnvironment: Shared<Intersection>
+  pub targetEnvironment: Shared<Intersection>
+}
+
+/// A proved structural mismatch, or a comparison outside the implemented relation.
+pub enum Failure { Incompatible, Unsupported }
+
+/// Extracts the invocation contract while preserving its exact value representation separately.
+pub effect fn ofType(value: &Shared<Type>) -> Option<CallableContract>
+! OutOfMemoryError ? &mut Allocator {
+  let node = run Type.copy(value)
+  return match move node {
+    Type.CallableValue {contract, ..} => run ofType(&contract)
+    Type.Callable {mode, isUnsafe, environment, invocationBinders, invocationBounds, parameters, result} =>
+      Option.some<CallableContract>(CallableContract {mode: mode, isUnsafe: isUnsafe,
+        environment: move environment, invocationBinders: invocationBinders,
+        invocationBounds: move invocationBounds, parameters: move parameters, result: move result})
+    _ => Option.none<CallableContract>()
+  }
+}
+
+fn strength(mode: CallableMode) -> usize {
+  return match mode { CallableMode.Shared => usize.ZERO CallableMode.Mutable => usize.ONE CallableMode.Once => 2 }
+}
+
+struct Reference {
+  referent: Shared<Type>
+  access: Access
+  lifetime: Shared<Lifetime>
+  slice: bool
+}
+
+effect fn reference(value: &Shared<Type>) -> Option<Reference>
+! OutOfMemoryError ? &mut Allocator {
+  let node = run Type.copy(value)
+  return match move node {
+    Type.Reference {referent, access, lifetime} => Option.some<Reference>(Reference {
+      referent: move referent, access: access, lifetime: move lifetime,
+      slice: false,
+    })
+    Type.Slice {element, access, lifetime} => Option.some<Reference>(Reference {
+      referent: move element, access: access, lifetime: move lifetime, slice: true,
+    })
+    _ => Option.none<Reference>()
+  }
+}
+
+// Reference validity is covariant. Exclusive referents remain invariant, and shared
+// referents use the same value relation recursively. Other unequal forms remain explicit gaps.
+effect fn valueRelation(source: &Shared<Type>, target: &Shared<Type>, required: &mut Vector<Outlives>)
+  -> Option<Failure> ! OutOfMemoryError ? &mut Allocator {
+  if run Type.equalsShared(source, target) { return Option.none<Failure>() }
+  let first = run reference(source)
+  let second = run reference(target)
+  if let Option<Reference>.Some {value: offered} = move first {
+    if let Option<Reference>.Some {value: wanted} = move second {
+      if offered.slice != wanted.slice || (offered.access == Access.Shared && wanted.access == Access.Mutable) {
+        return Option.some<Failure>(Failure.Incompatible)
+      }
+      let mut failure = Option.none<Failure>()
+      if wanted.access == Access.Mutable {
+        failure = run valueRelation(&offered.referent, &wanted.referent, &mut required.*)
+        match move failure {
+          Option<Failure>.Some {value} => { return Option.some<Failure>(value) }
+          Option<Failure>.None => ()
+        }
+        failure = run valueRelation(&wanted.referent, &offered.referent, &mut required.*)
+      } else { failure = run valueRelation(&offered.referent, &wanted.referent, &mut required.*) }
+      if let Option<Failure>.Some {value} = move failure { return Option.some<Failure>(value) }
+      run Vector.append<Outlives>(&mut required.*, Outlives {longer: move offered.lifetime, shorter: move wanted.lifetime})
+      return Option.none<Failure>()
+    }
+    return Option.some<Failure>(Failure.Incompatible)
+  }
+  if Type.hasOpenParameters(source) || Type.hasOpenParameters(target) {
+    return Option.some<Failure>(Failure.Unsupported)
+  }
+  // Distinct primitives are a structural mismatch. Other conversions may be valid but
+  // require an argument/result ABI conversion before direct-call admission.
+  let firstType = run Type.copy(source)
+  let secondType = run Type.copy(target)
+  if let Type.Primitive {name} = &firstType {
+    if let Type.Primitive {..} = &secondType {
+      let bytes = Bytes.asSlice(&name)
+      let bottom = b"never"
+      let mut matches = bytes.length == bottom.length
+      let mut at = usize.ZERO
+      while matches && at < bottom.length {
+        matches = bytes[at] == bottom[at]
+        at = at + usize.ONE
+      }
+      if matches { return Option.some<Failure>(Failure.Unsupported) }
+      return Option.some<Failure>(Failure.Incompatible)
+    }
+  }
+  return Option.some<Failure>(Failure.Unsupported)
+}
+
+fn invocation(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Invocation {..} => true _ => false }
+}
+
+effect fn appendBounds(bounds: &[Outlives], provided: &mut Vector<Outlives>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < bounds.length {
+    run Vector.append<Outlives>(&mut provided.*, Outlives {
+      longer: Shared.clone<Lifetime>(&bounds[at].longer), shorter: Shared.clone<Lifetime>(&bounds[at].shorter)})
+    at = at + usize.ONE
+  }
+}
+
+/// Compares invocation modes, unsafe policy and signature variance; the caller proves the
+/// retained environment and returned lifetime obligations against its own declared premises.
+pub effect fn compare(source: &CallableContract, target: &CallableContract) -> Result<Relation, Failure>
+! OutOfMemoryError ? &mut Allocator {
+  let offered = Vector.asSlice<Shared<Type>>(&source.parameters)
+  let wanted = Vector.asSlice<Shared<Type>>(&target.parameters)
+  if offered.length != wanted.length || strength(source.mode) > strength(target.mode)
+    || (source.isUnsafe && !target.isUnsafe) { return Result.failResult<Relation, Failure>(Failure.Incompatible) }
+  if source.invocationBinders != target.invocationBinders && source.invocationBinders != usize.ZERO {
+    return Result.failResult<Relation, Failure>(Failure.Unsupported)
+  }
+  let mut required = Vector.make<Outlives>()
+  let mut provided = Vector.make<Outlives>()
+  let bounds = Vector.asSlice<Outlives>(&source.invocationBounds)
+  let mut at = usize.ZERO
+  while at < bounds.length {
+    let formation = !Shared.with<Lifetime, bool>(&bounds[at].longer, invocation)
+      && !Shared.with<Lifetime, bool>(&bounds[at].shorter, invocation)
+    if formation { run Vector.append<Outlives>(&mut provided, Outlives {
+      longer: Shared.clone<Lifetime>(&bounds[at].longer), shorter: Shared.clone<Lifetime>(&bounds[at].shorter),
+    }) } else { run Vector.append<Outlives>(&mut required, Outlives {
+      longer: Shared.clone<Lifetime>(&bounds[at].longer), shorter: Shared.clone<Lifetime>(&bounds[at].shorter),
+    }) }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < offered.length {
+    let failed = run valueRelation(&wanted[at], &offered[at], &mut required)
+    if let Option<Failure>.Some {value} = move failed { return Result.failResult<Relation, Failure>(value) }
+    at = at + usize.ONE
+  }
+  let failed = run valueRelation(&source.result, &target.result, &mut required)
+  if let Option<Failure>.Some {value} = move failed { return Result.failResult<Relation, Failure>(value) }
+  let premises = Vector.asSlice<Outlives>(&target.invocationBounds)
+  run appendBounds(premises, &mut provided)
+  return Result.succeed<Relation, Failure>(Relation {required: move required, provided: move provided,
+    sourceEnvironment: Shared.clone<Intersection>(&source.environment), targetEnvironment: Shared.clone<Intersection>(&target.environment)})
+}
