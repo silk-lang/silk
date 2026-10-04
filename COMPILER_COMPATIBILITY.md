@@ -19,10 +19,10 @@ diagnosis, and it may be a real bug.
 
 ## The two compilers
 
-| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                     |
-| ------------------------------ | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section). |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports.                |
+| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -147,7 +147,7 @@ Each entry records:
   between joining paths or that is moved on only some paths, a write at a runtime index beside a
   moved element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for callable and Effect environments, generic nominal unions and unions without a
+  drop glue for Effect environments, generic nominal unions and unions without a
   canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
@@ -157,20 +157,48 @@ Each entry records:
   borrowing match result gap, which current typing cannot reach because it borrows only places and
   Drop-free array literals, and the deferred glue forms.
 
-### Selfhost does not reject moves inside match guards at typing
+### Selfhost guard ownership checking is limited to callable availability
 
-- **Status:** recorded on 2026-10-03 with Step 6c.
+- **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d.
 - **Rule:** the reference reports OWN0008 for moving a provisional pattern binding inside its guard
   (ownership-and-borrowing.md, MATCH-002); it states no rule for other places a guard moves.
-- **Compilers:** the bootstrap checks every guard in guard mode and reports OWN0008 for any place a
-  guard moves, including an ordinary local, which is broader than the reference. Selfhost has no
-  OWN0008 yet. It types a guard that moves an owner, and MIR lowering then reports the `cleanup`
-  gap for a guard that changes an owner's state, so no program it accepts here reaches codegen.
+- **Compilers:** the bootstrap checks explicit moves, callable captures and consuming arguments
+  in guard mode, including ordinary locals, which is broader than the reference. Both compilers
+  admit the implicit receiver transfer of an ordinary stored once invocation or staging while
+  preserving guard checks on nested explicit moves and supplied arguments. Selfhost reports
+  `GuardConsumesPattern` at a forbidden transfer span in bodies checked by callable availability,
+  including environments that need no drop glue. It also rejects implicit receiver transfer from
+  a provisional matched subject, following MATCH-002; the bootstrap currently bypasses its guard
+  check for that receiver path. Other bodies still type a guard that moves an owner; MIR
+  reports the `cleanup` gap when the guard changes an acquired cleanup owner's state. General
+  ownership checking outside callable availability remains incomplete.
 - **Source migration:** none.
-- **Evidence:** the `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` in
-  `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `plainCallableParameterRejectsCleanupFreeGuardTransfer` checks retained guard
+  control flow independently of layout and Drop, with an unguarded transfer control.
+  `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation and nested
+  explicit callee moves with diagnostic spans. The
+  `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
+  Source callable-bearing record patterns remain blocked by generic record typing and are not
+  claimed as native runtime coverage here.
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
-  reference should widen it, before selfhost implements the code.
+  reference should widen it, before extending selfhost's general guard ownership checking.
+
+### Plain mutable callable parameter forwarding in selfhost
+
+- **Status:** incomplete native view lowering recorded on 2026-10-03 during Step 8d review.
+- **Rule:** CALLABLE-003 separates reusable exclusive environment access from ownership of newly
+  supplied arguments. Bootstrap keeps a source-written plain `mut fn` parameter as a callable
+  view: forwarding that parameter without `move` does not consume it. An exact affine closure
+  value or an authored constrained `F` argument still requires an explicit transfer.
+- **Compilers:** selfhost specializes plain callable parameters with exact environment types.
+  Bare forwarding of a direct plain mutable callable parameter reports `typed-form` at the
+  operand until retained environment reborrows are lowered. It does not diagnose that valid
+  source form as OWN0003 or make the environment Copy. This boundary does not exempt references,
+  constrained parameters, exact closure locals, explicit moves or staging from ownership rules.
+- **Evidence:** `plainCallableParameterForwardedMutableViewKeepsNamedGap` asserts the gap span;
+  `plainCallableParameterRejectsAffineArgumentCopies` retains the consuming controls. Bootstrap
+  evidence is the declared raw callable type and `Ownership.argumentConsumes` source path.
+- **Owner:** remaining Step 8d callable view and loan lowering, including escaping views.
 
 ### Omitted Effect environments elaborated from inputs
 
@@ -399,8 +427,7 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 
 ### Native anonymous bodies retain nested lexical captures
 
-- **Status:** intentional native typing support in #567 Step 8b, 2026-10-03; native environment
-  construction and direct invocation follow in Step 8c.
+- **Status:** intentional native support in #567 Steps 8b and 8c, 2026-10-03.
 - **Rule:** every non-effect anonymous literal is its own function declaration and stores its
   ordered captures in an exact environment (functions-callables.md, CAPTURE-001;
   compiler/docs/mir-core-shape.md §7). A nested literal captures the lexical values visible in its
@@ -408,8 +435,8 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Compilers:** the bootstrap rejects an anonymous literal inside another anonymous body with
   SEM0199 because its transitive capture lifting is unimplemented. Native typing keeps both
   declaration identities, checked bodies, and capture fields. This follows the approved ordinary
-  declaration/environment design; it introduces no implicit box, code pointer, or adapter. Until
-  Step 8c supplies lowering, reaching construction still reports `typed-form`.
+  declaration/environment design; it introduces no implicit box, code pointer, or adapter. Native
+  lowering constructs those environments and directly invokes their ordinary function instances.
 - **Source migration:** none.
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
   `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
