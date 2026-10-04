@@ -61,7 +61,7 @@ section runtime coverage. No bootstrap corpus source is changed by this pin laye
 | Returned environments and weaker public permissions | plainCallableReturnsKeepOriginalStorageAndPublicContracts, plainCallableViewsKeepWeakerInvocationPermissions |
 | Stored/method producers and moved-once returned capture cleanup | plainCallableResultsFromStoredProducersAndMethodsUseOriginalTargets, plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce |
 | Higher-order producer/leaf identity, nested free application/capture channels and affine cleanup | CallableResultCases: higherOrderCallableResultsKeepSelectedProducerAndLeafTargets, higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels, higherOrderAffineArgumentsAndOnceResultsHaveOneCleanupOwner |
-| Selected invocation lifetime proof without physical retention | deferredCallableResultRetainsSelectedLifetimeEvidence |
+| Selected invocation lifetime proof without physical retention | CallableResultCases: deferredCallableResultRetainsSelectedLifetimeEvidence |
 | Raw callable return diagnostic role through aliases and enclosing captures | rawOwnedCallableReturnKeepsBootstrapIdentityGuard |
 | Exact callable union injection, original target, canonical layout and active captured-member glue | callableUnionMembersRetainCanonicalStorageAndDirectTargets, plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce |
 
