@@ -76,6 +76,31 @@ Each entry records:
 
 ## Entries
 
+### Shared-loan lifetime shortening in selfhost call inference
+
+- **Status:** implemented on 2026-10-04 on PR #787; verification is pending exact-head CI.
+- **Rule:** a shared loan `&'x T` or `&'x [T]` requires `T: 'x` (LIFE-002). A lifetime in a
+  covariant position of `T` may therefore be shortened to `'x`. Covariance follows the bootstrap
+  `NominalVariance`: reference, slice and `string` lifetimes are covariant, a shared referent keeps
+  its position's variance, and exclusive referents and pointees are invariant. A nominal lifetime
+  argument is covariant only when its struct, tuple, union or enum declaration stores that binder
+  only in covariant positions.
+- **Compilers:** the bootstrap checks every argument by subtyping over the complete variance
+  summary. Selfhost call inference still unifies exactly. Only when an inferred argument fails with
+  `TypeMismatch`, and both the argument and the parameter are shared loans, does selfhost match one
+  shortened argument against the same inference state. In that argument, each referent lifetime in
+  a covariant position is shortened to the argument's loan region, but only where the parameter
+  writes its own loan lifetime. Every other lifetime keeps its evidence.
+- **Source migration:** none.
+- **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
+  rows, callable and Effect positions, services, interfaces, recursive declarations still being
+  summarized, and declarations whose member shape is unavailable are treated as invariant. Such
+  calls keep the original `TypeMismatch` at the call.
+- **Evidence:** `sharedLoansShortenCovariantNominalArguments` in
+  `compiler/src/semantic/SemanticCases.silk`.
+- **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
+  the matcher using a cached per-declaration variance summary.
+
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
 - **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
