@@ -219,6 +219,10 @@ suspension point structurally).
   inserting free caller evidence, solves independently, proves the target bounds, then constructs
   an ordinary complete function application. The blueprint is type metadata; only supplied
   captures occupy the environment record. It never becomes a function key or dispatch adapter.
+  Passing a generic section to a concrete callable promise opens its target binders only for
+  contract comparison and proves the resulting bounds. This preserves the section's exact type
+  across consumers. Inside a closed consumer, invocation solves again from its actual operands
+  and selects the original target instance; the comparison contract never supplies a runtime key.
 - **Named effect fn runners** keep their written parameters as ordinary `Parameter` locals, so
   `run f(a)` is `Call(f, [a], providers)`. Running a stored Effect built from `f` moves (`once`) or
   copies its fields into those arguments. Effect blocks and anonymous effect fns take the closure
