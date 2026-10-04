@@ -894,7 +894,9 @@ repeated invocation and capture-only drop glue.
   Selection evidence is not a physical capture. No adapter, code pointer or separate closure key is
   introduced; emitted identity still comes from the complete ordinary application and MIR graph.
 - **Proof context:** only reachable return operands participate in origin normalization, under the
-  producer's own applied premises. Mutable storage views and staged schemas use the same original
+  producer's own applied premises. Closed source recipes are also normalized in capture fields and
+  free original application arguments/scopes; opaque family identity and bound schema blueprints
+  are preserved. Mutable storage views and staged schemas use the same original
   target selection and bound proof as direct invocation, retaining public permissions. Selected
   lifetime/row/type evidence participates in exact equality, substitution and unification.
 - **Bootstrap boundaries:** reduced constrained higher-order source is admitted by the bootstrap
@@ -908,5 +910,9 @@ repeated invocation and capture-only drop glue.
   `higherOrderCallableSchemaResultsNormalizeBeforeExactInference`,
   `deferredCallableResultRetainsSelectedLifetimeEvidence`,
   `higherOrderBorrowedMutableProducersPreserveOriginalTargets` and
-  `higherOrderStagedSchemaProducersRetainOriginalSelection` retain structured source/MIR claims.
+  `higherOrderStagedSchemaProducersRetainOriginalSelection`,
+  `higherOrderAffineArgumentsAndOnceResultsHaveOneCleanupOwner` and
+  `higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels` retain structured source/MIR claims.
+  The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
+  the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
