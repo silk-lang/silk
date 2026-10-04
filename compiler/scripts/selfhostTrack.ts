@@ -15,6 +15,8 @@ export const selfhostTrack = [
   'operator-interface-contract',
   'contract-only-impl-binder',
   'generic-partial-type-arguments',
+  'generic-record-instances',
+  'generic-union-instances',
   'array-upper-index-trap',
   'array-zero-index-trap',
   'mutable-array-loop',

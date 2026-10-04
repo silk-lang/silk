@@ -211,6 +211,39 @@ Each entry records:
   `genericNominalConstructionAndPatternsRetainLexicalBounds` contain independent code/span
   controls; execution is not yet claimed.
 
+### Selfhost bounds inline stored-property proof recursion
+
+- **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
+  and exact-head CI remain pending.
+- **Rule:** Copy and cleanup proofs must terminate without treating impossible inline storage as
+  Copy or cleanup-free. Consuming a strict runtime-subterm argument discharges only that ancestor
+  frame; older cycle evidence remains. Finite descent through an opaque nominal argument's fields
+  is allowed, including `A<B>` followed by `B` and `A<i32>`.
+- **Compilers:** bootstrap's declaration-completion storage SCC reports `SEM0020` at an aggregate
+  name. Native on-demand Copy validation reports its existing `InvalidCopyConformance` family at
+  the selecting Copy implementation; cleanup reports `InlineStorageUnavailable` at the repeated
+  aggregate's whole declaration with the named `inline-storage-recursion` gap. Both module and
+  span come from that same selecting declaration, including imported cycles.
+- **Source migration:** none; infinitely expanding inline storage has no finite runtime layout.
+- **Evidence:** `genericCopyRejectsAffineStoredFieldsAndOwnDrop`,
+  `genericCopyCyclesKeepCompleteImportedDiagnosticSite` and
+  `genericCleanupPropertiesKeepFiniteOpaqueDescentAndRejectGrowth`; corrected execution pending.
+
+### Selfhost keeps generic aggregate borrow regions tied to actual places
+
+- **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
+  and exact-head CI remain pending.
+- **Rule:** fixed lifetime arguments cannot be replaced by local inference or manufacture a
+  stronger loan than the borrowed storage. Reborrowing a parameter referent retains its source
+  region; a static result annotation cannot turn owned local storage into a static loan.
+- **Compilers:** bootstrap reports `SEM0212` at the invalid local borrow and `OWN0019` at its
+  enclosing return use. The native aggregate operand boundary retains `TypeMismatch` at that
+  borrow, consistent with its existing field type-mismatch family. Complete and partial written
+  prefixes remain fixed evidence.
+- **Source migration:** none.
+- **Evidence:** positive complete/partial prefixes and the local-to-static negative in
+  `genericNominalConstructionAndPatternsRetainLexicalBounds`; corrected native execution pending.
+
 ### Selfhost does not reject moves inside match guards at typing
 
 - **Status:** recorded on 2026-10-03 with Step 6c.
