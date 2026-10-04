@@ -968,3 +968,31 @@ repeated invocation and capture-only drop glue.
   affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
   code/span assertions, MIR inspection and Linux timings have not yet executed.
 - **Source migration:** none.
+
+
+### Native inferred opaque callable record fields
+
+- **Status:** implemented in a draft Step 8 layer; bootstrap compiler source checking passes.
+  Native assertions, Linux timing and exact-head corpus preservation remain pending.
+- **Rule:** an inferred nominal construction retains its actual callable field types. Its own
+  opaque return boundary proves each leaf contract and original parameter role; existing exact
+  realization projects the public nominal result before layout and cleanup. A moved local record
+  can forward another producer's family without changing either family's source identity.
+- **Ownership:** generated raw Mutable/Once representation parameters cannot establish owned opaque
+  leaves. Authored constrained F remains an owner. The native role guard reports SEM0081 at the
+  returned constructor; bootstrap rejects these reduced raw-role constructors earlier at field
+  inference (SEM0099/SEM0025), followed by SEM0117. This extends the existing native role check
+  through an inferred record, without treating the bootstrap rejection as a positive.
+- **Diagnostics:** invalid inferred record field bounds retain the existing native SEM0076 at
+  the complete constructor; bootstrap emits SEM0106 at the field value plus SEM0117. The focused
+  control asserts the native code/span, not bootstrap wording or diagnostic multiplicity.
+- **Remaining projections:** structural unions containing owned opaque slots still need a physical
+  tag mapping. The admission guard follows substituted nominal fields and descriptor referents,
+  uses exact visited types and rejects bounded discovery overflow conservatively. Dotted construction
+  does not infer a new leaf under a promised opaque slot and is not claimed as a parity positive.
+- **Evidence:** five `opaqueCallableRecords*` structured controls cover original named/anonymous
+  fields, local forwarding, field-bound rejection, raw/authored roles, the exact record/environment/
+  capture glue chain, and a descriptor-union gap. Bootstrap independently admits the positive
+  records, authored-F control, repaired Drop fixture and descriptor-union source. Native execution
+  and per-test timings have not yet run.
+- **Source migration:** none.
