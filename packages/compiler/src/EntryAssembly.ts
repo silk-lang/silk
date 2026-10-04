@@ -91,34 +91,20 @@ const publishRunnerSuccess = (
 const runtimeParameterCount = (fn: Tir.TirFunction): number =>
   fn.declaration.parameters.filter((parameter) => parameter.phase === 'Runtime').length
 
-export const trapFunction = (
-  instance: Instances.Instance,
-  reason: string,
-  span: SourceSpan.SourceSpan,
-): Mir.MirFunction => {
-  const parameterCount = runtimeParameterCount(instance.function)
-  return {
-    _tag: 'MirFunction',
-    id: instance.key.declaration,
-    instance: instance.key,
-    parameterCount,
-    localTypes: Array.from({ length: parameterCount }, () => i32),
-    result: i32,
-    entry: { _tag: 'Region', ordinal: 0 },
-    regions: [
-      {
-        _tag: 'OperationRegion' as const,
-        id: { _tag: 'Region' as const, ordinal: 0 },
-        operations: [],
-        outcome: {
-          _tag: 'Trap' as const,
-          reason,
-          provenance: { span, generated: true },
-        },
-      },
-    ],
-  }
+/**
+ * A reachable instance whose valid body native lowering does not support yet. Lowering never
+ * substitutes a trap stub: the program diagnoses it when emitted code references it.
+ */
+export interface UnsupportedFunction {
+  readonly _tag: 'UnsupportedFunction'
+  readonly instance: Instances.InstanceKey
+  readonly span: SourceSpan.SourceSpan
 }
+
+const unsupportedFunction = (
+  instance: Instances.Instance,
+  span: SourceSpan.SourceSpan,
+): UnsupportedFunction => ({ _tag: 'UnsupportedFunction', instance: instance.key, span })
 
 export interface LoweredGeneratedEffectRunner {
   readonly _tag: 'LoweredGeneratedEffectRunner'
@@ -247,13 +233,16 @@ export const lowerInstance = (
   generatedRunners: Array<GeneratedEffectRunner>,
   opaqueRealizations: OpaqueRealization.Catalog,
   registry: SemanticContext.Registry,
-): Mir.MirFunction => {
+): Mir.MirFunction | UnsupportedFunction => {
   const fn = instance.function
   const plan = planFor(ownership, fn)
 
-  if (plan !== undefined && plan.verdict._tag === 'Violation') {
-    return trapFunction(instance, 'ownership violation', plan.verdict.cause.span)
-  }
+  // Every violating ownership plan is published as an OWN diagnostic, and realization lowers MIR
+  // only for programs without diagnostics, so a violating plan cannot reach this point.
+  if (plan !== undefined && plan.verdict._tag === 'Violation')
+    throw new RangeError(
+      `Ownership violation reached MIR lowering for ${instance.key.declaration.module}:${instance.key.declaration.name}`,
+    )
 
   const contract = fn.contract
   const callableEnvironment = Tir.isAnonymousCallableId(instance.key.declaration)
@@ -449,9 +438,12 @@ export const lowerInstance = (
           instance.specialization.result,
         ))
       : i32)
-  if (resultType === undefined) {
-    return trapFunction(instance, 'unavailable contract type', bodySpan(fn, registry))
-  }
+  // Target layout realizes every reachable instance's specialized result type before lowering, and
+  // its representation fences reject the types it cannot serve; no known program reaches this.
+  if (resultType === undefined)
+    throw new RangeError(
+      `Result type of ${instance.key.declaration.module}:${instance.key.declaration.name} has no MIR representation after layout`,
+    )
 
   const lowering = new FunctionLowering(
     layout,
@@ -488,7 +480,7 @@ export const lowerInstance = (
     )
   ) {
     const unavailable = Tir.firstUnavailable(fn)
-    return trapFunction(instance, 'unavailable body', unavailable?.span ?? bodySpan(fn, registry))
+    return unsupportedFunction(instance, unavailable?.span ?? bodySpan(fn, registry))
   }
 
   return {

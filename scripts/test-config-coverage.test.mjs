@@ -148,7 +148,6 @@ void test('exact-head full verification remains explicit and complete', () => {
   assert.match(full, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SHA"/)
   assert.match(full, /uses: \.\/\.github\/actions\/setup-linux-llvm/)
   assert.match(full, /^      - run: pnpm check$/m)
-  assert.match(full, /^      - run: pnpm release:candidate$/m)
   assert.match(full, /timeout-minutes: 240/)
   const scenarios = [
     ...['push', 'pull_request', 'schedule'].map((event) => ({

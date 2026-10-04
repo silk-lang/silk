@@ -10,6 +10,8 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
 import { raise } from './support/raise.js'
+import { readFileSync } from 'node:fs'
+import { executionDriveOpaqueCallbackSource } from './support/corpus.js'
 
 const encoder = new TextEncoder()
 
@@ -295,8 +297,6 @@ pub fn main() -> i32 { let parser = outer<i32>(true) return parser(1) }`
       [],
     )
     assert.strictEqual(realized.mir._tag, 'Available')
-    if (realized.mir._tag === 'Available')
-      assert.notInclude(MirEncoding.encode(realized.mir.value), 'unavailable contract type')
   }),
 )
 
@@ -320,7 +320,14 @@ pub fn main() -> i32 {
         encoder.encode(source),
         'wasm32-unknown-unknown',
       )
-      assert.deepEqual(Analysis.diagnostics(self), [])
+      // Layout facts are independent of lowering; main's opaque calls have no native lowering yet.
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: source.slice(diagnostic.span.start, diagnostic.span.end),
+        })),
+        [{ code: 'SEM0219', span: 'first(0) + second(0) + token.left' }],
+      )
       const makeInstances = self.instances.instances.filter(
         (instance) => instance.key.declaration.name === 'make',
       )
@@ -337,6 +344,27 @@ pub fn main() -> i32 {
         .sort((left, right) => left - right)
       assert.deepEqual(sizes, [4, 8])
     }),
+)
+
+it.effect('reports the statically called Execution.drive instance with an opaque callback', () =>
+  Effect.gen(function* () {
+    const self = yield* AnalysisFixture.retainingMain(
+      'opaque/execution-drive-callback',
+      encoder.encode(executionDriveOpaqueCallbackSource),
+    )
+    const execution = readFileSync(
+      new URL('../stdlib/silk/execution.silk', import.meta.url),
+      'utf8',
+    )
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => ({
+        code: diagnostic.code,
+        sourceId: diagnostic.span.sourceId,
+        head: execution.slice(diagnostic.span.start, diagnostic.span.end).split('\n')[0],
+      })),
+      [{ code: 'SEM0219', sourceId: 'silk/execution', head: "pub effect<'env> fn drive<" }],
+    )
+  }),
 )
 
 it.effect('rejects a static join between values from distinct opaque families', () =>
@@ -415,8 +443,6 @@ pub fn main() -> i32 { let parser = make(40) return parser(2) }`
     assert.notInclude(encoded, 'OpaqueRepresentationArgument')
     assert.notInclude(encoded, 'Existential')
     assert.notInclude(encoded, 'CallIndirect')
-    assert.notInclude(encoded, 'unavailable body')
-    assert.notInclude(encoded, 'unavailable contract type')
     const operations = self.mir.value.functions.flatMap(MirVerification.operations)
     assert.strictEqual(
       operations.some((operation) => operation._tag === 'Allocate'),
@@ -453,8 +479,6 @@ pub fn main() -> i32 { return run make(42) }`),
     assert.strictEqual(self.mir._tag, 'Available')
     if (self.mir._tag !== 'Available') return
     const encoded = MirEncoding.encode(self.mir.value)
-    assert.notInclude(encoded, 'unavailable body')
-    assert.notInclude(encoded, 'unavailable contract type')
     assert.notInclude(encoded, 'OpaqueRepresentationArgument')
     assert.strictEqual(
       self.mir.value.functions

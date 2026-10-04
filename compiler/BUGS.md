@@ -369,6 +369,7 @@ structure, so reference descent is sound and cutting it would reject valid progr
 reachable below it. The reachable set is the closure of template field types over the nominals the
 type contains. The search reads and extends the unfolding only at those declarations, so no answer
 changes.
+
 - **Regression:** `Instances.test.ts`, "shares cleanup subterm answers across unfoldings of
   unreachable declarations". Without the fix it overflows the same `Map.set` in
   `strictCleanupSubtermUnder` after 128 s

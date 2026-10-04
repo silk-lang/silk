@@ -2,6 +2,7 @@ import type * as ModuleClosure from '@silklang/compiler/ModuleClosure'
 import * as ProjectAnalysis from '@silklang/compiler/ProjectAnalysis'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as CompilerStdlib from '@silklang/compiler/Stdlib'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as DocumentationProject from './Project.js'
 import type * as Sources from './Sources.js'
@@ -26,7 +27,7 @@ export const sources: Sources.Lookup = (sourceId) => CompilerStdlib.sources.get(
 export const documentation = Effect.fn('Stdlib.documentation')(function* (
   target: string,
 ): Effect.fn.Return<DocumentationProject.Project, ModuleClosure.ModuleClosureError> {
-  const roots = CompilerStdlib.manifest.map((entry) => entry.module)
+  const roots = Arr.map(CompilerStdlib.manifest, (entry) => entry.module)
   const analysis = yield* ProjectAnalysis.make(roots, {
     configuration: { profile: { target } },
   }).pipe(Effect.provide(SourceResolver.empty))

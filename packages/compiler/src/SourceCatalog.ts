@@ -62,12 +62,15 @@ const projectCatalog = (
 export const fromProject = (
   project: ProjectAnalysis.ProjectAnalysis,
   previous?: ReadonlyMap<string, ModuleSummary.ModuleSummary>,
-): SourceCatalog | undefined => {
-  const view = project.views.values().next().value
-  return project.profile === undefined || view === undefined
+): SourceCatalog | undefined =>
+  project.profile === undefined
     ? undefined
-    : projectCatalog(project.closure, project.profile, Analysis.declarationIndex(view), previous)
-}
+    : projectCatalog(
+        project.closure,
+        project.profile,
+        Analysis.declarationIndex(project.primary),
+        previous,
+      )
 
 export interface Selection {
   readonly closure: ModuleClosure.ProjectClosure

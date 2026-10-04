@@ -1,6 +1,7 @@
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as Type from '../src/Type.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 
 const encoder = new TextEncoder()
@@ -109,13 +110,23 @@ pub fn main() -> i32 {
 
 it.effect('keeps ordinary Report conformance static and out of requirement rows', () =>
   Effect.gen(function* () {
-    // The default runtime's startup is what would reject a requirement row leaking onto main.
+    // Realized so the default runtime's startup analyzes main. Startup does not reject a leaked
+    // non-service requirement, so the declaration's requirement row is asserted directly.
     const self = yield* Analysis.ofSourceRealized(
       sourceId,
       encoder.encode(`pub struct Problem {}
 pub effect fn main() -> () ! Problem { return () }`),
     )
     assert.deepEqual(Analysis.diagnostics(self), [])
+    const main = Analysis.memberByName(self, sourceId, 'main')
+    assert.deepEqual(
+      main._tag === 'Resolved' && main.declaration._tag === 'FunctionDeclaration'
+        ? main.declaration.requirementRow.requirements.map((requirement) =>
+            Type.encode(requirement.capability),
+          )
+        : main,
+      [],
+    )
   }),
 )
 

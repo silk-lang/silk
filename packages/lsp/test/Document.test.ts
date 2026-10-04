@@ -10,6 +10,7 @@ import * as SourceOrigin from '@silklang/compiler/SourceOrigin'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as Stdlib from '@silklang/compiler/Stdlib'
 import * as WorkspaceInventory from '@silklang/compiler/WorkspaceInventory'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Inspectable from 'effect/Inspectable'
 import * as Layer from 'effect/Layer'
@@ -1272,7 +1273,7 @@ const toolchainResolver = (
 
 /** Opens several modules as one analyzed project and focuses one of them as the request document. */
 const openProject = (
-  modules: ReadonlyArray<ProjectModule>,
+  modules: Arr.NonEmptyReadonlyArray<ProjectModule>,
   focus: string,
 ): Effect.Effect<
   {
@@ -1285,11 +1286,7 @@ const openProject = (
     const bytes = new Map(
       modules.map(({ module, text }) => [module, encoder.encode(text)] as const),
     )
-    const project = yield* ProjectAnalysis.make(
-      modules
-        .map(({ module }) => SourceFile.make(module, bytes.get(module) ?? new Uint8Array()))
-        .map((source) => source.id),
-    ).pipe(
+    const project = yield* ProjectAnalysis.make(Arr.map(modules, ({ module }) => module)).pipe(
       Effect.provide(
         SourceResolver.overlay(
           modules.map(({ module }) =>
@@ -1715,7 +1712,7 @@ it.effect('warns on an unused authored import binding and removes only its selec
   Effect.gen(function* () {
     const source =
       'import geometry { area, perimeter as boundary }\npub fn main() -> i32 { return area(1, 2) }'
-    const modules = [
+    const modules: Arr.NonEmptyReadonlyArray<ProjectModule> = [
       {
         module: 'geometry',
         text: 'pub fn area(width: i32, height: i32) -> i32 { return width * height }\npub fn perimeter(width: i32, height: i32) -> i32 { return width + height }',
@@ -1764,7 +1761,7 @@ it.effect('warns on an unused authored import binding and removes only its selec
     if (edits === undefined) return
     const revised = applyDocumentEdits(source, edits)
     const accepted = yield* openProject(
-      modules.map((entry) => (entry.module === 'main' ? { ...entry, text: revised } : entry)),
+      Arr.map(modules, (entry) => (entry.module === 'main' ? { ...entry, text: revised } : entry)),
       'main',
     )
     assert.deepEqual(Analysis.diagnostics(accepted.snapshot), [])
@@ -2531,7 +2528,7 @@ pub fn calculate() -> i32 { return 2 }`
       const source = `// π🙂
 import library { existing }
 pub fn main() -> i32 { return calculate() }`
-      const modules = [
+      const modules: Arr.NonEmptyReadonlyArray<ProjectModule> = [
         { module: 'library', text: library },
         { module: 'main', text: source },
       ]
@@ -2845,14 +2842,11 @@ it.effect('marks compiler-selected inactive tokens without exposing inactive sym
     const source =
       'static if Intrinsic.targetOperatingSystem() == "darwin" { pub fn active() -> i32 { return 1 } } else { pub fn inactive() -> i32 { return 2 } }'
     const bytes = encoder.encode(source)
-    const project = yield* ProjectAnalysis.make(
-      [SourceFile.make('main', bytes)].map((source) => source.id),
-      {
-        configuration: {
-          profile: { target: 'aarch64-apple-darwin', artifact: 'object', entry: { kind: 'none' } },
-        },
+    const project = yield* ProjectAnalysis.make(['main'], {
+      configuration: {
+        profile: { target: 'aarch64-apple-darwin', artifact: 'object', entry: { kind: 'none' } },
       },
-    ).pipe(
+    }).pipe(
       Effect.provide(
         SourceResolver.overlay([SourceFile.make('main', bytes)]).pipe(
           Layer.provideMerge(SourceResolver.empty),

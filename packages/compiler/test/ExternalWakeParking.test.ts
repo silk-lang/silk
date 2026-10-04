@@ -9,6 +9,7 @@ import * as Mir from '../src/Mir.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Type from '../src/Type.js'
 import { independentExecutionMultiplePackages } from './support/corpus.js'
+import { unreachable } from './support/raise.js'
 
 const replaceMirOperation = (
   module: Mir.Module,
@@ -149,7 +150,15 @@ it.effect('emits native never-driven package cleanup', () =>
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
-    yield* Analysis.codegen(snapshot, { mode: 'release' })
+    const artifact = yield* Analysis.codegen(snapshot, { mode: 'release' })
+    // Dropping the never-driven Execution calls the module's out-of-line release helper, whose
+    // Initial/InitialReady branch drops the unstarted body instead of walking resumed frames: here it
+    // frees the guard allocation `parked` captured but never ran with.
+    const release =
+      /^define [^\n]*@silk_execution_release\(ptr [^\n]*\{\n(.*?)^\}$/ms.exec(artifact.ir)?.[1] ??
+      unreachable('expected the native Execution release helper')
+    assert.match(artifact.ir.replace(release, ''), /^ {2}call void @silk_execution_release\(ptr /m)
+    assert.match(release, /^ {2}call void @free\(ptr %execution_release_initial_body_\w+\)$/m)
   }),
 )
 

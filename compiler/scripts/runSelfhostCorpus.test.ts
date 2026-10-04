@@ -113,6 +113,32 @@ exit 2`,
   assert.strictEqual(parseUnsupported('unsupported: aggregates'), undefined)
 })
 
+it('retains exact gap source locations and rejects malformed location records', () => {
+  const gap = {
+    code: 'typed-form',
+    reason: 'deferred valid form',
+    source: { module: 'silk/option.silk', span: { start: 12, end: 27 } },
+  }
+  const encode = (value: unknown): string =>
+    `SILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [value] })}`
+  assert.deepStrictEqual(parseUnsupported(encode(gap)), [gap])
+  for (const span of [
+    { start: -1, end: 27 },
+    { start: 27, end: 12 },
+    { start: 12.5, end: 27 },
+    { start: 12, end: '27' },
+  ]) {
+    assert.strictEqual(
+      parseUnsupported(encode({ ...gap, source: { module: 'silk/option.silk', span } })),
+      undefined,
+    )
+  }
+  assert.strictEqual(
+    parseUnsupported(encode({ ...gap, source: { module: '', span: gap.source.span } })),
+    undefined,
+  )
+})
+
 it('keeps build and runtime regressions in the failure count', () => {
   withStub('echo "compiler crashed" >&2; exit 2', (silkc) => {
     const result = runCase(silkc, literal)

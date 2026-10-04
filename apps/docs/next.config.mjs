@@ -13,7 +13,8 @@ const config = {
   experimental: {
     useTypeScriptCli: true,
   },
-  // ponytail: content lives in packages/*/docs, outside this app's root.
+  // Trace from the monorepo root: workspace dependencies and pnpm's package store live outside
+  // this app's directory.
   outputFileTracingRoot: new URL('../../', import.meta.url).pathname,
   async headers() {
     return [

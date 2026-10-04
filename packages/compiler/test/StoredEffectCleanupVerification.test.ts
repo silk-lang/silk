@@ -30,14 +30,15 @@ const lowerStored = Effect.fnUntraced(function* (name: string, source: string) {
     snapshot.resolution.contexts,
   )
   const layout = yield* Layout.computeRuntime(catalog, snapshot.instances, snapshot.index)
-  const module = Lower.lowerProgram(
+  const lowered = Lower.lowerProgram(
     snapshot.instances,
     layout,
     snapshot.index,
     OpaqueRealization.catalogOf(snapshot),
     SemanticContext.fromModules(snapshot.results.values()),
   )
-  return Object.freeze({ catalog, module })
+  assert.deepEqual(lowered.diagnostics, [])
+  return Object.freeze({ catalog, module: lowered.program })
 })
 
 const replaceDrop = (
