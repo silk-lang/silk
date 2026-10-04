@@ -56,4 +56,6 @@ export const selfhostTrack = [
   'captured-exclusive-reference-parameters',
   'staged-callable-bindings',
   'staged-callable-parameter',
+  'operator-pipeline',
+  'staged-callable-section',
 ] as const satisfies ReadonlyArray<string>
