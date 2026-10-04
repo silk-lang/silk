@@ -1011,7 +1011,10 @@ repeated invocation and capture-only drop glue.
   `storedCallableFieldsShareInvocationAndPipelineChecking` independently covers receiver evaluation,
   pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. The first four
   passing native controls completed below one second; repaired dispatch assertions remain pending.
-- **Source migration:** none.
+  The earlier owner-claim control now asserts a projected field `CallableCall` with no interface or
+  named-call fallback; it retains the duplicate inherent-name collision rejection.
+- **Source migration:** the former callable-field `Unsupported` expectation is retired now that
+  fields invoke through the ordinary checked callable path.
 
 ### Native callable results from selected interface operations
 
