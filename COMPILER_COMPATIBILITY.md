@@ -333,6 +333,32 @@ Each entry records:
   codes and pipe spans. Interface-operation and Effect pipeline coverage remain separate gaps.
 - **Source migration:** construct a unary section on the right, for example `2 |> add(3)`.
 
+### Generic named sections in selfhost
+
+- **Status:** direct invocation and closed contextual callable admission implemented in the Step 8
+  generic-section layers; further staging remains owned by #567 Step 8.
+- **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
+  result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
+  independently; immutable construction evidence keeps its original binder ordinal.
+- **Compilers:** selfhost opens a generic section's target binders for each concrete callable
+  promise, proves its target bounds, and preserves the shared blueprint. A later operand may first
+  fix a consumer's type parameter. MIR selects the target from closed invocation operands rather
+  than the comparison contract. Further generic staging remains a `typed-form` gap, along with
+  quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
+  scope or static evidence. Bootstrap rejects some closed contextual forwarding of a stored generic
+  section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
+  type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
+  [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
+  lanes remain named gaps rather than signature-mismatch diagnostics. The implemented native
+  contextual lane intentionally extends this bootstrap limitation according to that specification.
+- **Evidence:** `genericNamedSectionsInferEachInvocationIndependently` and
+  `genericNamedSectionsPreserveSparseSelectedOrdinals` assert ordinary direct instances for both
+  `i32` and `bool`, stored suffix operands, immutable metadata and capture-only layout.
+  `contextualGenericSectionsReuseTheirBlueprintAcrossConsumers` and
+  `contextualGenericSectionsWaitForLaterOperandInference` inspect the consumer instances' direct
+  target calls. The contextual diagnostic and owned-capture claims cover target bounds, conflicting
+  signatures and a single transferred capture cleanup.
+
 ### Reached Effect literals in selfhost
 
 - **Status:** deferred to #567 Step 9; named during the Step 8 corpus sweep on 2026-10-03.
@@ -586,3 +612,13 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
   `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
   body queries. Native runtime execution is not claimed by this typing test.
+
+### Native stored-section loans retain an explicit borrow obligation
+
+Step 8 retains each captured local reference's access and region in the exact section environment.
+Native `TypedBody.borrowStatus` remains `NotChecked`; general overlapping writes while a section
+holds that loan belong to roadmap Step 14. The bootstrap rejects those writes through its loan
+checker. The native availability pass diagnoses moved places and consumption during an assignment
+RHS; it does not claim to check outstanding loan conflicts. `genericNamedSectionsRetainMutableCaptureStorage`
+asserts retained exclusive local provenance and the explicit unchecked status, alongside direct
+repeated invocation and capture-only drop glue.
