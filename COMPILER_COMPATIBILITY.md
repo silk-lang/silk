@@ -1006,8 +1006,8 @@ repeated invocation and capture-only drop glue.
 
 ### Native callable results from selected interface operations
 
-- **Status:** implemented in a draft Step 8 layer. Bootstrap source checking and independent
-  source review are in progress; native assertions, Linux timings and exact-head CI are pending.
+- **Status:** implemented in a draft Step 8 layer; both source roots pass bootstrap checking.
+  Frozen-head independent review, native assertions, Linux timings and exact-head CI are pending.
 - **Rule:** an operation returning a callable retains its original operation identity, complete
   contract/provider selection, original-owner invocation assignments, checked operand types and
   positional optional witness loans. A concrete conformance witness resolves the ordinary original
