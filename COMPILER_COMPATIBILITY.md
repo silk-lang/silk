@@ -912,9 +912,9 @@ repeated invocation and capture-only drop glue.
 
 ### Native higher-order callable result selection
 
-- **Status:** implemented; bootstrap source checking passes. The first isolated native run
-  executed ten assertions (seven PASS, three FAIL); corrected oracles and completed-schema
-  canonicalization await exact-head CI.
+- **Status:** implemented in a draft Step 8 layer. The native head ran ten controls with nine
+  passing and one staged-suffix failure. Invocation-local representation reification repairs
+  that source rejection; the corrected native assertions and exact-head gate remain pending.
 - **Rule:** a checked invocation through an abstract callable retains its producer, public result
   contract, argument type evidence and selected invocation values/ordinals. This source recipe is
   resolved after substitution to the original returned environment before exact consumer inference.
@@ -926,6 +926,9 @@ repeated invocation and capture-only drop glue.
   are preserved. Mutable storage views and staged schemas use the same original
   target selection and bound proof as direct invocation, retaining public permissions. Selected
   lifetime/row/type evidence participates in exact equality, substitution and unification.
+  Invocation-local inference reifies supplied callable-valued operands through the ordinary
+  representation binder operation, after quantified lifetime slots. Unsupplied leading operands
+  keep their public section contracts; schema invocations retain original target slot mappings.
 - **Bootstrap boundaries:** reduced constrained higher-order source is admitted by the bootstrap
   frontend but reaches SEM0219 when lowering the selected returned callable invocation. A generic
   stored-schema producer control is rejected with SEM0052 at its constrained `same` consumer even
@@ -943,6 +946,9 @@ repeated invocation and capture-only drop glue.
   `higherOrderStagedSuffixRecipesNormalizeBeforeSchemaSelection` retain structured source/MIR claims.
   Source canonicalization includes free exact callable contracts and staged suffix evidence before
   target selection; schema bound blueprints keep their target declarations and quantifiers.
+  Nested capture and staged Once controls compare the direct and higher-order construction
+  through one exact-F scalar consumer and inspect their actual MIR destination types, avoiding
+  an additional callable producer graph without removing either source path or storage assertion.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
