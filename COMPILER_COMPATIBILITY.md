@@ -620,3 +620,33 @@ checker. The native availability pass diagnoses moved places and consumption dur
 RHS; it does not claim to check outstanding loan conflicts. `genericNamedSectionsRetainMutableCaptureStorage`
 asserts retained exclusive local provenance and the explicit unchecked status, alongside direct
 repeated invocation and capture-only drop glue.
+
+### Native generic captures retain finite local contents obligations
+
+- **Status:** owned generic captures admitted for finite body use in Step 8; public escape remains
+  explicitly unsupported when the stored contents have no declared validity proof.
+- **Rule:** unknown stored `T` is not `'static`. A constructed closure or section retains exact
+  capture types and a local Contents obligation, separate from declared premises. Reference,
+  slice and callable retention stops at the stored loan or environment; invocation inputs and
+  results do not constitute stored contents.
+- **Compilers:** native construction permits unresolved owned contents with a `Lifetime.Local`
+  environment restriction and `TypedBody.SafetyObligation.Contents`. Every callable constructor,
+  including unresolved staging, rebuilds its intersection after substitution to preserve concrete
+  capture regions revealed by a binding. The original local restriction remains conservatively
+  retained even for a scalar substitution; this lane does not prove escaping validity.
+  Native public callable promises and returned callable contracts report `Unsupported` at the
+  value or invocation boundary when those contents remain unresolved, including callables inside
+  stored aggregates. The direct public-promise bootstrap control instead reports `SEM0212` on its generic declaration for a
+  `'static` promise with unbounded `T`; its complete borrow/lifetime analysis can prove additional
+  finite and escaping cases. The nested aggregate control is bootstrap-admitted; native intentionally retains the explicit
+  unresolved-contents gap until that proof is available. Native general borrow checking remains
+  `NotChecked`.
+- **Evidence:** `genericOwnedCapturesRetainLocalContentsAndSubstitutedLoans` checks the exact
+  parameter, once mode, local obligation and mixed known/unknown region retention;
+  `abstractCallableStagesRetainNewlySubstitutedCaptureLoans` keeps the base abstract while revealing
+  a capture loan. Direct and nested public promise controls assert native gap codes and spans.
+  `genericOwnedCaptureTransfersCleanupToOriginalTarget` checks the ordinary direct target and
+  transferred capture cleanup. The reduced owned program builds with bootstrap `build-exe` and
+  returns 42; native assertions and timing require exact-head CI.
+- **Owner:** Step 8 owns construction and direct lowering; Step 14 owns discharging local Contents
+  and general borrow obligations and proving additional escaping validity.

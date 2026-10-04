@@ -501,3 +501,14 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · A formatter-shifted CI stack line was attributed to the preceding combined assertion, wasting native-call diagnosis effort · Inspect numbered lines in an exact native-formatted copy before assigning the failure; line 35511 was the later loan-conflict oracle · selfhost Step 8d
 
 - 2026-10-04 · A generic Shared.with call directly after move in an if-let condition parsed its type arguments as comparison operators · Bind the generic call result first, then match the owned local · selfhost Step 8d generic staging
+
+- 2026-10-04 · A standalone block after a `let x = match ...` in a new Step 8 test was parsed as
+  a struct literal, and reused `Some {value}` arm names conflicted with an outer pattern binding.
+  Return from named match-arm helpers and use distinct binding names; check the source-written
+  test root with bootstrap before starting native CI · Silk compiler Step 8.
+
+- 2026-10-04 · Step 8 capture assertions assumed a staged environment had only its new local marker,
+  and checked unavailable callable bounds at the whole call. Staging also retains F's declared
+  environment; callable argument failures preserve the operand span. Assert both retained regions
+  and the operand span independently. Native formatter probes also require a selection inside the
+  manifest source root; use a disposable source-root copy and remove it afterward. · Silk selfhost
