@@ -23,6 +23,15 @@ Generic records and nominal unions retain complete type applications through con
 projection and patterns. Layout, Copy classification, drop glue and inherent call instances are
 computed under those applications; standard-library Option and Result use the same ordinary path
 as user declarations. Slice subranges and unions with string or f64 members remain follow-up work.
+Exact lifetime-bearing semantic instances are validated separately. Complete selected MIR recipes
+and their ordered call/drop graph determine emitted identities after finite reachability closes.
+Equivalent recipes share code; different direct or transitive cleanup receives distinct symbols,
+while physically equivalent types still share layouts. This is target-neutral and handles recursive
+instances without encoding discovery ordinals or LLVM text. The build answer retains its emission
+plan for structural inspection alongside the emitted module.
+Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
+certify LLVM executability. MIR, layouts and foreign signatures are validated before closure
+planning, while backend-only emission restrictions remain loud gaps on the completed build.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
 by-value receiver of an affine place. The place is a local or match subject plus static field,
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a

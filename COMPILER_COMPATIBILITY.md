@@ -174,24 +174,34 @@ Each entry records:
   `genericSealedDropRetainsExactHeadBindings` and `genericSealedUnknownDropProofIsNotAbsence` in
   `compiler/src/semantic/SemanticCases.silk`.
 
-### Selfhost checks lifetime-sensitive erased instance recipes before emission reuse
+### Selfhost resolves complete selected instance recipes before emission sharing
 
-- **Status:** correction in progress on 2026-10-04 after combined Step 7 review; native
-  execution and exact-head CI are not yet verified.
+- **Status:** implemented on 2026-10-04. Execution, independent-review and exact-head Linux CI
+  acceptance receipts are published on PR #761; source implementation is not itself a CI receipt.
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
-  cleanup. MIR remains layout-free, and emitted instance keys use the canonical runtime form
+  cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
-- **Compilers:** the bootstrap can compile lifetime-sensitive conditional Drop implementations.
-  Selfhost must resolve every exact semantic glue and function application before deciding
-  whether its erased runtime symbol can be shared. Equal emitted recipes may share; incompatible
-  recipes report `instance-recipe`, never silently reuse the first application's cleanup.
+- **Compilers:** selfhost resolves every exact semantic glue and function application before
+  deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
+  incompatible recipes receive distinct symbols, including all transitive callers. The erased
+  family alone is not emitted-code identity. Generic named-section types likewise retain fixed
+  selected lifetimes and the remaining contract's free validity in exact equality, even when
+  their runtime projections agree; copied immutable schema handles remain equal. The bootstrap currently compiles the reduced
+  conditional Drop fixture but its local-only execution traps; source inspection identifies a
+  missing substituted impl-lifetime-bound check in conformance discovery. A fixed-lifetime local
+  control succeeds alone but traps when both lifetimes reach one generic caller declaration.
+  The shared runtime control uses a fixed head and separate caller declarations, and observes
+  both payload drops through borrowed counters. That control passes both compilers; the harder
+  bound-sensitive and same-declaration caller cases remain native structured acceptance claims.
+  Bootstrap bound proof and caller-sharing repairs are separate bootstrap follow-ups, not native
+  gaps or reasons to weaken these controls.
 - **Source migration:** none. This is a native emitted-instance follow-up, not an Option/Result
   exception or an effect/closure deferral.
 - **Evidence:** review counterexample: `Guard<'a>` always owns a droppable `Token`, but its own
   `impl<'a: 'static> Drop` hook applies to a static instance and not a local one. Both demand
-  orders and an equal-recipe sharing control are being added; native results remain pending.
-- **Open questions:** canonical runtime recipe identity must support incompatible lifetime-
-  sensitive instances before the native compiler can accept that broader conditional subset.
+  orders and equal-recipe sharing controls are retained as structured acceptance assertions;
+  all four source controls execute successfully. Linux cost and final integrated-head execution
+  are separate acceptance gates, not implied by source review.
 
 ### Selfhost generic aggregate diagnostics retain existing family differences
 
