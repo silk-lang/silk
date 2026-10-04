@@ -605,3 +605,13 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
   `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
   body queries. Native runtime execution is not claimed by this typing test.
+
+### Native stored-section loans retain an explicit borrow obligation
+
+Step 8 retains each captured local reference's access and region in the exact section environment.
+Native `TypedBody.borrowStatus` remains `NotChecked`; general overlapping writes while a section
+holds that loan belong to roadmap Step 14. The bootstrap rejects those writes through its loan
+checker. The native availability pass diagnoses moved places and consumption during an assignment
+RHS; it does not claim to check outstanding loan conflicts. `genericNamedSectionsRetainMutableCaptureStorage`
+asserts retained exclusive local provenance and the explicit unchecked status, alongside direct
+repeated invocation and capture-only drop glue.
