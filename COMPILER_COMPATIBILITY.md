@@ -831,3 +831,24 @@ repeated invocation and capture-only drop glue.
   checks producer/caller transfer, a moved stored-field operand, target cleanup, abandonment glue
   and OWN0003 at a bare returned affine owner. Native execution of these assertions is pending.
 - **Source migration:** none.
+
+
+### Native raw owned-callable return identity guard
+
+- **Status:** bootstrap parity implemented during Step 8 on 2026-10-04; exact native CI pending.
+- **Rule:** returning a nonshared source-written callable parameter requires a known concrete
+  callable identity (SEM0081). An authored constrained `F` retains its owned type identity and
+  may return through the same public contract. Named values and constructed exact environments
+  also retain known identity.
+- **Compilers:** native classifies the original parameter owner and generated representation slot
+  through its tracked Signature. Moved aliases and enclosing captures preserve that role; source
+  syntax at the current return is not sufficient evidence. This guard follows the existing return
+  transfer check: a bare affine owner first reports OWN0003 at the operand. Bootstrap can report
+  OWN0003 and SEM0081 together; native retains its single primary rejection. Effect contracts
+  are outside this guard and retain their Step 9 owner.
+- **Evidence:** `rawOwnedCallableReturnKeepsBootstrapIdentityGuard` checks full move-expression
+  spans for direct mutable/once parameters, a moved alias and a nested enclosing capture, with
+  independent authored-F and known-target positives. Bootstrap Analysis reaches the four SEM0081
+  sites and the bare OWN0003 site; a separate reached positive reduction has available MIR.
+- **Source migration:** use an authored constrained type parameter when the returned owner needs
+  to preserve its exact callable type, or return a known construction.
