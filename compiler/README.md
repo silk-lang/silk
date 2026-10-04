@@ -22,7 +22,9 @@ it creates an occurrence-nominal anonymous aggregate laid out as an ordinary rec
 Generic records and nominal unions retain complete type applications through construction,
 projection and patterns. Layout, Copy classification, drop glue and inherent call instances are
 computed under those applications; standard-library Option and Result use the same ordinary path
-as user declarations. Slice subranges and unions with string or f64 members remain follow-up work.
+as user declarations. Runtime text (`string<'static>`) and byte-string (`&'static [u8]`) literals
+store their decoded bytes in a private constant and build the same address-and-byte-length
+descriptor as a slice. Slice subranges and unions with string or f64 members remain follow-up work.
 Exact lifetime-bearing semantic instances are validated separately. Complete selected MIR recipes
 and their ordered call/drop graph determine emitted identities after finite reachability closes.
 Equivalent recipes share code; different direct or transitive cleanup receives distinct symbols,
