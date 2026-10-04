@@ -44,21 +44,22 @@ application and abstract body typing, method and eligible operator selection, an
 across held source revisions. A fresh per-request specialization Pool builds identities from those
 validated facts; cached Pool or instance answers are outside M2.3. See
 [compiler/README.md](compiler/README.md#semantic-scope-and-later-waves) and the reconciled M2
-coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped`
-body still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This
-does not claim borrow checking or general executable support. The selfhost build CLI currently
-lowers closed scalar, reference, record and sequence forms through demanded MIR and LLVM text. It emits a
+coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped` body
+still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
+claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
+scalar, reference, record and sequence forms through demanded MIR and LLVM text. It emits a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
 remain a named `intrinsic-member` gap. A repeated inferred shared-slice lifetime with distinct
 actual Local regions of the same caller requires the deferred common-validity proof and reports
 `slice-region-relation`; this does not admit fixed Static, incompatible access/element, or foreign
-owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate
-raw pointer mutation-capability weakening preserves invariant pointee/extent and identical other
-qualifiers; it does not implement reverse access, nested pointee covariance, or other qualifier
-conversions. Ownership, lifetime, and cleanup checking remains step 14. The TypeScript bootstrap
-still builds the native compiler and remains the complete language oracle.
+owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate raw
+pointer weakening removes mutation capability and adds nullability, preserving invariant
+pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
+covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
+checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
+complete language oracle.
 
 ## Entry format
 
@@ -84,8 +85,9 @@ Each entry records:
   A misspelled member is an error; a catalog-defined runtime or mixed-phase member that selfhost
   has not implemented is an explicit `intrinsic-member` build gap.
 - **Compilers:** the bootstrap catalog defines the complete membership and phase metadata.
-  Selfhost implements only its existing target/static-text subset; the new membership check adds
-  no runtime primitive, contract validation, evaluation, or lowering.
+  Selfhost implements its target/static-text subset, the scalar `i32`/`bool`/float-bit
+  primitives, `isizeToUsize`, and the raw-pointer primitives `pointerFromSlice`, `pointerAt`,
+  `pointerRead` and `pointerRequalify`; the membership check itself adds no primitive.
 - **Source migration:** none. Keep ordinary standard-library wrappers in Silk source rather than
   adding privileged library actors or substituting unsupported runtime implementations.
 - **Diagnostics and limits:** the semantic lane retains `IntrinsicUnavailable` at the authored
@@ -122,6 +124,38 @@ Each entry records:
   boundary. The shared corpus program `static-type-selection` exercises the bootstrap natively.
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
+
+### Module static selection subset in selfhost
+
+- **Status:** implemented on 2026-10-04 on PR #773 (roadmap #567 Step 10b); verification is pending
+  that PR's exact-head CI.
+- **Rule:** declarations in module-level `static if` arms belong to the module namespace; only
+  selected arms exist, a failed or cyclic condition admits neither arm, and package parameters
+  cannot be conditional ([module static
+  selection](apps/docs/content/reference/module-static-selection.md), MODULE-STATIC-001 to 003).
+- **Compilers:** the bootstrap implements the complete rule. Selfhost selects arms for names,
+  imports, impl heads and inherent members through `Condition` queries, never reads an inactive
+  arm's imports, and rejects conditional package parameters by syntax. It does not yet select arms
+  inside mixed-body static routing, and it bounds interface scans during condition evaluation as
+  described below.
+- **Source migration:** none. Standard-library modules keep their module-level arms.
+- **Diagnostics and limits:** a non-`bool` condition is `ConditionNotBool` at the condition; a
+  condition that depends on its own arm is `Cycle`; a conditional package parameter is
+  `ConditionalParameter` at its declaration. Static routing of a mixed body (a function containing
+  `static if` or static parameters) reads only the syntax index, so naming a declaration that has
+  any conditional candidate there fails with fault `ConditionalName` and code `Unsupported` at the
+  name, even when an arm admits it. While a condition is evaluated, every demand is keyed by that
+  condition, and interface scans for operator and method syntax skip names whose every candidate
+  sits in that condition's own arms. Answers are therefore deterministic, but an operator or method
+  used by the condition or its helpers cannot be supplied by an interface that only the condition's
+  own arm imports or declares: the condition resolves as if that interface were absent instead of
+  reporting `Cycle`.
+- **Evidence:** in `compiler/src/semantic/SemanticCases.silk`, `moduleArmsSelectNativeDeclarations`,
+  `conditionOrderSelectNativeAnswers` (both demand orders in fresh stores) and
+  `mixedConditionalNameSelectNativeBoundary`.
+- **Open questions:** expose arm availability through the static port so mixed-body routing can
+  select arms, and decide whether the scan bound should instead report `Cycle` when a skipped
+  interface would apply.
 
 ### Selfhost rejects moves out of `match place` bindings
 
