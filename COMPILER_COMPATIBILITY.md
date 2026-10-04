@@ -822,13 +822,12 @@ repeated invocation and capture-only drop glue.
   is checked before body demands, including cached-body edges. The depth bound spans conditional
   context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
 - **Remaining Step 8 return-origin work:** recursive origin cycles, divergent plain origins and
-  callable-valued results reached through abstract or invocation-selected higher-order targets or
-  interface invocation remain explicitly unsupported. Fully selected stored producer values and
+  callable-valued results reached through interface invocation remain explicitly unsupported.
+  Abstract and invocation-selected higher-order results now retain a source selection recipe;
+  exact native verification of that layer is pending. Fully selected stored producer values and
   inherent receiver methods use the same original-result query and runtime ABI projection as direct
   producers. Retained mutable parameter storage loans use #783. General escape and parent-loan
-  proof remain NotChecked for Step 14. In particular, a constrained callable parameter producing
-  another callable remains required Step 8 work; missing corpus coverage does not discharge it.
-  These limitations are not claimed as native PASS.
+  proof remain NotChecked for Step 14. These limitations are not claimed as native PASS.
 - **Evidence:** `plainCallableReturnsKeepOriginalStorageAndPublicContracts`,
   `plainCallableOriginsUnifyAcrossProducers`, `plainCallableViewsKeepWeakerInvocationPermissions`
   and `plainCallableViewStagingRetainsPublicModeAndArgumentOrder` inspect original storage,
@@ -885,3 +884,29 @@ repeated invocation and capture-only drop glue.
 - **Source migration:** none. Opaque and plain Effect members retain `EffectFormUnavailable`
   at their producer call, including unions; this prevents a callable sweep from hiding the next
   Step 9 boundary behind a generic typed-form gap.
+
+### Native higher-order callable result selection
+
+- **Status:** implemented; bootstrap source checking passes, native assertions and exact-head CI pending.
+- **Rule:** a checked invocation through an abstract callable retains its producer, public result
+  contract, argument type evidence and selected invocation values/ordinals. This source recipe is
+  resolved after substitution to the original returned environment before exact consumer inference.
+  Selection evidence is not a physical capture. No adapter, code pointer or separate closure key is
+  introduced; emitted identity still comes from the complete ordinary application and MIR graph.
+- **Proof context:** only reachable return operands participate in origin normalization, under the
+  producer's own applied premises. Mutable storage views and staged schemas use the same original
+  target selection and bound proof as direct invocation, retaining public permissions. Selected
+  lifetime/row/type evidence participates in exact equality, substitution and unification.
+- **Bootstrap boundaries:** reduced constrained higher-order source is admitted by the bootstrap
+  frontend but reaches SEM0219 when lowering the selected returned callable invocation. A generic
+  stored-schema producer control is rejected with SEM0052 at its constrained `same` consumer even
+  when both producers return the same original leaf. Native's source normalization is intended to
+  retain exact leaf identity there; its native assertions have not yet executed. No new acceptance
+  corpus program is added from these bootstrap-blocked reductions.
+- **Evidence:** `higherOrderCallableResultsKeepSelectedProducerAndLeafTargets`,
+  `higherOrderCallableReturnsForwardOpenOriginsWithoutUnusedStorageDemands`,
+  `higherOrderCallableSchemaResultsNormalizeBeforeExactInference`,
+  `deferredCallableResultRetainsSelectedLifetimeEvidence`,
+  `higherOrderBorrowedMutableProducersPreserveOriginalTargets` and
+  `higherOrderStagedSchemaProducersRetainOriginalSelection` retain structured source/MIR claims.
+- **Source migration:** none.

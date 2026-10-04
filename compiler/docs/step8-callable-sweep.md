@@ -2,7 +2,7 @@
 
 This receipt belongs to [#567 Step 8](https://github.com/julia-script/silk/issues/567).
 This is an intermediate coverage receipt; Step 8 remains unchecked while the in-scope
-higher-order return-origin work below is unfinished. Exact CI receipts and merged heads belong
+higher-order return-origin work below awaits exact native verification. Exact CI receipts and merged heads belong
 on that issue; source assertions and corpus pins remain in the repository. Native borrow obligations remain explicitly NotChecked
 until Step 14.
 
@@ -15,6 +15,9 @@ The starting identity head `02dd3b595ce9af863da2eb51f71ca1270f1acd2f` passed
 The ordinary callable return/call head `2eda17bff056e4a662482735b94c39f7f00f581b` passed
 [CI 37212293538](https://github.com/julia-script/silk/actions/runs/37212293538):
 80 PASS, 0 FAIL, 313 Unsupported over 393 programs, with 59 selfhostTrack pins.
+The pin layer `e225c2f8eb302cc0a34549db7deeb57172a67b16` passes
+[CI 37220392157](https://github.com/julia-script/silk/actions/runs/37220392157):
+80 PASS, 0 FAIL, 313 Unsupported, track 67, with all 472 source tests under one second.
 All 60 starting PASS programs remain PASS. The overall gain of 20 includes concurrent Step 7
 and other upstream work; it is not a claim that Step 8 alone enabled all 20.
 
@@ -86,7 +89,7 @@ corpus sources; unsupported is not runtime coverage of later operations.
 | finite-effect-join-selected-requirement | effect-instance, effect.silk 24602–24864 | Step 9 |
 | finite-effect-join-selected-cleanup | effect-form, main.silk 1633–1640 | Step 9 |
 | finite-effect-join | scalar-enum-moving-match, main.silk 136–214 | Moving enum match follow-up precedes effects |
-| finite-effect-join-capture-arity | typed-form, main.silk 406–431, choose(First {}, payload) | Step 9 Effect-valued producer; later operations unmeasured |
+| finite-effect-join-capture-arity | effect-form, main.silk 406–431, choose(First {}, payload) | Step 9 Effect-valued producer; later operations unmeasured |
 | foreign-libc-qsort-callback | effect-form, main.silk 1264–1286 | Step 9 first; C callback lane unmeasured |
 | bound-method-values | bound-method, main.silk 416–427, shared.read | Approved bound-method capture follow-up in MIR note §10 |
 | method-call-matrix | typed-form, main.silk 1819–1850, Option.some<i32>(4).map(addOne) | Generic inherent-method inference follow-up; rejected before argument checking |
@@ -101,15 +104,19 @@ One additional non-effect first gap was demonstrated: ordinary-union-executable-
 at selectedCallable(), main.silk 244–262. The exact callable-union layer (#785) extends the existing
 member admission/canonical ordering and checks the original target and active-member glue. Its
 separate source assertion requires an Effect-valued union producer to report EffectFormUnavailable.
-The exact-head CI receipt determines the corpus's next observed gap rather than treating a
-source prediction as an executed result.
+[Exact CI 37220361315](https://github.com/julia-script/silk/actions/runs/37220361315) at
+`fc0230930960ff4bfe37c9fde9b68f2ed2462494` observes effect-form at main.silk 270–286 for
+ordinary-union-executable-members and at 406–431 for finite-effect-join-capture-arity.
+The callable-union admission is followed by the Step 9 producer boundary in both cases.
 
 ## Further return-shape coverage
 
-Abstract higher-order producer results remain required Step 8 work: a constrained parameter such
+Abstract higher-order producer results remain required Step 8 verification: a constrained parameter such
 as `P: fn<'static>() -> fn<'static>(i32) -> i32` must retain the selected producer's exact returned
-environment after monomorphization. The current checker rejects that application before origin
-normalization. Absence of an existing corpus first-gap witness does not remove it from scope.
+environment after monomorphization. The higher-order layer now retains checked source selection
+recipes, normalizes closed results before exact consumer inference, and adds selected-lifetime,
+mutable-view and staged-schema controls. Bootstrap source checking passes; native MIR assertions
+and exact-head CI remain pending. Absence of an existing corpus first-gap witness does not remove it from scope.
 Interface producer projections and recursive/divergent plain return origins also retain explicit
 Unsupported boundaries; they are not claimed PASS. Contextual opaque
 slots inside aggregate results and unresolved descriptor/phantom projection likewise retain explicit
