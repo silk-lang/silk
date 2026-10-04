@@ -1,3 +1,4 @@
+import * as Arr from 'effect/Array'
 import { modules, runtimeDefaults, runtimeComponents } from './Stdlib.generated.js'
 
 /** Installed build defaults generated from distribution composition data. */
@@ -34,7 +35,7 @@ const staticInventory = (entry: object): ReadonlyArray<string> =>
   'staticInventory' in entry && Array.isArray(entry.staticInventory) ? entry.staticInventory : []
 
 /** The deterministic standard-library manifest, ordered by canonical module identity. */
-export const manifest: ReadonlyArray<Module> = modules.map((entry) => ({
+export const manifest: Arr.NonEmptyReadonlyArray<Module> = Arr.map(modules, (entry) => ({
   module: entry.module,
   path: entry.path,
   sourceIdentity: entry.sourceIdentity,

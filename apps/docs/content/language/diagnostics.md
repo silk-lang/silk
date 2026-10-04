@@ -16,11 +16,11 @@ $ pnpm --filter @silklang/compiler documentation:generate
 | `LEX`  | Lexical   | 12    |
 | `PAR`  | Parser    | 5     |
 | `MOD`  | Module    | 2     |
-| `SEM`  | Semantic  | 202   |
+| `SEM`  | Semantic  | 203   |
 | `OWN`  | Ownership | 19    |
 | `LAY`  | Layout    | 1     |
 
-There are 241 codes in total.
+There are 242 codes in total.
 
 ## Lexical (`LEX`)
 
@@ -262,6 +262,7 @@ There are 241 codes in total.
 | `SEM0216` | A diagnostic observer callback lacks a complete direct-execution proof.                                      | `Diagnostic observer callback requires direct execution: <detail>`                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `SEM0217` | Terminal observation is provably outside a selected failure handler.                                         | `Terminal diagnostic observation requires a selected failure context`                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `SEM0218` | A `test` qualifier marks a function outside the finite executable test contract.                             | `Invalid test declaration: <detail>`                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `SEM0219` | Emitted code references a function instance whose valid body native lowering does not support yet.           | `Native lowering does not support this function body yet`                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ## Ownership (`OWN`)
 

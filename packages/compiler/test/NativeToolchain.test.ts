@@ -54,6 +54,7 @@ import * as Linker from '../src/Linker.js'
 import * as LlvmWasmRuntime from '../src/LlvmWasmRuntime.js'
 import * as Target from '../src/Target.js'
 import * as ToolchainPlan from '../src/ToolchainPlan.js'
+import { unreachable } from './support/raise.js'
 
 const defaultClang = (): string => {
   if (existsSync('/opt/homebrew/opt/llvm/bin/clang')) return '/opt/homebrew/opt/llvm/bin/clang'
@@ -1745,6 +1746,60 @@ it.effect('keys C objects by consumed headers and freezes preprocessing for insp
       }),
     )
   }),
+)
+
+it.effect(
+  'compiles Wasm C under a host supply and rejects a supply for another native target',
+  () =>
+    Effect.gen(function* () {
+      const host = yield* NativeToolchain.hostTarget()
+      const other = Target.native.find((target) => target.id !== host.id) ?? unreachable()
+      const cache = NativeToolchain.makeRuntimeObjectCache()
+      const selected = yield* NativeToolchain.resolveToolchain(
+        { ...toolchain, runtimeObjectCache: cache },
+        yield* profileFor(host),
+      )
+      yield* NativeToolchain.withBuildScope(
+        'wasm-c-under-host-supply',
+        Effect.fnUntraced(function* (scope) {
+          const wasm = Target.wasm32UnknownUnknown
+          const runtime = yield* NativeToolchain.compileCObject(
+            selected,
+            scope,
+            wasm,
+            'wasm_runtime',
+            LlvmWasmRuntime.source,
+          )
+          assert.isUndefined(runtime.artifact.translation)
+          // The host supply takes no part in the Wasm object's identity: the same Clang reuses it.
+          yield* NativeToolchain.compileCObject(
+            {
+              _tag: 'Toolchain',
+              clang: selected.clang,
+              llvmAr: selected.llvmAr,
+              runtimeObjectCache: cache,
+            },
+            scope,
+            wasm,
+            'wasm_runtime',
+            LlvmWasmRuntime.source,
+          )
+          assert.deepEqual(NativeToolchain.runtimeObjectCacheStats(cache), {
+            entries: 1,
+            hits: 1,
+            misses: 1,
+          })
+          const mismatch = yield* Effect.result(
+            NativeToolchain.compileCObject(selected, scope, other, 'other', 'int value(void);'),
+          )
+          assert.strictEqual(mismatch._tag, 'Failure')
+          if (mismatch._tag !== 'Failure') return
+          assert.strictEqual(mismatch.failure.reason._tag, 'SupplyFailed')
+          if (mismatch.failure.reason._tag !== 'SupplyFailed') return
+          assert.strictEqual(mismatch.failure.reason.failure.code, 'TargetMismatch')
+        }),
+      )
+    }),
 )
 
 it.effect(

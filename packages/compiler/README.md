@@ -181,9 +181,12 @@ target, unresolved entry, source rejection, backend failure, and external proces
 distinct outcomes. Successful artifacts retain the exact toolchain graph digest.
 
 `src/ToolchainIntegrity.generated.ts` is an ignored build artifact. Builds generate its compiler
-source digest and ship the compiled module in `dist`; Turbo restores both outputs on cache hits.
-The package's `dev` command refreshes the digest during watch mode, and `test` and `typecheck`
-generate it before checking source. After editing compiler source, regenerate it with
+distribution digest, which covers the compiler sources and the built `@silklang/llvm` JavaScript
+that writes its bitcode, and ship the compiled module in `dist`; Turbo restores both outputs on
+cache hits. Backend-emission and helper-object cache keys derive from this digest, so a change to
+either part invalidates them. The package's `dev` command refreshes the digest during watch mode,
+and `test` and `typecheck` generate it before checking source. After editing compiler source or
+rebuilding `@silklang/llvm`, regenerate it with
 `pnpm --filter @silklang/compiler toolchain:generate` before invoking Vitest directly.
 
 ## Implemented language surface
@@ -235,9 +238,12 @@ typed operation and `SourceResolver` is its Effect service: browser and editor t
 compiler core.
 
 `ProjectAnalysis` analyzes the union closure of synchronized roots once and returns immutable root
-views that share syntax, declaration, semantic, tooling, and diagnostic facts. Revising a project
-reuses byte-identical syntax and authored artifacts; semantic facts are reused per body when their
-authored content, scope and dependencies are unchanged and recomputed otherwise.
+views that share syntax, declaration, semantic, tooling, and diagnostic facts. Its root list is
+non-empty by type. `primary` is a view of the shared project-wide facts, rooted at the first
+canonical root (not the configured application); every view carries the same project facts, so
+documentation and source catalogs read it directly. Revising a project reuses byte-identical
+syntax and authored artifacts; semantic facts are reused per body when their authored content,
+scope and dependencies are unchanged and recomputed otherwise.
 
 ## Editor and documentation facts
 

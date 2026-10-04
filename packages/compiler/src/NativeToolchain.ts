@@ -224,25 +224,30 @@ export const resolveToolchain = Effect.fn('NativeToolchain.resolveToolchain')(fu
       llvmAr: toolchain.supply.archiver.command,
     }
   }
-  const host = hostSelection()
-  const supply = yield* PlatformSupplyResolver.resolveSupply(
-    PlatformSupplyResolver.make(process.env),
-    {
-      profile,
-      host: host._tag === 'Resolved' ? host.target.id : undefined,
-      clang: toolchain.clang,
-      llvmAr: toolchain.llvmAr,
-      ...(toolchain.platform === undefined ? {} : { request: toolchain.platform }),
-      ...(toolchain.artifactSupply === undefined ? {} : { artifact: toolchain.artifactSupply }),
-      ...(toolchain.projectSupply === undefined ? {} : { project: toolchain.projectSupply }),
-    },
-  ).pipe(Effect.mapError(supplyError), Effect.provide(NodeServices.layer))
+  const supply = yield* resolveSupply(toolchain, profile)
   return {
     ...toolchain,
     clang: supply.compiler.command,
     llvmAr: supply.archiver.command,
     supply,
   }
+})
+
+/** Resolves the platform supply an unresolved toolchain's request selects for one profile. */
+const resolveSupply = Effect.fnUntraced(function* (
+  toolchain: Toolchain,
+  profile: CompilationProfile.Facts,
+): Effect.fn.Return<PlatformSupply.PlatformSupply, ToolchainError> {
+  const host = hostSelection()
+  return yield* PlatformSupplyResolver.resolveSupply(PlatformSupplyResolver.make(process.env), {
+    profile,
+    host: host._tag === 'Resolved' ? host.target.id : undefined,
+    clang: toolchain.clang,
+    llvmAr: toolchain.llvmAr,
+    ...(toolchain.platform === undefined ? {} : { request: toolchain.platform }),
+    ...(toolchain.artifactSupply === undefined ? {} : { artifact: toolchain.artifactSupply }),
+    ...(toolchain.projectSupply === undefined ? {} : { project: toolchain.projectSupply }),
+  }).pipe(Effect.mapError(supplyError), Effect.provide(NodeServices.layer))
 })
 
 const storageError = (
@@ -1219,18 +1224,14 @@ export const compileHelpers = Effect.fn('NativeToolchain.compileHelpers')(functi
 })
 
 /**
- * Compiles one C translation unit to `<scope>/<name>.o` through the pinned Clang `-c -x c`
- * command, reusing native runtime objects by compiler content and frozen C translation identity.
+ * The platform supply a native C translation unit compiles against: the toolchain's own supply,
+ * which must belong to the C target, or one resolved for that target's default profile.
  */
-export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(function* (
+const nativeCSupply = Effect.fnUntraced(function* (
   toolchain: Toolchain,
-  scope: BuildScope,
   target: Target.Target,
-  name: string,
-  sourceText: string,
-): Effect.fn.Return<ObjectArtifact, ToolchainError> {
-  let selected = toolchain
-  if (target.kind === 'Native' && selected.supply === undefined) {
+): Effect.fn.Return<PlatformSupply.PlatformSupply, ToolchainError> {
+  if (toolchain.supply === undefined) {
     const profile = yield* CompilationProfile.normalize({ target: target.id }).pipe(
       Effect.mapError((error) =>
         supplyError(
@@ -1238,9 +1239,9 @@ export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(functi
         ),
       ),
     )
-    selected = yield* resolveToolchain(toolchain, profile)
+    return yield* resolveSupply(toolchain, profile)
   }
-  if (selected.supply !== undefined && selected.supply.target.id !== target.id)
+  if (toolchain.supply.target.id !== target.id)
     return yield* supplyError(
       PlatformSupply.failure(
         'TargetMismatch',
@@ -1249,14 +1250,37 @@ export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(functi
         'Resolve a supply for the C target.',
       ),
     )
+  return toolchain.supply
+})
+
+/**
+ * Compiles one C translation unit to `<scope>/<name>.o` through the pinned Clang `-c -x c`
+ * command, reusing native runtime objects by compiler content and frozen C translation identity.
+ * Only a native target consults a platform supply: freestanding Wasm C uses no platform headers or
+ * libraries, so it ignores any native supply the toolchain carries, such as one resolved for the
+ * host, and is keyed under the Wasm cache policy.
+ */
+export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(function* (
+  toolchain: Toolchain,
+  scope: BuildScope,
+  target: Target.Target,
+  name: string,
+  sourceText: string,
+): Effect.fn.Return<ObjectArtifact, ToolchainError> {
+  const supply = target.kind === 'Native' ? yield* nativeCSupply(toolchain, target) : undefined
   const objectPath = join(scope.root, `${name}.o`)
   const source = yield* writeArtifact(scope, target, `${name}.c`, sourceText)
-  let planned = ToolchainPlan.cObjectCommand(selected.clang, target, source.path, objectPath)
+  let planned = ToolchainPlan.cObjectCommand(
+    supply?.compiler.command ?? toolchain.clang,
+    target,
+    source.path,
+    objectPath,
+  )
   let cacheKey: string
   let translation: CTranslationUnit.CTranslationUnit | undefined
-  if (selected.supply !== undefined) {
+  if (supply !== undefined) {
     translation = yield* CTranslationUnitResolver.resolve(
-      selected.supply,
+      supply,
       source.path,
       join(scope.root, `${name}.d`),
       scope.root,
@@ -1266,7 +1290,7 @@ export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(functi
     planned = {
       ...planned,
       arguments: [
-        ...selected.supply.compilationArguments,
+        ...supply.compilationArguments,
         '-c',
         '-x',
         'cpp-output',
@@ -1277,11 +1301,11 @@ export const compileCObject = Effect.fn('NativeToolchain.compileCObject')(functi
         '-o',
         objectPath,
       ],
-      environment: selected.supply.environment,
+      environment: supply.environment,
     }
   } else {
-    // Freestanding Wasm C uses no platform headers; its source remains under the Wasm cache policy.
-    cacheKey = `${selected.clang}\u0000${target.id}\u0000${sourceText}`
+    // Freestanding Wasm C: the selected Clang, target, and source fully determine the object.
+    cacheKey = `${toolchain.clang}\u0000${target.id}\u0000${sourceText}`
   }
   const cached =
     toolchain.runtimeObjectCache === undefined

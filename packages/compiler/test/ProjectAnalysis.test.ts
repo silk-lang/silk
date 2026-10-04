@@ -1,6 +1,7 @@
 import { records } from './support/records.js'
 import * as Layer from 'effect/Layer'
 import { assert, it } from '@effect/vitest'
+import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Exit from 'effect/Exit'
 import * as Fiber from 'effect/Fiber'
@@ -23,15 +24,15 @@ import { raise } from './support/raise.js'
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
 
-const roots = Object.freeze([
+const roots: Arr.NonEmptyReadonlyArray<SourceFile.SourceFile> = Object.freeze([
   SourceFile.make('app/A', ascii('import shared.Core\npub fn a() -> i32 { return Core.answer() }')),
   SourceFile.make('app/B', ascii('import shared.Core\npub fn b() -> i32 { return Core.answer() }')),
 ])
 
 const sources = new Map([['shared/Core', ascii('pub fn answer() -> i32 { return 42 }')]])
 
-const make = (requestedRoots = roots) =>
-  ProjectAnalysis.make(requestedRoots.map((source) => source.id)).pipe(
+const make = (requestedRoots: Arr.NonEmptyReadonlyArray<SourceFile.SourceFile> = roots) =>
+  ProjectAnalysis.make(Arr.map(requestedRoots, (source) => source.id)).pipe(
     Effect.provide(
       SourceResolver.overlay(requestedRoots).pipe(
         Layer.provideMerge(SourceResolver.memory(sources)),
@@ -78,20 +79,13 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
           },
         },
       }
-      const darwin = yield* ProjectAnalysis.make(
-        [root].map((source) => source.id),
-        darwinOptions,
-      ).pipe(Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(supply('')))))
-      const linux = yield* ProjectAnalysis.revise(
-        darwin,
-        [root].map((source) => source.id),
-        linuxOptions,
-      ).pipe(Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(supply('')))))
-      const same = yield* ProjectAnalysis.revise(
-        darwin,
-        [root].map((source) => source.id),
-        darwinOptions,
-      ).pipe(
+      const darwin = yield* ProjectAnalysis.make([root.id], darwinOptions).pipe(
+        Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(supply('')))),
+      )
+      const linux = yield* ProjectAnalysis.revise(darwin, [root.id], linuxOptions).pipe(
+        Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(supply('')))),
+      )
+      const same = yield* ProjectAnalysis.revise(darwin, [root.id], darwinOptions).pipe(
         Effect.provide(
           SourceResolver.overlay([root]).pipe(
             Layer.provideMerge(supply('invalid unloaded source')),
@@ -149,15 +143,12 @@ static if enabled() { pub const first: i32 = 1 } else { pub const second: i32 = 
       SourceResolver.memory(
         new Map([['policy', ascii(`pub static fn enabled() -> bool { return ${value} }`)]]),
       )
-    const before = yield* ProjectAnalysis.make(
-      [root].map((source) => source.id),
-      options,
-    ).pipe(Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolver(true)))))
-    const after = yield* ProjectAnalysis.revise(
-      before,
-      [root].map((source) => source.id),
-      options,
-    ).pipe(Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolver(false)))))
+    const before = yield* ProjectAnalysis.make([root.id], options).pipe(
+      Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolver(true)))),
+    )
+    const after = yield* ProjectAnalysis.revise(before, [root.id], options).pipe(
+      Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolver(false)))),
+    )
     const beforeView = ProjectAnalysis.view(before, 'selected') ?? raise('before view')
     const afterView = ProjectAnalysis.view(after, 'selected') ?? raise('after view')
     assert.deepEqual(beforeView.diagnostics, [])
@@ -191,23 +182,17 @@ pub fn main() -> i32 { let value = 42 let result = run Core.borrow(&value) retur
 fn privateValue() -> i32 { return 1 }`
     const resolve = (source: string) =>
       SourceResolver.memory(new Map([['shared/Core', ascii(source)]]))
-    const initial = yield* ProjectAnalysis.make([root].map((source) => source.id)).pipe(
+    const initial = yield* ProjectAnalysis.make([root.id]).pipe(
       Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolve(library)))),
     )
-    const edited = yield* ProjectAnalysis.revise(
-      initial,
-      [root].map((source) => source.id),
-    ).pipe(
+    const edited = yield* ProjectAnalysis.revise(initial, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(resolve(library.replace('return 1', 'return 2'))),
         ),
       ),
     )
-    const renamed = yield* ProjectAnalysis.revise(
-      edited,
-      [root].map((source) => source.id),
-    ).pipe(
+    const renamed = yield* ProjectAnalysis.revise(edited, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(
@@ -228,10 +213,7 @@ fn privateValue() -> i32 { return 1 }`
           '\nfn another() -> i32 { let value = 21 let result = run Core.borrow(&value) return result.* }',
       ),
     )
-    const additional = yield* ProjectAnalysis.revise(
-      initial,
-      [extra].map((source) => source.id),
-    ).pipe(
+    const additional = yield* ProjectAnalysis.revise(initial, [extra.id]).pipe(
       Effect.provide(SourceResolver.overlay([extra]).pipe(Layer.provideMerge(resolve(library)))),
     )
     for (const project of [initial, edited, renamed, additional]) {
@@ -248,10 +230,7 @@ fn privateValue() -> i32 { return 1 }`
     assert.strictEqual(counts(edited).checked, 1)
     assert.strictEqual(counts(renamed).checked, 0)
     assert.strictEqual(counts(additional).checked, 1)
-    const constrained = yield* ProjectAnalysis.revise(
-      initial,
-      [root].map((source) => source.id),
-    ).pipe(
+    const constrained = yield* ProjectAnalysis.revise(initial, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(resolve(library.replace("'data: 'env", "'data: 'static"))),
@@ -280,14 +259,11 @@ fn unrelated() -> i32 { return 7 }`),
 fn privateValue() -> i32 { return 1 }`
     const resolve = (source: string) =>
       SourceResolver.memory(new Map([['shared/Core', ascii(source)]]))
-    const initial = yield* ProjectAnalysis.make([root].map((source) => source.id)).pipe(
+    const initial = yield* ProjectAnalysis.make([root.id]).pipe(
       Effect.provide(SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolve(library)))),
     )
     const editedSource = library.replace('return 1', 'return 2')
-    const edited = yield* ProjectAnalysis.revise(
-      initial,
-      [root].map((source) => source.id),
-    ).pipe(
+    const edited = yield* ProjectAnalysis.revise(initial, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolve(editedSource))),
       ),
@@ -300,10 +276,7 @@ fn privateValue() -> i32 { return 1 }`
     assert.strictEqual(privateQueries.checked, 1)
     assert.strictEqual(privateQueries.ownershipReused, 2)
     const exclusiveSource = editedSource.replace("&'a i32", "&'a mut i32")
-    const exclusive = yield* ProjectAnalysis.revise(
-      edited,
-      [root].map((source) => source.id),
-    ).pipe(
+    const exclusive = yield* ProjectAnalysis.revise(edited, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolve(exclusiveSource))),
       ),
@@ -319,10 +292,7 @@ fn privateValue() -> i32 { return 1 }`
       exclusiveSource +
       `
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }`
-    const cleanup = yield* ProjectAnalysis.revise(
-      exclusive,
-      [root].map((source) => source.id),
-    ).pipe(
+    const cleanup = yield* ProjectAnalysis.revise(exclusive, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(Layer.provideMerge(resolve(cleanupSource))),
       ),
@@ -335,10 +305,7 @@ impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } 
     // Adding a conformance changes the resolution catalog; implementation-only hook edits do not.
     assert.strictEqual(cleanupQueries.ownershipChecked, 4)
     assert.strictEqual(cleanupQueries.ownershipReused, 0)
-    const hookEdited = yield* ProjectAnalysis.revise(
-      cleanup,
-      [root].map((source) => source.id),
-    ).pipe(
+    const hookEdited = yield* ProjectAnalysis.revise(cleanup, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(
@@ -374,7 +341,7 @@ fn sibling() -> i32 { return 8 }`),
       const library = `pub fn identity<'a>(value: &'a i32) -> &'a i32 { return value }
 fn privateValue() -> i32 { return 1 }
 pub fn value() -> i32 { return privateValue() }`
-      const initial = yield* ProjectAnalysis.make([root].map((source) => source.id)).pipe(
+      const initial = yield* ProjectAnalysis.make([root.id]).pipe(
         Effect.provide(
           SourceResolver.overlay([root]).pipe(
             Layer.provideMerge(SourceResolver.memory(new Map([['shared/Core', ascii(library)]]))),
@@ -382,10 +349,7 @@ pub fn value() -> i32 { return privateValue() }`
         ),
       )
       const edited = library.replace('return 1', 'return 23')
-      const revised = yield* ProjectAnalysis.revise(
-        initial,
-        [root].map((source) => source.id),
-      ).pipe(
+      const revised = yield* ProjectAnalysis.revise(initial, [root.id]).pipe(
         Effect.provide(
           SourceResolver.overlay([root]).pipe(
             Layer.provideMerge(SourceResolver.memory(new Map([['shared/Core', ascii(edited)]]))),
@@ -400,10 +364,7 @@ pub fn value() -> i32 { return privateValue() }`
       assert.strictEqual(queries.ownershipChecked, 1)
       assert.strictEqual(queries.ownershipReused, 4)
       const alpha = edited.replaceAll("'a", "'long")
-      const renamed = yield* ProjectAnalysis.revise(
-        revised,
-        [root].map((source) => source.id),
-      ).pipe(
+      const renamed = yield* ProjectAnalysis.revise(revised, [root.id]).pipe(
         Effect.provide(
           SourceResolver.overlay([root]).pipe(
             Layer.provideMerge(SourceResolver.memory(new Map([['shared/Core', ascii(alpha)]]))),
@@ -456,10 +417,7 @@ pub fn main() -> i32 { let value = 5 return Core.identity(&value).* }
 fn sibling() -> i32 { return 8 }
 fn additional() -> i32 { let value = 6 return Core.identity(&value).* }`),
       )
-      const additional = yield* ProjectAnalysis.revise(
-        renamed,
-        [additionalRoot].map((source) => source.id),
-      ).pipe(
+      const additional = yield* ProjectAnalysis.revise(renamed, [additionalRoot.id]).pipe(
         Effect.provide(
           SourceResolver.overlay([additionalRoot]).pipe(
             Layer.provideMerge(SourceResolver.memory(new Map([['shared/Core', ascii(alpha)]]))),
@@ -474,10 +432,7 @@ fn additional() -> i32 { let value = 6 return Core.identity(&value).* }`),
       assert.strictEqual(additionalQueries.checked, 1)
       assert.strictEqual(additionalQueries.reused, 5)
       const constrained = alpha.replace("identity<'long>", "identity<'long: 'static>")
-      const changedBound = yield* ProjectAnalysis.revise(
-        renamed,
-        [root].map((source) => source.id),
-      ).pipe(
+      const changedBound = yield* ProjectAnalysis.revise(renamed, [root.id]).pipe(
         Effect.provide(
           SourceResolver.overlay([root]).pipe(
             Layer.provideMerge(
@@ -508,7 +463,7 @@ pub fn main() -> i32 { return Core.answer() }
 fn sibling() -> i32 { return 0 }`
     const root = SourceFile.make('query/Missing', ascii(source))
     const initialLibrary = 'pub fn other() -> i32 { return 1 }'
-    const initial = yield* ProjectAnalysis.make([root].map((source) => source.id)).pipe(
+    const initial = yield* ProjectAnalysis.make([root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(
@@ -534,10 +489,7 @@ fn sibling() -> i32 { return 0 }`
       ],
     )
     const unrelatedLibrary = `${initialLibrary}\nfn unrelated() -> i32 { return 2 }`
-    const unrelated = yield* ProjectAnalysis.revise(
-      initial,
-      [root].map((source) => source.id),
-    ).pipe(
+    const unrelated = yield* ProjectAnalysis.revise(initial, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(
@@ -560,10 +512,7 @@ fn sibling() -> i32 { return 0 }`
       ['SEM0014'],
     )
     const repairedLibrary = `${unrelatedLibrary}\npub fn answer() -> i32 { return 42 }`
-    const repaired = yield* ProjectAnalysis.revise(
-      unrelated,
-      [root].map((source) => source.id),
-    ).pipe(
+    const repaired = yield* ProjectAnalysis.revise(unrelated, [root.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([root]).pipe(
           Layer.provideMerge(
@@ -593,12 +542,7 @@ fn spare() -> i32 { return 0 }
 fn recursiveLeft() -> i32 { return recursiveRight() }
 fn recursiveRight() -> i32 { return recursiveLeft() }`
     const initial = yield* make([SourceFile.make('query/Static', ascii(source))])
-    const changed = yield* ProjectAnalysis.revise(
-      initial,
-      [SourceFile.make('query/Static', ascii(source.replace('return 1', 'return 2')))].map(
-        (source) => source.id,
-      ),
-    ).pipe(
+    const changed = yield* ProjectAnalysis.revise(initial, ['query/Static']).pipe(
       Effect.provide(
         SourceResolver.overlay([
           SourceFile.make('query/Static', ascii(source.replace('return 1', 'return 2'))),
@@ -629,10 +573,7 @@ fn broken() -> i32 { return missing() }`
       const initial = yield* make([SourceFile.make('query/Rebind', ascii(source))])
       const prefix = 'fn prefix() -> i32 { return 0 }\n'
       const currentSource = prefix + source
-      const current = yield* ProjectAnalysis.revise(
-        initial,
-        [SourceFile.make('query/Rebind', ascii(currentSource))].map((source) => source.id),
-      ).pipe(
+      const current = yield* ProjectAnalysis.revise(initial, ['query/Rebind']).pipe(
         Effect.provide(
           SourceResolver.overlay([SourceFile.make('query/Rebind', ascii(currentSource))]).pipe(
             Layer.provideMerge(SourceResolver.memory(sources)),
@@ -708,6 +649,12 @@ it.effect('analyzes a shared dependency once and derives structurally shared roo
     if (left === undefined || right === undefined) return
     assertProjectViewNotRealizable(left)
     assert.deepEqual(project.roots, ['app/A', 'app/B'])
+    assert.strictEqual(project.primary, left)
+    // Zero roots are unrepresentable; the test typecheck fails once either call accepts them.
+    // @ts-expect-error a project analysis needs at least one root
+    void ProjectAnalysis.make([])
+    // @ts-expect-error a revised project analysis needs at least one root
+    void ProjectAnalysis.revise(project, [])
     assert.strictEqual(project.semanticInvalidation.totals.modules, 3)
     assert.strictEqual(project.semanticInvalidation.totals.recomputed, 3)
     assert.strictEqual(project.semanticInvalidation.totals.reasons.Fresh, 3)
@@ -780,7 +727,7 @@ it.effect('analyzes a shared dependency once and derives structurally shared roo
 it.effect('keeps project facts deterministic when root supply order changes', () =>
   Effect.gen(function* () {
     const first = yield* make()
-    const second = yield* make([...roots].reverse())
+    const second = yield* make(Arr.reverse(roots))
 
     assert.deepEqual(first.roots, second.roots)
     assert.deepEqual(
@@ -810,14 +757,14 @@ it.effect('keeps project facts deterministic when root supply order changes', ()
 it.effect('interrupts cooperative tooling batches before processing remaining modules', () =>
   Effect.gen(function* () {
     const batchRoots = Object.freeze(
-      Array.from({ length: 9 }, (_, ordinal) =>
+      Arr.makeBy(9, (ordinal) =>
         SourceFile.make(
           `batch/M${ordinal.toString().padStart(2, '0')}`,
           ascii(`pub fn value${ordinal}() -> i32 { return ${ordinal} }`),
         ),
       ),
     )
-    const project = yield* ProjectAnalysis.make(batchRoots.map((source) => source.id)).pipe(
+    const project = yield* ProjectAnalysis.make(Arr.map(batchRoots, (source) => source.id)).pipe(
       Effect.provide(
         SourceResolver.overlay(batchRoots).pipe(Layer.provideMerge(SourceResolver.empty)),
       ),
@@ -863,7 +810,7 @@ it.effect('reuses exact unchanged syntax and module semantics inside one coheren
       },
     })
     const previous = yield* make().pipe(Effect.withTracer(tracer))
-    const revisedRoots = Object.freeze([
+    const revisedRoots: Arr.NonEmptyReadonlyArray<SourceFile.SourceFile> = Object.freeze([
       SourceFile.make(
         'app/A',
         ascii(
@@ -874,7 +821,7 @@ it.effect('reuses exact unchanged syntax and module semantics inside one coheren
     ])
     const current = yield* ProjectAnalysis.revise(
       previous,
-      revisedRoots.map((source) => source.id),
+      Arr.map(revisedRoots, (source) => source.id),
     ).pipe(
       Effect.provide(
         SourceResolver.overlay(revisedRoots).pipe(
@@ -1026,21 +973,12 @@ it.effect('reports fresh and removed modules and refuses reuse across source ori
       ascii('pub fn main() -> i32 { return 1 }'),
       SourceOrigin.memory('file:///old/Main.silk'),
     )
-    const previous = yield* ProjectAnalysis.make([previousRoot].map((source) => source.id)).pipe(
+    const previous = yield* ProjectAnalysis.make([previousRoot.id]).pipe(
       Effect.provide(
         SourceResolver.overlay([previousRoot]).pipe(Layer.provideMerge(SourceResolver.empty)),
       ),
     )
-    const current = yield* ProjectAnalysis.revise(
-      previous,
-      [
-        SourceFile.make(
-          'app/Next',
-          ascii('pub fn next() -> i32 { return 2 }'),
-          SourceOrigin.memory('file:///new/Next.silk'),
-        ),
-      ].map((source) => source.id),
-    ).pipe(
+    const current = yield* ProjectAnalysis.revise(previous, ['app/Next']).pipe(
       Effect.provide(
         SourceResolver.overlay([
           SourceFile.make(
@@ -1054,16 +992,7 @@ it.effect('reports fresh and removed modules and refuses reuse across source ori
     assert.strictEqual(current.syntaxRevisions.has('app/Main'), false)
     assert.strictEqual(current.syntaxRevisions.get('app/Next')?._tag, 'Fresh')
 
-    const changedOrigin = yield* ProjectAnalysis.revise(
-      previous,
-      [
-        SourceFile.make(
-          'app/Main',
-          ascii('pub fn main() -> i32 { return 1 }'),
-          SourceOrigin.memory('file:///new/Main.silk'),
-        ),
-      ].map((source) => source.id),
-    ).pipe(
+    const changedOrigin = yield* ProjectAnalysis.revise(previous, ['app/Main']).pipe(
       Effect.provide(
         SourceResolver.overlay([
           SourceFile.make(
@@ -1091,7 +1020,7 @@ it.effect('recomputes conservatively when a reusable prior artifact is missing',
     })
     const current = yield* ProjectAnalysis.revise(
       incomplete,
-      roots.map((source) => source.id),
+      Arr.map(roots, (source) => source.id),
     ).pipe(
       Effect.provide(
         SourceResolver.overlay(roots).pipe(Layer.provideMerge(SourceResolver.memory(sources))),
@@ -1121,7 +1050,7 @@ it.effect('recomputes tooling conservatively when prior module tooling is missin
     })
     const current = yield* ProjectAnalysis.revise(
       incomplete,
-      roots.map((source) => source.id),
+      Arr.map(roots, (source) => source.id),
     ).pipe(
       Effect.provide(
         SourceResolver.overlay(roots).pipe(Layer.provideMerge(SourceResolver.memory(sources))),
@@ -1150,9 +1079,7 @@ it.effect(
       const caller = `import shared.Callbacks
 fn conflict() -> i32 { return 0 }
 unsafe fn probe(core: &Intrinsic.SharedCore<i32>) -> i32 { return 1 }`
-      const initial = yield* ProjectAnalysis.make(
-        [SourceFile.make('boundary/Main', ascii(caller))].map((source) => source.id),
-      ).pipe(
+      const initial = yield* ProjectAnalysis.make(['boundary/Main']).pipe(
         Effect.provide(
           SourceResolver.overlay([SourceFile.make('boundary/Main', ascii(caller))]).pipe(
             Layer.provideMerge(
@@ -1165,10 +1092,7 @@ unsafe fn probe(core: &Intrinsic.SharedCore<i32>) -> i32 { return 1 }`
         'return 1',
         'return Intrinsic.sharedWithMut<i32, i32>(core, Callbacks.use, conflict)',
       )
-      const revised = yield* ProjectAnalysis.revise(
-        initial,
-        [SourceFile.make('boundary/Main', ascii(edited))].map((source) => source.id),
-      ).pipe(
+      const revised = yield* ProjectAnalysis.revise(initial, ['boundary/Main']).pipe(
         Effect.provide(
           SourceResolver.overlay([SourceFile.make('boundary/Main', ascii(edited))]).pipe(
             Layer.provideMerge(
@@ -1231,24 +1155,16 @@ unsafe fn probe(core: &Intrinsic.SharedCore<i32>) -> i32 { return 1 }`
 
 it.effect('loads a configured application independently of open document roots', () =>
   Effect.gen(function* () {
-    const project = yield* ProjectAnalysis.make(
-      [
-        SourceFile.make(
-          'Main',
-          ascii('import Util\npub fn main() -> i32 { return Util.answer() }'),
-        ),
-      ].map((source) => source.id),
-      {
-        application: 'Entry',
-        configuration: {
-          profile: {
-            target: 'aarch64-apple-darwin',
-            artifact: 'object',
-            runtime: { kind: 'none' },
-          },
+    const project = yield* ProjectAnalysis.make(['Main'], {
+      application: 'Entry',
+      configuration: {
+        profile: {
+          target: 'aarch64-apple-darwin',
+          artifact: 'object',
+          runtime: { kind: 'none' },
         },
       },
-    ).pipe(
+    }).pipe(
       Effect.provide(
         SourceResolver.overlay([
           SourceFile.make(
@@ -1285,9 +1201,7 @@ for (const [target, startup, explicitApplication] of [
       const application = SourceFile.make('Main', ascii('pub fn main() -> i32 { return 42 }'))
       const helper = SourceFile.make('Helper', ascii('pub fn value() -> i32 { return 7 }'))
       const project = yield* ProjectAnalysis.make(
-        (explicitApplication ? [helper, application] : [application, helper]).map(
-          (source) => source.id,
-        ),
+        explicitApplication ? [helper.id, application.id] : [application.id, helper.id],
         {
           ...(explicitApplication ? { application: 'Main' } : {}),
           configuration: { profile: { target } },

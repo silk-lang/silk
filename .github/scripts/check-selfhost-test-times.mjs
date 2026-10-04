@@ -5,7 +5,9 @@ if (!logPath) {
   throw new Error('Expected a test runner log path')
 }
 
-const lines = readFileSync(logPath, 'utf8').replaceAll(/\u001b\[[0-9;]*m/g, '').split(/\r?\n/)
+const lines = readFileSync(logPath, 'utf8')
+  .replaceAll(/\u001b\[[0-9;]*m/g, '')
+  .split(/\r?\n/)
 let pendingName
 let measured = 0
 const slow = []

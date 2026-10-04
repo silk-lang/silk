@@ -17,22 +17,38 @@ const decoder = (provider: Type.Type) => Type.nominal('heads', 'Decoder', [provi
 
 const wrap = (inner: Type.GenericArgument) => Type.nominal('heads', 'Wrap', [inner])
 
-it('gives alpha-equivalent headers one identity', () => {
-  // Two headers differing only in binder spelling and declaration order. Names are provenance, and
-  // the normal form renumbers by first occurrence in the term, so both reduce to one key.
+it('gives alpha-equivalent headers one identity and one requirement normal form', () => {
+  // Two headers differing only in binder owner, spelling, and declaration order. Names are
+  // provenance, and the normal form renumbers by first occurrence in the term, so both reduce to one
+  // key. Requirements are renumbered through the same map, so they agree too even though the key
+  // never reads them.
   const first = binder('a', 0, 'S')
   const second = binder('a', 1, 'T')
   const left = ConformanceHead.make(
     Type.nominal('heads', 'Pair', [first, second]),
     Type.nominal('heads', 'Box', [first, second]),
+    [
+      Object.freeze({ capability: decoder(second), provider: second }),
+      Object.freeze({ capability: decoder(first), provider: first }),
+    ],
   )
   const renamedFirst = binder('b', 1, 'Element')
   const renamedSecond = binder('b', 0, 'Other')
   const right = ConformanceHead.make(
     Type.nominal('heads', 'Pair', [renamedFirst, renamedSecond]),
     Type.nominal('heads', 'Box', [renamedFirst, renamedSecond]),
+    [
+      Object.freeze({ capability: decoder(renamedSecond), provider: renamedSecond }),
+      Object.freeze({ capability: decoder(renamedFirst), provider: renamedFirst }),
+    ],
   )
+  const requirements = (head: ConformanceHead.ConformanceHead) =>
+    head.requirements.map((requirement) => [
+      Type.key(requirement.capability),
+      Type.key(requirement.provider),
+    ])
   assert.strictEqual(ConformanceHead.key(left), ConformanceHead.key(right))
+  assert.deepEqual(requirements(left), requirements(right))
 })
 
 it('keeps a requirement from shifting the identity its header already has', () => {

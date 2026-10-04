@@ -14,6 +14,10 @@ import { selfhostTrack } from './selfhostTrack.js'
 export interface Gap {
   readonly code: string
   readonly reason: string
+  readonly source?: {
+    readonly module: string
+    readonly span: { readonly start: number; readonly end: number }
+  }
 }
 
 export interface BuildDiagnostic {
@@ -54,6 +58,43 @@ const processFailure = (process: SpawnSyncReturns<string>): string => {
     .join('; ')
 }
 
+const validSpan = (span: unknown): span is BuildDiagnostic['span'] =>
+  typeof span === 'object' &&
+  span !== null &&
+  'start' in span &&
+  'end' in span &&
+  typeof span.start === 'number' &&
+  typeof span.end === 'number' &&
+  Number.isSafeInteger(span.start) &&
+  Number.isSafeInteger(span.end) &&
+  span.start >= 0 &&
+  span.end >= span.start
+
+const validGap = (gap: unknown): gap is Gap => {
+  if (
+    typeof gap !== 'object' ||
+    gap === null ||
+    !('code' in gap) ||
+    typeof gap.code !== 'string' ||
+    gap.code.length === 0 ||
+    !('reason' in gap) ||
+    typeof gap.reason !== 'string' ||
+    gap.reason.length === 0
+  )
+    return false
+  if (!('source' in gap)) return true
+  const source = gap.source
+  return (
+    typeof source === 'object' &&
+    source !== null &&
+    'module' in source &&
+    typeof source.module === 'string' &&
+    source.module.length > 0 &&
+    'span' in source &&
+    validSpan(source.span)
+  )
+}
+
 /** Only B1's machine-readable gap record can classify a failed build as unsupported. */
 export const parseUnsupported = (stderr: string): ReadonlyArray<Gap> | undefined => {
   const records = stderr.split('\n').filter((line) => line.startsWith(unsupportedPrefix))
@@ -64,21 +105,12 @@ export const parseUnsupported = (stderr: string): ReadonlyArray<Gap> | undefined
     if (typeof value !== 'object' || value === null || !('gaps' in value)) return undefined
     const gaps = value.gaps
     if (!Array.isArray(gaps) || gaps.length === 0) return undefined
-    if (
-      !gaps.every(
-        (gap: unknown) =>
-          typeof gap === 'object' &&
-          gap !== null &&
-          'code' in gap &&
-          typeof gap.code === 'string' &&
-          gap.code.length > 0 &&
-          'reason' in gap &&
-          typeof gap.reason === 'string' &&
-          gap.reason.length > 0,
-      )
-    )
-      return undefined
-    return gaps.map((gap: Gap) => ({ code: gap.code, reason: gap.reason }))
+    if (!gaps.every(validGap)) return undefined
+    return gaps.map((gap) => ({
+      code: gap.code,
+      reason: gap.reason,
+      ...(gap.source === undefined ? {} : { source: gap.source }),
+    }))
   } catch {
     return undefined
   }
@@ -102,19 +134,7 @@ export const parseBuildDiagnostic = (stderr: string): BuildDiagnostic | undefine
     )
       return undefined
     const span = value.span
-    if (
-      typeof span !== 'object' ||
-      span === null ||
-      !('start' in span) ||
-      !('end' in span) ||
-      typeof span.start !== 'number' ||
-      typeof span.end !== 'number' ||
-      !Number.isSafeInteger(span.start) ||
-      !Number.isSafeInteger(span.end) ||
-      span.start < 0 ||
-      span.end < span.start
-    )
-      return undefined
+    if (!validSpan(span)) return undefined
     return { code: value.code, span: { start: span.start, end: span.end } }
   } catch {
     return undefined
@@ -329,7 +349,12 @@ export const runCorpus = (silkc: string, corpus: ReadonlyArray<CorpusProgram>): 
     if (result.status === 'fail')
       detail = `: code=${result.code} span=${result.span === undefined ? 'unavailable' : `${result.span.start}-${result.span.end}`} ${result.reason}`
     if (result.status === 'unsupported')
-      detail = `: ${result.gaps.map((gap) => `${gap.code}: ${gap.reason}`).join('; ')}`
+      detail = `: ${result.gaps
+        .map(
+          (gap) =>
+            `${gap.code}: ${gap.reason}${gap.source === undefined ? '' : ` [${gap.source.module}:${gap.source.span.start}-${gap.source.span.end}]`}`,
+        )
+        .join('; ')}`
     process.stdout.write(`${result.status.toUpperCase()} ${result.name}${detail}\n`)
   }
   const summary = summarize(results, track)
