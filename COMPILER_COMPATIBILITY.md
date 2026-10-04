@@ -973,7 +973,8 @@ repeated invocation and capture-only drop glue.
 ### Native inferred opaque callable record fields
 
 - **Status:** implemented in a draft Step 8 layer; bootstrap compiler source checking passes.
-  Native assertions, Linux timing and exact-head corpus preservation remain pending.
+  The first native run passed four of five record controls; direct field invocation exposed a
+  field-dispatch gap. The repaired dispatcher and exact-head corpus preservation await verification.
 - **Rule:** an inferred nominal construction retains its actual callable field types. Its own
   opaque return boundary proves each leaf contract and original parameter role; existing exact
   realization projects the public nominal result before layout and cleanup. A moved local record
@@ -986,6 +987,10 @@ repeated invocation and capture-only drop glue.
 - **Diagnostics:** invalid inferred record field bounds retain the existing native SEM0076 at
   the complete constructor; bootstrap emits SEM0106 at the field value plus SEM0117. The focused
   control asserts the native code/span, not bootstrap wording or diagnostic multiplicity.
+- **Field invocation:** a present field is selected before methods and uses the ordinary callable
+  checker, including pipeline invocation, access and ownership permissions. Its record expression
+  is checked once. Invalid field annotations preserve their original rejection; a noncallable
+  field reports SEM0075 at the complete field expression, matching the bootstrap control.
 - **Remaining projections:** structural unions containing owned opaque slots still need a physical
   tag mapping. The admission guard follows substituted nominal fields and descriptor referents,
   uses exact visited types and rejects bounded discovery overflow conservatively. Dotted construction
@@ -993,6 +998,8 @@ repeated invocation and capture-only drop glue.
 - **Evidence:** five `opaqueCallableRecords*` structured controls cover original named/anonymous
   fields, local forwarding, field-bound rejection, raw/authored roles, the exact record/environment/
   capture glue chain, and a descriptor-union gap. Bootstrap independently admits the positive
-  records, authored-F control, repaired Drop fixture and descriptor-union source. Native execution
-  and per-test timings have not yet run.
+  records, authored-F control, repaired Drop fixture and descriptor-union source.
+  `storedCallableFieldsShareInvocationAndPipelineChecking` independently covers receiver evaluation,
+  pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. The first four
+  passing native controls completed below one second; repaired dispatch assertions remain pending.
 - **Source migration:** none.
