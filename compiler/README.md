@@ -78,9 +78,12 @@ arguments move (once) or copy into the target's parameters. A parameter of Effec
 gets an implicit representation binder like a callable parameter, so a generic runner is
 specialized to its argument's exact Effect. A named non-generic function used as a value is a
 capture-free exact callable; invoking it is a direct call, and running an invoked `effect fn` value
-calls the instance. Effect blocks, requirement-row arguments, service operations and the
-composition intrinsics remain the `effect-form` and `effect-instance` gaps, and `effect fn main`
-the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
+calls the instance. `Intrinsic.catchFailure<S>` builds an exact composite Effect; its run expands in
+place (D4): the protected Effect fails into a temporary, a switch sends members of `S` to the
+handler and injects the rest into the residual failure. Effect blocks, requirement-row arguments,
+service operations and the other composition intrinsics remain the `effect-form` and
+`effect-instance` gaps, and `effect fn main` the `entry-signature` gap; `Intrinsic.suspendEffect`
+and `Intrinsic.park` report `suspension`. The
 sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
