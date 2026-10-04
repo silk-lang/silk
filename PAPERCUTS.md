@@ -465,3 +465,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · A repeated text marker put callable signature reification in the implementation-head resolver and failed the bootstrap build · Anchor edits inside the owning function and inspect the full diff before the focused run · self-hosted compiler
 
 - 2026-10-03 · Formatting the large semantic roots rewrote tens of thousands of unrelated lines · Preserve the focused source patch before formatting; use canonical byte comparison to verify a reduced diff retains the checked program · self-hosted compiler
+
+- 2026-10-03 · Direct field writes on a borrowed Option<State> pattern failed SEM0036, and treating its binding as a reference failed SEM0171 · The binding denotes the borrowed place; pass `&mut value` to the owning State operation, as `scopeState` already does · self-hosted compiler Step 8d

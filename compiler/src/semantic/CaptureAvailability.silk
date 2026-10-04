@@ -2,9 +2,10 @@
 //!
 //! This proof walks checked control flow, including cleanup-free and Copy owners. It retains
 //! static source paths rather than backend remainder indices. General loan validity remains a
-//! separate obligation; uncertain guard or indexed-restoration facts are never ownership errors.
+//! separate obligation; uncertain indexed-restoration facts are never ownership errors. A guard
+//! cannot transfer provisional places, whether or not their types need cleanup.
 
-import hir.Hir {InfixOperator}
+import hir.Hir {CallableMode, InfixOperator}
 import semantic.TypedBody {AggregateField, BindingAccess, ConsumedPlace, Expression, MatchArm, Node, NodeId, NodeKind, Origin, PlaceRoot, PlaceStep, SubjectAccess}
 import semantic.Type {Type}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -14,7 +15,7 @@ import silk.usize
 import silk.vector {Vector}
 
 /// The result that prevents an environment from acquiring one of its places.
-pub enum FailureKind { Unavailable, LoopChanged, OverlappingWrite, Unproved }
+pub enum FailureKind { Unavailable, LoopChanged, OverlappingWrite, GuardConsumed, Unproved }
 
 /// An authored capture or control-flow edge and the earlier consuming operation, when known.
 pub struct Failure {
@@ -28,7 +29,7 @@ struct Root { kind: RootKind id: usize }
 impl Copy for Root {}
 
 struct Hole { root: Root path: Vector<PlaceStep> origin: Origin }
-struct State { roots: Vector<Root> holes: Vector<Hole> definite: Vector<Hole> transitions: Vector<Hole> uncertain: Vector<Root> }
+struct State { roots: Vector<Root> holes: Vector<Hole> definite: Vector<Hole> transitions: Vector<Hole> uncertain: Vector<Root> guard: bool }
 struct Flow {
   normal: Option<State>
   breaks: Option<State>
@@ -84,7 +85,7 @@ effect fn copyPath(path: &[PlaceStep]) -> Vector<PlaceStep> ! OutOfMemoryError ?
   return move copied
 }
 effect fn copyState(value: &State) -> State ! OutOfMemoryError ? &mut Allocator {
-  let mut copied = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>()}
+  let mut copied = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>(), guard: value.guard}
   let roots = Vector.asSlice<Root>(&value.roots)
   let mut at = usize.ZERO
   while at < roots.length { run Vector.append<Root>(&mut copied.roots, roots[at])
@@ -178,6 +179,9 @@ effect fn missing(state: &mut State, root: Root, path: &[PlaceStep], origin: Ori
 effect fn consume(state: &mut State, consumed: &Option<ConsumedPlace>, origin: Origin) -> Option<Failure>
 ! OutOfMemoryError ? &mut Allocator {
   if let Option<ConsumedPlace>.Some {value} = &consumed.* {
+    if state.guard {
+      return Option.some<Failure>(Failure {kind: FailureKind.GuardConsumed, origin: origin, previous: Option.none<Origin>()})
+    }
     let root = rootOf(&value.root)
     let path = Vector.asSlice<PlaceStep>(&value.steps)
     let absent = overlap(&state.*, root, path)
@@ -293,6 +297,13 @@ fn scopeFlow(flow: &mut Flow, roots: usize) -> () {
   if let Option<State>.Some {value} = &mut flow.breaks { scopeState(&mut value, roots) }
   if let Option<State>.Some {value} = &mut flow.continues { scopeState(&mut value, roots) }
   return ()
+}
+
+fn guardState(state: &mut State, guard: bool) -> () { state.guard = guard }
+fn guardFlow(flow: &mut Flow, guard: bool) -> () {
+  if let Option<State>.Some {value} = &mut flow.normal { guardState(&mut value, guard) }
+  if let Option<State>.Some {value} = &mut flow.breaks { guardState(&mut value, guard) }
+  if let Option<State>.Some {value} = &mut flow.continues { guardState(&mut value, guard) }
 }
 fn equalHoles(holes: &[Hole], other: &[Hole]) -> bool {
   if holes.length != other.length { return false }
@@ -478,14 +489,39 @@ fn descriptor(nodes: &[Node], id: NodeId) -> Option<NodeId> {
   }
 }
 fn sliceType(ty: &Type) -> bool { return match &ty.* { Type.Slice {..} => true _ => false } }
-effect fn consumeFlow(nodes: &[Node], consumed: &Option<ConsumedPlace>, origin: Origin, flow: &mut Flow) -> ()
+effect fn consumeFlow(nodes: &[Node], consumed: &Option<ConsumedPlace>, origin: Origin, receiver: bool, flow: &mut Flow) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   let mut current = Intrinsic.replace(flow.normal, Option.none<State>())
   let mut failure = Option.none<Failure>()
-  if let Option<State>.Some {value} = &mut current { failure = run consume(&mut value, consumed, origin) }
+  if let Option<State>.Some {value} = &mut current {
+    let guard = value.guard
+    // Invoking a stored once callable commits its ordinary owner even in a guard.
+    // A matched subject remains provisional until its arm is selected.
+    if receiver {
+      if let Option<ConsumedPlace>.Some {value: place} = &consumed.* {
+        if let PlaceRoot.Local {..} = &place.root { guardState(&mut value, false) }
+      }
+    }
+    failure = run consume(&mut value, consumed, origin)
+    guardState(&mut value, guard)
+  }
   flow.normal = move current
   if noFailure(&flow.failure) { flow.failure = move failure }
   return ()
+}
+
+// Only the callee's outer synthesized move is invocation transport. An explicit source move
+// inside it is evaluated under the original guard mode, as are all written arguments.
+effect fn callableReceiver(nodes: &[Node], indices: &[Option<usize>], id: NodeId,
+  mode: CallableMode, flow: &mut Flow) -> () ! OutOfMemoryError ? &mut Allocator {
+  if mode == CallableMode.Once {
+    if let NodeKind.Expression {form: Expression.Move {value, consumed}, ..} = &nodes[id.index].kind {
+      if let Option<ConsumedPlace>.Some {..} = &consumed { run interior(nodes, indices, value, &mut flow.*) }
+      else { run sequence(nodes, indices, value, &mut flow.*) }
+      return run consumeFlow(nodes, &consumed, nodes[id.index].origin, true, &mut flow.*)
+    }
+  }
+  return run sequence(nodes, indices, id, &mut flow.*)
 }
 fn transitionCount(flow: &Flow) -> usize {
   if let Option<State>.Some {value} = &flow.normal { return Vector.length<Hole>(&value.transitions) }
@@ -671,19 +707,6 @@ effect fn looping(nodes: &[Node], indices: &[Option<usize>], id: NodeId, conditi
   return move evaluated
 }
 
-effect fn changedRoots(before: &State, after: &State) -> Vector<Root>
-! OutOfMemoryError ? &mut Allocator {
-  let mut changed = Vector.make<Root>()
-  let holes = Vector.asSlice<Hole>(&before.holes)
-  let mut at = usize.ZERO
-  while at < holes.length { run Vector.append<Root>(&mut changed, holes[at].root)
-    at = at + usize.ONE }
-  let later = Vector.asSlice<Hole>(&after.holes)
-  at = usize.ZERO
-  while at < later.length { run Vector.append<Root>(&mut changed, later[at].root)
-    at = at + usize.ONE }
-  return move changed
-}
 effect fn matching(nodes: &[Node], indices: &[Option<usize>], id: NodeId, subject: NodeId, access: &SubjectAccess, arms: &[MatchArm], state: State) -> Flow
 ! OutOfMemoryError ? &mut Allocator {
   let mut flow = continuing(move state)
@@ -710,15 +733,12 @@ effect fn matching(nodes: &[Node], indices: &[Option<usize>], id: NodeId, subjec
     while at < arms.length {
       let mut candidate = continuing(run copyState(&remaining))
       if let Option<NodeId>.Some {value: guard} = &arms[at].guard {
+        guardFlow(&mut candidate, true)
         run sequence(nodes, indices, guard, &mut candidate)
+        guardFlow(&mut candidate, remaining.guard)
         if let Option<State>.Some {value: guarded} = &mut candidate.normal {
-          if !sameHoles(&remaining, &guarded) {
-            let changed = run changedRoots(&remaining, &guarded)
-            let changedView = Vector.asSlice<Root>(&changed)
-            let mut hole = usize.ZERO
-            while hole < changedView.length { run uncertainRoot(&mut guarded, changedView[hole])
-              hole = hole + usize.ONE }
-          }
+          // Valid receiver transfers commit on both Boolean outcomes. Keep their known holes;
+          // forbidden provisional transfers already failed while evaluating the guard.
           run unionState(&mut remaining, &guarded)
         }
       }
@@ -770,7 +790,7 @@ effect fn walk(nodes: &[Node], indices: &[Option<usize>], id: NodeId, state: Sta
     NodeKind.Drop {value, consumed} => {
       if let Option<ConsumedPlace>.Some {..} = &consumed { run interior(nodes, indices, value, &mut flow) }
       else { run sequence(nodes, indices, value, &mut flow) }
-      run consumeFlow(nodes, &consumed, nodes[id.index].origin, &mut flow)
+      run consumeFlow(nodes, &consumed, nodes[id.index].origin, false, &mut flow)
     }
     NodeKind.Branch {condition, thenBranch, elseBranch, ..} => {
       let before = Intrinsic.replace(flow.normal, Option.none<State>())
@@ -784,7 +804,7 @@ effect fn walk(nodes: &[Node], indices: &[Option<usize>], id: NodeId, state: Sta
       Expression.Move {value, consumed} => {
         if let Option<ConsumedPlace>.Some {..} = &consumed { run interior(nodes, indices, value, &mut flow) }
         else { run sequence(nodes, indices, value, &mut flow) }
-        run consumeFlow(nodes, &consumed, nodes[id.index].origin, &mut flow)
+        run consumeFlow(nodes, &consumed, nodes[id.index].origin, false, &mut flow)
       }
       Expression.Local {..} => { run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
       Expression.PatternBinding {..} => { run readPlace(nodes, indices, id, nodes[id.index].origin, &mut flow) }
@@ -795,16 +815,16 @@ effect fn walk(nodes: &[Node], indices: &[Option<usize>], id: NodeId, state: Sta
       Expression.InterfaceCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
       Expression.ForeignCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
       Expression.IntrinsicCall {arguments: operands, ..} => { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
-      Expression.CallableCall {callee, arguments: operands, pipeline, ..} => {
+      Expression.CallableCall {callee, mode, arguments: operands, pipeline, ..} => {
         if pipeline { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow)
-          run sequence(nodes, indices, callee, &mut flow) }
-        else { run sequence(nodes, indices, callee, &mut flow)
+          run callableReceiver(nodes, indices, callee, mode, &mut flow) }
+        else { run callableReceiver(nodes, indices, callee, mode, &mut flow)
           run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
       }
-      Expression.StagedCallable {callee, arguments: operands, pipeline, ..} => {
+      Expression.StagedCallable {callee, mode, arguments: operands, pipeline, ..} => {
         if pipeline { run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow)
-          run sequence(nodes, indices, callee, &mut flow) }
-        else { run sequence(nodes, indices, callee, &mut flow)
+          run callableReceiver(nodes, indices, callee, mode, &mut flow) }
+        else { run callableReceiver(nodes, indices, callee, mode, &mut flow)
           run arguments(nodes, indices, Vector.asSlice<NodeId>(&operands), &mut flow) }
       }
       Expression.Match {subject, access, arms, ..} => {
@@ -880,8 +900,7 @@ pub fn applies(nodes: &[Node]) -> bool {
 /// Delayed bodies are checked separately; unused node-list order never stands in for control flow.
 pub effect fn check(nodes: &[Node], indices: &[Option<usize>], root: NodeId, parameters: usize) -> Option<Failure>
 ! OutOfMemoryError ? &mut Allocator {
-  if !applies(nodes) { return Option.none<Failure>() }
-  let mut state = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>()}
+  let mut state = State {roots: Vector.make<Root>(), holes: Vector.make<Hole>(), definite: Vector.make<Hole>(), transitions: Vector.make<Hole>(), uncertain: Vector.make<Root>(), guard: false}
   let mut at = usize.ZERO
   while at < parameters { run declareRoot(&mut state, Root {kind: RootKind.Local, id: at})
     at = at + usize.ONE }

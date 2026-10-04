@@ -157,20 +157,31 @@ Each entry records:
   borrowing match result gap, which current typing cannot reach because it borrows only places and
   Drop-free array literals, and the deferred glue forms.
 
-### Selfhost does not reject moves inside match guards at typing
+### Selfhost guard ownership checking is limited to callable availability
 
-- **Status:** recorded on 2026-10-03 with Step 6c.
+- **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d.
 - **Rule:** the reference reports OWN0008 for moving a provisional pattern binding inside its guard
   (ownership-and-borrowing.md, MATCH-002); it states no rule for other places a guard moves.
-- **Compilers:** the bootstrap checks every guard in guard mode and reports OWN0008 for any place a
-  guard moves, including an ordinary local, which is broader than the reference. Selfhost has no
-  OWN0008 yet. It types a guard that moves an owner, and MIR lowering then reports the `cleanup`
-  gap for a guard that changes an owner's state, so no program it accepts here reaches codegen.
+- **Compilers:** the bootstrap checks explicit moves, callable captures and consuming arguments
+  in guard mode, including ordinary locals, which is broader than the reference. Both compilers
+  admit the implicit receiver transfer of an ordinary stored once invocation or staging while
+  preserving guard checks on nested explicit moves and supplied arguments. Selfhost reports
+  `GuardConsumesPattern` at a forbidden transfer span in bodies checked by callable availability,
+  including environments that need no drop glue. It also rejects implicit receiver transfer from
+  a provisional matched subject, following MATCH-002; the bootstrap currently bypasses its guard
+  check for that receiver path. Other bodies still type a guard that moves an owner; MIR
+  reports the `cleanup` gap when the guard changes an acquired cleanup owner's state. General
+  ownership checking outside callable availability remains incomplete.
 - **Source migration:** none.
-- **Evidence:** the `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` in
-  `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `plainCallableParameterRejectsCleanupFreeGuardTransfer` checks retained guard
+  control flow independently of layout and Drop, with an unguarded transfer control.
+  `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation and nested
+  explicit callee moves with diagnostic spans. The
+  `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
+  Source callable-bearing record patterns remain blocked by generic record typing and are not
+  claimed as native runtime coverage here.
 - **Open questions:** whether the bootstrap should narrow OWN0008 to provisional bindings, or the
-  reference should widen it, before selfhost implements the code.
+  reference should widen it, before extending selfhost's general guard ownership checking.
 
 ### Omitted Effect environments elaborated from inputs
 
