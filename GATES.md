@@ -47,7 +47,7 @@ claims, and historical receipts below are explicitly distinguished from final-he
       EVIDENCE: earlier landed source audits plus fresh full-change round1 bounded source/shape audit found no direct or indirect recognition in either compiler; #738 runtime comparison and actual stdlib/user-union structured numeric layout comparison both pass. Final integrated-head review/CI remain required.
 
 - [ ] G6: the generic-record and user-defined generic-union native corpus acceptances land on main, sync to selfhost, pass exactly, and are pinned
-      EVIDENCE: #738 main23eb6fc95 reachedselfhost through merged #750/#751; both corpus programs pass and are pinned. New distinguishing #759 main22de957e reaches #761 by merge with both parents, passes natively and is pinned in both lists.
+      EVIDENCE: #738 main23eb6fc95 reachedselfhost through merged #750 and its native stack; both corpus programs pass and are pinned. New distinguishing #759 main22de957e reaches #761 by merge with both parents, passes natively and is pinned in both lists.
 
 - [ ] G7: the task diff is structurally clean and changes every hard-coded corpus-name list together
       CHECK: git diff --check && node -e "const fs = require('node:fs'); const names = ['retained-if-let-match-binding','scalar-enum-equality-from-borrowed-variant','while-entry-backedge','generic-record-instances','generic-union-instances','generic-lifetime-selected-cleanup']; for (const path of ['compiler/scripts/selfhostTrack.ts','.github/workflows/selfhost.yml']) { const text = fs.readFileSync(path, 'utf8'); for (const name of names) if (!text.includes(String.fromCharCode(39) + name + String.fromCharCode(39))) throw new Error(path + ' missing ' + name); } console.log('diff hygiene and pin lists verified')"
