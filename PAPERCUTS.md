@@ -469,3 +469,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · Direct field writes on a borrowed Option<State> pattern failed SEM0036, and treating its binding as a reference failed SEM0171 · The binding denotes the borrowed place; pass `&mut value` to the owning State operation, as `scopeState` already does · self-hosted compiler Step 8d
 
 - 2026-10-03 · An `if let` assertion against the fieldless `MirLocalKind.Temp` case produced parser errors and a misleading missing-return diagnostic · Test the case with a `match` Boolean, then branch on the result · self-hosted compiler Step 8d
+
+- 2026-10-04 · A nested scalar-enum spelling such as `access: Access.Mutable` was parsed as a binding followed by an unexpected dot in a record pattern · Bind the field and compare it in the arm body · self-hosted compiler Step 8d
