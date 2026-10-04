@@ -224,10 +224,13 @@ Each entry records:
 - **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
   result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
   independently; immutable construction evidence keeps its original binder ordinal.
-- **Compilers:** bootstrap additionally admits a generic section against a contextual callable
-  contract and supports its further staging. Selfhost retains those cases as `typed-form` gaps,
-  along with sections requiring deferred lifetime/row binders, enclosing scope or static evidence.
-  These gaps do not become a signature-mismatch diagnostic.
+- **Compilers:** selfhost retains contextual callable admission and further generic staging as
+  `typed-form` gaps, along with sections requiring deferred lifetime/row binders, enclosing scope
+  or static evidence. Bootstrap also rejects some closed contextual forwarding of a stored generic
+  section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
+  type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
+  [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
+  lanes remain named gaps rather than signature-mismatch diagnostics.
 - **Evidence:** `genericNamedSectionsInferEachInvocationIndependently` and
   `genericNamedSectionsPreserveSparseSelectedOrdinals` assert ordinary direct instances for both
   `i32` and `bool`, stored suffix operands, immutable metadata and capture-only layout.
