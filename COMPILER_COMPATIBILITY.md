@@ -921,3 +921,25 @@ repeated invocation and capture-only drop glue.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
+
+
+### Finite recursive native callable origins
+
+- **Status:** implemented in a draft Step 8 layer; bootstrap source checking passes, native
+  assertions and exact-head CI remain pending. This is not a PASS claim.
+- **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
+  return operands provide environment equations; other checked expressions retain validation
+  dependencies. Source recipes normalize before exact inference, and every selected producer
+  plus its ordinary symbolic owner schema receives strict body replay before publication.
+  Canonicalization preserves the immutable original request and all converging source evidence.
+- **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
+  invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
+  projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
+  origin recipes have no runtime storage or new key/MIR representation.
+- **Evidence:** the nine `finiteCallableOrigins*` cases in `CallableResultCases` cover seeded
+  recursion, convergence, exact replay, generic source rejection, free union/application channels,
+  canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
+  `factory()` in the invalid generic assignment control; it additionally treats represented F as
+  affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
+  code/span assertions, MIR inspection and Linux timings have not yet executed.
+- **Source migration:** none.

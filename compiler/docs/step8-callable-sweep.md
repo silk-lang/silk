@@ -126,3 +126,10 @@ slots inside aggregate results and unresolved descriptor/phantom projection like
 projection limitations. Detached/nonParking executable-property proof belongs to the Effect/property
 work. General escaping validity and parent-loan proof belong to Step 14. No producer adapter or
 invented leaf identity is an acceptable substitute for those proofs.
+
+
+The finite recursive-origin draft adds private complete-application equations and mandatory exact
+replay of selected and symbolic producers. Its nine `finiteCallableOrigins*` controls check source
+identity, inference, root canonicalization and explicit unavailable cycles. Bootstrap source
+checking passes; native assertions, timing and exact-head corpus verification remain pending.
+This draft does not complete the selected-interface or contextual-opaque-storage obligations.
