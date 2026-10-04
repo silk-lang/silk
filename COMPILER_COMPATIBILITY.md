@@ -329,28 +329,33 @@ Each entry records:
 ### Generic named sections in selfhost
 
 - **Status:** direct invocation and closed contextual callable admission implemented in the Step 8
-  generic-section layers; further staging remains owned by #567 Step 8.
+  generic-section layers; direct generic-schema staging retains the same immutable blueprint.
 - **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
   result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
   independently; immutable construction evidence keeps its original binder ordinal.
 - **Compilers:** selfhost opens a generic section's target binders for each concrete callable
   promise, proves its target bounds, and preserves the shared blueprint. A later operand may first
   fix a consumer's type parameter. MIR selects the target from closed invocation operands rather
-  than the comparison contract. Further generic staging remains a `typed-form` gap, along with
-  quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
+  than the comparison contract. Direct staging over a schema appends captures and selects any new
+  evidence supplied at that stage. Staging through an abstract callable parameter remains a
+  `typed-form` gap until its closed schema recipe is normalized, along with quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
   scope or static evidence. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
   [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
   lanes remain named gaps rather than signature-mismatch diagnostics. The implemented native
   contextual lane intentionally extends this bootstrap limitation according to that specification.
+  Bootstrap also reports `SEM0122` for the reduced generic-schema staging fixtures; their syntax
+  passes `build-exe` checking before that complete-application evidence limitation.
 - **Evidence:** `genericNamedSectionsInferEachInvocationIndependently` and
   `genericNamedSectionsPreserveSparseSelectedOrdinals` assert ordinary direct instances for both
   `i32` and `bool`, stored suffix operands, immutable metadata and capture-only layout.
   `contextualGenericSectionsReuseTheirBlueprintAcrossConsumers` and
   `contextualGenericSectionsWaitForLaterOperandInference` inspect the consumer instances' direct
   target calls. The contextual diagnostic and owned-capture claims cover target bounds, conflicting
-  signatures and a single transferred capture cleanup.
+  signatures and a single transferred capture cleanup. `genericSectionsStageWithDeferredLeadingEvidence`,
+  `genericSectionsSelectEvidenceSuppliedByAStage` and `genericSectionsStageOwnedCapturesWithOneCleanupOwner`
+  cover staged blueprint selection, capture layout, argument appending and ownership.
 
 ### Reached Effect literals in selfhost
 
