@@ -347,8 +347,10 @@ Each entry records:
   promise, proves its target bounds, and preserves the shared blueprint. A later operand may first
   fix a consumer's type parameter. MIR selects the target from closed invocation operands rather
   than the comparison contract. Direct staging over a schema appends captures and selects any new
-  evidence supplied at that stage. Staging through an abstract callable parameter remains a
-  `typed-form` gap until its closed schema recipe is normalized, along with quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
+  evidence supplied at that stage. Staging through an abstract callable parameter normalizes its
+  closed schema recipe before MIR, preserving the original target blueprint and exact capture
+  record. Storage mode follows the actual base and newly stored fields; source promises still
+  determine consuming transport. Quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
   scope or static evidence. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
