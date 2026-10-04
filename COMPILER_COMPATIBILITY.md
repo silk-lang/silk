@@ -176,8 +176,9 @@ Each entry records:
 
 ### Selfhost resolves complete selected instance recipes before emission sharing
 
-- **Status:** implementation in progress on 2026-10-04; focused execution, independent
-  review and exact-head CI remain acceptance gates.
+- **Status:** implemented on 2026-10-04; all60 focused generic controls executed successfully,
+  and independent full-change review round1 found no blocking source defects. Optimized-head
+  execution, subsequent review rounds and exact-head Linux CI remain acceptance gates.
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
   cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
@@ -198,7 +199,8 @@ Each entry records:
 - **Evidence:** review counterexample: `Guard<'a>` always owns a droppable `Token`, but its own
   `impl<'a: 'static> Drop` hook applies to a static instance and not a local one. Both demand
   orders and equal-recipe sharing controls are retained as structured acceptance assertions;
-  native execution remains pending until the current implementation is checked.
+  all four source controls execute successfully. Linux cost and final integrated-head execution
+  are separate acceptance gates, not implied by source review.
 
 ### Selfhost generic aggregate diagnostics retain existing family differences
 

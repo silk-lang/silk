@@ -81,6 +81,8 @@ share one definition; differing direct or transitive cleanup splits every affect
 Root-local numbering makes identity independent of discovery order and unrelated instances.
 Definitions, calls and drops all resolve through the same completed plan. The C shim alone keeps
 the ABI name `main`; genuine digest collisions reject before emission.
+Finite-closure evidence certifies complete lowered successors, not executable backend output.
+LLVM-only restrictions are checked when the completed plan is emitted and remain build gaps.
 
 **Bounds checks are explicit.** `SliceLength` or the static array length, a compare, then `Branch`
 to a `Trap` block. `Index` is therefore a plain address step. Arithmetic overflow and division
