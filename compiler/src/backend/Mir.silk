@@ -1737,7 +1737,62 @@ effect fn callArgument(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
   return run witnessArgument(&mut builder.*, body, callNode, child, at, witness, move produced, origin)
 }
 
-// Lowers each argument of a call node, in order, into an operand.
+struct PipedArgument {
+  operand: Operand
+  cleanup: Option<usize>
+}
+
+fn callablePipeline(body: &Shared<TypedBody>, node: BodyNodeId) -> bool {
+  return Shared.with<TypedBody, bool>(body, fn(value: &TypedBody) -> bool {
+    return match &TypedBody.nodeSlice(value)[node.index].kind {
+      BodyNodeKind.Expression {form: BodyExpression.CallableCall {pipeline, ..}, ..} => pipeline
+      _ => false
+    }
+  })
+}
+
+// A unary pipeline completes its input before touching the callable environment. Retain
+// transferred input storage until invocation/construction commits, including callee exits.
+effect fn pipedArgument(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
+  node: BodyNodeId, witness: bool, origin: Origin) -> Option<PipedArgument>
+! Gap | OutOfMemoryError ? &mut Allocator {
+  if !callablePipeline(body, node) { return Option.none<PipedArgument>() }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let child = match move childAt(body, node, usize.ONE) {
+    Option<BodyNodeId>.Some {value} => value
+    _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+  }
+  let mut ty = match move run instanceNodeType(&builder.*, body, child) {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let mut borrowed = false
+  if witness {
+    if let Option<CallOperand>.Some {value} = move resolvedCallOperand(&builder.*, node, usize.ONE) {
+      borrowed = match &value.borrow { Option<Access>.Some {..} => true _ => false }
+      ty = Shared.clone<Type>(&value.parameter)
+    }
+  }
+  let input = run callArgument(&mut builder.*, body, hir, node, child, usize.ONE, false, witness, origin)
+  if !builder.live { return Option.none<PipedArgument>() }
+  let transfers = !borrowed && ownedRvalue(body, child)
+  let snapshot = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: move input}, origin)
+  let mut cleanup = Option.none<usize>()
+  if transfers && CleanupNeeds.node(&builder.needs, child.index) {
+    run Vector.append<usize>(&mut builder.*.temporaries, snapshot)
+    cleanup = Option.some<usize>(snapshot)
+  }
+  let mut operand = Operand.Copy {place: place(snapshot)}
+  if transfers { operand = Operand.Move {place: place(snapshot)} }
+  return Option.some<PipedArgument>(PipedArgument {operand: move operand, cleanup: move cleanup})
+}
+
+fn commitPipedArgument(builder: &mut Builder, cleanup: Option<usize>) -> () {
+  if let Option<usize>.Some {value} = move cleanup { transferTemporary(&mut builder.*, value) }
+}
+
+// Lowers call operands in source evaluation order, retaining their ABI parameter order.
 effect fn callArguments(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
@@ -1757,7 +1812,10 @@ effect fn callArguments(
   let owner = InstanceKey.identity(&builder.function.key)
   let mut witness = false
   if let Option<Shared<DeclarationId>>.None = &foreign.* { witness = true }
+  let mut piped = run pipedArgument(&mut builder.*, body, hir, callNode, witness, origin)
+  let mut pipedCleanup = Option.none<usize>()
   let mut values = Vector.make<Operand>()
+  if !builder.live { return move values }
   let mut at = usize.ZERO
   while at < count {
     let child = match move childAt(body, callNode, at) {
@@ -1766,10 +1824,19 @@ effect fn callArguments(
         return run unsupported(&owner, origin, GapCode.MissingCallArgument)
       }
     }
-    let argument = run callArgument(&mut builder.*, body, hir, callNode, child, at, environment, witness, origin)
+    let mut argument = Operand.Unit
+    if at == usize.ONE {
+      if let Option<PipedArgument>.Some {value} = move piped {
+        pipedCleanup = move value.cleanup
+        argument = move value.operand
+      } else { argument = run callArgument(&mut builder.*, body, hir, callNode, child, at, environment, witness, origin) }
+      piped = Option.none<PipedArgument>()
+    } else { argument = run callArgument(&mut builder.*, body, hir, callNode, child, at, environment, witness, origin) }
+    if !builder.live { return move values }
     run Vector.append<Operand>(&mut values, move argument)
     at = at + usize.ONE
   }
+  commitPipedArgument(&mut builder.*, move pipedCleanup)
   return move values
 }
 
@@ -1903,6 +1970,10 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   node: BodyNodeId, count: usize, stored: StoredArguments, origin: Origin) -> Vector<Operand>
 ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
+  let mut piped = run pipedArgument(&mut builder.*, body, hir, node, false, origin)
+  let mut pipedCleanup = Option.none<usize>()
+  let mut values = Vector.make<Operand>()
+  if !builder.live { return move values }
   let callee = match move childAt(body, node, usize.ZERO) {
     Option<BodyNodeId>.Some {value} => value
     _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
@@ -1927,6 +1998,7 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
     run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: Operand.Copy {place: run copyPlace(&value)}}, origin)
     evaluated = Operand.Copy {place: place(snapshot)}
   } else { evaluated = run expression(&mut builder.*, body, hir, callee) }
+  if !builder.live { return move values }
   let environment = match move evaluated {
     Operand.Copy {place: value} => move value
     Operand.Move {place: value} => move value
@@ -1935,7 +2007,6 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   let pending = Vector.length<usize>(&builder.temporaries)
   let guarded = stored.consumes && CleanupNeeds.node(&builder.needs, callee.index)
   if guarded { run Vector.append<usize>(&mut builder.*.temporaries, environment.local) }
-  let mut values = Vector.make<Operand>()
   if let Option<StoredEnvironment>.Some {value: input} = &stored.environment {
     let mut field = run copyPlace(&environment)
     if let Option<Place>.Some {value} = &original { field = run copyPlace(&value) }
@@ -1954,7 +2025,15 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
       Option<BodyNodeId>.Some {value} => value
       _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
     }
-    run Vector.append<Operand>(&mut values, run expression(&mut builder.*, body, hir, child))
+    let mut argument = Operand.Unit
+    if at == usize.ONE {
+      if let Option<PipedArgument>.Some {value} = move piped {
+        pipedCleanup = move value.cleanup
+        argument = move value.operand
+      } else { argument = run expression(&mut builder.*, body, hir, child) }
+      piped = Option.none<PipedArgument>()
+    } else { argument = run expression(&mut builder.*, body, hir, child) }
+    run Vector.append<Operand>(&mut values, move argument)
     if !builder.live { return move values }
     at = at + usize.ONE
   }
@@ -1971,6 +2050,7 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   // A diverging written argument cleaned the transferred environment. On the call edge every
   // capture moves into its original target parameter, so remove the temporary cleanup owner.
   if guarded { drop Vector.remove<usize>(&mut builder.*.temporaries, pending) }
+  commitPipedArgument(&mut builder.*, move pipedCleanup)
   return move values
 }
 

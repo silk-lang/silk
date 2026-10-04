@@ -475,3 +475,11 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-03 · Writing `#123` in Linear text autolinks to an unrelated Linear issue instead of the GitHub pull request · Write `julia-script/silk#123` or a full pull request URL · agent workflow
 - 2026-10-03 · A Bash loop that slept while polling CI status was denied by the auto-mode permission classifier · Subscribe to PR activity or run the poll as a background command that notifies on exit · agent workflow
 - 2026-10-03 · Linear MCP `get_issue` and `save_issue` sometimes returned the old description right after a successful write, so a patch that had applied looked like it had failed · Wait about 20 seconds and re-read before retrying a Linear write · agent workflow
+
+- 2026-10-03 · A repeated text marker put callable signature reification in the implementation-head resolver and failed the bootstrap build · Anchor edits inside the owning function and inspect the full diff before the focused run · self-hosted compiler
+
+- 2026-10-03 · Formatting the large semantic roots rewrote tens of thousands of unrelated lines · Preserve the focused source patch before formatting; use canonical byte comparison to verify a reduced diff retains the checked program · self-hosted compiler
+
+- 2026-10-03 · Direct field writes on a borrowed Option<State> pattern failed SEM0036, and treating its binding as a reference failed SEM0171 · The binding denotes the borrowed place; pass `&mut value` to the owning State operation, as `scopeState` already does · self-hosted compiler Step 8d
+
+- 2026-10-03 · An `if let` assertion against the fieldless `MirLocalKind.Temp` case produced parser errors and a misleading missing-return diagnostic · Test the case with a `match` Boolean, then branch on the result · self-hosted compiler Step 8d
