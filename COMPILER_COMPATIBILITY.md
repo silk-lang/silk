@@ -338,20 +338,31 @@ Each entry records:
 
 ### Plain mutable callable parameter forwarding in selfhost
 
-- **Status:** incomplete native view lowering recorded on 2026-10-03 during Step 8d review.
+- **Status:** temporary native view lowering implemented on 2026-10-04; exact native CI pending.
 - **Rule:** CALLABLE-003 separates reusable exclusive environment access from ownership of newly
   supplied arguments. Bootstrap keeps a source-written plain `mut fn` parameter as a callable
   view: forwarding that parameter without `move` does not consume it. An exact affine closure
   value or an authored constrained `F` argument still requires an explicit transfer.
 - **Compilers:** selfhost specializes plain callable parameters with exact environment types.
-  Bare forwarding of a direct plain mutable callable parameter reports `typed-form` at the
-  operand until retained environment reborrows are lowered. It does not diagnose that valid
-  source form as OWN0003 or make the environment Copy. This boundary does not exempt references,
-  constrained parameters, exact closure locals, explicit moves or staging from ownership rules.
-- **Evidence:** `plainCallableParameterForwardedMutableViewKeepsNamedGap` asserts the gap span;
+  A bare plain mutable parameter passed to another plain mutable parameter stores a temporary
+  reference to its original environment before inference. Its public capture contract is
+  separate from the local storage loan, including when the public captures are static.
+  Runtime projection keeps the reference descriptor. Direct anonymous invocation borrows the
+  dereferenced original place; sections snapshot only that descriptor and dereference it before
+  reading the stored trailing arguments. No environment copy, adapter or function pointer is
+  introduced. Constrained parameters, exact closure locals, references and explicit moves keep
+  their ordinary ownership roles.
+- **Evidence:** `plainCallableParameterForwardedMutableViewRetainsOriginalEnvironment` checks
+  the local storage loan, static-public-contract retention, original mutable call operand and
+  Shared-capable targets. `plainMutableCallableSectionViewProjectsBeforeStoredArguments` checks
+  descriptor snapshot, Deref-before-Field order and absent consumer cleanup.
   `plainCallableParameterRejectsAffineArgumentCopies` retains the consuming controls. Bootstrap
-  evidence is the declared raw callable type and `Ownership.argumentConsumes` source path.
-- **Owner:** remaining Step 8d callable view and loan lowering, including escaping views.
+  accepts reached mutable-capture, Shared named-target and section forwarding controls, but
+  does not publish an explicit hidden forwarding loan; the native reference descriptor is its
+  transport design rather than a claimed matching bootstrap ownership fact.
+- **Owner:** Step 8 owns view construction and direct lowering. General borrow and parent-loan
+  validity obligations remain honestly NotChecked for Step 14; raw owned-callable return
+  diagnostics and remaining callable-bearing storage are still required Step 8 work.
 
 ### Unary callable pipelines in selfhost
 
