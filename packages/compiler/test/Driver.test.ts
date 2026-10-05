@@ -113,7 +113,6 @@ const expectedPhases = [
   'backend',
   'supply',
   'object',
-  'helpers',
   'runtime',
   'link',
 ]
@@ -706,14 +705,10 @@ it.effect(
           }),
       })
       const source = 'pub fn main() -> i32 { return 42 }'
-      // An unchanged rebuild reuses emission, helpers, and the final artifact; a different
-      // program with the same profile still reuses the helper object compiled by the first.
-      for (const [name, text] of [
-        ['admission-first', source],
-        ['admission-second', source],
-        ['admission-other', 'pub fn main() -> i32 { return 41 }'],
-      ] as const) {
-        const outcome = yield* compileSource(name, text, { cache: true }).pipe(
+      // An unchanged rebuild reuses emission and the final artifact. Hosted libc supplies the
+      // memory helpers, so no build realizes a helper object.
+      for (const name of ['admission-first', 'admission-second'] as const) {
+        const outcome = yield* compileSource(name, source, { cache: true }).pipe(
           Effect.provideService(NativeToolchain.ArtifactStorage, artifactStorage),
         )
         assert.strictEqual(outcome._tag, 'Compiled')
@@ -723,8 +718,8 @@ it.effect(
         assert.isDefined(outcome.linkPlan)
         assert.isFalse(outcome.linkPlan?.command.arguments.includes('-lm') ?? true)
         if (name === 'admission-second') assert.include(phases, 'backend-cache')
-        assert.include(phases, name === 'admission-first' ? 'helpers' : 'helpers-cache')
-        assert.notInclude(phases, name === 'admission-first' ? 'helpers-cache' : 'helpers')
+        assert.notInclude(phases, 'helpers')
+        assert.notInclude(phases, 'helpers-cache')
       }
       const nativeReads = reads.filter((key) => key.startsWith('native-')).length
       const failed = yield* Effect.result(
@@ -740,13 +735,11 @@ it.effect(
       if (failed.failure.reason._tag === 'SupplyFailed')
         assert.strictEqual(failed.failure.reason.failure.code, 'MissingCapability')
       assert.strictEqual(reads.filter((key) => key.startsWith('native-')).length, nativeReads)
-      // One final artifact per distinct program; one helper object for the whole profile.
-      assert.strictEqual(writes.filter((key) => key.startsWith('native-')).length, 2)
-      assert.strictEqual(writes.filter((key) => key.startsWith('helpers-')).length, 1)
+      // One final artifact for the program and no helper object.
+      assert.strictEqual(writes.filter((key) => key.startsWith('native-')).length, 1)
+      assert.strictEqual(writes.filter((key) => key.startsWith('helpers-')).length, 0)
     }),
-  // Cold emission, a second program reusing the helper object, cache reuse and a rejected
-  // supply took 21s locally on 2026-10-02; the complete source runtime pipelines exceeded 120s
-  // in CI shard 4 before helper reuse.
+  // The complete source runtime pipelines exceeded 120s in CI shard 4.
   240_000,
 )
 

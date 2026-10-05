@@ -1075,8 +1075,9 @@ export const compile = Effect.fn('Driver.compile')(
           const generatedObjects: Array<NativeToolchain.PathArtifact> = [object.artifact]
           const helpers = object.helpers === undefined ? [] : [object.helpers]
           // Executables and shared libraries need helper implementations at this link step.
-          // Compile those helpers, or reuse an object for the same providers, profile, compiler,
-          // and distribution, and include their required native libraries in the link inputs.
+          // Hosted libc supplies them; without libc, compile the source helpers, or reuse an
+          // object for the same providers, profile, compiler, and distribution. Either way,
+          // include the helpers' required native libraries in the link inputs.
           const final = cacheKind === 'NativeExecutable' || cacheKind === 'NativeSharedLibrary'
           if (final && object.helpers !== undefined) {
             const support = yield* PhaseReport.measureEffect(

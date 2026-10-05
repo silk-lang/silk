@@ -1072,7 +1072,6 @@ export const helperCacheKey = (
       Canonical.array(profile.deployment === undefined ? [] : [profile.deployment]),
       profile.relocation,
       profile.codeModel,
-      profile.optimization,
       String(profile.debug),
       compiler.digest,
       compiler.version,

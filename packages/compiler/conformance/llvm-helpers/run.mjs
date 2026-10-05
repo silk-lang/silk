@@ -166,38 +166,76 @@ const program = Effect.gen(function* () {
           return yield* new ConformanceError({
             message: `Unexpected legalization requirements: ${requested.join(',')}`,
           })
-        const support = yield* NativeToolchain.compileHelpers(
+        // Hosted libc supplies every request, so no source helper object is realized.
+        if (object.helpers.requirements.some((entry) => entry.provider.kind !== 'platform'))
+          return yield* new ConformanceError({
+            message: 'Hosted helper requests did not select the platform C library',
+          })
+        const hostedSupport = yield* NativeToolchain.compileHelpers(
           tools,
           scope,
           profile,
           object.helpers,
-          {
-            _tag: 'Disabled',
-          },
+          { _tag: 'Disabled' },
         )
-        const helperObjects = support === undefined ? [] : [support.object]
+        if (hostedSupport !== undefined)
+          return yield* new ConformanceError({
+            message: 'A hosted build realized source memory helpers',
+          })
+        // The same memory requests without libc select the Silk source providers, which are
+        // realized optimized for both program modes and must stay freestanding.
+        if (object.inventory === undefined)
+          return yield* new ConformanceError({ message: 'Missing legalization object inventory' })
+        const freestanding = yield* CompilationProfile.normalize({
+          ...input,
+          libc: 'none',
+          artifact: 'object',
+          entry: { kind: 'none' },
+          runtime: { kind: 'none' },
+        })
+        const memoryRequests = yield* HelperCapability.reconcile(
+          {
+            ...object.inventory,
+            symbols: object.inventory.symbols.filter((entry) => {
+              const symbol = HelperCapability.symbolName(profile.target, entry.name)
+              return symbol !== 'fmod' && symbol !== 'fmodf'
+            }),
+          },
+          artifact,
+          freestanding,
+          object.artifact.path,
+          object.helpers.objectDigest,
+        )
+        const support = yield* NativeToolchain.compileHelpers(
+          tools,
+          scope,
+          freestanding,
+          memoryRequests,
+          { _tag: 'Disabled' },
+        )
         if (
-          helperObjects.length !== expected.length - 2 ||
-          helperObjects.some(
-            (entry) =>
-              entry.helpers.requirements.length !== 0 ||
-              entry.helpers.foreign.length !== 0 ||
-              entry.helpers.runtime.length !== 0,
-          )
+          support === undefined ||
+          memoryRequests.requirements.length !== expected.length - 2 ||
+          memoryRequests.requirements.some((entry) => entry.provider.kind !== 'source') ||
+          !support.object.planned.arguments.includes('-O2') ||
+          support.object.helpers === undefined ||
+          support.object.helpers.requirements.length !== 0 ||
+          support.object.helpers.foreign.length !== 0 ||
+          support.object.helpers.runtime.length !== 0
         )
           return yield* new ConformanceError({
-            message: 'Source memory providers are not freestanding',
+            message: 'Source memory providers are not optimized and freestanding',
           })
-        const helperInspections = []
-        for (const [index, helper] of helperObjects.entries()) {
-          helperInspections.push(
-            yield* run(inspect, ['--symbols', '--relocations', helper.artifact.path]),
-          )
-          yield* fs.copyFile(
-            helper.artifact.path,
-            path.join(output, `${target}-${optimization}-helper-${index}.o`),
-          )
-        }
+        const helper = support.object
+        const helperInspection = yield* run(inspect, [
+          '--symbols',
+          '--relocations',
+          helper.artifact.path,
+        ])
+        yield* fs.copyFile(
+          helper.artifact.path,
+          path.join(output, `${target}-${optimization}-helper.o`),
+        )
         const c = yield* NativeToolchain.compileCObject(
           tools,
           scope,
@@ -225,28 +263,45 @@ const program = Effect.gen(function* () {
           'independent C helper receiver',
         )
         const destination = path.join(output, `${target}-${optimization}`)
-        const plan = yield* NativeToolchain.planNativeLink(
-          tools,
-          scope,
-          'NativeExecutable',
-          profile,
-          [object.artifact, ...helperObjects.map((entry) => entry.artifact), c.artifact],
-          HelperCapability.linkInputs([object.helpers]),
-          destination,
-          {
-            request: { kind: 'default' },
-            composition: { kind: 'default' },
-            resolved: { kind: 'default' },
+        const sourceDestination = `${destination}-source-helpers`
+        const linkExecutable = Effect.fnUntraced(
+          function* (
+            /** @type {ReadonlyArray<NativeToolchain.PathArtifact>} */ objects,
+            /** @type {ReadonlyArray<HelperCapability.Report>} */ helpers,
+            /** @type {string} */ executable,
+          ) {
+            const plan = yield* NativeToolchain.planNativeLink(
+              tools,
+              scope,
+              'NativeExecutable',
+              profile,
+              [object.artifact, ...objects, c.artifact],
+              HelperCapability.linkInputs([object.helpers]),
+              executable,
+              {
+                request: { kind: 'default' },
+                composition: { kind: 'default' },
+                resolved: { kind: 'default' },
+              },
+              [object.helpers, ...helpers],
+            )
+            yield* Linker.link({
+              scope,
+              plan,
+              artifactKind: 'NativeExecutable',
+              destination: executable,
+              cache: { _tag: 'Disabled' },
+            })
+            return plan
           },
-          [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
         )
-        yield* Linker.link({
-          scope,
-          plan,
-          artifactKind: 'NativeExecutable',
-          destination,
-          cache: { _tag: 'Disabled' },
-        })
+        const plan = yield* linkExecutable([], [], destination)
+        // The receiver also drives the source providers: their object takes the helper symbols.
+        const sourcePlan = yield* linkExecutable(
+          [helper.artifact],
+          [helper.helpers],
+          sourceDestination,
+        )
         yield* fs.writeFile(`${destination}.ll`, source)
         yield* fs.copyFile(object.artifact.path, `${destination}.o`)
         const inspection = yield* run(inspect, [
@@ -265,14 +320,14 @@ const program = Effect.gen(function* () {
           return yield* new ConformanceError({
             message: 'Object inspection did not verify architecture and helper relocation',
           })
-        let execution
-        if (target.includes('apple')) {
-          const cwd = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-helper-execution-' })
-          execution = yield* run('/usr/bin/env', ['-C', cwd, destination], 42)
-        } else {
+        const execute = Effect.fnUntraced(function* (/** @type {string} */ executable) {
+          if (target.includes('apple')) {
+            const cwd = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-helper-execution-' })
+            return yield* run('/usr/bin/env', ['-C', cwd, executable], 42)
+          }
           if (image === '')
             return yield* new ConformanceError({ message: 'Required GNU execution image missing' })
-          execution = yield* run(
+          return yield* run(
             'docker',
             [
               'run',
@@ -284,26 +339,30 @@ const program = Effect.gen(function* () {
               '-w',
               '/tmp',
               image,
-              `/fixture/${path.basename(destination)}`,
+              `/fixture/${path.basename(executable)}`,
             ],
             42,
           )
-        }
+        })
+        const execution = yield* execute(destination)
+        const sourceExecution = yield* execute(sourceDestination)
         return {
           optimization,
           profile: profile.identity,
           plan,
+          sourcePlan,
           cCompilation,
-          helperInspections,
+          helperInspection,
           inspection,
           assembly,
           execution,
+          sourceExecution,
         }
       }),
     )
     report.lanes.push(lane)
     yield* Console.log(
-      `${target} ${optimization}: target legalization requests accounted; source providers audited; independent C ABI fixture executed`,
+      `${target} ${optimization}: legalization requests accounted to libc; no-libc source providers optimized and audited; C ABI fixture executed against both`,
     )
   }
   const reportPath = path.join(output, `${target}.json`)

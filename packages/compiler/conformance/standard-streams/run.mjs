@@ -175,26 +175,6 @@ const program = Effect.gen(function* () {
           artifact,
           profile,
         })
-        const support = yield* NativeToolchain.compileHelpers(
-          tools,
-          scope,
-          profile,
-          object.helpers,
-          {
-            _tag: 'Disabled',
-          },
-        )
-        const helperObjects = support === undefined ? [] : [support.object]
-        const helperInspections = []
-        for (const [index, helper] of helperObjects.entries()) {
-          helperInspections.push(
-            yield* run(inspect, ['--symbols', '--relocations', helper.artifact.path]),
-          )
-          yield* fs.copyFile(
-            helper.artifact.path,
-            path.join(output, `${target}-${optimization}-helper-${index}.o`),
-          )
-        }
         const c = yield* NativeToolchain.compileCObject(
           tools,
           scope,
@@ -227,7 +207,7 @@ const program = Effect.gen(function* () {
           scope,
           'NativeExecutable',
           profile,
-          [object.artifact, ...helperObjects.map((entry) => entry.artifact), c.artifact],
+          [object.artifact, c.artifact],
           HelperCapability.linkInputs([object.helpers]),
           destination,
           {
@@ -235,7 +215,7 @@ const program = Effect.gen(function* () {
             composition: { kind: 'default' },
             resolved: { kind: 'default' },
           },
-          [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
+          [object.helpers],
         )
         yield* Linker.link({
           scope,
@@ -292,7 +272,6 @@ const program = Effect.gen(function* () {
           profile: profile.identity,
           plan,
           cCompilation,
-          helperInspections,
           inspection,
           assembly,
           execution,
