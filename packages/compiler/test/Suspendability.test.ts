@@ -1093,7 +1093,7 @@ effect fn acquire() -> Allocation ! OutOfMemoryError ? &mut Allocator {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut custom = SuspendingAllocator {}
-  let pending = acquire() |> Effect.provideMut(&mut custom)
+  let mut pending = acquire() |> Effect.provideMut(&mut custom)
   let allocation = run pending
   drop allocation
   return 42

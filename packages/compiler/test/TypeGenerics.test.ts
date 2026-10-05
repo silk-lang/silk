@@ -1332,7 +1332,7 @@ where &mut P provides S from R, S in R {
 }
 pub fn main() -> i32 {
   let mut clock = FixedClock {}
-  let provided = provideBoth(read(), &mut clock)
+  let mut provided = provideBoth(read(), &mut clock)
   return run provided
 }`),
     )

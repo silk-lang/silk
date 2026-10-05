@@ -8604,7 +8604,7 @@ fn forwardOnce<'env>(self: once Effect<'env; Payload>) -> once Effect<'env; Payl
 pub fn main() -> i32 {
   let mut counter = 40
   let pending = effect { counter = counter + 1 return counter }
-  let forwarded = forwardReusable(move pending)
+  let mut forwarded = forwardReusable(move pending)
   let first = run forwarded
   let second = run forwarded
   drop forwarded

@@ -34,7 +34,7 @@ effect fn copyMessage() -> i32
 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let source = b"Silk"
-  let copying = Bytes.copy(&source)
+  let mut copying = Bytes.copy(&source)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let bytes = run copying
   return Bytes.length(&bytes)

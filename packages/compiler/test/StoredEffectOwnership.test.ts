@@ -265,3 +265,34 @@ pub fn main() -> i32 {
     assert.include(codesOf(snapshot), 'OWN0001')
   }),
 )
+
+it.effect('runs a mut Effect only from a mutable binding', () =>
+  Effect.gen(function* () {
+    const source = (binding: string) => `
+pub fn main() -> i32 {
+  let mut count = 0
+  ${binding} pending = effect { count = count + 1 return count }
+  let first = run pending
+  return first
+}`
+    const immutable = yield* analyzed('stored-effect-ownership/immutable-mut-run', source('let'))
+    const diagnostic =
+      Analysis.diagnostics(immutable).find((candidate) => candidate.code === 'SEM0077') ??
+      unreachable('expected an exclusive run access rejection')
+    const text = source('let')
+    const start = text.indexOf('pending', text.indexOf('run pending'))
+    assert.strictEqual(diagnostic.span.start, start)
+    assert.strictEqual(diagnostic.span.end, start + 'pending'.length)
+    const mutable = yield* analyzed('stored-effect-ownership/mutable-mut-run', source('let mut'))
+    assert.notInclude(codesOf(mutable), 'SEM0077')
+    assert.notInclude(codesOf(mutable), 'SEM0068')
+    const shared = yield* analyzed(
+      'stored-effect-ownership/mutable-shared-recipe',
+      `pub fn main() -> i32 {
+  let mut pending = effect { return 1 }
+  return run pending
+}`,
+    )
+    assert.include(codesOf(shared), 'SEM0068')
+  }),
+)
