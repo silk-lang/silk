@@ -90,9 +90,11 @@ captures, and running it (or an invoked anonymous `effect fn`) calls its own ins
 environment as parameter 0. A block derives its success, failure and requirement row from its
 `return`, `fail` and `run` sites (EFF-002, EFF-011); sites that differ from that join are checked
 again against it. Joining distinct Effect construction sites (EFF-013) reports `effect-form`.
-Requirement-row arguments, service operations and the binding intrinsics remain the
-`effect-form` and `effect-instance` gaps, and `effect fn main` the `entry-signature` gap; `Intrinsic.suspendEffect`
-and `Intrinsic.park` report `suspension`. The
+An instance receives one hidden provider address per entry of its requirement row, in canonical
+service-role key order (D2), and its key names each provider's type. Running
+`Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
+`Svc.op(args)` calls the witness for the serving provider's type with the provider address as its
+receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
 sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.

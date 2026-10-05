@@ -328,6 +328,8 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 | `entry-signature`  | unchanged                   | `Entry { main }` with any signature except `fn main() -> i32`           | Q1                                 |
 | `intrinsic-member` | unchanged                   | `execution*`, `wake`, `observeUnhandled`, `observeDiagnostics`          | suspension stage and observer note |
 | `typed-form`       | narrower                    | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land      | per PR                             |
+| `interface-effect-witness` | **new** (Step 9d)   | an `effect fn` witness reached through an interface call, or a `run` of such a call's Effect | lowering interface Effect constructions with their failure edge; owner: Step 9 follow-up |
+| `cleanup` (owned provider) | extended (Step 9d)  | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run) | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up |
 
 Every gap is a structured `Unsupported` result naming the owner instance and span. None becomes a
 trap stub.
