@@ -281,6 +281,34 @@ pub struct StoredArguments {
   pub consumes: bool
 }
 
+/// How a run site expands one exact Effect stored at a place (Effect note D4). Semantic analysis
+/// prepares every target, so lowering reads no callee body.
+pub union RunPlan {
+  /// The Effect's own runner: a construction's target with its stored arguments, or an Effect
+  /// block's instance with the environment.
+  Runner {pub target: CallTarget, pub success: Shared<Type>, pub failure: Shared<Type>},
+  /// Runs part 0. A failure in `selector` runs the handler stored in part 1 with that failure;
+  /// every other failure is residual.
+  Catch {
+    pub selector: Shared<Type>,
+    /// The step that runs part 0, in the same plan.
+    pub inner: usize,
+    pub innerFailure: Shared<Type>,
+    pub handler: CallTarget,
+    pub handlerSuccess: Shared<Type>,
+    pub handlerFailure: Shared<Type>,
+    /// The handler part's type when it owns cleanup; only the selected path consumes it.
+    pub handlerDrop: Option<Shared<Type>>,
+  },
+}
+
+/// The expansion prepared for one `run` of a composed Effect: its steps, each after the steps it
+/// runs, so the root is last.
+pub struct NodePlan {
+  pub node: BodyNodeId
+  pub steps: Vector<RunPlan>
+}
+
 /// A staged anonymous target keeps its original environment as one capture field.
 pub struct StoredEnvironment {
   pub field: usize
@@ -327,6 +355,14 @@ struct Builder {
   needs: CleanupNeeds
   // The `Failure` local, or `usize.MAX` when this function cannot fail.
   failure: usize
+  // The expansions of runs of composed Effects, each consumed by its run node.
+  plans: Vector<NodePlan>
+}
+
+// Where a failure inside an expansion goes: out of this function, or into a handler's temporary.
+union FailureSink {
+  Propagate,
+  Catch {temp: usize, block: usize},
 }
 
 // A shallow, owned projection of one cached typed node. Shared.with never leaks a body loan.
@@ -3063,6 +3099,7 @@ fn effectFailure(value: &Type) -> Option<Shared<Type>> {
   return match &value.* {
     Type.Effect {failure, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&failure))
     Type.CallableValue {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
+    Type.EffectComposite {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
     _ => Option.none<Shared<Type>>()
   }
 }
@@ -3073,6 +3110,21 @@ fn effectFailure(value: &Type) -> Option<Shared<Type>> {
 effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, runNode: BodyNodeId, value: BodyNodeId,
   ty: &Shared<Type>, origin: Origin) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
+  // A composed Effect expands at this run site into ordinary calls, branches and edges (D4).
+  let planned = takePlan(&mut builder.*, runNode)
+  if let Option<Vector<RunPlan>>.Some {value: steps} = move planned {
+    let evaluated = run expression(&mut builder.*, body, hir, value)
+    if !builder.live { return Operand.Unit }
+    let stored = match move evaluated {
+      Operand.Copy {place: at} => at
+      Operand.Move {place: at} => at
+      _ => { return run unsupported(&owner, origin, GapCode.ExpectedPlace) }
+    }
+    let output = run temporary(&mut builder.*, ty, origin)
+    let root = Vector.length<RunPlan>(&steps) - usize.ONE
+    run executePlan(&mut builder.*, Vector.asSlice<RunPlan>(&steps), root, &stored, output, &FailureSink.Propagate, origin)
+    return Operand.Copy {place: place(output)}
+  }
   let construction = run instanceView(&builder.*, body, value)
   let mut node = value
   let mut count = usize.ZERO
@@ -3138,8 +3190,18 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
 // every open scope innermost first and fails.
 effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<Type>, origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
-  let owner = InstanceKey.identity(&builder.function.key)
   let destination = builder.failure
+  run widenInto(&mut builder.*, caught, from, destination, origin)
+  run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
+  terminate(&mut builder.*, Terminator.Fail {origin: origin})
+  return ()
+}
+
+// Moves a failure of type `from` into `destination`, injecting it into a wider failure union.
+// Moves `caught` into `destination`, injecting it, or each of its members, into a wider union.
+effect fn widenInto(builder: &mut Builder, caught: usize, from: &Shared<Type>, destination: usize, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
   let into = localType(&builder.*, destination)
   if run Type.runtimeEqualsShared(from, &into) {
     run assign(&mut builder.*, place(destination), Rvalue.Use {value: Operand.Move {place: place(caught)}}, origin)
@@ -3189,9 +3251,242 @@ effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<T
       }
     }
   }
-  run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
-  terminate(&mut builder.*, Terminator.Fail {origin: origin})
   return ()
+}
+
+fn takePlan(builder: &mut Builder, node: BodyNodeId) -> Option<Vector<RunPlan>> {
+  let mut at = usize.ZERO
+  while at < Vector.length<NodePlan>(&builder.plans) {
+    if Vector.asSlice<NodePlan>(&builder.plans)[at].node.index == node.index {
+      let found = Vector.remove<NodePlan>(&mut builder.*.plans, at)
+      return Option.some<Vector<RunPlan>>(move found.steps)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Vector<RunPlan>>()
+}
+
+// Delivers a failure held in `caught` to its sink: out of the function, or into a handler.
+effect fn deliverFailure(builder: &mut Builder, caught: usize, from: &Shared<Type>, sink: &FailureSink, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  match &sink.* {
+    FailureSink.Propagate => {
+      let owner = InstanceKey.identity(&builder.function.key)
+      if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
+      run propagateFailure(&mut builder.*, caught, from, origin)
+    }
+    FailureSink.Catch {temp, block: target, ..} => {
+      run widenInto(&mut builder.*, caught, from, temp, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: target, origin: origin})
+    }
+  }
+  return ()
+}
+
+// The operands of a prepared target whose environment is the Effect stored at `environment`, with
+// the written operands in their parameter positions (MIR note §7).
+effect fn placeArguments(builder: &mut Builder, target: &CallTarget, environment: &Place, written: Vector<Operand>,
+  origin: Origin) -> Vector<Operand> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<Operand>()
+  let mut supplied = move written
+  if let Option<StoredArguments>.Some {value: stored} = &target.stored {
+    if let Option<StoredEnvironment>.Some {value: input} = &stored.environment {
+      let mut field = run copyPlace(environment)
+      run Vector.append<Projection>(&mut field.projections, Projection.Field {index: input.field})
+      if let Option<Access>.Some {value: access} = &input.borrow {
+        let reference = run temporary(&mut builder.*, &input.parameter, origin)
+        run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: move field}, origin)
+        run Vector.append<Operand>(&mut values, Operand.Copy {place: place(reference)})
+      } else { run Vector.append<Operand>(&mut values, Operand.Move {place: move field}) }
+    }
+    while Vector.length<Operand>(&supplied) > usize.ZERO {
+      run Vector.append<Operand>(&mut values, Vector.remove<Operand>(&mut supplied, usize.ZERO))
+    }
+    let fields = Vector.asSlice<usize>(&stored.fields)
+    let mut at = usize.ZERO
+    while at < fields.length {
+      let mut field = run copyPlace(environment)
+      run Vector.append<Projection>(&mut field.projections, Projection.Field {index: fields[at]})
+      if stored.consumes { run Vector.append<Operand>(&mut values, Operand.Move {place: move field}) }
+      else { run Vector.append<Operand>(&mut values, Operand.Copy {place: move field}) }
+      at = at + usize.ONE
+    }
+    return move values
+  }
+  // An anonymous body receives its whole environment first, lent or moved per its run access.
+  let operands = Vector.asSlice<CallOperand>(&target.operands)
+  let mut lent = Option.none<Access>()
+  let mut parameter = Option.none<Shared<Type>>()
+  if operands.length > usize.ZERO {
+    lent = copyAccess(&operands[usize.ZERO].borrow)
+    parameter = Option.some<Shared<Type>>(Shared.clone<Type>(&operands[usize.ZERO].parameter))
+  }
+  match move lent {
+    Option<Access>.Some {value: access} => {
+      if let Option<Shared<Type>>.Some {value: referenceType} = move parameter {
+        let reference = run temporary(&mut builder.*, &referenceType, origin)
+        run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: run copyPlace(environment)}, origin)
+        run Vector.append<Operand>(&mut values, Operand.Copy {place: place(reference)})
+      }
+    }
+    Option<Access>.None => { run Vector.append<Operand>(&mut values, Operand.Move {place: run copyPlace(environment)}) }
+  }
+  while Vector.length<Operand>(&supplied) > usize.ZERO {
+    run Vector.append<Operand>(&mut values, Vector.remove<Operand>(&mut supplied, usize.ZERO))
+  }
+  return move values
+}
+
+// Calls a prepared target, writing success to `output` (injected when `output` is a wider union)
+// and routing a failure to `sink`. Emission continues on the success edge.
+effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Place, written: Vector<Operand>,
+  success: &Shared<Type>, failure: &Shared<Type>, output: usize, sink: &FailureSink, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let values = run placeArguments(&mut builder.*, target, environment, move written, origin)
+  let outputType = localType(&builder.*, output)
+  let mut destination = output
+  let direct = run Type.runtimeEqualsShared(success, &outputType)
+  if !direct { destination = run temporary(&mut builder.*, success, origin) }
+  let continuation = run block(&mut builder.*, origin)
+  run Vector.append<Reference>(&mut builder.*.function.references,
+    Reference {key: InstanceKey.copy(&target.key), edge: Edge.copy(&target.edge), origin: origin})
+  let mut edge = Option.none<FailureEdge>()
+  let mut caught = usize.MAX
+  let mut handler = usize.MAX
+  if !Shared.with<Type, bool>(failure, neverType) {
+    caught = run temporary(&mut builder.*, failure, origin)
+    handler = run block(&mut builder.*, origin)
+    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
+  }
+  terminate(&mut builder.*, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(&target.key)},
+    arguments: move values, destination: place(destination), normal: continuation, failure: move edge, origin: origin})
+  if handler != usize.MAX {
+    resume(&mut builder.*, handler)
+    run deliverFailure(&mut builder.*, caught, failure, sink, origin)
+  }
+  resume(&mut builder.*, continuation)
+  if !direct {
+    // A handler that cannot succeed never reaches the join.
+    if Shared.with<Type, bool>(success, neverType) {
+      terminate(&mut builder.*, Terminator.Unreachable {origin: origin})
+      return ()
+    }
+    run widenInto(&mut builder.*, destination, success, output, origin)
+  }
+  return ()
+}
+
+fn unionType(value: &Type) -> bool {
+  return match &value.* { Type.Union {..} => true _ => false }
+}
+
+effect fn dropUnused(builder: &mut Builder, part: &Place, ty: &Option<Shared<Type>>, origin: Origin) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  if let Option<Shared<Type>>.Some {value} = &ty.* {
+    let owner = InstanceKey.identity(&builder.function.key)
+    run dropPlace(&mut builder.*, run copyPlace(part), &value, &owner, origin)
+  }
+  return ()
+}
+
+effect fn projectedPart(environment: &Place, index: usize) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut part = run copyPlace(environment)
+  run Vector.append<Projection>(&mut part.projections, Projection.Field {index: index})
+  return move part
+}
+
+// Expands one composed Effect stored at `environment` into calls and edges (Effect note D4).
+effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, environment: &Place, output: usize,
+  sink: &FailureSink, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  match &steps[step] {
+    RunPlan.Runner {target, success, failure} => {
+      run planCall(&mut builder.*, &target, environment, Vector.make<Operand>(), &success, &failure, output, sink, origin)
+    }
+    RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop} => {
+      // The protected Effect fails into a temporary of its own failure type; the edge selects.
+      let caught = run temporary(&mut builder.*, &innerFailure, origin)
+      let selecting = run block(&mut builder.*, origin)
+      let joined = run block(&mut builder.*, origin)
+      let protectedPart = run projectedPart(environment, usize.ZERO)
+      let handlerPart = run projectedPart(environment, usize.ONE)
+      let local = FailureSink.Catch {temp: caught, block: selecting}
+      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &local, origin)
+      run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+      resume(&mut builder.*, selecting)
+      let failureUnion = Shared.with<Type, bool>(&innerFailure, unionType)
+      let mut canonical = run Type.canonicalUnionMembers(&innerFailure)
+      if failureUnion {
+        if let Option<Vector<Shared<Type>>>.None = &canonical { return run unsupported(&owner, origin, GapCode.UnionForm) }
+      }
+      // Selecting the whole failure needs no switch (D4).
+      if run Type.runtimeEqualsShared(&selector, &innerFailure) { canonical = Option.none<Vector<Shared<Type>>>() }
+      let members = match move canonical {
+        Option<Vector<Shared<Type>>>.Some {value} => value
+        Option<Vector<Shared<Type>>>.None => {
+          // One failure type, or the whole failure: it is the selection.
+          run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(Operand.Move {place: place(caught)}),
+            &handlerSuccess, &handlerFailure, output, sink, origin)
+          terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+          resume(&mut builder.*, joined)
+          return ()
+        }
+      }
+      let listed = Vector.asSlice<Shared<Type>>(&members)
+      let selectedMembers = run Type.canonicalUnionMembers(&selector)
+      let tagType = run Layout.tagType(listed.length)
+      let read = run temporary(&mut builder.*, &tagType, origin)
+      run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: place(caught)}, origin)
+      let mut cases = Vector.make<SwitchCase>()
+      let mut arms = Vector.make<usize>()
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let arm = run block(&mut builder.*, origin)
+        run Vector.append<usize>(&mut arms, arm)
+        run Vector.append<SwitchCase>(&mut cases, SwitchCase {decimal: run Type.extentText(at), negative: false, target: arm})
+        at = at + usize.ONE
+      }
+      let unreachable = run block(&mut builder.*, origin)
+      terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases,
+        otherwise: unreachable, origin: origin})
+      at = usize.ZERO
+      while at < listed.length {
+        resume(&mut builder.*, Vector.asSlice<usize>(&arms)[at])
+        let mut payload = place(caught)
+        run Vector.append<Projection>(&mut payload.projections, Projection.Payload {index: at, ty: Shared.clone<Type>(&listed[at])})
+        let held = run temporary(&mut builder.*, &listed[at], origin)
+        run assign(&mut builder.*, place(held), Rvalue.Use {value: Operand.Move {place: move payload}}, origin)
+        if run Type.coversFailure(&selector, &listed[at]) {
+          // A selected member reaches the handler as the handler's parameter type `S`.
+          let mut argument = Operand.Move {place: place(held)}
+          if let Option<Vector<Shared<Type>>>.Some {value: wider} = &selectedMembers {
+            let tag = run memberTag(Vector.asSlice<Shared<Type>>(&wider), &listed[at])
+            if tag == usize.MAX { return run unsupported(&owner, origin, GapCode.UnionForm) }
+            let injected = run temporary(&mut builder.*, &selector, origin)
+            run assign(&mut builder.*, place(injected), Rvalue.Inject {tag: tag, value: Operand.Move {place: place(held)}}, origin)
+            argument = Operand.Move {place: place(injected)}
+          }
+          run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument), &handlerSuccess, &handlerFailure,
+            output, sink, origin)
+          terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+        } else {
+          run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
+          run deliverFailure(&mut builder.*, held, &listed[at], sink, origin)
+        }
+        at = at + usize.ONE
+      }
+      resume(&mut builder.*, joined)
+    }
+  }
+  return ()
+}
+
+effect fn singleOperand(value: Operand) -> Vector<Operand> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<Operand>()
+  run Vector.append<Operand>(&mut values, move value)
+  return move values
 }
 
 effect fn memberTag(members: &[Shared<Type>], member: &Shared<Type>) -> usize ! OutOfMemoryError ? &mut Allocator {
@@ -3235,6 +3530,7 @@ fn borrowingType(value: &Type) -> bool {
     Type.Array {element, ..} => Shared.with<Type, bool>(&element, borrowingType)
     Type.CallableValue {captures, ..} => borrowingMembers(Vector.asSlice<Shared<Type>>(&captures))
     Type.CallableSchema {captures, ..} => borrowingMembers(Vector.asSlice<Shared<Type>>(&captures))
+    Type.EffectComposite {parts, ..} => borrowingMembers(Vector.asSlice<Shared<Type>>(&parts))
     Type.Anonymous {members, ..} => borrowingMembers(Vector.asSlice<Shared<Type>>(&members))
     Type.Union {members} => borrowingMembers(Vector.asSlice<Shared<Type>>(&members))
     Type.Callable {environment, ..} => Shared.with<Intersection, bool>(&environment, capturing)
@@ -3848,6 +4144,7 @@ impl MirFunction {
     failure: &Shared<Type>,
     parameters: &[Shared<Type>],
     calls: Vector<CallTarget>,
+    plans: Vector<NodePlan>,
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
     projections: Vector<RuntimeProjection>,
@@ -3943,6 +4240,7 @@ impl MirFunction {
       remainders: move remainders,
       needs: move needs,
       failure: failureLocal,
+      plans: move plans,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
