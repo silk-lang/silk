@@ -153,7 +153,7 @@ export const compile = Effect.fn('Workflow.compile')(function* (
 > {
   const fileSystem = yield* FileSystem.FileSystem
   const path = yield* Path.Path
-  const resolver = FileSourceResolver.make(options.entry.sourceRoot)
+  const resolver = FileSourceResolver.make(options.entry.sourceRoot, { kind: 'embedded' })
   const prepared = yield* Effect.result(
     fileSystem.makeDirectory(path.dirname(options.destination), { recursive: true }),
   )
@@ -274,7 +274,7 @@ const checkTarget = Effect.fnUntraced(function* (
 ): Effect.fn.Return<CheckAttempt, never, FileSystem.FileSystem | Path.Path> {
   const target = plan.target
   const path = yield* Path.Path
-  const resolver = FileSourceResolver.make(project.entry.sourceRoot)
+  const resolver = FileSourceResolver.make(project.entry.sourceRoot, { kind: 'embedded' })
   const attempted = yield* Effect.result(
     Analysis.makeRealized({
       root: project.entry.module,

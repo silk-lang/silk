@@ -11,14 +11,19 @@ import * as Stdlib from './Stdlib.js'
 export interface FileSourceResolver {
   readonly _tag: 'FileSourceResolver'
   readonly root: string
-  readonly toolchainRoot?: string
+  readonly standardLibrary: StandardLibrary
 }
 
+/** Embedded distribution bytes or navigable files from an installed toolchain. */
+export type StandardLibrary =
+  | { readonly kind: 'embedded' }
+  | { readonly kind: 'files'; readonly root?: string }
+
 /** Creates a resolver configuration from an already normalized absolute source root. */
-export const make = (root: string, toolchainRoot?: string): FileSourceResolver =>
-  toolchainRoot === undefined
-    ? { _tag: 'FileSourceResolver', root }
-    : { _tag: 'FileSourceResolver', root, toolchainRoot }
+export const make = (
+  root: string,
+  standardLibrary: StandardLibrary = { kind: 'files' },
+): FileSourceResolver => ({ _tag: 'FileSourceResolver', root, standardLibrary })
 
 /** Maps one canonical module exactly to `<source-root>/<module>.silk`. */
 export const sourcePath = (self: FileSourceResolver, module: string, path: Path.Path): string =>
@@ -34,12 +39,14 @@ export const layer = (
       const fileSystem = yield* FileSystem.FileSystem
       const path = yield* Path.Path
       const readToolchainSource = Effect.fnUntraced(function* (module: string) {
+        if (self.standardLibrary.kind === 'embedded')
+          return yield* SourceResolver.resolveEmbeddedStandardLibrary(module)
         const entry = Stdlib.find(module)
         if (entry === undefined) return Option.none<SourceResolver.ResolvedSource>()
         const sourceUrl =
-          self.toolchainRoot === undefined
+          self.standardLibrary.root === undefined
             ? entry.sourceUrl
-            : new URL(entry.path, self.toolchainRoot)
+            : new URL(entry.path, self.standardLibrary.root)
         const file = yield* path.fromFileUrl(sourceUrl).pipe(
           Effect.mapError(
             (cause) =>

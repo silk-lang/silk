@@ -2,6 +2,53 @@
 
 The project-oriented command line interface for the Silk bootstrap compiler.
 
+## Standalone compiler for CI
+
+Passing `main` commits publish a GitHub Actions artifact named `silk-bootstrap`, containing
+one `silk.mjs` file. It includes the CLI, compiler, JavaScript dependencies, standard-library
+sources, and native runtime source. Other workflows can download it and invoke it with Node 24
+or Bun; no package install or repository build is needed:
+
+```yaml
+permissions:
+  contents: read
+  actions: read
+
+steps:
+  - uses: actions/checkout@v6
+  - uses: actions/setup-node@v6
+    with:
+      node-version: 24
+  - uses: julia-script/silk/.github/actions/download-bootstrap@main
+    id: bootstrap
+    # Optional: pin the compiler to a full main commit SHA.
+    # with:
+    #   sha: <full-main-commit-sha>
+  - run: node "${{ steps.bootstrap.outputs.path }}" check --manifest-path compiler/silk.toml
+  - run: node --max-old-space-size=8192 "${{ steps.bootstrap.outputs.path }}" build --manifest-path compiler/silk.toml
+```
+
+The action selects the latest verified main run, returns the compiler path and source SHA, and
+supports a `sha` input for reproducible CI. Only a main build that passes the complete CI
+dependency graph receives the shared artifact name. Selection uses the workflow run ID, so a
+late upload or rerun of an older commit cannot replace a newer compiler. Artifacts are retained
+for 90 days; expired pins fail with an explicit error. The selfhost M1 CI lane uses this action.
+The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
+repositories can pass a `token` with Actions read access to `julia-script/silk`; their own
+`GITHUB_TOKEN` may not have access to that repository.
+
+For Bun, invoke `bun "${{ steps.bootstrap.outputs.path }}"` with the same CLI arguments.
+
+Checking and emitting `llvm-ir` or `llvm-bitcode` stages need only the JavaScript runtime and
+your source project. Native compilation, linking, `run`, and `test` also need the existing
+LLVM/Clang toolchain and target platform supplies. The bundle does not download them.
+
+To build the asset locally, run `pnpm bundle:cli` from the repository root. The output is
+`packages/cli/dist/silk.mjs`. `node packages/cli/scripts/test-bundle.mjs node` and the same
+command with `bun` copy only that file into an isolated temporary directory, create and check
+a project with local and standard-library imports, generate documentation, and emit LLVM bitcode.
+Add `--native` with LLVM/Clang on `PATH` to also compile, run, and execute a test through the bundle.
+
 ## Create a project
 
 ```bash

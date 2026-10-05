@@ -71,6 +71,10 @@ Current specifications live under [`openspec/specs`](openspec/specs); active cha
 
 ## Development
 
+CI can use the [standalone bootstrap compiler](packages/cli/README.md#standalone-compiler-for-ci)
+stored as a GitHub Actions artifact from passing `main` commits: download `silk.mjs` and run it
+with Node 24 or Bun.
+
 ```sh
 pnpm install
 pnpm dev
