@@ -67,4 +67,6 @@ export const selfhostTrack = [
   'owner-typed-direct-section',
   'option-result-combinators',
   'opaque-callable',
+  'effect-nested-failure-propagation',
+  'effect-selective-catch-direct-stored',
 ] as const satisfies ReadonlyArray<string>
