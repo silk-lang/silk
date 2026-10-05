@@ -4596,6 +4596,20 @@ export const make = (operations: Operations) => {
       providerBindings.values(),
       providerRelevance(dependencies.all, [...serviceCalls.keys(), ...deferredCalls.keys()]),
     )
+    // Every environment reaching a node walks its dependency targets again, and most targets
+    // cannot reach a service or deferred call: on the selfhost semantic root that relevance test
+    // was 21 s of self time. Dependencies are fixed until the walk ends, so filter each node once.
+    const relevantTargets = new Map<string, ReadonlyArray<string>>()
+    const relevantTargetsOf = (node: string): ReadonlyArray<string> => {
+      let targets = relevantTargets.get(node)
+      if (targets === undefined) {
+        targets = [...(dependencies.all.get(node) ?? [])].filter((target) =>
+          providers.relevant.has(target),
+        )
+        relevantTargets.set(node, targets)
+      }
+      return targets
+    }
     const selectedEdges: Array<readonly [string, string]> = []
     for (let ordinal = 0; ordinal < providers.pending.length; ordinal += 1) {
       const current = providers.pending[ordinal]
@@ -4716,7 +4730,7 @@ export const make = (operations: Operations) => {
           }
         }
       }
-      for (const target of dependencies.all.get(current.node) ?? [])
+      for (const target of relevantTargetsOf(current.node))
         enqueueProvider(providers, target, environment)
     }
     for (const [owner, target] of selectedEdges) addDependency(owner, target)

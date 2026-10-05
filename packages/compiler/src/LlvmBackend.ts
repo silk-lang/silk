@@ -6,7 +6,7 @@ import * as NativeProgram from './NativeProgram.js'
 import * as Target from './Target.js'
 
 /** The bootstrap LLVM backend over the Silk LLVM builder. */
-export const LlvmBackend: Backend.Backend<Backend.LlvmBitcodeArtifact> = {
+export const LlvmBackend: Backend.Backend<Backend.LlvmEmission> = {
   _tag: 'Backend',
   id: 'llvm',
   name: 'LLVM',
@@ -14,7 +14,7 @@ export const LlvmBackend: Backend.Backend<Backend.LlvmBitcodeArtifact> = {
   emit: Effect.fn('Backend.LLVM.emit')(function* (
     program: Mir.Module,
     request: Backend.CodegenRequest,
-  ): Effect.fn.Return<Backend.LlvmBitcodeArtifact, BackendError> {
+  ): Effect.fn.Return<Backend.LlvmEmission, BackendError> {
     const output = yield* NativeProgram.emit(program, request).pipe(
       Effect.catchTag('LlvmError', (cause) =>
         Effect.fail(
@@ -27,7 +27,10 @@ export const LlvmBackend: Backend.Backend<Backend.LlvmBitcodeArtifact> = {
         ),
       ),
     )
-    const artifact = {
+    // Textual IR is rendered only when read: it is a full extra pass over the module and most
+    // compiles (including the cached-artifact path) never look at it.
+    let renderedIr: string | undefined
+    return {
       _tag: 'LlvmBitcodeArtifact',
       support: request.support === true,
       backend: 'llvm',
@@ -40,17 +43,10 @@ export const LlvmBackend: Backend.Backend<Backend.LlvmBitcodeArtifact> = {
       foreignExports: output.foreignExports,
       foreignStatics: output.foreignStatics,
       bitcode: output.bitcode,
-    }
-    // Textual IR is rendered only when read: it is a full extra pass over the module and most
-    // compiles (including the cached-artifact path) never look at it.
-    let renderedIr: string | undefined
-    Object.defineProperty(artifact, 'ir', {
-      enumerable: true,
-      get: () => {
+      get ir() {
         renderedIr ??= output.renderIr()
         return renderedIr
       },
-    })
-    return artifact as Backend.LlvmBitcodeArtifact
+    }
   }),
 }

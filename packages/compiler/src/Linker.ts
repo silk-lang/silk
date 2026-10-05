@@ -55,11 +55,9 @@ export const link = Effect.fn('Linker.link')(function* (
       )
     : yield* NativeToolchain.finalizeLink(request.plan, request.artifactKind, request.destination)
   if (!reusable && request.cache._tag === 'ReadWrite')
-    yield* NativeToolchain.writeArtifactCache(
-      request.cache.store,
-      request.cache.key,
+    yield* NativeToolchain.writeArtifactCache(request.cache.store, request.cache.key, [
       artifact.bytes,
-    )
+    ])
   return {
     _tag: 'LinkedArtifact',
     artifact,

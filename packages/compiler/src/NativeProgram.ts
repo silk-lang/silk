@@ -898,7 +898,6 @@ const encodeArtifact = Effect.fn('NativeProgram.encodeArtifact')(function* ({
   return {
     symbols: declared.map((entry) => ({
       declaration: entry.fn.id,
-      instance: entry.fn.instance,
       symbol: entry.publicSymbol,
     })),
     nativeRuntimeSymbols: [

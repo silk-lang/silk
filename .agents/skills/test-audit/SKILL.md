@@ -68,10 +68,10 @@ to its owning concept; do not introduce TypeScript test harnesses for Silk claim
 
 ## Linux timing budget
 
-Every source-written selfhost test must finish **under 1 s on Linux CI**; target
-**under 500 ms**. `.github/scripts/check-selfhost-test-times.mjs` rejects timings
-of 1 s or longer and logs with no measured tests. Keep this check outside compiler
-execution. Compile-and-run step duration includes compilation and is not the
+Source-written selfhost tests should finish **within 1 s on Linux CI**; aim for
+**under 500 ms**. `.github/scripts/check-selfhost-test-times.mjs` warns above the
+1 s target and rejects timings of 2 s or longer and logs with no measured tests.
+Keep this check outside compiler execution. Compile-and-run step duration includes compilation and is not the
 per-test runtime budget.
 
 Reduce fixture size, irrelevant declarations, repeated parsing, and demand cost

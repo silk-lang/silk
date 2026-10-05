@@ -1,6 +1,7 @@
 import * as ConcreteCleanup from './ConcreteCleanup.js'
 import {
   authored,
+  bindingAt,
   lowerBorrowedWritePlace,
   generated,
   emitReleases,
@@ -12,6 +13,7 @@ import {
   lowerWriteSelectors,
   lowerOwnershipPath,
   ownershipLocal,
+  patternBinding,
   propagationLoanEnds,
   propagationReleases,
   specializedCleanup,
@@ -86,6 +88,7 @@ import {
   effectValueType,
   ensureEffectRunner,
   functionItemValueType,
+  generatedRunner,
   instanceText,
   providerBindings,
   requirementsFor,
@@ -395,11 +398,7 @@ export function lowerExpressionInner(
       return { result: bound }
     }
     case 'PatternBindingReference': {
-      const binding = Ownership.allBindings(fn.ownership).find(
-        (binding) =>
-          binding.site._tag === 'Pattern' &&
-          patternKey(binding.site.binding) === patternKey(expression.binding),
-      )
+      const binding = patternBinding(fn, expression.binding)
       if (binding?.place !== undefined) {
         const root = ownershipLocal(fn, binding.place.root)
         const type = fn.type(expression.type)
@@ -1375,7 +1374,7 @@ function lowerEffectBlockExpression(
     provenance: authored(expression.span),
   })
   const specializationKey = baseRunnerKey(fn.owner.key, expression.site, type.type)
-  if (!fn.generatedRunners.some((candidate) => candidate.specializationKey === specializationKey)) {
+  if (generatedRunner(fn.generatedRunners, specializationKey) === undefined) {
     fn.generatedRunners.push({
       _tag: 'BlockEffectRunner',
       id: runner,
@@ -2139,9 +2138,7 @@ function lowerMatchExpression(
   } else if (expression.access === 'Place') {
     const source = Ownership.placeOf(expression.scrutinee)
     if (source === undefined) return undefined
-    const alias = Ownership.allBindings(fn.ownership).find(
-      (binding) => Ownership.siteKey(binding.site) === Ownership.siteKey(source.root),
-    )?.place
+    const alias = bindingAt(fn, source.root)?.place
     const root = ownershipLocal(fn, alias?.root ?? source.root)
     if (root === undefined) return undefined
     selectors = lowerOwnershipPath(
