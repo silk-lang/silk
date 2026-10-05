@@ -114,74 +114,74 @@ Corpus programs with failure reports: `native-termination-logical-path`,
 
 `observeDiagnostics` builds an exact composite like the other composition intrinsics (Effect note
 D1): environment `{state, callback, body}`, type `EffectComposite { Observe, parts: [S, F, B] }`
-with the contract `once Effect<A ! never ? R>`. Running it expands at the run site (D4):
+with the contract `once Effect<A ! never ? R>`. Running it expands at the run site (D4) as the
+`RunPlan.Observe` step:
 
-1. Build the observer record `_o = Aggregate { AddressOf(mut, env.0), AddressOf(env.1) }`, type
-   `Observer<S, F>` (two addresses).
-2. Run `body` (part 2) with observer `AddressOf(_o)` and a null cause.
-3. Drop `state` and `callback` with the environment.
+1. Borrow the state: `_s = Ref(mut, env.0)`, type `&mut S`.
+2. Run `body` (part 2) with observer `_s` and no selected failure (§N2).
+3. Drop the state with the environment.
 
 The observer reaches instances like a provider (D2), with one difference: it is inherited by every
 callee, not selected by a row.
 
-- `InstanceKey.Function` gains `observer: Option<Shared<Type>>`, the record type `Observer<S, F>`.
-  It is part of the runtime identity, exactly like a provider type.
-- An observed instance has two hidden locals, `LocalKind.Observer` (the record address) and
+- `InstanceKey.Function` gains `observer: Option<Shared<Observer>>`, where
+  `Observer { state: S, callback: InstanceKey }`. The state type and the callback's instance are
+  part of the runtime identity, exactly like a provider type.
+- The callback must be a direct function (a named `fn` value): an observed instance calls the
+  callback's instance with exactly the six written operands. A capturing callback reports the
+  `observer-callback` gap.
+- An observed instance has two hidden locals, `LocalKind.Observer` (the `&mut S` address) and
   `LocalKind.Cause` (§N2), passed after the providers.
-- Every `Call` in an observed instance targets the callee key with the same observer and passes
-  both operands. The callback is the one independent edge: it is called unobserved, with no hidden
-  operands, so it cannot observe itself (SEM0216's recursion case cannot arise at run time).
+- Semantic call preparation (`provideCall`) gives every callee the observer of the call site: the
+  innermost enclosing `Observe` step, else the instance's own. `Terminator.Call` gains
+  `diagnostics: Option<Diagnostics { observer, cause }>`, present exactly when the callee key is
+  observed.
+- The callback is the one independent edge: it is called unobserved, with no hidden operands, so it
+  cannot observe itself (SEM0216's recursion case cannot arise at run time).
 - The root and every instance reached only outside observation have `observer = None`: no hidden
-  locals, no companions, no `FailureContext` statements, and no ABI change.
+  locals, no companions and no ABI change.
 
 ### N2. The selected failure is a hidden cause address
 
-`LocalKind.Cause` holds the address of the companion of the failure the current recovery handler
-is handling, or null.
+`LocalKind.Cause` holds the address of the context companion (§N3) of the failure the current
+recovery handler is handling. "Nothing selected" is the address of a companion whose identity is
+empty, so no null pointers are needed.
 
-| Call site                                                            | Cause operand passed                               |
-| -------------------------------------------------------------------- | -------------------------------------------------- |
-| a handler run by a `Catch` step                                      | the caught temporary's companion address           |
-| the body run by an `Observe` step                                    | null (a fresh observation selects nothing)         |
-| finalizers, `release`, provider bindings, joins and every other call | the caller's own `Cause` (inherited, not selected) |
+| Call site                                                            | Cause operand passed                                  |
+| -------------------------------------------------------------------- | ----------------------------------------------------- |
+| a handler run by a `Catch` step                                      | the caught temporary's companion address              |
+| the body run by an `Observe` step                                    | an empty companion (a fresh observation selects none) |
+| finalizers, `release`, provider bindings, joins and every other call | the caller's own `Cause` (inherited, not selected)    |
 
 The companion of a caught temporary lives in the frame that runs the handler, so the address stays
 valid for the whole handler run. This is FAIL-006: an `ensuring` failure keeps its context but is
 not selected inside the finalizer.
 
-### N3. The failure context companion and `FailureContext`
+### N3. The failure context companion is an ordinary local
 
-Every failure slot of an observed instance has a fixed-size companion. Failure slots are the
-`Failure` local and every place that a `FailureEdge` targets or a failure moves through (catch and
-finalizer temporaries). Origin-only content:
+Every failure slot of an observed instance has a companion local of the ordinary type
+`[string<'static>; 2]`: the failure's identity and its origin label. Failure slots are the
+`Failure` local and every temporary a failure moves through (failure-edge destinations, catch and
+finalizer temporaries). The companion of `Failure` is `LocalKind.Context`, a second caller-owned
+out-slot.
 
-```text
-Context = { identity: string<'static>, origin: string<'static> }    // 4 words
-```
+The reserved `Statement.FailureContext` is not needed and is retired. Every context operation is
+ordinary MIR:
 
-The reserved statement becomes:
+- **Raise.** `fail x` emits `Assign(Failure, x)`, then `Assign(Context, Aggregate [identity,
+label])` of two static strings, then the drop chain and `Fail`. When the `Failure` type is a
+  structural union, a `Discriminant` and `Switch` select the active member's identity.
+- **Carry.** Every move of a failure between slots (`propagateFailure`, a catch sink, a residual
+  member) moves the companion with it: `Assign(to', Use(Move from'))`.
+- **Call edges.** `FailureEdge` gains `context: Option<Place>`, the companion of its destination,
+  present exactly when the callee is observed. The callee writes it with its failure.
+- **Discard.** A handler that succeeds simply stops using the caught companion. Origin-only context
+  owns no resource.
 
-```text
-Statement.FailureContext { destination: Place, source: ContextSource, origin: Origin }
-ContextSource = Raise { identities: Vector<Bytes>, label: Bytes }
-              | Carry { place: Place }
-```
-
-- `fail x` emits `Assign(Failure, x)`, then `FailureContext { Failure, Raise, origin }`, then the
-  drop chain and `Fail`. `identities` holds one canonical identity per canonical member of the
-  `Failure` type (one entry when it is not a union); emission indexes it by the runtime tag.
-  `label` is the site label `<module>.<function> (<source>:<line>:<column>)`.
-- Every move or conversion of a failure between failure slots (`widenInto`, catch selection,
-  finalizer hold, `deliverFailure`) emits `FailureContext { to, Carry { from }, origin }` next to
-  the payload move.
-- A callee writes its companion through a third failure out-address. The caller passes the
-  companion of `FailureEdge.destination`, so a call edge needs no statement.
-- A handler that succeeds simply stops using the caught companion. Origin-only context owns no
-  resource, so discarding it is free.
-
-The texts are rendered while building MIR, where the module source and declaration names are
-available, so Layout and LLVM emission only store constants. `Raise` and `Carry` replace the
-reserved `source: Option<Place>`, because origination needs its texts in the statement.
+Identity is the canonical type name (`module.Name<Arguments>`, primitives by spelling, `()`); other
+failure types report the `failure-identity` gap. The label is `<module>.<function>
+(<module>:<line>:<column>)`, 1-based, rendered while building MIR from the instance's module
+source. Layout and LLVM emission only see constant strings.
 
 ABI of an observed instance, after the written parameters and providers:
 
@@ -198,9 +198,8 @@ f(arguments..., providers..., observer, cause, success: address, failure: addres
 - **`observeUnhandled()`** in an observed instance:
 
   ```text
-  Branch(cause != null) -> bb1, bb2
-  bb1: Call F([callback env from (*observer).1], (*observer).0, 5u8, 0, 0,
-               (*cause).identity, (*cause).origin) -> _r     // independent edge
+  _n = SliceLength((*cause)[0]); Branch(_n != 0) -> bb1, bb2
+  bb1: Call callback(observer, 5u8, 0, 0, (*cause)[0], (*cause)[1]) -> _r   // unobserved
   bb2: _r = 0
   ```
 
@@ -221,7 +220,7 @@ protocol, never `NativeDiagnostics`, `NativeReport` or the report policy.
 | `finalizeEffect`, `useReleaseNonParking` | hold in a temporary, run the finalizer or `release`, deliver    | `Carry` into the hold and out of it; the finalizer inherits the caller's cause           |
 | `bindRequirement*`                       | unchanged                                                       | inherited, like every call                                                               |
 | EFF-013 joins                            | one runner per arm                                              | per arm, like a direct run                                                               |
-| `observeDiagnostics`                     | none (empty failure row)                                        | body starts with a null cause                                                            |
+| `observeDiagnostics`                     | none (empty failure row)                                        | body starts with an empty cause                                                          |
 
 ### N6. Cost model
 
@@ -237,18 +236,17 @@ protocol, never `NativeDiagnostics`, `NativeReport` or the report policy.
 
 ### N7. Logical frames and causes (follow-up)
 
-The follow-up fills the same statement and companion; it adds no new form.
+The follow-up keeps the same locals and edges; it adds calls, not forms.
 
-- `Context` gains `handle: usize`, a node of the observer's pool (`0` when refused).
-- `Raise` calls the callback with event 0, then event 2 with the current cause's handle when the
-  cause is non-null, and releases the plain node, matching the bootstrap order.
-- `Carry` gains `frame: Option<Bytes>`. A carry on a `run` site's failure edge has the frame label
-  of the propagating caller and calls event 1. Carries inside one expansion have none.
+- The companion gains a `handle` (a node of the observer's pool, `0` when refused).
+- Raise calls the callback with event 0, then event 2 with the selected cause's handle when one is
+  selected, and releases the plain node, matching the bootstrap order.
+- A carry on a `run` site's failure edge calls event 1 with the propagating caller's label.
+  Carries inside one expansion do not.
 - A selected handler that succeeds, an overwritten companion and a dropped temporary call event 4.
-  Each is a `FailureContext` site or an existing drop, so no new edge is needed.
 - `observeUnhandled` passes the cause's handle. Observed traps call event 6 before `Trap`.
-- Release on every exit requires the companion to be a cleanup owner. That is the one real change
-  to Step 6's cleanup stack.
+- Releasing on every exit makes the companion a cleanup owner. That is the one real change to
+  Step 6's cleanup stack.
 
 ## 3. What becomes reachable
 
@@ -265,13 +263,15 @@ prints `identity` and `origin` on event 5 and returns `1` prints `main.Missing` 
 
 ## 4. Gap codes
 
-| Code               | Change    | Raised where                                                               | Exit condition   |
-| ------------------ | --------- | -------------------------------------------------------------------------- | ---------------- |
-| `intrinsic-member` | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage |
-| `entry-signature`  | unchanged | as before                                                                  | Q1               |
+| Code                | Change    | Raised where                                                               | Exit condition                       |
+| ------------------- | --------- | -------------------------------------------------------------------------- | ------------------------------------ |
+| `intrinsic-member`  | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage                     |
+| `observer-callback` | **new**   | an `observeDiagnostics` callback that is not a direct function             | callback environments in the slot    |
+| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive or unit type  | identity rendering for the remainder |
+| `entry-signature`   | unchanged | as before                                                                  | Q1                                   |
 
-No new gap. Drop glue keys (`InstanceKey.DropGlue`) do not carry an observer in the origin-only
-step, so a `Drop` hook runs unobserved. Drop glue cannot fail, so the only observable effect is an
+Drop glue keys (`InstanceKey.DropGlue`) do not carry an observer in the origin-only step, so a
+`Drop` hook runs unobserved. Drop glue cannot fail, so the only observable effect is an
 `observeUnhandled()` inside a handler that a `Drop` hook runs: it returns `0` and reports nothing.
 That is a recorded divergence (§5), retired by observed drop glue in N7.
 
@@ -298,13 +298,11 @@ All structured and cheap, in `SemanticCases.silk`, one shared source per test:
 - **Typing.** `observeDiagnostics` accepts the exact composite and rejects a fallible body (the
   SEM0052 counterpart) and a callback of the wrong shape, asserted by code and span.
   `observeUnhandled()` types as `usize`.
-- **MIR shape.** An `Observe` run passes an observer and a null cause to the body. An observed
-  `fail` emits `Raise` with the expected identity count and label. An observed catch passes the
-  caught companion to its handler and `Carry`s the residual. An unobserved instance contains no
-  `FailureContext` and no hidden locals. `observeUnhandled` in an unobserved instance is `0`.
-- **Recipe and emission.** The instance recipe encodes the observer and the two hidden locals, and
-  the observed and unobserved instances of one function are distinct. Emitted LLVM text shows the
-  three failure out-addresses and the constant identity table.
+- **MIR shape.** An `Observe` run passes an observer and an empty cause to the body. An observed
+  `fail` writes the context once per union member, with the expected identity and label. An
+  observed catch passes the caught companion to its handler, and its edge names the companion. An
+  unobserved instance has no hidden locals. `observeUnhandled` calls the callback unobserved, and
+  in an unobserved instance it is `0`.
 
 No corpus program changes status (§3), so `selfhostTrack.ts` and `baselinePasses` stay as they are;
 CI must still show 0 FAIL and no lost PASS.
@@ -313,20 +311,19 @@ CI must still show 0 FAIL and no lost PASS.
 
 1. **This note** (docs only).
 2. **Origin-only context and both readers.** Typing of both intrinsics, `Composition.Observe`,
-   `RunPlan.Observe`, observer and cause slots in `InstanceKey`, MIR, recipe and LLVM,
-   `FailureContext` with `Raise` and `Carry`, the compatibility entry,
-   and the Effect note's §4, §5 and §7 updated. Stacked on Step 9d providers, whose hidden-operand
-   path it extends.
+   `RunPlan.Observe`, the observer slot in `InstanceKey`, hidden locals, companions, recipe and
+   LLVM, the compatibility entry, and the Effect note's §4, §5 and §7 updated. It extends Step 9d's
+   hidden-operand path.
 3. **Frames and causes** (N7), then observed drop glue and fatal traps.
 4. **SEM0216 and SEM0217**, with the suspension stage's executable-closure summary.
 
 ## 8. Privilege
 
-| Piece                                                                                   | Owner                                                                |
-| --------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| observer slot, cause slot, companion, `FailureContext`, the event protocol's call sites | compiler (MIR lowering and emission)                                 |
-| `observeDiagnostics`, `observeUnhandled`                                                | sealed `Intrinsic`, already cataloged                                |
-| node pool, report text, limits, policy `1`, exit status                                 | `silk/native_diagnostics`, `silk/native_report`, `silk/native_start` |
+| Piece                                                                  | Owner                                                                |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| observer slot, cause slot, companions, the event protocol's call sites | compiler (MIR lowering and emission)                                 |
+| `observeDiagnostics`, `observeUnhandled`                               | sealed `Intrinsic`, already cataloged                                |
+| node pool, report text, limits, policy `1`, exit status                | `silk/native_diagnostics`, `silk/native_report`, `silk/native_start` |
 
 No standard-library declaration is recognized by name. The event numbers are the only contract
 between the compiler and the library, and the bootstrap already fixes them.
@@ -335,8 +332,8 @@ between the compiler and the library, and the bootstrap already fixes them.
 
 Each has a recommendation; the implementation follows it until Julia decides otherwise.
 
-1. **Observer reach.** Specialize instances on the observer record type and pass a direct
-   address (as above), or copy the bootstrap's module-wide switch with a pointer-dispatched
+1. **Observer reach.** Specialize instances on the observer (state type and callback instance) and
+   pass the state's address (as above), or copy the bootstrap's module-wide switch with a pointer-dispatched
    callback? **Recommended: specialize.** It is the provider mechanism Julia already approved (D2),
    it keeps unobserved code unchanged, and it never calls through a function pointer. The cost is
    duplicated instances reached both inside and outside observation.
@@ -350,10 +347,10 @@ Each has a recommendation; the implementation follows it until Julia decides oth
 4. **Companion ABI.** A third failure out-address, or a companion embedded in the failure slot's
    layout? **Recommended: a third out-address** in observed instances only. It leaves `E`'s layout,
    `Payload` and `Inject` untouched, and unobserved instances keep the D3 ABI exactly.
-5. **Where the texts come from.** Render identity and site label while building MIR, or carry
-   origins and render during emission? **Recommended: while building MIR,** where module source and
-   declaration names are available. This refines the reserved `source: Option<Place>` into `Raise`
-   and `Carry`.
+5. **The reserved `FailureContext` statement.** Keep it, or express context as ordinary companion
+   locals, assignments and calls? **Recommended: ordinary MIR, and retire the statement.** Raise
+   and carry are plain assignments, the frames step adds plain calls, and MIR keeps its rule of no
+   Effect-specific forms. Texts are rendered while building MIR, where source and names exist.
 6. **`observeUnhandled` with origin-only context.** Pass handle `0` with the companion's texts (the
    report ends in `[trace truncated]`), or create and release an origin node so the report looks
    complete? **Recommended: handle `0`.** One callback call, no pool use, and the truncation marker

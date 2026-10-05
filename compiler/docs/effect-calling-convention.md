@@ -388,7 +388,7 @@ All three recommendations accepted on PR #708:
    added by the PR that adds its first reader (the observer and trace note due before milestone
    (i-b)), not in Step 9. The trace gap belongs to that PR. This refines the 2026-09-30 decision
    about which PR ships it; the origin-only content is unchanged. The note is
-   [failure-observer-and-trace.md](failure-observer-and-trace.md); it refines the reserved
-   statement's `source` into `Raise` and `Carry` (its N3).
+   [failure-observer-and-trace.md](failure-observer-and-trace.md); it retires the reserved
+   statement in favor of ordinary companion locals (its N3 and Q5).
 3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
    covers becomes either supported or `suspension`.

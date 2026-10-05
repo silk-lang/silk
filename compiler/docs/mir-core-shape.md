@@ -120,8 +120,9 @@ edge; there is no implicit unwinding and no landing pad.
   move or conversion between failure slots). Both places are failure slots: the `Failure` local or
   a `FailureEdge` destination; `Layout` gives each its fixed-size companion. A succeeding handler
   discards it. The statement is added by the PR that adds its first reader (observer/reporting
-  intrinsics); trace frames later fill the same statement. Its final shape is in
-  [the failure observer note](failure-observer-and-trace.md) N3.
+  intrinsics); trace frames later fill the same statement. The failure observer note retires it:
+  context is an ordinary companion local per failure slot
+  ([failure-observer-and-trace.md](failure-observer-and-trace.md) N3, Q5).
 - **Control intrinsics never appear as a MIR callee.** `Intrinsic.catchFailure`,
   `finalizeEffect` and `bindRequirement*` are expanded by lowering into ordinary calls, failure
   edges, aggregates and switches (Step 5 owns the expansion); `suspendEffect` becomes `Suspend` (§6). MIR has no
