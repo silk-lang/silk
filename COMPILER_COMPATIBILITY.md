@@ -986,3 +986,10 @@ repeated invocation and capture-only drop glue.
   code/span assertions and MIR inspection passed on `db60c160`; repaired-head assertions and Linux
   timings remain pending.
 - **Source migration:** none.
+
+- **Finite origin cost correction:** settled immutable source type trees share their original
+  evidence during callable normalization, avoiding deep reconstruction on each solving/replay
+  pass. Open recipes, views, structural unions and static-bearing callable applications remain
+  on the normal path. Every producer still performs bounds checks and exact whole-body replay;
+  unused dependencies and every distinct existing assertion remain unchanged. Native timing
+  improvement and the newly integrated upstream head require fresh exact-head evidence.
