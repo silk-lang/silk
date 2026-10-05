@@ -912,9 +912,11 @@ repeated invocation and capture-only drop glue.
 
 ### Native higher-order callable result selection
 
-- **Status:** implemented in a draft Step 8 layer. The native head ran ten controls with nine
-  passing and one staged-suffix failure. Invocation-local representation reification repairs
-  that source rejection; the corrected native assertions and exact-head gate remain pending.
+- **Status:** implemented in a draft Step 8 layer. Invocation-local representation reification
+  repaired the staged-suffix source rejection. The reduced Once control exposed a separate source
+  admission gap for a staged recipe behind a public Once view; that recipe is now admitted like
+  a callable-result recipe and must still realize its exact storage before MIR. Native assertions
+  for this repair and the exact-head gate remain pending.
 - **Rule:** a checked invocation through an abstract callable retains its producer, public result
   contract, argument type evidence and selected invocation values/ordinals. This source recipe is
   resolved after substitution to the original returned environment before exact consumer inference.
@@ -947,8 +949,10 @@ repeated invocation and capture-only drop glue.
   Source canonicalization includes free exact callable contracts and staged suffix evidence before
   target selection; schema bound blueprints keep their target declarations and quantifiers.
   Nested capture and staged Once controls compare the direct and higher-order construction
-  through one exact-F scalar consumer and inspect their actual MIR destination types, avoiding
-  an additional callable producer graph without removing either source path or storage assertion.
+  through one exact-F scalar consumer. The nested control inspects actual MIR destinations;
+  the Once control inspects independently recorded checked-body result types, public permissions
+  and the original captured schema. Affine-result and staged-suffix controls retain MIR lowering
+  and cleanup proof, avoiding a repeated backend demand for the Once source-inference claim.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
