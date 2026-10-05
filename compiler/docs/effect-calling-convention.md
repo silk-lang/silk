@@ -217,7 +217,7 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 - `LocalKind.Failure` (one per function that can fail) and `LocalKind.Provider { index }` are distinct from `Return` and `Parameter`; Layout's ABI classification makes `Return` and `Failure` out-addresses when the failure type is not `never`.
 - `Terminator.Fail { origin }` exits with `Failure` initialized. `fail x` is `Assign(Failure, x)`, the Step 6 drop chain, then `Fail`. A failure-edge target converts or injects the value into `Failure` or a handler temporary, runs the drop chain of the exited scopes (innermost first, reverse acquisition order, flag-guarded), then reaches `Fail` or the handler call. There is no unwinding; `Trap` skips cleanup; automatic `Drop` is infallible.
 - Control-affecting intrinsics never appear as MIR callees; lowering expands them into ordinary MIR (Step 5 owns the expansion). `catchAll`/`catch`: failure edge into a temporary, `Discriminant`, `Switch`, `Payload` + `Inject`, then an ordinary handler `Call`. `ensuring`: both the normal and failure targets of the protected call run the finalizer (failure type `never`); the failure path then moves the temporary into `Failure` and does `Fail`.
-- Failure context: every failure slot of an observed instance has an ordinary companion local (`[string<'static>; 2]`, identity and origin). `fail x` assigns it after `Assign(Failure, x)`; every move of a failure between slots moves its companion; `FailureEdge.context` names the companion an observed callee writes through its `Context` out-slot. A succeeding handler discards it. See [the failure observer note](failure-observer-and-trace.md) N3.
+- Reserved: `Statement.FailureContext { destination: Place, source: Option<Place>, origin }`. `source` absent originates context at `origin` (emitted by `fail x` after `Assign(Failure, x)`); `source` present carries it from that failure slot (emitted on every move or conversion between failure slots). Both places are failure slots (the `Failure` local or a `FailureEdge` destination); Layout gives each a fixed-size companion. A succeeding handler discards it. It is added by the PR that adds its first reader; trace frames later fill the same statement.
 - Runners: a named effect fn keeps its written parameters as `Parameter` locals, so `run f(a)` is `Call(f, [a], providers)`; running a stored Effect built from `f` moves (once) or copies its fields into those arguments. Effect blocks and anonymous effect fns take the Step 8 closure environment as parameter 0. A closed, infallible effect fn has the ordinary fn ABI.
 
 ### Suspension (agreed by Steps 4 and 5)
@@ -384,11 +384,10 @@ All three recommendations accepted on PR #708:
    until selfhost compiles `silk/native_start`. It is recorded in COMPILER_COMPATIBILITY.md as a
    temporary difference from the bootstrap and ENTRY-001. `pub effect fn main` stays
    `entry-signature` until then. No compiler entry adapter is added for `effect fn main`.
-2. **Failure context (Q2).** Origin-only context is
+2. **Failure context (Q2).** The `FailureContext` statement stays reserved. Origin-only context is
    added by the PR that adds its first reader (the observer and trace note due before milestone
    (i-b)), not in Step 9. The trace gap belongs to that PR. This refines the 2026-09-30 decision
    about which PR ships it; the origin-only content is unchanged. The note is
-   [failure-observer-and-trace.md](failure-observer-and-trace.md); context is ordinary companion
-   locals (its N3 and Q5).
+   [failure-observer-and-trace.md](failure-observer-and-trace.md).
 3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
    covers becomes either supported or `suspension`.
