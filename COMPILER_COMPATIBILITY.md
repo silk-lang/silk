@@ -753,7 +753,7 @@ repeated invocation and capture-only drop glue.
   retains exact owner evidence and does not add union-member or callback privilege.
   Authored `typeof` rejects still-open type or row selections as SEM0111, following REP-006 and
   the bootstrap; abstract applications inside checked generic bodies remain internal templates.
-  Uninferred result-only binders, quantified section lifetimes, runtime static parameters and
+  Uninferred result-only binders, explicitly quantified public section contracts, runtime static parameters and
   enclosing owner recipes keep their existing precise gaps. Unsafe acknowledgement belongs to
   invocation, including zero-argument targets. Foreign function values remain SEM0189; callable
   values remain forbidden source static data. Opaque callable result realization and retained
@@ -1164,10 +1164,15 @@ repeated invocation and capture-only drop glue.
   representation inference does not rewrite it into a shape error. Authored generic inference keeps
   its call-level diagnostic. Invocation-variance and Effect lifetime parity are separate lanes;
   this correction does not change them. General borrow safety remains Step 14.
-- **Boundary:** eligible lifetime deferral is restricted to ordinary anonymous schemas. Named
-  quantified sections and deferred requirement rows retain their existing named gaps; broadening
-  them prematurely exposed 57 pre-existing diagnostics through Effect providers. Narrowing this
-  change restores the exact baseline PASS set and zero FAIL without translating diagnostics.
+- **Boundary:** anonymous invocation schemas retain their original lifetime-to-declaration map.
+  Ordinary named sections now use that same map when still-unsupplied operands can infer the
+  invocation lifetime, including staged sections and independent caller loans. Effect-valued
+  targets with deferred invocation lifetimes retain their separate source-recipe boundary; generic
+  requirement rows now defer through the upstream Step 10 section recipe. The guard
+  inspects substituted result representations, union members, and target/caller contract premises;
+  an Effect hidden behind a generic result cannot enter the ordinary section lane. Explicitly
+  quantified public section contracts retain their existing gap. General borrow checking remains
+  Step 14; accepting caller lifetime evidence does not certify loan conflicts or escaping loans.
 - **Bootstrap lowering:** the focused positive probes pass bootstrap frontend analysis, but its
   build-exe backend cannot resolve the anonymous higher-order targets (the two-stage case reaches
   SEM0219). Native direct invocation deliberately implements the approved MIR design. These reduced
@@ -1198,4 +1203,25 @@ repeated invocation and capture-only drop glue.
   `DivergentOpaqueRealization` at the opaque result annotation. Ordinary assignment rejects the
   incompatible callback operand with `TypeMismatch`. No adapter, runtime code pointer, new instance
   key or MIR variant is introduced. General borrow obligations remain Step 14.
+- **Source migration:** none.
+
+### Native named sections with deferred invocation lifetimes
+
+- **Status:** implemented on the Step 8 branch; native exact-head assertions and corpus verification
+  remain pending corrected-head CI. At the first head, the reduced native program builds and returns
+  74, all Effect boundary controls pass, and the positive assertion exposed an incorrect expected
+  lifetime origin. The corrected assertion uses the enclosing call region, retaining the written
+  Borrow source identity. Bootstrap build-exe admits the same ordinary reduced staged section.
+- **Rule:** a named section can defer its original lifetime slot when an unsupplied operand carries
+  the evidence. Each invocation opens a fresh inference owner, restores the selected lifetime to
+  the original target ordinal, and directly calls that target. Captures append in construction
+  order; invocation uses their original parameter ordinals. No adapter, pointer, MIR variant, or
+  alternate emitted-identity path is introduced.
+- **Evidence:** `namedLifetimeSectionsSelectOriginalTargetAtInvocation` checks two distinct source
+  Borrow arguments and their typed caller/call-site regions, original application slot 0, two direct target
+  calls, and stored suffix projection order 1/0. `namedLifetimeSectionsKeepEffectProviderBoundary`
+  asserts Unsupported codes and exact spans for opaque, selected, union-member and caller-bound
+  Effect result sections. Bootstrap currently reports SEM0052 on the selected generic Effect
+  section controls; native retains its Unsupported provider-recipe boundary until Step 9 supplies
+  that recipe, rather than admitting a partially inferred Effect construction.
 - **Source migration:** none.
