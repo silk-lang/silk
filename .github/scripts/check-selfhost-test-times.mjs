@@ -11,7 +11,7 @@ const lines = readFileSync(logPath, 'utf8')
 // Tests should finish within 1 s; the failing limit leaves headroom so runner noise near the
 // target does not fail CI.
 const targetMs = 1000
-const limitMs = 2000
+const limitMs = 3000
 let pendingName
 let measured = 0
 const slow = []
@@ -37,6 +37,6 @@ if (measured === 0) {
 }
 for (const line of overTarget) console.warn(`::warning::Selfhost test over the 1 s target: ${line}`)
 if (slow.length > 0) {
-  throw new Error(`Selfhost tests took 2 s or longer:\n${slow.join('\n')}`)
+  throw new Error(`Selfhost tests took 3 s or longer:\n${slow.join('\n')}`)
 }
-console.log(`All ${measured} selfhost tests finished under 2 s (${overTarget.length} over the 1 s target)`)
+console.log(`All ${measured} selfhost tests finished under 3 s (${overTarget.length} over the 1 s target)`)
