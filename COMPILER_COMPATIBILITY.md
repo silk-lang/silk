@@ -450,14 +450,18 @@ Each entry records:
   lets Effects from different construction sites with one compatible contract join behind a finite
   hidden variant, and a declared `Effect<...>` position may hold any of them.
 - **Compilers:** bootstrap lowers finite joins. Selfhost gives each Effect literal its exact
-  representation (D1): an `effect {}` block derives its channels from its body and runs as a direct
-  call of its own instance with its environment. It reports `effect-form` where a value of one
-  exact Effect representation meets a different type with the same channels: an `if` or `match`
-  joining two construction sites, or a declared `Effect<...>` result, binding or field. Contracts
-  that differ remain `TypeMismatch`.
+  representation (D1): an `effect {}` block takes its channels from a closed expected `Effect<...>`
+  (EFF-011) or else derives them from its body, and runs as a direct call of its own instance with
+  its environment. It reports `effect-form` where a value of one exact Effect representation meets
+  a different Effect type whose channels cover it: an `if` or `match` joining two construction
+  sites, or a declared `Effect<...>` result, binding or field (a block in such a position is first
+  checked against its channels). Channels that are not covered remain `TypeMismatch`. Run access and environment are not yet compared, so
+  a once-runnable or borrowing value stored as an unrestricted `Effect<...>` reports `effect-form`
+  rather than a mismatch.
 - **Evidence:** `effectLiteralsRunTheirInstanceWithTheirEnvironment` asserts the block and
-  anonymous `effect fn` runs, environment operands and failure edges; the native corpus reports
-  `effect-form` for the joining programs.
+  anonymous `effect fn` runs, environment operands and failure edges;
+  `effectBlockChannelsAreDerivedAndChecked` asserts derived and expected channels; the native corpus
+  reports `effect-form` for the joining programs.
 - **Owner:** #567 Step 9 (EFF-013 joins as a tagged representation with one runner per arm).
 
 ### Omitted Effect environments elaborated from inputs
