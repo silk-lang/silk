@@ -80,13 +80,17 @@ specialized to its argument's exact Effect. A named non-generic function used as
 capture-free exact callable; invoking it is a direct call, and running an invoked `effect fn` value
 calls the instance. `Intrinsic.catchFailure<S>` builds an exact composite Effect; its run expands in
 place (D4): the protected Effect fails into a temporary, a switch sends members of `S` to the
-handler and injects the rest into the residual failure. An `effect {}` block or anonymous
+handler and injects the rest into the residual failure. `finalizeEffect`, its NonParking variant
+and `useReleaseNonParking` expand the same way: both exits of the protected run (or of `use`, lent
+the owned resource) run the `() ! never` finalizer (or `release`, which drops the resource), and a
+held failure is raised afterwards. `Intrinsic.NonParking` bounds hold until the suspension stage,
+since reaching parking is itself the `suspension` gap (D6). An `effect {}` block or anonymous
 `effect fn` is an exact representation like an anonymous closure: its environment holds its
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
 `return`, `fail` and `run` sites (EFF-002, EFF-011); sites that differ from that join are checked
 again against it. Joining distinct Effect construction sites (EFF-013) reports `effect-form`.
-Requirement-row arguments, service operations and the other composition intrinsics remain the
+Requirement-row arguments, service operations and the binding intrinsics remain the
 `effect-form` and `effect-instance` gaps, and `effect fn main` the `entry-signature` gap; `Intrinsic.suspendEffect`
 and `Intrinsic.park` report `suspension`. The
 sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
