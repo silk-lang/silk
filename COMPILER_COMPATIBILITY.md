@@ -442,17 +442,27 @@ Each entry records:
   `genericSectionsSelectEvidenceSuppliedByAStage` and `genericSectionsStageOwnedCapturesWithOneCleanupOwner`
   cover staged blueprint selection, capture layout, argument appending and ownership.
 
-### Reached Effect literals in selfhost
+### Effect literal joins in selfhost
 
-- **Status:** deferred to #567 Step 9; named during the Step 8 corpus sweep on 2026-10-03.
-- **Rule:** Effect blocks and anonymous `effect fn` values retain their indexed EffectBlock
-  identity. Constructing their executable environments requires Effect lowering.
-- **Compilers:** bootstrap lowers these values. Selfhost reports `effect-instance` when runtime
-  typing reaches either literal, at the literal's span. It does not treat an anonymous effect
-  function as an ordinary closure when the value is stored without being invoked.
-- **Evidence:** `reachedEffectLiteralsKeepPreciseStepNineGap` checks both literal kinds and their
-  gap spans, alongside an ordinary closure that still lowers successfully.
-- **Owner:** #567 Step 9. Earlier unrelated gaps may still block an enclosing program first.
+- **Status:** deferred to #567 Step 9; Effect blocks and anonymous `effect fn` literals otherwise
+  lower since the Step 9 Effect-literal PR (2026-10-04).
+- **Rule:** [EFF-013](apps/docs/content/reference/effect-contracts.md#eff-013--compatible-effects-may-join-across-construction-sites)
+  lets Effects from different construction sites with one compatible contract join behind a finite
+  hidden variant, and a declared `Effect<...>` position may hold any of them.
+- **Compilers:** bootstrap lowers finite joins. Selfhost gives each Effect literal its exact
+  representation (D1): an `effect {}` block takes its channels from a closed expected `Effect<...>`
+  (EFF-011) or else derives them from its body, and runs as a direct call of its own instance with
+  its environment. It reports `effect-form` where a value of one exact Effect representation meets
+  a different Effect type whose channels cover it: an `if` or `match` joining two construction
+  sites, or a declared `Effect<...>` result, binding or field (a block in such a position is first
+  checked against its channels). Channels that are not covered remain `TypeMismatch`. Run access and environment are not yet compared, so
+  a once-runnable or borrowing value stored as an unrestricted `Effect<...>` reports `effect-form`
+  rather than a mismatch.
+- **Evidence:** `effectLiteralsRunTheirInstanceWithTheirEnvironment` asserts the block and
+  anonymous `effect fn` runs, environment operands and failure edges;
+  `effectBlockChannelsAreDerivedAndChecked` asserts derived and expected channels; the native corpus
+  reports `effect-form` for the joining programs.
+- **Owner:** #567 Step 9 (EFF-013 joins as a tagged representation with one runner per arm).
 
 ### Omitted Effect environments elaborated from inputs
 
