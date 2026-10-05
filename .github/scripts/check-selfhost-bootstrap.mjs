@@ -59,10 +59,10 @@ for (const commit of commits) {
   if (changed.length === 0 || isAncestor(commit, mainCommit)) continue
 
   const mainParent = otherParents.find((parent) => isAncestor(parent, mainCommit))
+  // A later base merge can move the fork point past an earlier legitimate main sync.
+  // Its bootstrap tree must still match its landed main parent exactly.
   const isCleanMainSync =
-    mainParent &&
-    isAncestor(forkPoint, firstParent) &&
-    !git('diff', '--name-only', mainParent, commit, '--', ...guardedPaths)
+    mainParent && !git('diff', '--name-only', mainParent, commit, '--', ...guardedPaths)
   const isCleanBaseSync = otherParents.some(
     (parent) =>
       isAncestor(parent, baseCommit) &&
