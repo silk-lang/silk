@@ -563,3 +563,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · The rebased Step 9 base stack did not type-check (`union` keyword local, missing call operands), so every focused check failed before reaching the new slice · Type-check the base head first (`node packages/cli/dist/bin.js check --manifest-path compiler/silk.toml` under the build slot) and keep base repairs in their own commit · selfhost Step 9 Effect literals
 
 - 2026-10-05 · A full-manifest source check was accidentally launched without the documented Node heap allowance and exhausted the default 4 GiB heap · Use the focused bootstrap check manifest with NODE_OPTIONS=--max-old-space-size=8192; rely on exact-head CI for the full compiler guard · selfhost Step 8
+
+- 2026-10-05 · A contextual repeated-family negative control demanded an abstract Body but expected the later opaque realization rejection · Demand the producer MIR, as existing opaque-return divergence controls do; retain Body demands for immediate contract and assignment diagnostics · selfhost Step 8
