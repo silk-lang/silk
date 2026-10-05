@@ -12,6 +12,7 @@ import * as ChildProcessSpawner from 'effect/unstable/process/ChildProcessSpawne
 export interface FormatterVerification {
   readonly repository: string
   readonly node: string
+  readonly bootstrap: string
   readonly gate: string
   readonly compiler: string
   readonly safetyLog: string
@@ -97,7 +98,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
     ChildProcess.make(
       self.node,
       [
-        'packages/cli/dist/bin.js',
+        self.bootstrap,
         'build',
         '--manifest-path',
         'compiler/silk.toml',
@@ -130,7 +131,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
     })
 })
 
-/** Resolves CI configuration from the compiler package directory, then runs verification. */
+/** Resolves CI configuration from the repository directory, then runs verification. */
 export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(function* (
   node: string,
 ): Effect.fn.Return<
@@ -139,12 +140,14 @@ export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(fu
   Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
   const path = yield* Path.Path
-  const repository = path.resolve('../..')
+  const repository = path.resolve('.')
   const temporary = yield* Config.String('RUNNER_TEMP')
   const compiler = yield* Config.String('SILKC')
+  const bootstrap = yield* Config.String('SILK_BOOTSTRAP')
   return yield* run({
     repository,
     node,
+    bootstrap,
     gate: path.join(
       repository,
       'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
