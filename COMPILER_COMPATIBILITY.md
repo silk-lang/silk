@@ -1156,3 +1156,35 @@ repeated invocation and capture-only drop glue.
   ABI changes through projected nominal arguments. Fixed field-embedded opaque recipes beyond
   those arguments require separate discovery before admission; they are not covered by this proof.
 - **Source migration:** none.
+
+### Native callable parameters in ordinary anonymous declarations
+
+- **Status:** ordinary anonymous headers now reify written callable parameters into exact hidden
+  representation slots after authored binders and elided lifetimes. A release compiler built from
+  this change preserves all 82 baseline PASS programs and reports 82 PASS, 0 FAIL, 311 Unsupported.
+  Seven focused native probes pass, including two distinct anonymous callbacks, mutable capture
+  invocation, borrowed callback lifetimes, and two-stage suffix order. Structured native assertions
+  and their Linux timings remain pending exact-head CI.
+- **Rule:** an anonymous invocation uses the existing CallableSchema blueprint and ordinary
+  Function application. Selected enclosing bindings remain free construction evidence; own
+  invocation representation and lifetime slots remain bound until use. Only lexical captures form
+  its environment. Staging stores that environment once, then appends supplied operands under their
+  original parameter ordinals. No function pointer, adapter, closure key, or new MIR variant is used.
+- **Ownership:** a raw Once or Mutable callable parameter retains the bootstrap SEM0081 role
+  when returned from an anonymous body. An outer authored F retains its authored owner and can be
+  forwarded. Elided invocation lifetimes accept caller evidence; a fixed Static contract rejects
+  unsuitable evidence with SEM0212 at the supplied operand. A matching signature whose retained
+  environment cannot outlive the promised one keeps this lifetime diagnostic; hidden plain-callable
+  representation inference does not rewrite it into a shape error. Authored generic inference keeps
+  its call-level diagnostic. Invocation-variance and Effect lifetime parity are separate lanes;
+  this correction does not change them. General borrow safety remains Step 14.
+- **Boundary:** eligible lifetime deferral is restricted to ordinary anonymous schemas. Named
+  quantified sections and deferred requirement rows retain their existing named gaps; broadening
+  them prematurely exposed 57 pre-existing diagnostics through Effect providers. Narrowing this
+  change restores the exact baseline PASS set and zero FAIL without translating diagnostics.
+- **Bootstrap lowering:** the focused positive probes pass bootstrap frontend analysis, but its
+  build-exe backend cannot resolve the anonymous higher-order targets (the two-stage case reaches
+  SEM0219). Native direct invocation deliberately implements the approved MIR design. These reduced
+  programs are structured controls rather than new corpus fixtures until the main-first bootstrap
+  build-exe boundary is repaired.
+- **Source migration:** none.
