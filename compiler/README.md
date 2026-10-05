@@ -185,9 +185,11 @@ For each bootstrap build, record the `selfhost` commit, the downloaded main comp
 run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified
 `silk-bootstrap` artifact using `.github/actions/download-bootstrap` and records its provenance in
 the job summary. Invoke its `silk.mjs` with Node 24; native builds also require LLVM. No workspace
-dependency install or TypeScript compiler build runs in the native job. A separate lightweight job
-checks and bundles the formatter/corpus verification harness; that harness uses the current
-checkout's authored corpus and live standard library, preserving the native compiler safety gates.
+dependency install, TypeScript compiler build, or verification packaging job runs on selfhost.
+Main also publishes `silk-selfhost-verification`; the download action fetches it from the same run
+as the compiler. The verifier reads `compiler/scripts/selfhost-track.json` from this checkout and
+checks its intrinsic catalog, authored corpus fixtures, and live formatted standard library,
+preserving the native compiler safety gates.
 
 For a local source bootstrap, the checkout supplies the TypeScript compiler and CLI sources in
 `packages/compiler` and `packages/cli`, the standard library in `packages/compiler/stdlib`, and the

@@ -12,7 +12,8 @@ export const backend: Backend.Id = LlvmBackend.LlvmBackend.id
 
 /**
  * The restricted object profile helpers are realized under: the build's code-generation facts with
- * no entry, runtime, libc, unwinding, or sanitizers.
+ * no entry, runtime, libc, unwinding, or sanitizers. Helpers are always optimized, whatever the
+ * program's mode, because every copy the program makes runs through them.
  */
 export const profileInput = (profile: CompilationProfile.Facts): CompilationProfile.Input => ({
   target: profile.target.id,
@@ -24,7 +25,7 @@ export const profileInput = (profile: CompilationProfile.Facts): CompilationProf
   libc: 'none',
   relocation: profile.relocation,
   codeModel: profile.codeModel,
-  optimization: profile.optimization,
+  optimization: 'speed',
   debug: profile.debug,
   unwind: 'none',
   sanitizers: [],
@@ -78,10 +79,9 @@ export const compile = Effect.fn('HelperSource.compile')(function* (
   const diagnostics = program.diagnostics
   if (diagnostics.length !== 0 || program.profile === undefined)
     return yield* invalid(diagnostics.map((entry) => `${entry.code}: ${entry.message}`).join('\n'))
-  const artifact = yield* Analysis.codegen(program, {
-    mode: profile.optimization === 'none' ? 'debug' : 'release',
-    support: true,
-  }).pipe(Effect.mapError((failure) => invalid(failure.message)))
-  yield* HelperCapability.verifyExports(providers, artifact.foreignExports, profile.target)
+  const artifact = yield* Analysis.codegen(program, { mode: 'release', support: true }).pipe(
+    Effect.mapError((failure) => invalid(failure.message)),
+  )
+  yield* HelperCapability.verifyExports(providers, artifact.foreignExports, profile)
   return { artifact: Backend.bitcodeArtifact(artifact), profile: program.profile }
 })

@@ -4,7 +4,6 @@ import { join } from 'node:path'
 import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
-import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
 import {
   parseBuildDiagnostic,
   parseUnsupported,
@@ -12,22 +11,6 @@ import {
   runCorpus,
   summarize,
 } from './runSelfhostCorpus.js'
-
-it('keeps the selfhost runtime-member list equal to the canonical intrinsic catalog', () => {
-  const source = readFileSync(
-    new URL('../src/semantic/IntrinsicCatalog.silk', import.meta.url),
-    'utf8',
-  )
-  const encoded = source.split('let members = b"').at(1)?.split('"').at(0)
-  assert.ok(encoded !== undefined)
-  assert.deepStrictEqual(
-    encoded.split('|').filter((name) => name.length > 0),
-    Intrinsic.inventory()
-      .filter((entry) => entry.phase !== 'StaticOnly')
-      .map((entry) => entry.operation.slice('Intrinsic.'.length))
-      .sort(),
-  )
-})
 
 const literal: CorpusProgram = {
   name: 'literal',
@@ -91,7 +74,7 @@ ${compiled}`,
 it('requires the full track in supplied materialized scenarios', () => {
   withStub(compiled, (silkc) => {
     assert.throws(
-      () => runCorpus(silkc, [literal]),
+      () => runCorpus(silkc, [literal], ['trivial-features', 'other']),
       /selfhost track names absent from corpus: trivial-features,/,
     )
   })

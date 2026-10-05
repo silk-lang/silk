@@ -5,16 +5,20 @@ const { build } = createRequire(new URL('../../packages/cli/package.json', impor
   'esbuild',
 )
 
-// This packages the CI harness only. It never builds the TypeScript bootstrap compiler.
+// Publish reusable verification tooling from main; consumer feature promises stay in its checkout.
 const repository = resolve('.')
 const result = await build({
   stdin: {
     contents: `
+      import { realpathSync } from 'node:fs'
+      import { pathToFileURL } from 'node:url'
       import * as Effect from 'effect/Effect'
       import * as NodeRuntime from '@effect/platform-node/NodeRuntime'
       import * as NodeServices from '@effect/platform-node/NodeServices'
       import * as Verification from '../../compiler/scripts/FormatterVerification.js'
-      NodeRuntime.runMain(Verification.runConfigured(process.execPath).pipe(Effect.provide(NodeServices.layer)))
+      export const runtimeIntrinsicNames = Verification.runtimeIntrinsicNames
+      if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)
+        NodeRuntime.runMain(Verification.runConfigured(process.execPath).pipe(Effect.provide(NodeServices.layer)))
     `,
     resolveDir: resolve('packages/compiler'),
     sourcefile: 'selfhost-verification.mjs',

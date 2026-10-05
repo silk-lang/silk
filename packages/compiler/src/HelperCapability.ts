@@ -95,6 +95,20 @@ const nativeTargets: ReadonlyArray<Target.Id> = [
   'aarch64-unknown-linux-gnu',
 ]
 
+/**
+ * A hosted native profile links the platform C library, which supplies every admitted memory
+ * helper; arithmetic comes from the platform math library. Only a profile without libc needs Silk
+ * source memory providers.
+ */
+const hosted = (profile: CompilationProfile.Facts): boolean =>
+  profile.libc !== 'none' && profile.target.kind === 'Native'
+
+/** The platform library root that supplies a hosted helper of `family`. */
+const platformRoot = (family: Family, profile: CompilationProfile.Facts): string => {
+  if (profile.target.operatingSystem === 'darwin') return 'libSystem'
+  return family === 'arithmetic' ? 'm' : 'c'
+}
+
 /** Normalizes precisely the Mach-O C symbol prefix, preserving every other byte. */
 export const symbolName = (target: Target.Target, name: string): string =>
   target.operatingSystem === 'darwin' && name.startsWith('_') ? name.slice(1) : name
@@ -112,7 +126,8 @@ const familyOf = (symbol: string): Family | undefined => {
   return undefined
 }
 
-const contractOf = (symbol: string, target: Target.Target): Contract | undefined => {
+const contractOf = (symbol: string, profile: CompilationProfile.Facts): Contract | undefined => {
+  const target = profile.target
   const family = familyOf(symbol)
   if (family === undefined || (!memory.includes(symbol) && !arithmetic.includes(symbol)))
     return undefined
@@ -141,7 +156,7 @@ const contractOf = (symbol: string, target: Target.Target): Contract | undefined
     result,
     linkage: 'external',
     visibility: 'default',
-    retention: family === 'memory' ? 'explicit-object' : 'platform-symbol',
+    retention: family === 'memory' && !hosted(profile) ? 'explicit-object' : 'platform-symbol',
     lto: 'unsupported',
     authority,
   }
@@ -158,17 +173,17 @@ export const policyIdentity = (profile: CompilationProfile.Facts): string => {
         (symbol !== 'bcmp' || profile.target.operatingSystem === 'linux') &&
         (symbol !== 'bzero' || profile.target.operatingSystem === 'darwin'),
     ),
-    ...(profile.libc !== 'none' && profile.target.kind === 'Native' ? arithmetic : []),
+    ...(hosted(profile) ? arithmetic : []),
   ]
   const entries: Array<string> = []
   for (const symbol of symbols) {
-    const contract = contractOf(symbol, profile.target)
+    const contract = contractOf(symbol, profile)
     if (contract === undefined) continue
     let kind: Provider['kind'] = 'source'
     let root = `silk.support.${symbol}`
-    if (contract.family === 'arithmetic') {
+    if (hosted(profile)) {
       kind = 'platform'
-      root = profile.target.operatingSystem === 'darwin' ? 'libSystem' : 'm'
+      root = platformRoot(contract.family, profile)
     } else if (profile.target.kind === 'WebAssembly') {
       kind = 'bootstrap'
       root = 'llvm-wasm-memory.v1'
@@ -201,7 +216,10 @@ export const policyIdentity = (profile: CompilationProfile.Facts): string => {
   )
 }
 
-/** Selects the initial permanent source/platform and explicit Wasm bootstrap providers. */
+/**
+ * Selects the platform C library on hosted native profiles, Silk source memory providers without
+ * libc, and the explicit Wasm bootstrap provider.
+ */
 export const provider = Effect.fn('HelperCapability.provider')(function* (
   symbol: string,
   profile: CompilationProfile.Facts,
@@ -210,7 +228,7 @@ export const provider = Effect.fn('HelperCapability.provider')(function* (
   if (family === undefined) return yield* error('UnexplainedSymbol', symbol, [profile.target.id])
   if (!memory.includes(symbol) && !arithmetic.includes(symbol))
     return yield* error('UnsupportedFamily', `${family}:${symbol}`, [profile.target.id])
-  if (family === 'arithmetic' && (profile.libc === 'none' || profile.target.kind !== 'Native'))
+  if (family === 'arithmetic' && !hosted(profile))
     return yield* error('MissingProvider', symbol, [profile.target.id, profile.libc])
   if (
     (symbol === 'bcmp' && profile.target.operatingSystem !== 'linux') ||
@@ -223,9 +241,9 @@ export const provider = Effect.fn('HelperCapability.provider')(function* (
   )
   let kind: Provider['kind'] = 'source'
   let root = `silk.support.${symbol}`
-  if (family === 'arithmetic') {
+  if (hosted(profile)) {
     kind = 'platform'
-    root = profile.target.operatingSystem === 'darwin' ? 'libSystem' : 'm'
+    root = platformRoot(family, profile)
   } else if (profile.target.kind === 'WebAssembly') {
     kind = 'bootstrap'
     root = 'llvm-wasm-memory.v1'
@@ -363,7 +381,7 @@ export const reconcile = Effect.fn('HelperCapability.reconcile')(function* (
           }),
       ),
     )
-    const contract = contractOf(symbol, profile.target)
+    const contract = contractOf(symbol, profile)
     if (contract === undefined) return yield* error('UnsupportedFamily', symbol, [object])
     requirements.push({
       contract,
@@ -409,7 +427,7 @@ export const reconcile = Effect.fn('HelperCapability.reconcile')(function* (
 export const verifyExports = Effect.fn('HelperCapability.verifyExports')(function* (
   providers: ReadonlyArray<Provider>,
   exports: ReadonlyArray<Backend.ForeignExport>,
-  target: Target.Target,
+  profile: CompilationProfile.Facts,
 ): Effect.fn.Return<void, HelperError> {
   const ids = providers.map((provider) => provider.id)
   const provides = providers.flatMap((provider) => provider.provides)
@@ -418,7 +436,7 @@ export const verifyExports = Effect.fn('HelperCapability.verifyExports')(functio
   const scalar = (type: string): string => (type.startsWith('pointer<') ? 'pointer' : type)
   for (const provider of providers)
     for (const symbol of provider.provides) {
-      const expected = contractOf(symbol, target)
+      const expected = contractOf(symbol, profile)
       const actual = exports.find((entry) => entry.symbol === symbol)
       if (
         expected === undefined ||
@@ -430,7 +448,7 @@ export const verifyExports = Effect.fn('HelperCapability.verifyExports')(functio
       )
         return yield* error('IncompatibleProvider', `C ABI mismatch: ${symbol}`, [
           provider.id,
-          target.id,
+          profile.target.id,
         ])
     }
 })

@@ -6,8 +6,16 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Stream from 'effect/Stream'
+import * as Schema from 'effect/Schema'
 import * as ChildProcess from 'effect/unstable/process/ChildProcess'
 import * as ChildProcessSpawner from 'effect/unstable/process/ChildProcessSpawner'
+import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
+
+/** Canonical runtime members checked against the consuming selfhost checkout. */
+export const runtimeIntrinsicNames = Intrinsic.inventory()
+  .filter((entry) => entry.phase !== 'StaticOnly')
+  .map((entry) => entry.operation.slice('Intrinsic.'.length))
+  .sort()
 
 export interface FormatterVerification {
   readonly repository: string
@@ -22,6 +30,7 @@ export class VerificationError extends Data.TaggedError('FormatterVerificationEr
   readonly message: string
   readonly operation: string
   readonly reason:
+    | { readonly _tag: 'InvalidInput' }
     | { readonly _tag: 'Exit'; readonly code: number }
     | { readonly _tag: 'WrappedFailure'; readonly cause: unknown }
 }> {}
@@ -64,6 +73,48 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
   })
   const fs = yield* FileSystem.FileSystem
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  // Feature promises belong to selfhost, not the publishing main revision.
+  const trackSource = yield* fs.readFileString(
+    `${self.repository}/compiler/scripts/selfhost-track.json`,
+  )
+  const track = yield* Schema.decodeEffect(
+    Schema.fromJsonString(Schema.NonEmptyArray(Schema.NonEmptyString)),
+  )(trackSource).pipe(
+    Effect.mapError(
+      (cause) =>
+        new VerificationError({
+          operation: 'read selfhost track',
+          message: 'Invalid selfhost corpus track',
+          reason: { _tag: 'WrappedFailure', cause },
+        }),
+    ),
+  )
+  if (new Set(track).size !== track.length)
+    return yield* new VerificationError({
+      operation: 'read selfhost track',
+      message: 'Duplicate selfhost corpus names',
+      reason: { _tag: 'InvalidInput' },
+    })
+  const catalog = yield* fs.readFileString(
+    `${self.repository}/compiler/src/semantic/IntrinsicCatalog.silk`,
+  )
+  const members = catalog
+    .split('let members = b"')
+    .at(1)
+    ?.split('"')
+    .at(0)
+    ?.split('|')
+    .filter((name) => name.length > 0)
+  if (
+    members === undefined ||
+    members.length !== runtimeIntrinsicNames.length ||
+    members.some((name, index) => name !== runtimeIntrinsicNames[index])
+  )
+    return yield* new VerificationError({
+      operation: 'verify intrinsic catalog',
+      message: 'Selfhost runtime members differ from the canonical intrinsic catalog',
+      reason: { _tag: 'InvalidInput' },
+    })
   const tracked = yield* capture(
     ChildProcess.make('git', ['ls-files', '-z', '--', '*.silk'], {
       cwd: self.repository,
@@ -115,7 +166,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
       reason: { _tag: 'Exit', code: rebuilt },
     })
   const result = yield* Effect.try({
-    try: () => runCorpus(self.compiler, nativeCorpus),
+    try: () => runCorpus(self.compiler, nativeCorpus, track),
     catch: (cause) =>
       new VerificationError({
         message: 'Native corpus execution failed',

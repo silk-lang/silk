@@ -39,6 +39,11 @@ Memory, arithmetic, atomics, stack probes, stack protection, sanitizers and unwi
 - **WHEN** an admitted GNU hosted object requires fmod or fmodf
 - **THEN** its plan includes the selected libc-compatible math provider and only its justified physical inputs
 
+#### Scenario: Hosted memory
+
+- **WHEN** an admitted hosted native object requires a memory helper
+- **THEN** the platform C library already selected for the link supplies it, and no source helper object is realized or linked
+
 #### Scenario: Unavailable family
 
 - **WHEN** an object or request needs an unimplemented family or a native libc provider under a no-libc/Wasm profile
@@ -46,12 +51,12 @@ Memory, arithmetic, atomics, stack probes, stack protection, sanitizers and unwi
 
 ### Requirement: Source support closures cannot recursively depend on themselves
 
-Source memory providers MUST compile through a restricted no-entry, no-runtime, no-libc object profile. Their selected exports MUST be retained explicitly. Their emitted dependencies MUST conform to their declared provider graph, and direct, transitive and legalization-induced cycles MUST fail with deterministic origin paths. Optimization restrictions MUST be specific to bootstrap recursion and MUST NOT replace post-object verification.
+Source memory providers MUST serve only native profiles without libc. They MUST compile through a restricted no-entry, no-runtime, no-libc object profile that is optimized whatever the program's optimization mode. Their selected exports MUST be retained explicitly. Their emitted dependencies MUST conform to their declared provider graph, and direct, transitive and legalization-induced cycles MUST fail with deterministic origin paths. Optimization restrictions MUST be specific to bootstrap recursion and MUST NOT replace post-object verification.
 
 #### Scenario: Freestanding source memory helper
 
-- **WHEN** the selected source memory routine is compiled in debug or optimized mode
-- **THEN** its actual object closes without unexplained libc/runtime references and retains the required C export
+- **WHEN** a debug or optimized program without libc selects a source memory routine
+- **THEN** the routine is compiled optimized, and its actual object closes without unexplained libc/runtime references and retains the required C export
 
 #### Scenario: Recursive provider graph
 
@@ -79,7 +84,7 @@ The final artifact plan MUST expose the selected support roots, contracts and ph
 
 ### Requirement: Conformance proves selected helper ABIs and preserves Wasm
 
-Required Darwin ARM64 and GNU x86-64/ARM64 lanes MUST produce actual target objects and independent C ABI fixtures, inspect debug/optimized helper inventories and execute the distinguishing cases on available runners. Missing supplies and skipped required cases MUST fail. The admitted LLVM-to-Wasm helper set MUST remain usable through an explicit target-compatible provider without native OS dependencies.
+Required Darwin ARM64 and GNU x86-64/ARM64 lanes MUST produce actual target objects and independent C ABI fixtures, account hosted helper requests to the platform C library, inspect the optimized no-libc helper inventories for debug and optimized programs, and execute the distinguishing cases on available runners. Missing supplies and skipped required cases MUST fail. The admitted LLVM-to-Wasm helper set MUST remain usable through an explicit target-compatible provider without native OS dependencies.
 
 #### Scenario: Required target lane
 
@@ -107,9 +112,9 @@ The compiler SHALL expose target-neutral `Intrinsic.pointerAddress<P>(pointer: P
 
 ### Requirement: Target-specific memory idioms
 
-LLVM-generated `bcmp` on GNU and `bzero` on Darwin SHALL select source providers with their exact C ABI. They SHALL remain unavailable on the Wasm bootstrap.
+LLVM-generated `bcmp` on GNU and `bzero` on Darwin SHALL select the platform C library on hosted profiles and source providers with their exact C ABI without libc. They SHALL remain unavailable on the Wasm bootstrap.
 
 #### Scenario: Optimized comparison and zero fill
 
 - **WHEN** optimized GNU equality introduces `bcmp`, or optimized Darwin zero fill introduces `bzero`
-- **THEN** the emitted dependency is resolved by the corresponding audited source provider.
+- **THEN** the emitted dependency is resolved by the platform C library on a hosted profile, or by the corresponding audited source provider without libc.
