@@ -993,8 +993,8 @@ union ResolvedTarget {
   Function {target: CallTarget},
   Constant {declaration: DeclarationId, ty: Shared<Type>},
   Intrinsic {member: IntrinsicMember, typeArguments: Vector<Shared<Type>>},
-  /// A sealed Effect composition intrinsic and its written selector.
-  Composition {operation: Composition, selector: Shared<Type>},
+  /// A sealed Effect composition intrinsic and its written type and row arguments.
+  Composition {operation: Composition, written: Vector<Argument>},
   Tuple {ty: Shared<Type>, elements: Vector<Shared<Type>>},
   Selected {fact: SelectionFact},
 }
@@ -21574,13 +21574,22 @@ effect fn typedIntrinsicTarget(
   return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
 }
 
-// A composition intrinsic's single written selector: the caught failure subset of `catchFailure`.
+// A composition intrinsic's written arguments: the caught failure subset of `catchFailure`, or the
+// optional `<A, E, ?R, ?S>` of a finalizer (preceded by `Resource` for `useReleaseNonParking`).
 effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, moduleOrdinal: usize, operation: Composition,
   generics: HirRef, scope: &[Binder], span: Span) -> Result<ResolvedTarget, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut arity = usize.ONE
+  if operation == Composition.Finalize || operation == Composition.FinalizeNonParking { arity = 4 }
+  if operation == Composition.UseRelease { arity = 5 }
+  let mut written = Vector.make<Argument>()
   if !generics.present {
-    return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, span, usize.ONE, usize.ZERO))
+    // Only a finalizer infers its arguments from its operands.
+    if operation == Composition.CatchFailure {
+      return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, span, usize.ONE, usize.ZERO))
+    }
+    return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Composition {operation: operation, written: move written})
   }
   let mut elision = LifetimeElision {
     owner: Option.none<DeclarationId>(), nextOrdinal: usize.ZERO, output: false,
@@ -21588,26 +21597,39 @@ effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Word, Ans
     nested: false, renumber: Vector.make<usize>(), staticEnvironment: false,
     supplied: Option.none<Vector<Argument>>(), assumptions: Option.none<Vector<Constraint>>(),
   }
-  let written = run typeNode(&mut resolver.*, module, generics.id)
-  if let Option<HeaderSyntax>.Some {value: found} = move written {
+  let syntax = run typeNode(&mut resolver.*, module, generics.id)
+  if let Option<HeaderSyntax>.Some {value: found} = move syntax {
     if let Node.TypeArguments {arguments: supplied, environment, failures, requirements} = found.header {
-      if supplied.length != usize.ONE {
-        return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, found.span, usize.ONE, supplied.length))
+      if supplied.length != arity {
+        return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, found.span, arity, supplied.length))
       }
       if environment.present || failures.present || requirements.present {
         return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span))
       }
-      let child = run typeChild(&mut resolver.*, module, supplied, usize.ZERO)
-      let argument = match move child {
-        Option<HirId>.Some {value} => value
-        Option<HirId>.None => { return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span)) }
+      let mut at = usize.ZERO
+      while at < arity {
+        let child = run typeChild(&mut resolver.*, module, supplied, at)
+        let argument = match move child {
+          Option<HirId>.Some {value} => value
+          Option<HirId>.None => { return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span)) }
+        }
+        // A finalizer's last two arguments are the protected and finalizer requirement rows.
+        if operation != Composition.CatchFailure && at + 2 >= arity {
+          let mut row = Row.empty()
+          let failed = run rowArgument(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, argument,
+            b"", scope, &mut elision, false, &mut row)
+          if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<ResolvedTarget, Shared<Rejection>>(move value) }
+          run Vector.append<Argument>(&mut written, Argument.Row {value: run Shared.make<Row>(move row)})
+        } else {
+          let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, argument, scope, &mut elision)
+          match move resolved {
+            Result<Shared<Type>, Shared<Rejection>>.Success {value} => { run Vector.append<Argument>(&mut written, Argument.Type {value: move value}) }
+            Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<ResolvedTarget, Shared<Rejection>>(move error) }
+          }
+        }
+        at = at + usize.ONE
       }
-      let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, argument, scope, &mut elision)
-      return match move resolved {
-        Result<Shared<Type>, Shared<Rejection>>.Success {value: selected} =>
-          Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Composition {operation: operation, selector: move selected})
-        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => Result.failResult<ResolvedTarget, Shared<Rejection>>(move error)
-      }
+      return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Composition {operation: operation, written: move written})
     }
   }
   return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
@@ -21891,9 +21913,14 @@ effect fn intrinsicCallTarget(
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   // Composition intrinsics build exact Effects that a run site expands (Effect note D4).
-  if same(member, b"catchFailure") {
+  let mut composition = Option.none<Composition>()
+  if same(member, b"catchFailure") { composition = Option.some<Composition>(Composition.CatchFailure) }
+  if same(member, b"finalizeEffect") { composition = Option.some<Composition>(Composition.Finalize) }
+  if same(member, b"finalizeEffectNonParking") { composition = Option.some<Composition>(Composition.FinalizeNonParking) }
+  if same(member, b"useReleaseNonParking") { composition = Option.some<Composition>(Composition.UseRelease) }
+  if let Option<Composition>.Some {value: operation} = move composition {
     return run compositionTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal,
-      Composition.CatchFailure, syntax.generics, scope, span)
+      operation, syntax.generics, scope, span)
   }
   return match move intrinsicLookup(member) {
     Option<IntrinsicMember>.Some {value} => {
@@ -22708,7 +22735,8 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
     },
     }
     ResolvedTarget.Tuple {ty, elements} => run copyTupleTarget(&ty, &elements)
-    ResolvedTarget.Composition {operation, selector} => ResolvedTarget.Composition {operation: operation, selector: Shared.clone<Type>(&selector)}
+    ResolvedTarget.Composition {operation, written} => ResolvedTarget.Composition {operation: operation,
+      written: run copyArguments(Vector.asSlice<Argument>(&written))}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {
       declaration: run DeclarationId.copy(&declaration),
       ty: Shared.clone<Type>(&ty),
@@ -29935,22 +29963,171 @@ effect fn appendMembers(output: &mut Vector<Shared<Type>>, value: &Shared<Type>)
   return ()
 }
 
+effect fn channelRejection(resolver: &Resolver, module: &ModuleId, code: RejectionCode, span: Span)
+-> Result<EffectChannels, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  return Result.failResult<EffectChannels, Shared<Rejection>>(run reject(resolver, module, code, span))
+}
+
+fn unitShape(value: &Type) -> bool {
+  return match &value.* { Type.Unit => true _ => false }
+}
+
+// The channels of the Effect a callable returns when it is lent `&mut resource`.
+effect fn lentChannels(callable: &Shared<Type>, resource: &Shared<Type>, constraints: &[Constraint]) -> Option<EffectChannels>
+! OutOfMemoryError ? &mut Allocator {
+  let contract = match move run valueCallableContract(callable, constraints) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Option.none<EffectChannels>() }
+  }
+  let shape = run Type.copy(&contract)
+  if let Type.Callable {parameters, result, ..} = move shape {
+    let accepted = Vector.asSlice<Shared<Type>>(&parameters)
+    if accepted.length != usize.ONE { return Option.none<EffectChannels>() }
+    let lent = run Type.copy(&accepted[usize.ZERO])
+    // The loan is quantified per invocation (`for<'scope>`), never a fixed or caller region.
+    if let Type.Reference {referent, access, lifetime} = move lent {
+      let quantified = Shared.with<Lifetime, bool>(&lifetime, fn(value: &Lifetime) -> bool {
+        return match &value.* { Lifetime.Invocation {..} => true _ => false }
+      })
+      if access == Access.Mutable && quantified && run Type.equalsShared(&referent, resource) { return Shared.with<Type, Option<EffectChannels>>(&result, effectChannels) }
+    }
+  }
+  return Option.none<EffectChannels>()
+}
+
+// The channels of a finalizer composition: the protected Effect's success and failure, and both
+// requirement rows. The finalizer is `() ! never`; written arguments, when present, name exactly
+// `[Resource,] A, E, R, S` (D4).
+effect fn finalizedChannels(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
+  operation: Composition, operands: &[Shared<Type>], written: &[Argument], constraints: &[Constraint], span: Span)
+-> Result<EffectChannels, Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let lends = operation == Composition.UseRelease
+  let mut protectedAt = usize.ZERO
+  if lends { protectedAt = usize.ONE }
+  let finalizerAt = protectedAt + usize.ONE
+  let protectedSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, protectedAt))
+  let finalizerSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, finalizerAt))
+  let mut protected = Option.none<EffectChannels>()
+  let mut finalizer = Option.none<EffectChannels>()
+  let mut code = RejectionCode.RunNonEffect
+  if lends {
+    protected = run lentChannels(&operands[protectedAt], &operands[usize.ZERO], constraints)
+    finalizer = run lentChannels(&operands[finalizerAt], &operands[usize.ZERO], constraints)
+    code = RejectionCode.TypeMismatch
+  } else {
+    protected = run runnableChannels(&operands[protectedAt], constraints)
+    finalizer = run runnableChannels(&operands[finalizerAt], constraints)
+  }
+  let kept = match move protected {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, code, protectedSpan) }
+  }
+  let cleanup = match move finalizer {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, code, finalizerSpan) }
+  }
+  if !Shared.with<Type, bool>(&cleanup.success, unitShape) || !Shared.with<Type, bool>(&cleanup.failure, neverType) {
+    return run channelRejection(resolver, module, RejectionCode.TypeMismatch, finalizerSpan)
+  }
+  if written.length != usize.ZERO {
+    let mut derived = Vector.make<Argument>()
+    if lends { run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&operands[usize.ZERO])}) }
+    run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&kept.success)})
+    run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&kept.failure)})
+    run Vector.append<Argument>(&mut derived, Argument.Row {value: Shared.clone<Row>(&kept.requirements)})
+    run Vector.append<Argument>(&mut derived, Argument.Row {value: Shared.clone<Row>(&cleanup.requirements)})
+    if !sameArguments(written, Vector.asSlice<Argument>(&derived)) {
+      return run channelRejection(resolver, module, RejectionCode.TypeMismatch, span)
+    }
+  }
+  let mut requirements = Row.empty()
+  run Row.merge(&mut requirements, &kept.requirements)
+  run Row.merge(&mut requirements, &cleanup.requirements)
+  return Result.succeed<EffectChannels, Shared<Rejection>>(EffectChannels {success: move kept.success, failure: move kept.failure,
+    requirements: run Shared.make<Row>(move requirements)})
+}
+
+effect fn compositionChannels(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
+  operation: Composition, operands: &[Shared<Type>], written: &[Argument], selector: &Shared<Type>, constraints: &[Constraint],
+  span: Span) -> Result<EffectChannels, Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if operation == Composition.CatchFailure {
+    return run caughtChannels(resolver, module, cursor, arguments, operands, selector, constraints)
+  }
+  return run finalizedChannels(resolver, module, cursor, arguments, operation, operands, written, constraints, span)
+}
+
+// The channels of `catchFailure<S>`: the protected or handler success, the residual and handler
+// failures, and both requirement rows.
+effect fn caughtChannels(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
+  operands: &[Shared<Type>], selector: &Shared<Type>, constraints: &[Constraint]) -> Result<EffectChannels, Shared<Rejection>>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let protectedSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO))
+  let handlerSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ONE))
+  let protected = match move run runnableChannels(&operands[usize.ZERO], constraints) {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, RejectionCode.RunNonEffect, protectedSpan) }
+  }
+  // The handler is invoked with one selected failure and returns the Effect that recovers it.
+  let handlerContract = match move run valueCallableContract(&operands[usize.ONE], constraints) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return run channelRejection(resolver, module, RejectionCode.InvalidEffectHandler, handlerSpan) }
+  }
+  let handlerParts = run Type.copy(&handlerContract)
+  let mut recovered = Option.none<EffectChannels>()
+  let mut accepts = false
+  if let Type.Callable {parameters, result, ..} = move handlerParts {
+    let accepted = Vector.asSlice<Shared<Type>>(&parameters)
+    if accepted.length == usize.ONE { accepts = run Type.equalsShared(&accepted[usize.ZERO], selector) }
+    recovered = Shared.with<Type, Option<EffectChannels>>(&result, effectChannels)
+  }
+  let recovery = match move recovered {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, RejectionCode.InvalidEffectHandler, handlerSpan) }
+  }
+  // `S` must be a nonempty subset of the protected failure members (FAIL-005).
+  let selected = run failureMembers(selector)
+  if !accepts || Vector.length<Shared<Type>>(&selected) == usize.ZERO || !run Type.coversFailure(&protected.failure, selector) {
+    return run channelRejection(resolver, module, RejectionCode.InvalidEffectHandler, handlerSpan)
+  }
+  let mut residual = Vector.make<Shared<Type>>()
+  let caught = run failureMembers(&protected.failure)
+  let listed = Vector.asSlice<Shared<Type>>(&caught)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if !run Type.coversFailure(selector, &listed[at]) { run Vector.append<Shared<Type>>(&mut residual, Shared.clone<Type>(&listed[at])) }
+    at = at + usize.ONE
+  }
+  run appendMembers(&mut residual, &recovery.failure)
+  let mut successes = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut successes, Shared.clone<Type>(&protected.success))
+  run Vector.append<Shared<Type>>(&mut successes, Shared.clone<Type>(&recovery.success))
+  let mut requirements = Row.empty()
+  run Row.merge(&mut requirements, &protected.requirements)
+  run Row.merge(&mut requirements, &recovery.requirements)
+  return Result.succeed<EffectChannels, Shared<Rejection>>(EffectChannels {success: run joinedType(move successes),
+    failure: run joinedType(move residual), requirements: run Shared.make<Row>(move requirements)})
+}
+
 // `Intrinsic.catchFailure<S>(protected, handler)` builds the exact Effect that runs `protected`
 // and recovers its failures in `S` through `handler`; other failures stay residual (FAIL-005, D4).
+// A finalizer composition keeps the protected outcome and runs a `() ! never` finalizer on every
+// exit; `useReleaseNonParking(resource, use, release)` lends the owned resource to both callables.
 effect fn checkComposition<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut Vector<BodyNode>,
   signatures: &mut Vector<SignatureDependency>, requiredBodies: &mut Vector<DeclarationId>, expression: HirId,
-  span: Span, operation: Composition, selector: Shared<Type>, arguments: CallArguments, expected: &Option<Shared<Type>>,
+  span: Span, operation: Composition, written: Vector<Argument>, arguments: CallArguments, expected: &Option<Shared<Type>>,
   constraints: &[Constraint], contractBody: bool, unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  if CallArguments.length(arguments) != 2 { return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span) }
+  let mut count = usize.ONE + usize.ONE
+  if operation == Composition.UseRelease { count = count + usize.ONE }
+  if CallArguments.length(arguments) != count { return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span) }
   let mut parts = Vector.make<BodyNodeId>()
   let mut types = Vector.make<Shared<Type>>()
   let mut at = usize.ZERO
-  while at < 2 {
+  while at < count {
     let argument = run bodyArgument(&resolver.source, cursor, arguments, at)
     let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
       caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, argument,
@@ -29986,53 +30163,22 @@ effect fn checkComposition<'scope>(
     run Vector.append<Shared<Type>>(&mut types, move ty)
     at = at + usize.ONE
   }
-  let protectedSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO))
-  let handlerSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ONE))
   let operands = Vector.asSlice<Shared<Type>>(&types)
-  let protected = match move run runnableChannels(&operands[usize.ZERO], constraints) {
-    Option<EffectChannels>.Some {value} => value
-    Option<EffectChannels>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.RunNonEffect, protectedSpan) }
+  // A finalizer composition selects no failure: its selector is `never`.
+  let mut selector = run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+  let listed = Vector.asSlice<Argument>(&written)
+  if operation == Composition.CatchFailure {
+    if let Argument.Type {value} = &listed[usize.ZERO] { selector = Shared.clone<Type>(&value) }
   }
-  // The handler is invoked with one selected failure and returns the Effect that recovers it.
-  let handlerContract = match move run valueCallableContract(&operands[usize.ONE], constraints) {
-    Option<Shared<Type>>.Some {value} => value
-    Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.InvalidEffectHandler, handlerSpan) }
+  let composed = run compositionChannels(&resolver.*, module, cursor, arguments, operation, operands, listed, &selector,
+    constraints, span)
+  let channels = match move composed {
+    Result<EffectChannels, Shared<Rejection>>.Success {value} => value
+    Result<EffectChannels, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
   }
-  let handlerParts = run Type.copy(&handlerContract)
-  let mut recovered = Option.none<EffectChannels>()
-  let mut accepts = false
-  if let Type.Callable {parameters, result, ..} = move handlerParts {
-    let accepted = Vector.asSlice<Shared<Type>>(&parameters)
-    if accepted.length == usize.ONE { accepts = run Type.equalsShared(&accepted[usize.ZERO], &selector) }
-    recovered = Shared.with<Type, Option<EffectChannels>>(&result, effectChannels)
-  }
-  let recovery = match move recovered {
-    Option<EffectChannels>.Some {value} => value
-    Option<EffectChannels>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.InvalidEffectHandler, handlerSpan) }
-  }
-  // `S` must be a nonempty subset of the protected failure members (FAIL-005).
-  let selected = run failureMembers(&selector)
-  if !accepts || Vector.length<Shared<Type>>(&selected) == usize.ZERO || !run Type.coversFailure(&protected.failure, &selector) {
-    return run bodyRejection(&resolver.*, module, RejectionCode.InvalidEffectHandler, handlerSpan)
-  }
-  let mut residual = Vector.make<Shared<Type>>()
-  let caught = run failureMembers(&protected.failure)
-  let listed = Vector.asSlice<Shared<Type>>(&caught)
-  at = usize.ZERO
-  while at < listed.length {
-    if !run Type.coversFailure(&selector, &listed[at]) { run Vector.append<Shared<Type>>(&mut residual, Shared.clone<Type>(&listed[at])) }
-    at = at + usize.ONE
-  }
-  run appendMembers(&mut residual, &recovery.failure)
-  let mut successes = Vector.make<Shared<Type>>()
-  run Vector.append<Shared<Type>>(&mut successes, Shared.clone<Type>(&protected.success))
-  run Vector.append<Shared<Type>>(&mut successes, Shared.clone<Type>(&recovery.success))
-  let mut requirements = Row.empty()
-  run Row.merge(&mut requirements, &protected.requirements)
-  run Row.merge(&mut requirements, &recovery.requirements)
   let mut regions = Vector.make<Shared<Lifetime>>()
   at = usize.ZERO
-  while at < 2 {
+  while at < count {
     if !run captureRetainedRegions(&operands[at], caller, expression.index, constraints, &mut regions) {
       return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
     }
@@ -30040,14 +30186,16 @@ effect fn checkComposition<'scope>(
   }
   let contract = run Shared.make<Type>(Type.Effect {mode: CallableMode.Once,
     environment: run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions))),
-    success: run joinedType(move successes), failure: run joinedType(move residual),
-    requirements: run Shared.make<Row>(move requirements)})
+    success: move channels.success, failure: move channels.failure, requirements: move channels.requirements})
   let ty = run Shared.make<Type>(Type.EffectComposite {operation: operation, selector: move selector, parts: move types,
     contract: move contract})
   let ordered = Vector.asSlice<BodyNodeId>(&parts)
   let mut fields = Vector.make<BodyAggregateField>()
-  run Vector.append<BodyAggregateField>(&mut fields, BodyAggregateField {index: usize.ZERO, value: ordered[usize.ZERO]})
-  run Vector.append<BodyAggregateField>(&mut fields, BodyAggregateField {index: usize.ONE, value: ordered[usize.ONE]})
+  at = usize.ZERO
+  while at < count {
+    run Vector.append<BodyAggregateField>(&mut fields, BodyAggregateField {index: at, value: ordered[at]})
+    at = at + usize.ONE
+  }
   return run finishExpression(&mut resolver.*, module, &mut nodes.*, expression, span, move ty,
     BodyExpression.Aggregate {fields: move fields}, false, expected, contractBody, false)
 }
@@ -32451,11 +32599,11 @@ effect fn checkInvocation<'scope>(
     ResolvedTarget.Constant {..} => {
       return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
     }
-    ResolvedTarget.Composition {operation, selector} => {
+    ResolvedTarget.Composition {operation, written} => {
       if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
       return run checkComposition(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
         caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, expression, span,
-        operation, move selector, arguments, expected, constraints, contractBody, unsafeAllowed)
+        operation, move written, arguments, expected, constraints, contractBody, unsafeAllowed)
     }
     ResolvedTarget.Selected {..} => {
       return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
@@ -41120,7 +41268,6 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, ty: &Shared<Type>,
   origin: BodyOrigin, steps: &mut Vector<MirRunPlan>) -> Result<usize, GapCode>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  let none = Vector.make<Constraint>()
   let channels = match move Shared.with<Type, Option<EffectChannels>>(ty, effectChannels) {
     Option<EffectChannels>.Some {value} => value
     Option<EffectChannels>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
@@ -41128,8 +41275,39 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   let shape = run Type.copy(ty)
   match move shape {
     Type.EffectComposite {operation, selector, parts, ..} => {
-      if operation != Composition.CatchFailure { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
       let stored = Vector.asSlice<Shared<Type>>(&parts)
+      if operation == Composition.UseRelease {
+        // Both callables receive a fresh exclusive loan of the owned resource (D4).
+        let lent = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(&stored[usize.ZERO]), access: Access.Mutable,
+          lifetime: run Shared.make<Lifetime>(Lifetime.Local {
+            declaration: run DeclarationId.copy(Application.bodyDeclaration(caller)), ordinal: origin.syntax.index})})
+        let use = match move run invokedTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
+          projections, identity, &stored[usize.ONE], &lent, origin) {
+          Result<InvokedTarget, GapCode>.Success {value} => value
+          Result<InvokedTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        let release = match move run invokedTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+          callerBindings, projections, identity, &stored[2], &lent, origin) {
+          Result<InvokedTarget, GapCode>.Success {value} => value
+          Result<InvokedTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        // Both callables are invoked on every path; a loaned invocation would leave an owning one undropped.
+        if (use.mode != CallableMode.Once && run ownsCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ONE], origin))
+          || (release.mode != CallableMode.Once && run ownsCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[2], origin)) {
+          return Result.failResult<usize, GapCode>(GapCode.Cleanup)
+        }
+        let resourceDrop = match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ZERO], origin) {
+          Result<Option<Shared<Type>>, GapCode>.Success {value} => value
+          Result<Option<Shared<Type>>, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.UseRelease {lent: move lent, use: move use.target,
+          useSuccess: move use.channels.success, useFailure: move use.channels.failure, release: move release.target,
+          releaseSuccess: move release.channels.success, releaseFailure: move release.channels.failure, resourceDrop: move resourceDrop})
+        return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
+      }
+      if operation != Composition.CatchFailure && operation != Composition.Finalize && operation != Composition.FinalizeNonParking {
+        return Result.failResult<usize, GapCode>(GapCode.EffectForm)
+      }
       let inner = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
         projections, identity, &stored[usize.ZERO], origin, &mut steps.*) {
         Result<usize, GapCode>.Success {value} => value
@@ -41139,51 +41317,46 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
         Option<EffectChannels>.Some {value} => value
         Option<EffectChannels>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
       }
-      let contract = match move run valueCallableContract(&stored[usize.ONE], Vector.asSlice<Constraint>(&none)) {
-        Option<Shared<Type>>.Some {value} => value
-        Option<Shared<Type>>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
+      if operation != Composition.CatchFailure {
+        // The finalizer is itself an exact Effect; NonParking is a compile-time bound only (D4).
+        let finalizer = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+          callerBindings, projections, identity, &stored[usize.ONE], origin, &mut steps.*) {
+          Result<usize, GapCode>.Success {value} => value
+          Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        let cleanup = match move Shared.with<Type, Option<EffectChannels>>(&stored[usize.ONE], effectChannels) {
+          Option<EffectChannels>.Some {value} => value
+          Option<EffectChannels>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
+        }
+        run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.Finalize {inner: inner, innerFailure: move protected.failure,
+          finalizer: finalizer, finalizerSuccess: move cleanup.success})
+        return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
       }
-      let invoked = match move Shared.with<Type, Option<Shared<Type>>>(&contract, callableResult) {
-        Option<Shared<Type>>.Some {value} => value
-        Option<Shared<Type>>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
-      }
-      let recovery = match move Shared.with<Type, Option<EffectChannels>>(&invoked, effectChannels) {
-        Option<EffectChannels>.Some {value} => value
-        Option<EffectChannels>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
-      }
-      let mut written = Vector.make<Shared<Type>>()
-      run Vector.append<Shared<Type>>(&mut written, Shared.clone<Type>(&selector))
-      let inputs = CallableCallInputs {receiver: Shared.clone<Type>(&stored[usize.ONE]), inference: Shared.clone<DeclarationId>(identity),
-        bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()),
-        mode: Shared.with<Type, CallableMode>(&contract, callableInvocationMode), callee: node,
-        result: Shared.clone<Type>(&recovery.success), count: usize.ONE, origin: origin}
-      let handler = match move run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
-        callerBindings, projections, move inputs, Vector.asSlice<Shared<Type>>(&written)) {
-        Result<MirCallTarget, GapCode>.Success {value} => value
-        Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+      let handler = match move run invokedTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+        callerBindings, projections, identity, &stored[usize.ONE], &selector, origin) {
+        Result<InvokedTarget, GapCode>.Success {value} => value
+        Result<InvokedTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
       // Only the selected path consumes the handler; every other exit drops an owning one.
-      let mut visiting = Vector.make<Shared<Type>>()
-      let handlerFree = match move run cleanupFree(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ONE],
-        &mut visiting, origin.span) {
-        Result<bool, Shared<Rejection>>.Success {value} => value
-        Result<bool, Shared<Rejection>>.Failure {..} => { return Result.failResult<usize, GapCode>(GapCode.Cleanup) }
+      let handlerDrop = match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ONE], origin) {
+        Result<Option<Shared<Type>>, GapCode>.Success {value} => value
+        Result<Option<Shared<Type>>, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
-      let mut handlerDrop = Option.none<Shared<Type>>()
-      if !handlerFree {
-        if Shared.with<Type, CallableMode>(&contract, callableInvocationMode) != CallableMode.Once {
-          return Result.failResult<usize, GapCode>(GapCode.Cleanup)
-        }
-        handlerDrop = Option.some<Shared<Type>>(Shared.clone<Type>(&stored[usize.ONE]))
+      if let Option<Shared<Type>>.Some {..} = &handlerDrop {
+        if handler.mode != CallableMode.Once { return Result.failResult<usize, GapCode>(GapCode.Cleanup) }
       }
       run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.Catch {selector: move selector, inner: inner,
-        innerFailure: move protected.failure, handler: move handler, handlerSuccess: move recovery.success,
-        handlerFailure: move recovery.failure, handlerDrop: move handlerDrop})
+        innerFailure: move protected.failure, handler: move handler.target, handlerSuccess: move handler.channels.success,
+        handlerFailure: move handler.channels.failure, handlerDrop: move handlerDrop})
     }
     Type.CallableValue {contract, ..} => {
+      let mode = Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
+      // A stored part runs once per exit; a loaned run never consumes, so nothing would drop it.
+      if mode != CallableMode.Once {
+        if run ownsCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, origin) { return Result.failResult<usize, GapCode>(GapCode.Cleanup) }
+      }
       let inputs = CallableCallInputs {receiver: Shared.clone<Type>(ty), inference: Shared.clone<DeclarationId>(identity),
-        bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()),
-        mode: Shared.with<Type, CallableMode>(&contract, callableInvocationMode), callee: node,
+        bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()), mode: mode, callee: node,
         result: Shared.clone<Type>(&channels.success), count: usize.ZERO, origin: origin}
       let written = Vector.make<Shared<Type>>()
       let target = match move run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
@@ -41197,6 +41370,68 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
     _ => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
   }
   return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
+}
+
+// A stored callable invoked with one argument, and the channels of the Effect its invocation runs.
+struct InvokedTarget {
+  target: MirCallTarget
+  channels: EffectChannels
+  mode: CallableMode
+}
+
+effect fn invokedTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, caller: &Application,
+  callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, callable: &Shared<Type>,
+  argument: &Shared<Type>, origin: BodyOrigin) -> Result<InvokedTarget, GapCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let none = Vector.make<Constraint>()
+  let contract = match move run valueCallableContract(callable, Vector.asSlice<Constraint>(&none)) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Result.failResult<InvokedTarget, GapCode>(GapCode.EffectForm) }
+  }
+  let invoked = match move Shared.with<Type, Option<Shared<Type>>>(&contract, callableResult) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Result.failResult<InvokedTarget, GapCode>(GapCode.EffectForm) }
+  }
+  let channels = match move Shared.with<Type, Option<EffectChannels>>(&invoked, effectChannels) {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return Result.failResult<InvokedTarget, GapCode>(GapCode.EffectForm) }
+  }
+  let mode = Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
+  let mut written = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut written, Shared.clone<Type>(argument))
+  let inputs = CallableCallInputs {receiver: Shared.clone<Type>(callable), inference: Shared.clone<DeclarationId>(identity),
+    bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()), mode: mode, callee: node,
+    result: Shared.clone<Type>(&channels.success), count: usize.ONE, origin: origin}
+  return match move run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+    callerBindings, projections, move inputs, Vector.asSlice<Shared<Type>>(&written)) {
+    Result<MirCallTarget, GapCode>.Success {value} => Result.succeed<InvokedTarget, GapCode>(InvokedTarget {target: move value,
+      channels: move channels, mode: mode})
+    Result<MirCallTarget, GapCode>.Failure {error} => Result.failResult<InvokedTarget, GapCode>(error)
+  }
+}
+
+// Whether a stored part owns cleanup; an unanswerable verdict is treated as owning.
+effect fn ownsCleanup(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, part: &Shared<Type>, origin: BodyOrigin) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  return match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, part, origin) {
+    Result<Option<Shared<Type>>, GapCode>.Success {value: Option<Shared<Type>>.None} => false
+    _ => true
+  }
+}
+
+// A stored part's type when an exit that does not consume it must drop it.
+effect fn ownedCleanup(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, part: &Shared<Type>, origin: BodyOrigin) -> Result<Option<Shared<Type>>, GapCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut visiting = Vector.make<Shared<Type>>()
+  let free = match move run cleanupFree(&mut resolver.*, &mut owner.*, &mut dependencies.*, part, &mut visiting, origin.span) {
+    Result<bool, Shared<Rejection>>.Success {value} => value
+    Result<bool, Shared<Rejection>>.Failure {..} => { return Result.failResult<Option<Shared<Type>>, GapCode>(GapCode.Cleanup) }
+  }
+  if free { return Result.succeed<Option<Shared<Type>>, GapCode>(Option.none<Shared<Type>>()) }
+  return Result.succeed<Option<Shared<Type>>, GapCode>(Option.some<Shared<Type>>(Shared.clone<Type>(part)))
 }
 
 fn callableResult(value: &Type) -> Option<Shared<Type>> {
@@ -47849,6 +48084,11 @@ effect fn proveAppliedBounds(
       premise = premise + usize.ONE
     }
     if assumed { at = at + usize.ONE continue }
+    // NonParking is a transitive suspension summary. Before the suspension stage, reaching parking
+    // is itself the `suspension` gap at that site, so every caller already fails through it (D6).
+    if let Constraint.Property {property, ..} = &bounds[at] {
+      if property == IntrinsicProperty.NonParking { at = at + usize.ONE continue }
+    }
     if let Constraint.Copyable {subject} = &bounds[at] {
       let copied = run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, assumptions, span)
       match move copied {
