@@ -31,7 +31,7 @@ option-result-combinators, owner-typed-direct-section, relayed-section,
 staged-callable-bindings, staged-callable-parameter and staged-callable-section.
 
 This pin layer adds these eight previously verified PASS programs to both
-`compiler/scripts/selfhostTrack.ts` and the B11 list in `.github/workflows/selfhost.yml`:
+`compiler/scripts/selfhost-track.json` and the B11 list in `.github/workflows/selfhost.yml`:
 
 | Program                                | Coverage                                                |
 | -------------------------------------- | ------------------------------------------------------- |

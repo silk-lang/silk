@@ -34,6 +34,13 @@ commands, receives the shared artifact name. Other repository CI failures remain
 not block distributing that tested compiler. Selection uses the workflow run ID, so a
 late upload or rerun of an older commit cannot replace a newer compiler. Artifacts are retained
 for 90 days; expired pins fail with an explicit error. The selfhost M1 CI lane uses this action.
+Main also publishes `silk-selfhost-verification` from the same checked run. The download action's
+`verification: 'true'` input fetches this standalone Node 24 harness and returns `verification-path`.
+It verifies the consuming checkout's formatter, intrinsic catalog, and corpus against
+`compiler/scripts/selfhost-track.json`, then rebuilds using `SILK_BOOTSTRAP`. Set `SILKC` to the
+native compiler and `RUNNER_TEMP` to the log directory. Selfhost needs no dependency install or
+verification packaging job.
+
 The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
 repositories can pass a `token` with Actions read access to `julia-script/silk`; their own
 `GITHUB_TOKEN` may not have access to that repository.

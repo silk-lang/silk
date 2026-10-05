@@ -3,13 +3,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
-import { fileURLToPath, pathToFileURL } from 'node:url'
-import {
-  nativeCorpus,
-  type CorpusProgram,
-  type NativeRun,
-} from '../../packages/compiler/test/support/corpus.js'
-import { selfhostTrack } from './selfhostTrack.js'
+import { fileURLToPath } from 'node:url'
+import type { CorpusProgram, NativeRun } from '../../packages/compiler/test/support/corpus.js'
 
 export interface Gap {
   readonly code: string
@@ -333,16 +328,18 @@ export const summarize = (
 }
 
 /** Runs already-materialized scenarios against the requested compiler and its live standard library. */
-export const runCorpus = (silkc: string, corpus: ReadonlyArray<CorpusProgram>): number => {
-  const selected = process.env.SILK_SELFHOST_CORPUS_CASES?.split(',')
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0)
+export const runCorpus = (
+  silkc: string,
+  corpus: ReadonlyArray<CorpusProgram>,
+  required: ReadonlyArray<string>,
+  selected?: ReadonlyArray<string>,
+): number => {
   const selectedSet = selected === undefined ? undefined : new Set(selected)
   const programs =
     selectedSet === undefined ? corpus : corpus.filter((program) => selectedSet.has(program.name))
   if (selectedSet !== undefined && programs.length !== selectedSet.size)
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
-  const track = selfhostTrack.filter((name) => selectedSet === undefined || selectedSet.has(name))
+  const track = required.filter((name) => selectedSet === undefined || selectedSet.has(name))
   const executable = silkc.includes('/') ? resolve(silkc) : silkc
   const results = programs.map((program) => {
     const started = performance.now()
@@ -379,16 +376,3 @@ export const runCorpus = (silkc: string, corpus: ReadonlyArray<CorpusProgram>): 
   }
   return 0
 }
-
-const main = (): void => {
-  const silkc = process.env.SILKC
-  if (silkc === undefined || silkc.length === 0)
-    throw new Error('SILKC must name the self-hosted compiler executable')
-  process.exitCode = runCorpus(silkc, nativeCorpus)
-}
-
-if (
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
-)
-  main()

@@ -4,7 +4,6 @@ import { join } from 'node:path'
 import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
-import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
 import {
   parseBuildDiagnostic,
   parseUnsupported,
@@ -12,22 +11,6 @@ import {
   runCorpus,
   summarize,
 } from './runSelfhostCorpus.js'
-
-it('keeps the selfhost runtime-member list equal to the canonical intrinsic catalog', () => {
-  const source = readFileSync(
-    new URL('../src/semantic/IntrinsicCatalog.silk', import.meta.url),
-    'utf8',
-  )
-  const encoded = source.split('let members = b"').at(1)?.split('"').at(0)
-  assert.ok(encoded !== undefined)
-  assert.deepStrictEqual(
-    encoded.split('|').filter((name) => name.length > 0),
-    Intrinsic.inventory()
-      .filter((entry) => entry.phase !== 'StaticOnly')
-      .map((entry) => entry.operation.slice('Intrinsic.'.length))
-      .sort(),
-  )
-})
 
 const literal: CorpusProgram = {
   name: 'literal',
@@ -55,7 +38,7 @@ output="$2"
 printf '#!/bin/sh\\nexit 42\\n' > "$output"
 chmod +x "$output"`
 
-it('runs a pinned native corpus program through the build command', () => {
+void it('runs a pinned native corpus program through the build command', () => {
   withStub(compiled, (silkc) => {
     assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
     const profiled = {
@@ -88,16 +71,16 @@ ${compiled}`,
   })
 })
 
-it('requires the full track in supplied materialized scenarios', () => {
+void it('requires the full track in supplied materialized scenarios', () => {
   withStub(compiled, (silkc) => {
     assert.throws(
-      () => runCorpus(silkc, [literal]),
+      () => runCorpus(silkc, [literal], ['trivial-features', 'other']),
       /selfhost track names absent from corpus: trivial-features,/,
     )
   })
 })
 
-it('classifies only a structured build gap as unsupported', () => {
+void it('classifies only a structured build gap as unsupported', () => {
   withStub(
     `echo 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"MIR_AGGREGATE","reason":"aggregates are not lowered"}]}' >&2
 exit 2`,
@@ -113,7 +96,7 @@ exit 2`,
   assert.strictEqual(parseUnsupported('unsupported: aggregates'), undefined)
 })
 
-it('retains exact gap source locations and rejects malformed location records', () => {
+void it('retains exact gap source locations and rejects malformed location records', () => {
   const gap = {
     code: 'typed-form',
     reason: 'deferred valid form',
@@ -139,7 +122,7 @@ it('retains exact gap source locations and rejects malformed location records', 
   )
 })
 
-it('keeps build and runtime regressions in the failure count', () => {
+void it('keeps build and runtime regressions in the failure count', () => {
   withStub('echo "compiler crashed" >&2; exit 2', (silkc) => {
     const result = runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
@@ -155,7 +138,7 @@ it('keeps build and runtime regressions in the failure count', () => {
   })
 })
 
-it('fails the gate only for cases on the ordered selfhost track', () => {
+void it('fails the gate only for cases on the ordered selfhost track', () => {
   const results = [
     { name: 'literal', status: 'pass' },
     { name: 'future', status: 'fail', code: 'UnknownName', reason: 'not ready' },
@@ -176,7 +159,7 @@ it('fails the gate only for cases on the ordered selfhost track', () => {
   assert.deepStrictEqual(summarize(results, ['literal', 'later']).trackFailures, ['later'])
 })
 
-it('passes native run arguments and closes stderr when requested', () => {
+void it('passes native run arguments and closes stderr when requested', () => {
   const argumentAndStderrStub = `while [ "$1" != "-o" ]; do shift; done
 output="$2"
 cat > "$output" <<'SCRIPT'
@@ -203,7 +186,7 @@ chmod +x "$output"`
   })
 })
 
-it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
+void it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
   const record =
     'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34},"module":"main.silk"}'
   withStub(`echo '${record}' >&2; exit 1`, (silkc) => {
