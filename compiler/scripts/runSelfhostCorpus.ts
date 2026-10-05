@@ -332,10 +332,8 @@ export const runCorpus = (
   silkc: string,
   corpus: ReadonlyArray<CorpusProgram>,
   required: ReadonlyArray<string>,
+  selected?: ReadonlyArray<string>,
 ): number => {
-  const selected = process.env.SILK_SELFHOST_CORPUS_CASES?.split(',')
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0)
   const selectedSet = selected === undefined ? undefined : new Set(selected)
   const programs =
     selectedSet === undefined ? corpus : corpus.filter((program) => selectedSet.has(program.name))

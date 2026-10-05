@@ -24,6 +24,7 @@ export interface FormatterVerification {
   readonly gate: string
   readonly compiler: string
   readonly safetyLog: string
+  readonly selected?: ReadonlyArray<string>
 }
 
 export class VerificationError extends Data.TaggedError('FormatterVerificationError')<{
@@ -166,7 +167,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
       reason: { _tag: 'Exit', code: rebuilt },
     })
   const result = yield* Effect.try({
-    try: () => runCorpus(self.compiler, nativeCorpus, track),
+    try: () => runCorpus(self.compiler, nativeCorpus, track, self.selected),
     catch: (cause) =>
       new VerificationError({
         message: 'Native corpus execution failed',
@@ -195,6 +196,11 @@ export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(fu
   const temporary = yield* Config.String('RUNNER_TEMP')
   const compiler = yield* Config.String('SILKC')
   const bootstrap = yield* Config.String('SILK_BOOTSTRAP')
+  const selection = yield* Config.String('SILK_SELFHOST_CORPUS_CASES').pipe(Config.withDefault(''))
+  const selected = selection
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0)
   return yield* run({
     repository,
     node,
@@ -205,5 +211,6 @@ export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(fu
     ),
     compiler,
     safetyLog: path.join(temporary, 'formatter-safety.log'),
+    ...(selected.length === 0 ? {} : { selected }),
   })
 })
