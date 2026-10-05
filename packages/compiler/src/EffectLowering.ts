@@ -6,6 +6,7 @@ import {
   ownershipLocal,
   lowerOwnershipPath,
   lowerReferencePlace,
+  patternBinding,
   propagationLoanEnds,
   propagationReleases,
 } from './CleanupEmission.js'
@@ -32,6 +33,7 @@ import {
   baseRunnerKey,
   effectValueByIdentity,
   ensureEffectRunner,
+  generatedRunner,
   instanceText,
   providerBindings,
   requirementsFor,
@@ -101,7 +103,7 @@ export const lowerCatchEffectValue = (
     type,
     provenance: authored(expression.span),
   })
-  if (!fn.generatedRunners.some((candidate) => candidate.specializationKey === specializationKey))
+  if (generatedRunner(fn.generatedRunners, specializationKey) === undefined)
     fn.generatedRunners.push({
       _tag: 'CatchEffectRunner',
       id: runner,
@@ -1541,22 +1543,49 @@ export const endLoan = (
   fn.loanLocals.delete(key)
 }
 
+// Run and expression sites scan the function's loans in ownership order, once per site. The
+// origin filters are per function, so each owner keeps its filtered loans: the selfhost lowering
+// profile spent about 40 s rescanning and probing every loan at each site.
+const runLoanFacts = new WeakMap<Ownership.FunctionOwnership, ReadonlyArray<Ownership.LoanFact>>()
+const returnedViewLoanFacts = new WeakMap<
+  Ownership.FunctionOwnership,
+  ReadonlyArray<Ownership.LoanFact>
+>()
+
+const ownershipLoans = (
+  cache: WeakMap<Ownership.FunctionOwnership, ReadonlyArray<Ownership.LoanFact>>,
+  ownership: Ownership.FunctionOwnership | undefined,
+  admits: (loan: Ownership.LoanFact) => boolean,
+): ReadonlyArray<Ownership.LoanFact> => {
+  if (ownership === undefined) return []
+  let loans = cache.get(ownership)
+  if (loans === undefined) {
+    loans = ownership.loans.filter(admits)
+    cache.set(ownership, loans)
+  }
+  return loans
+}
+
 export const endRunLoans = (fn: FunctionLowering, span: SourceSpan.SourceSpan): void => {
   // A constructed effect holds its argument borrows until the run that consumes it: ownership
   // records that end site, so every lowering path for run must release them here.
-  for (const loan of fn.ownership?.loans ?? []) {
-    if (
-      loan.origin !== 'EffectCapture' &&
-      loan.origin !== 'CallableCapture' &&
-      loan.origin !== 'ReturnedCallableCapture' &&
-      loan.origin !== 'ValueBorrow' &&
-      loan.origin !== 'InterfaceOperand'
-    )
-      continue
+  const loans = ownershipLoans(
+    runLoanFacts,
+    fn.ownership,
+    (loan) =>
+      loan.origin === 'EffectCapture' ||
+      loan.origin === 'CallableCapture' ||
+      loan.origin === 'ReturnedCallableCapture' ||
+      loan.origin === 'ValueBorrow' ||
+      loan.origin === 'InterfaceOperand',
+  )
+  for (const loan of loans) {
+    // Only a held loan can end, so the rest of the scan is inert once none remain.
+    if (fn.loanLocals.size === 0) return
     if (loan.endSpan.sourceId !== span.sourceId || loan.endSpan.end > span.end) {
       continue
     }
-    endLoans(fn, [loan.id], span)
+    endLoan(fn, fn.recipeBorrow(loan.id), span)
   }
 }
 
@@ -1577,9 +1606,15 @@ export const dropOwnedProvider = (
 }
 
 export const endReturnedViewLoans = (fn: FunctionLowering, span: SourceSpan.SourceSpan): void => {
-  for (const loan of fn.ownership?.loans ?? []) {
-    if (loan.cleanupOnly) continue
-    if (loan.origin !== 'ReturnedView' && loan.origin !== 'ReturnedCallableCapture') continue
+  const loans = ownershipLoans(
+    returnedViewLoanFacts,
+    fn.ownership,
+    (loan) =>
+      !loan.cleanupOnly &&
+      (loan.origin === 'ReturnedView' || loan.origin === 'ReturnedCallableCapture'),
+  )
+  for (const loan of loans) {
+    if (fn.loanLocals.size === 0) return
     if (
       loan.endSpan.sourceId !== span.sourceId ||
       loan.endSpan.start < span.start ||
@@ -1587,7 +1622,7 @@ export const endReturnedViewLoans = (fn: FunctionLowering, span: SourceSpan.Sour
     ) {
       continue
     }
-    endLoans(fn, [loan.id], span)
+    endLoan(fn, fn.recipeBorrow(loan.id), span)
   }
 }
 
@@ -1640,11 +1675,7 @@ export const patternPlace = (
 ):
   | { readonly root: Mir.LocalId; readonly selectors: ReadonlyArray<Mir.PlaceSelector> }
   | undefined => {
-  const place = Ownership.allBindings(fn.ownership).find(
-    (candidate) =>
-      candidate.site._tag === 'Pattern' &&
-      patternKey(candidate.site.binding) === patternKey(binding),
-  )?.place
+  const place = patternBinding(fn, binding)?.place
   if (place === undefined) return undefined
   const root = ownershipLocal(fn, place.root)
   if (root === undefined) return undefined
@@ -1662,11 +1693,7 @@ export const ownedWriteRoot = (
     case 'BindingWriteRoot':
       return fn.bindingLocals.get(root.binding.ordinal)
     case 'PatternWriteRoot': {
-      const place = Ownership.allBindings(fn.ownership).find(
-        (candidate) =>
-          candidate.site._tag === 'Pattern' &&
-          patternKey(candidate.site.binding) === patternKey(root.binding),
-      )?.place
+      const place = patternBinding(fn, root.binding)?.place
       return place === undefined
         ? fn.patternLocals.get(patternKey(root.binding))
         : ownershipLocal(fn, place.root)

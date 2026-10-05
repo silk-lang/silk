@@ -31,7 +31,6 @@ export interface CodegenRequest {
 
 export interface SymbolEntry {
   readonly declaration: DeclarationFacts.CanonicalId
-  readonly instance: Mir.MirFunction['instance']
   readonly symbol: string
 }
 
@@ -102,15 +101,44 @@ interface ArtifactBase {
   readonly foreignStatics: ReadonlyArray<ForeignStatic>
 }
 
+/** The durable product of LLVM emission: bitcode with its link and interface metadata. */
 export interface LlvmBitcodeArtifact extends ArtifactBase {
   readonly _tag: 'LlvmBitcodeArtifact'
   readonly support?: boolean
   readonly backend: 'llvm'
   readonly bitcode: Uint8Array
+}
+
+/**
+ * One LLVM emission: its bitcode artifact plus the textual IR, rendered on first read from the
+ * in-memory module (and the MIR it was built from) that the emission keeps alive. Inspection reads
+ * IR here; anything that outlives emission keeps only {@link bitcodeArtifact}.
+ */
+export interface LlvmEmission extends LlvmBitcodeArtifact {
   readonly ir: string
 }
 
 export type Artifact = LlvmBitcodeArtifact
+
+/**
+ * The durable artifact of an emission, without the in-memory module behind its IR. Object
+ * emission, linking, and caches hold artifacts long after emission; keeping the emission instead
+ * would retain the whole LLVM module and MIR through Clang and the linker.
+ */
+export const bitcodeArtifact = (self: LlvmBitcodeArtifact): LlvmBitcodeArtifact => ({
+  _tag: 'LlvmBitcodeArtifact',
+  ...(self.support === undefined ? {} : { support: self.support }),
+  backend: self.backend,
+  module: self.module,
+  target: self.target,
+  symbols: self.symbols,
+  nativeRuntimeSymbols: self.nativeRuntimeSymbols,
+  runtimeFeatures: self.runtimeFeatures,
+  foreignImports: self.foreignImports,
+  foreignExports: self.foreignExports,
+  foreignStatics: self.foreignStatics,
+  bitcode: self.bitcode,
+})
 
 export interface ModuleViolation {
   readonly function: string

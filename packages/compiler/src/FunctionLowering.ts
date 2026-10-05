@@ -163,6 +163,13 @@ export interface LoweringFailure {
       }
 }
 
+/** The generated owner of one materialized borrowable temporary. */
+export interface TemporaryBorrowOwner {
+  readonly local: Mir.LocalId
+  readonly cleanup: CleanupPlan.CleanupPlan
+  readonly span: SourceSpan.SourceSpan
+}
+
 export class FunctionLowering {
   /** Only the generated primitive runner may emit the terminal suspension origin. */
   builtinEffectRunner = false
@@ -192,14 +199,7 @@ export class FunctionLowering {
     Extract<Mir.Operation, { readonly _tag: 'MakeCallable' }>
   >()
   // Allocation metadata survives branch/loop rewrites; loanLocals tracks path-local liveness.
-  readonly temporaryBorrowOwners = new Map<
-    string,
-    {
-      readonly local: Mir.LocalId
-      readonly cleanup: CleanupPlan.CleanupPlan
-      readonly span: SourceSpan.SourceSpan
-    }
-  >()
+  readonly temporaryBorrowOwners = new Map<string, TemporaryBorrowOwner>()
   readonly expressionLocals = new Map<string, Mir.LocalId>()
   readonly matchCleanupLocals = new Map<string, Mir.LocalId>()
   readonly extractedRegions = new Set<number>()
@@ -210,6 +210,14 @@ export class FunctionLowering {
   private syntheticBorrowOrdinal = 0
   private replayBorrowSubstitution: Map<string, Tir.BorrowId> | undefined
   private readonly directBorrowSubstitution = new Map<string, Tir.BorrowId>()
+  /**
+   * Every slot transition between vacant and published, in order. A branch collects the regions
+   * it published from this log; rescanning every region of the body at each branch was quadratic.
+   */
+  private readonly regionTransitions: Array<{
+    readonly ordinal: number
+    readonly published: boolean
+  }> = []
   loweringFailure: LoweringFailure | undefined
 
   constructor(
@@ -298,7 +306,31 @@ export class FunctionLowering {
   }
 
   publish(region: Mir.Region): void {
+    if (this.regions.at(region.id.ordinal) === undefined)
+      this.regionTransitions.push({ ordinal: region.id.ordinal, published: true })
     this.regions[region.id.ordinal] = region
+  }
+
+  /** Marks the current region state for {@link regionsPublishedSince}. */
+  regionMark(): number {
+    return this.regionTransitions.length
+  }
+
+  /** The ordinals, ascending, of regions published now that were vacant or absent at `mark`. */
+  regionsPublishedSince(mark: number): ReadonlyArray<number> {
+    // A slot's first transition after the mark tells its state at the mark; a slot without one
+    // is unchanged since then.
+    const vacantAtMark = new Map<number, boolean>()
+    for (let position = mark; position < this.regionTransitions.length; position += 1) {
+      const transition = this.regionTransitions.at(position)
+      if (transition !== undefined && !vacantAtMark.has(transition.ordinal))
+        vacantAtMark.set(transition.ordinal, transition.published)
+    }
+    return [...vacantAtMark]
+      .flatMap(([ordinal, vacant]) =>
+        vacant && this.regions.at(ordinal) !== undefined ? [ordinal] : [],
+      )
+      .sort((left, right) => left - right)
   }
 
   recordLoweringFailure(
@@ -346,6 +378,7 @@ export class FunctionLowering {
       regions.push(region)
       this.extractedRegions.add(ordinal)
       this.regions[ordinal] = undefined
+      this.regionTransitions.push({ ordinal, published: false })
     }
     return { ...result, regions: regions }
   }

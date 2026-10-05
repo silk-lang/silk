@@ -43,6 +43,8 @@ export interface NativeDropGlue {
   readonly diagnosticDispatch: NativeDiagnosticDispatch.NativeDiagnosticDispatch
   /** Helpers bucketed by a cheap key; members are distinguished by structural equality. */
   readonly helpers: Map<string, Array<Helper>>
+  /** Helpers declared so far; numbers the next helper's symbol. */
+  declaredCount: number
   /** Declared helpers whose bodies are not yet emitted, in declaration order. */
   readonly pending: Array<Helper>
 }
@@ -56,9 +58,12 @@ interface Helper {
   readonly runsUserCode: boolean
 }
 
-export const make = (context: Omit<NativeDropGlue, 'helpers' | 'pending'>): NativeDropGlue => ({
+export const make = (
+  context: Omit<NativeDropGlue, 'helpers' | 'declaredCount' | 'pending'>,
+): NativeDropGlue => ({
   ...context,
   helpers: new Map(),
+  declaredCount: 0,
   pending: [],
 })
 
@@ -135,28 +140,39 @@ export const admits = (
   CleanupPlan.hasEffect(plan) &&
   weight(plan) > 1
 
-/** Structural equality over plain compiler data; plans are rebuilt per site, never shared. */
+/**
+ * Structural equality over plain compiler data; plans are rebuilt per site, never shared.
+ *
+ * Every glue request deep-compares its plan and type against the bucket's helpers, which
+ * profiled at ~8 s of self time over a 24k-function module, so this walks plain loops instead of
+ * allocating key arrays and per-entry closures.
+ */
 const equal = (left: unknown, right: unknown): boolean => {
   if (left === right) return true
   if (typeof left !== 'object' || typeof right !== 'object' || left === null || right === null)
     return false
   if (Array.isArray(left)) {
     if (!Array.isArray(right) || left.length !== right.length) return false
-    return left.every((value, index) => equal(value, right[index]))
+    // Holes in `left` are skipped, as `every` skipped them.
+    for (let index = 0; index < left.length; index += 1)
+      if (index in left && !equal(left[index], right[index])) return false
+    return true
   }
   if (Array.isArray(right)) return false
   // Anything but plain records (maps, sets, class instances) only matches by identity: a
   // missed share costs one more helper, a false share would release the wrong owner.
   if (Object.getPrototypeOf(left) !== Object.prototype) return false
   if (Object.getPrototypeOf(right) !== Object.prototype) return false
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  if (leftKeys.length !== rightKeys.length) return false
-  return leftKeys.every(
-    (key) =>
-      Object.hasOwn(right, key) &&
-      equal((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]),
-  )
+  // Both are plain records, so `for...in` visits exactly their own enumerable keys.
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  let unmatched = 0
+  for (const key in leftRecord) {
+    unmatched += 1
+    if (!Object.hasOwn(rightRecord, key) || !equal(leftRecord[key], rightRecord[key])) return false
+  }
+  for (const _key in rightRecord) unmatched -= 1
+  return unmatched === 0
 }
 
 const helperSymbol = (ordinal: number) => `silk_drop_glue_${ordinal}`
@@ -179,9 +195,7 @@ const request = (
   const { program, pointer } = self
   const base = program.functions.at(0)
   if (base === undefined) throw new RangeError('Drop glue requested by a module without functions')
-  const symbol = helperSymbol(
-    [...self.helpers.values()].reduce((sum, list) => sum + list.length, 0),
-  )
+  const symbol = helperSymbol(self.declaredCount)
   const diagnostics = Mir.hasDiagnosticObservation(program)
   const parameters = diagnostics
     ? [
@@ -246,6 +260,7 @@ const request = (
   }
   bucket.push(helper)
   self.helpers.set(key, bucket)
+  self.declaredCount += 1
   self.pending.push(helper)
   return helper
 }

@@ -472,7 +472,11 @@ it.effect('authenticates artifact-cache payloads and rejects body or trailing co
         }),
     })
     const payload = Uint8Array.from([1, 2, 3, 4])
-    yield* NativeToolchain.writeArtifactCache(storage, 'entry', payload)
+    // A record written as consecutive parts reads back as their concatenation.
+    yield* NativeToolchain.writeArtifactCache(storage, 'entry', [
+      payload.subarray(0, 1),
+      payload.subarray(1),
+    ])
     assert.deepStrictEqual(yield* NativeToolchain.readArtifactCache(storage, 'entry'), payload)
     assert.strictEqual(yield* NativeToolchain.readArtifactCache(storage, 'other-entry'), undefined)
     if (stored === undefined) return assert.fail('expected encoded cache entry')

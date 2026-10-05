@@ -6,7 +6,7 @@ import type * as Match from './Match.js'
 import { endLoans } from './EffectLowering.js'
 import type {} from './EntryAssembly.js'
 import type {} from './Forwarding.js'
-import type { FunctionLowering } from './FunctionLowering.js'
+import type { FunctionLowering, TemporaryBorrowOwner } from './FunctionLowering.js'
 import * as Tir from './Tir.js'
 import * as TypeInference from './internal/TypeInference.js'
 import * as Instances from './Instances.js'
@@ -122,25 +122,81 @@ export const initializationFor = (
   return { state, flags: flags }
 }
 
+interface OwnershipIndex {
+  /** The first binding fact per binding site, as a source-ordered scan would select it. */
+  readonly bindings: ReadonlyMap<string, Ownership.BindingFact>
+  /** The first pattern binding fact per pattern key, as a source-ordered scan would select it. */
+  readonly patterns: ReadonlyMap<string, Ownership.BindingFact>
+  /** Source-ordered transitions per kind and span. */
+  readonly transitions: ReadonlyMap<string, ReadonlyArray<Ownership.PlaceTransition>>
+}
+
+// Every place expression resolves its binding and transition. Scanning all bindings and
+// transitions per expression cost about 9 s in the selfhost lowering profile; ownership facts
+// are immutable, so each function indexes them once.
+const ownershipIndexes = new WeakMap<Ownership.FunctionOwnership, OwnershipIndex>()
+
+const transitionKey = (kind: Ownership.PlaceTransition['kind'], span: SourceSpan.SourceSpan) =>
+  `${kind}:${spanKey(span)}`
+
+const ownershipIndex = (ownership: Ownership.FunctionOwnership): OwnershipIndex => {
+  const existing = ownershipIndexes.get(ownership)
+  if (existing !== undefined) return existing
+  const bindings = new Map<string, Ownership.BindingFact>()
+  const patterns = new Map<string, Ownership.BindingFact>()
+  for (const binding of Ownership.allBindings(ownership)) {
+    const key = Ownership.siteKey(binding.site)
+    if (!bindings.has(key)) bindings.set(key, binding)
+    if (binding.site._tag !== 'Pattern') continue
+    const pattern = patternKey(binding.site.binding)
+    if (!patterns.has(pattern)) patterns.set(pattern, binding)
+  }
+  const transitions = new Map<string, Array<Ownership.PlaceTransition>>()
+  for (const transition of ownership.transitions) {
+    const key = transitionKey(transition.kind, transition.span)
+    const group = transitions.get(key)
+    if (group === undefined) transitions.set(key, [transition])
+    else group.push(transition)
+  }
+  const index = { bindings, patterns, transitions }
+  ownershipIndexes.set(ownership, index)
+  return index
+}
+
+/** The first binding fact of the function at one binding site. */
+export const bindingAt = (
+  fn: FunctionLowering,
+  site: Ownership.BindingSite,
+): Ownership.BindingFact | undefined =>
+  fn.ownership === undefined
+    ? undefined
+    : ownershipIndex(fn.ownership).bindings.get(Ownership.siteKey(site))
+
+/** The first pattern binding fact of the function for one pattern binding identity. */
+export const patternBinding = (
+  fn: FunctionLowering,
+  binding: Match.BindingId | Tir.LocalId,
+): Ownership.BindingFact | undefined =>
+  fn.ownership === undefined
+    ? undefined
+    : ownershipIndex(fn.ownership).patterns.get(patternKey(binding))
+
 export const transitionAt = (
   fn: FunctionLowering,
   span: SourceSpan.SourceSpan,
   kind: Ownership.PlaceTransition['kind'],
   root?: Ownership.BindingSite,
 ): Ownership.PlaceTransition | undefined => {
+  if (fn.ownership === undefined) return undefined
+  const index = ownershipIndex(fn.ownership)
   const canonicalRoot = (site: Ownership.BindingSite): Ownership.BindingSite => {
-    const alias = Ownership.allBindings(fn.ownership).find(
-      (binding) => Ownership.siteKey(binding.site) === Ownership.siteKey(site),
-    )?.place?.root
+    const alias = index.bindings.get(Ownership.siteKey(site))?.place?.root
     return alias === undefined ? site : canonicalRoot(alias)
   }
   const rootKey = root === undefined ? undefined : Ownership.siteKey(canonicalRoot(root))
-  return fn.ownership?.transitions.find(
-    (transition) =>
-      transition.kind === kind &&
-      spanKey(transition.span) === spanKey(span) &&
-      (rootKey === undefined || Ownership.siteKey(transition.root) === rootKey),
-  )
+  return index.transitions
+    .get(transitionKey(kind, span))
+    ?.find((transition) => rootKey === undefined || Ownership.siteKey(transition.root) === rootKey)
 }
 
 /** Resolves a canonical source owner to its retained MIR storage. */
@@ -338,35 +394,80 @@ export const loanEndOperations = (
   ]
 }
 
+const sourceSpanKey = (span: SourceSpan.SourceSpan): string =>
+  `${span.sourceId}:${span.start}:${span.end}`
+
+interface ExitSpanIndex {
+  /** The first exit temporary per exact source span, in exit order. */
+  readonly temporaries: ReadonlyMap<string, Ownership.TemporaryRelease>
+  /** The first propagation exit per span range. */
+  readonly propagations: ReadonlyMap<string, Ownership.ExitPlan>
+}
+
+// Every run site resolved its propagation exit, and every cleanup drop its exit temporary, by
+// scanning all exits of the function (part of the ~13 s propagationReleases spent in the
+// selfhost lowering profile). Ownership facts are immutable, so each function indexes them once.
+const exitSpanIndexes = new WeakMap<Ownership.FunctionOwnership, ExitSpanIndex>()
+
+const exitSpanIndex = (ownership: Ownership.FunctionOwnership): ExitSpanIndex => {
+  const existing = exitSpanIndexes.get(ownership)
+  if (existing !== undefined) return existing
+  const temporaries = new Map<string, Ownership.TemporaryRelease>()
+  const propagations = new Map<string, Ownership.ExitPlan>()
+  for (const exit of ownership.exits) {
+    if (exit.kind === 'Propagation') {
+      const key = spanKey(exit.span)
+      if (!propagations.has(key)) propagations.set(key, exit)
+    }
+    for (const release of exit.temporaries) {
+      const key = sourceSpanKey(release.span)
+      if (!temporaries.has(key)) temporaries.set(key, release)
+    }
+  }
+  const index = { temporaries, propagations }
+  exitSpanIndexes.set(ownership, index)
+  return index
+}
+
 /** Orders hidden storage immediately before its defining binding in acquisition order. */
 export const orderedCleanup = (
   fn: FunctionLowering,
   operations: ReadonlyArray<Mir.EndLoanOperation | Mir.DropOperation>,
 ): ReadonlyArray<Mir.EndLoanOperation | Mir.DropOperation> => {
   const drops = operations.filter((operation) => operation._tag === 'Drop')
+  // Each drop scanned every temporary owner and binding for its local. Owners do not change
+  // while one cleanup is ordered, so the first owner per local is indexed once per call.
+  let temporaries: Map<number, TemporaryBorrowOwner> | undefined
+  let bindings: Map<number, Ownership.BindingFact> | undefined
   const acquisitions = drops.map((drop) => {
-    const temporary = [...fn.temporaryBorrowOwners.values()].find(
-      (owner) => owner.local.ordinal === drop.local.ordinal,
-    )
-    const binding =
-      temporary === undefined
-        ? Ownership.allBindings(fn.ownership).find(
-            (binding) => ownershipLocal(fn, binding.site)?.ordinal === drop.local.ordinal,
-          )
-        : Ownership.allBindings(fn.ownership).find(
-            (binding) =>
-              binding.liveFrom.sourceId === temporary.span.sourceId &&
-              binding.liveFrom.start <= temporary.span.start &&
-              binding.liveFrom.end >= temporary.span.end,
-          )
-    const release = fn.ownership?.exits
-      .flatMap((exit) => exit.temporaries)
-      .find(
-        (release) =>
-          release.span.sourceId === drop.provenance.span.sourceId &&
-          release.span.start === drop.provenance.span.start &&
-          release.span.end === drop.provenance.span.end,
+    if (temporaries === undefined) {
+      temporaries = new Map()
+      for (const owner of fn.temporaryBorrowOwners.values())
+        if (!temporaries.has(owner.local.ordinal)) temporaries.set(owner.local.ordinal, owner)
+    }
+    const temporary = temporaries.get(drop.local.ordinal)
+    let binding: Ownership.BindingFact | undefined
+    if (temporary === undefined) {
+      if (bindings === undefined) {
+        bindings = new Map()
+        for (const candidate of Ownership.allBindings(fn.ownership)) {
+          const local_ = ownershipLocal(fn, candidate.site)
+          if (local_ !== undefined && !bindings.has(local_.ordinal))
+            bindings.set(local_.ordinal, candidate)
+        }
+      }
+      binding = bindings.get(drop.local.ordinal)
+    } else
+      binding = Ownership.allBindings(fn.ownership).find(
+        (candidate) =>
+          candidate.liveFrom.sourceId === temporary.span.sourceId &&
+          candidate.liveFrom.start <= temporary.span.start &&
+          candidate.liveFrom.end >= temporary.span.end,
       )
+    const release =
+      fn.ownership === undefined
+        ? undefined
+        : exitSpanIndex(fn.ownership).temporaries.get(sourceSpanKey(drop.provenance.span))
     return { drop, ordinal: binding?.ordinal ?? release?.ordinal, temporary }
   })
   // Keep generated releases without a source acquisition in their established relative order.
@@ -397,15 +498,15 @@ export const propagationReleases = (
   fn: FunctionLowering,
   span: SourceSpan.SourceSpan,
 ): ReadonlyArray<Mir.DropOperation> => {
-  const exit = fn.ownership?.exits.find(
-    (candidate) =>
-      candidate.kind === 'Propagation' &&
-      candidate.span.start === span.start &&
-      candidate.span.end === span.end,
-  )
+  const exit =
+    fn.ownership === undefined
+      ? undefined
+      : exitSpanIndex(fn.ownership).propagations.get(spanKey(span))
   const releases = exit === undefined ? [] : [...exitDrops(fn, exit)]
   const retained = new Set(releases.map((release) => release.local.ordinal))
-  for (const [key, temporary] of [...fn.temporaryBorrowOwners.entries()].reverse()) {
+  // Only temporaries held by a live loan release here; with none held the scan is inert.
+  const temporaries = fn.loanLocals.size === 0 ? [] : [...fn.temporaryBorrowOwners.entries()]
+  for (const [key, temporary] of temporaries.reverse()) {
     if (!fn.loanLocals.has(key)) continue
     if (retained.has(temporary.local.ordinal)) continue
     const localType = fn.localTypes.at(temporary.local.ordinal)

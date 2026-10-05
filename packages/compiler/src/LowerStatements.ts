@@ -3,6 +3,7 @@ import type { ExitIndex } from './CleanupEmission.js'
 import * as CleanupPlan from './CleanupPlan.js'
 import {
   authored,
+  bindingAt,
   lowerBorrowedWritePlace,
   cleanupForLocal,
   delayedLoopLoans,
@@ -61,6 +62,7 @@ import * as Match from './Match.js'
 import * as Mir from './Mir.js'
 import * as MovePath from './MovePath.js'
 import * as Ownership from './Ownership.js'
+import type * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
 import { effectValueForCall, instanceText } from './ValueType.js'
 
@@ -359,6 +361,34 @@ export const lowerSequence = (
     })
   }
   return id
+}
+
+// Drop and expression statements end the loans whose end span is the statement's span. Scanning
+// every loan of the function per statement is quadratic in body size, and ownership facts are
+// immutable, so each function groups its loans by end span once, keeping ownership order.
+const loansByEndSpan = new WeakMap<
+  Ownership.FunctionOwnership,
+  ReadonlyMap<string, ReadonlyArray<Ownership.LoanFact>>
+>()
+
+const loansEndingAt = (
+  fn: FunctionLowering,
+  span: SourceSpan.SourceSpan,
+): ReadonlyArray<Ownership.LoanFact> => {
+  if (fn.ownership === undefined) return []
+  let index = loansByEndSpan.get(fn.ownership)
+  if (index === undefined) {
+    const groups = new Map<string, Array<Ownership.LoanFact>>()
+    for (const loan of fn.ownership.loans) {
+      const key = spanKey(loan.endSpan)
+      const group = groups.get(key)
+      if (group === undefined) groups.set(key, [loan])
+      else group.push(loan)
+    }
+    index = groups
+    loansByEndSpan.set(fn.ownership, index)
+  }
+  return index.get(spanKey(span)) ?? []
 }
 
 /**
@@ -803,9 +833,7 @@ const lowerStatement = (
           )?.state ?? MovePath.make(selected.initialization)
       const initialization = initializationFor(fn, transition.root, selected, transition.path)
       const [, operations] = fn.capture(() => {
-        const authoredEndings = (fn.ownership?.loans ?? [])
-          .filter((loan) => spanKey(loan.endSpan) === spanKey(statement.span))
-          .map((loan) => loan.id)
+        const authoredEndings = loansEndingAt(fn, statement.span).map((loan) => loan.id)
         const retainedEndings =
           transition.root._tag === 'Let' && transition.path.length === 0
             ? (fn.effectLoanEnds.get(transition.root.binding.ordinal) ?? [])
@@ -871,15 +899,9 @@ const lowerStatement = (
       droppedExpression._tag === 'BindingReference' ? droppedExpression.binding.ordinal : undefined
     const bindingFact =
       droppedBinding !== undefined
-        ? Ownership.allBindings(fn.ownership).find(
-            (binding) =>
-              binding.site._tag === 'Let' && binding.site.binding.ordinal === droppedBinding,
-          )
+        ? bindingAt(fn, { _tag: 'Let', binding: { _tag: 'TirLocal', ordinal: droppedBinding } })
         : undefined
-    const ownershipLoanReleases = (fn.ownership?.loans ?? []).flatMap((loan) => {
-      if (loan.endSpan.start !== statement.span.start || loan.endSpan.end !== statement.span.end) {
-        return []
-      }
+    const ownershipLoanReleases = loansEndingAt(fn, statement.span).flatMap((loan) => {
       const slice = fn.loanLocals.get(borrowKey(loan.id))
       if (slice === undefined) return []
       fn.loanLocals.delete(borrowKey(loan.id))
@@ -1023,9 +1045,7 @@ const lowerStatement = (
       provenance: authored(statement.span),
     })
     const branchState = delayedEffectState(fn)
-    const beforeTaken = new Set(
-      fn.regions.flatMap((region) => (region === undefined ? [] : [region.id.ordinal])),
-    )
+    const beforeTaken = fn.regionMark()
     const loweredTaken = lowerSequence(
       fn,
       statement.taken,
@@ -1041,16 +1061,12 @@ const lowerStatement = (
     )
     if (loweredTaken === undefined) return undefined
     const takenState = delayedEffectState(fn)
-    const takenRegions = fn.regions.flatMap((region) =>
-      region !== undefined && !beforeTaken.has(region.id.ordinal) ? [region.id.ordinal] : [],
-    )
+    const takenRegions = fn.regionsPublishedSince(beforeTaken)
     if (statement._tag === 'IfLet')
       for (const binding of statement.selection.bindings)
         fn.patternLocals.delete(patternKey(binding.id))
     restoreDelayedEffectState(fn, branchState)
-    const beforeOtherwise = new Set(
-      fn.regions.flatMap((region) => (region === undefined ? [] : [region.id.ordinal])),
-    )
+    const beforeOtherwise = fn.regionMark()
     const loweredOtherwise = lowerSequence(
       fn,
       statement.otherwise,
@@ -1066,9 +1082,7 @@ const lowerStatement = (
     )
     if (loweredOtherwise === undefined) return undefined
     const otherwiseState = delayedEffectState(fn)
-    const otherwiseRegions = fn.regions.flatMap((region) =>
-      region !== undefined && !beforeOtherwise.has(region.id.ordinal) ? [region.id.ordinal] : [],
-    )
+    const otherwiseRegions = fn.regionsPublishedSince(beforeOtherwise)
     restoreDelayedEffectState(fn, branchState)
     // Only loans held by one branch end, in the function's loan order. Visiting the held set
     // keeps each conditional proportional to its live loans rather than to every loan issued

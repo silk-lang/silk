@@ -1,6 +1,6 @@
 import * as Effect from 'effect/Effect'
 import * as Analysis from './Analysis.js'
-import type * as Backend from './Backend.js'
+import * as Backend from './Backend.js'
 import * as CompilationProfile from './CompilationProfile.js'
 import * as HelperCapability from './HelperCapability.js'
 import * as LlvmBackend from './LlvmBackend.js'
@@ -83,5 +83,5 @@ export const compile = Effect.fn('HelperSource.compile')(function* (
     support: true,
   }).pipe(Effect.mapError((failure) => invalid(failure.message)))
   yield* HelperCapability.verifyExports(providers, artifact.foreignExports, profile.target)
-  return { artifact, profile: program.profile }
+  return { artifact: Backend.bitcodeArtifact(artifact), profile: program.profile }
 })
