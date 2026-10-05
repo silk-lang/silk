@@ -181,14 +181,21 @@ resolution, run the focused native checks below, and target the synchronization 
 bootstrap patch stream or reset `selfhost` onto another history. Update native feature branches
 from the synchronized `selfhost` tip as needed.
 
-For each bootstrap build, record the `selfhost` commit, the merged `main` repair commit it contains,
-the host platform and LLVM target. The checkout supplies the bootstrap compiler and CLI sources in
-`packages/compiler` and `packages/cli`, standard library sources in `packages/compiler/stdlib`,
-and the native sources and manifest in `compiler`. Root `package.json` pins the pnpm version and
-minimum Node version; `pnpm-lock.yaml` and `pnpm-workspace.yaml` determine the resolved workspace
-dependencies. Install from that lockfile with `pnpm install --frozen-lockfile`, then build this
-checkout's CLI with the command below. A built `dist` CLI or native executable is an output of
-those recorded inputs, not an independent bootstrap source.
+For each bootstrap build, record the `selfhost` commit, the downloaded main compiler commit and CI
+run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified
+`silk-bootstrap` artifact using `.github/actions/download-bootstrap` and records its provenance in
+the job summary. Invoke its `silk.mjs` with Node 24; native builds also require LLVM. No workspace
+dependency install or TypeScript compiler build runs in the native job. A separate lightweight job
+checks and bundles the formatter/corpus verification harness; that harness uses the current
+checkout's authored corpus and live standard library, preserving the native compiler safety gates.
+
+For a local source bootstrap, the checkout supplies the TypeScript compiler and CLI sources in
+`packages/compiler` and `packages/cli`, the standard library in `packages/compiler/stdlib`, and the
+native sources and manifests in `compiler`. Install with `pnpm install --frozen-lockfile`, then
+build the CLI. To use the same CI bootstrap locally instead, download `silk-bootstrap` from a
+verified main run and use `node /absolute/path/silk.mjs` in place of `node packages/cli/dist/bin.js`
+in the commands below. See [bundled CLI downloads](../packages/cli/README.md) for retention and
+pinning instructions.
 
 ## Anonymous declaration identities
 
