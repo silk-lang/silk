@@ -11,7 +11,7 @@ import hir.Hir {
   ParameterMode,
   PrefixOperator,
 }
-import backend.InstanceKey {InstanceKey, ProviderEntry}
+import backend.InstanceKey {InstanceKey, Observer, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity}
 import backend.Layout {
@@ -33465,6 +33465,8 @@ fn misshapen<'env>(protected: once Effect<'env; i32>) -> once Effect<'env; i32> 
   run Testing.expect(callCause(&store, &bodyMir, "load") == usize.ONE, "a protected call inherits the instance's cause")
   run Testing.expect(edgeCarriesContext(&store, &bodyMir, "load"), "an observed failure edge names the caught slot's companion")
   run Testing.expect(callCause(&store, &bodyMir, "failed") == 2, "a selected handler gets the caught failure's context")
+  run Testing.expect(handlerSeesEdgeContext(&store, &bodyMir, "load", "failed"),
+    "the handler's cause is the context the failure edge wrote")
   let loadKey = match move providedCallee(&store, &bodyMir, "load") {
     Option<InstanceKey>.Some {value} => value
     Option<InstanceKey>.None => { return run Testing.expect(false, "the body runs load") }
@@ -33638,4 +33640,336 @@ fn sameText(left: &[u8], right: &[u8]) -> bool {
     at = at + usize.ONE
   }
   return true
+}
+
+// An `Observe` step expanded in an unobserved function still carries every failure's context:
+// the handler and a finalizer hold see what the failure edge wrote, and a
+// nested observation starts its own observer (failure observer note N1-N3, N5).
+test effect fn unobservedExpansionsCarryObservedContext() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("observer-expansions.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+struct Log { reports: usize }
+struct Trace { reports: usize }
+struct Missing { code: i32 }
+struct Other {}
+fn onEvent(self: &mut Log, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 1 }
+fn onTrace(self: &mut Trace, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 2 }
+effect fn load(mode: i32) -> i32 ! Missing | Other {
+  if mode == 0 { fail Missing { code: 1 } }
+  fail Other {}
+}
+effect fn failed(error: Missing | Other) -> i32 {
+  drop error
+  let status = Intrinsic.observeUnhandled()
+  return 2
+}
+effect fn tidy() -> () { return () }
+effect fn inner() -> i32 { return run Intrinsic.catchFailure<Missing | Other>(load(1), failed) }
+effect fn outer() -> i32 { return run Intrinsic.observeDiagnostics(Trace { reports: 0 }, onTrace, inner()) }
+fn inline() -> i32 {
+  return run Intrinsic.observeDiagnostics(Log { reports: 0 }, onEvent, Intrinsic.catchFailure<Missing | Other>(load(0), failed))
+}
+fn finalizing() -> i32 {
+  return run Intrinsic.observeDiagnostics(Log { reports: 0 }, onEvent,
+    Intrinsic.catchFailure<Missing | Other>(Intrinsic.finalizeEffect(load(0), tidy()), failed))
+}
+fn nested() -> i32 { return run Intrinsic.observeDiagnostics(Log { reports: 0 }, onEvent, outer()) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let inline = run Semantic.demandMir(&mut store, &mut request, &id, b"inline") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(diagnosticLocals(&store, &inline) == usize.ZERO, "the observing function stays unobserved")
+  run Testing.expect(handlerSeesEdgeContext(&store, &inline, "load", "failed"),
+    "an inline catch hands its handler the context its failure edge wrote")
+  let finalizing = run Semantic.demandMir(&mut store, &mut request, &id, b"finalizing") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(handlerSeesEdgeContext(&store, &finalizing, "load", "failed"),
+    "a finalizer hold carries the context to the handler")
+  run Testing.expect(sameCause(&store, &finalizing, "load", "tidy"), "the finalizer inherits the cause; nothing is selected")
+  let nested = run Semantic.demandMir(&mut store, &mut request, &id, b"nested") |> Effect.provideMut<Allocator>(&mut allocator)
+  let outerKey = match move providedCallee(&store, &nested, "outer") {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run Testing.expect(false, "the outer observation runs outer") }
+  }
+  run Testing.expect(observerNamed(&outerKey, b"Log"), "the outer body runs under the outer observer")
+  let outerMir = run Semantic.demandInstanceMir(&mut store, &mut request, &outerKey) |> Effect.provideMut<Allocator>(&mut allocator)
+  let innerKey = match move providedCallee(&store, &outerMir, "inner") {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run Testing.expect(false, "the nested observation runs inner") }
+  }
+  run Testing.expect(observerNamed(&innerKey, b"Trace"), "a nested observation replaces the observer for its body")
+  run Testing.expect(callCause(&store, &outerMir, "inner") == 2, "a nested observation starts with no selected failure")
+  return ()
+}
+
+// An observed fallible instance takes the observer and cause after its parameters and providers,
+// then the success, failure and context out-addresses, and writes its context on `fail` (N3).
+test effect fn observedInstancesEmitTheContextAbi() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("observer-abi.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
+  let text = """
+struct Log { reports: usize }
+struct Missing { code: i32 }
+fn onEvent(self: &mut Log, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 1 }
+effect fn lone(mode: i32) -> i32 ! Missing { fail Missing { code: mode } }
+effect fn relay(mode: i32) -> i32 ! Missing { return run lone(mode) }
+effect fn recover(problem: Missing) -> i32 { return problem.code }
+effect fn guard() -> i32 { return run Intrinsic.catchFailure<Missing>(relay(1), recover) }
+fn observed() -> i32 { return run Intrinsic.observeDiagnostics(Log { reports: 0 }, onEvent, guard()) }
+"""
+  let mut store = run staticSemantic(&id, text, target) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let observed = run Semantic.demandMir(&mut store, &mut request, &id, b"observed") |> Effect.provideMut<Allocator>(&mut allocator)
+  let guardKey = match move providedCallee(&store, &observed, "guard") {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run Testing.expect(false, "the observation runs guard") }
+  }
+  let guardMir = run Semantic.demandInstanceMir(&mut store, &mut request, &guardKey) |> Effect.provideMut<Allocator>(&mut allocator)
+  let relayKey = match move providedCallee(&store, &guardMir, "relay") {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run Testing.expect(false, "guard runs relay") }
+  }
+  let relay = run Semantic.demandInstanceMir(&mut store, &mut request, &relayKey) |> Effect.provideMut<Allocator>(&mut allocator)
+  let loneKey = match move providedCallee(&store, &relay, "lone") {
+    Option<InstanceKey>.Some {value} => value
+    Option<InstanceKey>.None => { return run Testing.expect(false, "relay runs lone") }
+  }
+  let lone = run Semantic.demandInstanceMir(&mut store, &mut request, &loneKey) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut ir = Bytes.make()
+  let mut types = Vector.make<Shared<Type>>()
+  run localTypes(&store, &relay, &mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+  run localTypes(&store, &lone, &mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut layouts = Vector.make<TypeLayout>()
+  let listedTypes = Vector.asSlice<Shared<Type>>(&types)
+  let mut typeAt = usize.ZERO
+  while typeAt < listedTypes.length {
+    let layout = run Semantic.demandLayout(&mut store, &mut request, &id, &listedTypes[typeAt]) |> Effect.provideMut<Allocator>(&mut allocator)
+    let layoutIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&layout, selectedLayoutIndex)
+    if let Option<usize>.Some {value: laid} = move layoutIndex {
+      if let Option<Shared<BackendLayout>>.Some {value: facts} = move Semantic.layoutAt(&store, laid) {
+        run Vector.append<TypeLayout>(&mut layouts, TypeLayout {ty: Shared.clone<Type>(&listedTypes[typeAt]), layout: move facts})
+          |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+    }
+    typeAt = typeAt + usize.ONE
+  }
+  let callee = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&lone, selectedMirIndex)
+  let caller = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&relay, selectedMirIndex)
+  if let Option<usize>.Some {value: calleeIndex} = move callee {
+    if let Option<usize>.Some {value: callerIndex} = move caller {
+      if let Option<&MirFunction>.Some {value: called} = move Semantic.mirAt(&store, calleeIndex) {
+        if let Option<&MirFunction>.Some {value: calling} = move Semantic.mirAt(&store, callerIndex) {
+          let emitted = run Effect.result(emitWithCallee(calling, called, &target, Vector.asSlice<TypeLayout>(&layouts)))
+            |> Effect.provideMut<Allocator>(&mut allocator)
+          if let Result<Bytes, BackendGap | OutOfMemoryError>.Success {value: llvmText} = move emitted { ir = move llvmText }
+        }
+      }
+    }
+  }
+  let emitted = Bytes.asSlice(&ir)
+  run Testing.expect(emitted.length != usize.ZERO, "the observed instance emits")
+  run Testing.expect(containsIr(emitted, b"i32 %p0, ptr %observer, ptr %cause, ptr %out, ptr %fail, ptr %context)"),
+    "the observer and cause follow the parameters; the context out-address follows the failure's")
+  run Testing.expect(occurrences(emitted, b"%context") >= 2, "fail stores the context through the caller's out-address")
+  run Testing.expect(callPointers(emitted) == 5, "the call passes observer, cause, success, failure and context addresses")
+  return ()
+}
+
+// Whether the context written by the failure edge of the call to `callee` reaches the cause the
+// call to `handler` receives, through the carries between failure slots.
+fn handlerSeesEdgeContext(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, callee: string, handler: string) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      // ponytail: a fixed reach set; companions move through at most a few slots per expansion.
+      let mut reached: [usize; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      let mut count = usize.ZERO
+      let mut causeLocal = usize.MAX
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, failure, diagnostics, ..} = &blocks[at].terminator {
+          if keyNamed(&key, callee) && count == usize.ZERO {
+            if let Option<MirFailureEdge>.Some {value: edge} = &failure {
+              if let Option<MirPlace>.Some {value: companion} = &edge.context {
+                reached[usize.ZERO] = companion.local
+                count = usize.ONE
+              }
+            }
+          }
+          if keyNamed(&key, handler) {
+            if let Option<MirDiagnostics>.Some {value: observed} = &diagnostics { causeLocal = copiedLocal(&observed.cause) }
+          }
+        }
+        at = at + usize.ONE
+      }
+      if count == usize.ZERO || causeLocal == usize.MAX { return false }
+      // Follow plain moves of whole companions to a fixed point; the cause is a loan of one.
+      let mut grown = true
+      while grown {
+        grown = false
+        at = usize.ZERO
+        while at < blocks.length {
+          let statements = Vector.asSlice<MirStatement>(&blocks[at].statements)
+          let mut statementAt = usize.ZERO
+          while statementAt < statements.length {
+            if let MirStatement.Assign {destination, value, ..} = &statements[statementAt] {
+              let source = movedLocal(&value)
+              if source != usize.MAX && count < 16 && Vector.length<MirProjection>(&destination.projections) == usize.ZERO &&
+                listed(&reached, count, source) && !listed(&reached, count, destination.local) {
+                reached[count] = destination.local
+                count = count + usize.ONE
+                grown = true
+              }
+            }
+            statementAt = statementAt + usize.ONE
+          }
+          at = at + usize.ONE
+        }
+      }
+      at = usize.ZERO
+      while at < blocks.length {
+        let statements = Vector.asSlice<MirStatement>(&blocks[at].statements)
+        let mut statementAt = usize.ZERO
+        while statementAt < statements.length {
+          if let MirStatement.Assign {destination, value, ..} = &statements[statementAt] {
+            if destination.local == causeLocal {
+              if let MirRvalue.Ref {place, ..} = &value { return listed(&reached, count, place.local) }
+            }
+          }
+          statementAt = statementAt + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
+}
+
+fn movedLocal(value: &MirRvalue) -> usize {
+  if let MirRvalue.Use {value: operand} = &value.* {
+    if let MirOperand.Move {place} = &operand {
+      if Vector.length<MirProjection>(&place.projections) == usize.ZERO { return place.local }
+    }
+  }
+  return usize.MAX
+}
+
+fn listed(entries: &[usize], count: usize, wanted: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < count {
+    if entries[at] == wanted { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether the calls to `first` and `second` pass the same cause address.
+fn sameCause(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, first: string, second: string) -> bool {
+  let left = causeOperandLocal(store, answer, first)
+  return left != usize.MAX && left == causeOperandLocal(store, answer, second)
+}
+
+fn causeOperandLocal(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: string) -> usize {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, diagnostics, ..} = &blocks[at].terminator {
+          if keyNamed(&key, name) {
+            if let Option<MirDiagnostics>.Some {value: observed} = &diagnostics { return copiedLocal(&observed.cause) }
+            return usize.MAX
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return usize.MAX
+}
+
+// Whether `key` runs under an observer whose state is the nominal type `name`.
+fn observerNamed(key: &InstanceKey, name: &[u8]) -> bool {
+  let slot = match move InstanceKey.observer(key) {
+    Option<Shared<Observer>>.Some {value} => value
+    Option<Shared<Observer>>.None => { return false }
+  }
+  let state = Shared.with<Observer, Shared<Type>>(&slot, fn(observer: &Observer) -> Shared<Type> { return Shared.clone<Type>(&observer.state) })
+  return Shared.with<Type, bool>(&state, fn(ty: &Type) -> bool {
+    return match &ty.* { Type.Nominal {declaration, ..} => DeclarationId.named(&declaration, name) _ => false }
+  })
+}
+
+fn occurrences(text: &[u8], needle: &[u8]) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at + needle.length <= text.length {
+    if startsAt(text, at, needle) { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+fn startsAt(text: &[u8], at: usize, needle: &[u8]) -> bool {
+  let mut offset = usize.ZERO
+  while offset < needle.length {
+    if text[at + offset] != needle[offset] { return false }
+    offset = offset + usize.ONE
+  }
+  return true
+}
+
+// The pointer arguments of the first status-returning call.
+fn callPointers(text: &[u8]) -> usize {
+  let marker = b" = call i1 @"
+  let mut at = usize.ZERO
+  while at + marker.length <= text.length {
+    if startsAt(text, at, marker) {
+      let mut count = usize.ZERO
+      let mut cursor = at
+      while cursor + 4 <= text.length && text[cursor] != 10 {
+        if startsAt(text, cursor, b"ptr ") { count = count + usize.ONE }
+        cursor = cursor + usize.ONE
+      }
+      return count
+    }
+    at = at + usize.ONE
+  }
+  return usize.ZERO
+}
+
+effect fn localTypes(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, output: &mut Vector<Shared<Type>>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let mut at = usize.ZERO
+      while at < locals.length {
+        run Vector.append<Shared<Type>>(&mut output.*, Shared.clone<Type>(&locals[at].ty))
+        at = at + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
+// Emits `caller` with `callee` in the same closed plan, so the call resolves its symbol.
+effect fn emitWithCallee(caller: &MirFunction, callee: &MirFunction, target: &MachineTarget, layouts: &[TypeLayout]) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator {
+  let mut recipes = Vector.make<InstanceRecipe>()
+  run Vector.append<InstanceRecipe>(&mut recipes, run InstanceRecipe.make(caller))
+  run Vector.append<InstanceRecipe>(&mut recipes, run InstanceRecipe.make(callee))
+  let plan = run EmissionPlan.make(Vector.asSlice<InstanceRecipe>(&recipes))
+  let foreign = Vector.make<CAbi.Signature>()
+  let mut text = run LlvmText.emit(caller, target, layouts, Vector.asSlice<CAbi.Signature>(&foreign), &plan)
+  let called = run LlvmText.emit(callee, target, layouts, Vector.asSlice<CAbi.Signature>(&foreign), &plan)
+  run Bytes.append(&mut text, Bytes.asSlice(&called))
+  return move text
 }

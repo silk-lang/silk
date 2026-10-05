@@ -660,11 +660,15 @@ Each entry records:
     time, as the bootstrap's null observer does.
   - A capturing callback reports `observer-callback`; an observed `fail` of a type that is not
     nominal, primitive or unit reports `failure-identity`.
-- **Source migration:** none. No corpus program reaches an observer under selfhost until
-  `silk/native_start` compiles (Q1).
+  - Selfhost infers omitted `observeDiagnostics` type arguments from the operands; the bootstrap
+    requires all four (SEM0051). A fallible body or a misshapen callback is an argument type
+    mismatch at that argument in both (bootstrap SEM0012).
+- **Source migration:** write the four type arguments, as `silk/native_diagnostics` does. No
+  corpus program reaches an observer under selfhost until `silk/native_start` compiles (Q1).
 - **Diagnostics and limits:** the missing report parts are runtime presentation only; status and
   cleanup are unchanged.
-- **Evidence:** `observedFailuresCarryOriginContext` in `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `observedFailuresCarryOriginContext`, `unobservedExpansionsCarryObservedContext` and
+  `observedInstancesEmitTheContextAbi` in `compiler/src/semantic/SemanticCases.silk`.
 
 ### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
 
