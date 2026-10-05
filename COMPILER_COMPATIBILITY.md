@@ -423,8 +423,9 @@ Each entry records:
   evidence supplied at that stage. Staging through an abstract callable parameter normalizes its
   closed schema recipe before MIR, preserving the original target blueprint and exact capture
   record. Storage mode follows the actual base and newly stored fields; source promises still
-  determine consuming transport. Quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
-  scope or static evidence. Bootstrap rejects some closed contextual forwarding of a stored generic
+  determine consuming transport. Ordinary named sections with deferred invocation lifetimes remain
+  required Step 8 work. Deferred requirement rows, unapplied enclosing owners and runtime static
+  evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
   [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
@@ -932,10 +933,10 @@ repeated invocation and capture-only drop glue.
   spellings. `plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce` additionally inspects
   active-member cleanup for a union containing a Drop-bearing section. Independent bootstrap
   Analysis accepts the union source and a reached public-entry reduction has available MIR.
-- **Source migration:** none. Opaque Effect result-family admission and public Effect-contract
-  representation widening/joins, including promised union members, retain `EffectFormUnavailable`
-  at the producer call. This boundary does not exclude supported closed Effect literals and
-  compositions; those use the landed Step 9 implementation.
+- **Source migration:** none. Opaque Effect result-family admission, including promised union
+  members, retains `EffectFormUnavailable`, as the `selectedEffect() -> some<F: Effect<'static; i32>> F | i32`
+  control proves. Supported closed Effect literals/compositions use the landed Step 9 implementation
+  and are outside this gap. Public Effect representation joins are documented separately.
 
 ### Native higher-order callable result selection
 
