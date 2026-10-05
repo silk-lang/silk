@@ -767,11 +767,10 @@ repeated invocation and capture-only drop glue.
   not aggregate bootstrap's multiple return sites or simultaneous realization diagnostics.
   Discovery that exceeds the existing finite node bound stays unsupported, without claiming
   an infinite specialization proof. Effect contracts retain their named Step 9 gap.
-- **Remaining projection follow-ups:** contextual opaque slots inside aggregate results and projected
-  structural-union tags stay explicitly unsupported, rather than inventing leaf evidence from
-  nullary variants or emitting an uninjected value. Descriptor or phantom-metadata recursion may
-  also retain the explicit projection gap after physical inline validation; it is not reported
-  as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof
+- **Remaining projection follow-ups:** contextual opaque aggregate construction and structural-union
+  tag projection are covered by the later entries below. Representation-sensitive descriptor or
+  phantom-metadata recursion may retain the explicit projection gap after physical inline
+  validation; it is not reported as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof
   remains Effect/property work. Ordinary callable result provenance uses the
   separate origin query below.
 - **Evidence:** `opaqueCallableReturnsRealizeOriginalSectionStorage`,
@@ -987,8 +986,9 @@ repeated invocation and capture-only drop glue.
   remains required, including unused calls whose operands depend on an origin.
 - **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
   invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
-  projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
-  origin recipes have no runtime storage or new key/MIR representation.
+  projections and contextual opaque aggregate slots are covered by the later selected-interface
+  and producer-construction entries. Unresolved origin recipes have no runtime storage or new
+  key/MIR representation.
 - **Evidence:** the nine `finiteCallableOrigins*` cases in `CallableResultCases` cover seeded
   recursion, convergence, exact replay, generic source rejection, free union/application channels,
   canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
