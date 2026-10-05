@@ -155,7 +155,7 @@ effect fn create<
 }
 effect fn package() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let creating = create(effect { return 42 }, ready)
+  let mut creating = create(effect { return 42 }, ready)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let execution = run creating
   drop execution

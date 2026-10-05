@@ -10373,6 +10373,17 @@ function analyzeExpressionDecision(
       diagnostics.push(
         Diagnostic.runNonEffect(Type.display(subject.type), Location.at(node.anchor)),
       )
+    // A `mut Effect` runs through exclusive access, which needs a mutable root (EFFECT-OWN-002,
+    // BORROW-002), exactly as invoking a `mut fn` binding does.
+    if (
+      effect?.access === 'Exclusive' &&
+      subject.fact._tag === 'Identifier' &&
+      subject.fact.reference._tag === 'ResolvedBinding' &&
+      subject.fact.reference.binding.mutability !== 'Mutable'
+    )
+      diagnostics.push(
+        Diagnostic.invalidCallableInvocationAccess('Exclusive', Location.at(subject.fact.anchor)),
+      )
     if (unhandled.length > 0 || symbolicFailuresUnhandled)
       diagnostics.push(
         Diagnostic.unhandledEffectFailures(

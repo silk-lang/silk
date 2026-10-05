@@ -163,7 +163,7 @@ effect fn take<'call, 'data>(self: &'call mut Holder<'data>) -> &'data i32 {
 pub fn main() -> i32 {
   let value = 42
   let mut holder = Holder { value: &value, count: 0 }
-  let pending = take(&mut holder)
+  let mut pending = take(&mut holder)
   let first = run pending
   let second = run pending
   drop pending

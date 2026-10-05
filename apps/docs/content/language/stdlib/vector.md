@@ -87,7 +87,7 @@ effect fn search() -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let third = run Vector.append<i32>(&mut values, 3)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let sorting = Vector.sort<i32>(&mut values)
+  let mut sorting = Vector.sort<i32>(&mut values)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let sorted = run sorting
   let found = Vector.binarySearch<i32>(&values, 3)

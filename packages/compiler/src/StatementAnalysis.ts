@@ -739,7 +739,14 @@ export const analyzeStatements = (
           ),
         )
 
-      if (element.mutable && initializer.type !== undefined && Type.isEffect(initializer.type))
+      // Only a `mut Effect` needs a mutable binding: it runs through exclusive access
+      // (EFFECT-OWN-002, BORROW-002). Every other recipe binding stays immutable.
+      if (
+        element.mutable &&
+        initializer.type !== undefined &&
+        Type.isEffect(initializer.type) &&
+        initializer.type.access !== 'Exclusive'
+      )
         context.diagnostics.push(Diagnostic.mutableEffectRecipe(Location.at(element.anchor)))
 
       const name = bindingName(context.context, element.name)

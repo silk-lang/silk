@@ -50,7 +50,7 @@ effect fn build() -> i32
 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut map = HashMap.make<Word, i32>(Hash.seed(17))
-  let inserting = HashMap.insert<Word, i32>(&mut map, Hash.word(7), 42)
+  let mut inserting = HashMap.insert<Word, i32>(&mut map, Hash.word(7), 42)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let previous = run inserting
   drop previous
