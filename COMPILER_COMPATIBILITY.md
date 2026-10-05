@@ -752,7 +752,7 @@ repeated invocation and capture-only drop glue.
   retains exact owner evidence and does not add union-member or callback privilege.
   Authored `typeof` rejects still-open type or row selections as SEM0111, following REP-006 and
   the bootstrap; abstract applications inside checked generic bodies remain internal templates.
-  Uninferred result-only binders, quantified section lifetimes, runtime static parameters and
+  Uninferred result-only binders, explicitly quantified public section contracts, runtime static parameters and
   enclosing owner recipes keep their existing precise gaps. Unsafe acknowledgement belongs to
   invocation, including zero-argument targets. Foreign function values remain SEM0189; callable
   values remain forbidden source static data. Opaque callable result realization and retained
@@ -891,7 +891,6 @@ repeated invocation and capture-only drop glue.
   and OWN0003 at a bare returned affine owner. Both exact-head CI runs execute these assertions.
 - **Source migration:** none.
 
-
 ### Native raw owned-callable return identity guard
 
 - **Status:** bootstrap parity implemented during Step 8 on 2026-10-04 in #784;
@@ -916,7 +915,6 @@ repeated invocation and capture-only drop glue.
   documented for the nominal-domain premise difference.
 - **Source migration:** use an authored constrained type parameter when the returned owner needs
   to preserve its exact callable type, or return a known construction.
-
 
 ### Exact callable members in native structural unions
 
@@ -985,7 +983,6 @@ repeated invocation and capture-only drop glue.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
-
 
 ### Finite recursive native callable origins
 
@@ -1105,7 +1102,6 @@ repeated invocation and capture-only drop glue.
   timing verification after the normalization correction remains pending. Unresolved recipes never have storage or an executable key.
 - **Source migration:** none.
 
-
 ### Native opaque structural union projection
 
 - **Status:** implemented in a draft Step 8 layer. Exact head `71e206ba7` passed 41 of 43
@@ -1178,17 +1174,20 @@ repeated invocation and capture-only drop glue.
   representation inference does not rewrite it into a shape error. Authored generic inference keeps
   its call-level diagnostic. Invocation-variance and Effect lifetime parity are separate lanes;
   this correction does not change them. General borrow safety remains Step 14.
-- **Boundary:** eligible lifetime deferral is restricted to ordinary anonymous schemas. Named
-  quantified sections and deferred requirement rows retain their existing named gaps; broadening
-  them prematurely exposed 57 pre-existing diagnostics through Effect providers. Narrowing this
-  change restores the exact baseline PASS set and zero FAIL without translating diagnostics.
+- **Boundary:** anonymous invocation schemas retain their original lifetime-to-declaration map.
+  Ordinary named sections now use that same map when still-unsupplied operands can infer the
+  invocation lifetime, including staged sections and independent caller loans. Effect-valued
+  targets and deferred requirement rows retain their separate source-recipe boundary. The guard
+  inspects substituted result representations, union members, and target/caller contract premises;
+  an Effect hidden behind a generic result cannot enter the ordinary section lane. Explicitly
+  quantified public section contracts retain their existing gap. General borrow checking remains
+  Step 14; accepting caller lifetime evidence does not certify loan conflicts or escaping loans.
 - **Bootstrap lowering:** the focused positive probes pass bootstrap frontend analysis, but its
   build-exe backend cannot resolve the anonymous higher-order targets (the two-stage case reaches
   SEM0219). Native direct invocation deliberately implements the approved MIR design. These reduced
   programs are structured controls rather than new corpus fixtures until the main-first bootstrap
   build-exe boundary is repaired.
 - **Source migration:** none.
-
 
 ### Contextual opaque callable aggregate results
 
@@ -1212,4 +1211,22 @@ repeated invocation and capture-only drop glue.
   `DivergentOpaqueRealization` at the opaque result annotation. Ordinary assignment rejects the
   incompatible callback operand with `TypeMismatch`. No adapter, runtime code pointer, new instance
   key or MIR variant is introduced. General borrow obligations remain Step 14.
+- **Source migration:** none.
+
+### Native named sections with deferred invocation lifetimes
+
+- **Status:** implemented on the Step 8 branch; native exact-head assertions and corpus verification
+  remain pending CI. Bootstrap build-exe admits the ordinary reduced staged section.
+- **Rule:** a named section can defer its original lifetime slot when an unsupplied operand carries
+  the evidence. Each invocation opens a fresh inference owner, restores the selected lifetime to
+  the original target ordinal, and directly calls that target. Captures append in construction
+  order; invocation uses their original parameter ordinals. No adapter, pointer, MIR variant, or
+  alternate emitted-identity path is introduced.
+- **Evidence:** `namedLifetimeSectionsSelectOriginalTargetAtInvocation` checks two distinct source
+  loans against their caller declaration and syntax, original application slot 0, two direct target
+  calls, and stored suffix projection order 1/0. `namedLifetimeSectionsKeepEffectProviderBoundary`
+  asserts Unsupported codes and exact spans for opaque, selected, union-member and caller-bound
+  Effect result sections. Bootstrap currently reports SEM0052 on the selected generic Effect
+  section controls; native retains its Unsupported provider-recipe boundary until Step 9 supplies
+  that recipe, rather than admitting a partially inferred Effect construction.
 - **Source migration:** none.

@@ -569,3 +569,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · `SILK_SELFHOST_CORPUS_CASES=""` selected zero programs and the corpus runner reported success instantly · Leave the variable unset to run the whole corpus · selfhost corpus
 
 - 2026-10-05 · An anonymous fixed-Static callback negative failed native assertions because environment lifetime proof was relabeled as a signature mismatch · Preserve UnsatisfiedLifetimeBound at a plain callable operand; keep authored inference and structural mismatch diagnostics separate · selfhost Step 8
+
+- 2026-10-05 · A focused bootstrap check manifest rooted directly in src/semantic treated src/semantic as the module root and produced unrelated unknown-import diagnostics · Put the temporary import-only root in compiler/src so hir/backend/semantic imports retain the compiler module root · selfhost Step 8
