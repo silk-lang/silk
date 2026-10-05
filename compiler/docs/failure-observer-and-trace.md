@@ -35,10 +35,10 @@ handling` causes. Frames and causes follow (N7) on the same `FailureContext` sta
 
 ### 1.1 The two intrinsics
 
-| Intrinsic                                                                                                     | Signature                                                                                                                                                          | Checks                                                                                                                                                                                                                           |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `observeDiagnostics<S, A, ?R, F>(state: S, observer: F, protected: once Effect<A ? R>) -> once Effect<A ? R>` | `F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking`, shared access; `protected` has the empty failure row | A `protected` that can fail does not match (SEM0052, type-argument inference). SEM0216 when the callback's execution closure is not provably direct (unavailable summary, a suspension mode, or a reachable nested observation). |
-| `observeUnhandled() -> usize`                                                                                 | no arguments                                                                                                                                                       | SEM0217 when the site is provably outside every selected recovery handler's inherited execution closure.                                                                                                                         |
+| Intrinsic                                                                                                     | Signature                                                                                                                                                          | Checks                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `observeDiagnostics<S, A, ?R, F>(state: S, observer: F, protected: once Effect<A ? R>) -> once Effect<A ? R>` | `F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking`, shared access; `protected` has the empty failure row | A `protected` that can fail, or a callback of another shape, is an argument mismatch at that argument (SEM0012). SEM0216 when the callback's execution closure is not provably direct (unavailable summary, a suspension mode, or a reachable nested observation). |
+| `observeUnhandled() -> usize`                                                                                 | no arguments                                                                                                                                                       | SEM0217 when the site is provably outside every selected recovery handler's inherited execution closure.                                                                                                                                                           |
 
 SEM0217 seeds come from `catchFailure` handlers (the handler instance and the Effect it returns)
 and close over inherited edges only. The `protected` argument of `observeDiagnostics` and an
@@ -235,7 +235,9 @@ protocol, never `NativeDiagnostics`, `NativeReport` or the report policy.
   payloads); every carried failure a four-word copy. No callback runs until `observeUnhandled`,
   which calls it through the record's address.
 - Code size: no duplication; each instance is emitted once, in the program's mode. Building an
-  observing program lowers MIR twice (the first walk only discovers the switch).
+  observing program lowers MIR twice (the first walk only discovers the switch) and keeps both
+  modes' MIR in the query cache. Dropping the unobserving answers after the switch is a memory
+  follow-up.
 
 ### N7. Logical frames and causes (follow-up)
 
@@ -297,7 +299,7 @@ It is not added before then, as the Effect note §5 requires. The entry-shim ent
 All structured and cheap, in `SemanticCases.silk`, one shared source per test:
 
 - **Typing.** `observeDiagnostics` accepts the exact composite and rejects a fallible body (the
-  SEM0052 counterpart) and a callback of the wrong shape, asserted by code and span.
+  bootstrap's SEM0012) and a callback of the wrong shape (SEM0012), asserted by code and span.
   `observeUnhandled()` types as `usize`.
 - **MIR shape.** A program running an observation is marked `observes`; in observing mode every
   function has the hidden pair, an `Observe` run passes its record and a null cause, each `fail`
