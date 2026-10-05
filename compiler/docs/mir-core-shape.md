@@ -38,7 +38,6 @@ Operand     = Copy(Place) | Move(Place) | Integer | Float | Boolean | Unit
 Rvalue      = Use | Unary | Binary | Bitcast | Ref(access, Place) | AddressOf(access, Place)
             | Aggregate | Slice | SliceLength | Discriminant | Inject | Variant
 Statement   = Assign(Place, Rvalue) | Drop(Place, InstanceKey)
-            | **FailureContext(destination, source: Option<Place>)** (reserved; first reader)
             | **StorageLive(local) | StorageDead(local)** (borrow stage)
 Terminator  = Goto | Branch | Switch | Return | Trap | Unreachable
             | Call { callee, arguments, **providers**, destination, normal, failure: Option<FailureEdge> }
@@ -112,17 +111,11 @@ edge; there is no implicit unwinding and no landing pad.
   `Assign` into `Failure`, the same drop chain, and `Fail`.
 - `Trap` skips all cleanup (FAIL-007). Automatic `Drop` is infallible (DROP-002), so a drop chain
   has no failure edges.
-- **Diagnostic context is an explicit statement, reserved.** FAIL-006 context records the
-  authored `fail` origin and must travel with the payload through edge conversion, catch residual
-  re-injection and `ensuring` temporaries. `FailureContext { destination, source, origin }`
-  originates context at `origin` when `source` is absent (emitted by `fail x` after
-  `Assign(Failure, x)`), and carries it from failure slot `source` otherwise (emitted on every
-  move or conversion between failure slots). Both places are failure slots: the `Failure` local or
-  a `FailureEdge` destination; `Layout` gives each its fixed-size companion. A succeeding handler
-  discards it. The statement is added by the PR that adds its first reader (observer/reporting
-  intrinsics); trace frames later fill the same statement. The failure observer note retires it:
-  context is an ordinary companion local per failure slot
-  ([failure-observer-and-trace.md](failure-observer-and-trace.md) N3, Q5).
+- **Diagnostic context is ordinary MIR.** FAIL-006 context records the authored `fail` origin
+  and travels with the payload through edge conversion, catch residual re-injection and
+  `ensuring` temporaries as an ordinary companion local per failure slot, assigned at `fail` and
+  moved with every failure move. `FailureEdge.context` names the companion an observed callee
+  writes ([failure-observer-and-trace.md](failure-observer-and-trace.md) N3).
 - **Control intrinsics never appear as a MIR callee.** `Intrinsic.catchFailure`,
   `finalizeEffect` and `bindRequirement*` are expanded by lowering into ordinary calls, failure
   edges, aggregates and switches (Step 5 owns the expansion); `suspendEffect` becomes `Suspend` (§6). MIR has no
@@ -400,7 +393,7 @@ The Step 4 and Step 5 authors agreed this text on 2026-10-02. It appears verbati
 - `LocalKind.Failure` (one per function that can fail) and `LocalKind.Provider { index }` are distinct from `Return` and `Parameter`; Layout's ABI classification makes `Return` and `Failure` out-addresses when the failure type is not `never`.
 - `Terminator.Fail { origin }` exits with `Failure` initialized. `fail x` is `Assign(Failure, x)`, the Step 6 drop chain, then `Fail`. A failure-edge target converts or injects the value into `Failure` or a handler temporary, runs the drop chain of the exited scopes (innermost first, reverse acquisition order, flag-guarded), then reaches `Fail` or the handler call. There is no unwinding; `Trap` skips cleanup; automatic `Drop` is infallible.
 - Control-affecting intrinsics never appear as MIR callees; lowering expands them into ordinary MIR (Step 5 owns the expansion). `catchAll`/`catch`: failure edge into a temporary, `Discriminant`, `Switch`, `Payload` + `Inject`, then an ordinary handler `Call`. `ensuring`: both the normal and failure targets of the protected call run the finalizer (failure type `never`); the failure path then moves the temporary into `Failure` and does `Fail`.
-- Reserved: `Statement.FailureContext { destination: Place, source: Option<Place>, origin }`. `source` absent originates context at `origin` (emitted by `fail x` after `Assign(Failure, x)`); `source` present carries it from that failure slot (emitted on every move or conversion between failure slots). Both places are failure slots (the `Failure` local or a `FailureEdge` destination); Layout gives each a fixed-size companion. A succeeding handler discards it. It is added by the PR that adds its first reader; trace frames later fill the same statement.
+- Failure context: every failure slot of an observed instance has an ordinary companion local (`[string<'static>; 2]`, identity and origin). `fail x` assigns it after `Assign(Failure, x)`; every move of a failure between slots moves its companion; `FailureEdge.context` names the companion an observed callee writes through its `Context` out-slot. A succeeding handler discards it. See [the failure observer note](failure-observer-and-trace.md) N3.
 - Runners: a named effect fn keeps its written parameters as `Parameter` locals, so `run f(a)` is `Call(f, [a], providers)`; running a stored Effect built from `f` moves (once) or copies its fields into those arguments. Effect blocks and anonymous effect fns take the Step 8 closure environment as parameter 0. A closed, infallible effect fn has the ordinary fn ABI.
 
 ### Suspension (agreed by Steps 4 and 5)

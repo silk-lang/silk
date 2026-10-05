@@ -28,7 +28,7 @@ the record of the failure the current handler is recovering from. Code that neve
 observer is compiled exactly as today and pays nothing.
 
 The first native step is origin only: identity and origin, no logical frames and no `while
-handling` causes. Frames and causes follow (§7) by filling the same MIR statement.
+handling` causes. Frames and causes follow (N7) as ordinary calls on the same companions.
 
 ## 1. What the bootstrap does
 
@@ -165,8 +165,7 @@ Every failure slot of an observed instance has a companion local of the ordinary
 finalizer temporaries). The companion of `Failure` is `LocalKind.Context`, a second caller-owned
 out-slot.
 
-The reserved `Statement.FailureContext` is not needed and is retired. Every context operation is
-ordinary MIR:
+Every context operation is ordinary MIR:
 
 - **Raise.** `fail x` emits `Assign(Failure, x)`, then `Assign(Context, Aggregate [identity,
 label])` of two static strings, then the drop chain and `Fail`. When the `Failure` type is a
@@ -277,14 +276,15 @@ That is a recorded divergence (§5), retired by observed drop glue in N7.
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
-| Area                   | Bootstrap                                                | Native after the origin-only step                                      | Observable?                                        |
-| ---------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------- |
-| observer reach         | module-wide switch, every function, dispatch via pointer | specialized slot inherited by observed instances, direct callback call | no                                                 |
-| context content        | pool handle plus fallback identity and origin            | identity and origin                                                    | yes: no frames, report ends in `[trace truncated]` |
-| causes (TERM-006)      | `while handling` chains                                  | none                                                                   | yes                                                |
-| fatal traps (TERM-008) | observed traps report event 6                            | bare trap                                                              | yes                                                |
-| SEM0216, SEM0217       | executable-closure analysis                              | not diagnosed; a context-free `observeUnhandled` returns `0`           | yes: missing compile-time diagnostics              |
-| observed `Drop` hooks  | inherit observer and cause                               | run unobserved                                                         | yes: `observeUnhandled` inside one returns `0`     |
+| Area                                | Bootstrap                                                                                          | Native after the origin-only step                                                                | Observable?                                        |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------- |
+| observer reach                      | module-wide switch, every function, dispatch via pointer                                           | specialized slot inherited by observed instances, direct callback call                           | no                                                 |
+| context content                     | pool handle plus fallback identity and origin                                                      | identity and origin                                                                              | yes: no frames, report ends in `[trace truncated]` |
+| causes (TERM-006)                   | `while handling` chains                                                                            | none                                                                                             | yes                                                |
+| fatal traps (TERM-008)              | observed traps report event 6                                                                      | bare trap                                                                                        | yes                                                |
+| SEM0216, SEM0217                    | executable-closure analysis                                                                        | not diagnosed; a context-free `observeUnhandled` returns `0`                                     | yes: missing compile-time diagnostics              |
+| observed `Drop` hooks               | inherit observer and cause                                                                         | run unobserved                                                                                   | yes: `observeUnhandled` inside one returns `0`     |
+| `observeDiagnostics` type arguments | required (SEM0051 when omitted); a fallible body or misshapen callback is SEM0012 at that argument | inferred from the operands when omitted; the same mismatches are `TypeMismatch` at that argument | yes: selfhost accepts the omitted form             |
 
 **COMPILER_COMPATIBILITY.md:** the PR that first lowers `observeUnhandled` adds one entry, "Selfhost
 failure reports carry origin only", listing the rows above with their exit conditions (N7 for
