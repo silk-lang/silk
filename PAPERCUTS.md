@@ -551,3 +551,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · Indexing a borrowed projection slice again while the first Payload arm still borrows it caused OWN0011 in a test oracle · Extract an owned payload handle before reading the tail field; source-check the helper before native execution · selfhost Step 8
 
 - 2026-10-05 · A nested generic Option.Some pattern inside a Return record failed bootstrap parsing before test execution · Destructure Return then match the optional value in a separate if-let, as existing compiler walkers do · selfhost Step 8
+
+- 2026-10-05 · Automatic merges combined newly assigned CallableOrigin and EffectComposite discriminator numbers without a text conflict, making the copier choose the wrong variant · Audit the entire combined tag table and every copier guard after variant integrations; reserve distinct tags across pending layers and retain existing corpus copy coverage · selfhost Step 8
