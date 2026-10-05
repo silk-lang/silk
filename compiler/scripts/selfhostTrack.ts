@@ -72,4 +72,7 @@ export const selfhostTrack = [
   'effect-ensuring-fallible-finalizer',
   'role-keyed-service-provider-selection',
   'owned-provider-shared-dispatch',
+  'constrained-callable-forwarding',
+  'constrained-section-two-applications',
+  'stdout-writer-hello',
 ] as const satisfies ReadonlyArray<string>
