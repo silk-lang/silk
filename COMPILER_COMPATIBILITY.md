@@ -995,6 +995,13 @@ repeated invocation and capture-only drop glue.
   unused dependencies and every distinct existing assertion remain unchanged. Native timing
   improvement and the newly integrated upstream head require fresh exact-head evidence.
 
+- **Direct normalization cost correction:** direct child/contract walkers use the same settled-tree
+  sharing predicate as result normalization. Unions, unresolved recipes, views, stages and static-
+  bearing applications retain full normalization. The suffix control reads its canonical section
+  from the main call's actual MIR destination and its independent leaf from the factory's checked
+  return operand, retaining the original invocation and rejection assertions while avoiding two
+  redundant MIR demands. New Linux timings remain pending.
+
 ### Native inferred opaque callable record fields
 
 - **Status:** implemented in a draft Step 8 layer; bootstrap compiler source checking passes.

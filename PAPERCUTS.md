@@ -549,3 +549,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · A partial-cleanup assertion bound `index` inside a function already owning an `index` local, producing cascading OWN0011/SEM0135 errors · Use `fieldIndex` and fix the first SEM0048 before investigating borrowed-view cascades · selfhost Step 8
 
 - 2026-10-05 · Indexing a borrowed projection slice again while the first Payload arm still borrows it caused OWN0011 in a test oracle · Extract an owned payload handle before reading the tail field; source-check the helper before native execution · selfhost Step 8
+
+- 2026-10-05 · A nested generic Option.Some pattern inside a Return record failed bootstrap parsing before test execution · Destructure Return then match the optional value in a separate if-let, as existing compiler walkers do · selfhost Step 8
