@@ -66,6 +66,8 @@ pub union LocalKind {
   /// The caller-owned failure out-slot of a function whose failure type is not `never` (Effect
   /// note D3). `Fail` exits with it initialized.
   Failure,
+  /// The address of the provider of requirement entry `index`, in canonical key order (D2).
+  Provider {pub index: usize},
   /// A `bool` that records whether owned local `local` still needs its drop, where ownership
   /// differs between the paths that reach a join (MIR core shape §3).
   DropFlag {pub local: usize},
@@ -142,6 +144,8 @@ pub union Terminator {
   Call {
     pub callee: Callee,
     pub arguments: Vector<Operand>,
+    /// Provider addresses in the callee's canonical requirement-key order (D2).
+    pub providers: Vector<Operand>,
     pub destination: Place,
     pub normal: usize,
     /// Present exactly when the callee's failure type is not `never`.
@@ -274,6 +278,29 @@ pub struct CallTarget {
   /// A section appends these environment fields in target parameter order. They are operands
   /// of the original direct call, never an adapter or a distinct instance identity.
   pub stored: Option<StoredArguments>
+  /// Where each provider of the callee's requirement row comes from, in its key order (D2).
+  pub providers: Vector<ProviderSource>
+  /// A service operation's witness receives the dispatched provider's address first (D2).
+  pub dispatch: Option<ProviderSource>
+}
+
+/// The source of one provider address passed to a callee (Effect note D2).
+pub union ProviderSource {
+  /// This function's own provider of requirement entry `index`.
+  Own {pub index: usize},
+  /// The provider stored in part 1 of the `depth`th binding enclosing the run, outermost first;
+  /// `owned` when the part holds the provider value itself rather than its loan.
+  Bound {pub depth: usize, pub owned: bool, pub access: Access, pub address: Shared<Type>},
+}
+
+impl ProviderSource {
+  pub fn copy(self: &Self) -> ProviderSource {
+    return match &self.* {
+      ProviderSource.Own {index} => ProviderSource.Own {index: index}
+      ProviderSource.Bound {depth, owned, access, address} => ProviderSource.Bound {depth: depth, owned: owned,
+        access: access, address: Shared.clone<Type>(&address)}
+    }
+  }
 }
 
 pub struct StoredArguments {
@@ -324,6 +351,14 @@ pub union RunPlan {
     /// The resource's type when it owns cleanup.
     pub resourceDrop: Option<Shared<Type>>,
   },
+  /// Runs part 0 with the provider in part 1 bound for one requirement key (D2 rule 2): only
+  /// this execution sees the replacement.
+  Bind {pub inner: usize},
+}
+
+// The place of the provider stored by one binding that encloses the current expansion.
+struct BoundPlace {
+  place: Place
 }
 
 /// The expansion prepared for one `run` of a composed Effect: its steps, each after the steps it
@@ -381,6 +416,8 @@ struct Builder {
   failure: usize
   // The expansions of runs of composed Effects, each consumed by its run node.
   plans: Vector<NodePlan>
+  // This function's `Provider` locals in canonical requirement-key order.
+  providers: Vector<usize>
 }
 
 // Where a failure inside an expansion goes: out of this function, or into a handler's temporary.
@@ -2497,11 +2534,13 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       let output = run temporary(&mut builder.*, &ty, origin)
       let continuation = run block(&mut builder.*, origin)
       let target = run callCallee(&mut builder.*, move foreign, callNode, &owner, origin)
+      let providers = run targetProviders(&mut builder.*, callNode, origin)
       terminate(
         &mut builder.*,
         Terminator.Call {
           callee: move target,
           arguments: move values,
+          providers: move providers,
           destination: place(output),
           normal: continuation,
           failure: Option.none<FailureEdge>(),
@@ -3184,7 +3223,8 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
     }
     let output = run temporary(&mut builder.*, ty, origin)
     let root = Vector.length<RunPlan>(&steps) - usize.ONE
-    run executePlan(&mut builder.*, Vector.asSlice<RunPlan>(&steps), root, &stored, output, &FailureSink.Propagate, origin)
+    let mut bound = Vector.make<BoundPlace>()
+    run executePlan(&mut builder.*, Vector.asSlice<RunPlan>(&steps), root, &stored, output, &FailureSink.Propagate, &mut bound, origin)
     return Operand.Copy {place: place(output)}
   }
   let construction = run instanceView(&builder.*, body, value)
@@ -3222,8 +3262,15 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
     Option<Shared<Type>>.Some {value: selected} => selected
     Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
   }
-  let values = run callArguments(&mut builder.*, body, hir, node, count, environment || invoked, &Option.none<Shared<DeclarationId>>(), origin)
+  let mut values = run callArguments(&mut builder.*, body, hir, node, count, environment || invoked, &Option.none<Shared<DeclarationId>>(), origin)
   if !builder.live { return Operand.Unit }
+  // A service operation's witness takes the dispatched provider's address as its receiver.
+  let dispatched = callDispatch(&builder.*, node)
+  if let Option<ProviderSource>.Some {value: dispatch} = &dispatched {
+    let none = Vector.make<BoundPlace>()
+    let receiver = run providerOperand(&mut builder.*, &dispatch, Vector.asSlice<BoundPlace>(&none), origin)
+    run Vector.insert<Operand>(&mut values, usize.ZERO, move receiver)
+  }
   let output = run temporary(&mut builder.*, ty, origin)
   let continuation = run block(&mut builder.*, origin)
   let target = run callCallee(&mut builder.*, Option.none<Shared<DeclarationId>>(), node, &owner, origin)
@@ -3236,9 +3283,10 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
     handler = run block(&mut builder.*, origin)
     edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
   }
+  let providers = run targetProviders(&mut builder.*, node, origin)
   terminate(&mut builder.*, Terminator.Call {
-    callee: move target, arguments: move values, destination: place(output), normal: continuation,
-    failure: move edge, origin: origin,
+    callee: move target, arguments: move values, providers: move providers, destination: place(output),
+    normal: continuation, failure: move edge, origin: origin,
   })
   if handler != usize.MAX {
     resume(&mut builder.*, handler)
@@ -3402,10 +3450,16 @@ effect fn placeArguments(builder: &mut Builder, target: &CallTarget, environment
 // Calls a prepared target, writing success to `output` (injected when `output` is a wider union)
 // and routing a failure to `sink`. Emission continues on the success edge.
 effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Place, written: Vector<Operand>,
-  success: &Shared<Type>, failure: &Shared<Type>, output: usize, sink: &FailureSink, origin: Origin) -> ()
+  success: &Shared<Type>, failure: &Shared<Type>, output: usize, sink: &FailureSink, bound: &[BoundPlace], origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
-  let values = run placeArguments(&mut builder.*, target, environment, move written, origin)
+  let mut supplied = move written
+  if let Option<ProviderSource>.Some {value: dispatch} = &target.dispatch {
+    let receiver = run providerOperand(&mut builder.*, &dispatch, bound, origin)
+    run Vector.insert<Operand>(&mut supplied, usize.ZERO, move receiver)
+  }
+  let values = run placeArguments(&mut builder.*, target, environment, move supplied, origin)
+  let providers = run providerOperands(&mut builder.*, Vector.asSlice<ProviderSource>(&target.providers), bound, origin)
   let outputType = localType(&builder.*, output)
   let mut destination = output
   let direct = run Type.runtimeEqualsShared(success, &outputType)
@@ -3422,7 +3476,8 @@ effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Pla
     edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
   }
   terminate(&mut builder.*, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(&target.key)},
-    arguments: move values, destination: place(destination), normal: continuation, failure: move edge, origin: origin})
+    arguments: move values, providers: move providers, destination: place(destination), normal: continuation,
+    failure: move edge, origin: origin})
   if handler != usize.MAX {
     resume(&mut builder.*, handler)
     run deliverFailure(&mut builder.*, caught, failure, sink, origin)
@@ -3460,11 +3515,19 @@ effect fn projectedPart(environment: &Place, index: usize) -> Place ! OutOfMemor
 
 // Expands one composed Effect stored at `environment` into calls and edges (Effect note D4).
 effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, environment: &Place, output: usize,
-  sink: &FailureSink, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  sink: &FailureSink, bound: &mut Vector<BoundPlace>, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
   match &steps[step] {
     RunPlan.Runner {target, success, failure} => {
-      run planCall(&mut builder.*, &target, environment, Vector.make<Operand>(), &success, &failure, output, sink, origin)
+      run planCall(&mut builder.*, &target, environment, Vector.make<Operand>(), &success, &failure, output, sink,
+        Vector.asSlice<BoundPlace>(&bound.*), origin)
+    }
+    RunPlan.Bind {inner} => {
+      // The provider part stays in place; its address reaches every runner below this binding.
+      run Vector.append<BoundPlace>(&mut bound.*, BoundPlace {place: run projectedPart(environment, usize.ONE)})
+      let protectedPart = run projectedPart(environment, usize.ZERO)
+      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, &mut bound.*, origin)
+      drop Vector.pop<BoundPlace>(&mut bound.*)
     }
     RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop} => {
       // The protected Effect fails into a temporary of its own failure type; the edge selects.
@@ -3474,7 +3537,7 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let protectedPart = run projectedPart(environment, usize.ZERO)
       let handlerPart = run projectedPart(environment, usize.ONE)
       let local = FailureSink.Catch {temp: caught, block: selecting}
-      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &local, origin)
+      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &local, &mut bound.*, origin)
       run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, selecting)
@@ -3490,7 +3553,7 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
         Option<Vector<Shared<Type>>>.None => {
           // One failure type, or the whole failure: it is the selection.
           run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(Operand.Move {place: place(caught)}),
-            &handlerSuccess, &handlerFailure, output, sink, origin)
+            &handlerSuccess, &handlerFailure, output, sink, Vector.asSlice<BoundPlace>(&bound.*), origin)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
           resume(&mut builder.*, joined)
           return ()
@@ -3531,7 +3594,7 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
             argument = Operand.Move {place: place(injected)}
           }
           run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument), &handlerSuccess, &handlerFailure,
-            output, sink, origin)
+            output, sink, Vector.asSlice<BoundPlace>(&bound.*), origin)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
         } else {
           run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
@@ -3545,18 +3608,19 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let protectedPart = run projectedPart(environment, usize.ZERO)
       let finalizerPart = run projectedPart(environment, usize.ONE)
       if Shared.with<Type, bool>(&innerFailure, neverType) {
-        run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, origin)
-        return run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, origin)
+        run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, &mut bound.*, origin)
+        return run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       }
       // Both exits run the finalizer; a failure is held in `caught` until it has finished (D4).
       let caught = run temporary(&mut builder.*, &innerFailure, origin)
       let failing = run block(&mut builder.*, origin)
       let joined = run block(&mut builder.*, origin)
-      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &FailureSink.Catch {temp: caught, block: failing}, origin)
-      run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, origin)
+      run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &FailureSink.Catch {temp: caught, block: failing},
+        &mut bound.*, origin)
+      run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, failing)
-      run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, origin)
+      run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       run deliverFailure(&mut builder.*, caught, &innerFailure, sink, origin)
       resume(&mut builder.*, joined)
     }
@@ -3568,19 +3632,22 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run assign(&mut builder.*, place(borrowed), Rvalue.Ref {access: Access.Mutable, place: run copyPlace(&resource)}, origin)
       let used = run singleOperand(Operand.Copy {place: place(borrowed)})
       if Shared.with<Type, bool>(&useFailure, neverType) {
-        run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output, sink, origin)
+        run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output, sink,
+          Vector.asSlice<BoundPlace>(&bound.*), origin)
         return run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
-          &resourceDrop, origin)
+          &resourceDrop, Vector.asSlice<BoundPlace>(&bound.*), origin)
       }
       let caught = run temporary(&mut builder.*, &useFailure, origin)
       let failing = run block(&mut builder.*, origin)
       let joined = run block(&mut builder.*, origin)
       run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output,
-        &FailureSink.Catch {temp: caught, block: failing}, origin)
-      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop, origin)
+        &FailureSink.Catch {temp: caught, block: failing}, Vector.asSlice<BoundPlace>(&bound.*), origin)
+      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
+        Vector.asSlice<BoundPlace>(&bound.*), origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, failing)
-      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop, origin)
+      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
+        Vector.asSlice<BoundPlace>(&bound.*), origin)
       run deliverFailure(&mut builder.*, caught, &useFailure, sink, origin)
       resume(&mut builder.*, joined)
     }
@@ -3590,21 +3657,89 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
 
 // Runs a `() ! never` finalizer step into a fresh unit temporary.
 effect fn finalizeOnce(builder: &mut Builder, steps: &[RunPlan], step: usize, part: &Place, success: &Shared<Type>,
-  origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  bound: &mut Vector<BoundPlace>, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let done = run temporary(&mut builder.*, success, origin)
-  return run executePlan(&mut builder.*, steps, step, part, done, &FailureSink.Propagate, origin)
+  return run executePlan(&mut builder.*, steps, step, part, done, &FailureSink.Propagate, &mut bound.*, origin)
 }
 
 // Lends the resource afresh to `release`, runs the Effect it returns, then drops the resource.
 effect fn releaseOnce(builder: &mut Builder, release: &CallTarget, part: &Place, resource: &Place, lent: &Shared<Type>,
-  success: &Shared<Type>, failure: &Shared<Type>, resourceDrop: &Option<Shared<Type>>, origin: Origin) -> ()
+  success: &Shared<Type>, failure: &Shared<Type>, resourceDrop: &Option<Shared<Type>>, bound: &[BoundPlace], origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
   let borrowed = run temporary(&mut builder.*, lent, origin)
   run assign(&mut builder.*, place(borrowed), Rvalue.Ref {access: Access.Mutable, place: run copyPlace(resource)}, origin)
   let done = run temporary(&mut builder.*, success, origin)
   run planCall(&mut builder.*, release, part, run singleOperand(Operand.Copy {place: place(borrowed)}), success, failure, done,
-    &FailureSink.Propagate, origin)
+    &FailureSink.Propagate, bound, origin)
   return run dropUnused(&mut builder.*, resource, resourceDrop, origin)
+}
+
+// One provider address: this function's own provider, or a binding's stored provider (D2).
+effect fn providerOperand(builder: &mut Builder, source: &ProviderSource, bound: &[BoundPlace], origin: Origin) -> Operand
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  match &source.* {
+    ProviderSource.Own {index} => {
+      if index >= Vector.length<usize>(&builder.providers) { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      return Operand.Copy {place: place(Vector.asSlice<usize>(&builder.providers)[index])}
+    }
+    ProviderSource.Bound {depth, owned, access, address} => {
+      if depth >= bound.length { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      if !owned { return Operand.Copy {place: run copyPlace(&bound[depth].place)} }
+      let reference = run temporary(&mut builder.*, &address, origin)
+      run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: run copyPlace(&bound[depth].place)}, origin)
+      return Operand.Copy {place: place(reference)}
+    }
+  }
+}
+
+effect fn providerOperands(builder: &mut Builder, sources: &[ProviderSource], bound: &[BoundPlace], origin: Origin) -> Vector<Operand>
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<Operand>()
+  let mut at = usize.ZERO
+  while at < sources.length {
+    run Vector.append<Operand>(&mut values, run providerOperand(&mut builder.*, &sources[at], bound, origin))
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+// The provider addresses of the direct call prepared for `node`. Outside an expansion every
+// source is this function's own provider (D2 rule 1).
+effect fn targetProviders(builder: &mut Builder, node: BodyNodeId, origin: Origin) -> Vector<Operand>
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut sources = Vector.make<ProviderSource>()
+  let calls = Vector.asSlice<CallTarget>(&builder.calls)
+  let mut at = usize.ZERO
+  while at < calls.length {
+    if calls[at].node.index == node.index {
+      let listed = Vector.asSlice<ProviderSource>(&calls[at].providers)
+      let mut index = usize.ZERO
+      while index < listed.length {
+        run Vector.append<ProviderSource>(&mut sources, ProviderSource.copy(&listed[index]))
+        index = index + usize.ONE
+      }
+      break
+    }
+    at = at + usize.ONE
+  }
+  let none = Vector.make<BoundPlace>()
+  return run providerOperands(&mut builder.*, Vector.asSlice<ProviderSource>(&sources), Vector.asSlice<BoundPlace>(&none), origin)
+}
+
+fn callDispatch(builder: &Builder, node: BodyNodeId) -> Option<ProviderSource> {
+  let calls = Vector.asSlice<CallTarget>(&builder.calls)
+  let mut at = usize.ZERO
+  while at < calls.length {
+    if calls[at].node.index == node.index {
+      return match &calls[at].dispatch {
+        Option<ProviderSource>.Some {value} => Option.some<ProviderSource>(ProviderSource.copy(&value))
+        Option<ProviderSource>.None => Option.none<ProviderSource>()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<ProviderSource>()
 }
 
 effect fn singleOperand(value: Operand) -> Vector<Operand> ! OutOfMemoryError ? &mut Allocator {
@@ -4232,6 +4367,7 @@ impl MirFunction {
         terminator: Terminator.Call {
           callee: Callee.Instance {key: InstanceKey.copy(&callee)},
           arguments: Vector.make<Operand>(),
+          providers: Vector.make<Operand>(),
           destination: place(usize.ZERO),
           normal: usize.ONE,
           failure: Option.none<FailureEdge>(),
@@ -4267,34 +4403,17 @@ impl MirFunction {
     result: &Shared<Type>,
     failure: &Shared<Type>,
     parameters: &[Shared<Type>],
+    providers: &[Shared<Type>],
     calls: Vector<CallTarget>,
     plans: Vector<NodePlan>,
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
     projections: Vector<RuntimeProjection>,
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
-    let identity = InstanceKey.identity(&key)
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
     let supplied = Vector.asSlice<Binding>(&bindings)
     let selectedProjections = Vector.asSlice<RuntimeProjection>(&projections)
-    let mut argumentAt = usize.ZERO
-    while argumentAt < supplied.length {
-      if let Argument.Row {value: row} = &supplied[argumentAt].value {
-        let nonempty = Shared.with<Row, bool>(
-          &row,
-          fn(value: &Row) -> bool {
-            return Vector.length<Requirement>(&value.entries) > usize.ZERO || Vector.length<
-              RowParameter,
-            >(&value.parameters) > usize.ZERO
-          },
-        )
-        if nonempty {
-          fail Gap.make(GapCode.EffectInstance, &identity, bodyOrigin(body).span)
-        }
-      }
-      argumentAt = argumentAt + usize.ONE
-    }
 
     let closedResult = run RuntimeType.applyBindings(result, supplied, selectedProjections)
     let root = bodyRoot(body)
@@ -4333,6 +4452,15 @@ impl MirFunction {
       )
       at = at + usize.ONE
     }
+    // One hidden provider address per requirement entry, after the written parameters (D2).
+    let mut providerLocals = Vector.make<usize>()
+    let mut providerAt = usize.ZERO
+    while providerAt < providers.length {
+      run Vector.append<usize>(&mut providerLocals, Vector.length<Local>(&locals))
+      run Vector.append<Local>(&mut locals, Local {ty: Shared.clone<Type>(&providers[providerAt]),
+        kind: LocalKind.Provider {index: providerAt}, origin: origin})
+      providerAt = providerAt + usize.ONE
+    }
     // A function that can fail writes its failure value to a caller-owned out-slot (D3).
     let mut failureLocal = usize.MAX
     let closedFailure = run Type.applyBindings(failure, supplied, true)
@@ -4365,6 +4493,7 @@ impl MirFunction {
       needs: move needs,
       failure: failureLocal,
       plans: move plans,
+      providers: move providerLocals,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)

@@ -11,7 +11,7 @@ import hir.Hir {
   ParameterMode,
   PrefixOperator,
 }
-import backend.InstanceKey {InstanceKey}
+import backend.InstanceKey {InstanceKey, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity}
 import backend.Layout {
@@ -20821,7 +20821,8 @@ effect fn recipeControlMir(key: &InstanceKey, callees: &[InstanceKey], constant:
   while at < callees.length {
     run Vector.append<MirBlock>(&mut blocks, MirBlock {statements: Vector.make<MirStatement>(),
       terminator: MirTerminator.Call {callee: MirCallee.Instance {key: InstanceKey.copy(&callees[at])},
-        arguments: Vector.make<MirOperand>(), destination: MirPlace {local: usize.ZERO, projections: Vector.make<MirProjection>()},
+        arguments: Vector.make<MirOperand>(), providers: Vector.make<MirOperand>(),
+        destination: MirPlace {local: usize.ZERO, projections: Vector.make<MirProjection>()},
         normal: at + usize.ONE, failure: Option.none<MirFailureEdge>(), origin: origin}})
     at = at + usize.ONE
   }
@@ -24243,6 +24244,295 @@ effect fn rethrows() -> i32 ! Residual { return run Intrinsic.catchFailure<Selec
   run Testing.expect(rejectsSpan(&wrong, RejectionCode.InvalidEffectHandler, text, "recoverSelected", 2),
     "a handler that does not accept the selected failures is rejected at the handler")
   return ()
+}
+
+// Providers (Effect note D2): an instance receives its row's providers in canonical key order, a
+// binding serves its key to the enclosed run only, and a service operation calls the witness for
+// the serving provider's type with that provider's address as its receiver.
+test effect fn providersServeRowsInKeyOrder() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("providers.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+role Left
+role Right
+service Values {
+  effect fn left() -> i32 ? &Values at Left
+  effect fn right() -> i32 ? &Values at Right
+}
+struct Fixed { value: i32 }
+effect fn left(self: &Fixed) -> i32 { return self.value }
+effect fn right(self: &Fixed) -> i32 { return self.value }
+impl Values for Fixed { left: Fixed.left right: Fixed.right }
+effect fn total() -> i32 ? &Values at Right | &Values at Left {
+  let leftValue = run Values.left()
+  let pending = Values.right()
+  let rightValue = run pending
+  return leftValue * 10 + rightValue
+}
+fn both() -> i32 {
+  let leftProvider = Fixed { value: 4 }
+  let rightProvider = Fixed { value: 2 }
+  return run Intrinsic.bindRequirement<Values at Right>(Intrinsic.bindRequirement<Values at Left>(total(), &leftProvider), &rightProvider)
+}
+fn partial() -> i32 {
+  let provider = Fixed { value: 1 }
+  return run Intrinsic.bindRequirement<Values at Left>(total(), &provider)
+}
+fn wrongShape() -> i32 {
+  let shapeProvider = Fixed { value: 1 }
+  return run Intrinsic.bindRequirementMut<Values at Left>(total(), &shapeProvider)
+}
+interface Present { effect fn present(value: &Self) -> i32 }
+impl Present for i32 { effect fn present(value: &Self) -> i32 { return 1 } }
+effect fn presented(value: &i32) -> i32 { return run Present.present(value) }
+effect fn pendingPresent(value: &i32) -> i32 {
+  let pending = Present.present(value)
+  return 0
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let both = run Semantic.demandMir(&mut store, &mut request, &id, b"both") |> Effect.provideMut<Allocator>(&mut allocator)
+  let called = providedCallee(&store, &both, "total")
+  run Testing.expect(boundProvidersByDepth(&store, &both),
+    "each binding serves its key to the enclosed run, the inner binding from deeper in the stored composite, in callee key order")
+  if let Option<InstanceKey>.Some {value: key} = move called {
+    let total = run Semantic.demandInstanceMir(&mut store, &mut request, &key) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(dispatchesOwnProvider(&store, &total, &key, "left", "Left") && dispatchesOwnProvider(&store, &total, &key, "right", "Right"),
+      "a service operation, run directly or stored first, calls its witness with the provider local of its own key as the receiver")
+  } else {
+    run Testing.expect(false, "running the bound composite calls total with its providers in its key")
+  }
+  let partial = run Semantic.demandBody(&mut store, &mut request, &id, b"partial") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsSpan(&partial, RejectionCode.UnhandledRequirement, text,
+    "run Intrinsic.bindRequirement<Values at Left>(total(), &provider)", 0),
+    "a binding removes only its selected key; the rest of the row must still be covered")
+  let wrongShape = run Semantic.demandBody(&mut store, &mut request, &id, b"wrongShape") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsSpan(&wrongShape, RejectionCode.TypeMismatch, text, "&shapeProvider", 0),
+    "an exclusive binding takes an exclusive provider loan")
+  let presented = run Semantic.demandMir(&mut store, &mut request, &id, b"presented") |> Effect.provideMut<Allocator>(&mut allocator)
+  let pendingPresent = run Semantic.demandMir(&mut store, &mut request, &id, b"pendingPresent") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(backendGapAt(&presented, GapCode.TypedForm, text, "Present.present(value)", 0)
+    && backendGapAt(&pendingPresent, GapCode.TypedForm, text, "Present.present(value)", 1),
+    "running or constructing an effect fn through an interface stops before lowering; no witness is called eagerly")
+  return ()
+}
+
+fn backendGapAt(answer: &Shared<Result<Answer, NoRejection>>, code: GapCode, text: string, spelling: string,
+  occurrence: usize) -> bool {
+  let found = Shared.with<Result<Answer, NoRejection>, Option<Shared<BackendGap>>>(answer, selectedBackendGap)
+  if let Option<Shared<BackendGap>>.Some {value} = move found {
+    let start = offsetOf(text, spelling, occurrence)
+    return Shared.with<BackendGap, bool>(&value, fn(gap: &BackendGap) -> bool {
+      let site = BackendGap.span(gap)
+      return gap.code == code && site.start == start && site.end == start + String.utf8Bytes(spelling).length
+    })
+  }
+  return false
+}
+
+// D2 rule 2: a binding replaces an instance's own provider for the run it encloses only; a
+// handler outside that binding is served by the instance's own provider of the same key.
+test effect fn bindingsShadowOwnProvidersForTheirRunOnly() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("provider-scopes.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+role Left
+role Right
+service Values {
+  effect fn left() -> i32 ? &Values at Left
+  effect fn right() -> i32 ? &Values at Right
+}
+struct Fixed { value: i32 }
+effect fn left(self: &Fixed) -> i32 { return self.value }
+effect fn right(self: &Fixed) -> i32 { return self.value }
+impl Values for Fixed { left: Fixed.left right: Fixed.right }
+struct Problem { code: i32 }
+effect fn risky() -> i32 ! Problem ? &Values at Left | &Values at Right {
+  let leftValue = run Values.left()
+  let rightValue = run Values.right()
+  if leftValue > rightValue { fail Problem { code: leftValue } }
+  return rightValue
+}
+effect fn recover(problem: Problem) -> i32 ? &Values at Left { return run Values.left() }
+effect fn shadowing() -> i32 ? &Values at Left | &Values at Right {
+  let inner = Fixed { value: 7 }
+  return run Intrinsic.catchFailure<Problem>(Intrinsic.bindRequirement<Values at Left>(risky(), &inner), recover)
+}
+fn outer() -> i32 {
+  let leftProvider = Fixed { value: 4 }
+  let rightProvider = Fixed { value: 2 }
+  return run Intrinsic.bindRequirement<Values at Right>(Intrinsic.bindRequirement<Values at Left>(shadowing(), &leftProvider), &rightProvider)
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let outer = run Semantic.demandMir(&mut store, &mut request, &id, b"outer") |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Option<InstanceKey>.Some {value: key} = move providedCallee(&store, &outer, "shadowing") {
+    let shadowing = run Semantic.demandInstanceMir(&mut store, &mut request, &key) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(providerOrigin(&store, &shadowing, "risky", "Left") == usize.ONE
+      && providerOrigin(&store, &shadowing, "risky", "Right") == usize.ZERO,
+      "inside the binding its key comes from the stored provider and every other key from the instance's own")
+    run Testing.expect(providerOrigin(&store, &shadowing, "recover", "Left") == usize.ZERO,
+      "the handler outside the binding sees the instance's own provider of the same key")
+    return ()
+  }
+  run Testing.expect(false, "the outer binding runs shadowing with its providers in its key")
+}
+
+// Where the provider of `roleName` passed to the call of `name` comes from: 0 for this
+// instance's own Provider local, 1 for a binding's stored provider, usize.MAX otherwise.
+fn providerOrigin(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: string, roleName: string) -> usize {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, providers, ..} = &blocks[at].terminator {
+          if keyNamed(&key, name) {
+            let entries = match move InstanceKey.providers(&key) {
+              Option<Shared<Vector<ProviderEntry>>>.Some {value} => value
+              Option<Shared<Vector<ProviderEntry>>>.None => { return usize.MAX }
+            }
+            let slot = Shared.with<Vector<ProviderEntry>, usize>(&entries, fn(values: &Vector<ProviderEntry>) -> usize {
+              let listed = Vector.asSlice<ProviderEntry>(values)
+              let mut entry = usize.ZERO
+              while entry < listed.length && !roleNamed(&listed[entry], roleName) { entry = entry + usize.ONE }
+              return entry
+            })
+            let operands = Vector.asSlice<MirOperand>(&providers)
+            if slot >= operands.length { return usize.MAX }
+            let projected = copiedProjections(&operands[slot])
+            if projected == usize.MAX { return usize.MAX }
+            if projected > usize.ZERO { return usize.ONE }
+            let local = copiedLocal(&operands[slot])
+            if local >= locals.length { return usize.MAX }
+            return match &locals[local].kind { MirLocalKind.Provider {..} => usize.ZERO _ => usize.MAX }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return usize.MAX
+}
+
+fn roleNamed(entry: &ProviderEntry, name: string) -> bool {
+  return match &entry.key.roleType {
+    Option<Shared<Type>>.Some {value} => Shared.with<Type, bool>(&value, fn(ty: &Type) -> bool {
+      return match &ty.* { Type.Nominal {declaration, ..} => DeclarationId.named(&declaration, String.utf8Bytes(name)) _ => false }
+    })
+    Option<Shared<Type>>.None => false
+  }
+}
+
+fn keyNamed(key: &InstanceKey, name: string) -> bool {
+  return Shared.with<DeclarationId, bool>(&InstanceKey.identity(key), fn(value: &DeclarationId) -> bool {
+    return DeclarationId.named(value, String.utf8Bytes(name))
+  })
+}
+
+// The callee key of the first call to `name`, providers included.
+fn providedCallee(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: string) -> Option<InstanceKey> {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+          if keyNamed(&key, name) { return Option.some<InstanceKey>(InstanceKey.copy(&key)) }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<InstanceKey>()
+}
+
+fn copiedLocal(operand: &MirOperand) -> usize {
+  return match &operand.* { MirOperand.Copy {place} => place.local _ => usize.MAX }
+}
+
+fn copiedProjections(operand: &MirOperand) -> usize {
+  return match &operand.* { MirOperand.Copy {place} => Vector.length<MirProjection>(&place.projections) _ => usize.MAX }
+}
+
+// The call to `total` passes two stored provider loans in its key order: the outer binding's part
+// 1 (Right) and the inner binding's, one part deeper (Left).
+fn boundProvidersByDepth(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, providers, ..} = &blocks[at].terminator {
+          if keyNamed(&key, "total") {
+            let entries = match move InstanceKey.providers(&key) {
+              Option<Shared<Vector<ProviderEntry>>>.Some {value} => value
+              Option<Shared<Vector<ProviderEntry>>>.None => { return false }
+            }
+            let operands = Vector.asSlice<MirOperand>(&providers)
+            if operands.length != 2 { return false }
+            let firstLeft = Shared.with<Vector<ProviderEntry>, bool>(&entries, fn(values: &Vector<ProviderEntry>) -> bool {
+              let listed = Vector.asSlice<ProviderEntry>(values)
+              return roleNamed(&listed[usize.ZERO], "Left")
+            })
+            let first = copiedProjections(&operands[usize.ZERO])
+            let second = copiedProjections(&operands[usize.ONE])
+            if first == usize.MAX || second == usize.MAX { return false }
+            if firstLeft { return first == second + usize.ONE }
+            return second == first + usize.ONE
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
+}
+
+// The call to witness `name` receives, first, the provider local whose key entry has role `role`.
+fn dispatchesOwnProvider(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, instance: &InstanceKey, name: string,
+  roleName: string) -> bool {
+  let entries = match move InstanceKey.providers(instance) {
+    Option<Shared<Vector<ProviderEntry>>>.Some {value} => value
+    Option<Shared<Vector<ProviderEntry>>>.None => { return false }
+  }
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          if keyNamed(&key, name) {
+            let passed = Vector.asSlice<MirOperand>(&arguments)
+            if passed.length == usize.ZERO || copiedProjections(&passed[usize.ZERO]) != usize.ZERO { return false }
+            let local = copiedLocal(&passed[usize.ZERO])
+            if local >= locals.length { return false }
+            return match &locals[local].kind {
+              MirLocalKind.Provider {index: provider} => Shared.with<Vector<ProviderEntry>, bool>(&entries, fn(values: &Vector<ProviderEntry>) -> bool {
+                let listed = Vector.asSlice<ProviderEntry>(values)
+                return provider < listed.length && roleNamed(&listed[provider], roleName)
+              })
+              _ => false
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
 }
 
 // Local closures are part of their owner's declaration graph: re-entering the owner through one
@@ -33006,6 +33296,115 @@ effect fn callableUnionDropBlock(block: &MirBlock, environment: &Shared<Type>, t
       return false
     }
     at = at + usize.ONE
+  }
+  return false
+}
+
+
+// A generic binding in the shape of `Effect.bindRequirementOwned` serves its key from the owned
+// provider inside its own instance, whose row is then empty; the provider type keys the callee.
+test effect fn ownedProviderServesGenericBinding() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("owned-providers.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+effect<'env> fn bindOwned<'env, ?S, A, P: 'env, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: P) -> A ! E ? Without<R, S>
+where P provides S from R {
+  let bound = Intrinsic.bindRequirementOwned<S>(move self, move provider)
+  return run bound
+}
+service Counter {
+  effect fn get() -> i32 ? &Counter
+  effect fn bump() -> () ? &mut Counter
+}
+struct Cell { value: i32 }
+effect fn get(self: &Cell) -> i32 { return self.value }
+effect fn bump(self: &mut Cell) -> () { self.value = self.value + 1 }
+impl Counter for Cell { get: Cell.get bump: Cell.bump }
+effect fn both() -> i32 ? &mut Counter {
+  run Counter.bump()
+  return run Counter.get()
+}
+fn owned() -> i32 { return run bindOwned<Counter>(both(), Cell { value: 1 }) }
+fn lasting<T: 'static>(value: T) -> i32 { return 0 }
+fn shortLived() -> i32 {
+  let local = 1
+  return lasting(&local)
+}
+role Inner
+role Outer
+service Twice { effect fn read() -> i32 ? &Twice at Inner | &mut Twice at Outer }
+struct Both { value: i32 }
+effect fn read(self: &mut Both) -> i32 { return self.value }
+impl Twice for Both { read: Both.read }
+effect fn useTwice() -> i32 ? &Twice at Inner | &mut Twice at Outer { return run Twice.read() }
+fn twice() -> i32 {
+  let shared = Both { value: 1 }
+  let mut exclusive = Both { value: 2 }
+  return run Intrinsic.bindRequirementMut<Twice at Outer>(Intrinsic.bindRequirement<Twice at Inner>(useTwice(), &shared), &mut exclusive)
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let owned = run Semantic.demandMir(&mut store, &mut request, &id, b"owned") |> Effect.provideMut<Allocator>(&mut allocator)
+  let generic = providedCallee(&store, &owned, "bindOwned")
+  if let Option<InstanceKey>.Some {value: bindKey} = move generic {
+    let binding = run Semantic.demandInstanceMir(&mut store, &mut request, &bindKey) |> Effect.provideMut<Allocator>(&mut allocator)
+    let inner = providedCallee(&store, &binding, "both")
+    if let Option<InstanceKey>.Some {value: bothKey} = move inner {
+      run Testing.expect(ownedCellProvider(&bothKey), "the owned binding keys its inner run by the provider's own type")
+      let both = run Semantic.demandInstanceMir(&mut store, &mut request, &bothKey) |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(receivesProviderLocal(&store, &both, "bump") && receivesProviderLocal(&store, &both, "get"),
+        "each service operation in the bound instance calls its witness with the instance's provider local")
+      let shortLived = run Semantic.demandBody(&mut store, &mut request, &id, b"shortLived") |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(rejectsSpan(&shortLived, RejectionCode.UnsatisfiedLifetimeBound, text, "lasting(&local)", 0),
+        "a call proves its contents bounds against the supplied argument's regions")
+      let twice = run Semantic.demandBody(&mut store, &mut request, &id, b"twice") |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(rejectsSpan(&twice, RejectionCode.Unsupported, text, "read: Both.read", 0),
+        "an operation whose row names its own service under two roles has no single receiver")
+      return ()
+    }
+  }
+  run Testing.expect(false, "the generic binding's instance runs the inner Effect with its served provider")
+}
+
+fn cellNominal(ty: &Type) -> bool {
+  return match &ty.* { Type.Nominal {declaration, ..} => DeclarationId.named(&declaration, b"Cell") _ => false }
+}
+
+fn ownedCellProvider(key: &InstanceKey) -> bool {
+  let entries = match move InstanceKey.providers(key) {
+    Option<Shared<Vector<ProviderEntry>>>.Some {value} => value
+    Option<Shared<Vector<ProviderEntry>>>.None => { return false }
+  }
+  return Shared.with<Vector<ProviderEntry>, bool>(&entries, fn(values: &Vector<ProviderEntry>) -> bool {
+    let listed = Vector.asSlice<ProviderEntry>(values)
+    if listed.length != usize.ONE { return false }
+    return Shared.with<Type, bool>(&listed[usize.ZERO].provider, cellNominal)
+  })
+}
+
+fn receivesProviderLocal(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: string) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          if keyNamed(&key, name) {
+            let passed = Vector.asSlice<MirOperand>(&arguments)
+            if passed.length == usize.ZERO || copiedProjections(&passed[usize.ZERO]) != usize.ZERO { return false }
+            let local = copiedLocal(&passed[usize.ZERO])
+            if local >= locals.length { return false }
+            return match &locals[local].kind { MirLocalKind.Provider {..} => true _ => false }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
   }
   return false
 }
