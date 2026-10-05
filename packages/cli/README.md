@@ -4,7 +4,7 @@ The project-oriented command line interface for the Silk bootstrap compiler.
 
 ## Standalone compiler for CI
 
-Passing `main` commits publish a GitHub Actions artifact named `silk-bootstrap`, containing
+`main` commits whose bundled CLI passes its isolated runtime checks publish a GitHub Actions artifact named `silk-bootstrap`, containing
 one `silk.mjs` file. It includes the CLI, compiler, JavaScript dependencies, standard-library
 sources, and native runtime source. Other workflows can download it and invoke it with Node 24
 or Bun; no package install or repository build is needed:
@@ -29,8 +29,9 @@ steps:
 ```
 
 The action selects the latest verified main run, returns the compiler path and source SHA, and
-supports a `sha` input for reproducible CI. Only a main build that passes the complete CI
-dependency graph receives the shared artifact name. Selection uses the workflow run ID, so a
+supports a `sha` input for reproducible CI. Only a main bundle that passes isolated Node 24 and Bun checks, including native build and test
+commands, receives the shared artifact name. Other repository CI failures remain visible and do
+not block distributing that tested compiler. Selection uses the workflow run ID, so a
 late upload or rerun of an older commit cannot replace a newer compiler. Artifacts are retained
 for 90 days; expired pins fail with an explicit error. The selfhost M1 CI lane uses this action.
 The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
