@@ -635,6 +635,25 @@ Each entry records:
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
 
+### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
+
+- **Status:** temporary divergence, Step 9e of
+  [#567](https://github.com/julia-script/silk/issues/567), 2026-10-05. It is retired by the
+  suspension stage or native provider lowering, whichever first lets a reached executable park.
+- **Rule:** an `Intrinsic.NonParking` bound holds only when the specialized transitive graph
+  cannot reach external parking.
+- **Compilers:** the bootstrap proves the bound during executable analysis
+  (`ExecutableOrigin.ts` NonParking obligations for `finalizeEffectNonParking` and
+  `useReleaseNonParking`; `CallResolution.ts` for service operations) and rejects a finalizer or
+  release whose targets are not exact or not proven. Selfhost discharges the bound at the call
+  without that analysis. Any parking it would have rejected is still reached, and selfhost reports
+  it as `SuspensionUnavailable` (the `suspension` gap) at the `park` or `suspendEffect` site
+  (Effect note D6), not as an unsatisfied bound at the call.
+- **Source migration:** none; no program that compiles under selfhost parks.
+- **Diagnostics and limits:** the failure is a structured `suspension` gap at the parking site
+  instead of the bootstrap's unsatisfied-property diagnostic at the bounded call.
+- **Evidence:** `nonParkingFinalizersAreAdmitted` in `compiler/src/semantic/SemanticCases.silk`.
+
 ### Nominal qualification requires an inherent member
 
 CALL-003 and STYLE-002 require a nominal-qualified function to be published in that type's
