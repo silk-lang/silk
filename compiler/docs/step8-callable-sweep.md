@@ -124,7 +124,7 @@ The two additional PASS programs belong to concurrent Step 9 work.
 Opaque union projection and collision controls are in #797. Exact head `71e206ba7` reported the
 same corpus and 41 PASS/2 FAIL among 43 controls. The repaired head `98f3fabb7` preserves strict
 selected-arm cleanup and fixes explicit nominal transport in the collision fixture; both roots
-pass bootstrap source checking and independent review. Its exact-head native CI remains pending.
+pass bootstrap source checking and independent review. Exact repaired head `98f3fabb7` ran all 43 controls with 0 assertion failures; its only failures were two timings (2007/2328 ms), covered by Julia's timing-only waiver. The refresh onto landed Effect literals is independently accepted and running exact integrated CI.
 
 Ordinary anonymous callable parameters now retain exact hidden invocation representations and
 selected outer scope evidence separately from their lexical captures. Seven focused native probes
@@ -134,7 +134,7 @@ with the same 82 PASS names as the isolated `71e206ba7` control. Structured nati
 and exact published-head CI remain pending. Named quantified sections and row deferral retain their
 existing gaps; they are not silently enabled by anonymous lifetime staging.
 
-Contextual opaque aggregate result construction remains required Step 8 work. Unresolved
+Contextual opaque aggregate result construction now has focused native record, tuple, nested and explicit-child probes returning 42. The release compiler preserves the same 82 PASS names, with 0 FAIL/311 Unsupported/track 69. Source controls assert exact storage and original direct targets, fixed nested arguments and written evaluation order, incompatible contracts, repeated-family divergence and ordinary assignment rejection. Their native execution and integrated CI remain pending. Unresolved
 representation-sensitive recursive descriptor projection retains its precise union-form follow-up;
 that conservative ABI boundary is not a claim that every such source has incompatible storage.
 Detached/nonParking executable-property proof belongs to the Effect/property work. General escaping
