@@ -847,13 +847,12 @@ repeated invocation and capture-only drop glue.
   is checked before body demands, including cached-body edges. The depth bound spans conditional
   context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
 - **Remaining Step 8 return-origin work:** recursive origin cycles, divergent plain origins and
-  callable-valued results reached through abstract or invocation-selected higher-order targets or
-  interface invocation remain explicitly unsupported. Fully selected stored producer values and
+  callable-valued results reached through interface invocation remain explicitly unsupported.
+  Abstract and invocation-selected higher-order results now retain a source selection recipe;
+  exact native verification of that layer is pending. Fully selected stored producer values and
   inherent receiver methods use the same original-result query and runtime ABI projection as direct
   producers. Retained mutable parameter storage loans use #783. General escape and parent-loan
-  proof remain NotChecked for Step 14. In particular, a constrained callable parameter producing
-  another callable remains required Step 8 work; missing corpus coverage does not discharge it.
-  These limitations are not claimed as native PASS.
+  proof remain NotChecked for Step 14. These limitations are not claimed as native PASS.
 - **Evidence:** `plainCallableReturnsKeepOriginalStorageAndPublicContracts`,
   `plainCallableOriginsUnifyAcrossProducers`, `plainCallableViewsKeepWeakerInvocationPermissions`
   and `plainCallableViewStagingRetainsPublicModeAndArgumentOrder` inspect original storage,
@@ -910,3 +909,50 @@ repeated invocation and capture-only drop glue.
 - **Source migration:** none. Opaque and plain Effect members retain `EffectFormUnavailable`
   at their producer call, including unions; this prevents a callable sweep from hiding the next
   Step 9 boundary behind a generic typed-form gap.
+
+### Native higher-order callable result selection
+
+- **Status:** implemented in a draft Step 8 layer. Invocation-local representation reification
+  repaired the staged-suffix source rejection. The reduced Once control exposed a separate source
+  admission gap for a staged recipe behind a public Once view; that recipe is now admitted like
+  a callable-result recipe and must still realize its exact storage before MIR. Native assertions
+  for this repair and the exact-head gate remain pending.
+- **Rule:** a checked invocation through an abstract callable retains its producer, public result
+  contract, argument type evidence and selected invocation values/ordinals. This source recipe is
+  resolved after substitution to the original returned environment before exact consumer inference.
+  Selection evidence is not a physical capture. No adapter, code pointer or separate closure key is
+  introduced; emitted identity still comes from the complete ordinary application and MIR graph.
+- **Proof context:** only reachable return operands participate in origin normalization, under the
+  producer's own applied premises. Closed source recipes are also normalized in capture fields and
+  free original application arguments/scopes; opaque family identity and bound schema blueprints
+  are preserved. Mutable storage views and staged schemas use the same original
+  target selection and bound proof as direct invocation, retaining public permissions. Selected
+  lifetime/row/type evidence participates in exact equality, substitution and unification.
+  Invocation-local inference reifies supplied callable-valued operands through the ordinary
+  representation binder operation, after quantified lifetime slots. Unsupplied leading operands
+  keep their public section contracts; schema invocations retain original target slot mappings.
+- **Bootstrap boundaries:** reduced constrained higher-order source is admitted by the bootstrap
+  frontend but reaches SEM0219 when lowering the selected returned callable invocation. A generic
+  stored-schema producer control is rejected with SEM0052 at its constrained `same` consumer even
+  when both producers return the same original leaf. Native's source normalization is intended to
+  retain exact leaf identity there; that structured native control passed in the first isolated run. No new acceptance
+  corpus program is added from these bootstrap-blocked reductions.
+- **Evidence:** `higherOrderCallableResultsKeepSelectedProducerAndLeafTargets`,
+  `higherOrderCallableReturnsForwardOpenOriginsWithoutUnusedStorageDemands`,
+  `higherOrderCallableSchemaResultsNormalizeBeforeExactInference`,
+  `deferredCallableResultRetainsSelectedLifetimeEvidence`,
+  `higherOrderBorrowedMutableProducersPreserveOriginalTargets` and
+  `higherOrderStagedSchemaProducersRetainOriginalSelection`,
+  `higherOrderAffineArgumentsAndOnceResultsHaveOneCleanupOwner` and
+  `higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels` and
+  `higherOrderStagedSuffixRecipesNormalizeBeforeSchemaSelection` retain structured source/MIR claims.
+  Source canonicalization includes free exact callable contracts and staged suffix evidence before
+  target selection; schema bound blueprints keep their target declarations and quantifiers.
+  Nested capture and staged Once controls compare the direct and higher-order construction
+  through one exact-F scalar consumer. The nested control inspects actual MIR destinations;
+  the Once control inspects independently recorded checked-body result types, public permissions
+  and the original captured schema. Affine-result and staged-suffix controls retain MIR lowering
+  and cleanup proof, avoiding a repeated backend demand for the Once source-inference claim.
+  The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
+  the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
+- **Source migration:** none.

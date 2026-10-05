@@ -1,0 +1,1143 @@
+//! Higher-order callable result selection, exact origins and capture cleanup.
+
+import hir.Hir {CallableMode, OwnerKind}
+import backend.InstanceKey {InstanceKey}
+import backend.Mir {Reference as MirReference, Callee as MirCallee, Block as MirBlock, Local as MirLocal, LocalKind as MirLocalKind, MirFunction, Projection as MirProjection, Operand as MirOperand, Statement as MirStatement, Terminator as MirTerminator, Rvalue as MirRvalue}
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.CallableSchema {CallableSchema as SectionSchema}
+import semantic.Lifetime {Intersection, Lifetime}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.Query {Cycle}
+import semantic.Semantic {Answer, Outcome, Semantic, Request, Value}
+import semantic.FinalProfile {FinalProfile}
+import semantic.SourceIndex {NoRejection, RevisionMismatch}
+import semantic.Rejection {Rejection, RejectionCode}
+import semantic.SourceRevision {Revision}
+import semantic.Specialization {Application as SpecializationApplication, ScopeBinding, StaticSlot, Target as SpecializationTarget}
+import semantic.Type {Argument, Binding, Comparison, CallableFieldInput, Outlives, Type, Unification}
+import semantic.Target {Id as TargetId, Target as MachineTarget}
+import semantic.TypedBody {Expression as BodyExpression, NodeId as BodyNodeId, NodeKind as BodyNodeKind, TypedBody}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.string {String}
+import silk.testing {AssertionError, Testing}
+import silk.u8
+import silk.usize
+import silk.vector {Vector}
+
+effect fn staticSemantic(id: &ModuleId, text: string, target: MachineTarget) -> Semantic
+! OutOfMemoryError
+? &mut Allocator {
+  let source = run present(text)
+  let revision = run Revision.publish(&Revision.make(), id, &source)
+  return Semantic.make(move revision, target, Option.none<FinalProfile>())
+}
+
+fn rejection(answer: &Result<Answer, NoRejection>) -> Option<Shared<Rejection>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Rejected {diagnostic} => Option.some<Shared<Rejection>>(
+        Shared.clone<Rejection>(&diagnostic),
+      )
+      Outcome.Success {value: _} => Option.none<Shared<Rejection>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Rejection>>()
+  }
+}
+
+fn checkedBody(answer: &Result<Answer, NoRejection>) -> Option<Shared<TypedBody>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Body {body, source: _}} => Option.some<Shared<TypedBody>>(
+        Shared.clone<TypedBody>(&body),
+      )
+      _ => Option.none<Shared<TypedBody>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<TypedBody>>()
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn module(path: string) -> ModuleId ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  return run ModuleId.make(b"memory", b"example", String.utf8Bytes(path))
+}
+
+effect fn present(text: string) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  return Option.some<Bytes>(run Bytes.copy(String.utf8Bytes(text)))
+}
+
+fn offsetOf(text: string, needle: string, occurrence: usize) -> usize {
+  let haystack = String.utf8Bytes(text)
+  let wanted = String.utf8Bytes(needle)
+  let mut seen = usize.ZERO
+  let mut at = usize.ZERO
+  while at + wanted.length <= haystack.length {
+    let mut matched = true
+    let mut inner = usize.ZERO
+    while inner < wanted.length {
+      if haystack[at + inner] != wanted[inner] {
+        matched = false
+      }
+      inner = inner + usize.ONE
+    }
+    if matched {
+      if seen == occurrence {
+        return at
+      }
+      seen = seen + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn rejectsSpan(
+  answer: &Shared<Result<Answer, NoRejection>>,
+  code: RejectionCode,
+  text: string,
+  spelling: string,
+  occurrence: usize,
+) -> bool {
+  let start = offsetOf(text, spelling, occurrence)
+  if start == usize.MAX { return false }
+  let end = start + String.utf8Bytes(spelling).length
+  let found = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(answer, rejection)
+  if let Option<Shared<Rejection>>.Some {value} = move found {
+    return Shared.with<Rejection, bool>(&value, fn(diagnostic: &Rejection) -> bool {
+      return diagnostic.code == code && diagnostic.span.start == start && diagnostic.span.end == end
+    })
+  }
+  return false
+}
+
+fn succeeded(answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  return Shared.with<Result<Answer, NoRejection>, bool>(
+    answer,
+    fn(resolved: &Result<Answer, NoRejection>) -> bool {
+      return match & resolved.* {
+        Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+          Outcome.Success {value: Value.Unsupported {..}} => false
+          Outcome.Success {value: _} => true
+          Outcome.Rejected {diagnostic: _} => false
+        }
+        Result<Answer, NoRejection>.Failure {error: _} => false
+      }
+    },
+  )
+}
+
+fn nominalType(value: &Type) -> bool {
+  return match & value.* {
+    Type.Nominal {..} => true
+    _ => false
+  }
+}
+
+effect fn specializationWithArguments(declaration: &DeclarationId, arguments: Vector<Argument>) -> SpecializationApplication
+! OutOfMemoryError ? &mut Allocator {
+  return SpecializationApplication {
+    target: SpecializationTarget.Named {declaration: run DeclarationId.copy(declaration)},
+    argumentOrdinals: run SpecializationApplication.denseOrdinals(Vector.length<Argument>(&arguments)),
+    scopes: Vector.make<ScopeBinding>(),
+    arguments: move arguments,
+    statics: Vector.make<StaticSlot>(),
+  }
+}
+
+effect fn specializationPrimitive(name: &[u8]) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(name)})
+}
+
+effect fn specializationRepresentation(declaration: &DeclarationId) -> Shared<Type>
+! OutOfMemoryError ? &mut Allocator {
+  let application = run specializationWithArguments(declaration, Vector.make<Argument>())
+  let result = run specializationPrimitive(b"i32")
+  let regions = Vector.make<Shared<Lifetime>>()
+  let contract = run Shared.make<Type>(Type.Callable {mode: CallableMode.Shared, isUnsafe: false,
+    environment: run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions))),
+    invocationBinders: usize.ZERO, invocationBounds: Vector.make<Outlives>(),
+    parameters: Vector.make<Shared<Type>>(), result: move result})
+  return run Type.callableValue(false, run Shared.make<SpecializationApplication>(move application), move contract,
+    Vector.make<Shared<Type>>(), Vector.make<CallableFieldInput>())
+}
+
+fn selectedMirIndex(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Mir {index}} => Option.some<usize>(index)
+      _ => Option.none<usize>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<usize>()
+  }
+}
+
+fn glueFact(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, fact: usize) -> usize {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      if fact == 6 {
+        let references = Vector.asSlice<MirReference>(&function.references)
+        let mut glued = usize.ZERO
+        let mut at = usize.ZERO
+        while at < references.length {
+          if let Option<Shared<Type>>.Some {..} = move InstanceKey.glueType(&references[at].key) { glued = glued + usize.ONE }
+          at = at + usize.ONE
+        }
+        return glued
+      }
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut drops = usize.ZERO
+      let mut calls = usize.ZERO
+      let mut switches = usize.ZERO
+      let mut branches = usize.ZERO
+      let mut first = usize.MAX
+      let mut second = usize.MAX
+      let mut firstCall = usize.MAX
+      let mut firstDrop = usize.MAX
+      let mut nominalPayload = false
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        let statements = Vector.asSlice<MirStatement>(&blocks[at].statements)
+        let mut position = usize.ZERO
+        while position < statements.length {
+          if let MirStatement.Drop {destination, ..} = &statements[position] {
+            let code = lastProjectionCode(&destination.projections)
+            if drops == usize.ZERO {
+              first = code
+              firstDrop = at
+              nominalPayload = nominalPayloadStep(&destination.projections)
+            }
+            if drops == usize.ONE { second = code }
+            drops = drops + usize.ONE
+          }
+          position = position + usize.ONE
+        }
+        if let MirTerminator.Call {..} = &blocks[at].terminator {
+          if calls == usize.ZERO { firstCall = at }
+          calls = calls + usize.ONE
+        }
+        if let MirTerminator.Switch {..} = &blocks[at].terminator { switches = switches + usize.ONE }
+        if let MirTerminator.Branch {..} = &blocks[at].terminator { branches = branches + usize.ONE }
+        at = at + usize.ONE
+      }
+      if fact == usize.ZERO { return drops }
+      if fact == usize.ONE { return calls }
+      if fact == 2 { return switches }
+      if fact == 3 { return first }
+      if fact == 4 { return second }
+      if fact == 7 {
+        if firstCall < firstDrop { return usize.ONE }
+        return usize.ZERO
+      }
+      if fact == 8 {
+        if nominalPayload { return usize.ONE }
+        return usize.ZERO
+      }
+      return branches
+    }
+  }
+  return usize.MAX
+}
+
+fn nominalPayloadStep(projections: &Vector<MirProjection>) -> bool {
+  let listed = Vector.asSlice<MirProjection>(projections)
+  if listed.length == usize.ZERO { return false }
+  return match &listed[listed.length - usize.ONE] {
+    MirProjection.Payload {ty, ..} => Shared.with<Type, bool>(&ty, nominalType)
+    _ => false
+  }
+}
+
+fn lastProjectionCode(projections: &Vector<MirProjection>) -> usize {
+  let listed = Vector.asSlice<MirProjection>(projections)
+  if listed.length == usize.ZERO { return usize.MAX }
+  return match &listed[listed.length - usize.ONE] {
+    MirProjection.Field {index} => index
+    MirProjection.Index {..} => 1000
+    MirProjection.Payload {index, ..} => 2000 + index
+    MirProjection.VariantField {variant, field} => 3000 + 10 * variant + field
+    _ => usize.MAX - usize.ONE
+  }
+}
+
+fn sectionStoredField(operand: &MirOperand, field: usize) -> bool {
+  if let MirOperand.Copy {place} = &operand.* {
+    return Vector.length<MirProjection>(&place.projections) == usize.ONE
+      && lastProjectionCode(&place.projections) == field
+  }
+  return false
+}
+
+fn sectionCaptureOperand(operand: &MirOperand, consumes: bool) -> bool {
+  if consumes {
+    if let MirOperand.Move {place} = &operand.* {
+      return Vector.length<MirProjection>(&place.projections) == usize.ONE
+        && lastProjectionCode(&place.projections) == usize.ZERO
+    }
+    return false
+  }
+  return sectionStoredField(operand, usize.ZERO)
+}
+
+fn sectionInvocationCount(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>,
+  target: &[u8], consumes: bool) -> usize {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  let mut count = usize.ZERO
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          let identity = InstanceKey.identity(&key)
+          let named = Shared.with<DeclarationId, bool>(&identity,
+            fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, target) })
+          let operands = Vector.asSlice<MirOperand>(&arguments)
+          if named && operands.length == 2 && sectionCaptureOperand(&operands[usize.ONE], consumes) { count = count + usize.ONE }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return count
+}
+
+fn namedMirApplication(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: &[u8]) -> Option<Shared<SpecializationApplication>> {
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: selected} = move index {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, selected) {
+      let references = Vector.asSlice<MirReference>(&function.references)
+      let mut at = usize.ZERO
+      while at < references.length {
+        let identity = InstanceKey.identity(&references[at].key)
+        let matches = Shared.with<DeclarationId, bool>(&identity,
+          fn(value: &DeclarationId) -> bool { return sameBytes(DeclarationId.spelling(value), name) })
+        if matches {
+          // Capture glue can share the target's owner identity without being a function application.
+          let application = InstanceKey.application(&references[at].key)
+          if let Option<Shared<SpecializationApplication>>.Some {value} = move application {
+            return Option.some<Shared<SpecializationApplication>>(move value)
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<Shared<SpecializationApplication>>()
+}
+
+fn plainCallableMirResultType(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> Option<Shared<Type>> {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      return Option.some<Shared<Type>>(Shared.clone<Type>(&function.result))
+    }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn originalCallableInvocationCount(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>,
+  target: &[u8], arity: usize) -> usize {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  let mut count = usize.ZERO
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          let identity = InstanceKey.identity(&key)
+          let named = Shared.with<DeclarationId, bool>(&identity,
+            fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, target) })
+          if named && Vector.length<MirOperand>(&arguments) == arity {
+            if let Option<Shared<SpecializationApplication>>.Some {..} = move InstanceKey.application(&key) { count = count + usize.ONE }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return count
+}
+
+test effect fn higherOrderCallableResultsKeepSelectedProducerAndLeafTargets() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderCallableTargetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderCallableTargetClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-callable-targets.silk")
+  let text = """
+fn addTwo(value: i32) -> i32 { return value + 2 }
+fn addThree(value: i32) -> i32 { return value + 3 }
+fn producerTwo() -> fn<'static>(i32) -> i32 { return addTwo }
+fn producerThree() -> fn<'static>(i32) -> i32 { return addThree }
+fn relay<P: fn<'static>() -> fn<'static>(i32) -> i32>(factory: P) -> i32 {
+  let callback = factory()
+  return callback(40)
+}
+fn main() -> i32 { return relay(producerTwo) + relay(producerThree) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let generic = run Semantic.demandBody(&mut store, &mut request, &id, b"relay")
+  let body = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&generic, checkedBody)
+  let mut deferred = false
+  if let Option<Shared<TypedBody>>.Some {value} = move body { deferred = Shared.with<TypedBody, bool>(&value, hasDeferredCallableResult) }
+  run Testing.expect(deferred,
+    "a generic callable producer retains checked result provenance instead of a raw function pointer contract")
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&entry), "both concrete producer applications are admitted")
+  let mut at = usize.ZERO
+  while at < 2 {
+    let mut producerName = b"producerTwo"
+    let mut leafName = b"addTwo"
+    if at == usize.ONE { producerName = b"producerThree" leafName = b"addThree" }
+    let application = namedMirApplicationForProducer(&store, &entry, b"relay", producerName)
+    if let Option<Shared<SpecializationApplication>>.Some {value} = move application {
+      let closedApplication = run SpecializationApplication.copyShared(&value)
+      let selected = run Semantic.demandApplicationMir(&mut store, &mut request, &closedApplication)
+      run Testing.expect(succeeded(&selected)
+        && originalCallableInvocationCount(&store, &selected, producerName, usize.ZERO) == usize.ONE
+        && originalCallableInvocationCount(&store, &selected, leafName, usize.ONE) == usize.ONE,
+        "each specialization calls its own original producer and returned leaf directly")
+    } else { run Testing.expect(false, "each producer retains its own relay application") }
+    at = at + usize.ONE
+  }
+}
+
+fn hasDeferredCallableResult(body: &TypedBody) -> bool {
+  let nodes = TypedBody.nodeSlice(body)
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {ty, ..} = &nodes[at].kind {
+      if Shared.with<Type, bool>(&ty, fn(value: &Type) -> bool { return match &value.* { Type.CallableResult {..} => true _ => false } }) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn higherOrderApplicationProducer(application: &SpecializationApplication, name: &[u8]) -> bool {
+  let arguments = Vector.asSlice<Argument>(&application.arguments)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if let Argument.Type {value} = &arguments[at] {
+      if Shared.with<Type, bool>(&value, fn(ty: &Type) -> bool { return higherOrderProducerType(ty, name) }) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn higherOrderProducerType(value: &Type, name: &[u8]) -> bool {
+  return match &value.* {
+    Type.CallableValue {application, ..} => Shared.with<SpecializationApplication, bool>(&application,
+      fn(selected: &SpecializationApplication) -> bool { return DeclarationId.named(SpecializationApplication.bodyDeclaration(selected), name) })
+    Type.CallableView {representation, ..} => Shared.with<Type, bool>(&representation,
+      fn(nested: &Type) -> bool { return higherOrderProducerType(nested, name) })
+    _ => false
+  }
+}
+
+fn namedMirApplicationForProducer(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, name: &[u8], producer: &[u8])
+  -> Option<Shared<SpecializationApplication>> {
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: selected} = move index {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, selected) {
+      let references = Vector.asSlice<MirReference>(&function.references)
+      let mut at = usize.ZERO
+      while at < references.length {
+        let identity = InstanceKey.identity(&references[at].key)
+        if Shared.with<DeclarationId, bool>(&identity, fn(value: &DeclarationId) -> bool { return sameBytes(DeclarationId.spelling(value), name) }) {
+          if let Option<Shared<SpecializationApplication>>.Some {value} = move InstanceKey.application(&references[at].key) {
+            let selected = Shared.with<SpecializationApplication, bool>(&value,
+              fn(application: &SpecializationApplication) -> bool { return higherOrderApplicationProducer(application, producer) })
+            if selected { return Option.some<Shared<SpecializationApplication>>(move value) }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<Shared<SpecializationApplication>>()
+}
+
+
+test effect fn higherOrderCallableReturnsForwardOpenOriginsWithoutUnusedStorageDemands() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderCallableForwardClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderCallableForwardClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-callable-forward.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn producer() -> fn<'static>(i32) -> i32 { return add }
+fn forward<P: fn<'static>() -> fn<'static>(i32) -> i32>(factory: P) -> fn<'static>(i32) -> i32 { return factory() }
+fn chosen<P: fn<'static>() -> fn<'static>(i32) -> i32>(factory: P) -> fn<'static>(i32) -> i32 { drop factory() return add }
+fn outer<P: fn<'static>() -> fn<'static>(i32) -> i32>(factory: P) -> i32 { return forward(move factory)(40) }
+fn outerChosen<P: fn<'static>() -> fn<'static>(i32) -> i32>(factory: P) -> i32 { return chosen(move factory)(40) }
+fn main() -> i32 { return outer(producer) + outerChosen(producer) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let outer = run Semantic.demandBody(&mut store, &mut request, &id, b"outer")
+  let chosen = run Semantic.demandBody(&mut store, &mut request, &id, b"outerChosen")
+  run Testing.expect(succeeded(&outer) && succeeded(&chosen),
+    "open forwarding retains its recipe and an unrelated unused recipe cannot poison a known return origin")
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&entry), "closed outer callers resolve original result storage")
+  let first = namedMirApplication(&store, &entry, b"outer")
+  let second = namedMirApplication(&store, &entry, b"outerChosen")
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move first {
+    let closedApplication = run SpecializationApplication.copyShared(&value)
+    let selected = run Semantic.demandApplicationMir(&mut store, &mut request, &closedApplication)
+    run Testing.expect(succeeded(&selected) && originalCallableInvocationCount(&store, &selected, b"add", usize.ONE) == usize.ONE,
+      "the forwarded result calls the original add target")
+  } else { run Testing.expect(false, "the forwarded outer application is retained") }
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move second {
+    let closedApplication = run SpecializationApplication.copyShared(&value)
+    let selected = run Semantic.demandApplicationMir(&mut store, &mut request, &closedApplication)
+    run Testing.expect(succeeded(&selected) && originalCallableInvocationCount(&store, &selected, b"add", usize.ONE) == usize.ONE,
+      "known return evidence remains independent of the unused producer invocation")
+  } else { run Testing.expect(false, "the chosen outer application is retained") }
+}
+
+
+test effect fn higherOrderCallableSchemaResultsNormalizeBeforeExactInference() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderCallableSchemaClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderCallableSchemaClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-callable-schema.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn different(value: i32) -> i32 { return value + 3 }
+fn makerA<T>(unused: T) -> fn<'static>(i32) -> i32 { drop unused return add }
+fn makerB<T>(unused: T) -> fn<'static>(i32) -> i32 { drop unused return add }
+fn makerOther<T>(unused: T) -> fn<'static>(i32) -> i32 { drop unused return different }
+fn same<F: fn<'static>(i32) -> i32>(first: F, second: F) -> i32 { return first(20) + second(18) }
+fn main() -> i32 { let a = makerA let b = makerB return same(a(1), b(1)) }
+fn invalid() -> i32 { let a = makerA let other = makerOther return same(a(1), other(1)) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&entry), "distinct selected schema producers returning add infer one exact original F")
+  let common = namedMirApplication(&store, &entry, b"same")
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move common {
+    let closedApplication = run SpecializationApplication.copyShared(&value)
+    let selected = run Semantic.demandApplicationMir(&mut store, &mut request, &closedApplication)
+    run Testing.expect(succeeded(&selected) && originalCallableInvocationCount(&store, &selected, b"add", usize.ONE) == 2,
+      "both arguments invoke the shared original leaf without a producer-specific adapter")
+  } else { run Testing.expect(false, "the common exact consumer application is retained") }
+  let invalid = run Semantic.demandBody(&mut store, &mut request, &id, b"invalid")
+  run Testing.expect(rejectsSpan(&invalid, RejectionCode.TypeArgumentInference, text, "same(a(1), other(1))", usize.ZERO),
+    "equal public promises cannot unify two different original returned leaf targets")
+}
+
+test effect fn deferredCallableResultRetainsSelectedLifetimeEvidence() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run deferredCallableLifetimeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn deferredCallableLifetimeClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("callable-result-lifetime.silk")
+  let mut owners = Vector.make<OwnerStep>()
+  run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: OwnerKind.Function,
+    name: Option.some<Bytes>(run Bytes.copy(b"producer")), occurrence: usize.ZERO})
+  let owner = DeclarationId.fromParts(run ModuleId.copy(&id), move owners)
+  let producer = run specializationRepresentation(&owner)
+  let contract = match move run Type.copy(&producer) {
+    Type.CallableValue {contract, ..} => move contract
+    _ => { run Testing.expect(false, "the actor producer has a callable contract") return () }
+  }
+  let region = run Shared.make<Lifetime>(Lifetime.Parameter {declaration: run DeclarationId.copy(&owner), ordinal: 3})
+  let mut selected = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut selected, Argument.Lifetime {value: move region})
+  let mut ordinals = Vector.make<usize>()
+  run Vector.append<usize>(&mut ordinals, usize.ZERO)
+  let recipe = run Shared.make<Type>(Type.CallableResult {producer: move producer, contract: move contract,
+    arguments: Vector.make<Shared<Type>>(), selected: move selected, selectedOrdinals: move ordinals})
+  let mut types = Vector.make<usize>()
+  let mut lifetimes = Vector.make<usize>()
+  let mut rows = Vector.make<usize>()
+  run Type.collectOwned(&recipe, &owner, &mut types, &mut lifetimes, &mut rows)
+  run Testing.expect(Type.hasOpenParameters(&recipe) && Vector.length<usize>(&types) == usize.ZERO
+    && Vector.length<usize>(&rows) == usize.ZERO && Vector.length<usize>(&lifetimes) == usize.ONE
+    && Vector.get<usize>(&lifetimes, usize.ZERO) == 3,
+    "selected-only lifetime evidence remains a free original owner slot")
+  let representations = Vector.make<Option<Shared<Type>>>()
+  let mut retained = Vector.make<Shared<Lifetime>>()
+  let known = run Type.retainedRegions(&recipe, &owner,
+    Vector.asSlice<Option<Shared<Type>>>(&representations), &mut retained)
+  run Testing.expect(known && Vector.length<Shared<Lifetime>>(&retained) == usize.ZERO,
+    "invocation proof evidence does not become a physical captured region")
+  let mut substitutions = Vector.make<Binding>()
+  run Vector.append<Binding>(&mut substitutions, Binding {declaration: run Shared.make<DeclarationId>(run DeclarationId.copy(&owner)),
+    ordinal: 3, value: Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Static)}})
+  let closed = run Type.applyBindings(&recipe, Vector.asSlice<Binding>(&substitutions), true)
+  let copied = run Shared.make<Type>(run Type.copy(&closed))
+  let sameCopy = run Type.equalsShared(&closed, &copied)
+  let unchanged = run Type.equalsShared(&recipe, &closed)
+  run Testing.expect(!Type.hasOpenParameters(&closed) && sameCopy && !unchanged, "copy preserves selected evidence and substitution closes it exactly")
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut variables, run Shared.make<DeclarationId>(run DeclarationId.copy(&owner)))
+  let mut solved = Vector.make<Binding>()
+  let unified = run Type.unify(&recipe, &closed, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut solved)
+  let success = match &unified { Unification.Unified => true _ => false }
+  let applied = run Type.applyBindings(&recipe, Vector.asSlice<Binding>(&solved), true)
+  let exact = run Type.equalsShared(&applied, &closed)
+  run Testing.expect(success && Vector.length<Binding>(&solved) == usize.ONE && exact,
+    "exact unification solves selected lifetime evidence instead of rigidly comparing its shape")
+}
+
+test effect fn higherOrderBorrowedMutableProducersPreserveOriginalTargets() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderMutableProducerClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderMutableProducerClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-mutable-producer.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn factory() -> fn<'static>(i32) -> i32 { return add }
+fn consume(mut cb: mut fn<'static>() -> fn<'static>(i32) -> i32) -> fn<'static>(i32) -> i32 { return cb() }
+fn relay(mut cb: mut fn<'static>() -> fn<'static>(i32) -> i32) -> i32 { let out = consume(cb) return out(40) }
+fn main() -> i32 { return relay(factory) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  let selected = namedMirApplication(&store, &entry, b"relay")
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move selected {
+    let application = run SpecializationApplication.copyShared(&value)
+    let target = run Semantic.demandApplicationMir(&mut store, &mut request, &application)
+    run Testing.expect(succeeded(&target) && originalCallableInvocationCount(&store, &target, b"add", usize.ONE) == usize.ONE,
+      "a borrowed mutable producer view returns the original direct leaf with its public contract")
+  } else { run Testing.expect(false, "the mutable producer caller retains its selected original application") }
+}
+
+test effect fn higherOrderStagedSchemaProducersRetainOriginalSelection() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderStagedProducerClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderStagedProducerClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-staged-producer.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn factory<T>(value: T, extra: i32) -> fn<'static>(i32) -> i32 { drop value drop extra return add }
+fn forward<P: fn<'static>(i32, i32) -> fn<'static>(i32) -> i32>(p: P) -> fn<'static>(i32) -> i32 {
+  let staged = p(2)
+  return staged(1)
+}
+fn outer<P: fn<'static>(i32, i32) -> fn<'static>(i32) -> i32>(p: P) -> i32 { return forward(move p)(40) }
+fn main() -> i32 { return outer(factory) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  let selected = namedMirApplication(&store, &entry, b"outer")
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move selected {
+    let application = run SpecializationApplication.copyShared(&value)
+    let target = run Semantic.demandApplicationMir(&mut store, &mut request, &application)
+    run Testing.expect(succeeded(&target) && originalCallableInvocationCount(&store, &target, b"add", usize.ONE) == usize.ONE,
+      "a staged schema producer resolves its original returned leaf before later direct invocation")
+  } else { run Testing.expect(false, "the staged schema caller retains its selected application") }
+}
+
+test effect fn higherOrderAffineArgumentsAndOnceResultsHaveOneCleanupOwner() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderAffineResultClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderAffineResultClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-affine-result.silk")
+  let text = """
+struct Token { value: i32 }
+impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
+fn consume(amount: i32, token: Token) -> i32 { drop token return amount }
+fn factory(token: Token) -> once fn<'static>(i32) -> i32 { return consume(move token) }
+fn relay<P: once fn<'static>(Token) -> once fn<'static>(i32) -> i32>(p: P, token: Token) -> i32 {
+  let operation = p(move token)
+  return operation(42)
+}
+fn abandon<P: once fn<'static>(Token) -> once fn<'static>(i32) -> i32>(p: P, token: Token) -> i32 {
+  let unused = p(move token)
+  return 42
+}
+fn main() -> i32 { return relay(factory, Token { value: 42 }) + abandon(factory, Token { value: 42 }) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  let producer = run Semantic.demandMir(&mut store, &mut request, &id, b"factory")
+  let invoked = namedMirApplication(&store, &entry, b"relay")
+  let unused = namedMirApplication(&store, &entry, b"abandon")
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move invoked {
+    let application = run SpecializationApplication.copyShared(&value)
+    let relay = run Semantic.demandApplicationMir(&mut store, &mut request, &application)
+    run Testing.expect(succeeded(&relay) && originalCallableInvocationCount(&store, &relay, b"factory", usize.ONE) == usize.ONE
+      && higherOrderMovesOriginalParameter(&store, &relay, b"factory", usize.ONE)
+      && sectionInvocationCount(&store, &relay, b"consume", true) == usize.ONE
+      && glueFact(&store, &relay, usize.ZERO) == usize.ZERO,
+      "an affine producer argument and its returned Once capture transfer to their original direct targets")
+  } else { run Testing.expect(false, "the invoking relay retains its original selected application") }
+  if let Option<Shared<SpecializationApplication>>.Some {value} = move unused {
+    let application = run SpecializationApplication.copyShared(&value)
+    let abandoned = run Semantic.demandApplicationMir(&mut store, &mut request, &application)
+    let environment = plainCallableMirResultType(&store, &producer)
+    let mut exactDrop = false
+    if let Option<Shared<Type>>.Some {value: returned} = move environment {
+      exactDrop = run higherOrderAbandonDropUsesEnvironment(&store, &abandoned, &returned)
+    }
+    run Testing.expect(succeeded(&abandoned) && higherOrderMovesOriginalParameter(&store, &abandoned, b"factory", usize.ONE)
+      && glueFact(&store, &abandoned, usize.ZERO) == usize.ONE && exactDrop,
+      "abandonment drops the returned environment once after moving the original Token argument")
+  } else { run Testing.expect(false, "the abandoning relay retains its original selected application") }
+  let target = run Semantic.demandMir(&mut store, &mut request, &id, b"consume")
+  run Testing.expect(succeeded(&producer) && succeeded(&target) && glueFact(&store, &producer, usize.ZERO) == usize.ZERO
+    && glueFact(&store, &target, usize.ZERO) == usize.ONE,
+    "the factory transfers cleanup and the invoked original target drops its Token once")
+  let environment = plainCallableMirResultType(&store, &producer)
+  if let Option<Shared<Type>>.Some {value} = move environment {
+    let glue = run Semantic.demandGlueMir(&mut store, &mut request, &value)
+    run Testing.expect(succeeded(&glue) && glueFact(&store, &glue, usize.ZERO) == usize.ONE,
+      "the abandoned returned environment's exact glue drops its one capture")
+  } else { run Testing.expect(false, "the original factory retains exact returned capture storage") }
+}
+
+fn higherOrderMovesOriginalParameter(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>,
+  target: &[u8], parameter: usize) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          let identity = InstanceKey.identity(&key)
+          let named = Shared.with<DeclarationId, bool>(&identity,
+            fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, target) })
+          let operands = Vector.asSlice<MirOperand>(&arguments)
+          if named && operands.length == usize.ONE {
+            if let MirOperand.Move {place} = &operands[usize.ZERO] {
+              if Vector.length<MirProjection>(&place.projections) != usize.ZERO { return false }
+              return higherOrderTemporaryParameter(function, at, place.local, parameter)
+            }
+            return false
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
+}
+
+// Follow only preceding, unprojected Use assignments through fresh MIR temporaries.
+// The final call operand must still be Move, and cleanup assertions prove transfer.
+fn higherOrderTemporaryParameter(function: &MirFunction, before: usize, local: usize, parameter: usize) -> bool {
+  let locals = Vector.asSlice<MirLocal>(&function.locals)
+  let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+  let mut current = local
+  let mut block = before
+  let mut statement = Vector.length<MirStatement>(&blocks[block].statements)
+  let mut remaining = locals.length
+  while remaining != usize.ZERO && current < locals.length {
+    if let MirLocalKind.Parameter {index} = &locals[current].kind { return index == parameter }
+    let temporary = match &locals[current].kind { MirLocalKind.Temp => true _ => false }
+    if !temporary { return false }
+    let mut found = false
+    while !found {
+      if statement == usize.ZERO {
+        if block == usize.ZERO { return false }
+        block = block - usize.ONE
+        statement = Vector.length<MirStatement>(&blocks[block].statements)
+      } else {
+        statement = statement - usize.ONE
+        let statements = Vector.asSlice<MirStatement>(&blocks[block].statements)
+        if let MirStatement.Assign {destination, value, ..} = &statements[statement] {
+          if destination.local == current {
+            if Vector.length<MirProjection>(&destination.projections) != usize.ZERO { return false }
+            if let MirRvalue.Use {value: operand} = &value {
+              let whole = match &operand {
+                MirOperand.Copy {place} => Vector.length<MirProjection>(&place.projections) == usize.ZERO
+                MirOperand.Move {place} => Vector.length<MirProjection>(&place.projections) == usize.ZERO
+                _ => false
+              }
+              if !whole { return false }
+              let next = match &operand {
+                MirOperand.Copy {place} => place.local
+                MirOperand.Move {place} => place.local
+                _ => { return false }
+              }
+              current = next
+              found = true
+            } else { return false }
+          }
+        }
+      }
+    }
+    remaining = remaining - usize.ONE
+  }
+  return false
+}
+
+test effect fn higherOrderNestedCaptureOriginsNormalizeOriginalApplicationChannels() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderNestedOriginClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderNestedOriginClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-nested-origin.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn factory() -> fn<'static>(i32) -> i32 { return add }
+fn wrap(callback: fn<'static>(i32) -> i32) -> fn<'static>(i32) -> i32 {
+  return fn(value: i32) -> i32 { let held = move callback return held(value) }
+}
+fn via<P: fn<'static>() -> fn<'static>(i32) -> i32>(producer: P) -> fn<'static>(i32) -> i32 { return wrap(producer()) }
+fn same<F: fn<'static>(i32) -> i32>(first: F, second: F) -> i32 { return first(20) + second(18) }
+fn main() -> i32 { return same(via(factory), wrap(factory())) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let selected = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&selected),
+    "exact F inference agrees on the direct and higher-order original nested environment")
+  let result = higherOrderCallResultType(&store, &selected, b"via")
+  let direct = higherOrderCallResultType(&store, &selected, b"wrap")
+  if let Option<Shared<Type>>.Some {value: first} = &result {
+    if let Option<Shared<Type>>.Some {value: second} = &direct {
+      run Testing.expect(run Type.equalsShared(&first, &second),
+        "both constructed results retain one exact original anonymous application and capture")
+    } else { run Testing.expect(false, "the direct wrapper result has exact storage") }
+  }
+  let leaf = higherOrderCallResultType(&store, &selected, b"factory")
+  if let Option<Shared<Type>>.Some {value: environment} = move result {
+    if let Option<Shared<Type>>.Some {value: originalLeaf} = move leaf {
+      let capture = Shared.with<Type, Option<Shared<Type>>>(&environment, higherOrderNestedCapture)
+      if let Option<Shared<Type>>.Some {value: captured} = move capture {
+        run Testing.expect(run Type.equalsShared(&captured, &originalLeaf),
+          "the canonical returned closure captures the original add environment rather than a producer recipe")
+        return ()
+      }
+    }
+  }
+  run Testing.expect(false, "the selected common result retains one original anonymous captured environment")
+}
+
+fn higherOrderNestedCapture(value: &Type) -> Option<Shared<Type>> {
+  if let Type.CallableValue {captures, application, ..} = &value.* {
+    let fields = Vector.asSlice<Shared<Type>>(&captures)
+    let anonymous = Shared.with<SpecializationApplication, bool>(&application, higherOrderNestedAnonymous)
+    if anonymous && fields.length == usize.ONE { return Option.some<Shared<Type>>(Shared.clone<Type>(&fields[usize.ZERO])) }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn higherOrderNestedAnonymous(selected: &SpecializationApplication) -> bool {
+  return DeclarationId.kind(SpecializationApplication.bodyDeclaration(selected)) == OwnerKind.Anonymous
+}
+
+effect fn higherOrderAbandonDropUsesEnvironment(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>,
+  environment: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        let statements = Vector.asSlice<MirStatement>(&blocks[at].statements)
+        let mut item = usize.ZERO
+        while item < statements.length {
+          if let MirStatement.Drop {destination, glue, ..} = &statements[item] {
+            if Vector.length<MirProjection>(&destination.projections) != usize.ZERO { return false }
+            let exact = run Type.equalsShared(&locals[destination.local].ty, environment)
+            let dropped = InstanceKey.glueType(&glue)
+            if let Option<Shared<Type>>.Some {value: captureStorage} = move dropped {
+              let sameGlue = run Type.equalsShared(&captureStorage, environment)
+              return exact && sameGlue
+            }
+            return false
+          }
+          item = item + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
+}
+
+test effect fn higherOrderStagedSuffixRecipesNormalizeBeforeSchemaSelection() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderStagedSuffixClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderStagedSuffixClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-staged-suffix.silk")
+  let text = """
+fn add(value: i32) -> i32 { return value + 2 }
+fn other(value: i32) -> i32 { return value + 3 }
+fn factory() -> fn<'static>(i32) -> i32 { return add }
+fn invoke(value: i32, callback: fn<'static>(i32) -> i32) -> i32 { return callback(value) }
+fn stage<P: fn<'static>(i32, fn<'static>(i32) -> i32) -> i32, Q: fn<'static>() -> fn<'static>(i32) -> i32>(p: P, q: Q) -> fn<'static>(i32) -> i32 { return p(q()) }
+fn choose(flag: bool) -> fn<'static>(i32) -> i32 { if flag { return stage(invoke, factory) } return invoke(add) }
+fn same<F: fn<'static>(i32) -> i32>(first: F, second: F) -> i32 { return first(20) + second(18) }
+fn invalidSuffix() -> i32 { return same(stage(invoke, factory), invoke(other)) }
+fn main() -> i32 { return choose(false)(20) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let chosen = run Semantic.demandMir(&mut store, &mut request, &id, b"choose")
+  let factory = run Semantic.demandMir(&mut store, &mut request, &id, b"factory")
+  run Testing.expect(succeeded(&chosen) && succeeded(&factory),
+    "staged and direct suffix construction agree on one original exact schema")
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&entry)
+    && originalCallableInvocationCount(&store, &entry, b"invoke", 2) == usize.ONE,
+    "the canonical returned section calls the original invoke target with its supplied suffix")
+  let different = run Semantic.demandBody(&mut store, &mut request, &id, b"invalidSuffix")
+  run Testing.expect(rejectsSpan(&different, RejectionCode.TypeArgumentInference, text,
+    "same(stage(invoke, factory), invoke(other))", usize.ZERO),
+    "completed stages retain exact callback identity instead of unifying equal public contracts")
+  let environment = plainCallableMirResultType(&store, &chosen)
+  let leaf = plainCallableMirResultType(&store, &factory)
+  if let Option<Shared<Type>>.Some {value: staged} = move environment {
+    if let Option<Shared<Type>>.Some {value: original} = move leaf {
+      let capture = Shared.with<Type, Option<Shared<Type>>>(&staged, higherOrderStagedSuffixCapture)
+      if let Option<Shared<Type>>.Some {value: selected} = move capture {
+        run Testing.expect(run Type.equalsShared(&selected, &original),
+          "schema inference stores the original add environment after normalizing the suffix result recipe")
+        return ()
+      }
+    }
+  }
+  run Testing.expect(false, "the canonical staged schema retains its original target and one captured suffix")
+}
+
+fn higherOrderStagedSuffixCapture(value: &Type) -> Option<Shared<Type>> {
+  if let Type.CallableValue {application, captures, ..} = &value.* {
+    let original = Shared.with<SpecializationApplication, bool>(&application,
+      fn(selected: &SpecializationApplication) -> bool { return DeclarationId.named(SpecializationApplication.bodyDeclaration(selected), b"invoke") })
+    let fields = Vector.asSlice<Shared<Type>>(&captures)
+    if original && fields.length == usize.ONE { return Option.some<Shared<Type>>(Shared.clone<Type>(&fields[usize.ZERO])) }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+
+
+
+test effect fn higherOrderStagedResultsPreservePublicOnceViews() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run higherOrderStagedOnceClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn higherOrderStagedOnceClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("higher-order-staged-once.silk")
+  let text = """
+fn binary<T>(first: T, last: i32) -> i32 { drop first return last }
+fn factory() -> once fn<'static>(i32, i32) -> i32 { return binary }
+fn wrap(callback: once fn<'static>(i32) -> i32) -> once fn<'static>(i32) -> i32 {
+  return fn(value: i32) -> i32 { return callback(value) }
+}
+fn via<P: fn<'static>() -> once fn<'static>(i32, i32) -> i32>(p: P) -> once fn<'static>(i32) -> i32 {
+  return wrap(p()(2))
+}
+fn same<F: once fn<'static>(i32) -> i32>(first: F, second: F) -> i32 { return first(42) + second(0) }
+fn main() -> i32 { return same(via(factory), wrap(factory()(2))) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let selected = run Semantic.demandBody(&mut store, &mut request, &id, b"main")
+  run Testing.expect(succeeded(&selected),
+    "exact F inference preserves public Once permission across direct and higher-order staged results")
+  let result = higherOrderSourceCallType(&selected, b"via")
+  let direct = higherOrderSourceCallType(&selected, b"wrap")
+  if let Option<Shared<Type>>.Some {value: first} = &result {
+    if let Option<Shared<Type>>.Some {value: second} = &direct {
+      run Testing.expect(run Type.equalsShared(&first, &second),
+        "both Once constructions retain the same original application and staged capture storage")
+      let inferred = higherOrderSourceConsumerType(&selected, b"same")
+      if let Option<Shared<Type>>.Some {value} = move inferred {
+        let firstMatches = run Type.equalsShared(&first, &value)
+        let secondMatches = run Type.equalsShared(&second, &value)
+        run Testing.expect(firstMatches && secondMatches,
+          "both independently recorded operands agree with the consumer's selected exact F")
+      } else { run Testing.expect(false, "the exact-F consumer records its selected type argument") }
+      run Testing.expect(Shared.with<Type, bool>(&first, higherOrderPublicOnce)
+        && Shared.with<Type, bool>(&second, higherOrderPublicOnce),
+        "both source paths preserve the public Once permission before storage projection")
+    } else { run Testing.expect(false, "the direct Once wrapper has exact storage") }
+  }
+  if let Option<Shared<Type>>.Some {value: environment} = move result {
+    let capture = Shared.with<Type, Option<Shared<Type>>>(&environment, higherOrderSourceNestedCapture)
+    let mut exactCapture = false
+    if let Option<Shared<Type>>.Some {value} = move capture {
+      exactCapture = Shared.with<Type, bool>(&value, higherOrderPublicOnce)
+        && Shared.with<Type, bool>(&value, higherOrderSourceStageCapture)
+    }
+    run Testing.expect(exactCapture,
+      "the common origin captures the original binary schema, supplied trailing argument and public Once permission")
+    return ()
+  }
+  run Testing.expect(false, "the selected Once result has exact original environment storage")
+}
+
+fn higherOrderSourceCallType(answer: &Shared<Result<Answer, NoRejection>>, name: &[u8]) -> Option<Shared<Type>> {
+  let body = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(answer, checkedBody)
+  if let Option<Shared<TypedBody>>.Some {value} = move body {
+    return Shared.with<TypedBody, Option<Shared<Type>>>(&value, fn(body: &TypedBody) -> Option<Shared<Type>> {
+      let nodes = TypedBody.nodeSlice(body)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        if let BodyNodeKind.Expression {ty, form: BodyExpression.DirectCall {declaration, ..}} = &nodes[at].kind {
+          if DeclarationId.named(&declaration, name) { return Option.some<Shared<Type>>(Shared.clone<Type>(&ty)) }
+        }
+        at = at + usize.ONE
+      }
+      return Option.none<Shared<Type>>()
+    })
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn higherOrderPublicOnce(value: &Type) -> bool {
+  return match &value.* {
+    Type.Callable {mode, ..} => mode == CallableMode.Once
+    Type.CallableView {contract, ..} => Shared.with<Type, bool>(&contract, higherOrderPublicOnce)
+    Type.CallableValue {contract, ..} => Shared.with<Type, bool>(&contract, higherOrderPublicOnce)
+    Type.CallableSchema {schema, ..} => Shared.with<SectionSchema, bool>(&schema,
+      fn(value: &SectionSchema) -> bool { return Shared.with<Type, bool>(&value.contract, higherOrderPublicOnce) })
+    _ => false
+  }
+}
+
+fn higherOrderSourceConsumerType(answer: &Shared<Result<Answer, NoRejection>>, name: &[u8]) -> Option<Shared<Type>> {
+  let body = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(answer, checkedBody)
+  if let Option<Shared<TypedBody>>.Some {value} = move body {
+    return Shared.with<TypedBody, Option<Shared<Type>>>(&value, fn(body: &TypedBody) -> Option<Shared<Type>> {
+      let nodes = TypedBody.nodeSlice(body)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {declaration, application, arguments, ..}, ..} = &nodes[at].kind {
+          if DeclarationId.named(&declaration, name) && Vector.length<BodyNodeId>(&arguments) == 2 {
+            return Shared.with<SpecializationApplication, Option<Shared<Type>>>(&application,
+              higherOrderFirstTypeArgument)
+          }
+        }
+        at = at + usize.ONE
+      }
+      return Option.none<Shared<Type>>()
+    })
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn higherOrderFirstTypeArgument(value: &SpecializationApplication) -> Option<Shared<Type>> {
+  return SpecializationApplication.typeAt(value, usize.ZERO)
+}
+
+fn higherOrderSourceNestedCapture(value: &Type) -> Option<Shared<Type>> {
+  if let Type.CallableView {representation, ..} = &value.* {
+    return Shared.with<Type, Option<Shared<Type>>>(&representation, higherOrderSourceNestedCapture)
+  }
+  return higherOrderNestedCapture(value)
+}
+
+fn higherOrderSourceStageCapture(value: &Type) -> bool {
+  if let Type.CallableView {representation, ..} = &value.* {
+    return Shared.with<Type, bool>(&representation, higherOrderSourceStageCapture)
+  }
+  if let Type.CallableSchema {schema, captures, fieldInputs, ..} = &value.* {
+    let original = Shared.with<SectionSchema, bool>(&schema, higherOrderBinarySchema)
+    let fields = Vector.asSlice<Shared<Type>>(&captures)
+    let inputs = Vector.asSlice<CallableFieldInput>(&fieldInputs)
+    if !original || fields.length != usize.ONE || inputs.length != usize.ONE { return false }
+    if let CallableFieldInput.Argument {parameter} = &inputs[usize.ZERO] {
+      return parameter == usize.ONE && Shared.with<Type, bool>(&fields[usize.ZERO],
+        fn(value: &Type) -> bool {
+          if let Type.Primitive {name} = &value.* { return sameBytes(Bytes.asSlice(&name), b"i32") }
+          return false
+        })
+    }
+  }
+  return false
+}
+
+fn higherOrderBinarySchema(value: &SectionSchema) -> bool {
+  return Shared.with<DeclarationId, bool>(&value.target, higherOrderBinaryDeclaration)
+}
+
+fn higherOrderBinaryDeclaration(value: &DeclarationId) -> bool {
+  return DeclarationId.named(value, b"binary")
+}
+
+// Inspect the actual destination of an original direct call, without demanding a second body.
+fn higherOrderCallResultType(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>,
+  target: &[u8]) -> Option<Shared<Type>> {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, destination, ..} = &blocks[at].terminator {
+          let identity = InstanceKey.identity(&key)
+          let named = Shared.with<DeclarationId, bool>(&identity,
+            fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, target) })
+          if named && Vector.length<MirProjection>(&destination.projections) == usize.ZERO {
+            return Option.some<Shared<Type>>(Shared.clone<Type>(&locals[destination.local].ty))
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option.none<Shared<Type>>()
+}
