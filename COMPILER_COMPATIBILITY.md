@@ -912,9 +912,11 @@ repeated invocation and capture-only drop glue.
 
 ### Native higher-order callable result selection
 
-- **Status:** implemented in a draft Step 8 layer. The native head ran ten controls with nine
-  passing and one staged-suffix failure. Invocation-local representation reification repairs
-  that source rejection; the corrected native assertions and exact-head gate remain pending.
+- **Status:** implemented in a draft Step 8 layer. Invocation-local representation reification
+  repaired the staged-suffix source rejection. The reduced Once control exposed a separate source
+  admission gap for a staged recipe behind a public Once view; that recipe is now admitted like
+  a callable-result recipe and must still realize its exact storage before MIR. Native assertions
+  for this repair and the exact-head gate remain pending.
 - **Rule:** a checked invocation through an abstract callable retains its producer, public result
   contract, argument type evidence and selected invocation values/ordinals. This source recipe is
   resolved after substitution to the original returned environment before exact consumer inference.
@@ -947,8 +949,10 @@ repeated invocation and capture-only drop glue.
   Source canonicalization includes free exact callable contracts and staged suffix evidence before
   target selection; schema bound blueprints keep their target declarations and quantifiers.
   Nested capture and staged Once controls compare the direct and higher-order construction
-  through one exact-F scalar consumer and inspect their actual MIR destination types, avoiding
-  an additional callable producer graph without removing either source path or storage assertion.
+  through one exact-F scalar consumer. The nested control inspects actual MIR destinations;
+  the Once control inspects independently recorded checked-body result types, public permissions
+  and the original captured schema. Affine-result and staged-suffix controls retain MIR lowering
+  and cleanup proof, avoiding a repeated backend demand for the Once source-inference claim.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
@@ -956,9 +960,10 @@ repeated invocation and capture-only drop glue.
 
 ### Finite recursive native callable origins
 
-- **Status:** implemented in a draft Step 8 layer. The latest native run passed seventeen controls
-  and failed two; nested generic inference and the inherited staged suffix are repaired for the
-  next head. Native correctness, reduced fixture timings and the exact-head gate remain pending.
+- **Status:** implemented in a draft Step 8 layer. Head `db60c160` ran eighteen controls successfully
+  and failed the inherited Once control; its finite-origin controls passed. Two inherited controls
+  exceeded the Linux timing budget. The parent repair, filtered solver demands and reused negative
+  fixture evidence await native verification and the exact-head gate.
 - **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
   return operands provide environment equations; other checked expressions retain validation
   dependencies. Source recipes normalize before exact inference, and every selected producer
@@ -966,6 +971,9 @@ repeated invocation and capture-only drop glue.
   Canonicalization preserves the immutable original request and all converging source evidence.
   Draft argument comparison examines earlier inferred assignments before locating a pending
   recipe; that temporary comparison cannot bypass the final exact replay.
+  After substitution, only distinct origin-dependent node types enter the demand graph; exact
+  deduplication preserves source identities. Every reachable return equation and whole-body replay
+  remains required, including unused calls whose operands depend on an origin.
 - **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
   invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
   projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
@@ -975,7 +983,8 @@ repeated invocation and capture-only drop glue.
   canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
   `factory()` in the invalid generic assignment control; it additionally treats represented F as
   affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
-  code/span assertions, MIR inspection and Linux timings have not yet executed.
+  code/span assertions and MIR inspection passed on `db60c160`; repaired-head assertions and Linux
+  timings remain pending.
 - **Source migration:** none.
 
 
@@ -1011,7 +1020,11 @@ repeated invocation and capture-only drop glue.
   `storedCallableFieldsShareInvocationAndPipelineChecking` independently covers receiver evaluation,
   pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. The first four
   passing native controls completed below one second; repaired dispatch assertions remain pending.
-  The earlier owner-claim control now asserts a projected field `CallableCall` with no interface or
-  named-call fallback; it retains the duplicate inherent-name collision rejection.
-- **Source migration:** the former callable-field `Unsupported` expectation is retired now that
-  fields invoke through the ordinary checked callable path.
+  The earlier owner-claim control uses an explicit static environment and asserts a projected
+  field `CallableCall` with no interface or named-call fallback; it retains the duplicate
+  inherent-name collision rejection. Its original omitted-environment field remains a distinct
+  `Unsupported` control at the complete struct declaration: member annotation resolution does
+  not yet reuse the aggregate's generated field lifetime binder. That binder replay is a named
+  follow-up, separate from field dispatch.
+- **Source migration:** the field-dispatch positive now spells its static environment. The
+  omitted-environment rejection is retained with its exact code and declaration span.
