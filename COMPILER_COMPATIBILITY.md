@@ -1165,3 +1165,28 @@ repeated invocation and capture-only drop glue.
   programs are structured controls rather than new corpus fixtures until the main-first bootstrap
   build-exe boundary is repaired.
 - **Source migration:** none.
+
+
+### Contextual opaque callable aggregate results
+
+- **Status:** native contextual record, tuple and nested record probes build and return 42;
+  the release compiler preserves all 82 baseline PASS programs with 0 FAIL, 311 Unsupported,
+  track 69. Structured controls and exact integrated CI are pending.
+- **Rule:** a producer returning `some<F: fn(...)> Wrap<F>` may establish its own exact family
+  through a contextual `.{ ... }` or tuple literal. The original nominal blueprint supplies field
+  shape and fixed arguments; inference opens only this producer's opaque arguments. Nested literals
+  receive construction permission from that blueprint. Explicit child constructors keep ordinary
+  inference. Contract and repeated-family proof occur before publishing the concrete result.
+- **Authority:** construction permission is explicit and local to the producer's return literal.
+  Ordinary assignment, initialization and call arguments cannot use it to replace an exact family.
+  Deriving Effect blocks continue to infer their return channels without an expected context.
+- **Compilers:** bootstrap frontend currently treats the contextual opaque argument as fixed and
+  rejects these record/tuple reductions (SEM0117 with SEM0104 or SEM0025 at the field). Explicit
+  named construction is admitted. Native deliberately implements the approved exact environment
+  design; reduced sources stay structured controls until bootstrap build-exe admits corpus fixtures.
+- **Diagnostics:** wrong callback contracts retain `IncompatibleCallableSignature` at the complete
+  literal; differing original callable families for a repeated opaque slot retain
+  `DivergentOpaqueRealization` at the opaque result annotation. Ordinary assignment rejects the
+  incompatible callback operand with `TypeMismatch`. No adapter, runtime code pointer, new instance
+  key or MIR variant is introduced. General borrow obligations remain Step 14.
+- **Source migration:** none.
