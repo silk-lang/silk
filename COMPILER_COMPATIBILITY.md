@@ -1079,8 +1079,10 @@ repeated invocation and capture-only drop glue.
 
 ### Native opaque structural union projection
 
-- **Status:** implemented in an unverified Step 8 layer. Bootstrap control checking and independent
-  validator source review pass; native assertions, timing and exact-head corpus remain pending.
+- **Status:** implemented in a draft Step 8 layer. Exact head `71e206ba7` passed 41 of 43
+  callable-result controls and the corpus (82 PASS, 0 FAIL). Two fixture/oracle repairs retain the
+  original assertions: explicit affine transport for the descriptor collision, and temporary-copy
+  provenance before the partial-move consumer. Their native assertion run remains pending.
 - **Rule:** original source member ordinals are retained in typed injection, root/nested patterns
   and payload paths. A complete injective source-to-canonical-storage map selects every physical
   tag and payload type; cleanup remainder paths use the same map before exact glue selection.
@@ -1117,6 +1119,10 @@ repeated invocation and capture-only drop glue.
   at `_ => 42`. Native deliberately retains its existing structural member-pattern semantics;
   the new control extends that same semantic path to substituted callable members. The separate
   partial-move fixture is independently admitted by bootstrap Analysis without diagnostics.
+  The immediate descriptor-collision fixture now writes `return move value`: bootstrap accepts
+  the implicit and explicit forms, while native currently rejects the implicit nominal transport
+  with `ExplicitMoveRequired` on `value`. This is a remaining ownership parity boundary, not an
+  incompatible union-layout proof. The explicit form reaches the intended carried-union gap.
   Unchanged nominal descriptor identities do not demand unrelated field shapes: this guard proves
   ABI changes through projected nominal arguments. Fixed field-embedded opaque recipes beyond
   those arguments require separate discovery before admission; they are not covered by this proof.

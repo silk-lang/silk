@@ -553,3 +553,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · A nested generic Option.Some pattern inside a Return record failed bootstrap parsing before test execution · Destructure Return then match the optional value in a separate if-let, as existing compiler walkers do · selfhost Step 8
 
 - 2026-10-05 · Automatic merges combined newly assigned CallableOrigin and EffectComposite discriminator numbers without a text conflict, making the copier choose the wrong variant · Audit the entire combined tag table and every copier guard after variant integrations; reserve distinct tags across pending layers and retain existing corpus copy coverage · selfhost Step 8
+
+- 2026-10-05 · Passing a borrowed MIR pattern binding directly to Option.some<&Place> inferred the Place referent and failed SEM0100 in the provenance oracle · Write the explicit &place loan and source-check both roots before native execution · selfhost Step 8
