@@ -2,7 +2,7 @@
 
 This receipt belongs to [#567 Step 8](https://github.com/julia-script/silk/issues/567).
 This is an intermediate coverage receipt; Step 8 remains unchecked while the in-scope
-higher-order return-origin work below awaits exact native verification. Exact CI receipts and merged heads belong
+anonymous parameter and contextual aggregate work below awaits exact native verification. Exact CI receipts and merged heads belong
 on that issue; source assertions and corpus pins remain in the repository. Native borrow obligations remain explicitly NotChecked
 until Step 14.
 
@@ -113,23 +113,30 @@ The callable-union admission is followed by the Step 9 producer boundary in both
 
 ## Further return-shape coverage
 
-Abstract higher-order producer results remain required Step 8 verification: a constrained parameter such
-as `P: fn<'static>() -> fn<'static>(i32) -> i32` must retain the selected producer's exact returned
-environment after monomorphization. The higher-order layer now retains checked source selection
-recipes, normalizes closed results before exact consumer inference, and adds selected-lifetime,
-mutable-view and staged-schema controls. Bootstrap source checking passes. Isolated native CI executed all ten cases: seven PASS and
-three FAIL. Review identified two oracle errors (hashed reference order and temporary move
-transport) and completed-stage canonicalization; their repair awaits exact-head native CI. Absence of an existing corpus first-gap witness does not remove it from scope.
-Interface producer projections and recursive/divergent plain return origins also retain explicit
-Unsupported boundaries; they are not claimed PASS. Contextual opaque
-slots inside aggregate results and unresolved descriptor/phantom projection likewise retain explicit
-projection limitations. Detached/nonParking executable-property proof belongs to the Effect/property
-work. General escaping validity and parent-loan proof belong to Step 14. No producer adapter or
-invented leaf identity is an acceptable substitute for those proofs.
+Higher-order producer results, finite recursive origins, opaque record fields and selected interface
+results landed through #788, #791, #792 and #793. Their exact integrated head
+`244d4883ce44c0817f6619655ac768170e15d960` reports 82 PASS, 0 FAIL, 311 Unsupported, track 69 in
+[CI 37257790739](https://github.com/julia-script/silk/actions/runs/37257790739), preserving all 80
+previous PASS programs. All 32 callable-result assertions passed; the only failure was the former
+one-second timing gate. Julia explicitly authorized those merges with timing repair as follow-up.
+The two additional PASS programs belong to concurrent Step 9 work.
 
+Opaque union projection and collision controls are in #797. Exact head `71e206ba7` reported the
+same corpus and 41 PASS/2 FAIL among 43 controls. The repaired head `98f3fabb7` preserves strict
+selected-arm cleanup and fixes explicit nominal transport in the collision fixture; both roots
+pass bootstrap source checking and independent review. Its exact-head native CI remains pending.
 
-The finite recursive-origin draft adds private complete-application equations and mandatory exact
-replay of selected and symbolic producers. Its nine `finiteCallableOrigins*` controls check source
-identity, inference, root canonicalization and explicit unavailable cycles. Bootstrap source
-checking passes; native assertions, timing and exact-head corpus verification remain pending.
-This draft does not complete the selected-interface or contextual-opaque-storage obligations.
+Ordinary anonymous callable parameters now retain exact hidden invocation representations and
+selected outer scope evidence separately from their lexical captures. Seven focused native probes
+pass, including distinct anonymous callbacks, mutable environment invocation, borrowed lifetimes
+and two-stage original suffix order. The repaired compiler reports 82 PASS/0 FAIL/311 Unsupported,
+with the same 82 PASS names as the isolated `71e206ba7` control. Structured native assertion execution
+and exact published-head CI remain pending. Named quantified sections and row deferral retain their
+existing gaps; they are not silently enabled by anonymous lifetime staging.
+
+Contextual opaque aggregate result construction remains required Step 8 work. Unresolved
+representation-sensitive recursive descriptor projection retains its precise union-form follow-up;
+that conservative ABI boundary is not a claim that every such source has incompatible storage.
+Detached/nonParking executable-property proof belongs to the Effect/property work. General escaping
+validity and parent-loan proof belong to Step 14. No producer adapter or invented leaf identity
+substitutes for those proofs.

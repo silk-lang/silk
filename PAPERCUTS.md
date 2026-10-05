@@ -555,3 +555,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · Automatic merges combined newly assigned CallableOrigin and EffectComposite discriminator numbers without a text conflict, making the copier choose the wrong variant · Audit the entire combined tag table and every copier guard after variant integrations; reserve distinct tags across pending layers and retain existing corpus copy coverage · selfhost Step 8
 
 - 2026-10-05 · Passing a borrowed MIR pattern binding directly to Option.some<&Place> inferred the Place referent and failed SEM0100 in the provenance oracle · Write the explicit &place loan and source-check both roots before native execution · selfhost Step 8
+
+- 2026-10-05 · Generalizing every schema's lifetime/row deferral exposed 57 pre-existing diagnostics through named Effect provider sections · Compare against an isolated exact-head compiler, restrict new lifetime staging to anonymous schemas, and rerun the complete cheap CLI corpus; restored 82 PASS/0 FAIL · selfhost Step 8
+
+- 2026-10-05 · A helper nested a Shared.with lambda inside another lambda and failed SEM0199 during bootstrap checking · Give the inner predicate a named sibling function before taking a native build hold · selfhost Step 8
