@@ -956,3 +956,119 @@ repeated invocation and capture-only drop glue.
   The affine reduction passes bootstrap typing/ownership and reaches SEM0219 at returned invocation;
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
+
+
+### Finite recursive native callable origins
+
+- **Status:** implemented in a draft Step 8 layer. Head `db60c160` ran eighteen controls successfully
+  and failed the inherited Once control; its finite-origin controls passed. Two inherited controls
+  exceeded the Linux timing budget. The parent repair, filtered solver demands and reused negative
+  fixture evidence await native verification and the exact-head gate.
+- **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
+  return operands provide environment equations; other checked expressions retain validation
+  dependencies. Source recipes normalize before exact inference, and every selected producer
+  plus its ordinary symbolic owner schema receives strict body replay before publication.
+  Canonicalization preserves the immutable original request and all converging source evidence.
+  Draft argument comparison examines earlier inferred assignments before locating a pending
+  recipe; that temporary comparison cannot bypass the final exact replay.
+  After substitution, only distinct origin-dependent node types enter the demand graph; exact
+  deduplication preserves source identities. Every reachable return equation and whole-body replay
+  remains required, including unused calls whose operands depend on an origin.
+- **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
+  invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
+  projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
+  origin recipes have no runtime storage or new key/MIR representation.
+- **Evidence:** the nine `finiteCallableOrigins*` cases in `CallableResultCases` cover seeded
+  recursion, convergence, exact replay, generic source rejection, free union/application channels,
+  canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
+  `factory()` in the invalid generic assignment control; it additionally treats represented F as
+  affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
+  code/span assertions and MIR inspection passed on `db60c160`; repaired-head assertions and Linux
+  timings remain pending.
+- **Source migration:** none.
+
+- **Finite origin cost correction:** settled immutable source type trees share their original
+  evidence during callable normalization, avoiding deep reconstruction on each solving/replay
+  pass. Open recipes, views, structural unions and static-bearing callable applications remain
+  on the normal path. Every producer still performs bounds checks and exact whole-body replay;
+  unused dependencies and every distinct existing assertion remain unchanged. Native timing
+  improvement and the newly integrated upstream head require fresh exact-head evidence.
+
+- **Direct normalization cost correction:** direct child/contract walkers use the same settled-tree
+  sharing predicate as result normalization. Unions, unresolved recipes, views, stages and static-
+  bearing applications retain full normalization. The suffix control reads its canonical section
+  from the main call's actual MIR destination and its independent leaf from the factory's checked
+  return operand, retaining the original invocation and rejection assertions while avoiding two
+  redundant MIR demands. New Linux timings remain pending.
+
+### Native inferred opaque callable record fields
+
+- **Status:** implemented in a draft Step 8 layer; bootstrap compiler source checking passes.
+  The first native run passed four of five record controls; direct field invocation exposed a
+  field-dispatch gap. The repaired dispatcher and exact-head corpus preservation await verification.
+- **Rule:** an inferred nominal construction retains its actual callable field types. Its own
+  opaque return boundary proves each leaf contract and original parameter role; existing exact
+  realization projects the public nominal result before layout and cleanup. A moved local record
+  can forward another producer's family without changing either family's source identity.
+- **Ownership:** generated raw Mutable/Once representation parameters cannot establish owned opaque
+  leaves. Authored constrained F remains an owner. The native role guard reports SEM0081 at the
+  returned constructor; bootstrap rejects these reduced raw-role constructors earlier at field
+  inference (SEM0099/SEM0025), followed by SEM0117. This extends the existing native role check
+  through an inferred record, without treating the bootstrap rejection as a positive.
+- **Diagnostics:** invalid inferred record field bounds retain the existing native SEM0076 at
+  the complete constructor; bootstrap emits SEM0106 at the field value plus SEM0117. The focused
+  control asserts the native code/span, not bootstrap wording or diagnostic multiplicity.
+- **Field invocation:** a present field is selected before methods and uses the ordinary callable
+  checker, including pipeline invocation, access and ownership permissions. Its record expression
+  is checked once. Invalid field annotations preserve their original rejection; a noncallable
+  field reports SEM0075 at the complete field expression, matching the bootstrap control.
+- **Remaining projections:** structural unions containing owned opaque slots still need a physical
+  tag mapping. The admission guard follows substituted nominal fields and descriptor referents,
+  uses exact visited types and rejects bounded discovery overflow conservatively. Dotted construction
+  does not infer a new leaf under a promised opaque slot and is not claimed as a parity positive.
+- **Evidence:** five `opaqueCallableRecords*` structured controls cover original named/anonymous
+  fields, local forwarding, field-bound rejection, raw/authored roles, the exact record/environment/
+  capture glue chain, and a descriptor-union gap. Bootstrap independently admits the positive
+  records, authored-F control, repaired Drop fixture and descriptor-union source.
+  `storedCallableFieldsShareInvocationAndPipelineChecking` independently covers receiver evaluation,
+  pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. The first four
+  passing native controls completed below one second; repaired dispatch assertions remain pending.
+  The earlier owner-claim control uses an explicit static environment and asserts a projected
+  field `CallableCall` with no interface or named-call fallback; it retains the duplicate
+  inherent-name collision rejection. Its original omitted-environment field remains a distinct
+  `Unsupported` control at the complete struct declaration: member annotation resolution does
+  not yet reuse the aggregate's generated field lifetime binder. That binder replay is a named
+  follow-up, separate from field dispatch.
+- **Source migration:** the field-dispatch positive now spells its static environment. The
+  omitted-environment rejection is retained with its exact code and declaration span.
+
+### Native callable results from selected interface operations
+
+- **Status:** implemented in a draft Step 8 layer with independent source acceptance. The native
+  compiler and five positive interface fixtures built successfully; those probes did not execute
+  binaries. Native unit assertions, Linux timings and the repaired exact-head CI remain pending.
+- **Rule:** an operation returning a callable retains its original operation identity, complete
+  contract/provider selection, original-owner invocation assignments, checked operand types and
+  positional optional witness loans. A concrete conformance witness resolves the ordinary original
+  implementation application before returned-origin selection. Source normalization and MIR share
+  the same target slot and loan transport; there is no interface adapter or runtime dispatch value.
+- **Lifetime evidence:** public descriptor operands cannot need owned-value witness borrowing and
+  retain their existing regions without a fresh transport slot. An owned public operand may need a
+  fresh loan after witness selection; its actual caller region fills the original target slot.
+  Exact type equality preserves all selected/transport evidence. Only private pending returned-origin
+  comparison can disregard differing transient Local loan values in two open witness recipes.
+  Every original return equation remains immutable, and every closed equation is normalized with
+  its own complete evidence and strictly compared before publication. Schema blueprints, binding
+  owners/ordinals, rows, statics and all other lifetime evidence remain exact.
+- **Bootstrap boundaries:** the two-provider and two-descriptor-return fixtures are independently
+  admitted by bootstrap Analysis. The staged generic section fixture reports SEM0052 at the whole
+  `apply(Factory.make(provider))`, an existing inference boundary; native acceptance is an intended
+  extension. The invalid arbitrary-F assignment reports bootstrap SEM0037 at exactly
+  `Factory.make(provider)` plus its existing affine-F forwarding diagnostic. Native's structured
+  assignment assertion retains its existing TypeMismatch code and exact expression span.
+- **Evidence:** seven `interfaceCallable*` controls cover original provider/implementation/leaf
+  selection, symbolic descriptor and owned return replay, deferred section evidence, universal
+  source rejection, independent loan-only source equality/substitution and optional presence, and
+  original receiver-region transport through a captured MIR temporary. These assertions have not
+  yet run natively. Unresolved recipes never have storage or an executable key.
+- **Source migration:** none.
