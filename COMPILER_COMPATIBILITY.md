@@ -1097,8 +1097,19 @@ repeated invocation and capture-only drop glue.
   immediate/latent collision controls are source-written structured assertions. The new storage
   fixtures independently pass bootstrap Analysis; their native observations remain pending.
   A root-match control independently derives its scalar physical tag from the original call
-  destination and checks both switch routing and the recovered payload type. Changed-order nested
-  selectors and partial cleanup still require distinguishing structured controls.
+  destination and checks both switch routing and the recovered payload type. A nested-test control
+  derives its nominal tag from the concrete definition parameter and checks the selector and full
+  payload type. A partial-move control follows only the selected record arm: it requires the first
+  field's Move into the original consumer, exactly one remaining second-field cleanup, no ancestor
+  cleanup on that path, and exact glue identity from an independent type query. Their native
+  observations and timings remain pending.
+- **Nested-pattern bootstrap boundary:** the bootstrap rejects literal nested structural member
+  patterns even for the pre-existing ordinary `Narrow | Wide` control. Its nested pattern checker
+  compares the entire field union against the selected member instead of supplying expected
+  context. The callable reduction reports SEM0042 at `Marker { value }` and downstream SEM0043
+  at `_ => 42`. Native deliberately retains its existing structural member-pattern semantics;
+  the new control extends that same semantic path to substituted callable members. The separate
+  partial-move fixture is independently admitted by bootstrap Analysis without diagnostics.
   Unchanged nominal descriptor identities do not demand unrelated field shapes: this guard proves
   ABI changes through projected nominal arguments. Fixed field-embedded opaque recipes beyond
   those arguments require separate discovery before admission; they are not covered by this proof.

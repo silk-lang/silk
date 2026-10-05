@@ -545,3 +545,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · After #766 merged, both the local focused SemanticCases run and Linux CI "Run M1 semantic cases" aborted with a JavaScript heap OOM at the 8192 MiB bootstrap heap (also on the unrelated step9c branch) · Treat it as root-wide heap headroom, not a branch defect; report to the coordinator instead of bisecting the branch · selfhost Step 9d
 
 - 2026-10-04 · Using reserved `union` as a local or pattern binding in a new union control caused parser recovery to claim an extra `Option` declaration and hundreds of misleading type errors · Fix the first PAR diagnostic and use `unionType`/`isStructuralUnion` before investigating downstream imports · selfhost Step 8
+
+- 2026-10-05 · A partial-cleanup assertion bound `index` inside a function already owning an `index` local, producing cascading OWN0011/SEM0135 errors · Use `fieldIndex` and fix the first SEM0048 before investigating borrowed-view cascades · selfhost Step 8
+
+- 2026-10-05 · Indexing a borrowed projection slice again while the first Payload arm still borrows it caused OWN0011 in a test oracle · Extract an owned payload handle before reading the tail field; source-check the helper before native execution · selfhost Step 8
