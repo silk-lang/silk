@@ -786,11 +786,10 @@ repeated invocation and capture-only drop glue.
   not aggregate bootstrap's multiple return sites or simultaneous realization diagnostics.
   Discovery that exceeds the existing finite node bound stays unsupported, without claiming
   an infinite specialization proof. Effect contracts retain their named Step 9 gap.
-- **Remaining projection follow-ups:** contextual opaque slots inside aggregate results and projected
-  structural-union tags stay explicitly unsupported, rather than inventing leaf evidence from
-  nullary variants or emitting an uninjected value. Descriptor or phantom-metadata recursion may
-  also retain the explicit projection gap after physical inline validation; it is not reported
-  as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof
+- **Remaining projection follow-ups:** contextual opaque aggregate construction and structural-union
+  tag projection are covered by the later entries below. Representation-sensitive descriptor or
+  phantom-metadata recursion may retain the explicit projection gap after physical inline
+  validation; it is not reported as SEM0115 merely for crossing a reference. Detached/nonParking executable-property proof
   remains Effect/property work. Ordinary callable result provenance uses the
   separate origin query below.
 - **Evidence:** `opaqueCallableReturnsRealizeOriginalSectionStorage`,
@@ -1006,8 +1005,9 @@ repeated invocation and capture-only drop glue.
   remains required, including unused calls whose operands depend on an origin.
 - **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
   invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
-  projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
-  origin recipes have no runtime storage or new key/MIR representation.
+  projections and contextual opaque aggregate slots are covered by the later selected-interface
+  and producer-construction entries. Unresolved origin recipes have no runtime storage or new
+  key/MIR representation.
 - **Evidence:** the nine `finiteCallableOrigins*` cases in `CallableResultCases` cover seeded
   recursion, convergence, exact replay, generic source rejection, free union/application channels,
   canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
@@ -1155,4 +1155,61 @@ repeated invocation and capture-only drop glue.
   Unchanged nominal descriptor identities do not demand unrelated field shapes: this guard proves
   ABI changes through projected nominal arguments. Fixed field-embedded opaque recipes beyond
   those arguments require separate discovery before admission; they are not covered by this proof.
+- **Source migration:** none.
+
+### Native callable parameters in ordinary anonymous declarations
+
+- **Status:** ordinary anonymous headers now reify written callable parameters into exact hidden
+  representation slots after authored binders and elided lifetimes. A release compiler built from
+  this change preserves all 82 baseline PASS programs and reports 82 PASS, 0 FAIL, 311 Unsupported.
+  Seven focused native probes pass, including two distinct anonymous callbacks, mutable capture
+  invocation, borrowed callback lifetimes, and two-stage suffix order. Structured native assertions
+  and their Linux timings remain pending exact-head CI.
+- **Rule:** an anonymous invocation uses the existing CallableSchema blueprint and ordinary
+  Function application. Selected enclosing bindings remain free construction evidence; own
+  invocation representation and lifetime slots remain bound until use. Only lexical captures form
+  its environment. Staging stores that environment once, then appends supplied operands under their
+  original parameter ordinals. No function pointer, adapter, closure key, or new MIR variant is used.
+- **Ownership:** a raw Once or Mutable callable parameter retains the bootstrap SEM0081 role
+  when returned from an anonymous body. An outer authored F retains its authored owner and can be
+  forwarded. Elided invocation lifetimes accept caller evidence; a fixed Static contract rejects
+  unsuitable evidence with SEM0212 at the supplied operand. A matching signature whose retained
+  environment cannot outlive the promised one keeps this lifetime diagnostic; hidden plain-callable
+  representation inference does not rewrite it into a shape error. Authored generic inference keeps
+  its call-level diagnostic. Invocation-variance and Effect lifetime parity are separate lanes;
+  this correction does not change them. General borrow safety remains Step 14.
+- **Boundary:** eligible lifetime deferral is restricted to ordinary anonymous schemas. Named
+  quantified sections and deferred requirement rows retain their existing named gaps; broadening
+  them prematurely exposed 57 pre-existing diagnostics through Effect providers. Narrowing this
+  change restores the exact baseline PASS set and zero FAIL without translating diagnostics.
+- **Bootstrap lowering:** the focused positive probes pass bootstrap frontend analysis, but its
+  build-exe backend cannot resolve the anonymous higher-order targets (the two-stage case reaches
+  SEM0219). Native direct invocation deliberately implements the approved MIR design. These reduced
+  programs are structured controls rather than new corpus fixtures until the main-first bootstrap
+  build-exe boundary is repaired.
+- **Source migration:** none.
+
+
+### Contextual opaque callable aggregate results
+
+- **Status:** native contextual record, tuple and nested record probes build and return 42;
+  the release compiler preserves all 82 baseline PASS programs with 0 FAIL, 311 Unsupported,
+  track 69. Structured controls and exact integrated CI are pending.
+- **Rule:** a producer returning `some<F: fn(...)> Wrap<F>` may establish its own exact family
+  through a contextual `.{ ... }` or tuple literal. The original nominal blueprint supplies field
+  shape and fixed arguments; inference opens only this producer's opaque arguments. Nested literals
+  receive construction permission from that blueprint. Explicit child constructors keep ordinary
+  inference. Contract and repeated-family proof occur before publishing the concrete result.
+- **Authority:** construction permission is explicit and local to the producer's return literal.
+  Ordinary assignment, initialization and call arguments cannot use it to replace an exact family.
+  Deriving Effect blocks continue to infer their return channels without an expected context.
+- **Compilers:** bootstrap frontend currently treats the contextual opaque argument as fixed and
+  rejects these record/tuple reductions (SEM0117 with SEM0104 or SEM0025 at the field). Explicit
+  named construction is admitted. Native deliberately implements the approved exact environment
+  design; reduced sources stay structured controls until bootstrap build-exe admits corpus fixtures.
+- **Diagnostics:** wrong callback contracts retain `IncompatibleCallableSignature` at the complete
+  literal; differing original callable families for a repeated opaque slot retain
+  `DivergentOpaqueRealization` at the opaque result annotation. Ordinary assignment rejects the
+  incompatible callback operand with `TypeMismatch`. No adapter, runtime code pointer, new instance
+  key or MIR variant is introduced. General borrow obligations remain Step 14.
 - **Source migration:** none.

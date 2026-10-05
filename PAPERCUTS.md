@@ -555,8 +555,16 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · Automatic merges combined newly assigned CallableOrigin and EffectComposite discriminator numbers without a text conflict, making the copier choose the wrong variant · Audit the entire combined tag table and every copier guard after variant integrations; reserve distinct tags across pending layers and retain existing corpus copy coverage · selfhost Step 8
 
 - 2026-10-05 · Passing a borrowed MIR pattern binding directly to Option.some<&Place> inferred the Place referent and failed SEM0100 in the provenance oracle · Write the explicit &place loan and source-check both roots before native execution · selfhost Step 8
+
+- 2026-10-05 · Generalizing every schema's lifetime/row deferral exposed 57 pre-existing diagnostics through named Effect provider sections · Compare against an isolated exact-head compiler, restrict new lifetime staging to anonymous schemas, and rerun the complete cheap CLI corpus; restored 82 PASS/0 FAIL · selfhost Step 8
+
+- 2026-10-05 · A helper nested a Shared.with lambda inside another lambda and failed SEM0199 during bootstrap checking · Give the inner predicate a named sibling function before taking a native build hold · selfhost Step 8
 - 2026-10-04 · A focused selfhost test failed with only `unhandled error: AssertionError` (the runner prints no assertion message), so the rejection code behind a failed `demandMir` was invisible · Add a throwaway helper that matches the answer's `GapCode`/`RejectionCode` with one `Testing.expect(false, ...)` per arm; the failing trace line names the code (here `Cycle` from `bodySignatureConstraints` demanding an `effect {}` block's derived signature) · selfhost Step 9 Effect literals
 - 2026-10-04 · The rebased Step 9 base stack did not type-check (`union` keyword local, missing call operands), so every focused check failed before reaching the new slice · Type-check the base head first (`node packages/cli/dist/bin.js check --manifest-path compiler/silk.toml` under the build slot) and keep base repairs in their own commit · selfhost Step 9 Effect literals
+
+- 2026-10-05 · A full-manifest source check was accidentally launched without the documented Node heap allowance and exhausted the default 4 GiB heap · Use the focused bootstrap check manifest with NODE_OPTIONS=--max-old-space-size=8192; rely on exact-head CI for the full compiler guard · selfhost Step 8
+
+- 2026-10-05 · A contextual repeated-family negative control demanded an abstract Body but expected the later opaque realization rejection · Demand the producer MIR, as existing opaque-return divergence controls do; retain Body demands for immediate contract and assignment diagnostics · selfhost Step 8
 - 2026-10-04 · In a worktree-isolated agent session, Bash refused heredocs, `/usr/bin/time`, and `VAR=... node` prefixes as "too complex to verify", blocking builds and Python edits · Write the command or edit script to a /tmp file with the Write tool and run it as `zsh /tmp/x.sh` or `python3 /tmp/x.py` · selfhost Step 9e
 - 2026-10-04 · `SILK_SELFHOST_CORPUS_CASES=""` selected zero programs and the corpus runner reported success instantly · Leave the variable unset to run the whole corpus · selfhost corpus
 
@@ -570,3 +578,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · `packages/compiler/scripts/lifetime-benchmark.mjs` fails on main with `TypeError: undefined is not a function` in `retainedProofs` (line 307) · Profile lifetime analysis through the CLI or focused tests until the script is repaired · compiler perf
 - 2026-10-05 · CPU profiles of compiler sources run through tsx lost most function names · Profile the built `dist` JavaScript and map functions back to `src` by name · compiler perf
 - 2026-10-05 · A "light" focused vitest run of 14 compiler files started 4 workers of about 1.8 GB each beside a selfhost benchmark, drove the load average to 20 on 4 cores, hit a 30-minute limit and invalidated the benchmark's timing · Run compiler vitest files with `--maxWorkers=1` or 2 under the same lock as heavy jobs whenever a benchmark is timing · compiler perf
+
+- 2026-10-05 · An anonymous fixed-Static callback negative failed native assertions because environment lifetime proof was relabeled as a signature mismatch · Preserve UnsatisfiedLifetimeBound at a plain callable operand; keep authored inference and structural mismatch diagnostics separate · selfhost Step 8
