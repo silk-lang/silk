@@ -368,6 +368,17 @@ export const analyze = (
   const allPoints = Array.from({ length: pointCount }, (_, ordinal) => ordinal)
   const spans = new Map(entries.map(([anchor, point]) => [point, context.spanOf(anchor)]))
   for (const [point, span] of terminalSpans) spans.set(point, span)
+  // Every binding borrow filters all points by authored order; selfhost profiling attributed 3.8 s
+  // to resolving those orders per borrow, so resolve each point's order once.
+  const entryOrders = Array.from({ length: entries.length }, (): number | undefined => undefined)
+  const entryOrder = (ordinal: number, position: AuthoredHir.Anchor): number => {
+    let order = entryOrders[ordinal]
+    if (order === undefined) {
+      order = context.orderOf(position)
+      entryOrders[ordinal] = order
+    }
+    return order
+  }
   const regions = new Map<string, Region>()
   const origins = new Map<string, Origin>()
   const constraints = new Map(body.constraints)
@@ -529,9 +540,9 @@ export const analyze = (
     const bindingOrder = context.orderOf(origin)
     const available = entries
       .filter(
-        ([position]) =>
+        ([position], ordinal) =>
           encloses(context, scope, position) &&
-          (source._tag !== 'BindingRoot' || context.orderOf(position) >= bindingOrder),
+          (source._tag !== 'BindingRoot' || entryOrder(ordinal, position) >= bindingOrder),
       )
       .map(([, point]) => point)
     restrict(lifetime, available, {
@@ -1264,6 +1275,15 @@ export const analyze = (
       pending.push(...(incoming.get(Lifetime.key(source)) ?? []))
     }
   }
+  // Selfhost profiling attributed 3.8 s to resolving every point's boundary, and keying its barrier
+  // list, once per activated constraint. Resolve the boundaries once and each reach set once.
+  let resolvedSpanUses:
+    | ReadonlyArray<readonly [number, BodyControlFlow.Boundary | undefined]>
+    | undefined
+  const spanUses = (): ReadonlyArray<readonly [number, BodyControlFlow.Boundary | undefined]> =>
+    (resolvedSpanUses ??= [...spans].map(
+      ([point, span]) => [point, BodyControlFlow.at(controlFlow, span)] as const,
+    ))
   const activatedConstraints = body.activatedConstraints.flatMap(({ bound, installed, owner }) => {
     ensure(bound.longer)
     ensure(bound.shorter)
@@ -1277,15 +1297,10 @@ export const analyze = (
       installation.before,
       ...(ownerBoundary === undefined ? [] : [ownerBoundary.before]),
     ]
+    const reachable = BodyControlFlow.reachable(controlFlow, installation.after, barriers)
     const points = new Set<number>()
-    for (const [point, span] of spans) {
-      const use = BodyControlFlow.at(controlFlow, span)
-      if (
-        use !== undefined &&
-        BodyControlFlow.reaches(controlFlow, installation.after, use.after, barriers)
-      )
-        points.add(point)
-    }
+    for (const [point, use] of spanUses())
+      if (use !== undefined && BodyControlFlow.includes(reachable, use.after)) points.add(point)
     return [{ ...bound, points }]
   })
   const input: Lifetime.Input = {
@@ -1425,8 +1440,32 @@ interface LoanLiveness {
 // rather than retaining one forward traversal for every access and creation barrier pair.
 // Cleanup and presentation return new flows, so their changed uses and spans get fresh answers.
 const loanLivenessCache = new WeakMap<LifetimeFlow, Map<string, LoanLiveness>>()
+// Ownership probes each loan's own start span against every access in scope. Selfhost profiling
+// attributed 13.8 s of self time to keying that probe by a freshly built span string, so answer by
+// span object first, including the loans no origin or boundary answers for.
+const loanLivenessBySpan = new WeakMap<
+  LifetimeFlow,
+  WeakMap<SourceSpan.SourceSpan, LoanLiveness | false>
+>()
 
 const loanLiveness = (
+  self: LifetimeFlow,
+  solution: Extract<Lifetime.Solution, { readonly _tag: 'Solved' }>,
+  start: SourceSpan.SourceSpan,
+): LoanLiveness | undefined => {
+  let bySpan = loanLivenessBySpan.get(self)
+  if (bySpan === undefined) {
+    bySpan = new WeakMap()
+    loanLivenessBySpan.set(self, bySpan)
+  }
+  const known = bySpan.get(start)
+  if (known !== undefined) return known === false ? undefined : known
+  const answer = resolveLoanLiveness(self, solution, start)
+  bySpan.set(start, answer ?? false)
+  return answer
+}
+
+const resolveLoanLiveness = (
   self: LifetimeFlow,
   solution: Extract<Lifetime.Solution, { readonly _tag: 'Solved' }>,
   start: SourceSpan.SourceSpan,
@@ -1460,23 +1499,34 @@ const loanLiveness = (
   return answer
 }
 
-/** Tests concrete loan liveness at an access using the solved holder uses and source CFG. */
-export const liveAt = (
+/**
+ * The control-flow point a solved flow checks one access at. Ownership resolves it once and probes
+ * it against every loan in scope with `liveAt`.
+ */
+export const accessPoint = (
   self: LifetimeFlow,
-  start: SourceSpan.SourceSpan,
   access: SourceSpan.SourceSpan,
-  end: SourceSpan.SourceSpan,
   write = false,
-): boolean | undefined => {
+): number | undefined => {
   if (self.solution._tag !== 'Solved') return undefined
   const accessed = BodyControlFlow.at(self.controlFlow, access)
   if (accessed === undefined) return undefined
+  return write
+    ? (BodyControlFlow.writeAt(self.controlFlow, access) ?? accessed.after)
+    : accessed.before
+}
+
+/** Tests concrete loan liveness at an access point using the solved holder uses and source CFG. */
+export const liveAt = (
+  self: LifetimeFlow,
+  start: SourceSpan.SourceSpan,
+  at: number,
+  end: SourceSpan.SourceSpan,
+): boolean | undefined => {
+  if (self.solution._tag !== 'Solved') return undefined
   const liveness = loanLiveness(self, self.solution, start)
   if (liveness === undefined) return undefined
   const { created } = liveness
-  const at = write
-    ? (BodyControlFlow.writeAt(self.controlFlow, access) ?? accessed.after)
-    : accessed.before
   if (!BodyControlFlow.reaches(self.controlFlow, created.after, at, created.before)) return false
   if (BodyControlFlow.includes(liveness.required, at)) return true
   if (liveness.observedHolderUse) return false

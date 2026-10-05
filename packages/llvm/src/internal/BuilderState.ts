@@ -182,33 +182,41 @@ export const snapshot = (
         invalidState({ operation, message: 'Unknown LLVM builder value', state: self }),
       )
     }
-    return Effect.sync(() => ({
-      owner: state.owner,
-      strip: state.value.strip,
-      moduleName: state.value.moduleName,
-      sourceFilename: state.value.sourceFilename,
-      targetTriple: state.value.targetTriple,
-      dataLayout: state.value.dataLayout,
-      layout: state.value.layout,
-      moduleAssembly: [...state.value.moduleAssembly],
-      strings: [...state.value.strings],
-      types: Table.freeze(state.value.types).descriptions,
-      typeHandles: Table.freeze(state.value.types).handles,
-      attributes: Table.freeze(state.value.attributes).descriptions,
-      attributeSets: Table.freeze(state.value.attributeSets).descriptions,
-      functionAttributeSets: Table.freeze(state.value.functionAttributeSets).descriptions,
-      constants: Table.freeze(state.value.constants).descriptions,
-      constantHandles: Table.freeze(state.value.constants).handles,
-      globals: GlobalTable.freeze(state.value.globals).globals,
-      globalHandles: GlobalTable.freeze(state.value.globals).globalHandles,
-      variables: GlobalTable.freeze(state.value.globals).variables,
-      variableHandles: GlobalTable.freeze(state.value.globals).variableHandles,
-      aliases: GlobalTable.freeze(state.value.globals).aliases,
-      aliasHandles: GlobalTable.freeze(state.value.globals).aliasHandles,
-      functions: GlobalTable.freeze(state.value.globals).functions,
-      functionHandles: GlobalTable.freeze(state.value.globals).functionHandles,
-      metadata: MetadataTable.freeze(state.value.metadata).descriptions,
-      namedMetadata: MetadataTable.freeze(state.value.metadata).named,
-      globalMetadata: GlobalTable.freeze(state.value.globals).attachments,
-    }))
+    return Effect.sync(() => {
+      // Freeze each table once: a whole-module snapshot copies every table, and per-field
+      // freezes copied the global tables nine times over for a 24k-function module.
+      const types = Table.freeze(state.value.types)
+      const constants = Table.freeze(state.value.constants)
+      const globals = GlobalTable.freeze(state.value.globals)
+      const metadata = MetadataTable.freeze(state.value.metadata)
+      return {
+        owner: state.owner,
+        strip: state.value.strip,
+        moduleName: state.value.moduleName,
+        sourceFilename: state.value.sourceFilename,
+        targetTriple: state.value.targetTriple,
+        dataLayout: state.value.dataLayout,
+        layout: state.value.layout,
+        moduleAssembly: [...state.value.moduleAssembly],
+        strings: [...state.value.strings],
+        types: types.descriptions,
+        typeHandles: types.handles,
+        attributes: [...state.value.attributes.descriptions],
+        attributeSets: [...state.value.attributeSets.descriptions],
+        functionAttributeSets: [...state.value.functionAttributeSets.descriptions],
+        constants: constants.descriptions,
+        constantHandles: constants.handles,
+        globals: globals.globals,
+        globalHandles: globals.globalHandles,
+        variables: globals.variables,
+        variableHandles: globals.variableHandles,
+        aliases: globals.aliases,
+        aliasHandles: globals.aliasHandles,
+        functions: globals.functions,
+        functionHandles: globals.functionHandles,
+        metadata: metadata.descriptions,
+        namedMetadata: metadata.named,
+        globalMetadata: globals.attachments,
+      }
+    })
   })

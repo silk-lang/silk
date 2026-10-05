@@ -21,7 +21,7 @@ const commandText = (planned: ToolchainPlan.PlannedCommand): string =>
   [planned.command, ...planned.arguments].join(' ')
 
 export type Emission =
-  | { readonly _tag: 'Emitted'; readonly artifact: Backend.Artifact }
+  | { readonly _tag: 'Emitted'; readonly artifact: Backend.LlvmEmission }
   | { readonly _tag: 'Rejected'; readonly message: string }
 
 /**

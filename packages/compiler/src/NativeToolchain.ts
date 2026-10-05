@@ -327,20 +327,29 @@ const artifactCacheHeaderLength = artifactCacheMagic.length + 4 + artifactCacheD
 const artifactStorageNamespace = 'native-artifacts'
 const maximumNativeCacheRecordBytes = Number.MAX_SAFE_INTEGER
 
-const artifactCacheDigest = (key: string, bytes: Uint8Array): Uint8Array =>
-  createHash('sha256').update(key).update('\0').update(bytes).digest()
+/** Digests the key and the payload given as consecutive parts, as if they were concatenated. */
+const artifactCacheDigest = (key: string, payload: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const hash = createHash('sha256').update(key).update('\0')
+  for (const part of payload) hash.update(part)
+  return hash.digest()
+}
 
-const encodeArtifactCacheEntry = (key: string, bytes: Uint8Array): Uint8Array => {
-  if (bytes.length > 0xffff_ffff) throw new RangeError('artifact cache entry exceeds 4 GiB')
-  const encoded = new Uint8Array(artifactCacheHeaderLength + bytes.length)
+const encodeArtifactCacheEntry = (key: string, payload: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const length = payload.reduce((total, part) => total + part.length, 0)
+  if (length > 0xffff_ffff) throw new RangeError('artifact cache entry exceeds 4 GiB')
+  const encoded = new Uint8Array(artifactCacheHeaderLength + length)
   encoded.set(artifactCacheMagic)
   const lengthOffset = artifactCacheMagic.length
-  encoded[lengthOffset] = bytes.length & 0xff
-  encoded[lengthOffset + 1] = (bytes.length >>> 8) & 0xff
-  encoded[lengthOffset + 2] = (bytes.length >>> 16) & 0xff
-  encoded[lengthOffset + 3] = (bytes.length >>> 24) & 0xff
-  encoded.set(artifactCacheDigest(key, bytes), lengthOffset + 4)
-  encoded.set(bytes, artifactCacheHeaderLength)
+  encoded[lengthOffset] = length & 0xff
+  encoded[lengthOffset + 1] = (length >>> 8) & 0xff
+  encoded[lengthOffset + 2] = (length >>> 16) & 0xff
+  encoded[lengthOffset + 3] = (length >>> 24) & 0xff
+  encoded.set(artifactCacheDigest(key, payload), lengthOffset + 4)
+  let offset = artifactCacheHeaderLength
+  for (const part of payload) {
+    encoded.set(part, offset)
+    offset += part.length
+  }
   return encoded
 }
 
@@ -359,7 +368,7 @@ const decodeArtifactCacheEntry = (key: string, encoded: Uint8Array): Uint8Array 
     lengthOffset + 4,
     lengthOffset + 4 + artifactCacheDigestLength,
   )
-  const actualDigest = artifactCacheDigest(key, payload)
+  const actualDigest = artifactCacheDigest(key, [payload])
   if (!actualDigest.every((byte, index) => expectedDigest[index] === byte)) return undefined
   return Uint8Array.from(payload)
 }
@@ -386,14 +395,18 @@ export const readArtifactCache = Effect.fnUntraced(function* (
   })
 })
 
-/** Encodes and atomically publishes one native artifact envelope through Storage. */
+/**
+ * Encodes and atomically publishes one native artifact envelope through Storage. The payload is
+ * the record's consecutive parts, so a caller with a header and a large body never concatenates
+ * them first: the envelope is the only copy.
+ */
 export const writeArtifactCache = Effect.fnUntraced(function* (
   storage: Storage.Service,
   key: string,
-  bytes: Uint8Array,
+  payload: ReadonlyArray<Uint8Array>,
 ): Effect.fn.Return<void, ToolchainError> {
   const encoded = yield* Effect.try({
-    try: () => encodeArtifactCacheEntry(key, bytes),
+    try: () => encodeArtifactCacheEntry(key, payload),
     catch: (cause) => storageError('NativeToolchain.ArtifactCache.set', 'cache-write', key, cause),
   })
   return yield* Storage.publish(
@@ -1215,11 +1228,9 @@ export const compileHelpers = Effect.fn('NativeToolchain.compileHelpers')(functi
   const emitted = yield* emitObject(toolchain, scope, source.artifact, source.profile, 'helpers')
   yield* verifyHelperObject(sources, emitted.object, profile)
   if (address !== undefined)
-    yield* writeArtifactCache(
-      address.store,
-      address.key,
+    yield* writeArtifactCache(address.store, address.key, [
       encodeHelperRecord(source.artifact, emitted.bytes),
-    )
+    ])
   return { _tag: 'HelperObject', object: emitted.object, reused: false }
 })
 
@@ -1829,12 +1840,10 @@ export const emitRepresentation = Effect.fn('NativeToolchain.emitRepresentation'
   scope: BuildScope,
   artifact: Backend.LlvmBitcodeArtifact,
   profile: CompilationProfile.CompilationProfile,
-  stage: Exclude<ArtifactPlan.Stage, 'final'>,
+  stage: Exclude<ArtifactPlan.Stage, 'final' | 'llvm-ir'>,
   destination: string,
 ): Effect.fn.Return<string, ToolchainError> {
   if (stage === 'llvm-bitcode') return yield* commitRepresentation(artifact.bitcode, destination)
-  if (stage === 'llvm-ir')
-    return yield* commitRepresentation(new TextEncoder().encode(artifact.ir), destination)
   if (stage === 'object') {
     const object = yield* materializeObject(toolchain, scope, artifact, profile)
     return yield* commitPathRepresentation(object.artifact, destination)

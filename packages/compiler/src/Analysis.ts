@@ -1318,7 +1318,7 @@ export const codegen = Effect.fn('Analysis.codegen')(function* (
   self: CodegenInput,
   request: CodegenRequest,
 ): Effect.fn.Return<
-  Backend.LlvmBitcodeArtifact,
+  Backend.LlvmEmission,
   | Backend.BackendError
   | MirVerification.MirVerificationError
   | Target.TargetError

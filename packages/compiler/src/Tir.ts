@@ -213,8 +213,19 @@ export interface TemporaryOwnerId {
   readonly node: NodeRef
 }
 
-export const borrowKey = (borrow: BorrowId): string =>
-  `${nodeRefKey(borrow.call)}:${borrow.ordinal}`
+// Borrow identities are immutable. MIR lowering probes loan maps with the same identities once per
+// candidate loan at every run site (about 40 s of the selfhost lowering profile rebuilt and
+// rehashed these artifact-prefixed keys), so each identity keeps its one flat key.
+const borrowKeys = new WeakMap<BorrowId, string>()
+
+export const borrowKey = (borrow: BorrowId): string => {
+  let key = borrowKeys.get(borrow)
+  if (key === undefined) {
+    key = `${nodeRefKey(borrow.call)}:${borrow.ordinal}`
+    borrowKeys.set(borrow, key)
+  }
+  return key
+}
 
 interface ExecutableNodeSiteId {
   readonly node: NodeRef

@@ -17,7 +17,7 @@ import * as Mir from './Mir.js'
 import * as Scalar from './Scalar.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
-import { baseRunnerKey, effectValueAtSite } from './ValueType.js'
+import { baseRunnerKey, effectValueAtSite, generatedRunner } from './ValueType.js'
 
 export const emitWitnessDispatch = (
   fn: FunctionLowering,
@@ -480,7 +480,7 @@ export const lowerWitnessEffect = (
     provenance: generated(expression.span),
   })
   const key = baseRunnerKey(fn.owner.key, site, type.type)
-  if (!fn.generatedRunners.some((candidate) => candidate.specializationKey === key))
+  if (generatedRunner(fn.generatedRunners, key) === undefined)
     fn.generatedRunners.push({
       _tag: 'WitnessEffectRunner',
       id: runner,
