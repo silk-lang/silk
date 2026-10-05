@@ -4,7 +4,7 @@
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`.
 
-Byte-wise compiler support with explicit C linkage and no runtime services.
+Word-wise compiler support with explicit C linkage and no runtime services.
 
 Public declarations: 0.
 

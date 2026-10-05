@@ -226,26 +226,6 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
             artifact,
             profile,
           })
-          const support = yield* NativeToolchain.compileHelpers(
-            tools,
-            scope,
-            profile,
-            object.helpers,
-            {
-              _tag: 'Disabled',
-            },
-          )
-          const helperObjects = support === undefined ? [] : [support.object]
-          const helperInspections = []
-          for (const [index, helper] of helperObjects.entries()) {
-            helperInspections.push(
-              yield* run(inspect, ['--symbols', '--relocations', helper.artifact.path]),
-            )
-            yield* fs.copyFile(
-              helper.artifact.path,
-              path.join(output, `${target}-${optimization}-${fixture.name}-helper-${index}.o`),
-            )
-          }
           const c = yield* NativeToolchain.compileCObject(
             tools,
             scope,
@@ -282,12 +262,7 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
             scope,
             'NativeExecutable',
             profile,
-            [
-              object.artifact,
-              ...helperObjects.map((entry) => entry.artifact),
-              c.artifact,
-              runtime.artifact,
-            ],
+            [object.artifact, c.artifact, runtime.artifact],
             HelperCapability.linkInputs([object.helpers]),
             destination,
             {
@@ -295,7 +270,7 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
               composition: { kind: 'default' },
               resolved: { kind: 'default' },
             },
-            [object.helpers, ...helperObjects.map((entry) => entry.helpers)],
+            [object.helpers],
           )
           yield* Linker.link({
             scope,
@@ -357,7 +332,6 @@ int main(void) { return storage_lifecycle() == ${expected} ? 42 : 1; }
             profile: profile.identity,
             plan,
             cCompilation,
-            helperInspections,
             inspection,
             assembly,
             execution,

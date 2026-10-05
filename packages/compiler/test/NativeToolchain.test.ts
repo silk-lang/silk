@@ -1922,7 +1922,13 @@ it.effect(
           target,
         )
         if (Result.isFailure(cycle)) return assert.fail(cycle.failure.detail)
-        const profile = yield* CompilationProfile.normalize({ target: target.id })
+        const profile = yield* CompilationProfile.normalize({
+          target: target.id,
+          libc: 'none',
+          artifact: 'object',
+          entry: { kind: 'none' },
+          runtime: { kind: 'none' },
+        })
         const provider = yield* HelperCapability.provider('memcpy', profile)
         const verified = yield* Effect.result(
           HelperCapability.verifyProviders([provider], cycle.success, target),
@@ -1938,7 +1944,10 @@ it.effect(
 
 it.effect('keys a reusable helper object by every input that shapes it, and only those', () =>
   Effect.gen(function* () {
-    const profile = yield* CompilationProfile.normalize({ target: 'x86_64-unknown-linux-gnu' })
+    const profile = yield* CompilationProfile.normalize({
+      target: 'x86_64-unknown-linux-gnu',
+      libc: 'none',
+    })
     const arm = yield* CompilationProfile.normalize({ target: 'aarch64-unknown-linux-gnu' })
     const memcpy = yield* HelperCapability.provider('memcpy', profile)
     const memset = yield* HelperCapability.provider('memset', profile)
@@ -1960,9 +1969,14 @@ it.effect('keys a reusable helper object by every input that shapes it, and only
         overrides.compiler ?? compiler,
       )
     const base = key(profile)
-    // Provider order and program-only facts do not split the cache across programs.
+    // Provider order and program-only facts do not split the cache across programs. Helpers are
+    // always optimized, so the program's optimization is one of those facts.
     assert.strictEqual(key(profile, { providers: [memset, memcpy] }), base)
     assert.strictEqual(key({ ...profile, safety: 'unchecked', artifact: 'loadable-module' }), base)
+    assert.strictEqual(
+      key({ ...profile, optimization: profile.optimization === 'none' ? 'speed' : 'none' }),
+      base,
+    )
     const variants = [
       key(profile, { providers: [memcpy] }),
       key(profile, { distribution: 'other-distribution' }),
@@ -1973,13 +1987,160 @@ it.effect('keys a reusable helper object by every input that shapes it, and only
       key({ ...profile, deployment: '12.0.0' }),
       key({ ...profile, relocation: profile.relocation === 'pic' ? 'static' : 'pic' }),
       key({ ...profile, codeModel: profile.codeModel === 'small' ? 'large' : 'small' }),
-      key({ ...profile, optimization: profile.optimization === 'none' ? 'speed' : 'none' }),
       key({ ...profile, debug: !profile.debug }),
       key(profile, { compiler: { ...compiler, digest: 'other-clang-digest' } }),
       key(profile, { compiler: { ...compiler, version: 'clang version 22.1.9' } }),
     ]
     assert.strictEqual(new Set([base, ...variants]).size, variants.length + 1)
   }),
+)
+
+it.effect(
+  'leaves hosted helpers to libc and realizes no-libc helpers optimized once for any program mode',
+  () =>
+    Effect.gen(function* () {
+      const target = yield* NativeToolchain.hostTarget()
+      const hosted = yield* profileFor(target, 'debug')
+      const selected = yield* NativeToolchain.resolveToolchain(toolchain, hosted)
+      const entries = new Map<string, Uint8Array>()
+      const store: Storage.Service = Storage.Storage.of({
+        read: (address) =>
+          Effect.sync(() => {
+            const found = entries.get(address.key)
+            return found === undefined ? Option.none() : Option.some(found)
+          }),
+        publish: (address, bytes) =>
+          Effect.sync(() => {
+            entries.set(address.key, Uint8Array.from(bytes))
+          }),
+      })
+      const cache: NativeToolchain.HelperCache = {
+        _tag: 'ReadWrite',
+        store,
+        distribution: 'distribution',
+      }
+      const symbols = ['memcpy', 'memset'].map((name) => ({
+        name: target.operatingSystem === 'darwin' ? `_${name}` : name,
+        defined: false,
+        weak: false,
+        visibility: 'default' as const,
+      }))
+      const report = (profile: CompilationProfile.Facts) =>
+        HelperCapability.reconcile(
+          {
+            format: target.operatingSystem === 'darwin' ? 'macho' : 'elf',
+            symbols,
+            references: [],
+          },
+          { foreignImports: [], foreignStatics: [], nativeRuntimeSymbols: [] },
+          profile,
+          'program.o',
+          'program-digest',
+        )
+      yield* NativeToolchain.withBuildScope(
+        'helper-realization',
+        Effect.fnUntraced(function* (scope) {
+          const hostedReport = yield* report(hosted)
+          assert.deepEqual(
+            hostedReport.requirements.map((entry) => entry.provider.kind),
+            ['platform', 'platform'],
+          )
+          assert.isUndefined(
+            yield* NativeToolchain.compileHelpers(selected, scope, hosted, hostedReport, cache),
+          )
+          const realized: Array<NativeToolchain.HelperObject> = []
+          for (const optimization of ['none', 'speed'] as const) {
+            const profile = yield* CompilationProfile.normalize({
+              target: target.id,
+              libc: 'none',
+              artifact: 'object',
+              entry: { kind: 'none' },
+              runtime: { kind: 'none' },
+              optimization,
+            })
+            const helpers = yield* report(profile)
+            const compiled = yield* NativeToolchain.compileHelpers(
+              selected,
+              scope,
+              profile,
+              helpers,
+              cache,
+            )
+            if (compiled === undefined) return assert.fail('expected a source helper object')
+            realized.push(compiled)
+          }
+          const [debugProgram, releaseProgram] = realized
+          if (debugProgram === undefined || releaseProgram === undefined)
+            return assert.fail('expected both helper realizations')
+          // A debug program still realizes optimized helpers, which a release program then reuses.
+          assert.isFalse(debugProgram.reused)
+          assert.include(debugProgram.object.planned.arguments, '-O2')
+          assert.notInclude(debugProgram.object.planned.arguments, '-O0')
+          assert.isTrue(releaseProgram.reused)
+        }),
+      )
+    }),
+)
+
+it.effect(
+  'executes the no-libc source memory providers across lengths, offsets and overlap',
+  () =>
+    Effect.gen(function* () {
+      const target = yield* NativeToolchain.hostTarget()
+      const selected = yield* NativeToolchain.resolveToolchain(toolchain, yield* profileFor(target))
+      const profile = yield* CompilationProfile.normalize({
+        target: target.id,
+        libc: 'none',
+        artifact: 'object',
+        entry: { kind: 'none' },
+        runtime: { kind: 'none' },
+      })
+      const darwin = target.operatingSystem === 'darwin'
+      const symbols = ['memcpy', 'memmove', 'memset', 'memcmp', darwin ? 'bzero' : 'bcmp'].map(
+        (name) => ({
+          name: darwin ? `_${name}` : name,
+          defined: false,
+          weak: false,
+          visibility: 'default' as const,
+        }),
+      )
+      const report = yield* HelperCapability.reconcile(
+        { format: darwin ? 'macho' : 'elf', symbols, references: [] },
+        { foreignImports: [], foreignStatics: [], nativeRuntimeSymbols: [] },
+        profile,
+        'program.o',
+        'program-digest',
+      )
+      const linked = yield* NativeToolchain.withBuildScope(
+        'source-memory-execution',
+        Effect.fnUntraced(function* (scope) {
+          const helpers = yield* NativeToolchain.compileHelpers(selected, scope, profile, report, {
+            _tag: 'Disabled',
+          })
+          if (helpers === undefined) return assert.fail('expected a source helper object')
+          // The helper object's definitions take precedence over libc for the receiver's calls.
+          const receiver = yield* NativeToolchain.compileCObject(
+            selected,
+            scope,
+            target,
+            'source-memory-receiver',
+            readFileSync(new URL('./fixtures/source-memory-helpers.c', import.meta.url), 'utf8'),
+          )
+          return yield* finalize(
+            selected,
+            scope,
+            'NativeExecutable',
+            target,
+            [receiver.artifact, helpers.object.artifact],
+            [],
+            join(testRoot, 'source-memory-helpers'),
+          )
+        }),
+      )
+      const run = spawnSync(linked.path, [], { encoding: 'utf8' })
+      assert.strictEqual(run.status, 42, run.stderr)
+    }),
+  30_000,
 )
 
 it.effect(
@@ -2023,6 +2184,18 @@ it.effect(
           ['memcpy', ['pointer', 'pointer', 'u64'], 'pointer'],
         ],
       )
+      // Hosted libc supplies both families; only libm is an added link input.
+      assert.deepEqual(
+        report.requirements.map((entry) => [
+          entry.provider.kind,
+          entry.provider.root,
+          entry.contract.retention,
+        ]),
+        [
+          ['platform', 'm', 'platform-symbol'],
+          ['platform', 'c', 'platform-symbol'],
+        ],
+      )
       assert.deepEqual(report.runtime, ['calloc', 'malloc'])
       assert.deepEqual(report.foreign, ['foreign_read'])
       assert.deepEqual(HelperCapability.linkInputs([report]), [
@@ -2061,6 +2234,8 @@ it.effect(
       const absent = yield* Effect.result(HelperCapability.provider('fmod', noLibc))
       if (Result.isSuccess(absent)) return assert.fail('Unexpected no-libc arithmetic provider')
       assert.strictEqual(absent.failure.code, 'MissingProvider')
+      const source = yield* HelperCapability.provider('memcpy', noLibc)
+      assert.deepEqual([source.kind, source.root], ['source', 'silk.support.memcpy'])
     }),
 )
 
@@ -2068,7 +2243,13 @@ it.effect(
   'rejects direct and transitive provider cycles, incompatible targets and emitted self dependencies',
   () =>
     Effect.gen(function* () {
-      const profile = yield* CompilationProfile.normalize({ target: 'aarch64-apple-darwin' })
+      const profile = yield* CompilationProfile.normalize({
+        target: 'aarch64-apple-darwin',
+        libc: 'none',
+        artifact: 'object',
+        entry: { kind: 'none' },
+        runtime: { kind: 'none' },
+      })
       const copy = yield* HelperCapability.provider('memcpy', profile)
       const move = yield* HelperCapability.provider('memmove', profile)
       const abi = yield* Effect.result(
@@ -2083,7 +2264,7 @@ it.effect(
               contract: ForeignContract.conservative,
             },
           ],
-          profile.target,
+          profile,
         ),
       )
       if (Result.isSuccess(abi)) return assert.fail('Mismatched C helper signature was admitted')

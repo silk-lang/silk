@@ -53,7 +53,7 @@ export const run = Effect.fn('DocumentationWorkflow.run')(function* (
     return 2
   }
   const project = loaded.success
-  const resolver = FileSourceResolver.make(project.entry.sourceRoot)
+  const resolver = FileSourceResolver.make(project.entry.sourceRoot, { kind: 'embedded' })
   const attempted = yield* Effect.result(
     Analysis.make({
       root: project.entry.module,

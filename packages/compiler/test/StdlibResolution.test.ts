@@ -381,12 +381,12 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`),
   }),
 )
 
-it.effect('closes byte-loop helper providers over pointer and option only', () =>
+it.effect('closes source helper providers over pointer and option only', () =>
   Effect.gen(function* () {
-    // Every uncached native build realizes its selected helpers as a separate program, so one stray
-    // import (such as `silk.i32`) re-elaborates the numeric, format and allocator closure each time.
-    // `memset` still needs `i32.toU8` and is excluded until its conversion stops pulling that in.
-    for (const symbol of ['bcmp', 'bzero', 'memcmp', 'memcpy', 'memmove']) {
+    // Every uncached no-libc native build realizes its selected helpers as a separate program, so
+    // one stray import (such as `silk.i32`) re-elaborates the numeric, format and allocator closure
+    // each time. Providers convert integers through intrinsics instead.
+    for (const symbol of ['bcmp', 'bzero', 'memcmp', 'memcpy', 'memmove', 'memset']) {
       const closure = yield* ModuleClosure.load({ root: `silk/support/${symbol}` }).pipe(
         Effect.provide(SourceResolver.empty),
       )
