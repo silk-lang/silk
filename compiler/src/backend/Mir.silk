@@ -3,7 +3,7 @@
 import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder, RemainderLevel, Variant as GlueVariant}
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.Gap {Code as GapCode, Gap}
-import backend.InstanceKey {InstanceKey}
+import backend.InstanceKey {InstanceKey, Observer}
 import backend.RuntimeType
 import backend.UnionProjection
 import backend.RuntimeType {Projection as RuntimeProjection}
@@ -21,6 +21,8 @@ import silk.u32
 import silk.u64
 import hir.Hir {Access, CallableMode, HirId, InfixOperator, Module, Node as HirNode, OwnerKind, PrefixOperator, Sign}
 import lexer.Span {Span}
+import semantic.Lifetime {Lifetime}
+import semantic.ModuleId {ModuleId}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Type {Argument, Binding, ArrayShape, CallableFieldInput, Requirement, Row, RowParameter, Type}
 import semantic.Lifetime {Intersection, Member as Region}
@@ -68,6 +70,14 @@ pub union LocalKind {
   Failure,
   /// The address of the provider of requirement entry `index`, in canonical key order (D2).
   Provider {pub index: usize},
+  /// The observed state's address in an instance that runs under a diagnostic observer
+  /// (failure observer note N1).
+  Observer,
+  /// The address of the context of the failure the current recovery handler selected; its
+  /// identity is empty when none is selected (N2).
+  Cause,
+  /// The caller-owned failure context out-slot of an observed function that can fail (N3).
+  Context,
   /// A `bool` that records whether owned local `local` still needs its drop, where ownership
   /// differs between the paths that reach a join (MIR core shape §3).
   DropFlag {pub local: usize},
@@ -146,6 +156,8 @@ pub union Terminator {
     pub arguments: Vector<Operand>,
     /// Provider addresses in the callee's canonical requirement-key order (D2).
     pub providers: Vector<Operand>,
+    /// Present exactly when the callee runs under a diagnostic observer (N1).
+    pub diagnostics: Option<Diagnostics>,
     pub destination: Place,
     pub normal: usize,
     /// Present exactly when the callee's failure type is not `never`.
@@ -165,6 +177,14 @@ pub union Terminator {
 pub struct FailureEdge {
   pub destination: Place
   pub target: usize
+  /// Where an observed callee writes the failure's context companion (N3).
+  pub context: Option<Place>
+}
+
+/// The hidden operands of an observed callee, after its providers (failure observer note N1, N2).
+pub struct Diagnostics {
+  pub observer: Operand
+  pub cause: Operand
 }
 
 /// One distinct switch value in sign-magnitude decimal form and its target block.
@@ -354,6 +374,9 @@ pub union RunPlan {
   /// Runs part 0 with the provider in part 1 bound for one requirement key (D2 rule 2): only
   /// this execution sees the replacement.
   Bind {pub inner: usize},
+  /// Runs part 2 under the diagnostic observer whose state is part 0, with no selected failure,
+  /// then drops the state (failure observer note N1). `state` is the state's address type.
+  Observe {pub inner: usize, pub state: Shared<Type>, pub stateDrop: Option<Shared<Type>>},
 }
 
 // The place of the provider stored by one binding that encloses the current expansion.
@@ -418,6 +441,32 @@ struct Builder {
   plans: Vector<NodePlan>
   // This function's `Provider` locals in canonical requirement-key order.
   providers: Vector<usize>
+  // The observer and selected-cause addresses passed to observed callees; absent outside
+  // observation (failure observer note N1, N2).
+  diagnostics: Option<DiagnosticPlaces>
+  // The `Context` out-slot, or `usize.MAX` when this function is unobserved or cannot fail.
+  context: usize
+  // The context companion of each failure slot of an observed function (N3).
+  companions: Vector<Companion>
+  // Renders this observed function's site labels; absent when it is unobserved.
+  sites: Option<SiteText>
+}
+
+struct DiagnosticPlaces {
+  observer: Place
+  cause: Place
+}
+
+struct Companion {
+  slot: usize
+  context: usize
+}
+
+// An observed function's report name and its module's line starts (failure observer note N3).
+struct SiteText {
+  name: Bytes
+  path: Bytes
+  lines: Vector<usize>
 }
 
 // Where a failure inside an expansion goes: out of this function, or into a handler's temporary.
@@ -2503,6 +2552,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Intrinsic {member, node: callNode, ty, origin} => {
+      if member == IntrinsicMember.ObserveUnhandled { return run observeUnhandled(&mut builder.*, &ty, origin) }
       let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, member, &ty, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), move operation, origin)
@@ -2535,12 +2585,14 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       let continuation = run block(&mut builder.*, origin)
       let target = run callCallee(&mut builder.*, move foreign, callNode, &owner, origin)
       let providers = run targetProviders(&mut builder.*, callNode, origin)
+      let diagnostics = run calleeDiagnostics(&builder.*, &target, origin)
       terminate(
         &mut builder.*,
         Terminator.Call {
           callee: move target,
           arguments: move values,
           providers: move providers,
+          diagnostics: move diagnostics,
           destination: place(output),
           normal: continuation,
           failure: Option.none<FailureEdge>(),
@@ -3281,12 +3333,14 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
     if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
     caught = run temporary(&mut builder.*, &calleeFailure, origin)
     handler = run block(&mut builder.*, origin)
-    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
+    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler,
+      context: run edgeContext(&mut builder.*, &target, caught, origin)})
   }
   let providers = run targetProviders(&mut builder.*, node, origin)
+  let diagnostics = run calleeDiagnostics(&builder.*, &target, origin)
   terminate(&mut builder.*, Terminator.Call {
-    callee: move target, arguments: move values, providers: move providers, destination: place(output),
-    normal: continuation, failure: move edge, origin: origin,
+    callee: move target, arguments: move values, providers: move providers, diagnostics: move diagnostics,
+    destination: place(output), normal: continuation, failure: move edge, origin: origin,
   })
   if handler != usize.MAX {
     resume(&mut builder.*, handler)
@@ -3302,6 +3356,7 @@ effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<T
 ! Gap | OutOfMemoryError ? &mut Allocator {
   let destination = builder.failure
   run widenInto(&mut builder.*, caught, from, destination, origin)
+  run carry(&mut builder.*, caught, destination, origin)
   run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
   terminate(&mut builder.*, Terminator.Fail {origin: origin})
   return ()
@@ -3387,6 +3442,7 @@ effect fn deliverFailure(builder: &mut Builder, caught: usize, from: &Shared<Typ
     }
     FailureSink.Catch {temp, block: target, ..} => {
       run widenInto(&mut builder.*, caught, from, temp, origin)
+      run carry(&mut builder.*, caught, temp, origin)
       terminate(&mut builder.*, Terminator.Goto {target: target, origin: origin})
     }
   }
@@ -3473,11 +3529,15 @@ effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Pla
   if !Shared.with<Type, bool>(failure, neverType) {
     caught = run temporary(&mut builder.*, failure, origin)
     handler = run block(&mut builder.*, origin)
-    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler})
+    let failing = Callee.Instance {key: InstanceKey.copy(&target.key)}
+    edge = Option.some<FailureEdge>(FailureEdge {destination: place(caught), target: handler,
+      context: run edgeContext(&mut builder.*, &failing, caught, origin)})
   }
-  terminate(&mut builder.*, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(&target.key)},
-    arguments: move values, providers: move providers, destination: place(destination), normal: continuation,
-    failure: move edge, origin: origin})
+  let callee = Callee.Instance {key: InstanceKey.copy(&target.key)}
+  let diagnostics = run calleeDiagnostics(&builder.*, &callee, origin)
+  terminate(&mut builder.*, Terminator.Call {callee: move callee,
+    arguments: move values, providers: move providers, diagnostics: move diagnostics, destination: place(destination),
+    normal: continuation, failure: move edge, origin: origin})
   if handler != usize.MAX {
     resume(&mut builder.*, handler)
     run deliverFailure(&mut builder.*, caught, failure, sink, origin)
@@ -3529,6 +3589,19 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, &mut bound.*, origin)
       drop Vector.pop<BoundPlace>(&mut bound.*)
     }
+    RunPlan.Observe {inner, state, stateDrop} => {
+      // The body runs with the observed state's address and no selected failure (N1, N2).
+      let statePart = run projectedPart(environment, usize.ZERO)
+      let bodyPart = run projectedPart(environment, 2)
+      let address = run temporary(&mut builder.*, &state, origin)
+      run assign(&mut builder.*, place(address), Rvalue.Ref {access: Access.Mutable, place: run copyPlace(&statePart)}, origin)
+      let none = run emptyCause(&mut builder.*, origin)
+      let outer = swapDiagnostics(&mut builder.*, Option.some<DiagnosticPlaces>(DiagnosticPlaces {observer: place(address),
+        cause: place(none)}))
+      run executePlan(&mut builder.*, steps, inner, &bodyPart, output, sink, &mut bound.*, origin)
+      drop swapDiagnostics(&mut builder.*, move outer)
+      run dropUnused(&mut builder.*, &statePart, &stateDrop, origin)
+    }
     RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop} => {
       // The protected Effect fails into a temporary of its own failure type; the edge selects.
       let caught = run temporary(&mut builder.*, &innerFailure, origin)
@@ -3552,8 +3625,10 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
         Option<Vector<Shared<Type>>>.Some {value} => value
         Option<Vector<Shared<Type>>>.None => {
           // One failure type, or the whole failure: it is the selection.
+          let outer = run selectCause(&mut builder.*, caught, origin)
           run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(Operand.Move {place: place(caught)}),
             &handlerSuccess, &handlerFailure, output, sink, Vector.asSlice<BoundPlace>(&bound.*), origin)
+          drop swapDiagnostics(&mut builder.*, move outer)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
           resume(&mut builder.*, joined)
           return ()
@@ -3593,11 +3668,14 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
             run assign(&mut builder.*, place(injected), Rvalue.Inject {tag: tag, value: Operand.Move {place: place(held)}}, origin)
             argument = Operand.Move {place: place(injected)}
           }
+          let outer = run selectCause(&mut builder.*, caught, origin)
           run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument), &handlerSuccess, &handlerFailure,
             output, sink, Vector.asSlice<BoundPlace>(&bound.*), origin)
+          drop swapDiagnostics(&mut builder.*, move outer)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
         } else {
           run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
+          run carry(&mut builder.*, caught, held, origin)
           run deliverFailure(&mut builder.*, held, &listed[at], sink, origin)
         }
         at = at + usize.ONE
@@ -3740,6 +3818,309 @@ fn callDispatch(builder: &Builder, node: BodyNodeId) -> Option<ProviderSource> {
     at = at + usize.ONE
   }
   return Option.none<ProviderSource>()
+}
+
+// The failure context companion: the failure's identity and its origin label (failure
+// observer note N3).
+effect fn contextType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  let text = run Shared.make<Type>(Type.String {lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+  return run Shared.make<Type>(Type.Array {element: move text, extent: run Bytes.copy(b"2")})
+}
+
+effect fn causeType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Reference {referent: run contextType(), access: Access.Shared,
+    lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+}
+
+effect fn stateAddress(state: &Shared<Type>) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(state), access: Access.Mutable,
+    lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+}
+
+// A module's report name: its logical path without the source extension.
+effect fn modulePath(module: &ModuleId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let path = ModuleId.logicalPath(module)
+  let mut end = path.length
+  if end > 5 && path[end - 5] == 46 && path[end - 4] == 115 && path[end - 3] == 105 && path[end - 2] == 108 && path[end - 1] == 107 {
+    end = end - 5
+  }
+  let mut copied = run Bytes.copy(path)
+  Bytes.truncate(&mut copied, end)
+  return move copied
+}
+
+// `module.Owner.name`, naming only named owner steps (anonymous bodies report their owner).
+effect fn declarationName(declaration: &DeclarationId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut name = run modulePath(DeclarationId.moduleId(declaration))
+  let steps = DeclarationId.ownerSteps(declaration)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Option<Bytes>.Some {value} = &steps[at].name {
+      run Bytes.append(&mut name, b".")
+      run Bytes.append(&mut name, Bytes.asSlice(&value))
+    }
+    at = at + usize.ONE
+  }
+  return move name
+}
+
+effect fn siteText(key: &InstanceKey, source: &[u8]) -> SiteText ! OutOfMemoryError ? &mut Allocator {
+  let identity = run DeclarationId.copyShared(&InstanceKey.identity(key))
+  let mut lines = Vector.make<usize>()
+  run Vector.append<usize>(&mut lines, usize.ZERO)
+  let mut at = usize.ZERO
+  while at < source.length {
+    if source[at] == 10 { run Vector.append<usize>(&mut lines, at + usize.ONE) }
+    at = at + usize.ONE
+  }
+  return SiteText {name: run declarationName(&identity), path: run modulePath(DeclarationId.moduleId(&identity)),
+    lines: move lines}
+}
+
+// `module.function (module:line:column)` for one site, 1-based.
+effect fn siteLabel(sites: &SiteText, span: Span) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let starts = Vector.asSlice<usize>(&sites.lines)
+  let mut line = usize.ONE
+  while line < starts.length && starts[line] <= span.start { line = line + usize.ONE }
+  let mut label = run Bytes.copy(Bytes.asSlice(&sites.name))
+  run Bytes.append(&mut label, b" (")
+  run Bytes.append(&mut label, Bytes.asSlice(&sites.path))
+  run Bytes.append(&mut label, b":")
+  run Bytes.append(&mut label, Bytes.asSlice(&run decimalBytes(usize.toU64(line))))
+  run Bytes.append(&mut label, b":")
+  run Bytes.append(&mut label, Bytes.asSlice(&run decimalBytes(usize.toU64(span.start - starts[line - usize.ONE] + usize.ONE))))
+  run Bytes.append(&mut label, b")")
+  return move label
+}
+
+// The canonical identity a report names for one failure type: `module.Name<Arguments>`.
+effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let shape = run Type.copy(ty)
+  match move shape {
+    Type.Primitive {name} => { run Bytes.append(&mut output.*, Bytes.asSlice(&name)) }
+    Type.Unit => { run Bytes.append(&mut output.*, b"()") }
+    Type.Nominal {declaration, arguments, ..} => {
+      run Bytes.append(&mut output.*, Bytes.asSlice(&run declarationName(&declaration)))
+      let listed = Vector.asSlice<Argument>(&arguments)
+      let mut written = usize.ZERO
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if let Argument.Type {value} = &listed[at] {
+          if written == usize.ZERO { run Bytes.append(&mut output.*, b"<") } else { run Bytes.append(&mut output.*, b", ") }
+          if !run identityText(&value, &mut output.*) { return false }
+          written = written + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if written != usize.ZERO { run Bytes.append(&mut output.*, b">") }
+    }
+    _ => { return false }
+  }
+  return true
+}
+
+effect fn textOperand(builder: &mut Builder, text: Bytes, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator {
+  let ty = run Shared.make<Type>(Type.String {lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+  let count = Bytes.length(&text)
+  let output = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(output), Rvalue.Slice {data: Operand.StaticBytes {bytes: move text}, count: count}, origin)
+  return Operand.Copy {place: place(output)}
+}
+
+// Stores `identity` and `label` in the companion `context`.
+effect fn writeContext(builder: &mut Builder, context: usize, identity: Bytes, label: Bytes, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let named = run textOperand(&mut builder.*, move identity, origin)
+  let located = run textOperand(&mut builder.*, move label, origin)
+  let mut fields = Vector.make<AggregateField>()
+  run Vector.append<AggregateField>(&mut fields, AggregateField {index: usize.ZERO, value: move named})
+  run Vector.append<AggregateField>(&mut fields, AggregateField {index: usize.ONE, value: move located})
+  return run assign(&mut builder.*, place(context), Rvalue.Aggregate {fields: move fields}, origin)
+}
+
+// The companion of failure slot `slot` in an observed function (N3).
+effect fn companion(builder: &mut Builder, slot: usize, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if slot == builder.failure && builder.context != usize.MAX { return builder.context }
+  let listed = Vector.asSlice<Companion>(&builder.companions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].slot == slot { return listed[at].context }
+    at = at + usize.ONE
+  }
+  let context = run temporary(&mut builder.*, &run contextType(), origin)
+  run Vector.append<Companion>(&mut builder.*.companions, Companion {slot: slot, context: context})
+  return context
+}
+
+// Moves a failure's context with its payload from slot `from` to slot `to` (N3).
+effect fn carry(builder: &mut Builder, from: usize, to: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<SiteText>.None = &builder.sites { return () }
+  let source = run companion(&mut builder.*, from, origin)
+  let destination = run companion(&mut builder.*, to, origin)
+  return run assign(&mut builder.*, place(destination), Rvalue.Use {value: Operand.Move {place: place(source)}}, origin)
+}
+
+// `fail` originates its context: the active member's identity and this site's label (N3).
+effect fn raise(builder: &mut Builder, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let label = match &builder.sites {
+    Option<SiteText>.Some {value: sites} => run siteLabel(&sites, origin.span)
+    Option<SiteText>.None => { return () }
+  }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let slot = builder.failure
+  let failed = localType(&builder.*, slot)
+  let context = run companion(&mut builder.*, slot, origin)
+  let members = match move run Type.canonicalUnionMembers(&failed) {
+    Option<Vector<Shared<Type>>>.Some {value} => value
+    Option<Vector<Shared<Type>>>.None => {
+      let mut identity = Bytes.make()
+      if !run identityText(&failed, &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
+      return run writeContext(&mut builder.*, context, move identity, move label, origin)
+    }
+  }
+  // A union failure names its active member, selected by the runtime tag.
+  let listed = Vector.asSlice<Shared<Type>>(&members)
+  let tagType = run Layout.tagType(listed.length)
+  let read = run temporary(&mut builder.*, &tagType, origin)
+  run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: place(slot)}, origin)
+  let joined = run block(&mut builder.*, origin)
+  let mut cases = Vector.make<SwitchCase>()
+  let mut arms = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let arm = run block(&mut builder.*, origin)
+    run Vector.append<usize>(&mut arms, arm)
+    run Vector.append<SwitchCase>(&mut cases, SwitchCase {decimal: run Type.extentText(at), negative: false, target: arm})
+    at = at + usize.ONE
+  }
+  let unreachable = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases,
+    otherwise: unreachable, origin: origin})
+  resume(&mut builder.*, unreachable)
+  terminate(&mut builder.*, Terminator.Unreachable {origin: origin})
+  at = usize.ZERO
+  while at < listed.length {
+    resume(&mut builder.*, Vector.asSlice<usize>(&arms)[at])
+    let mut identity = Bytes.make()
+    if !run identityText(&listed[at], &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
+    run writeContext(&mut builder.*, context, move identity, run Bytes.copy(Bytes.asSlice(&label)), origin)
+    terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+    at = at + usize.ONE
+  }
+  resume(&mut builder.*, joined)
+  return ()
+}
+
+fn observedKey(callee: &Callee) -> bool {
+  return match &callee.* {
+    Callee.Instance {key} => match move InstanceKey.observer(&key) { Option<Shared<Observer>>.Some {..} => true _ => false }
+    _ => false
+  }
+}
+
+// The observer and selected-cause operands of an observed callee (N1, N2).
+effect fn calleeDiagnostics(builder: &Builder, callee: &Callee, origin: Origin) -> Option<Diagnostics>
+! Gap | OutOfMemoryError ? &mut Allocator {
+  if !observedKey(callee) { return Option.none<Diagnostics>() }
+  return match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value: places} => Option.some<Diagnostics>(Diagnostics {
+      observer: Operand.Copy {place: run copyPlace(&places.observer)}, cause: Operand.Copy {place: run copyPlace(&places.cause)}})
+    Option<DiagnosticPlaces>.None => run unsupported(&InstanceKey.identity(&builder.function.key), origin, GapCode.EffectForm)
+  }
+}
+
+// Where an observed callee writes a failure's context: the companion of the edge's slot (N3).
+effect fn edgeContext(builder: &mut Builder, callee: &Callee, caught: usize, origin: Origin) -> Option<Place>
+! OutOfMemoryError ? &mut Allocator {
+  if !observedKey(callee) { return Option.none<Place>() }
+  return Option.some<Place>(place(run companion(&mut builder.*, caught, origin)))
+}
+
+fn swapDiagnostics(builder: &mut Builder, next: Option<DiagnosticPlaces>) -> Option<DiagnosticPlaces> {
+  return Intrinsic.replace(builder.diagnostics, move next)
+}
+
+// The address of an empty context: no selected failure (N2).
+effect fn emptyCause(builder: &mut Builder, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let empty = run temporary(&mut builder.*, &run contextType(), origin)
+  run writeContext(&mut builder.*, empty, Bytes.make(), Bytes.make(), origin)
+  let address = run temporary(&mut builder.*, &run causeType(), origin)
+  run assign(&mut builder.*, place(address), Rvalue.Ref {access: Access.Shared, place: place(empty)}, origin)
+  return address
+}
+
+// Selects the caught failure's context for its handler's run; returns the places to restore (N2).
+effect fn selectCause(builder: &mut Builder, caught: usize, origin: Origin) -> Option<DiagnosticPlaces>
+! OutOfMemoryError ? &mut Allocator {
+  let observer = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value: places} => run copyPlace(&places.observer)
+    Option<DiagnosticPlaces>.None => { return Option.none<DiagnosticPlaces>() }
+  }
+  let context = run companion(&mut builder.*, caught, origin)
+  let address = run temporary(&mut builder.*, &run causeType(), origin)
+  run assign(&mut builder.*, place(address), Rvalue.Ref {access: Access.Shared, place: place(context)}, origin)
+  return swapDiagnostics(&mut builder.*, Option.some<DiagnosticPlaces>(DiagnosticPlaces {observer: move observer, cause: place(address)}))
+}
+
+effect fn usizeOperand(value: u64) -> Operand ! OutOfMemoryError ? &mut Allocator {
+  return Operand.Integer {decimal: run decimalBytes(value), negative: false,
+    ty: run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"usize")})}
+}
+
+// `observeUnhandled()` hands the selected failure's context to the observer's callback as event 5
+// with handle 0; without an observer or a selected failure it is 0 (failure observer note N4).
+effect fn observeUnhandled(builder: &mut Builder, ty: &Shared<Type>, origin: Origin) -> Operand
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let output = run temporary(&mut builder.*, ty, origin)
+  let slot = InstanceKey.observer(&builder.function.key)
+  let places = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value} => DiagnosticPlaces {observer: run copyPlace(&value.observer), cause: run copyPlace(&value.cause)}
+    Option<DiagnosticPlaces>.None => {
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: run usizeOperand(0)}, origin)
+      return Operand.Copy {place: place(output)}
+    }
+  }
+  let callback = match &slot {
+    Option<Shared<Observer>>.Some {value} => Shared.with<Observer, InstanceKey>(&value, fn(observer: &Observer) -> InstanceKey {
+      return InstanceKey.copy(&observer.callback)
+    })
+    Option<Shared<Observer>>.None => run unsupported(&InstanceKey.identity(&builder.function.key), origin, GapCode.EffectForm)
+  }
+  let mut identity = run copyPlace(&places.cause)
+  run Vector.append<Projection>(&mut identity.projections, Projection.Deref)
+  let mut label = run copyPlace(&identity)
+  run Vector.append<Projection>(&mut identity.projections, Projection.ConstIndex {index: usize.ZERO})
+  run Vector.append<Projection>(&mut label.projections, Projection.ConstIndex {index: usize.ONE})
+  let length = run temporary(&mut builder.*, &run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"usize")}), origin)
+  run assign(&mut builder.*, place(length), Rvalue.SliceLength {place: run copyPlace(&identity)}, origin)
+  let selected = run temporary(&mut builder.*, &run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")}), origin)
+  run assign(&mut builder.*, place(selected), Rvalue.Binary {operation: InfixOperator.NotEquals,
+    left: Operand.Copy {place: place(length)}, right: run usizeOperand(0)}, origin)
+  let report = run block(&mut builder.*, origin)
+  let quiet = run block(&mut builder.*, origin)
+  let joined = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(selected)}, thenBlock: report,
+    elseBlock: quiet, origin: origin})
+  resume(&mut builder.*, report)
+  let mut arguments = Vector.make<Operand>()
+  run Vector.append<Operand>(&mut arguments, Operand.Copy {place: move places.observer})
+  run Vector.append<Operand>(&mut arguments, Operand.Integer {decimal: run Bytes.copy(b"5"), negative: false,
+    ty: run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u8")})})
+  run Vector.append<Operand>(&mut arguments, run usizeOperand(0))
+  run Vector.append<Operand>(&mut arguments, run usizeOperand(0))
+  run Vector.append<Operand>(&mut arguments, Operand.Copy {place: move identity})
+  run Vector.append<Operand>(&mut arguments, Operand.Copy {place: move label})
+  // The callback is an independent edge: it runs unobserved (N1).
+  run Vector.append<Reference>(&mut builder.*.function.references,
+    Reference {key: InstanceKey.copy(&callback), edge: Edge.Direct, origin: origin})
+  terminate(&mut builder.*, Terminator.Call {callee: Callee.Instance {key: move callback}, arguments: move arguments,
+    providers: Vector.make<Operand>(), diagnostics: Option.none<Diagnostics>(), destination: place(output), normal: joined,
+    failure: Option.none<FailureEdge>(), origin: origin})
+  resume(&mut builder.*, quiet)
+  run assign(&mut builder.*, place(output), Rvalue.Use {value: run usizeOperand(0)}, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+  resume(&mut builder.*, joined)
+  return Operand.Copy {place: place(output)}
 }
 
 effect fn singleOperand(value: Operand) -> Vector<Operand> ! OutOfMemoryError ? &mut Allocator {
@@ -3976,6 +4357,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
       let destination = builder.failure
       run assign(&mut builder.*, place(destination), Rvalue.Use {value: move failed}, origin)
+      run raise(&mut builder.*, origin)
       run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
       terminate(&mut builder.*, Terminator.Fail {origin: origin})
     }
@@ -4368,6 +4750,7 @@ impl MirFunction {
           callee: Callee.Instance {key: InstanceKey.copy(&callee)},
           arguments: Vector.make<Operand>(),
           providers: Vector.make<Operand>(),
+          diagnostics: Option.none<Diagnostics>(),
           destination: place(usize.ZERO),
           normal: usize.ONE,
           failure: Option.none<FailureEdge>(),
@@ -4409,6 +4792,7 @@ impl MirFunction {
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
     projections: Vector<RuntimeProjection>,
+    source: &[u8],
   ) -> MirFunction ! Gap | OutOfMemoryError ? &mut Allocator {
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
@@ -4461,12 +4845,31 @@ impl MirFunction {
         kind: LocalKind.Provider {index: providerAt}, origin: origin})
       providerAt = providerAt + usize.ONE
     }
+    // An observed function receives the observed state's and the selected cause's addresses (N1, N2).
+    let observer = InstanceKey.observer(&key)
+    let mut diagnostics = Option.none<DiagnosticPlaces>()
+    let mut sites = Option.none<SiteText>()
+    if let Option<Shared<Observer>>.Some {value: slot} = &observer {
+      let state = Shared.with<Observer, Shared<Type>>(&slot, fn(value: &Observer) -> Shared<Type> { return Shared.clone<Type>(&value.state) })
+      let observerLocal = Vector.length<Local>(&locals)
+      run Vector.append<Local>(&mut locals, Local {ty: run stateAddress(&state), kind: LocalKind.Observer, origin: origin})
+      run Vector.append<Local>(&mut locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+      diagnostics = Option.some<DiagnosticPlaces>(DiagnosticPlaces {observer: place(observerLocal),
+        cause: place(observerLocal + usize.ONE)})
+      sites = Option.some<SiteText>(run siteText(&key, source))
+    }
     // A function that can fail writes its failure value to a caller-owned out-slot (D3).
     let mut failureLocal = usize.MAX
+    let mut contextLocal = usize.MAX
     let closedFailure = run Type.applyBindings(failure, supplied, true)
     if !Shared.with<Type, bool>(&closedFailure, neverType) {
       failureLocal = Vector.length<Local>(&locals)
       run Vector.append<Local>(&mut locals, Local {ty: move closedFailure, kind: LocalKind.Failure, origin: origin})
+      // Its context travels in a second out-slot beside the failure (N3).
+      if let Option<SiteText>.Some {..} = &sites {
+        contextLocal = Vector.length<Local>(&locals)
+        run Vector.append<Local>(&mut locals, Local {ty: run contextType(), kind: LocalKind.Context, origin: origin})
+      }
     }
     let mut builder = Builder {
       bindings: move bindings,
@@ -4494,6 +4897,10 @@ impl MirFunction {
       failure: failureLocal,
       plans: move plans,
       providers: move providerLocals,
+      diagnostics: move diagnostics,
+      context: contextLocal,
+      companions: Vector.make<Companion>(),
+      sites: move sites,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)

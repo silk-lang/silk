@@ -37,7 +37,7 @@ import backend.DropGlue {
   RemainderLevel,
   Variant as GlueVariant,
 }
-import backend.InstanceKey {InstanceKey, ProviderEntry}
+import backend.InstanceKey {InstanceKey, Observer, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity}
 import backend.Layout {
@@ -156,6 +156,7 @@ import semantic.ScalarEnum {
   Member as EnumInput,
   Reason as EnumReason,
 }
+import semantic.SourceUnit {SourceUnit}
 import semantic.SourceIndex {
   AuthoredCursor,
   Event as SourceEvent,
@@ -21714,9 +21715,10 @@ effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Word, Ans
   let mut arity = usize.ONE
   if operation == Composition.Finalize || operation == Composition.FinalizeNonParking { arity = 4 }
   if operation == Composition.UseRelease { arity = 5 }
+  if operation == Composition.Observe { arity = 4 }
   let mut written = Vector.make<Argument>()
   if !generics.present {
-    // Only a finalizer infers its arguments from its operands.
+    // A finalizer and an observation infer their arguments from their operands.
     if operation == Composition.CatchFailure || bindingComposition(operation) {
       return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, span, usize.ONE, usize.ZERO))
     }
@@ -21751,7 +21753,8 @@ effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Word, Ans
             b"S", scope, &mut elision, true, &mut keys)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<ResolvedTarget, Shared<Rejection>>(move value) }
           run Vector.append<Argument>(&mut written, Argument.Row {value: run Shared.make<Row>(move keys)})
-        } else if operation != Composition.CatchFailure && at + 2 >= arity {
+        } else if (operation == Composition.Observe && at == 2) || (operation != Composition.CatchFailure &&
+          operation != Composition.Observe && at + 2 >= arity) {
           let mut row = Row.empty()
           let failed = run rowArgument(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, argument,
             b"", scope, &mut elision, false, &mut row)
@@ -22140,6 +22143,7 @@ effect fn intrinsicCallTarget(
   if same(member, b"bindRequirement") { composition = Option.some<Composition>(Composition.BindShared) }
   if same(member, b"bindRequirementMut") { composition = Option.some<Composition>(Composition.BindExclusive) }
   if same(member, b"bindRequirementOwned") { composition = Option.some<Composition>(Composition.BindOwned) }
+  if same(member, b"observeDiagnostics") { composition = Option.some<Composition>(Composition.Observe) }
   if let Option<Composition>.Some {value: operation} = move composition {
     return run compositionTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal,
       operation, syntax.generics, scope, span)
@@ -30456,7 +30460,82 @@ effect fn compositionChannels(resolver: &Resolver, module: &ModuleId, cursor: &A
   if operation == Composition.CatchFailure {
     return run caughtChannels(resolver, module, cursor, arguments, operands, selector, constraints)
   }
+  if operation == Composition.Observe {
+    return run observedChannels(resolver, module, cursor, arguments, operands, written, constraints, span)
+  }
   return run finalizedChannels(resolver, module, cursor, arguments, operation, operands, written, constraints, span)
+}
+
+// Whether `value` is the primitive named `name`.
+fn primitiveNamed(value: &Type, name: &[u8]) -> bool {
+  return match &value.* { Type.Primitive {name: spelled} => same(Bytes.asSlice(&spelled), name) _ => false }
+}
+
+fn stringType(value: &Type) -> bool {
+  return match &value.* { Type.String {..} => true _ => false }
+}
+
+// The observer callback's contract `fn(&mut S, u8, usize, usize, string, string) -> usize`.
+effect fn observerCallback(callback: &Shared<Type>, state: &Shared<Type>, constraints: &[Constraint]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let contract = match move run valueCallableContract(callback, constraints) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return false }
+  }
+  let parts = run Type.copy(&contract)
+  if let Type.Callable {parameters, result, ..} = move parts {
+    let listed = Vector.asSlice<Shared<Type>>(&parameters)
+    if listed.length != 6 || !Shared.with<Type, bool>(&result, fn(value: &Type) -> bool { return primitiveNamed(value, b"usize") }) {
+      return false
+    }
+    let receiver = Shared.with<Type, Option<Shared<Type>>>(&listed[usize.ZERO], fn(value: &Type) -> Option<Shared<Type>> {
+      return match &value.* {
+        Type.Reference {referent, access, ..} => {
+          if access != Access.Mutable { return Option.none<Shared<Type>>() }
+          return Option.some<Shared<Type>>(Shared.clone<Type>(&referent))
+        }
+        _ => Option.none<Shared<Type>>()
+      }
+    })
+    let lent = match move receiver { Option<Shared<Type>>.Some {value} => value Option<Shared<Type>>.None => { return false } }
+    let same = run Type.equalsShared(&lent, state)
+    return same &&
+      Shared.with<Type, bool>(&listed[usize.ONE], fn(value: &Type) -> bool { return primitiveNamed(value, b"u8") }) &&
+      Shared.with<Type, bool>(&listed[2], fn(value: &Type) -> bool { return primitiveNamed(value, b"usize") }) &&
+      Shared.with<Type, bool>(&listed[3], fn(value: &Type) -> bool { return primitiveNamed(value, b"usize") }) &&
+      Shared.with<Type, bool>(&listed[4], stringType) && Shared.with<Type, bool>(&listed[5], stringType)
+  }
+  return false
+}
+
+// The channels of `observeDiagnostics<S, A, R, F>(state, callback, body)`: the body's, whose
+// failure row is empty, so no failure leaves an observation (failure observer note N1).
+effect fn observedChannels(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
+  operands: &[Shared<Type>], written: &[Argument], constraints: &[Constraint], span: Span)
+-> Result<EffectChannels, Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let callbackSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ONE))
+  let bodySpanned = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, 2))
+  let observed = match move run runnableChannels(&operands[2], constraints) {
+    Option<EffectChannels>.Some {value} => value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, RejectionCode.RunNonEffect, bodySpanned) }
+  }
+  if !Shared.with<Type, bool>(&observed.failure, neverType) {
+    return run channelRejection(resolver, module, RejectionCode.TypeMismatch, bodySpanned)
+  }
+  if !run observerCallback(&operands[usize.ONE], &operands[usize.ZERO], constraints) {
+    return run channelRejection(resolver, module, RejectionCode.TypeMismatch, callbackSpan)
+  }
+  if written.length != usize.ZERO {
+    let mut derived = Vector.make<Argument>()
+    run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&operands[usize.ZERO])})
+    run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&observed.success)})
+    run Vector.append<Argument>(&mut derived, Argument.Row {value: Shared.clone<Row>(&observed.requirements)})
+    run Vector.append<Argument>(&mut derived, Argument.Type {value: Shared.clone<Type>(&operands[usize.ONE])})
+    if !sameArguments(written, Vector.asSlice<Argument>(&derived)) {
+      return run channelRejection(resolver, module, RejectionCode.TypeMismatch, span)
+    }
+  }
+  return Result.succeed<EffectChannels, Shared<Rejection>>(move observed)
 }
 
 // The channels of `catchFailure<S>`: the protected or handler success, the residual and handler
@@ -30525,7 +30604,7 @@ effect fn checkComposition<'scope>(
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut count = usize.ONE + usize.ONE
-  if operation == Composition.UseRelease { count = count + usize.ONE }
+  if operation == Composition.UseRelease || operation == Composition.Observe { count = count + usize.ONE }
   if CallArguments.length(arguments) != count { return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span) }
   let mut parts = Vector.make<BodyNodeId>()
   let mut types = Vector.make<Shared<Type>>()
@@ -41873,8 +41952,8 @@ fn compositeType(value: &Type) -> bool {
 effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, caller: &Application,
   callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, ty: &Shared<Type>,
-  origin: BodyOrigin, own: &[ProviderEntry], bound: &mut Vector<BoundProvider>, module: &ModuleId,
-  steps: &mut Vector<MirRunPlan>) -> Result<usize, GapCode>
+  origin: BodyOrigin, own: &[ProviderEntry], bound: &mut Vector<BoundProvider>, observer: &Option<Shared<Observer>>,
+  module: &ModuleId, steps: &mut Vector<MirRunPlan>) -> Result<usize, GapCode>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let channels = match move Shared.with<Type, Option<EffectChannels>>(ty, effectChannels) {
     Option<EffectChannels>.Some {value} => value
@@ -41913,13 +41992,36 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
         run Vector.append<BoundProvider>(&mut bound.*, BoundProvider {key: move key, owned: owned, access: access,
           provider: move provider, address: move address})
         let inner = run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
-          projections, identity, &stored[usize.ZERO], origin, own, &mut bound.*, module, &mut steps.*)
+          projections, identity, &stored[usize.ZERO], origin, own, &mut bound.*, observer, module, &mut steps.*)
         drop Vector.pop<BoundProvider>(&mut bound.*)
         let innerStep = match move inner {
           Result<usize, GapCode>.Success {value} => value
           Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
         }
         run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.Bind {inner: innerStep})
+        return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
+      }
+      if operation == Composition.Observe {
+        // The body's calls run under this observer; its callback is called directly and unobserved (N1).
+        let callback = match move run observerTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+          callerBindings, projections, identity, &stored[usize.ONE], &stored[usize.ZERO], origin) {
+          Result<MirCallTarget, GapCode>.Success {value} => value
+          Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        let stateDrop = match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ZERO], origin) {
+          Result<Option<Shared<Type>>, GapCode>.Success {value} => value
+          Result<Option<Shared<Type>>, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        let slot = run Shared.make<Observer>(Observer {state: Shared.clone<Type>(&stored[usize.ZERO]), callback: move callback.key})
+        let observed = Option.some<Shared<Observer>>(move slot)
+        let inner = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+          callerBindings, projections, identity, &stored[2], origin, own, &mut bound.*, &observed, module, &mut steps.*) {
+          Result<usize, GapCode>.Success {value} => value
+          Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+        }
+        let address = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(&stored[usize.ZERO]), access: Access.Mutable,
+          lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+        run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.Observe {inner: inner, state: move address, stateDrop: move stateDrop})
         return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
       }
       if operation == Composition.UseRelease {
@@ -41949,12 +42051,12 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
         let InvokedTarget {target: useCall, channels: useChannels, ..} = move use
         let InvokedTarget {target: releaseCall, channels: releaseChannels, ..} = move release
         let useServed = match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move useCall, own,
-          Vector.asSlice<BoundProvider>(&bound.*), module, origin.span) {
+          Vector.asSlice<BoundProvider>(&bound.*), observer, module, origin.span) {
           Result<MirCallTarget, GapCode>.Success {value} => value
           Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
         }
         let releaseServed = match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move releaseCall, own,
-          Vector.asSlice<BoundProvider>(&bound.*), module, origin.span) {
+          Vector.asSlice<BoundProvider>(&bound.*), observer, module, origin.span) {
           Result<MirCallTarget, GapCode>.Success {value} => value
           Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
         }
@@ -41967,7 +42069,7 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
         return Result.failResult<usize, GapCode>(GapCode.EffectForm)
       }
       let inner = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
-        projections, identity, &stored[usize.ZERO], origin, own, &mut bound.*, module, &mut steps.*) {
+        projections, identity, &stored[usize.ZERO], origin, own, &mut bound.*, observer, module, &mut steps.*) {
         Result<usize, GapCode>.Success {value} => value
         Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
@@ -41978,7 +42080,7 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
       if operation != Composition.CatchFailure {
         // The finalizer is itself an exact Effect; NonParking is a compile-time bound only (D4).
         let finalizer = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
-          callerBindings, projections, identity, &stored[usize.ONE], origin, own, &mut bound.*, module, &mut steps.*) {
+          callerBindings, projections, identity, &stored[usize.ONE], origin, own, &mut bound.*, observer, module, &mut steps.*) {
           Result<usize, GapCode>.Success {value} => value
           Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
         }
@@ -41997,7 +42099,7 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
       }
       let InvokedTarget {target: handlerCall, channels: handlerChannels, mode: handlerMode} = move handler
       let handlerServed = match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move handlerCall, own,
-        Vector.asSlice<BoundProvider>(&bound.*), module, origin.span) {
+        Vector.asSlice<BoundProvider>(&bound.*), observer, module, origin.span) {
         Result<MirCallTarget, GapCode>.Success {value} => value
         Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
@@ -42029,7 +42131,7 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
         Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
       let target = match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move constructed, own,
-        Vector.asSlice<BoundProvider>(&bound.*), module, origin.span) {
+        Vector.asSlice<BoundProvider>(&bound.*), observer, module, origin.span) {
         Result<MirCallTarget, GapCode>.Success {value} => value
         Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
       }
@@ -42046,6 +42148,48 @@ struct InvokedTarget {
   target: MirCallTarget
   channels: EffectChannels
   mode: CallableMode
+}
+
+// The observer callback's direct call `callback(&mut state, event, first, second, identity,
+// origin) -> usize` (failure observer note N1). Only a direct function is supported: an
+// observed instance passes exactly the written operands.
+effect fn observerTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, caller: &Application,
+  callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, callable: &Shared<Type>,
+  state: &Shared<Type>, origin: BodyOrigin) -> Result<MirCallTarget, GapCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let none = Vector.make<Constraint>()
+  let contract = match move run valueCallableContract(callable, Vector.asSlice<Constraint>(&none)) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Result.failResult<MirCallTarget, GapCode>(GapCode.ObserverCallback) }
+  }
+  let word = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let text = run Shared.make<Type>(Type.String {lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+  let mut written = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut written, run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(state),
+    access: Access.Mutable, lifetime: run Shared.make<Lifetime>(Lifetime.Static)}))
+  run Vector.append<Shared<Type>>(&mut written, run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"u8")}))
+  run Vector.append<Shared<Type>>(&mut written, Shared.clone<Type>(&word))
+  run Vector.append<Shared<Type>>(&mut written, Shared.clone<Type>(&word))
+  run Vector.append<Shared<Type>>(&mut written, Shared.clone<Type>(&text))
+  run Vector.append<Shared<Type>>(&mut written, move text)
+  let inputs = CallableCallInputs {receiver: Shared.clone<Type>(callable), inference: Shared.clone<DeclarationId>(identity),
+    bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()), mode: Shared.with<Type, CallableMode>(&contract, callableInvocationMode),
+    callee: node, result: move word, count: 6, origin: origin}
+  let target = match move run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+    callerBindings, projections, move inputs, Vector.asSlice<Shared<Type>>(&written)) {
+    Result<MirCallTarget, GapCode>.Success {value} => value
+    Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<MirCallTarget, GapCode>(error) }
+  }
+  let direct = match &target.stored {
+    Option<MirStoredArguments>.Some {value: stored} => match &stored.environment {
+      Option<MirStoredEnvironment>.None => Vector.length<usize>(&stored.fields) == usize.ZERO
+      _ => false
+    }
+    Option<MirStoredArguments>.None => false
+  }
+  if !direct || target.receiverDereferences != usize.ZERO { return Result.failResult<MirCallTarget, GapCode>(GapCode.ObserverCallback) }
+  return Result.succeed<MirCallTarget, GapCode>(move target)
 }
 
 effect fn invokedTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
@@ -42277,7 +42421,20 @@ fn dispatchedEntry(entries: &[ProviderEntry], operation: &DeclarationId) -> usiz
 // Completes a call target with its callee's providers (D2). A service operation dispatches to the
 // witness of its service for the serving provider's type; that witness's own row is served from
 // the same environment.
+// Completes a call target with its callee's providers and the observer it runs under (D2, N1).
 effect fn provideCall(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, target: MirCallTarget, own: &[ProviderEntry], bound: &[BoundProvider],
+  observer: &Option<Shared<Observer>>, module: &ModuleId, span: Span) -> Result<MirCallTarget, GapCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut call = match move run serveCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move target, own, bound, module, span) {
+    Result<MirCallTarget, GapCode>.Success {value} => value
+    Result<MirCallTarget, GapCode>.Failure {error} => { return Result.failResult<MirCallTarget, GapCode>(error) }
+  }
+  call.key = run InstanceKey.observed(&call.key, observer)
+  return Result.succeed<MirCallTarget, GapCode>(move call)
+}
+
+effect fn serveCall(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, target: MirCallTarget, own: &[ProviderEntry], bound: &[BoundProvider],
   module: &ModuleId, span: Span) -> Result<MirCallTarget, GapCode>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
@@ -42711,6 +42868,7 @@ effect fn resolveMir(
   }
   let storageProjection = Vector.asSlice<RuntimeProjection>(&projections)
   let own = run instanceProviders(&instance)
+  let observer = InstanceKey.observer(&instance)
   let needs = match move run cleanupNeeds(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, Vector.asSlice<Binding>(&callerBindings), storageProjection) {
     Result<CleanupNeeds, Shared<Rejection>>.Success {value} => value
     Result<CleanupNeeds, Shared<Rejection>>.Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
@@ -42758,7 +42916,7 @@ effect fn resolveMir(
       let mut bound = Vector.make<BoundProvider>()
       let prepared = run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, node, &callerApplication,
         Vector.asSlice<Binding>(&callerBindings), storageProjection, &identity, &closed, operand.origin, Vector.asSlice<ProviderEntry>(&own),
-        &mut bound, &module, &mut steps)
+        &mut bound, &observer, &module, &mut steps)
       match move prepared {
         Result<usize, GapCode>.Success {..} => { run Vector.append<MirNodePlan>(&mut plans, MirNodePlan {node: node, steps: move steps}) }
         Result<usize, GapCode>.Failure {error} => {
@@ -42913,7 +43071,7 @@ effect fn resolveMir(
     }
     let none = Vector.make<BoundProvider>()
     match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies, move pending, Vector.asSlice<ProviderEntry>(&own),
-      Vector.asSlice<BoundProvider>(&none), &module, site) {
+      Vector.asSlice<BoundProvider>(&none), &observer, &module, site) {
       Result<MirCallTarget, GapCode>.Success {value} => { run Vector.append<MirCallTarget>(&mut provided, move value) }
       Result<MirCallTarget, GapCode>.Failure {error} => {
         return memberSuccess(Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(error, &identity, site))}, move dependencies)
@@ -42942,6 +43100,7 @@ effect fn resolveMir(
         move remainders,
         move needs,
         move projections,
+        SourceUnit.bytes(IndexedSource.sourceUnit(indexed)),
       ),
     )
     Option<&IndexedSource>.None => {
