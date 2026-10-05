@@ -1173,7 +1173,11 @@ repeated invocation and capture-only drop glue.
 - **Ownership:** a raw Once or Mutable callable parameter retains the bootstrap SEM0081 role
   when returned from an anonymous body. An outer authored F retains its authored owner and can be
   forwarded. Elided invocation lifetimes accept caller evidence; a fixed Static contract rejects
-  unsuitable evidence with SEM0212 at the supplied operand. General borrow safety remains Step 14.
+  unsuitable evidence with SEM0212 at the supplied operand. A matching signature whose retained
+  environment cannot outlive the promised one keeps this lifetime diagnostic; hidden plain-callable
+  representation inference does not rewrite it into a shape error. Authored generic inference keeps
+  its call-level diagnostic. Invocation-variance and Effect lifetime parity are separate lanes;
+  this correction does not change them. General borrow safety remains Step 14.
 - **Boundary:** eligible lifetime deferral is restricted to ordinary anonymous schemas. Named
   quantified sections and deferred requirement rows retain their existing named gaps; broadening
   them prematurely exposed 57 pre-existing diagnostics through Effect providers. Narrowing this
