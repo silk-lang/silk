@@ -70,4 +70,6 @@ export const selfhostTrack = [
   'effect-nested-failure-propagation',
   'effect-selective-catch-direct-stored',
   'effect-ensuring-fallible-finalizer',
+  'role-keyed-service-provider-selection',
+  'owned-provider-shared-dispatch',
 ] as const satisfies ReadonlyArray<string>
