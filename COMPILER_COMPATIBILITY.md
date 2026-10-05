@@ -960,9 +960,10 @@ repeated invocation and capture-only drop glue.
 
 ### Finite recursive native callable origins
 
-- **Status:** implemented in a draft Step 8 layer. The latest native run passed seventeen controls
-  and failed two; nested generic inference and the inherited staged suffix are repaired for the
-  next head. Native correctness, reduced fixture timings and the exact-head gate remain pending.
+- **Status:** implemented in a draft Step 8 layer. Head `db60c160` ran eighteen controls successfully
+  and failed the inherited Once control; its finite-origin controls passed. Two inherited controls
+  exceeded the Linux timing budget. The parent repair, filtered solver demands and reused negative
+  fixture evidence await native verification and the exact-head gate.
 - **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
   return operands provide environment equations; other checked expressions retain validation
   dependencies. Source recipes normalize before exact inference, and every selected producer
@@ -970,6 +971,9 @@ repeated invocation and capture-only drop glue.
   Canonicalization preserves the immutable original request and all converging source evidence.
   Draft argument comparison examines earlier inferred assignments before locating a pending
   recipe; that temporary comparison cannot bypass the final exact replay.
+  After substitution, only distinct origin-dependent node types enter the demand graph; exact
+  deduplication preserves source identities. Every reachable return equation and whole-body replay
+  remains required, including unused calls whose operands depend on an origin.
 - **Proof boundaries:** leafless cycles remain unavailable; divergent exact environments cannot
   invent a dispatcher. Static residual bodies retain their selected-source rules. Selected interface
   projections and contextual opaque aggregate slots remain required Step 8 work. Unresolved
@@ -979,5 +983,6 @@ repeated invocation and capture-only drop glue.
   canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
   `factory()` in the invalid generic assignment control; it additionally treats represented F as
   affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
-  code/span assertions, MIR inspection and Linux timings have not yet executed.
+  code/span assertions and MIR inspection passed on `db60c160`; repaired-head assertions and Linux
+  timings remain pending.
 - **Source migration:** none.
