@@ -68,6 +68,7 @@ import backend.Mir {
   StoredArguments as MirStoredArguments,
   StoredEnvironment as MirStoredEnvironment,
   RunPlan as MirRunPlan,
+  JoinArm as MirJoinArm,
   NodePlan as MirNodePlan,
   Block as MirBlock,
   Local as MirLocal,
@@ -1413,6 +1414,7 @@ fn reusableTypeKind(value: &Type) -> usize {
     Type.CallableResult {..} => 21
     Type.CallableView {..} => 20
     Type.EffectComposite {..} => 24
+    Type.EffectJoin {..} => 25
   }
 }
 
@@ -18879,6 +18881,17 @@ effect fn resolveSignatureUnder(
     )
     listedAt = listedAt + usize.ONE
   }
+  // A declared `Effect<...>` result names the finite join of the Effects its body returns
+  // (EFF-013): a producer-owned family whose storage is realized like an opaque result's.
+  if Shared.with<Type, bool>(&result, bareEffect) && DeclarationId.kind(&signatureOwner) == OwnerKind.Function
+    && run opaqueProducerHasBody(&mut resolver.*, &module, &signatureOwner) {
+    let prototype = Application {target: SpecializationTarget.Named {declaration: run DeclarationId.copy(&signatureOwner)},
+      arguments: Vector.make<Argument>(), argumentOrdinals: Vector.make<usize>(),
+      scopes: Vector.make<ScopeBinding>(), statics: Vector.make<StaticSlot>()}
+    let declared = move result
+    result = run Shared.make<Type>(Type.OpaqueRepresentation {application: run Shared.make<Application>(move prototype),
+      contract: move declared, detached: false, nonParking: false})
+  }
   if run Type.containsOpaque(&result, &signatureOwner) {
     let producer = match &application.* {
       Option<Application>.Some {value: actual} => run Application.copy(&actual)
@@ -20164,8 +20177,8 @@ fn runtimeType(value: &Type) -> bool {
     Type.CallableValue {..} => true
     Type.CallableSchema {..} => true
     // Semantic storage remains exact and opaque until the runtime projection query proves
-    // its finite environment. Effect representations require their separate run/storage path.
-    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, bool>(&contract, callableType)
+    // its finite environment.
+    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, bool>(&contract, callableType) || Shared.with<Type, bool>(&contract, bareEffect)
     Type.CallableOrigin {..} => true
     Type.CallableWitnessResult {..} => true
     Type.CallableResult {..} => true
@@ -20176,6 +20189,7 @@ fn runtimeType(value: &Type) -> bool {
     // Ordinary callable contracts need their original returned environment before lowering.
     Type.Callable {..} => true
     Type.EffectComposite {..} => true
+    Type.EffectJoin {..} => true
     Type.Slice {..} => true
     Type.String {..} => true
     Type.Reference {..} => true
@@ -20188,12 +20202,11 @@ fn runtimeType(value: &Type) -> bool {
   }
 }
 
+// An Effect contract with no producer body to realize its storage, such as an interface
+// operation's declared `Effect<...>` result.
 fn effectStorageType(value: &Type) -> bool {
   return match &value.* {
     Type.Effect {..} => true
-    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, bool>(&contract, fn(ty: &Type) -> bool {
-      return match &ty.* { Type.Effect {..} => true _ => false }
-    })
     Type.Union {members} => {
       let listed = Vector.asSlice<Shared<Type>>(&members)
       let mut at = usize.ZERO
@@ -23347,11 +23360,12 @@ effect fn checkQualifiedInterfaceCall<'scope>(
   if CallArguments.length(arguments) == usize.ZERO && parameterCount > usize.ZERO {
     return run bodyRejection(&resolver.*, module, RejectionCode.RedundantCall, span)
   }
-  if CallArguments.length(arguments) < parameterCount || Shared.with<Result<Answer, NoRejection>, bool>(
-    &signature,
-    signatureIsEffect,
-  ) {
+  if CallArguments.length(arguments) < parameterCount {
     return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+  }
+  // An interface operation's Effect needs its witness construction (named gap).
+  if Shared.with<Result<Answer, NoRejection>, bool>(&signature, signatureIsEffect) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.InterfaceEffectUnavailable, span)
   }
   if operationGenerics.present || Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO {
     return Result.failResult<BodyNodeId, Shared<Rejection>>(run genericOperationRejection(module, span, &chosenOperation))
@@ -24017,7 +24031,7 @@ effect fn checkReceiverCall<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
   }
   if Shared.with<Result<Answer, NoRejection>, bool>(&signature, signatureIsEffect) {
-    return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    return run bodyRejection(&resolver.*, module, RejectionCode.InterfaceEffectUnavailable, span)
   }
   if Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO {
     if let ReceiverCallChoice.Interface {selected} = &choice {
@@ -27866,15 +27880,28 @@ effect fn checkArmResult<'scope>(
   )
 }
 
-// The joined result of the checked arms: equal results keep their type, no result is `never`, and
-// distinct results are `IncompatibleMatchResults` on the whole match.
+// The joined result of the checked arms: equal results keep their type, no result is `never`,
+// distinct exact Effects join (EFF-013), and other distinct results are `IncompatibleMatchResults`
+// on the whole match.
 struct ArmJoin {
   joined: Option<Shared<Type>>
   incompatible: bool
+  // Each arm that produced a value, by its position among the checked arms.
+  produced: Vector<ArmResult>
 }
 
-effect fn joinArm(join: &mut ArmJoin, produced: &Option<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator {
+struct ArmResult {
+  arm: usize
+  ty: Shared<Type>
+}
+
+fn emptyArmJoin() -> ArmJoin {
+  return ArmJoin {joined: Option.none<Shared<Type>>(), incompatible: false, produced: Vector.make<ArmResult>()}
+}
+
+effect fn joinArm(join: &mut ArmJoin, arm: usize, produced: &Option<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator {
   if let Option<Shared<Type>>.Some {value} = &produced.* {
+    run Vector.append<ArmResult>(&mut join.produced, ArmResult {arm: arm, ty: Shared.clone<Type>(&value)})
     let prior = match &join.joined {
       Option<Shared<Type>>.Some {value: earlier} => Option.some<Shared<Type>>(Shared.clone<Type>(&earlier))
       Option<Shared<Type>>.None => Option.none<Shared<Type>>()
@@ -27889,11 +27916,134 @@ effect fn joinArm(join: &mut ArmJoin, produced: &Option<Shared<Type>>) -> () ! O
   return ()
 }
 
-effect fn joinedMatchType(join: ArmJoin) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
-  return match move join.joined {
-    Option<Shared<Type>>.Some {value} => value
-    Option<Shared<Type>>.None => run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+// The match's type. Arms producing distinct exact Effects store the selected one in their finite
+// join: each arm result is injected under its alternative's tag (EFF-013).
+effect fn joinedMatchType(resolver: &Resolver, module: &ModuleId, nodes: &mut Vector<BodyNode>, arms: &mut Vector<BodyMatchArm>,
+  join: ArmJoin, span: Span) -> Result<Shared<Type>, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  if !join.incompatible {
+    let single = match move join.joined {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+    }
+    return Result.succeed<Shared<Type>, Shared<Rejection>>(move single)
   }
+  let results = Vector.asSlice<ArmResult>(&join.produced)
+  let mut types = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < results.length {
+    run Vector.append<Shared<Type>>(&mut types, Shared.clone<Type>(&results[at].ty))
+    at = at + usize.ONE
+  }
+  let joined = match move run effectJoinType(Vector.asSlice<Shared<Type>>(&types)) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleMatchResults, span)) }
+  }
+  at = usize.ZERO
+  while at < results.length {
+    let previous = Vector.asSlice<BodyMatchArm>(&arms.*)[results[at].arm].result
+    let injected = match move run injectJoined(&mut nodes.*, previous, &joined) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.NestedEffectJoinUnavailable, span)) }
+    }
+    let mut listed = Vector.asMutSlice<BodyMatchArm>(&mut arms.*)
+    listed[results[at].arm].result = injected
+    at = at + usize.ONE
+  }
+  return Result.succeed<Shared<Type>, Shared<Rejection>>(move joined)
+}
+
+// The finite join of exact Effects behind one contract (EFF-013): their distinct alternatives in
+// first-seen order. Joins that share a contract keep it; otherwise the contract joins successes
+// and failures, unites requirement rows, takes the strongest run access, and retains the
+// intersection of every environment, which each alternative outlives. Absent when a value is not
+// an exact Effect.
+effect fn effectJoinType(types: &[Shared<Type>]) -> Option<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let mut alternatives = Vector.make<Shared<Type>>()
+  let mut shared = Option.none<Shared<Type>>()
+  let mut sameContract = true
+  let mut successes = Vector.make<Shared<Type>>()
+  let mut failures = Vector.make<Shared<Type>>()
+  let mut requirements = Row.empty()
+  let mut mode = CallableMode.Shared
+  let mut regions = Vector.make<Shared<Lifetime>>()
+  let mut at = usize.ZERO
+  while at < types.length {
+    if !Shared.with<Type, bool>(&types[at], joinableEffect) { return Option.none<Shared<Type>>() }
+    let parts = match move Shared.with<Type, Option<EffectParts>>(&types[at], effectParts) {
+      Option<EffectParts>.Some {value} => value
+      Option<EffectParts>.None => { return Option.none<Shared<Type>>() }
+    }
+    let retained = run callableEnvironmentRegions(&parts.environment)
+    let listedRegions = Vector.asSlice<Shared<Lifetime>>(&retained)
+    let mut region = usize.ZERO
+    while region < listedRegions.length {
+      run Vector.append<Shared<Lifetime>>(&mut regions, Shared.clone<Lifetime>(&listedRegions[region]))
+      region = region + usize.ONE
+    }
+    run Vector.append<Shared<Type>>(&mut successes, Shared.clone<Type>(&parts.success))
+    run Vector.append<Shared<Type>>(&mut failures, Shared.clone<Type>(&parts.failure))
+    run Row.merge(&mut requirements, &parts.requirements)
+    if runStrength(parts.mode) > runStrength(mode) { mode = parts.mode }
+    let copied = run Type.copy(&types[at])
+    if let Type.EffectJoin {contract, ..} = move copied {
+      match &shared {
+        Option<Shared<Type>>.Some {value: previous} => { if !run Type.equalsShared(&previous, &contract) { sameContract = false } }
+        Option<Shared<Type>>.None => { shared = Option.some<Shared<Type>>(move contract) }
+      }
+    } else { sameContract = false }
+    let stored = run joinAlternatives(&types[at])
+    let listed = Vector.asSlice<Shared<Type>>(&stored)
+    let mut item = usize.ZERO
+    while item < listed.length {
+      if (run joinAlternative(Vector.asSlice<Shared<Type>>(&alternatives), &listed[item])) == usize.MAX {
+        run Vector.append<Shared<Type>>(&mut alternatives, Shared.clone<Type>(&listed[item]))
+      }
+      item = item + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let retained = run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions)))
+  if sameContract {
+    if let Option<Shared<Type>>.Some {value: contract} = move shared {
+      return Option.some<Shared<Type>>(run Shared.make<Type>(Type.EffectJoin {contract: move contract, alternatives: move alternatives}))
+    }
+  }
+  let contract = run Shared.make<Type>(Type.Effect {mode: mode, environment: move retained, success: run joinedType(move successes),
+    failure: run joinedType(move failures), requirements: run Shared.make<Row>(move requirements)})
+  return Option.some<Shared<Type>>(run Shared.make<Type>(Type.EffectJoin {contract: move contract, alternatives: move alternatives}))
+}
+
+// The position of an exact Effect among a join's alternatives, or `usize.MAX`.
+effect fn joinAlternative(alternatives: &[Shared<Type>], value: &Shared<Type>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < alternatives.length {
+    if run Type.equalsShared(&alternatives[at], value) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Stores a value holding one alternative of `joined` as that join: a union injection under the
+// alternative's tag, or the value itself when it already has the join's type. Absent for a value
+// that already holds several alternatives of a different join.
+effect fn injectJoined(nodes: &mut Vector<BodyNode>, node: BodyNodeId, joined: &Shared<Type>) -> Option<BodyNodeId>
+! OutOfMemoryError ? &mut Allocator {
+  let actual = match move bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &node) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Option.none<BodyNodeId>() }
+  }
+  if run Type.equalsShared(&actual, joined) { return Option.some<BodyNodeId>(node) }
+  let held = run joinAlternatives(&actual)
+  if Vector.length<Shared<Type>>(&held) != usize.ONE { return Option.none<BodyNodeId>() }
+  let all = run joinAlternatives(joined)
+  let single = Vector.asSlice<Shared<Type>>(&held)
+  let tag = run joinAlternative(Vector.asSlice<Shared<Type>>(&all), &single[usize.ZERO])
+  if tag == usize.MAX { return Option.none<BodyNodeId>() }
+  let origin = Vector.asSlice<BodyNode>(&nodes.*)[node.index].origin
+  let injected = BodyNodeId {index: Vector.length<BodyNode>(&nodes.*)}
+  run Vector.append<BodyNode>(&mut nodes.*, BodyNode {origin: origin, kind: BodyNodeKind.Expression {
+    ty: Shared.clone<Type>(joined), form: BodyExpression.UnionInject {tag: tag, value: node}}})
+  return Option.some<BodyNodeId>(injected)
 }
 
 // The arms one pattern selection checks: the written arms of a `match`, the selected body and
@@ -28002,7 +28152,7 @@ effect fn checkRecordMatch<'scope>(
     Option<Shared<Type>>.Some {value} => Option.some<Shared<Type>>(Shared.clone<Type>(&value))
     Option<Shared<Type>>.None => Option.none<Shared<Type>>()
   }
-  let mut join = ArmJoin {joined: Option.none<Shared<Type>>(), incompatible: false}
+  let mut join = emptyArmJoin()
   // Integer values an unguarded earlier arm already selected; a repeat is a duplicate pattern.
   let mut integerCases = Vector.make<Bytes>()
   let integerSubject = Shared.with<Type, bool>(subjectType, fn(value: &Type) -> bool {
@@ -28287,8 +28437,9 @@ effect fn checkRecordMatch<'scope>(
       }
       let guardType = bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &guardNode)
       let boolean = run primitiveType(b"bool")
+      // A guard that always exits, such as a match whose arms return, is `never` (any type).
       let isBoolean = match &guardType {
-        Option<Shared<Type>>.Some {value} => run Type.equalsShared(&value, &boolean)
+        Option<Shared<Type>>.Some {value} => (run Type.equalsShared(&value, &boolean)) || Shared.with<Type, bool>(&value, neverType)
         Option<Shared<Type>>.None => false
       }
       if !isBoolean {
@@ -28332,12 +28483,13 @@ effect fn checkRecordMatch<'scope>(
       Option<Shared<Type>>.Some {..} => false
       Option<Shared<Type>>.None => true
     }
+    // Distinct exact Effects join instead (EFF-013), so an Effect arm does not fix later arms.
     if unset && !armResult.block {
       if let Option<Shared<Type>>.Some {value: produced} = &armResult.ty {
-        resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced))
+        if !Shared.with<Type, bool>(&produced, joinableEffect) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
       }
     }
-    run joinArm(&mut join, &armResult.ty)
+    run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty)
     run Vector.append<BodyMatchArm>(&mut checkedArms, BodyMatchArm {
       origin: BodyOrigin {syntax: armId, span: armSpan},
       pattern: move checkedPattern, tests: move armTests, guard: move checkedGuard, result: resultNode,
@@ -28359,9 +28511,11 @@ effect fn checkRecordMatch<'scope>(
   if isUnion || isNominal { tags = count }
   let mut domain = count
   if open { domain = usize.MAX }
-  if join.incompatible { return run bodyRejection(&resolver.*, module, RejectionCode.IncompatibleMatchResults, span) }
   drop resultType
-  let matchType = run joinedMatchType(move join)
+  let matchType = match move run joinedMatchType(&resolver.*, module, &mut nodes.*, &mut checkedArms, move join, span) {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+  }
   let diverges = Shared.with<Type, bool>(&matchType, neverType)
   let index = Vector.length<BodyNode>(&nodes.*)
   run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
@@ -30237,8 +30391,9 @@ effect fn checkMatchGuard<'scope>(
   }
   let guardType = bodyExpressionType(Vector.asSlice<BodyNode>(&nodes.*), &guardNode)
   let boolean = run primitiveType(b"bool")
+  // A guard that always exits, such as a match whose arms return, is `never` (any type).
   let isBoolean = match &guardType {
-    Option<Shared<Type>>.Some {value} => run Type.equalsShared(&value, &boolean)
+    Option<Shared<Type>>.Some {value} => (run Type.equalsShared(&value, &boolean)) || Shared.with<Type, bool>(&value, neverType)
     Option<Shared<Type>>.None => false
   }
   if !isBoolean {
@@ -30263,6 +30418,9 @@ fn effectChannels(value: &Type) -> Option<EffectChannels> {
     })
     Type.CallableValue {contract, ..} => Shared.with<Type, Option<EffectChannels>>(&contract, effectChannels)
     Type.EffectComposite {contract, ..} => Shared.with<Type, Option<EffectChannels>>(&contract, effectChannels)
+    Type.EffectJoin {contract, ..} => Shared.with<Type, Option<EffectChannels>>(&contract, effectChannels)
+    // A producer's Effect family runs through its contract; its storage is realized at layout.
+    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, Option<EffectChannels>>(&contract, effectChannels)
     _ => Option.none<EffectChannels>()
   }
 }
@@ -31446,7 +31604,7 @@ effect fn checkExpressionUnder<'scope>(
         Option<Shared<Type>>.Some {value} => Option.some<Shared<Type>>(Shared.clone<Type>(&value))
         Option<Shared<Type>>.None => Option.none<Shared<Type>>()
       }
-      let mut join = ArmJoin {joined: Option.none<Shared<Type>>(), incompatible: false}
+      let mut join = emptyArmJoin()
       let mut checkedArms = Vector.make<BodyMatchArm>()
       let mut at = usize.ZERO
       while at < arms.length {
@@ -31514,10 +31672,10 @@ effect fn checkExpressionUnder<'scope>(
         }
         if unset && !armResult.block {
           if let Option<Shared<Type>>.Some {value: produced} = &armResult.ty {
-            resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced))
+            if !Shared.with<Type, bool>(&produced, joinableEffect) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
           }
         }
-        run joinArm(&mut join, &armResult.ty)
+        run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty)
         run Vector.append<BodyMatchArm>(&mut checkedArms, BodyMatchArm {
           origin: BodyOrigin {syntax: armId, span: armSpan},
           pattern: move checkedPattern, tests: Vector.make<BodyPatternTest>(), guard: move checkedGuard, result: resultNode,
@@ -31527,9 +31685,11 @@ effect fn checkExpressionUnder<'scope>(
       if !universal && coveredCount != count {
         return run bodyRejection(&resolver.*, module, RejectionCode.MissingEnumMember, span)
       }
-      if join.incompatible { return run bodyRejection(&resolver.*, module, RejectionCode.IncompatibleMatchResults, span) }
       drop resultType
-      let matchType = run joinedMatchType(move join)
+      let matchType = match move run joinedMatchType(&resolver.*, module, &mut nodes.*, &mut checkedArms, move join, span) {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
       let diverges = Shared.with<Type, bool>(&matchType, neverType)
       let index = Vector.length<BodyNode>(&nodes.*)
       run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
@@ -32165,6 +32325,8 @@ fn effectParts(value: &Type) -> Option<EffectParts> {
     })
     Type.CallableValue {contract, ..} => Shared.with<Type, Option<EffectParts>>(&contract, effectParts)
     Type.EffectComposite {contract, ..} => Shared.with<Type, Option<EffectParts>>(&contract, effectParts)
+    Type.EffectJoin {contract, ..} => Shared.with<Type, Option<EffectParts>>(&contract, effectParts)
+    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, Option<EffectParts>>(&contract, effectParts)
     _ => Option.none<EffectParts>()
   }
 }
@@ -32367,6 +32529,7 @@ effect fn valueCallableContract(value: &Shared<Type>, constraints: &[Constraint]
     Type.CallableStage {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
     Type.CallableSchema {schema, ..} => { return Option.some<Shared<Type>>(sectionSchemaContract(&schema)) }
     Type.EffectComposite {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
+    Type.EffectJoin {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
     Type.Callable {..} => { return Option.some<Shared<Type>>(Shared.clone<Type>(value)) }
     // An Effect produced by invoking a callable value is its own use contract.
     Type.Effect {..} => { return Option.some<Shared<Type>>(Shared.clone<Type>(value)) }
@@ -34502,9 +34665,15 @@ effect fn checkExpectedValue(
     }
     let compared = run originComparedType(resolver, &adapted)
     if run Type.equalsShared(&compared, &wanted) { return Result.succeed<BodyNodeId, Shared<Rejection>>(converted) }
-    // An exact Effect that the expected Effect admits (EFF-009, EFF-013) needs the finite join or
-    // erased storage Step 9 has not built yet; an Effect it does not admit is a mismatch.
-    if run admittedEffect(&actual, &value) { return run bodyRejection(resolver, module, RejectionCode.EffectFormUnavailable, span) }
+    // A declared Effect contract stores an exact Effect it admits as itself: a one-alternative
+    // join behind that contract (EFF-009, EFF-013).
+    let declared = Vector.make<Constraint>()
+    if Shared.with<Type, bool>(&value, bareEffect) && Shared.with<Type, bool>(&actual, joinableEffect)
+      && run admitsEffect(&actual, &value, Vector.asSlice<Constraint>(&declared)) {
+      let joined = run Shared.make<Type>(Type.EffectJoin {contract: Shared.clone<Type>(&value), alternatives: run joinAlternatives(&actual)})
+      run retypeNode(&mut nodes.*, node, move joined)
+      return Result.succeed<BodyNodeId, Shared<Rejection>>(node)
+    }
     return run bodyRejection(resolver, module, RejectionCode.TypeMismatch, span)
   }
   return Result.succeed<BodyNodeId, Shared<Rejection>>(node)
@@ -34693,7 +34862,16 @@ effect fn proveOpaqueReturn(resolver: &mut Resolver, owner: &mut Query<Word, Ans
         return match &ty.* { Type.Effect {..} => true _ => false }
       })
       if effectContract {
-        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.EffectFormUnavailable, span))
+        // An Effect with no exact representation, such as an interface operation's construction,
+        // has no storage to realize (named effect-form gap).
+        if !Shared.with<Type, bool>(&leaves[at].actual, joinableEffect) && !run representationParameter(&leaves[at].actual, declared) {
+          return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.EffectFormUnavailable, span))
+        }
+        if !run admitsEffect(&leaves[at].actual, &contract, declared) {
+          return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.ReturnTypeMismatch, span))
+        }
+        at = at + usize.ONE
+        continue
       }
       let failed = run proveCallableBound(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
         declared, &leaves[at].actual, &contract, span)
@@ -34719,20 +34897,163 @@ effect fn proveOpaqueReturn(resolver: &mut Resolver, owner: &mut Query<Word, Ans
   return Option.none<Shared<Rejection>>()
 }
 
-// Whether `wanted` admits the Effect `offered`: its success converts (an equal type, a member of
-// a wider union, or `never`), and its failures and requirements are covered.
-effect fn admittedEffect(offered: &Shared<Type>, wanted: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let left = Shared.with<Type, Option<EffectChannels>>(offered, effectChannels)
-  let right = Shared.with<Type, Option<EffectChannels>>(wanted, effectChannels)
-  if let Option<EffectChannels>.Some {value: given} = move left {
-    if let Option<EffectChannels>.Some {value: promised} = move right {
-      let success = run Type.coversFailure(&promised.success, &given.success)
-      let failure = run Type.coversFailure(&promised.failure, &given.failure)
-      let requirements = run Row.covers(&promised.requirements, &given.requirements)
-      return success && failure && requirements == RowCoverage.Covered
+// Whether the Effect contract `wanted` admits the exact Effect `offered` (EFF-009, EFF-013): its
+// success converts (an equal type, a member of a wider union, or `never`), its failures and
+// requirements are covered, it permits the promised run access, and its environment outlives
+// the promised one. A representation parameter offers its bound's contract.
+effect fn admitsEffect(offered: &Shared<Type>, wanted: &Shared<Type>, declared: &[Constraint]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut given = Shared.with<Type, Option<EffectParts>>(offered, effectParts)
+  let missing = match &given { Option<EffectParts>.None => true _ => false }
+  if missing {
+    let mut at = usize.ZERO
+    while at < declared.length {
+      if let Constraint.Represents {parameter, contract} = &declared[at] {
+        if run Type.equalsShared(offered, &parameter) { given = Shared.with<Type, Option<EffectParts>>(&contract, effectParts) }
+      }
+      at = at + usize.ONE
+    }
+  }
+  let left = match move given {
+    Option<EffectParts>.Some {value} => value
+    Option<EffectParts>.None => { return false }
+  }
+  let right = match move Shared.with<Type, Option<EffectParts>>(wanted, effectParts) {
+    Option<EffectParts>.Some {value} => value
+    Option<EffectParts>.None => { return false }
+  }
+  return runStrength(left.mode) <= runStrength(right.mode)
+    && (run Type.coversFailure(&right.success, &left.success))
+    && (run Type.coversFailure(&right.failure, &left.failure))
+    && (run Row.covers(&right.requirements, &left.requirements)) == RowCoverage.Covered
+    && (run callableEnvironmentOutlives(&left.environment, &right.environment, declared))
+}
+
+// The declared contract of a producer's Effect family, absent for any other type.
+fn effectFamilyContract(value: &Type) -> Option<Shared<Type>> {
+  if let Type.OpaqueRepresentation {contract, ..} = &value.* {
+    if Shared.with<Type, bool>(&contract, bareEffect) { return Option.some<Shared<Type>>(Shared.clone<Type>(&contract)) }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+// Whether a declaration writes an explicit `some<...>` result, which keeps one realization
+// (REP-005) rather than joining distinct returned Effects.
+effect fn writtenOpaqueResult(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let written = run signatureSyntax(&mut resolver.*, module, ordinal)
+  if let Option<WrittenSignature>.Some {value} = move written {
+    if let Option<HirId>.Some {value: result} = move value.result {
+      let syntax = run typeNode(&mut resolver.*, module, result)
+      if let Option<HeaderSyntax>.Some {value: found} = move syntax {
+        if let Node.OpaqueResultType {..} = found.header { return true }
+      }
     }
   }
   return false
+}
+
+// A declared `Effect<...>` result stores whichever Effect a return selects: when the returns
+// construct distinct exact Effects, each is injected into their finite join behind the declared
+// contract, which every return was proven to satisfy (EFF-013).
+effect fn joinEffectReturns(resolver: &Resolver, module: &ModuleId, nodes: &mut Vector<BodyNode>, contract: &Shared<Type>)
+  -> Option<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let mut returns = Vector.make<usize>()
+  let mut alternatives = Vector.make<Shared<Type>>()
+  let listed = Vector.asSlice<BodyNode>(&nodes.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let mut returned = usize.MAX
+    if let BodyNodeKind.Return {value: written} = &listed[at].kind {
+      if let Option<BodyNodeId>.Some {value: node} = &written { returned = node.index }
+    }
+    if returned != usize.MAX {
+      let value = BodyNodeId {index: returned}
+      let produced = bodyExpressionType(listed, &value)
+      if let Option<Shared<Type>>.Some {value: ty} = move produced {
+        if !Shared.with<Type, bool>(&ty, neverType) {
+          run Vector.append<usize>(&mut returns, at)
+          let stored = run joinAlternatives(&ty)
+          let values = Vector.asSlice<Shared<Type>>(&stored)
+          let mut item = usize.ZERO
+          while item < values.length {
+            if (run joinAlternative(Vector.asSlice<Shared<Type>>(&alternatives), &values[item])) == usize.MAX {
+              run Vector.append<Shared<Type>>(&mut alternatives, Shared.clone<Type>(&values[item]))
+            }
+            item = item + usize.ONE
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  if Vector.length<Shared<Type>>(&alternatives) < 2 { return Option.none<Shared<Rejection>>() }
+  let joined = run Shared.make<Type>(Type.EffectJoin {contract: Shared.clone<Type>(contract), alternatives: move alternatives})
+  let sites = Vector.asSlice<usize>(&returns)
+  at = usize.ZERO
+  while at < sites.length {
+    let node = BodyNodeId {index: sites[at]}
+    let mut returned = usize.MAX
+    if let BodyNodeKind.Return {value: written} = &Vector.asSlice<BodyNode>(&nodes.*)[node.index].kind {
+      if let Option<BodyNodeId>.Some {value: selected} = &written { returned = selected.index }
+    }
+    let value = BodyNodeId {index: returned}
+    let span = Vector.asSlice<BodyNode>(&nodes.*)[value.index].origin.span
+    let injected = match move run injectJoined(&mut nodes.*, value, &joined) {
+      Option<BodyNodeId>.Some {value: selected} => selected
+      Option<BodyNodeId>.None => { return Option.some<Shared<Rejection>>(run reject(resolver, module, RejectionCode.NestedEffectJoinUnavailable, span)) }
+    }
+    let previous = Vector.remove<BodyNode>(&mut nodes.*, node.index)
+    run Vector.insert<BodyNode>(&mut nodes.*, node.index, BodyNode {origin: previous.origin,
+      kind: BodyNodeKind.Return {value: Option.some<BodyNodeId>(injected)}})
+    at = at + usize.ONE
+  }
+  return Option.none<Shared<Rejection>>()
+}
+
+// Whether a value is a representation parameter, whose argument supplies its exact storage.
+effect fn representationParameter(value: &Shared<Type>, declared: &[Constraint]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < declared.length {
+    if let Constraint.Represents {parameter, ..} = &declared[at] {
+      if run Type.equalsShared(value, &parameter) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether a value is an exact Effect a finite join may hold (EFF-013): an `effect fn`
+// construction or Effect literal, a composition, a producer's Effect family, or a join.
+fn joinableEffect(value: &Type) -> bool {
+  return match &value.* {
+    Type.CallableValue {contract, ..} => Shared.with<Type, bool>(&contract, bareEffect)
+    Type.EffectComposite {..} => true
+    Type.EffectJoin {..} => true
+    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, bool>(&contract, bareEffect)
+    _ => false
+  }
+}
+
+// The exact Effects a value stores: a join's alternatives, or the value itself.
+effect fn joinAlternatives(value: &Shared<Type>) -> Vector<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let copied = run Type.copy(value)
+  if let Type.EffectJoin {alternatives, ..} = move copied { return move alternatives }
+  let mut single = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut single, Shared.clone<Type>(value))
+  return move single
+}
+
+// Replaces a checked expression's type; its storage is unchanged, as for a join view.
+effect fn retypeNode(nodes: &mut Vector<BodyNode>, node: BodyNodeId, ty: Shared<Type>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let previous = Vector.remove<BodyNode>(&mut nodes.*, node.index)
+  let form = match move previous.kind {
+    BodyNodeKind.Expression {form, ..} => move form
+    _ => absurd<BodyExpression>()
+  }
+  run Vector.insert<BodyNode>(&mut nodes.*, node.index, BodyNode {origin: previous.origin,
+    kind: BodyNodeKind.Expression {ty: move ty, form: move form}})
+  return ()
 }
 
 // Whether every value of a type is Copy. Scalars, the unit value, enums and shared references
@@ -34802,6 +35123,7 @@ effect fn copyTypeWithin(
       Type.String {..} => true
       Type.Callable {mode, ..} => mode == CallableMode.Shared
       Type.CallableValue {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode) == CallableMode.Shared
+      Type.EffectJoin {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode) == CallableMode.Shared
       Type.CallableOrigin {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode) == CallableMode.Shared
       Type.CallableWitnessResult {witness} => {
         let recipe = Shared.with<WitnessRecipe, WitnessRecipe>(&witness, CallableWitness.copy)
@@ -34812,6 +35134,7 @@ effect fn copyTypeWithin(
       Type.CallableSchema {schema, ..} => Shared.with<Type, CallableMode>(&sectionSchemaContract(&schema), callableInvocationMode) == CallableMode.Shared
       Type.CallableView {contract, ..} => Shared.with<Type, bool>(&contract, sharedCallableType)
       Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, bool>(&contract, sharedCallableType)
+        || Shared.with<Type, CallableMode>(&contract, callableInvocationMode) == CallableMode.Shared && Shared.with<Type, bool>(&contract, bareEffect)
       Type.Nominal {..} => nominalKind(value) == OwnerKind.Enumeration
       _ => false
     }
@@ -35155,6 +35478,7 @@ effect fn cleanupFree(
     Type.CallableValue {captures, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&captures)) }
     Type.CallableSchema {captures, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&captures)) }
     Type.EffectComposite {parts: stored, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&stored)) }
+    Type.EffectJoin {alternatives, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&alternatives)) }
     Type.CallableStage {base, captures, ..} => {
       run Vector.append<Shared<Type>>(&mut parts, Shared.clone<Type>(&base))
       let supplied = Vector.asSlice<Shared<Type>>(&captures)
@@ -36880,6 +37204,13 @@ effect fn checkStatements(
             if contextual {
               expected = Option.some<Shared<Type>>(Shared.clone<Type>(resultType))
               opaqueConstruction = true
+            }
+            // A returned `effect {}` block takes its channels from the declared Effect (EFF-011).
+            if let Node.EffectExpression {..} = literal {
+              let declared = Shared.with<Type, Option<Shared<Type>>>(resultType, effectFamilyContract)
+              if let Option<Shared<Type>>.Some {value: contract} = move declared {
+                expected = Option.some<Shared<Type>>(move contract)
+              }
             }
           }
           if deriving { expected = Option.none<Shared<Type>>() }
@@ -41864,8 +42195,72 @@ effect fn anonymousInvocationApplication(recorded: &Application, signature: &Sha
   return Result.succeed<Application, GapCode>(run Application.applyBindings(recorded, Vector.asSlice<Binding>(&invocation)))
 }
 
+// Whether a run expands through a prepared plan: a composition, a finite join, or a producer's
+// Effect family realized as either (D4, EFF-013).
 fn compositeType(value: &Type) -> bool {
-  return match &value.* { Type.EffectComposite {..} => true _ => false }
+  return match &value.* {
+    Type.EffectComposite {..} => true
+    Type.EffectJoin {..} => true
+    Type.OpaqueRepresentation {..} => true
+    _ => false
+  }
+}
+
+// One alternative a stored join holds: the Effect to run, and its tag and payload type in the
+// join's union storage.
+struct StoredAlternative {
+  alternative: Shared<Type>
+  tag: usize
+  storage: Shared<Type>
+}
+
+// The alternatives of a finite join, or of the union storage a producer's join realizes;
+// absent for any other Effect. A join whose storage collapsed has no injective tag map.
+effect fn storedAlternatives(ty: &Shared<Type>, projections: &[RuntimeProjection]) -> Option<Result<Vector<StoredAlternative>, GapCode>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut output = Vector.make<StoredAlternative>()
+  let copied = run Type.copy(ty)
+  match move copied {
+    Type.EffectJoin {alternatives, ..} => {
+      let listed = Vector.asSlice<Shared<Type>>(&alternatives)
+      if listed.length == usize.ONE {
+        run Vector.append<StoredAlternative>(&mut output, StoredAlternative {alternative: Shared.clone<Type>(&listed[usize.ZERO]),
+          tag: usize.ZERO, storage: Shared.clone<Type>(&listed[usize.ZERO])})
+        return Option.some<Result<Vector<StoredAlternative>, GapCode>>(Result.succeed<Vector<StoredAlternative>, GapCode>(move output))
+      }
+      let none = Vector.make<Binding>()
+      let mapped = match move run UnionProjection.map(ty, Vector.asSlice<Binding>(&none), projections) {
+        Option<Vector<UnionProjection.Member>>.Some {value} => value
+        Option<Vector<UnionProjection.Member>>.None => {
+          return Option.some<Result<Vector<StoredAlternative>, GapCode>>(Result.failResult<Vector<StoredAlternative>, GapCode>(GapCode.UnionForm))
+        }
+      }
+      let members = Vector.asSlice<UnionProjection.Member>(&mapped)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run Vector.append<StoredAlternative>(&mut output, StoredAlternative {alternative: Shared.clone<Type>(&listed[at]),
+          tag: members[at].tag, storage: Shared.clone<Type>(&members[at].ty)})
+        at = at + usize.ONE
+      }
+    }
+    Type.Union {..} => {
+      let canonical = match move run Type.canonicalUnionMembers(ty) {
+        Option<Vector<Shared<Type>>>.Some {value} => value
+        Option<Vector<Shared<Type>>>.None => {
+          return Option.some<Result<Vector<StoredAlternative>, GapCode>>(Result.failResult<Vector<StoredAlternative>, GapCode>(GapCode.UnionForm))
+        }
+      }
+      let listed = Vector.asSlice<Shared<Type>>(&canonical)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run Vector.append<StoredAlternative>(&mut output, StoredAlternative {alternative: Shared.clone<Type>(&listed[at]),
+          tag: at, storage: Shared.clone<Type>(&listed[at])})
+        at = at + usize.ONE
+      }
+    }
+    _ => { return Option.none<Result<Vector<StoredAlternative>, GapCode>>() }
+  }
+  return Option.some<Result<Vector<StoredAlternative>, GapCode>>(Result.succeed<Vector<StoredAlternative>, GapCode>(move output))
 }
 
 // Prepares the run of one exact Effect: a construction's or block's runner, or a composition whose
@@ -41876,6 +42271,37 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   origin: BodyOrigin, own: &[ProviderEntry], bound: &mut Vector<BoundProvider>, module: &ModuleId,
   steps: &mut Vector<MirRunPlan>) -> Result<usize, GapCode>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  // A producer's Effect family runs through the storage its returns realize (EFF-013).
+  if Shared.with<Type, bool>(ty, fn(value: &Type) -> bool { return match &value.* { Type.OpaqueRepresentation {..} => true _ => false } }) {
+    let realized = match move run RuntimeType.resolved(ty, projections) {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
+    }
+    return run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
+      projections, identity, &realized, origin, own, &mut bound.*, module, &mut steps.*)
+  }
+  // A finite join runs only the selected alternative's own plan (EFF-013, D1).
+  let stored = run storedAlternatives(ty, projections)
+  if let Option<Result<Vector<StoredAlternative>, GapCode>>.Some {value: found} = move stored {
+    let alternatives = match move found {
+      Result<Vector<StoredAlternative>, GapCode>.Success {value} => value
+      Result<Vector<StoredAlternative>, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+    }
+    let listed = Vector.asSlice<StoredAlternative>(&alternatives)
+    let mut arms = Vector.make<MirJoinArm>()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let step = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller, callerBindings,
+        projections, identity, &listed[at].alternative, origin, own, &mut bound.*, module, &mut steps.*) {
+        Result<usize, GapCode>.Success {value} => value
+        Result<usize, GapCode>.Failure {error} => { return Result.failResult<usize, GapCode>(error) }
+      }
+      run Vector.append<MirJoinArm>(&mut arms, MirJoinArm {step: step, tag: listed[at].tag, ty: Shared.clone<Type>(&listed[at].storage)})
+      at = at + usize.ONE
+    }
+    run Vector.append<MirRunPlan>(&mut steps.*, MirRunPlan.Join {arms: move arms, tagged: listed.length > usize.ONE})
+    return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
+  }
   let channels = match move Shared.with<Type, Option<EffectChannels>>(ty, effectChannels) {
     Option<EffectChannels>.Some {value} => value
     Option<EffectChannels>.None => { return Result.failResult<usize, GapCode>(GapCode.EffectForm) }
@@ -44648,6 +45074,13 @@ effect fn resolveBody(
     Result<CheckedControl, Shared<Rejection>>.Success {value} => value
     Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
       return rejectedBody(move error, move dependencies)
+    }
+  }
+  let family = Shared.with<Type, Option<Shared<Type>>>(&resultType, effectFamilyContract)
+  if !run writtenOpaqueResult(&mut resolver.*, &module, key.declaration) {
+    if let Option<Shared<Type>>.Some {value: contract} = move family {
+      let refused = run joinEffectReturns(&resolver.*, &module, &mut nodes, &contract)
+      if let Option<Shared<Rejection>>.Some {value} = move refused { return rejectedBody(move value, move dependencies) }
     }
   }
   let availability = run captureAvailability(&resolver.*, &module, &cursor, Vector.asSlice<BodyNode>(&nodes), control.node, initialLocals, Vector.asSlice<Constraint>(&constraints))
@@ -51505,6 +51938,8 @@ fn callableInvocationMode(value: &Type) -> CallableMode {
     Type.CallableStage {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
     Type.CallableSchema {schema, ..} => Shared.with<Type, CallableMode>(&sectionSchemaContract(&schema), callableInvocationMode)
     Type.EffectComposite {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
+    Type.EffectJoin {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
+    Type.OpaqueRepresentation {contract, ..} => Shared.with<Type, CallableMode>(&contract, callableInvocationMode)
     _ => CallableMode.Once
   }
 }
