@@ -79,6 +79,7 @@ export const selfhostTrack = [
   'effect-return-site-join-once',
   'finite-effect-join-capture-arity',
   'match-statement-arm-control',
+  'effect-access-forwarding',
   'opaque-effect',
   'ordinary-union-executable-members',
 ] as const satisfies ReadonlyArray<string>

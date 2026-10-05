@@ -459,21 +459,18 @@ Each entry records:
     producers therefore join as two families, each realized at layout.
   - A `match` join without a declared contract retains the intersection of the arms' environments;
     the bootstrap requires equal environments.
-  - Running a `mut Effect` needs a mutable place in selfhost, as invoking a `mut fn` does in both
-    compilers; the bootstrap runs one from an immutable binding. The corpus program
-    `effect-access-forwarding` is an accepted selfhost FAIL until Julia decides which rule is
-    intended.
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
   different join reports the named `nested-effect-join` gap. Constructing an interface operation's
   Effect reports `interface-effect-witness`. An Effect result with no producer body (an interface
   operation's) and Effect-producing callables inferred from `effect fn` values (handlers passed to
   `Effect.catch`, `catchAll`, `flatMap`) remain `effect-form`.
-- **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative` and
-  `effectJoinsCleanOnlyTheStoredAlternative` assert injections, tag switches calling each block,
-  failure edges, join glue and the gap codes; the native corpus pins `finite-effect-join-capture-arity`,
-  `effect-return-site-join-once`, `effect-higher-order-values`, `opaque-effect`,
-  `ordinary-union-executable-members` and `match-statement-arm-control`.
+- **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
+  and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
+  tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
+  the native corpus pins `finite-effect-join-capture-arity`, `effect-return-site-join-once`,
+  `effect-higher-order-values`, `opaque-effect`, `ordinary-union-executable-members`,
+  `match-statement-arm-control` and `effect-access-forwarding`.
 - **Owner:** nested join re-injection and Effect-producing callable inference: #567 Step 9
   follow-ups.
 
