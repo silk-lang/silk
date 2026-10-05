@@ -259,7 +259,7 @@ Each entry records:
 - **Evidence:** review counterexample: `Guard<'a>` always owns a droppable `Token`, but its own
   `impl<'a: 'static> Drop` hook applies to a static instance and not a local one. Both demand
   orders and equal-recipe sharing controls are retained as structured acceptance assertions;
-  all four source controls execute successfully. Linux cost and final integrated-head execution
+  all four source controls execute successfully. Linux cost and current integrated-head execution
   are separate acceptance gates, not implied by source review.
 
 ### Selfhost generic aggregate diagnostics retain existing family differences
@@ -423,8 +423,9 @@ Each entry records:
   evidence supplied at that stage. Staging through an abstract callable parameter normalizes its
   closed schema recipe before MIR, preserving the original target blueprint and exact capture
   record. Storage mode follows the actual base and newly stored fields; source promises still
-  determine consuming transport. Quantified contextual promises and sections requiring deferred lifetime/row binders, enclosing
-  scope or static evidence. Bootstrap rejects some closed contextual forwarding of a stored generic
+  determine consuming transport. Ordinary named sections with deferred invocation lifetimes remain
+  required Step 8 work. Deferred requirement rows, unapplied enclosing owners and runtime static
+  evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
   [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
@@ -874,10 +875,10 @@ repeated invocation and capture-only drop glue.
 - **Admission:** origin queries retain application, profile and conditional proof context. Growth
   is checked before body demands, including cached-body edges. The depth bound spans conditional
   context transitions; exhaustion stays unsupported rather than claiming infinite specialization.
-- **Remaining Step 8 return-origin work:** recursive origin cycles, divergent plain origins and
-  callable-valued results reached through interface invocation remain explicitly unsupported.
-  Abstract and invocation-selected higher-order results now retain a source selection recipe;
-  exact native verification of that layer is pending. Fully selected stored producer values and
+- **Return-origin coverage:** finite recursive origins, higher-order selection and selected
+  interface results are implemented and verified by the entries below. Leafless cycles and
+  divergent exact plain origins retain their explicit rejection; they cannot invent dispatch.
+  Abstract and invocation-selected higher-order results retain an original source selection recipe. Fully selected stored producer values and
   inherent receiver methods use the same original-result query and runtime ABI projection as direct
   producers. Retained mutable parameter storage loans use #783. General escape and parent-loan
   proof remain NotChecked for Step 14. These limitations are not claimed as native PASS.
@@ -890,7 +891,6 @@ repeated invocation and capture-only drop glue.
   checks producer/caller transfer, a moved stored-field operand, target cleanup, abandonment glue
   and OWN0003 at a bare returned affine owner. Both exact-head CI runs execute these assertions.
 - **Source migration:** none.
-
 
 ### Native raw owned-callable return identity guard
 
@@ -917,7 +917,6 @@ repeated invocation and capture-only drop glue.
 - **Source migration:** use an authored constrained type parameter when the returned owner needs
   to preserve its exact callable type, or return a known construction.
 
-
 ### Exact callable members in native structural unions
 
 - **Status:** implemented during Step 8 on 2026-10-04 in #785;
@@ -934,18 +933,16 @@ repeated invocation and capture-only drop glue.
   spellings. `plainOnceCallableReturnsTransferCaptureCleanupExactlyOnce` additionally inspects
   active-member cleanup for a union containing a Drop-bearing section. Independent bootstrap
   Analysis accepts the union source and a reached public-entry reduction has available MIR.
-- **Source migration:** none. Opaque and plain Effect members retain `EffectFormUnavailable`
-  at their producer call, including unions; this prevents a callable sweep from hiding the next
-  Step 9 boundary behind a generic typed-form gap.
+- **Source migration:** none. Opaque Effect result-family admission, including promised union
+  members, retains `EffectFormUnavailable`, as the `selectedEffect() -> some<F: Effect<'static; i32>> F | i32`
+  control proves. Supported closed Effect literals/compositions use the landed Step 9 implementation
+  and are outside this gap. Public Effect representation joins are documented separately.
 
 ### Native higher-order callable result selection
 
-- **Status:** implemented in a draft Step 8 layer. Invocation-local representation reification
-  repaired the staged-suffix source rejection. The reduced Once control exposed a separate source
-  admission gap for a staged recipe behind a public Once view; that recipe is now admitted like
-  a callable-result recipe and must still realize its exact storage before MIR. All ten callable-result assertions and the Linux timing gate passed at exact head `2bdaded22`
-  in CI 37249578160 (80 PASS, 0 FAIL, no lost baseline PASS). Verification after integrating
-  newer selfhost APIs remains pending.
+- **Status:** merged through #788. The current integrated head `0f2a900e0` passes all 52 callable
+  controls and preserves 84 corpus PASS programs with 0 FAIL in CI 37308766103. The only CI
+  failure is the 2000 ms timing guard, explicitly waived by Julia with a timing follow-up.
 - **Rule:** a checked invocation through an abstract callable retains its producer, public result
   contract, argument type evidence and selected invocation values/ordinals. This source recipe is
   resolved after substitution to the original returned environment before exact consumer inference.
@@ -986,13 +983,11 @@ repeated invocation and capture-only drop glue.
   the owned nested-literal reduction likewise has only the bootstrap lowering boundary.
 - **Source migration:** none.
 
-
 ### Finite recursive native callable origins
 
-- **Status:** implemented in a draft Step 8 layer. Exact head `6a9b96325` passed all nineteen callable-result assertions in CI
-  37249797146, including all finite-origin controls. Three inherited controls exceeded the Linux
-  timing budget. The reviewed settled-type normalization correction and newer upstream integration
-  await fresh exact-head verification.
+- **Status:** merged through #791; all finite-origin controls pass on current integrated head
+  `0f2a900e0` in CI 37308766103. Exact whole-body replay and corpus preservation remain required;
+  the current timing-only failure is recorded in compiler/docs/step8-callable-sweep.md.
 - **Rule:** complete ordinary producer applications form a bounded private source graph. Reachable
   return operands provide environment equations; other checked expressions retain validation
   dependencies. Source recipes normalize before exact inference, and every selected producer
@@ -1013,30 +1008,27 @@ repeated invocation and capture-only drop glue.
   canonical roots and symbolic forwarding. Independent bootstrap Analysis reports SEM0037 at
   `factory()` in the invalid generic assignment control; it additionally treats represented F as
   affine at bare forwarding, unlike the documented native shared-callable Copy promise. Native
-  code/span assertions and MIR inspection passed on `6a9b96325`; timing verification after the
-  normalization correction remains pending.
+  code/span assertions and MIR inspection also pass on current integrated head `0f2a900e0`.
 - **Source migration:** none.
 
 - **Finite origin cost correction:** settled immutable source type trees share their original
   evidence during callable normalization, avoiding deep reconstruction on each solving/replay
   pass. Open recipes, views, structural unions and static-bearing callable applications remain
   on the normal path. Every producer still performs bounds checks and exact whole-body replay;
-  unused dependencies and every distinct existing assertion remain unchanged. Native timing
-  improvement and the newly integrated upstream head require fresh exact-head evidence.
+  unused dependencies and every distinct existing assertion remain unchanged. The current integrated
+  Linux run executes these assertions; its remaining timing follow-up is recorded separately.
 
 - **Direct normalization cost correction:** direct child/contract walkers use the same settled-tree
   sharing predicate as result normalization. Unions, unresolved recipes, views, stages and static-
   bearing applications retain full normalization. The suffix control reads its canonical section
   from the main call's actual MIR destination and its independent leaf from the factory's checked
   return operand, retaining the original invocation and rejection assertions while avoiding two
-  redundant MIR demands. New Linux timings remain pending.
+  redundant MIR demands. Final integrated Linux timings are recorded in compiler/docs/step8-callable-sweep.md.
 
 ### Native inferred opaque callable record fields
 
-- **Status:** implemented in a draft Step 8 layer; bootstrap compiler source checking passes.
-  Exact head `a3cb04c65` passed all twenty-five callable-result assertions in CI 37250068547, including
-  the repaired field dispatcher and owner claim. Four inherited controls exceeded the Linux timing
-  budget; the reviewed normalization correction and exact-head corpus preservation await verification.
+- **Status:** merged through #792; all record, field-dispatch and owner-role controls pass
+  on current integrated head `0f2a900e0` in CI 37308766103.
 - **Rule:** an inferred nominal construction retains its actual callable field types. Its own
   opaque return boundary proves each leaf contract and original parameter role; existing exact
   realization projects the public nominal result before layout and cleanup. A moved local record
@@ -1053,17 +1045,17 @@ repeated invocation and capture-only drop glue.
   checker, including pipeline invocation, access and ownership permissions. Its record expression
   is checked once. Invalid field annotations preserve their original rejection; a noncallable
   field reports SEM0075 at the complete field expression, matching the bootstrap control.
-- **Remaining projections:** the next Step 8 layer maps structural source union ordinals to exact
-  physical tags, including substituted nominal fields and descriptor referents. Its symbolic owner
-  proof avoids an arbitrary global type-count limit. Dotted construction does not infer a new leaf
-  under a promised opaque slot and is not claimed as a parity positive.
+- **Projection and construction:** the opaque union entry below maps structural source ordinals
+  to physical tags, including nominal fields and descriptor referents. Its symbolic owner proof
+  avoids an arbitrary global type-count limit. Contextual construction opens only a producer’s
+  own opaque aggregate arguments, as documented separately below; other family authority stays exact.
 - **Evidence:** five `opaqueCallableRecords*` structured controls cover original named/anonymous
   fields, local forwarding, field-bound rejection, raw/authored roles, the exact record/environment/
   capture glue chain, and a descriptor-union gap. Bootstrap independently admits the positive
   records, authored-F control, repaired Drop fixture and descriptor-union source.
   `storedCallableFieldsShareInvocationAndPipelineChecking` independently covers receiver evaluation,
-  pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. All record controls, including repaired dispatch assertions, passed on the later `a3cb04c65` head;
-  fresh integrated Linux timing verification remains pending.
+  pipeline dispatch and the bootstrap's exact SEM0075/SEM0001 rejection spans. All record controls, including repaired dispatch assertions,
+  pass on current integrated head `0f2a900e0`.
   The earlier owner-claim control uses an explicit static environment and asserts a projected
   field `CallableCall` with no interface or named-call fallback; it retains the duplicate
   inherent-name collision rejection. Its original omitted-environment field remains a distinct
@@ -1075,10 +1067,9 @@ repeated invocation and capture-only drop glue.
 
 ### Native callable results from selected interface operations
 
-- **Status:** implemented in a draft Step 8 layer with independent source acceptance. Exact head
-  `1830c2f7d` passed all thirty-two callable-result assertions in CI 37250299480, including all seven
-  interface controls. Five controls exceeded the Linux timing budget. The reviewed normalization
-  correction and upstream row API integration await fresh exact-head verification.
+- **Status:** merged through #793; all selected-interface controls pass on current integrated
+  head `0f2a900e0` in CI 37308766103. One original-target control takes 2000 ms; Julia waived
+  this timing-only failure, and a follow-up must retain each distinct assertion.
 - **Rule:** an operation returning a callable retains its original operation identity, complete
   contract/provider selection, original-owner invocation assignments, checked operand types and
   positional optional witness loans. A concrete conformance witness resolves the ordinary original
@@ -1101,17 +1092,15 @@ repeated invocation and capture-only drop glue.
 - **Evidence:** seven `interfaceCallable*` controls cover original provider/implementation/leaf
   selection, symbolic descriptor and owned return replay, deferred section evidence, universal
   source rejection, independent loan-only source equality/substitution and optional presence, and
-  original receiver-region transport through a captured MIR temporary. These assertions passed natively on `1830c2f7d`;
-  timing verification after the normalization correction remains pending. Unresolved recipes never have storage or an executable key.
+  original receiver-region transport through a captured MIR temporary. These assertions also pass on current integrated head `0f2a900e0`.
+  Unresolved recipes never have storage or an executable key.
 - **Source migration:** none.
-
 
 ### Native opaque structural union projection
 
-- **Status:** implemented in a draft Step 8 layer. Exact head `71e206ba7` passed 41 of 43
-  callable-result controls and the corpus (82 PASS, 0 FAIL). Two fixture/oracle repairs retain the
-  original assertions: explicit affine transport for the descriptor collision, and temporary-copy
-  provenance before the partial-move consumer. Their native assertion run remains pending.
+- **Status:** merged through #797. All original mapping, root/nested selection, partial cleanup
+  and immediate/latent collision controls pass on current integrated head `0f2a900e0` in
+  CI 37308766103, preserving the complete parent PASS set.
 - **Rule:** original source member ordinals are retained in typed injection, root/nested patterns
   and payload paths. A complete injective source-to-canonical-storage map selects every physical
   tag and payload type; cleanup remainder paths use the same map before exact glue selection.
@@ -1133,14 +1122,13 @@ repeated invocation and capture-only drop glue.
 - **Evidence:** existing descriptor storage, complete reordered/colliding maps, original root-return
   injection, ordinary generic alias collapse, union-free growing pointer storage, and descriptor-only
   immediate/latent collision controls are source-written structured assertions. The new storage
-  fixtures independently pass bootstrap Analysis; their native observations remain pending.
+  fixtures independently pass bootstrap Analysis and the current native assertion run.
   A root-match control independently derives its scalar physical tag from the original call
   destination and checks both switch routing and the recovered payload type. A nested-test control
   derives its nominal tag from the concrete definition parameter and checks the selector and full
   payload type. A partial-move control follows only the selected record arm: it requires the first
   field's Move into the original consumer, exactly one remaining second-field cleanup, no ancestor
-  cleanup on that path, and exact glue identity from an independent type query. Their native
-  observations and timings remain pending.
+  cleanup on that path, and exact glue identity from an independent type query. All three controls pass in the current native assertion run.
 - **Nested-pattern bootstrap boundary:** the bootstrap rejects literal nested structural member
   patterns even for the pre-existing ordinary `Narrow | Wide` control. Its nested pattern checker
   compares the entire field union against the selected member instead of supplying expected
@@ -1159,12 +1147,10 @@ repeated invocation and capture-only drop glue.
 
 ### Native callable parameters in ordinary anonymous declarations
 
-- **Status:** ordinary anonymous headers now reify written callable parameters into exact hidden
-  representation slots after authored binders and elided lifetimes. A release compiler built from
-  this change preserves all 82 baseline PASS programs and reports 82 PASS, 0 FAIL, 311 Unsupported.
-  Seven focused native probes pass, including two distinct anonymous callbacks, mutable capture
-  invocation, borrowed callback lifetimes, and two-stage suffix order. Structured native assertions
-  and their Linux timings remain pending exact-head CI.
+- **Status:** merged through #801. All five anonymous-parameter controls, including the
+  repaired SEM0212 retained-environment rejection, pass in CI 37308603747 at `8c851ec46`
+  and again on current integrated head `0f2a900e0` in CI 37308766103. The integrated corpus
+  reports 84 PASS, 0 FAIL, 309 Unsupported, track 70; all prior PASS names are preserved.
 - **Rule:** an anonymous invocation uses the existing CallableSchema blueprint and ordinary
   Function application. Selected enclosing bindings remain free construction evidence; own
   invocation representation and lifetime slots remain bound until use. Only lexical captures form
@@ -1189,12 +1175,12 @@ repeated invocation and capture-only drop glue.
   build-exe boundary is repaired.
 - **Source migration:** none.
 
-
 ### Contextual opaque callable aggregate results
 
-- **Status:** native contextual record, tuple and nested record probes build and return 42;
-  the release compiler preserves all 82 baseline PASS programs with 0 FAIL, 311 Unsupported,
-  track 69. Structured controls and exact integrated CI are pending.
+- **Status:** merged through #802. All four contextual aggregate controls pass on exact
+  head `0f2a900e0` in CI 37308766103: record/tuple storage, nested fixed arguments and order,
+  contract/family proof, and assignment authority. The corpus remains 84 PASS, 0 FAIL,
+  309 Unsupported, track 70 with no lost PASS. Timing-only failure is separately waived.
 - **Rule:** a producer returning `some<F: fn(...)> Wrap<F>` may establish its own exact family
   through a contextual `.{ ... }` or tuple literal. The original nominal blueprint supplies field
   shape and fixed arguments; inference opens only this producer's opaque arguments. Nested literals
