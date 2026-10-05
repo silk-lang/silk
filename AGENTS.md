@@ -240,10 +240,11 @@ genuinely needs isolation may scope a distinct layer within that test.
 The compiler suite is the critical path of `pnpm check`; every test pays for the compiler
 pipelines it runs. Prove each claim at the cheapest tier that can falsify it.
 
-- Until the self-hosted compiler is functional, every selfhost test must finish within 1 s on
-  Linux CI; aim for under 500 ms. The focused selfhost workflow enforces the limit from the test
-  runner's per-test timings. Reduce fixture and demand cost before splitting a slow test; split
-  only independent claims, and retain every distinct assertion.
+- Until the self-hosted compiler is functional, every selfhost test should finish within 1 s on
+  Linux CI; aim for under 500 ms. The focused selfhost workflow warns above 1 s and fails at 2 s
+  from the test runner's per-test timings, so noise near the target does not fail CI. Reduce
+  fixture and demand cost before splitting a slow test; split only independent claims, and retain
+  every distinct assertion.
 
 - Prove parser, resolution, typing, ownership, Effect, target-selection, and diagnostic claims with
   structured analysis assertions. Prove compile-time execution only through `Evaluation`.
