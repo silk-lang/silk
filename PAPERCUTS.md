@@ -620,3 +620,4 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · Shared worktree dependency links did not expose esbuild to the verification bundler and a direct script typecheck missed Node declarations/generated toolchain inputs · Set NODE_PATH to the existing esbuild package for bundling; pass compiler @types explicitly and materialize the ignored ToolchainIntegrity.generated.ts locally · self-build corpus tooling
 
 - 2026-10-06 · Codex attach_artifact stalled from both worker and coordinator for963/964 · Attempt attachment without holding merges, record pending retry in ledger · Silk orchestration.
+- 2026-10-06 · An outer Cases parser probe did not validate embedded source strings, so an invalid `&[Allocation; 1]` fixture consumed a native rebuild · Parse fixture text directly before native checks; references to fixed arrays use `&([Allocation; 1])` · self-build semantic
