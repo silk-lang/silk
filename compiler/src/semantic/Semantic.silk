@@ -30655,7 +30655,9 @@ struct CheckedIdentifier {
 // Function values are handled by the construction path before this helper. An unbound identifier
 // here names a constant; a bound one names a local or runtime pattern binder.
 effect fn checkedIdentifier(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
   module: &ModuleId,
   cursor: &AuthoredCursor,
   locals: &[BodyLocal],
@@ -30668,7 +30670,7 @@ effect fn checkedIdentifier(
   span: Span,
   staticBody: bool,
 ) -> Result<CheckedIdentifier, Shared<Rejection>>
-! RevisionMismatch | OutOfMemoryError
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   if !bound {
     let found = run resolvedCall(calls, expression)
@@ -30676,7 +30678,7 @@ effect fn checkedIdentifier(
       Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} => value
       Option<Result<ResolvedTarget, Shared<Rejection>>>.None => {
         return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-          run reject(resolver, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
+          run reject(&resolver.*, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
         )
       }
     }
@@ -30684,20 +30686,24 @@ effect fn checkedIdentifier(
       Result<ResolvedTarget, Shared<Rejection>>.Success {
         value: ResolvedTarget.Constant {declaration, ty: constantType},
       } => {
-        if !staticBody {
-          return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-            run reject(resolver, module, RejectionCode.RuntimeConstantUnavailable, span),
-          )
+        if staticBody {
+          return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
+            ty: move constantType,
+            form: BodyExpression.Constant {
+              declaration: run Shared.make<DeclarationId>(move declaration),
+            },
+          })
         }
-        return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
-          ty: move constantType,
-          form: BodyExpression.Constant {
-            declaration: run Shared.make<DeclarationId>(move declaration),
-          },
-        })
+        let read = run runtimeConstantRead(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, move declaration, span)
+        return match move read {
+          Result<BodyExpression, Shared<Rejection>>.Success {value: form} => Result.succeed<CheckedIdentifier, Shared<Rejection>>(
+            CheckedIdentifier {ty: move constantType, form: move form},
+          )
+          Result<BodyExpression, Shared<Rejection>>.Failure {error} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(move error)
+        }
       }
       Result<ResolvedTarget, Shared<Rejection>>.Success {value: _} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-        run reject(resolver, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
+        run reject(&resolver.*, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
       )
       Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(move error)
     }
@@ -30719,11 +30725,11 @@ effect fn checkedIdentifier(
   }
   if staticBody {
     return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-      run reject(resolver, module, RejectionCode.StaticPhaseViolation, run bodySpan(&resolver.source, cursor, name)),
+      run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, run bodySpan(&resolver.source, cursor, name)),
     )
   }
   return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-    run reject(resolver, module, RejectionCode.Unsupported, span),
+    run reject(&resolver.*, module, RejectionCode.Unsupported, span),
   )
 }
 
@@ -30938,11 +30944,23 @@ effect fn checkFieldAccess<'scope>(
     }
   }
   // A qualified constant is a declaration selection, not a runtime namespace value. Preserve
-  // enum and unit-variant construction above, then report ordinary constant materialization.
+  // enum and unit-variant construction above, then read the constant's published value.
   let constantSelection = run resolvedCall(calls, expression)
   if let Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} = move constantSelection {
-    if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {..}} = move value {
-      return run bodyRejection(&resolver.*, module, RejectionCode.RuntimeConstantUnavailable, span)
+    if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {declaration, ty: constantType}} = move value {
+      let read = run runtimeConstantRead(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, move declaration, span)
+      let form = match move read {
+        Result<BodyExpression, Shared<Rejection>>.Success {value: selected} => selected
+        Result<BodyExpression, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let index = Vector.length<BodyNode>(&nodes.*)
+      run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+        origin: BodyOrigin {syntax: expression, span: span},
+        kind: BodyNodeKind.Expression {ty: move constantType, form: move form},
+      })
+      return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
     }
   }
   let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -32170,7 +32188,7 @@ effect fn checkExpressionUnder<'scope>(
       diverges = true
     }
     Node.IdentifierExpression {name, binding} => {
-      let found = run checkedIdentifier(&resolver.*, module, cursor,
+      let found = run checkedIdentifier(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
         Vector.asSlice<BodyLocal>(&statementScope.locals.*), calls, Vector.asSlice<BodyNode>(&nodes.*),
         expression, name, binding.present, binding.id, span, staticBody)
       let identifier = match move found {
@@ -39586,51 +39604,43 @@ effect fn staticSpan(resolver: &mut Resolver, module: &ModuleId, id: HirId) -> S
   return Span.make(usize.ZERO, usize.ZERO)
 }
 
-// This loan is short: the machine resumes only after the reached constant's query facts
-// have been recorded on the same active provider dependency ledger.
-effect fn staticResolveNeeded<'source>(
-  port: &mut StaticPort<'source>,
-  module: &ModuleId,
-  declaration: &Shared<DeclarationId>,
+// The type-fact key of one canonical constant, or absence when this store has not indexed the
+// constant's module and declaration. Its initializer shares the module and declaration ordinals.
+effect fn constantKey(resolver: &mut Resolver, declaration: &Shared<DeclarationId>) -> Option<Key>
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let moduleOrdinal = Shared.with<DeclarationId, usize>(declaration, fn(identity: &DeclarationId) -> usize {
+    return knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(identity))
+  })
+  if moduleOrdinal == usize.MAX { return Option.none<Key>() }
+  let targetModule = run resolvedModule(&resolver.*, moduleOrdinal)
+  let located = run ordinalOfIdentity(&mut resolver.*, &targetModule, declaration)
+  return match move located {
+    Option<usize>.Some {value} => Option.some<Key>(Key {
+      family: Family.Constant, module: moduleOrdinal, name: usize.ZERO,
+      declaration: value, member: usize.ZERO, external: false,
+    })
+    Option<usize>.None => Option.none<Key>()
+  }
+}
+
+// One constant's published value from its content-keyed initializer answer. Every reader shares
+// that answer and records the same value edge; a rejected initializer rejects the reader. `None`
+// means the answer published no value.
+effect fn constantInitializer(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  constant: Key,
   span: Span,
 ) -> Result<Option<Shared<StaticData>>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
-  let moduleOrdinal = Shared.with<DeclarationId, usize>(declaration, fn(identity: &DeclarationId) -> usize {
-    return knownModuleOrdinal(&port.resolver.*, DeclarationId.moduleId(identity))
-  })
-  if moduleOrdinal == usize.MAX {
-    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
-      run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
-    )
-  }
-  let targetModule = run resolvedModule(&port.resolver.*, moduleOrdinal)
-  let located = run ordinalOfIdentity(&mut port.resolver.*, &targetModule, declaration)
-  let ordinal = match move located {
-    Option<usize>.Some {value} => value
-    Option<usize>.None => {
-      return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
-        run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
-      )
-    }
-  }
-  let declared = run demandChild(
-    &mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*,
-    Key {
-      family: Family.Constant, module: moduleOrdinal, name: usize.ZERO,
-      declaration: ordinal, member: usize.ZERO, external: false,
-    },
-    span,
-  )
-  let referencedType = Shared.with<Result<Answer, NoRejection>, TypeSelection>(&declared, selectedType)
-  if let Option<Shared<Rejection>>.Some {value} = move referencedType.rejected {
-    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
-  }
   let referenced = run demandChild(
-    &mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*,
+    &mut resolver.*, &mut owner.*, &mut dependencies.*,
     Key {
-      family: Family.Initializer, module: moduleOrdinal, name: usize.ZERO,
-      declaration: ordinal, member: usize.ZERO, external: false,
+      family: Family.Initializer, module: constant.module, name: usize.ZERO,
+      declaration: constant.declaration, member: usize.ZERO, external: false,
     },
     span,
   )
@@ -39644,6 +39654,72 @@ effect fn staticResolveNeeded<'source>(
     &referenced, initializerValue,
   )
   return Result.succeed<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
+}
+
+// A runtime body reads a constant as its published value at the declared type. The value has no
+// runtime storage, so the read is embedded exactly like a selected static value.
+effect fn runtimeConstantRead(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  declaration: DeclarationId,
+  span: Span,
+) -> Result<BodyExpression, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let identity = run Shared.make<DeclarationId>(move declaration)
+  let located = run constantKey(&mut resolver.*, &identity)
+  let constant = match move located {
+    Option<Key>.Some {value} => value
+    Option<Key>.None => {
+      return Result.failResult<BodyExpression, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.InvalidConstant, span),
+      )
+    }
+  }
+  let published = run constantInitializer(&mut resolver.*, &mut owner.*, &mut dependencies.*, constant, span)
+  let selected = match move published {
+    Result<Option<Shared<StaticData>>, Shared<Rejection>>.Success {value} => value
+    Result<Option<Shared<StaticData>>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<BodyExpression, Shared<Rejection>>(move error)
+    }
+  }
+  return match move selected {
+    Option<Shared<StaticData>>.Some {value} => Result.succeed<BodyExpression, Shared<Rejection>>(
+      BodyExpression.Embedded {value: move value},
+    )
+    Option<Shared<StaticData>>.None => Result.failResult<BodyExpression, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.InvalidConstant, span),
+    )
+  }
+}
+
+// This loan is short: the machine resumes only after the reached constant's query facts
+// have been recorded on the same active provider dependency ledger.
+effect fn staticResolveNeeded<'source>(
+  port: &mut StaticPort<'source>,
+  module: &ModuleId,
+  declaration: &Shared<DeclarationId>,
+  span: Span,
+) -> Result<Option<Shared<StaticData>>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let located = run constantKey(&mut port.resolver.*, declaration)
+  let constant = match move located {
+    Option<Key>.Some {value} => value
+    Option<Key>.None => {
+      return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
+        run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
+      )
+    }
+  }
+  let declared = run demandChild(&mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*, constant, span)
+  let referencedType = Shared.with<Result<Answer, NoRejection>, TypeSelection>(&declared, selectedType)
+  if let Option<Shared<Rejection>>.Some {value} = move referencedType.rejected {
+    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
+  }
+  return run constantInitializer(&mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*, constant, span)
 }
 
 /// Resolves the constant a static evaluation needed and supplies it as a binding. Answers whether
