@@ -73,6 +73,7 @@ export interface BuildOptions {
   readonly optimization?: string | undefined
   readonly debug?: boolean | undefined
   readonly timeCommand?: string | undefined
+  readonly timeoutMs?: number | undefined
 }
 // Forward standard process necessities only; compiler/tool overrides come from verified inputs.
 // Never serialize this environment: measurement exposes only the verified SILKC_CLANG binding.
@@ -169,6 +170,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   optimization = 'speed',
   debug = false,
   timeCommand = '/usr/bin/time',
+  timeoutMs,
 }: BuildOptions): Effect.fn.Return<
   BuildReceipt,
   NativeBuildError | PlatformError,
@@ -190,6 +192,11 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     return yield* reject('output directory must be separate from the immutable inputs')
   if (!['none', 'speed'].includes(optimization) || typeof debug !== 'boolean')
     return yield* reject('invalid native build profile')
+  yield* NativeProcess.validateTimeout(timeoutMs).pipe(
+    Effect.mapError(
+      (error) => new NativeBuildError({ message: error.message, reason: 'RejectedInput' }),
+    ),
+  )
   const target = yield* hostTarget()
   // Exclusive directory creation never removes, overwrites or reuses an earlier generation.
   yield* fs.makeDirectory(outputDirectory)
@@ -267,6 +274,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       const sha256 = yield* fileHash(path)
       const result = yield* NativeProcess.execute(path, ['--version'], {
         env: nativeEnvironment(environment, path),
+        timeoutMs,
       }).pipe(
         Effect.mapError(
           (error) =>
@@ -277,7 +285,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
             }),
         ),
       )
-      if (result.status !== 0 || result.signal !== null)
+      if (result.status !== 0 || result.signal !== null || result.deadline?.expired)
         return yield* reject('cannot read verified clang version')
       const version = result.stdout.toString('utf8').trim()
       if ((yield* fileHash(path)) !== sha256 || (yield* fs.realPath(clang)) !== path)
@@ -330,14 +338,41 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     ) {
       currentStage = name
       yield* checkInputs()
-      const result = yield* NativeProcess.run({
+      const evidence = yield* NativeProcess.run({
         command,
         cwd,
         resourceFile: join(outputDirectory, `${name}-rss.txt`),
         timeCommand,
         env,
+        timeoutMs,
       })
+      const result = evidence.measurement
+      // Keep actual stage facts even if writing its completed evidence or postflight fails.
       receipt.stages.push({ name, ...result })
+      yield* fs.writeFile(join(outputDirectory, `${name}-stdout.bin`), evidence.raw.stdout, {
+        flag: 'wx',
+      })
+      yield* fs.writeFile(join(outputDirectory, `${name}-stderr.bin`), evidence.raw.stderr, {
+        flag: 'wx',
+      })
+      const sidecar = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+        deadline: evidence.deadline,
+        resources: {
+          path: evidence.resources.path,
+          present: evidence.resources.bytes !== null,
+          error: evidence.resources.error,
+        },
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new NativeBuildError({ message: cause.message, reason: 'ExternalFailure', cause }),
+        ),
+      )
+      yield* fs.writeFileString(
+        join(outputDirectory, `${name}-process-evidence.json`),
+        `${sidecar}\n`,
+        { flag: 'wx' },
+      )
       yield* checkInputs()
       return result
     })
@@ -421,6 +456,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             optimization: { type: 'string', default: 'speed' },
             debug: { type: 'boolean', default: false },
             'time-command': { type: 'string', default: '/usr/bin/time' },
+            'timeout-ms': { type: 'string' },
           },
         }),
       catch: (cause) =>
@@ -450,6 +486,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       optimization: values.optimization,
       debug: values.debug,
       timeCommand: values['time-command'],
+      timeoutMs: values['timeout-ms'] === undefined ? undefined : Number(values['timeout-ms']),
     })
     const encoded = yield* encodeReceipt(receipt)
     yield* Effect.sync(() => {
