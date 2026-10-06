@@ -5991,7 +5991,20 @@ export function analyzeBuiltinCall(
       ? []
       : signature.parameters.map((parameter) => Type.substitute(parameter, substitution))
   const instantiatedResult =
-    signature === undefined ? undefined : Type.substitute(signature.result, substitution)
+    signature === undefined
+      ? undefined
+      : Intrinsic.instantiateResult(
+          signature.result,
+          substitution,
+          (fields) =>
+            generatedAggregate(
+              context,
+              call,
+              'AnonymousPositional',
+              fields.map((type) => ({ type, anchor: call.anchor })),
+              resolution,
+            ).type,
+        )
   const pointerSourceType = instantiatedParameters.at(0)
   let qualifierDiagnostic: Diagnostic.Located | undefined
   if (
@@ -6050,7 +6063,7 @@ export function analyzeBuiltinCall(
     missingDiagnostic = undefined
   }
   let reference: CallReferenceFact
-  if (signature !== undefined) {
+  if (signature !== undefined && instantiatedResult !== undefined) {
     reference = {
       _tag: 'ResolvedBuiltin',
       spelling: `${actorSpelling}.${operationSpelling}`,
@@ -6059,7 +6072,7 @@ export function analyzeBuiltinCall(
       operation: signature.operation,
       intrinsic: signature.id,
       parameters: instantiatedParameters,
-      result: instantiatedResult ?? signature.result,
+      result: instantiatedResult,
       unsafe: signature.unsafe === true,
     }
   } else {
@@ -6072,6 +6085,7 @@ export function analyzeBuiltinCall(
   }
   if (
     reference._tag === 'ResolvedBuiltin' &&
+    signature?.result._tag === 'ClosedResult' &&
     declaredTypeParameters.length === 0 &&
     isSectionArity(reference.parameters.length, argumentsResult.facts.length)
   ) {
@@ -6161,88 +6175,22 @@ export const builtinArgumentMappings = (
   )
 }
 
-interface AggregateElementAnalysis {
-  readonly expression: Tir.Expression
-  readonly type?: SemanticType
-  readonly anchor: AuthoredHir.Anchor
-  readonly label?: string
-}
-
 const generatedAggregate = (
   context: SemanticContext.SemanticContext,
   syntax: AuthoredHir.Expression,
   kind: 'AnonymousNamed' | 'AnonymousPositional',
-  elements: ReadonlyArray<AggregateElementAnalysis & { readonly type: SemanticType }>,
+  elements: ReadonlyArray<{
+    readonly type: SemanticType
+    readonly anchor: AuthoredHir.Anchor
+    readonly label?: string
+  }>,
   resolution: ResolutionContext,
 ): { readonly struct: DeclarationFacts.StructFact; readonly type: Type.Nominal } => {
   if (resolution.builder === undefined)
     throw new RangeError('anonymous aggregate analysis requires its TIR body builder')
   const node = BodyBuilder.expressionReference(resolution.builder, syntax.anchor)
   const identity = AggregateIdentity.anonymous(AuthoredWalk.moduleName(context), node, kind)
-  const type = AggregateIdentity.nominal(identity)
-  const id: DeclarationFacts.DeclarationId = {
-    _tag: 'DeclarationId',
-    sourceId: AuthoredWalk.moduleName(context),
-    ordinal: -1 - node.node.ordinal * 2 - (kind === 'AnonymousPositional' ? 1 : 0),
-  }
-  const fields = elements.map((element, ordinal): DeclarationFacts.FieldFact => {
-    const fieldId: DeclarationFacts.FieldId = {
-      _tag: 'FieldId',
-      owner: { _tag: 'StructFieldOwnerId', declaration: id },
-      ordinal,
-    }
-    const labeled = kind === 'AnonymousNamed'
-    const label = element.label
-    return {
-      _tag: 'AggregateField',
-      id: fieldId,
-      member:
-        labeled && label !== undefined
-          ? AggregateIdentity.labeled(label)
-          : AggregateIdentity.ordinal(ordinal),
-      state: { _tag: 'Unique', id: fieldId },
-      visibility: 'Public',
-      name:
-        labeled && label !== undefined
-          ? { _tag: 'Present', spelling: label, anchor: element.anchor }
-          : { _tag: 'Unavailable', anchor: element.anchor },
-      declaredType: {
-        _tag: 'Resolved',
-        type: element.type,
-        spelling: Type.encode(element.type),
-        anchor: element.anchor,
-      },
-      anchor: element.anchor,
-    }
-  })
-  const dependencies = new Map<string, Type.Nominal>()
-  for (const element of elements)
-    for (const dependency of Type.nominals(element.type))
-      dependencies.set(Type.key(dependency), dependency)
-  const struct: DeclarationFacts.StructFact = {
-    _tag: 'StructDeclaration',
-    id,
-    canonical: {
-      _tag: 'Canonical',
-      id: {
-        _tag: 'CanonicalDeclarationId',
-        module: identity.module,
-        name: AggregateIdentity.internalName(identity),
-      },
-    },
-    visibility: 'Private',
-    layout: { _tag: 'Silk' },
-    typeParameters: [],
-    name: { _tag: 'Unavailable', anchor: syntax.anchor },
-    identity,
-    aggregateKind: kind,
-    fields: fields,
-    dependency: {
-      _tag: 'Available',
-      types: [...dependencies.values()].sort(Type.compare),
-    },
-    anchor: syntax.anchor,
-  }
+  const { struct, type } = AggregateIdentity.generated(identity, syntax.anchor, elements)
   resolution.generatedAggregates?.set(aggregateKey(type), struct)
   return { struct, type }
 }
@@ -7391,10 +7339,12 @@ export const analyzeOperatorExpression = (
   }
   const target = Operator.target(operator, selectedActor)
   const template = builtinSignature(target.actor, target.operation, 'Primitive')
-  if (template === undefined) throw new RangeError('Compiler operator table is inconsistent')
+  if (template === undefined || template.result._tag !== 'ClosedResult')
+    throw new RangeError('Compiler operator table requires a closed result')
   const signature = instantiateBuiltinSignature(template, node, resolution)
   const operatorParameters = signature.parameters
-  const operatorResult = signature.result
+  const operatorResult = Intrinsic.closedResultType(signature.result)
+  if (operatorResult === undefined) throw new RangeError('Compiler operator result must be closed')
   const reference: CallReferenceFact = {
     _tag: 'ResolvedBuiltin',
     spelling: `${target.actor}.${target.operation}`,
