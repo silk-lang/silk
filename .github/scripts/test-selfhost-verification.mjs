@@ -1,17 +1,29 @@
 import * as assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+// Hash every consumer Silk source, including fixture imports and the live stdlib.
+const sourceDigests = (directory) =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) return sourceDigests(path)
+    if (!entry.name.endsWith('.silk')) return []
+    return [[path, createHash('sha256').update(readFileSync(path)).digest('hex')]]
+  })
 
 const bundle = resolve('.scratch/selfhost-verification.mjs')
 const { runtimeIntrinsicNames } = await import(pathToFileURL(bundle).href)
@@ -84,8 +96,84 @@ try {
   const invalid = invoke()
   assert.notStrictEqual(invalid.status, 0)
   assert.match(invalid.stdout + invalid.stderr, /canonical intrinsic catalog/)
+  // Reuse the exact downloaded artifact as a corpus-only checkpoint. It must neither invoke
+  // the formatter nor bootstrap nor require bootstrap configuration or repository dependencies.
+  assert.strictEqual(existsSync(join(checkout, 'node_modules')), false)
+  const sentinel = join(temporary, 'unexpected-lifecycle-call')
+  writeFileSync(gate, `#!/bin/sh\nprintf 'formatter' >> '${sentinel}'\nexit 97\n`)
+  writeFileSync(
+    bootstrap,
+    `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(sentinel)}, 'bootstrap'); process.exit(98);`,
+  )
+  const stdlib = join(checkout, 'packages/compiler/stdlib/silk/i32.silk')
+  writeFileSync(stdlib, readFileSync(stdlib, 'utf8') + '\n// consumer corpus stdlib witness\n')
+  const calls = join(temporary, 'compiler-calls')
+  writeFileSync(
+    compiler,
+    `#!/bin/sh
+if [ "$6" != '${checkout}/packages/compiler/stdlib' ]; then exit 8; fi
+if ! grep -q 'consumer corpus stdlib witness' "$6/silk/i32.silk"; then exit 9; fi
+printf '%s:%s\\n' "$8" "\${10}" >> '${calls}'
+printf '#!/bin/sh\\nexit 42\\n' > program
+chmod +x program
+`,
+  )
+  const expectedCompiler = readFileSync(compiler)
+  const expectedSources = sourceDigests(checkout)
+  const corpusEnvironment = {
+    ...process.env,
+    SILKC: compiler,
+    SILK_SELFHOST_CORPUS_CASES: '',
+    NODE_PATH: '',
+    NODE_OPTIONS: '',
+  }
+  delete corpusEnvironment.SILK_BOOTSTRAP
+  delete corpusEnvironment.RUNNER_TEMP
+  const invokeCorpus = (args = ['--mode', 'corpus'], environment = {}) =>
+    spawnSync(process.execPath, [downloaded, ...args], {
+      cwd: checkout,
+      env: { ...corpusEnvironment, ...environment },
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+  writeFileSync(track, JSON.stringify(['trivial-features', 'scalar-reference-argument-order']))
+  const corpus = invokeCorpus()
+  assert.strictEqual(corpus.status, 0, corpus.stdout + corpus.stderr)
+  assert.match(corpus.stdout, /PASS trivial-features/)
+  assert.match(corpus.stdout, /PASS scalar-reference-argument-order/)
+  assert.match(corpus.stdout, /pass=2 fail=0 unsupported=0 track=2/)
+  assert.strictEqual(readFileSync(calls, 'utf8'), 'none:true\nspeed:false\nspeed:false\n')
+  assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
+  assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
+  assert.strictEqual(existsSync(sentinel), false)
+  // A configured bootstrap executable must still remain untouched in corpus mode.
+  assert.strictEqual(invokeCorpus(undefined, { SILK_BOOTSTRAP: bootstrap }).status, 0)
+  assert.strictEqual(existsSync(sentinel), false)
+  const callsBeforeRejections = readFileSync(calls, 'utf8')
+  for (const pins of [
+    [],
+    ['trivial-features', 'trivial-features'],
+    ['trivial-features', 'unknown'],
+  ]) {
+    writeFileSync(track, JSON.stringify(pins))
+    assert.notStrictEqual(invokeCorpus().status, 0)
+  }
+  writeFileSync(track, JSON.stringify(['trivial-features']))
+  for (const args of [['--mode', 'unknown'], ['corpus'], ['--mode', 'corpus', 'extra']]) {
+    const rejected = invokeCorpus(args)
+    assert.notStrictEqual(rejected.status, 0)
+    assert.match(rejected.stdout + rejected.stderr, /Usage:/)
+  }
+  assert.notStrictEqual(
+    invokeCorpus(undefined, { SILK_SELFHOST_CORPUS_CASES: 'trivial-features' }).status,
+    0,
+  )
+  assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
+  assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
+  assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
+  assert.strictEqual(existsSync(sentinel), false)
   process.stdout.write(
-    'Standalone verification passed without node_modules; consumer track/catalog and formatted stdlib verified\n',
+    'Standalone formatter and full-pin corpus modes passed without node_modules; live pins/stdlib and unchanged corpus inputs verified\n',
   )
 } finally {
   rmSync(temporary, { recursive: true, force: true })
