@@ -7175,30 +7175,33 @@ export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
     name: 'owned-allocation-preflight-refusal',
     source: ordinaryStorageSource(`import silk.effect { Effect }
 import silk.usize
+import silk.compilation
 unsafe extern "C" fn silk_allocation_reset(refuse: i32) -> ()
-unsafe extern "C" fn silk_allocation_check(size: usize, calls: i32, releases: i32, nulls: i32) -> i32
+unsafe extern "C" fn silk_allocation_check(size: usize, calls: i32, releases: i32, debug: i32) -> i32
 effect fn allocate(bytes: usize, alignment: usize) -> i32 ! OutOfMemoryError {
   let allocation = run Intrinsic.systemAllocationAcquire(Layout { bytes: bytes, alignment: alignment })
   drop allocation
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
-fn check(bytes: usize, alignment: usize, refuse: i32, result: i32, physical: usize, calls: i32, releases: i32, nulls: i32) -> bool {
+fn check(bytes: usize, alignment: usize, refuse: i32, result: i32, physical: usize, calls: i32, releases: i32) -> bool {
   unsafe silk_allocation_reset(refuse)
   let actual = run Effect.catchAll(allocate(bytes, alignment), recover)
-  return actual == result && unsafe silk_allocation_check(physical, calls, releases, nulls) == 42
+  let mut debug = 0
+  if compilation.debug { debug = 1 }
+  return actual == result && unsafe silk_allocation_check(physical, calls, releases, debug) == 42
 }
 pub fn main() -> i32 {
-  if !check(11, 0, 0, 7, 0, 0, 0, 0) { return 1 }
-  if !check(11, 3, 0, 7, 0, 0, 0, 0) { return 2 }
-  if !check(usize.MAX, 2, 0, 7, 0, 0, 0, 0) { return 3 }
-  if !check(0, 1, 0, 42, 1, 1, 1, 0) { return 4 }
-  if !check(0, 16, 0, 42, 15, 1, 1, 0) { return 5 }
-  if !check(11, 1, 0, 42, 11, 1, 1, 0) { return 6 }
-  if !check(11, 16, 0, 42, 26, 1, 1, 0) { return 8 }
-  if !check(11, 16, 1, 7, 26, 1, 1, 1) { return 9 }
+  if !check(11, 0, 0, 7, 0, 0, 0) { return 1 }
+  if !check(11, 3, 0, 7, 0, 0, 0) { return 2 }
+  if !check(usize.MAX, 2, 0, 7, 0, 0, 0) { return 3 }
+  if !check(0, 1, 0, 42, 1, 1, 1) { return 4 }
+  if !check(0, 16, 0, 42, 15, 1, 1) { return 5 }
+  if !check(11, 1, 0, 42, 11, 1, 1) { return 6 }
+  if !check(11, 16, 0, 42, 26, 1, 1) { return 8 }
+  if !check(11, 16, 1, 7, 26, 1, 0) { return 9 }
   let high = usize.MAX / 2 + 1
-  if !check(0, high, 1, 7, high - 1, 1, 1, 1) { return 10 }
+  if !check(0, high, 1, 7, high - 1, 1, 0) { return 10 }
   return 42
 }`),
     nativeCSources: {
@@ -7208,7 +7211,7 @@ pub fn main() -> i32 {
  * Counting starts in the source main, after the hosted runtime's own allocations. */
 _Alignas(max_align_t) static unsigned char arena[8 * 1024 * 1024];
 static size_t used;
-static int active, refuse, calls, releases, nulls, live, invalid_release;
+static int active, refuse, calls, frees, releases, live, invalid_release;
 static size_t requested;
 static void *ticket;
 void *malloc(size_t size) {
@@ -7222,19 +7225,23 @@ void *malloc(size_t size) {
 }
 void free(void *pointer) {
   if (!active) return;
+  frees++;
+  /* free(NULL) is inert and may disappear under optimization; it reclaims no ticket. */
+  if (!pointer) return;
   releases++;
-  if (!pointer) { nulls++; return; }
   if (pointer != ticket || live != 1) invalid_release++;
   else live--;
 }
 void silk_allocation_reset(int32_t should_refuse) {
   active = 1; refuse = should_refuse;
-  calls = releases = nulls = live = invalid_release = 0;
+  calls = frees = releases = live = invalid_release = 0;
   requested = 0; ticket = NULL;
 }
-int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expected_releases, int32_t expected_nulls) {
+int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expected_releases, int32_t debug) {
   int32_t result = requested == size && calls == expected_calls &&
-    releases == expected_releases && nulls == expected_nulls &&
+    releases == expected_releases &&
+    (expected_calls == 0 ? frees == 0 : expected_releases == 0 || frees == expected_releases) &&
+    (!debug || expected_calls != 1 || expected_releases != 0 || frees == 1) &&
     live == 0 && invalid_release == 0 ? 42 : 0;
   active = 0;
   return result;

@@ -22,7 +22,8 @@ it.effect(
       const snapshot = yield* AnalysisFixture.retainingMain(
         'allocation/preflight',
         ascii(
-          ordinaryStorageSource(`import silk.effect { Effect }
+          `import silk.effect { Effect }
+import silk.usize
 effect fn acquire(bytes: usize, alignment: usize) -> i32 ! OutOfMemoryError {
   let allocation = run Intrinsic.systemAllocationAcquire(Layout { bytes: bytes, alignment: alignment })
   drop allocation
@@ -31,7 +32,7 @@ effect fn acquire(bytes: usize, alignment: usize) -> i32 ! OutOfMemoryError {
 effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
 export "C" fn main(bytes: usize, alignment: usize) -> i32 {
   return run Effect.catchAll(acquire(bytes, alignment), recover)
-}`),
+}`,
         ),
       )
       assert.deepEqual(
