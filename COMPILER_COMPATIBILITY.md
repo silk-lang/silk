@@ -443,27 +443,36 @@ Each entry records:
   `genericSectionsSelectEvidenceSuppliedByAStage` and `genericSectionsStageOwnedCapturesWithOneCleanupOwner`
   cover staged blueprint selection, capture layout, argument appending and ownership.
 
-### Effect literal joins in selfhost
+### Effect joins in selfhost
 
-- **Status:** deferred to #567 Step 9; Effect blocks and anonymous `effect fn` literals otherwise
-  lower since the Step 9 Effect-literal PR (2026-10-04).
+- **Status:** Implemented in #567 Step 9 (PR #819, 2026-10-05); narrower remainders below.
 - **Rule:** [EFF-013](apps/docs/content/reference/effect-contracts.md#eff-013--compatible-effects-may-join-across-construction-sites)
   lets Effects from different construction sites with one compatible contract join behind a finite
   hidden variant, and a declared `Effect<...>` position may hold any of them.
-- **Compilers:** bootstrap lowers finite joins. Selfhost gives each Effect literal its exact
-  representation (D1): an `effect {}` block takes its channels from a closed expected `Effect<...>`
-  (EFF-011) or else derives them from its body, and runs as a direct call of its own instance with
-  its environment. It reports `effect-form` where a value of one exact Effect representation meets
-  a different Effect type whose channels cover it: an `if` or `match` joining two construction
-  sites, or a declared `Effect<...>` result, binding or field (a block in such a position is first
-  checked against its channels). Channels that are not covered remain `TypeMismatch`. Run access and environment are not yet compared, so
-  a once-runnable or borrowing value stored as an unrestricted `Effect<...>` reports `effect-form`
-  rather than a mismatch.
-- **Evidence:** `effectLiteralsRunTheirInstanceWithTheirEnvironment` asserts the block and
-  anonymous `effect fn` runs, environment operands and failure edges;
-  `effectBlockChannelsAreDerivedAndChecked` asserts derived and expected channels; the native corpus
-  reports `effect-form` for the joining programs.
-- **Owner:** #567 Step 9 (EFF-013 joins as a tagged representation with one runner per arm).
+- **Compilers:** both lower finite joins without allocation or dispatch tables. Selfhost represents
+  a join as `Type.EffectJoin { contract, alternatives }`: one alternative is stored as itself,
+  several as their structural union, and `run` switches on the tag to each alternative's own runner
+  (Effect note D1); drop glue cleans only the stored alternative. Divergences from the bootstrap:
+  - A declared `Effect<...>` result of a function body is a producer-owned family, realized like an
+    opaque result from the body's returns; distinct returns are injected into their join behind the
+    declared contract. The bootstrap infers the composite at the call instead. Values of two
+    producers therefore join as two families, each realized at layout.
+  - A `match` join without a declared contract retains the intersection of the arms' environments;
+    the bootstrap requires equal environments.
+- **Diagnostics and limits:** a `match` mixing an Effect with another value is
+  `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
+  different join reports the named `nested-effect-join` gap. Constructing an interface operation's
+  Effect reports `interface-effect-witness`. An Effect result with no producer body (an interface
+  operation's) and Effect-producing callables inferred from `effect fn` values (handlers passed to
+  `Effect.catch`, `catchAll`, `flatMap`) remain `effect-form`.
+- **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
+  and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
+  tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
+  the native corpus pins `finite-effect-join-capture-arity`, `effect-return-site-join-once`,
+  `effect-higher-order-values`, `opaque-effect`, `ordinary-union-executable-members`,
+  `match-statement-arm-control` and `effect-access-forwarding`.
+- **Owner:** nested join re-injection and Effect-producing callable inference: #567 Step 9
+  follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 

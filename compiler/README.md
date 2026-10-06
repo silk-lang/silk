@@ -89,7 +89,10 @@ since reaching parking is itself the `suspension` gap (D6). An `effect {}` block
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
 `return`, `fail` and `run` sites (EFF-002, EFF-011); sites that differ from that join are checked
-again against it. Joining distinct Effect construction sites (EFF-013) reports `effect-form`.
+again against it. Distinct exact Effects from `match` arms or from a body's returns under a
+declared `Effect<...>` result join (EFF-013): one alternative is stored as itself, several as their
+structural union, and `run` switches on the tag to each alternative's runner. A declared
+`Effect<...>` result is a producer-owned family realized from those returns, like an opaque result.
 An instance receives one hidden provider address per entry of its requirement row, in canonical
 service-role key order (D2), and its key names each provider's type. Running
 `Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
