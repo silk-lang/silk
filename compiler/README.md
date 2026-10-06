@@ -564,6 +564,14 @@ expression publishes no value. Static execution records reached body and initial
 and enforces step, depth, and retained-value limits, including retained text provenance. Returned
 text aliases preserve their original authored spans.
 
+A runtime body reads a local or namespace-qualified constant, such as `usize.MAX`, as its published
+value at the declared type. The read demands the constant's content-keyed initializer and records
+that value edge, so every reader shares one evaluation, and a rejected initializer rejects the reader
+with the initializer's own diagnostic. MIR materializes the value at its use: integers with their
+exact sign and magnitude, `bool`, floats (an `f32` widened exactly to the f64 operand bits), `char`
+as its scalar value, and text as a descriptor over its program-lifetime bytes. A `char` value still
+has no runtime layout and reports the `scalar-layout` gap.
+
 The sealed `Intrinsic` surface supplies target and final-profile facts and static text operations.
 One explicit final build profile controls selected static-if arms; inactive arms contribute no
 annotation, call, or body demands. Authored generic/evidence execution, nominal resource safety,
