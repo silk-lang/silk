@@ -21,7 +21,13 @@ skill and update this file rather than preserving an older convention.
 
 ## Papercuts
 
-Maintain PAPERCUTS.md, a global log shared by all agents sessions of anything that slowed down development. When you lose time to one mid-session, append date · symptom · fix · project. Check this file first when tooling fails mysteriously.
+Maintain PAPERCUTS.md, a global log shared by all agent sessions of anything that slowed down
+development. When you lose time to one mid-session, append date · symptom · fix · project. Check
+this file first when tooling fails mysteriously.
+
+- Append each entry at the end of the file on one physical line; use editor soft wrapping.
+- Entry order has no significance. Do not reorder or reformat existing entries.
+- Git uses `merge=union` for this append-only log, preserving concurrent additions from both branches.
 
 ## Compiler compatibility
 
