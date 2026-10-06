@@ -206,6 +206,46 @@ it.effect(
     }),
 )
 
+it.effect(
+  'proves an ordinary allocator that reconstructs the measured request through fields',
+  () =>
+    Effect.gen(function* () {
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'shared-stdlib/reconstructed-provider',
+        ascii(`import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.shared { Shared }
+struct Parts { requestedAlignment: usize requestedBytes: usize }
+struct ReconstructingAllocator {}
+fn rebuild(parts: Parts) -> Layout {
+  return Layout {alignment: parts.requestedAlignment, bytes: parts.requestedBytes}
+}
+effect fn allocate(self: &mut ReconstructingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+  let parts = Parts {requestedBytes: layout.bytes, requestedAlignment: layout.alignment}
+  return run Intrinsic.systemAllocationAcquire(rebuild(move parts))
+}
+impl Allocator for ReconstructingAllocator { allocate: ReconstructingAllocator.allocate }
+effect fn construct() -> i32 ! OutOfMemoryError {
+  let mut allocator = ReconstructingAllocator {}
+  let shared = run (Shared.make<i32>(42) |> Effect.provideMut<Allocator>(&mut allocator))
+  drop shared
+  let mut standard = Allocator.systemAllocatorProvider()
+  let sibling = run (Shared.make<i32>(43) |> Effect.provideMut<Allocator>(&mut standard))
+  drop sibling
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepEqual(Analysis.diagnostics(snapshot), [])
+      assert.strictEqual(snapshot.layout._tag, 'Available')
+      if (snapshot.layout._tag === 'Available')
+        assert.isNotEmpty(snapshot.layout.value.localSharedAllocationProvenance.facts)
+    }),
+)
+
 it.effect('does not infer access-boundary privilege from an unrelated wrapper shape', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
