@@ -24,7 +24,7 @@ export interface ProcessOutcome {
 }
 export interface ProcessOptions {
   readonly cwd?: string
-  readonly env?: Readonly<Record<string, string | undefined>>
+  readonly env?: Readonly<Record<string, string | undefined>> | undefined
   readonly stdio?: SpawnOptions['stdio']
   readonly input?: Uint8Array
 }
