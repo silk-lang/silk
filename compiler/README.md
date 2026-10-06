@@ -113,6 +113,48 @@ is the root for local module paths. Without a manifest, the entry file's directo
 root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
+### One native generation and its smoke receipt
+
+`NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
+snapshot exported by `SourceSnapshot.mjs`. It invokes N0 once to build **N1**, then uses only that
+new executable to compile and run the shared `trivial-features` program. N0 must be a regular
+executable with no write permission bits; a restored seed has mode `0555`. The output directory
+must not exist and must be separate from the inputs. Existing outputs, symbolic links and a hard
+link from N1 to N0 are rejected. Equal binary hashes are allowed: path freshness and the recorded
+invocations establish the generations without assuming their bytes differ.
+
+With Node 24, workspace dependencies installed, LLVM available, and GNU time installed on Linux:
+
+```sh
+node compiler/scripts/NativeBuild.ts \
+  --seed /absolute/immutable/N0 \
+  --snapshot /absolute/authored-snapshot \
+  --output /absolute/fresh-native-run
+```
+
+`--optimization none|speed` and `--debug` select the explicit native profile (defaults: speed,
+false). The native CLI chooses its host target; the receipt records the Linux host target triple.
+`--time-command /path/to/time` selects GNU time, whose absence or malformed measurement fails the
+run. Peak RSS is GNU time `%M` / Linux `ru_maxrss`, in KiB: the maximum resident set size of the
+command and its waited children, not summed concurrent memory. Wall time measures each invocation
+including the measurement wrapper. A contract-test measurement command supplies fixture values;
+these are not real compiler measurements.
+
+`build-receipt.json` retains N0/N1 SHA-256 hashes, the exact validated source and stdlib file hashes
+and normalized digests, source commit and archive digest, target/profile, commands, working
+directories, exits/signals, stdout/stderr, wall time and RSS for every attempted stage. Snapshot
+and seed hashes are checked before and after each stage. The smoke source is frozen before the
+native build from the existing plain `trivialFeatures` corpus template; the receipt records both
+that source's hash and the supplying corpus file's hash. `--corpus-source` can select an explicit
+copy of that corpus source file. Smoke success requires exit 42 and empty stdout.
+
+Build refusal (including the current `entry-signature` gap), missing output, signals, failed smoke
+compilation, and wrong exit/stdout retain a failed receipt and a nonzero driver exit. No fallback
+compiler, source repair, second build attempt or earlier output is used. The driver and its
+injected-producer contracts establish the receipt boundary; they do not claim a successful real
+self-build. Run the focused contracts with
+`pnpm exec vitest run --config compiler/scripts/vitest.config.mjs compiler/scripts/NativeBuild.test.mjs`.
+
 `silkc format [paths] [--check]` formats source without semantic analysis or code generation.
 The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
 directory is the source root. With no paths the command recursively selects that root. Explicit
