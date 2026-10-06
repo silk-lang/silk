@@ -127,8 +127,8 @@ Each entry records:
 
 ### Sealed core storage in selfhost
 
-- **Status:** implemented on 2026-10-06 on branch `selfhost-core-storage` (Stage 1 sealed core
-  storage workstream); verification is pending that PR's CI.
+- **Status:** implemented on 2026-10-06 on PR #1080 (Stage 1 sealed core storage workstream);
+  verification is pending that PR's CI.
 - **Rule:** the storage core types follow the reference, the standard library and the bootstrap.
   `Allocation` is six target words, `RawBuffer<T>` is its allocation and element count,
   `Slot<'storage, T>` is one element address, and `Intrinsic.SharedCore<T>` addresses a local,
@@ -143,6 +143,7 @@ Each entry records:
   Execution storage (`Intrinsic.Execution`, `Intrinsic.Wake`) remains the `core-type` deferral.
 - **Source migration:** none. A source type named `Slot`, `RawBuffer` or `Allocation` cannot be
   named in type position; inherent owners and expression paths of the same spelling stay ordinary.
+  A stored core contributes only its written element types to its container's field lifetimes.
 - **Diagnostics and limits:** contract violations reject with `TypeMismatch`, `CallArity`,
   `TypeArity`, `MissingConformance` for a non-Copy read, and the unsafe acknowledgement codes. A
   stored `systemAllocationAcquire` Effect that is not run in place reports the `effect-form` gap.
