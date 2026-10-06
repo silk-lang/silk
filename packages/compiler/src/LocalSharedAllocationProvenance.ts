@@ -1,4 +1,5 @@
 import * as ConformanceProof from './ConformanceProof.js'
+import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Diagnostic from './Diagnostic.js'
 import * as Tir from './Tir.js'
@@ -24,6 +25,29 @@ interface ExecutionOrigin {
 interface ParameterOrigin {
   readonly _tag: 'ParameterOrigin'
   readonly ordinal: number
+}
+
+interface AggregateOrigin {
+  readonly _tag: 'AggregateOrigin'
+  readonly fields: ReadonlyArray<{
+    readonly field: DeclarationFacts.FieldId
+    readonly origin: Origin
+  }>
+  readonly span: SourceSpan.SourceSpan
+}
+
+interface ProjectedOrigin {
+  readonly _tag: 'ProjectedOrigin'
+  readonly subject: Origin
+  readonly field: DeclarationFacts.FieldId
+  readonly span: SourceSpan.SourceSpan
+}
+
+interface MeasurementComponentOrigin {
+  readonly _tag: 'MeasurementComponentOrigin'
+  readonly role: 'Bytes' | 'Alignment'
+  readonly measurement: ConcreteOrigin | ExecutionOrigin
+  readonly span: SourceSpan.SourceSpan
 }
 
 interface InvalidOrigin {
@@ -63,6 +87,9 @@ type Origin =
   | ConcreteOrigin
   | ExecutionOrigin
   | ParameterOrigin
+  | AggregateOrigin
+  | ProjectedOrigin
+  | MeasurementComponentOrigin
   | InvalidOrigin
   | ConflictOrigin
   | UnreachedOrigin
@@ -119,6 +146,31 @@ const sameOrigin = (left: Origin, right: Origin): boolean => {
       )
     case 'ParameterOrigin':
       return right._tag === 'ParameterOrigin' && left.ordinal === right.ordinal
+    case 'AggregateOrigin':
+      return (
+        right._tag === 'AggregateOrigin' &&
+        left.fields.length === right.fields.length &&
+        left.fields.every((field, ordinal) => {
+          const other = right.fields.at(ordinal)
+          return (
+            other !== undefined &&
+            DeclarationFacts.sameFieldId(field.field, other.field) &&
+            sameOrigin(field.origin, other.origin)
+          )
+        })
+      )
+    case 'ProjectedOrigin':
+      return (
+        right._tag === 'ProjectedOrigin' &&
+        DeclarationFacts.sameFieldId(left.field, right.field) &&
+        sameOrigin(left.subject, right.subject)
+      )
+    case 'MeasurementComponentOrigin':
+      return (
+        right._tag === 'MeasurementComponentOrigin' &&
+        left.role === right.role &&
+        sameOrigin(left.measurement, right.measurement)
+      )
     case 'InvalidOrigin':
       return right._tag === 'InvalidOrigin' && left.description === right.description
     case 'ConflictOrigin':
@@ -146,6 +198,9 @@ const sameOrigin = (left: Origin, right: Origin): boolean => {
 const originSpan = (origin: Origin): SourceSpan.SourceSpan | undefined =>
   origin._tag === 'ConcreteOrigin' ||
   origin._tag === 'ExecutionOrigin' ||
+  origin._tag === 'AggregateOrigin' ||
+  origin._tag === 'ProjectedOrigin' ||
+  origin._tag === 'MeasurementComponentOrigin' ||
   origin._tag === 'InvalidOrigin' ||
   origin._tag === 'ConflictOrigin' ||
   origin._tag === 'ServiceOrigin' ||
@@ -153,9 +208,84 @@ const originSpan = (origin: Origin): SourceSpan.SourceSpan | undefined =>
     ? origin.span
     : undefined
 
+/** Field selectors are authenticated TIR identities; only sealed roots grant component roles. */
+const projectOrigin = (
+  subject: Origin,
+  field: DeclarationFacts.FieldId,
+  span: SourceSpan.SourceSpan,
+): Origin => {
+  if (subject._tag === 'AggregateOrigin')
+    return (
+      subject.fields.find((candidate) => DeclarationFacts.sameFieldId(candidate.field, field))
+        ?.origin ?? { _tag: 'InvalidOrigin', description: 'unknown field provenance', span }
+    )
+  if (subject._tag === 'ConcreteOrigin' || subject._tag === 'ExecutionOrigin') {
+    // SharedLayout and ExecutionLayout's existing result contract stores Bytes then Alignment.
+    // No source nominal, field name, or same-shaped constructor creates a measured root.
+    let role: MeasurementComponentOrigin['role'] | undefined
+    if (field.ordinal === 0) role = 'Bytes'
+    else if (field.ordinal === 1) role = 'Alignment'
+    return role === undefined
+      ? { _tag: 'InvalidOrigin', description: 'unknown measurement component provenance', span }
+      : { _tag: 'MeasurementComponentOrigin', role, measurement: subject, span: subject.span }
+  }
+  if (subject._tag === 'ParameterOrigin' || subject._tag === 'ProjectedOrigin')
+    return { _tag: 'ProjectedOrigin', subject, field, span }
+  if (subject._tag === 'UnreachedOrigin') return subject
+  if (subject._tag === 'InvalidOrigin' || subject._tag === 'ConflictOrigin') return subject
+  return { _tag: 'InvalidOrigin', description: 'unknown field provenance', span }
+}
+
+/** Reconstruct a measurement only from its unchanged, correctly ordered component proofs. */
+const matchingPair = (origin: Origin): Origin => {
+  if (origin._tag !== 'AggregateOrigin') return origin
+  const bytes = origin.fields.find((field) => field.field.ordinal === 0)?.origin
+  const alignment = origin.fields.find((field) => field.field.ordinal === 1)?.origin
+  if (
+    origin.fields.length === 2 &&
+    bytes?._tag === 'MeasurementComponentOrigin' &&
+    alignment?._tag === 'MeasurementComponentOrigin' &&
+    bytes.role === 'Bytes' &&
+    alignment.role === 'Alignment' &&
+    sameOrigin(bytes.measurement, alignment.measurement)
+  )
+    return bytes.measurement
+  return {
+    _tag: 'InvalidOrigin',
+    description: 'unproved measurement component pair',
+    span: originSpan(bytes ?? unreached) ?? originSpan(alignment ?? unreached) ?? origin.span,
+  }
+}
+
 const mergeOrigin = (left: Origin, right: Origin): Origin => {
   if (left._tag === 'UnreachedOrigin') return right
   if (right._tag === 'UnreachedOrigin' || sameOrigin(left, right)) return left
+  if (
+    left._tag === 'AggregateOrigin' &&
+    right._tag === 'AggregateOrigin' &&
+    left.fields.length === right.fields.length &&
+    left.fields.every((field, ordinal) => {
+      const other = right.fields.at(ordinal)
+      return other !== undefined && DeclarationFacts.sameFieldId(field.field, other.field)
+    })
+  )
+    return {
+      ...left,
+      fields: left.fields.map((field, ordinal) => {
+        const other = right.fields.at(ordinal)
+        if (other === undefined) return field
+        const merged = mergeOrigin(field.origin, other.origin)
+        return {
+          ...field,
+          origin:
+            merged._tag === 'UnreachedOrigin' &&
+            field.origin._tag !== 'UnreachedOrigin' &&
+            other.origin._tag !== 'UnreachedOrigin'
+              ? { _tag: 'ConflictOrigin', span: left.span }
+              : merged,
+        }
+      }),
+    }
   const span = originSpan(left) ?? originSpan(right)
   return span === undefined ? unreached : { _tag: 'ConflictOrigin', span }
 }
@@ -202,6 +332,9 @@ const nestedStatements = (
       if (statement._tag === 'While') visit(statement.body)
       for (const expression of Tir.statementExpressions(statement).flatMap(Tir.expressionTree)) {
         if (expression._tag === 'EffectBlock') visit(expression.statements)
+        if (expression._tag === 'Match')
+          for (const arm of expression.arms)
+            if (arm.body._tag === 'Block') visit(arm.body.statements)
       }
     }
   }
@@ -217,7 +350,10 @@ interface ArgumentSource {
 interface FunctionContext {
   readonly instance: Instances.Instance
   readonly bindings: ReadonlyMap<number, Tir.Expression>
-  readonly patternBindings: ReadonlyMap<string, Tir.Expression>
+  readonly patternBindings: ReadonlyMap<
+    string,
+    { readonly subject: Tir.Expression; readonly path: ReadonlyArray<DeclarationFacts.FieldId> }
+  >
   readonly writtenBindings: ReadonlySet<number>
   readonly writtenParameters: ReadonlySet<number>
 }
@@ -253,18 +389,32 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         ),
       ),
       patternBindings: new Map(
-        statements
-          .flatMap(Tir.statementExpressions)
-          .flatMap(Tir.expressionTree)
-          .flatMap((expression) =>
-            expression._tag === 'Match'
-              ? expression.arms.flatMap((arm) =>
-                  arm.bindings.map(
-                    (binding) => [patternBindingKey(binding.id), expression.scrutinee] as const,
-                  ),
-                )
-              : [],
-          ),
+        statements.flatMap((statement) => [
+          ...(statement._tag === 'PatternBind' || statement._tag === 'IfLet'
+            ? statement.selection.bindings.map(
+                (binding) =>
+                  [
+                    patternBindingKey(binding.id),
+                    { subject: statement.selection.subject, path: binding.path },
+                  ] as const,
+              )
+            : []),
+          ...Tir.statementExpressions(statement)
+            .flatMap(Tir.expressionTree)
+            .flatMap((expression) =>
+              expression._tag === 'Match'
+                ? expression.arms.flatMap((arm) =>
+                    arm.bindings.map(
+                      (binding) =>
+                        [
+                          patternBindingKey(binding.id),
+                          { subject: expression.scrutinee, path: binding.path },
+                        ] as const,
+                    ),
+                  )
+                : [],
+            ),
+        ]),
       ),
       writtenBindings: new Set([
         ...statements.flatMap((statement) =>
@@ -477,6 +627,16 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
 
   const substitute = (origin: Origin, arguments_: ReadonlyArray<Origin>): Origin => {
     if (origin._tag === 'ParameterOrigin') return arguments_.at(origin.ordinal) ?? unreached
+    if (origin._tag === 'AggregateOrigin')
+      return {
+        ...origin,
+        fields: origin.fields.map((field) => ({
+          ...field,
+          origin: substitute(field.origin, arguments_),
+        })),
+      }
+    if (origin._tag === 'ProjectedOrigin')
+      return projectOrigin(substitute(origin.subject, arguments_), origin.field, origin.span)
     if (origin._tag === 'ServiceOrigin')
       return { ...origin, layout: substitute(origin.layout, arguments_) }
     if (origin._tag === 'ProviderBoundOrigin')
@@ -532,15 +692,39 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
           )
     }
     if (expression._tag === 'PatternBindingReference') {
-      const scrutinee = context?.patternBindings.get(patternBindingKey(expression.binding))
-      return scrutinee === undefined
+      if (context?.writtenBindings.has(expression.binding.ordinal))
+        return {
+          _tag: 'InvalidOrigin',
+          description: 'mutable pattern allocation provenance',
+          span: expression.span,
+        }
+      const selected = context?.patternBindings.get(patternBindingKey(expression.binding))
+      return selected === undefined
         ? {
             _tag: 'InvalidOrigin',
             description: 'unknown pattern allocation provenance',
             span: expression.span,
           }
-        : originOf(scrutinee, instance, parameterOrigins, resolving, activeBindings)
+        : selected.path.reduce(
+            (origin, field) => projectOrigin(origin, field, expression.span),
+            originOf(selected.subject, instance, parameterOrigins, resolving, activeBindings),
+          )
     }
+    if (expression._tag === 'Construct')
+      return {
+        _tag: 'AggregateOrigin',
+        fields: expression.fields.map((field) => ({
+          field: field.field,
+          origin: originOf(field.value, instance, parameterOrigins, resolving, activeBindings),
+        })),
+        span: expression.span,
+      }
+    if (expression._tag === 'Project')
+      return projectOrigin(
+        originOf(expression.subject, instance, parameterOrigins, resolving, activeBindings),
+        expression.field,
+        expression.span,
+      )
     if (expression._tag === 'Move' || expression._tag === 'Run')
       return originOf(expression.subject, instance, parameterOrigins, resolving, activeBindings)
     if (expression._tag === 'UnionConvert')
@@ -577,7 +761,11 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         .map((arm) =>
           arm.body._tag === 'Expression'
             ? originOf(arm.body.expression, instance, parameterOrigins, resolving, activeBindings)
-            : unreached,
+            : Tir.returnExpressions(arm.body.statements)
+                .map((returned) =>
+                  originOf(returned, instance, parameterOrigins, resolving, activeBindings),
+                )
+                .reduce(mergeOrigin, unreached),
         )
         .reduce(mergeOrigin, unreached)
     if (expression._tag === 'BuiltinCall' && expression.operation === 'SharedLayout') {
@@ -602,10 +790,14 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
       return {
         _tag: 'ExecutionOrigin',
         arguments: expression.typeArguments.map((argument) =>
-          Type.substituteGenericArgument(
-            argument,
-            instance.substitution,
-            instance.specialization.compatibility,
+          Instances.concreteEffectRepresentationArgument(
+            instance.function,
+            instance.key,
+            Type.substituteGenericArgument(
+              argument,
+              instance.substitution,
+              instance.specialization.compatibility,
+            ),
           ),
         ),
         span: expression.span,
@@ -909,6 +1101,16 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
     return found
   }
   const resolve = (origin: Origin, providers: ReadonlyArray<Provider> = []): Origin => {
+    if (origin._tag === 'AggregateOrigin')
+      return {
+        ...origin,
+        fields: origin.fields.map((field) => ({
+          ...field,
+          origin: resolve(field.origin, providers),
+        })),
+      }
+    if (origin._tag === 'ProjectedOrigin')
+      return projectOrigin(resolve(origin.subject, providers), origin.field, origin.span)
     if (origin._tag === 'ProviderBoundOrigin') {
       const selected = selectedProvider(origin.owner, origin.provider)
       return resolve(
@@ -983,7 +1185,9 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
             span: origin.span,
           }
         arguments_[layoutParameter] = origin.layout
-        const implementationOrigin = resolve(substitute(summarize(target, new Set()), arguments_))
+        const implementationOrigin = matchingPair(
+          resolve(substitute(summarize(target, new Set()), arguments_)),
+        )
         return implementationOrigin._tag === 'UnreachedOrigin'
           ? resolve(origin.layout, providers)
           : implementationOrigin
@@ -1053,7 +1257,7 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
               span: expression.span,
             }
           : originOf(allocation, instance, parameters, new Set([ownerKey(instance)]))
-      const actual = resolve(unresolved)
+      const actual = matchingPair(resolve(unresolved))
       if (
         expected !== undefined &&
         actual._tag === 'ConcreteOrigin' &&
@@ -1130,7 +1334,7 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
               span: expression.span,
             }
           : originOf(allocation, instance, parameters, new Set([ownerKey(instance)]))
-      const actual = resolve(unresolved)
+      const actual = matchingPair(resolve(unresolved))
       const actualArguments =
         actual._tag === 'ExecutionOrigin'
           ? actual.arguments.map((argument) =>

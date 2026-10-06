@@ -257,6 +257,181 @@ pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`)
   }),
 )
 
+it.effect(
+  'reconstructs measured descriptors through declared fields and symbolic pattern paths',
+  () =>
+    Effect.gen(function* () {
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'local-shared-allocation/descriptor-fields',
+        ascii(`import silk.allocator { OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+struct Parts { alignmentLabel: usize bytesLabel: usize }
+struct Envelope { payload: Parts }
+fn envelope(layout: Layout) -> Envelope {
+  return Envelope { payload: Parts { bytesLabel: layout.alignment, alignmentLabel: layout.bytes } }
+}
+fn reconstruct(descriptor: Envelope) -> Layout {
+  let Envelope {payload: fields} = move descriptor
+  return match move fields {
+    Parts {alignmentLabel: size, bytesLabel: alignment} => {
+      let rebuilt = Layout {alignment: alignment, bytes: size}
+      return move rebuilt
+    }
+  }
+}
+fn project(parts: Parts) -> Layout {
+  return Layout {alignment: parts.bytesLabel, bytes: parts.alignmentLabel}
+}
+effect fn construct() -> i32 ! OutOfMemoryError {
+  let measured = Intrinsic.sharedLayout<i32>()
+  let reconstructed = reconstruct(envelope(move measured))
+  let first = run Intrinsic.systemAllocationAcquire(move reconstructed)
+  unsafe { let core = Intrinsic.sharedFromAllocation<i32>(move first, 42) drop core }
+  let size = Intrinsic.sharedLayout<i32>()
+  let alignment = Intrinsic.sharedLayout<i32>()
+  let parts = Parts {bytesLabel: alignment.alignment, alignmentLabel: size.bytes}
+  let second = run Intrinsic.systemAllocationAcquire(project(move parts))
+  unsafe { let core = Intrinsic.sharedFromAllocation<i32>(move second, 42) drop core }
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepEqual(Analysis.diagnostics(snapshot), [])
+      const operations = Analysis.loweredMir(snapshot).functions.flatMap((fn) =>
+        fn.regions
+          .flatMap(Mir.operationsOf)
+          .flatMap(Mir.operationTree)
+          .filter((operation) => operation._tag === 'SharedFromAllocation'),
+      )
+      assert.lengthOf(operations, 2)
+      assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+    }),
+)
+
+it.effect('rejects altered descriptor components and preserves measured mismatch spans', () =>
+  Effect.gen(function* () {
+    const cases = [
+      ['swapped', 'Layout {bytes: measured.alignment, alignment: measured.bytes}'],
+      ['mixed', 'Layout {bytes: measured.bytes, alignment: other.alignment}'],
+      ['arithmetic', 'Layout {bytes: measured.bytes + 0, alignment: measured.alignment}'],
+      ['unknown', 'Layout {bytes: 8, alignment: 8}'],
+      ['wrong', 'Layout {bytes: other.bytes, alignment: other.alignment}'],
+      ['cycle', 'loopDescriptor(Layout {bytes: measured.bytes, alignment: measured.alignment})'],
+    ] as const
+    const functions = cases.map(
+      ([name, layout]) => `effect fn ${name}() -> i32 ! OutOfMemoryError {
+  let measured = Intrinsic.sharedLayout<i32>()
+  let other = Intrinsic.sharedLayout<u32>()
+  let layout = ${layout}
+  let allocation = run Intrinsic.systemAllocationAcquire(move layout)
+  unsafe { let core = Intrinsic.sharedFromAllocation<i32>(move allocation, 42) drop core }
+  return 0
+}`,
+    )
+    const text = `import silk.allocator { OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+fn loopDescriptor(layout: Layout) -> Layout { return loopDescriptor(move layout) }
+${functions.join('\n')}
+effect fn overwritten() -> i32 ! OutOfMemoryError {
+  let measured = Intrinsic.sharedLayout<i32>()
+  let mut layout = Layout {bytes: measured.bytes, alignment: measured.alignment}
+  layout.bytes = 8
+  let allocation = run Intrinsic.systemAllocationAcquire(move layout)
+  unsafe { let core = Intrinsic.sharedFromAllocation<i32>(move allocation, 42) drop core }
+  return 0
+}
+effect fn construct() -> i32 ! OutOfMemoryError {
+  ${cases.map(([name]) => `let ${name}Result = run ${name}()`).join('\n  ')}
+  return run overwritten()
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`
+    const source = ordinaryStorageSource(text)
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'local-shared-allocation/descriptor-controls',
+      new TextEncoder().encode(source),
+      'wasm32-unknown-unknown',
+    )
+    const diagnostics = Analysis.diagnostics(snapshot)
+    assert.deepEqual(
+      diagnostics.map((diagnostic) => diagnostic.code),
+      Array(7).fill('SEM0138'),
+    )
+    for (const diagnostic of diagnostics) {
+      assert.strictEqual(diagnostic.relatedSpans?.length, 1)
+      assert.strictEqual(diagnostic.span.sourceId, 'local-shared-allocation/descriptor-controls')
+      assert.isTrue(
+        source.slice(diagnostic.span.start, diagnostic.span.end).includes('sharedFromAllocation'),
+      )
+      assert.strictEqual(
+        diagnostic.relatedSpans?.at(0)?.span.sourceId,
+        'local-shared-allocation/descriptor-controls',
+      )
+    }
+    const wrong = diagnostics.find(
+      (diagnostic) =>
+        diagnostic.reason._tag === 'LocalSharedLayoutMismatch' &&
+        diagnostic.reason.actual === 'u32',
+    )
+    assert.isDefined(wrong)
+    const measuredOrigin = wrong?.relatedSpans?.at(0)?.span
+    assert.isDefined(measuredOrigin)
+    if (measuredOrigin !== undefined)
+      assert.strictEqual(
+        source.slice(measuredOrigin.start, measuredOrigin.end),
+        'Intrinsic.sharedLayout<u32>()',
+      )
+  }),
+)
+
+it.effect('rejects mixed execution measurement specializations through descriptor fields', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'execution-allocation/descriptor-specializations',
+      ascii(`import silk.allocator { OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+struct Ready {}
+fn ready(state: &Ready) -> () { return () }
+effect fn other() -> i32 { return 41 }
+effect fn create<
+  F: once Effect<'static; i32> + Intrinsic.Detached,
+  G: once Effect<'static; i32> + Intrinsic.Detached,
+  R: fn<'static>(&Ready) -> () + Intrinsic.Detached + Intrinsic.NonParking
+>(body: F, different: G, onReady: R) -> Intrinsic.Execution<i32> ! OutOfMemoryError {
+  let first = Intrinsic.executionLayout<i32, F, Ready, R>()
+  let second = Intrinsic.executionLayout<i32, G, Ready, R>()
+  drop different
+  let layout = Layout {alignment: second.alignment, bytes: first.bytes}
+  let allocation = run Intrinsic.systemAllocationAcquire(move layout)
+  unsafe {
+    return Intrinsic.executionFromAllocation<i32, F, Ready, R>(
+      move allocation, move body, Ready {}, move onReady
+    )
+  }
+}
+effect fn construct() -> i32 ! OutOfMemoryError {
+  let execution = run create(effect { return 42 }, other(), ready)
+  drop execution
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`),
+      'wasm32-unknown-unknown',
+    )
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
+      ['SEM0142'],
+    )
+    const diagnostic = Analysis.diagnostics(snapshot).at(0)
+    assert.strictEqual(diagnostic?.relatedSpans?.length, 1)
+  }),
+)
+
 it.effect('invalidates inherited allocation provenance after a mutable parameter write', () =>
   Effect.gen(function* () {
     const source = ascii(`import silk.allocator { OutOfMemoryError }
