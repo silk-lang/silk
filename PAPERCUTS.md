@@ -1,271 +1,85 @@
 # Papercuts
 
-- 2026-10-06 · Isolated source-startup Vitest and compiler emission failed because the ignored
-  ToolchainIntegrity.generated.ts was absent · Run the existing toolchain generator against the
-  isolated source catalog before direct compiler checks; keep that generated identity local · compiler
-
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+Append entries at the end, with one physical line per entry. Entry order has no significance; do not reorder or reformat existing entries.
+
+- 2026-10-06 · Isolated source-startup Vitest and compiler emission failed because the ignored ToolchainIntegrity.generated.ts was absent · Run the existing toolchain generator against the isolated source catalog before direct compiler checks; keep that generated identity local · compiler
 - 2026-10-06 · A trailing body-end comment in the Allocation cleanup helper was parser-accepted but rejected by the native formatter at helper offset 4802/full-file offset 1643422 · An explicit unit return (#1043) preserves all assertions and passes full formatting safety and idempotence; the general formatter behavior remains a named follow-up · self-build orchestration
-
 - 2026-10-06 · Bootstrap `silk format` rewrites large unchanged native compiler actors and reports damaged large test sources without a diagnostic location · Keep task patches focused, use the native formatter safety gate for repository formatting, and validate new test fragments in an isolated exact-body root · self-hosted compiler
-
 - 2026-10-04 · New recipe actors and controls used unsupported conditional-expression initializers and temporary slice projections, wasting focused build cycles · Use typed mutable scalar locals with ordinary if statements, bind stable slice owners before indexing borrowed non-Copy values, and run Effect Boolean comparisons into locals before assertions · selfhost Step 7 instance recipes
-
 - 2026-10-03 · Closure emission trapped while structured MIR and layout demands passed because exact callable comparison borrowed one shared runtime-key buffer twice · Compare buffer allocation addresses before nested `Shared.with`, and assert same-handle and copied-type equality in the production environment fixture · self-hosted compiler
-
 - 2026-09-29 · Codebase Memory could not index the U8 checkout because a pre-coordination or unverified generation was active · Use targeted source searches until the index is available; do not retry concurrent indexing · self-hosted compiler
-
 - 2026-09-28 · The shared checkout's CLI dependency links pointed into another unit's worktree and became dangling during parallel setup · Run frontend checks with the intact main checkout's CLI, then build and test from an isolated worktree after acquiring the shared build slot · self-hosted compiler
 - 2026-09-28 · Importing the large semantic test root for a few target assertions exhausted a 6 GiB frontend heap before diagnostics · Keep these independent target assertions in a small focused root and run that root directly · self-hosted compiler
 - 2026-09-28 · Codebase-memory indexing failed with "a pre-coordination or unverified CBM generation is active" in both the shared checkout and an isolated worktree · Read the worker log, then use scoped `rg` until the index service can coordinate · self-hosted compiler
-
 - 2026-09-28 · `silk format --check` reported only PAR0001/PAR0002 for a damaged large source file, without a location; a one-line `match` in an added test hid the actual parse failure · Slice the new test into temporary complete source prefixes and format-check each to locate the first invalid statement; write match arms on separate lines · self-hosted compiler
-
 - 2026-09-26 · The combined M1 native test root reached JavaScript heap OOM in focused CI before any case ran, and `--filter` could not reduce compilation because it selects only at runtime · Run the query/source-index root and semantic root sequentially in the same job; all 27 cases pass uncached within the existing heap limit · self-hosted compiler
-
-- 2026-09-26 · A focused `Shared.with` assertion over optional generic-kind details passed source
-  checking but failed during LLVM emission · Store the diagnostic's kind fields directly and inspect
-  them with a named predicate; the focused native case then passed · self-hosted compiler
-
-- 2026-09-25 · Concurrent `pnpm exec` typechecks each triggered dependency auto-repair and raced
-  on a hoisted `node_modules` symlink · Invoke the prepared `node_modules/.bin` binaries directly
-  for focused checks and avoid parallel pnpm entry points · compiler
-- 2026-09-25 · A cached native acceptance object kept failing after an ownership fix because it
-  reused a stale binary · Disable the artifact cache for the focused compiler-lowering regression
-  so it compiles the current compiler code · compiler
-- 2026-09-25 · `silk format` rewrote hundreds of unrelated lines in touched HIR files, and even
-  the unchanged HEAD copy of Hir.silk failed its check · Keep the scoped source diff, verify
-  temporary formatted copies against the tested build, and use Oxfmt for CI-covered files · compiler
-- 2026-09-25 · Two `silk test --filter` calls for the same source-written HIR root each rebuilt its
-  native test executable for several minutes · Select related cases in one run when the filter
-  permits, then build the normal compiler once for corpus checks · self-hosted compiler
-- 2026-09-25 · A focused source-written query test used `--file`, but the CLI still compiled the
-  manifest root and its full import graph for over two minutes · Use `--root src/semantic/QueryCases.silk`
-  to compile only the test module's import graph · self-hosted compiler
-- 2026-09-25 · A generic scoped query answer passed `silk check` but native build failed with
-  `SEM0138` for shared allocation provenance, then tried to emit cleanup for a generic payload ·
-  Trace the recorded execution edges through the bracket callback and generate shared cleanup
-  only for concrete runtime payloads · compiler bootstrap
-
-- 2026-09-23 · A fresh task checkout had no `node_modules`; offline pnpm install missed cached
-  tarballs and sandboxed registry requests failed DNS resolution, then focused Vitest could not
-  import `ToolchainIntegrity.generated.js` · Run the lockfile install with approved network access
-  and `pnpm --filter @silklang/compiler toolchain:generate` before focused checks · compiler
-
-- 2026-09-23 · A delegated worktree had only a partial `node_modules`; `pnpm exec` automatically
-  attempted a full install and stalled on unavailable npm registry DNS · Stop the retry, use the
-  prepared main checkout's dependency links and binaries for focused checks, and pass Vitest
-  `--configLoader runner` to avoid writes through a read-only dependency link · compiler
-
-- 2026-09-19 · Ran the whole `packages/compiler` vitest suite (about 230 files, 25–40 min locally;
-  each `ModuleVerification` shard alone is about 10 min) after every change and as the harness for
-  a temporary probe, which cost hours · Typecheck, then run only the test files that exercise the
-  change (`CI=true ../../node_modules/.bin/vitest run test/A.test.ts test/B.test.ts`); to learn
-  which files matter, grep the tests or run a probe once and keep the list of files it flagged. Run
-  the full suite once per milestone and on CI, which shards it four ways and is faster than a
-  laptop · compiler
-- 2026-09-19 · A full run left going in the background while editing mixed old and new code,
-  because each worker loads whatever is on disk when its file starts, so the result proved nothing
-  · Never edit under a running suite; stop it first · compiler
-- 2026-09-19 · `pkill -f "vitest run"` left worker processes alive that kept writing output ·
-  `pkill -f vitest`, then check `ps aux | grep -c "[v]itest"` is 0 · compiler
-- 2026-09-19 · `ScannerDeterminism`, `ConditionalConformanceDeterminism` and the `StdlibResolution`
-  byte-identity test fail with `ERR_MODULE_NOT_FOUND` for `dist/*.js`; `lsp`/`docgen`/`cli` tests
-  fail to resolve `@silklang/*` · Build first:
-  `CI=true node scripts/turbo.mjs run build --filter=@silklang/lsp...` · compiler, lsp
-- 2026-09-19 · Three `ModuleVerification` cases fail locally with "Missing planned place" ·
-  Identical on `main` locally and green on CI; not a regression, do not chase · compiler
-- 2026-09-20 · `pnpm --filter @silklang/compiler exec tsx -e` could not load compiler sources
-  because the workspace LLVM package did not expose `@silklang/llvm/ByteString` · Use focused
-  Vitest fixtures, which build workspace dependencies correctly, for runtime inspection · silk
-- 2026-09-20 · Documentation checking hit Node's 4 GB heap after the first target profile because
-  the async loop retained the previous whole-project analysis frame · Isolate each profile analysis
-  in a helper so only its detached documentation model survives the iteration · compiler
-- 2026-09-20 · Running `pnpm --filter` in a detached comparison worktree with symlinked
-  `node_modules` tried to replace the modules directory and aborted without a TTY · Invoke the
-  primary worktree's `node_modules/.bin/vitest` directly from the comparison package directory ·
-  compiler
-- 2026-09-21 · The `silk-work` workflow's `superset mcp` transport was unavailable on PATH while
-  claiming JUL-209 · Use the connected Linear MCP tools directly and preserve the same admission,
-  evidence and reread gates · silk
-- 2026-09-21 · Compiler typecheck produced hundreds of misleading missing `@silklang/llvm/*`
-  errors in a fresh worktree · Build `@silklang/llvm` once before the focused compiler typecheck ·
-  compiler
-- 2026-09-21 · Native CLI tests failed with `Unknown attribute kind (102)` because `/usr/bin/clang`
-  17 could not read LLVM 22 bitcode · Run native CLI checks with
-  `PATH=/opt/homebrew/opt/llvm/bin:$PATH` so the compiler and Clang use the same LLVM generation ·
-  cli
-- 2026-09-21 · An effect test that locally provided a service failed native emission with an
-  unresolved downstream `completeTest` continuation, matching the open generic bracket-runner
-  defect · Exercise the closed Effect from a normal test until that separate compiler change lands
-  · compiler
-- 2026-09-21 · Local `pnpm release:candidate` could not install offline consumers because the pnpm
-  metadata mirror lacked unrelated package records · Use exact CI for the full release-candidate
-  gate; locally verify that changed export assertions advance past manifest validation · repository
-- 2026-09-21 · A zsh test wrapper assigned to the readonly `status` parameter after the test had
-  already run · Use a task-specific exit variable or avoid capturing the status when inspecting a
-  redirected log · repository
-- 2026-09-21 · A temporary comparison-worktree command was rejected because it began with
-  `rm -rf` cleanup · Use a unique temporary path and add the worktree directly · repository
-- 2026-09-22 · Indexing the current Superset workspace with codebase-memory failed because a
-  pre-coordination or unverified generation was active · Inspect the worker log to confirm the
-  guard, leave the unrelated indexer alone, and use direct read-only source inspection · silk
-- 2026-09-22 · Vitest tried to bundle a temporary config beneath a read-only dependency symlink and
-  failed with `EPERM` in `node_modules/.vite-temp` · Pass `--configLoader runner` when using a
-  workspace-local temporary Vitest config · cli
-- 2026-09-22 · The compiler documentation check could not start in a focused workspace because
-  `@silklang/docgen` had neither its workspace dependencies nor a complete build · Run the check in
-  a prepared checkout with the docgen dependency graph built first · compiler, docs
-- 2026-09-22 · A fresh codebase-memory index for the task worktree refused to start because a
-  pre-coordination or unverified CBM generation was active · Reuse the indexed main Silk checkout
-  for structural discovery and use targeted filesystem inspection only for uncovered task-local or
-  ignored files · repository
-- 2026-09-22 · A `cd` into a temporary probe project reset the shell cwd, and every following
-  `pnpm exec silk` call failed with `MODULE_NOT_FOUND` before running · Keep the shell in the
-  repository root and address probe projects only through `--manifest-path` · repository
-- 2026-09-22 · A large union failed to parse with a misleading `Expected }` at an unrelated later
-  variant because one field was named after the contextual keyword `role`; keyword fields such as
-  `type` and `unsafe` reported clearly, but `role` did not · Check a new field name against the
-  `TokenKind` keyword list before debugging the enclosing declaration · compiler
-- 2026-09-22 · A lowering test asserted zero generic parameters because its fixture source named the
-  function `run`, a keyword; the parser recovered the whole signature into a flat run of `Error`
-  nodes, so the failure surfaced as a wrong count far from the cause rather than as a syntax error ·
-  Dump a new fixture with `silk-compiler <file>` before asserting against it, and check fixture
-  identifiers against the `TokenKind` keyword list · compiler
-- 2026-09-23 · Starting an authorized merge in a linked worktree failed because the sandbox could
-  not create the shared Git worktree's `ORIG_HEAD.lock` · Retry the exact scoped merge with approved
-  Git metadata access instead of changing branches or bypassing the worktree · repository
-- 2026-09-23 · A focused formatter/linter command used repository-root paths after changing its cwd
-  to `packages/compiler`, so formatting matched no files and the package-local binary path was
-  wrong · Keep the repository root as cwd for root-relative file lists and tool binaries · compiler
-- 2026-09-23 · `pnpm exec silk` in a worktree ran the _main checkout's_ CLI: the globally installed
-  `silk` shim execs a hard-coded `/Users/.../Documents/dev.nosync/silk/packages/cli/dist/bin.js`, so
-  a compiler fix committed only in the worktree was invisible and `silk test` reproduced a bootstrap
-  blowup the worktree had already fixed; every self-hosted figure taken this way is a measurement of
-  the wrong compiler · Build locally with
-  `CI=true node scripts/turbo.mjs run build --filter=@silklang/cli --filter=@silklang/compiler`, then
-  run `node packages/cli/dist/bin.js <check|test|build> --manifest-path compiler/silk.toml`, and
-  state which binary produced any self-hosted figure · repository
-- 2026-09-23 · A bare `{ ... }` block inside a function body is not a nested block: the grammar reads
-  the brace as a nominal record literal, so a shadowing fixture silently became a
-  `StructLiteralExpression` with a missing type · Use a construct that owns its block (`if true { }`,
-  `while`, `unsafe`) when a fixture needs a nested scope · compiler
-- 2026-09-23 · `silk format --manifest-path compiler/silk.toml` reformatted every reachable source
-  file, not just the ones the task touched, so a task diff suddenly contained unrelated parser and
-  HIR churn; reverting it with `git checkout --` then also discarded the task's own edits to the
-  same files · Do not run the project formatter on a task branch; if it is run, restore the
-  unrelated files individually and re-apply the task edits from the change set · repository
-- 2026-09-23 · `match value { true => ..., false => ... }` on a `bool` is `SEM0044 Match does not
-cover bool` plus a parse error on each arm: `true` and `false` are not patterns, so the arms read
-  as binding identifiers · Use an `if` with a `mut` local; `match` is for unions and enums only ·
-  compiler
-- 2026-09-23 · A Codex model that works from the shell fails through Intent delegation with
-  `invalid params: Could not apply Codex model 'gpt-6-sol': JSON-RPC error -32602`, because two
-  different Codex clients are involved: the shell CLI is `codex-cli 0.156.1` at
-  `/opt/homebrew/bin/codex`, while Intent routes through the ChatGPT desktop app's embedded
-  `Codex Framework.framework` (`client_version: 0.153.4` in `~/.codex/models_cache.json`), and the
-  backend serves that older client a model list omitting newly released slugs, so Intent rejects the
-  model before it reaches the API; delegation also returns `ok: true` and fails only after the agent
-  starts, so an unsupported slug looks like a successful delegation · Update the ChatGPT desktop app
-  (`npm install -g @openai/codex@latest` upgrades a binary Intent never invokes), and pass effort as
-  the separate `reasoningEffort` argument (`sol-high` is not a model name) · repository
-- 2026-09-23 · `pnpm --filter ... exec vitest` tried to reinstall and purge the existing dependency
-  tree in a non-TTY session, aborting before a focused test could run · Invoke the already-installed
-  `node_modules/.bin/vitest` directly for focused compiler checks · compiler
-- 2026-09-23 · Native acceptance reached `ArtifactCache.set` but failed with `EPERM` because its
-  default cache writes under `~/.cache`, outside this worktree's writable sandbox · Set
-  `SILK_NATIVE_CACHE_DIR` to a dedicated directory under `/private/tmp` for local tests · compiler
-- 2026-09-23 · A focused native test reported an ownership error at a source offset that did not
-  match the current `format.silk`; the compiler loaded an older embedded copy from
-  `Stdlib.generated.ts` · Run `node scripts/generate-stdlib.mjs` in `packages/compiler` after
-  editing stdlib Silk before interpreting diagnostic offsets or runtime results · compiler
-- 2026-09-23 · Documentation generation passed policy checks but silently omitted newly registered
-  stdlib pages because `generate-documentation.mjs` read the built compiler's older manifest · Run
-  `node_modules/.bin/tsc -p packages/compiler/tsconfig.json` after changing the manifest, then
-  regenerate documentation and check that the new pages exist · compiler
-- 2026-09-23 · A fresh silk worktree has no `node_modules`, and after `pnpm install` the compiler
-  test files still fail to import: first `Cannot find module './ToolchainIntegrity.generated.js'`,
-  then `Cannot find package '@silklang/llvm/ByteString'` · Run `CI=true pnpm install` with
-  `--frozen-lockfile`, then run all three generator scripts from `packages/compiler`
-  (`generate-unicode-tables.mjs`, `generate-stdlib.mjs`, `generate-toolchain-integrity.mjs`), then
-  build the LLVM package with `turbo run build --filter @silklang/llvm` · compiler
-- 2026-09-23 · `MirVerification` emits the same `InvalidCallableOperation` rule tag for both the
-  `MakeCallable` and the `ApplyCallable` blocks, so a violation report alone does not say which
-  operation failed and sends debugging to the wrong code · Read the violation's `detail` string,
-  not the `rule`: "callable construction disagrees ..." is `MakeCallable`, "callable application
-  disagrees ..." is `ApplyCallable` · compiler
-- 2026-09-23 · Focused Vitest matched an untracked `.pnpm-store/v11/projects` duplicate of the
-  compiler suite and failed after the intended JSON case passed · Exclude `.pnpm-store/**` from
-  focused Vitest runs until the store is outside test discovery · compiler
-- 2026-09-23 · `pnpm lint` aborted before reading any source with "The `options.denyWarnings` option
-  is only supported in the root config", failing `validate` CI and the docs preview; the culprit was
-  a generated `.oxlintrc.json` under the git-tracked `.pnpm-store/` cache, not the root config ·
-  Gitignore and untrack `/.pnpm-store/` (`275516ad`); on any oxlint _configuration_ error, search for
-  stray `.oxlintrc.json` under cache or vendored directories first · repository
-- 2026-09-23 · `ws.git.commit` silently restaged an ignored cache file that had just been removed
-  from the index, so the commit still contained it · Use `git rm --cached` plus `git commit --amend`,
-  and verify with `git status` after any commit that removes a path from the index · repository
-- 2026-09-23 · The fresh-snapshot determinism canary timed out at 30s after stdlib growth, with no
-  indication whether cost or output changed · A focused run passed all assertions in 86.4s with a
-  120s limit; its three full snapshots scale with the stdlib's 167 modules · compiler
-- 2026-09-23 · In a shared checkout, a peer's `ws.git.commit({files: [...]})` naming `corpus.ts`
-  staged the WHOLE file, sweeping ~180 lines of my uncommitted work in that same file into their
-  task-scoped commit; separately my `format.silk` was reverted to base in the working tree and had
-  to be recovered · An explicit `files` allowlist stages whole files, never just your own hunks, so
-  two agents with uncommitted edits in one file cannot both commit cleanly. Keep an out-of-tree
-  copy (`cp x /tmp/x.mine`) before running anything that touches shared state, and commit your own
-  scope the moment it passes instead of batching it behind further verification · compiler
-- 2026-09-23 · A fresh `intent` worktree had no `node_modules`, so both the workspace and the
-  primary checkout's `vitest` failed to resolve `effect` · Run `pnpm install --frozen-lockfile` in
-  the worktree once; the symlink trick from the older papercut does not resolve workspace packages
-  · repository
-- 2026-09-23 · Blamed a failing `StdlibResolution` closure assertion on a peer's concurrent edit by
-  reverting only my own file and seeing it still fail; the real cause was a list already stale at
-  the base commit, and reverting one of two concurrent changes never tests a clean base · To
-  attribute a failure in a shared checkout, check out the BASE commit's inputs, `rm -rf
-packages/compiler/dist`, and rebuild with `turbo run build --force` (a plain build hits the
-  cache); and verify the causal chain you are claiming rather than concluding by elimination —
-  `option.silk` has no imports, so the chain I asserted could not have existed · compiler
-- 2026-09-23 · Reported a branch as "pushed at HEAD" after a co-agent committed to the same shared
-  checkout; their commit was local only, so the reported head did not contain the fix it was
-  credited with, and a conflicted PR meant no CI existed to expose the gap · In a shared checkout
-  never infer push state from your own last push: check `git rev-list --left-right --count
-HEAD...@{u}` before reporting a head, and confirm each claimed deliverable against `origin/<branch>`
-  with `git show origin/<branch>:<path>` rather than the working tree · repository
-- 2026-09-23 · Checking `.git/MERGE_HEAD` in a worktree falsely suggested that merge state had
-  disappeared, because `.git` is a pointer file there · Resolve the Git directory with
-  `git rev-parse --git-dir`, or check the state directly with `git rev-parse --verify MERGE_HEAD`
-  · repository
-- 2026-09-23 · `pnpm --filter @silklang/compiler exec vitest` tried to purge `node_modules`
-  during a dependency-status check and aborted without a TTY before the focused test began · Run
-  `../../node_modules/.bin/vitest` from `packages/compiler` when dependencies are already present
-  · compiler
-- 2026-09-23 · Compiler test shards 3 and 4 each carried 57 files, yet ran 10m21s and 20m46s;
-  shard 4 timed out eight tests · File count is a poor cost proxy: keep per-test timing artifacts
-  and rebalance the shards using measured work · compiler
+- 2026-09-26 · A focused `Shared.with` assertion over optional generic-kind details passed source checking but failed during LLVM emission · Store the diagnostic's kind fields directly and inspect them with a named predicate; the focused native case then passed · self-hosted compiler
+- 2026-09-25 · Concurrent `pnpm exec` typechecks each triggered dependency auto-repair and raced on a hoisted `node_modules` symlink · Invoke the prepared `node_modules/.bin` binaries directly for focused checks and avoid parallel pnpm entry points · compiler
+- 2026-09-25 · A cached native acceptance object kept failing after an ownership fix because it reused a stale binary · Disable the artifact cache for the focused compiler-lowering regression so it compiles the current compiler code · compiler
+- 2026-09-25 · `silk format` rewrote hundreds of unrelated lines in touched HIR files, and even the unchanged HEAD copy of Hir.silk failed its check · Keep the scoped source diff, verify temporary formatted copies against the tested build, and use Oxfmt for CI-covered files · compiler
+- 2026-09-25 · Two `silk test --filter` calls for the same source-written HIR root each rebuilt its native test executable for several minutes · Select related cases in one run when the filter permits, then build the normal compiler once for corpus checks · self-hosted compiler
+- 2026-09-25 · A focused source-written query test used `--file`, but the CLI still compiled the manifest root and its full import graph for over two minutes · Use `--root src/semantic/QueryCases.silk` to compile only the test module's import graph · self-hosted compiler
+- 2026-09-25 · A generic scoped query answer passed `silk check` but native build failed with `SEM0138` for shared allocation provenance, then tried to emit cleanup for a generic payload · Trace the recorded execution edges through the bracket callback and generate shared cleanup only for concrete runtime payloads · compiler bootstrap
+- 2026-09-23 · A fresh task checkout had no `node_modules`; offline pnpm install missed cached tarballs and sandboxed registry requests failed DNS resolution, then focused Vitest could not import `ToolchainIntegrity.generated.js` · Run the lockfile install with approved network access and `pnpm --filter @silklang/compiler toolchain:generate` before focused checks · compiler
+- 2026-09-23 · A delegated worktree had only a partial `node_modules`; `pnpm exec` automatically attempted a full install and stalled on unavailable npm registry DNS · Stop the retry, use the prepared main checkout's dependency links and binaries for focused checks, and pass Vitest `--configLoader runner` to avoid writes through a read-only dependency link · compiler
+- 2026-09-19 · Ran the whole `packages/compiler` vitest suite (about 230 files, 25–40 min locally; each `ModuleVerification` shard alone is about 10 min) after every change and as the harness for a temporary probe, which cost hours · Typecheck, then run only the test files that exercise the change (`CI=true ../../node_modules/.bin/vitest run test/A.test.ts test/B.test.ts`); to learn which files matter, grep the tests or run a probe once and keep the list of files it flagged. Run the full suite once per milestone and on CI, which shards it four ways and is faster than a laptop · compiler
+- 2026-09-19 · A full run left going in the background while editing mixed old and new code, because each worker loads whatever is on disk when its file starts, so the result proved nothing · Never edit under a running suite; stop it first · compiler
+- 2026-09-19 · `pkill -f "vitest run"` left worker processes alive that kept writing output · `pkill -f vitest`, then check `ps aux | grep -c "[v]itest"` is 0 · compiler
+- 2026-09-19 · `ScannerDeterminism`, `ConditionalConformanceDeterminism` and the `StdlibResolution` byte-identity test fail with `ERR_MODULE_NOT_FOUND` for `dist/*.js`; `lsp`/`docgen`/`cli` tests fail to resolve `@silklang/*` · Build first: `CI=true node scripts/turbo.mjs run build --filter=@silklang/lsp...` · compiler, lsp
+- 2026-09-19 · Three `ModuleVerification` cases fail locally with "Missing planned place" · Identical on `main` locally and green on CI; not a regression, do not chase · compiler
+- 2026-09-20 · `pnpm --filter @silklang/compiler exec tsx -e` could not load compiler sources because the workspace LLVM package did not expose `@silklang/llvm/ByteString` · Use focused Vitest fixtures, which build workspace dependencies correctly, for runtime inspection · silk
+- 2026-09-20 · Documentation checking hit Node's 4 GB heap after the first target profile because the async loop retained the previous whole-project analysis frame · Isolate each profile analysis in a helper so only its detached documentation model survives the iteration · compiler
+- 2026-09-20 · Running `pnpm --filter` in a detached comparison worktree with symlinked `node_modules` tried to replace the modules directory and aborted without a TTY · Invoke the primary worktree's `node_modules/.bin/vitest` directly from the comparison package directory · compiler
+- 2026-09-21 · The `silk-work` workflow's `superset mcp` transport was unavailable on PATH while claiming JUL-209 · Use the connected Linear MCP tools directly and preserve the same admission, evidence and reread gates · silk
+- 2026-09-21 · Compiler typecheck produced hundreds of misleading missing `@silklang/llvm/*` errors in a fresh worktree · Build `@silklang/llvm` once before the focused compiler typecheck · compiler
+- 2026-09-21 · Native CLI tests failed with `Unknown attribute kind (102)` because `/usr/bin/clang` 17 could not read LLVM 22 bitcode · Run native CLI checks with `PATH=/opt/homebrew/opt/llvm/bin:$PATH` so the compiler and Clang use the same LLVM generation · cli
+- 2026-09-21 · An effect test that locally provided a service failed native emission with an unresolved downstream `completeTest` continuation, matching the open generic bracket-runner defect · Exercise the closed Effect from a normal test until that separate compiler change lands · compiler
+- 2026-09-21 · Local `pnpm release:candidate` could not install offline consumers because the pnpm metadata mirror lacked unrelated package records · Use exact CI for the full release-candidate gate; locally verify that changed export assertions advance past manifest validation · repository
+- 2026-09-21 · A zsh test wrapper assigned to the readonly `status` parameter after the test had already run · Use a task-specific exit variable or avoid capturing the status when inspecting a redirected log · repository
+- 2026-09-21 · A temporary comparison-worktree command was rejected because it began with `rm -rf` cleanup · Use a unique temporary path and add the worktree directly · repository
+- 2026-09-22 · Indexing the current Superset workspace with codebase-memory failed because a pre-coordination or unverified generation was active · Inspect the worker log to confirm the guard, leave the unrelated indexer alone, and use direct read-only source inspection · silk
+- 2026-09-22 · Vitest tried to bundle a temporary config beneath a read-only dependency symlink and failed with `EPERM` in `node_modules/.vite-temp` · Pass `--configLoader runner` when using a workspace-local temporary Vitest config · cli
+- 2026-09-22 · The compiler documentation check could not start in a focused workspace because `@silklang/docgen` had neither its workspace dependencies nor a complete build · Run the check in a prepared checkout with the docgen dependency graph built first · compiler, docs
+- 2026-09-22 · A fresh codebase-memory index for the task worktree refused to start because a pre-coordination or unverified CBM generation was active · Reuse the indexed main Silk checkout for structural discovery and use targeted filesystem inspection only for uncovered task-local or ignored files · repository
+- 2026-09-22 · A `cd` into a temporary probe project reset the shell cwd, and every following `pnpm exec silk` call failed with `MODULE_NOT_FOUND` before running · Keep the shell in the repository root and address probe projects only through `--manifest-path` · repository
+- 2026-09-22 · A large union failed to parse with a misleading `Expected }` at an unrelated later variant because one field was named after the contextual keyword `role`; keyword fields such as `type` and `unsafe` reported clearly, but `role` did not · Check a new field name against the `TokenKind` keyword list before debugging the enclosing declaration · compiler
+- 2026-09-22 · A lowering test asserted zero generic parameters because its fixture source named the function `run`, a keyword; the parser recovered the whole signature into a flat run of `Error` nodes, so the failure surfaced as a wrong count far from the cause rather than as a syntax error · Dump a new fixture with `silk-compiler <file>` before asserting against it, and check fixture identifiers against the `TokenKind` keyword list · compiler
+- 2026-09-23 · Starting an authorized merge in a linked worktree failed because the sandbox could not create the shared Git worktree's `ORIG_HEAD.lock` · Retry the exact scoped merge with approved Git metadata access instead of changing branches or bypassing the worktree · repository
+- 2026-09-23 · A focused formatter/linter command used repository-root paths after changing its cwd to `packages/compiler`, so formatting matched no files and the package-local binary path was wrong · Keep the repository root as cwd for root-relative file lists and tool binaries · compiler
+- 2026-09-23 · `pnpm exec silk` in a worktree ran the _main checkout's_ CLI: the globally installed `silk` shim execs a hard-coded `/Users/.../Documents/dev.nosync/silk/packages/cli/dist/bin.js`, so a compiler fix committed only in the worktree was invisible and `silk test` reproduced a bootstrap blowup the worktree had already fixed; every self-hosted figure taken this way is a measurement of the wrong compiler · Build locally with `CI=true node scripts/turbo.mjs run build --filter=@silklang/cli --filter=@silklang/compiler`, then run `node packages/cli/dist/bin.js <check|test|build> --manifest-path compiler/silk.toml`, and state which binary produced any self-hosted figure · repository
+- 2026-09-23 · A bare `{ ... }` block inside a function body is not a nested block: the grammar reads the brace as a nominal record literal, so a shadowing fixture silently became a `StructLiteralExpression` with a missing type · Use a construct that owns its block (`if true { }`, `while`, `unsafe`) when a fixture needs a nested scope · compiler
+- 2026-09-23 · `silk format --manifest-path compiler/silk.toml` reformatted every reachable source file, not just the ones the task touched, so a task diff suddenly contained unrelated parser and HIR churn; reverting it with `git checkout --` then also discarded the task's own edits to the same files · Do not run the project formatter on a task branch; if it is run, restore the unrelated files individually and re-apply the task edits from the change set · repository
+- 2026-09-23 · `match value { true => ..., false => ... }` on a `bool` is `SEM0044 Match does not cover bool` plus a parse error on each arm: `true` and `false` are not patterns, so the arms read as binding identifiers · Use an `if` with a `mut` local; `match` is for unions and enums only · compiler
+- 2026-09-23 · A Codex model that works from the shell fails through Intent delegation with `invalid params: Could not apply Codex model 'gpt-6-sol': JSON-RPC error -32602`, because two different Codex clients are involved: the shell CLI is `codex-cli 0.156.1` at `/opt/homebrew/bin/codex`, while Intent routes through the ChatGPT desktop app's embedded `Codex Framework.framework` (`client_version: 0.153.4` in `~/.codex/models_cache.json`), and the backend serves that older client a model list omitting newly released slugs, so Intent rejects the model before it reaches the API; delegation also returns `ok: true` and fails only after the agent starts, so an unsupported slug looks like a successful delegation · Update the ChatGPT desktop app (`npm install -g @openai/codex@latest` upgrades a binary Intent never invokes), and pass effort as the separate `reasoningEffort` argument (`sol-high` is not a model name) · repository
+- 2026-09-23 · `pnpm --filter ... exec vitest` tried to reinstall and purge the existing dependency tree in a non-TTY session, aborting before a focused test could run · Invoke the already-installed `node_modules/.bin/vitest` directly for focused compiler checks · compiler
+- 2026-09-23 · Native acceptance reached `ArtifactCache.set` but failed with `EPERM` because its default cache writes under `~/.cache`, outside this worktree's writable sandbox · Set `SILK_NATIVE_CACHE_DIR` to a dedicated directory under `/private/tmp` for local tests · compiler
+- 2026-09-23 · A focused native test reported an ownership error at a source offset that did not match the current `format.silk`; the compiler loaded an older embedded copy from `Stdlib.generated.ts` · Run `node scripts/generate-stdlib.mjs` in `packages/compiler` after editing stdlib Silk before interpreting diagnostic offsets or runtime results · compiler
+- 2026-09-23 · Documentation generation passed policy checks but silently omitted newly registered stdlib pages because `generate-documentation.mjs` read the built compiler's older manifest · Run `node_modules/.bin/tsc -p packages/compiler/tsconfig.json` after changing the manifest, then regenerate documentation and check that the new pages exist · compiler
+- 2026-09-23 · A fresh silk worktree has no `node_modules`, and after `pnpm install` the compiler test files still fail to import: first `Cannot find module './ToolchainIntegrity.generated.js'`, then `Cannot find package '@silklang/llvm/ByteString'` · Run `CI=true pnpm install` with `--frozen-lockfile`, then run all three generator scripts from `packages/compiler` (`generate-unicode-tables.mjs`, `generate-stdlib.mjs`, `generate-toolchain-integrity.mjs`), then build the LLVM package with `turbo run build --filter @silklang/llvm` · compiler
+- 2026-09-23 · `MirVerification` emits the same `InvalidCallableOperation` rule tag for both the `MakeCallable` and the `ApplyCallable` blocks, so a violation report alone does not say which operation failed and sends debugging to the wrong code · Read the violation's `detail` string, not the `rule`: "callable construction disagrees ..." is `MakeCallable`, "callable application disagrees ..." is `ApplyCallable` · compiler
+- 2026-09-23 · Focused Vitest matched an untracked `.pnpm-store/v11/projects` duplicate of the compiler suite and failed after the intended JSON case passed · Exclude `.pnpm-store/**` from focused Vitest runs until the store is outside test discovery · compiler
+- 2026-09-23 · `pnpm lint` aborted before reading any source with "The `options.denyWarnings` option is only supported in the root config", failing `validate` CI and the docs preview; the culprit was a generated `.oxlintrc.json` under the git-tracked `.pnpm-store/` cache, not the root config · Gitignore and untrack `/.pnpm-store/` (`275516ad`); on any oxlint _configuration_ error, search for stray `.oxlintrc.json` under cache or vendored directories first · repository
+- 2026-09-23 · `ws.git.commit` silently restaged an ignored cache file that had just been removed from the index, so the commit still contained it · Use `git rm --cached` plus `git commit --amend`, and verify with `git status` after any commit that removes a path from the index · repository
+- 2026-09-23 · The fresh-snapshot determinism canary timed out at 30s after stdlib growth, with no indication whether cost or output changed · A focused run passed all assertions in 86.4s with a 120s limit; its three full snapshots scale with the stdlib's 167 modules · compiler
+- 2026-09-23 · In a shared checkout, a peer's `ws.git.commit({files: [...]})` naming `corpus.ts` staged the WHOLE file, sweeping ~180 lines of my uncommitted work in that same file into their task-scoped commit; separately my `format.silk` was reverted to base in the working tree and had to be recovered · An explicit `files` allowlist stages whole files, never just your own hunks, so two agents with uncommitted edits in one file cannot both commit cleanly. Keep an out-of-tree copy (`cp x /tmp/x.mine`) before running anything that touches shared state, and commit your own scope the moment it passes instead of batching it behind further verification · compiler
+- 2026-09-23 · A fresh `intent` worktree had no `node_modules`, so both the workspace and the primary checkout's `vitest` failed to resolve `effect` · Run `pnpm install --frozen-lockfile` in the worktree once; the symlink trick from the older papercut does not resolve workspace packages · repository
+- 2026-09-23 · Blamed a failing `StdlibResolution` closure assertion on a peer's concurrent edit by reverting only my own file and seeing it still fail; the real cause was a list already stale at the base commit, and reverting one of two concurrent changes never tests a clean base · To attribute a failure in a shared checkout, check out the BASE commit's inputs, `rm -rf packages/compiler/dist`, and rebuild with `turbo run build --force` (a plain build hits the cache); and verify the causal chain you are claiming rather than concluding by elimination — `option.silk` has no imports, so the chain I asserted could not have existed · compiler
+- 2026-09-23 · Reported a branch as "pushed at HEAD" after a co-agent committed to the same shared checkout; their commit was local only, so the reported head did not contain the fix it was credited with, and a conflicted PR meant no CI existed to expose the gap · In a shared checkout never infer push state from your own last push: check `git rev-list --left-right --count HEAD...@{u}` before reporting a head, and confirm each claimed deliverable against `origin/<branch>` with `git show origin/<branch>:<path>` rather than the working tree · repository
+- 2026-09-23 · Checking `.git/MERGE_HEAD` in a worktree falsely suggested that merge state had disappeared, because `.git` is a pointer file there · Resolve the Git directory with `git rev-parse --git-dir`, or check the state directly with `git rev-parse --verify MERGE_HEAD` · repository
+- 2026-09-23 · `pnpm --filter @silklang/compiler exec vitest` tried to purge `node_modules` during a dependency-status check and aborted without a TTY before the focused test began · Run `../../node_modules/.bin/vitest` from `packages/compiler` when dependencies are already present · compiler
+- 2026-09-23 · Compiler test shards 3 and 4 each carried 57 files, yet ran 10m21s and 20m46s; shard 4 timed out eight tests · File count is a poor cost proxy: keep per-test timing artifacts and rebalance the shards using measured work · compiler
 - 2026-09-23 · The delegated worktree had no `node_modules`; offline pnpm install lacked cached Changesets packages and online install retried unreachable npm DNS · Reuse the prepared main checkout's dependency links for focused local compiler checks · compiler
 - 2026-09-23 · Codebase memory refused to index this Intent worktree because an unverified generation held its coordination lock · Use the existing indexed Silk checkout to locate symbols, then verify source in the active worktree · compiler
 - 2026-09-23 · A Turbo compiler build invoked pnpm's dependency repair, retried unreachable registry URLs, and recreated `node_modules` after a successful install · Restore dependencies with `CI=true pnpm install --frozen-lockfile`, then run the needed generator, focused Vitest files, and direct `tsc` checks · compiler
 - 2026-09-23 · `git restore` could not create this Intent worktree's Git index lock under the read-only linked Git directory · For a generated file changed only by this session, restore its exact committed bytes with `git show HEAD:<path> > <path>` · repository
 - 2026-09-23 · The focused native JSON corpus case failed at `NativeToolchain.ArtifactCache.set` using the default in-memory cache, before program execution · Set `SILK_NATIVE_CACHE_DIR` to a writable `/tmp` directory for that focused run; the same case passed · compiler
-- 2026-09-23 · A filtered `pnpm exec vitest list` probe unexpectedly started recreating root
-  `node_modules`, then registry DNS failures left `.bin` missing · Stop the install, move the
-  incomplete directory aside, link the prepared main checkout's `node_modules`, and invoke its
-  binaries directly for focused local checks · compiler CI
-- 2026-09-23 · The codebase-memory index worker refused this worktree because another generation
-  was active, so graph discovery could not start · Inspect its log, then use targeted source reads
-  for the workflow and report script until indexing is available · compiler CI
-- 2026-09-23 · Focused Oxlint on script paths passed, but CI's full type-aware lint found floating
-  Node test promises and direct process environment reads · Await Node test registrations, pass
-  the GitHub summary path as an argument, and verify against full-root lint when dependencies are
-  complete · compiler CI
-- 2026-09-23 · After the interrupted install was cleaned up, worktree Oxlint could not resolve its
-  preset, while main-checkout Oxlint treated the worktree config as a nested root config · Confirm
-  both lockfiles and Oxlint configs match, then lint the changed absolute paths from the prepared
-  checkout with `--disable-nested-config` · compiler CI
-- 2026-09-24 · `rtk vitest --version` produced no output and stalled during a focused merge check ·
-  Stop that probe and invoke the prepared `node_modules/.bin/vitest` directly · compiler
+- 2026-09-23 · A filtered `pnpm exec vitest list` probe unexpectedly started recreating root `node_modules`, then registry DNS failures left `.bin` missing · Stop the install, move the incomplete directory aside, link the prepared main checkout's `node_modules`, and invoke its binaries directly for focused local checks · compiler CI
+- 2026-09-23 · The codebase-memory index worker refused this worktree because another generation was active, so graph discovery could not start · Inspect its log, then use targeted source reads for the workflow and report script until indexing is available · compiler CI
+- 2026-09-23 · Focused Oxlint on script paths passed, but CI's full type-aware lint found floating Node test promises and direct process environment reads · Await Node test registrations, pass the GitHub summary path as an argument, and verify against full-root lint when dependencies are complete · compiler CI
+- 2026-09-23 · After the interrupted install was cleaned up, worktree Oxlint could not resolve its preset, while main-checkout Oxlint treated the worktree config as a nested root config · Confirm both lockfiles and Oxlint configs match, then lint the changed absolute paths from the prepared checkout with `--disable-nested-config` · compiler CI
+- 2026-09-24 · `rtk vitest --version` produced no output and stalled during a focused merge check · Stop that probe and invoke the prepared `node_modules/.bin/vitest` directly · compiler
 - 2026-09-24 · Focused TOML tests appeared to ignore recent Silk source edits because the compiler reads generated embedded stdlib text · Run `node packages/compiler/scripts/generate-stdlib.mjs` after each stdlib edit before testing · compiler
 - 2026-09-24 · `pnpm exec vitest` in the TOML task worktree retried unreachable registry downloads and left only a partial `node_modules` · Stop the repair, link the prepared main checkout dependencies, and invoke its Vitest binary directly · compiler
 - 2026-09-24 · Linked dependencies in a TOML task checkout changed while focused checks ran, leaving `effect` and `typescript` links broken; an offline install lacked a cached tarball · Run a lockfile-frozen install with network access in the task checkout before documentation and Vitest checks · compiler
@@ -278,7 +92,6 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-25 · Full `SemanticCases` native emission spent about six minutes restarting finite instance discovery after a cleanup-path repair · Validate small structural cases first, then run the full consumer once after source checks · compiler
 - 2026-09-25 · A parked allocator in a nested semantic cancellation fixture kept the bootstrap frontend busy for more than six minutes without reaching one native test · Isolate the fixture and use a bounded compiler sample before deciding whether the test shape is practical · compiler
 - 2026-09-25 · Importing the full HIR case module into the combined M1 semantic test root exhausted Node's default heap before any test ran · Keep semantic cases in one native entry and run the existing integer HIR cases as a separate filtered root · self-hosted compiler
-
 - 2026-09-25 · Cached CLI output failed before source checking with `Flag.string is not a function` · Force the checkout-local CLI dependency build with `CI=true node scripts/turbo.mjs run build --filter=@silklang/cli... --force` · self-hosted compiler
 - 2026-09-25 · Replacing `Type.Primitive {name: Bytes}` with an enum-backed `{kind: Primitive}` made the unchanged M1 runner fail with `Backend error: LLVM emission failed for silk/test_runner` at base `d2b6d3ac8e9ce7b9dba5324fe51b8b9f7b17b03a` (bootstrap `NativePlace.ts` last changed at `079be1100f0a6293c2bc7eedc4add7b40f04a10d`); command: `NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --filter reusesUnrelatedRevisionAndInvalidatesImportedHeader --no-cache`. This is the smallest recorded failing change, not a reduced minimal repro · Restore validated byte-backed primitive identity and compare exact contents; the same command passes 1/1. Coordinate a separate current-main emitter repair if an enum layout becomes necessary · self-hosted compiler
 - 2026-09-25 · A traced `silk test` on `compiler/silk.toml` reported "Cannot run compiled test program" because a concurrent benchmark ran `rm -rf compiler/build`, deleting `compiler/build/test` mid-run · Serialize heavy builds with `lockf` on one lock file and delete only `compiler/build/llvm` between plain-build benchmarks · compiler perf
@@ -339,100 +152,71 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-09-29 · The B5 bootstrap check still exhausted its heap with pinned Node 24.18.1 and a 6144 MiB heap · Keep the five-minute cap and release the build slot; use exact-head Linux CI for the full compiler guard · self-hosted compiler
 - 2026-09-29 · B5 runner tests could not load Effect in the isolated worktree · Link its compiler node_modules to the prepared checkout and run the stub-only runner test with pinned Node24 · self-hosted compiler
 - 2026-09-29 · The workspace commit helper rejected an explicit file list while a merge was active · Stage the intended files and use the user-requested staged-only merge checkpoint without a files list · self-hosted compiler
-
 - 2026-09-29 · Concurrent full-manifest bootstrap checks exhausted the five-minute cap without diagnostics on the 32 GB Mac · Hold `/private/tmp/silk-build-slot.lock` with an owner marker for local checks; when busy, skip the concurrent check and use exact-head Linux CI as instructed by the coordinator · self-hosted backend
 - 2026-09-29 · The B6 full-manifest bootstrap check aborted at the default 4 GiB heap, and verified Node 24.18.1 with 6144 MiB reached the five-minute cap without diagnostics · The coordinator disabled local bootstrap checks after matching failures across agents; push and use exact-head Linux CI without holding the build slot · self-hosted backend
 - 2026-09-29 · The workspace commit helper rejected an explicit file list during a clean main merge as a partial merge commit · Stage the task changes with git add, then call ws.git.commit with userRequested and no files list to complete the staged merge checkpoint · self-hosted backend
 - 2026-09-29 · Corepack-backed pnpm install in a new backend worktree stayed silent on this Mac · Reuse an existing locked worktree's dependency directories and rebuild the isolated TS CLI outputs with verified Node 24; do not copy native outputs · self-hosted compiler
-
 - 2026-09-29 · An expanded C ABI assertion expected fneg for signed float literals, but HIR stores those literals as signed constants, causing a CI-only failure · Assert the exact emitted f32/f64 argument constants and keep foreign-header scans off ordinary signature queries · self-hosted backend
-
 - 2026-09-29 · A MIR assertion counted unique extern declarations even though repeated calls retain separate foreign edges · Assert foreign edge presence and an empty runtime-body worklist; declaration deduplication happens at final emission · self-hosted backend
 - 2026-09-29 · An inline effectful tuple copy inside a nested match argument reported PAR0001 in Linux CI even after simplifying its call · Use a statement-block arm with an explicit enclosing return, and verify the replacement head in CI · self-hosted compiler
-
 - 2026-09-29 · A direct-call test passed all assertions but exceeded the 1 s CI gate after B6 added repeated declaration/header queries and whole-source unsafe-prefix scans to ordinary calls · Retain foreign facts on the resolved call target and direct-prefix evidence during the existing syntax traversal; verify timing in exact-head Linux CI without dropping assertions · self-hosted backend
 - 2026-09-29 · The selfhost test-audit code graph worker could not start while an unverified generation was active · Used scoped source reads after checking the existing index-lock papercut · self-hosted compiler
-
 - 2026-09-30 · Multi-file driver CI rejected byte arguments to the text-only Path.resolve API and namespace calls from a selected-only import · Use a namespace alias for sibling functions, Path.fromBytes for absolute byte paths, and Path.joinBytes for normalized relative byte paths · self-hosted compiler
 - 2026-09-29 · Copying optional prefix-span evidence from borrowed call syntax produced OWN0002/OWN0003 in Linux bootstrap CI · Copy the span through a borrowed Option match and inspect retained prefix evidence by borrow · self-hosted backend
-
 - 2026-09-30 · B6 integration parsed but CI rejected its ABI fixture pattern after B5 added BackendBuild.Module.uncheckedBodies · Match the text field with an explicit remaining-field pattern; parser-only merge audits do not prove typed pattern completeness · self-hosted backend
 - 2026-09-30 · The multi-file fixture expected a body Reuse event after publishing an unrelated source, but unchanged observations take the completed-answer Hit path · Assert a body cache hit and no new body start in the existing single reuse check · self-hosted compiler
 - 2026-09-30 · The corpus runner passed a directory URL's trailing separator to the normalized Path CLI boundary, so every invoked build failed before source loading · Pass the stdlib URL without a trailing separator and require this in the existing runner stub · self-hosted compiler
 - 2026-09-30 · Shared dependency symlinks targeted a retired worktree, blocking runtime catalog generation · Derive the committed spellings from the checked inventory and validate exact runtime phase membership against the live canonical catalog in CI · self-hosted compiler
-
 - 2026-09-30 · New aggregate fixtures used comma-separated struct declarations; the native parser retained only the first field while bootstrap syntax checks accepted them, hiding the cause behind Layout and constructor assertions · Write documented newline-separated fields and inspect retained field counts before diagnosing Layout; removed temporary CI probes after locating the fixture syntax issue · self-hosted compiler
 - 2026-09-29 · Focused tests in a new worktree could not resolve the prepared LLVM Emitter, and pnpm exec tried to reinstall linked dependencies · Build isolated LLVM TypeScript artifacts and invoke the installed tool binaries directly under pinned Node 24 · bootstrap argument-order repair
 - 2026-09-29 · Compiler profiling could not use Codebase Memory because an unverified generation held the coordination lock · Inspect the worker log and use targeted source discovery while the existing generation remains active · compiler performance
 - 2026-09-29 · The Homebrew node@24 executable reported Node 26.5.0 during profiling · Record the actual runtime version and use the same executable for before/after comparisons; CI still validates on Node 24 · compiler performance
 - 2026-09-29 · Vitest 4 accepts --execArgv but rejects --setupFiles, and --logHeapUsage reports uncollected allocations · Supply temporary setupFiles through a merged config and expose GC in worker execArgv for retained-heap diagnostics · compiler performance
-
 - 2026-09-30 · Adding a shared acceptance corpus case directly on selfhost failed the bootstrap provenance gate before compilation · Publish corpus fixtures on main first, then synchronize the landed main history into selfhost · B10 scalar primitives
 - 2026-09-30 · U8b code graph indexing could not start while an unverified generation was active · Read the worker log, retain the active generation, and use scoped source reads · self-hosted CLI build profiles
-
 - 2026-09-30 · U8b CI rejected a borrowed empty literal and an if expression used to choose Clang flags · Keep schema slices backed by an owned Vector and select flags with a normal conditional assignment · self-hosted CLI build profiles
 - 2026-09-29 · A compiler test passed locally against stale LLVM dist files while the rebuilt dependency failed on CI · Rebuild changed workspace dependencies before running their consumer tests · compiler/LLVM
-
 - 2026-09-30 · The workspace commit helper rejected a merge commit with an explicit files list as a partial commit · Stage the intended merge and fix files, then call the helper with userRequested true and no files list · repository
 - 2026-09-30 · Documentation generation reported missing comments after a body-level `else static if`, hiding parser recovery · Use `else { static if ... }` in bodies; only the module-level grammar accepts a chained static group · B13 stdlib platform migration
-
 - 2026-09-30 · Generic declaration-copy callback forwarding failed bootstrap residualization with five closure arguments for four binders; a smaller reproduction did not fail · Use concrete projection readers and keep any bootstrap investigation on main · B12 direct generic calls
 - 2026-09-30 · Tuple/array CI failed because new module-level Type helpers were called as nominal operations, and array inference wrote through a live Option-pattern loan · Publish helpers in impl Type, import ArrayShape directly and track first-element inference outside the borrowed pattern · Silk selfhost B9.
-
 - 2026-09-30 · Sequence test CI stopped on a nested callback pattern binding that reused value from its enclosing scope · Give the callback binding a distinct name and check the SemanticCases root with the bootstrap before publishing · Silk selfhost B9.
-
 - 2026-09-30 · B9 array-to-slice validation nested a Shared.with callback inside another and CLI compilation rejected SEM0199 · Lift the outer inspection into the named borrowedArraySlice function, retaining one callback level and Exact inference · self-hosted compiler
 - 2026-09-30 · M2.4 review-fix graph indexing hit the active-generation guard · Confirmed the worker log and used targeted source reads without disturbing the other indexer · self-hosted compiler
 - 2026-09-30 · A nested origin assertion misparsed the next Option arm after an escaped-text lookup and failed CI repeatedly · Hoist the needle, lookup, and match result into named locals; check the SemanticCases root with the current bootstrap before pushing · M2.4 static evaluation
 - 2026-09-30 · Static execution rejected checked text-wrapper calls before their intrinsic fault because it counted only written generics · Validate completed application arity against resolved type, written and elided lifetime, and row binders · M2.4 static evaluation
 - 2026-09-30 · The resolved arity guard exposed demand roots that built empty applications for elided lifetimes · Complete root lifetime arguments from the selected signature and owned static values, then use the same application validation as source calls · M2.4 static evaluation
-
 - 2026-09-30 · Resumed B12 session lost its temporary worktree and the default zsh launcher was unavailable · Use explicit bash, remove only the stale B12 worktree registration, and restore its published branch in an isolated checkout · B12 direct generic calls
 - 2026-09-30 · Existing compiler dist generated older synthesized lifetime signatures for B13 documentation, despite fresh source bytes · Preserve current-base signatures for unchanged APIs and let exact-head documentation CI validate; do not rebuild the compiler locally · B13 stdlib platform migration
-
 - 2026-09-30 · Prepared compiler/docgen dist kept emitting stale lifetime signatures during B13 repairs · Use mise Node 24.18.1 with temporary current-source transform hooks for the canonical documentation script; focused Vitest uses current LLVM source aliases · B13 stdlib platform migration
-
 - 2026-09-30 · B12 expanding generic recursion emitted only a generic child-process failure before Admission · A bounded CI core/backtrace exposed repeated Type.unifyTerms; separate caller and callee inference binder owners while retaining the original value-argument regression (native repair verdict pending) · self-hosted compiler
-
 - 2026-09-30 · B12’s reserved importer retry found B9 had reclaimed the shared frontend slot after the previous B12 process released its physical lock · The atomic owner/live-process gate refused the overlap; hold the retry until an explicit coordinator handoff, and distinguish a sequential reservation from each process’s lock lifetime · self-hosted compiler
-
 - 2026-09-30 · rtk git diff --check returned exit2 without printing the whitespace diagnostic · Use rtk proxy git diff --check to retain the diagnostic, then remove the trailing blank line · B12 witness mapping
-
 - 2026-09-30 · Cloud Linux container had only system LLVM 18 and no `/usr/bin/time`; a merged Semantic+Target probe root was SIGKILLed near 7 GB while other compiles ran · Fetch LLVM 22.1.8 into `.scratch/llvm-22.1.8` exactly as `.github/actions/setup-linux-llvm` does, put it first on `PATH`, sample peak RSS with `ps`, and run one native test root at a time (SemanticCases alone peaks near 11.5 GB of process-tree RSS) · selfhost test audit
-
 - 2026-09-30 · B12 nested-row oracle added an equivalent SemanticCases helper, and a broad rename retained the duplicate · Reuse the existing effectRequirements projection and delete the added copy; inspect the complete correction diff before starting a check · self-hosted compiler
-
 - 2026-10-01 · B12 receiver region assertion nested Shared.with callbacks and failed the bounded importer with SEM0199 and follow-on ownership errors · Extract named region and application projections before checking the importer; retain actual caller ownership and original slot comparisons · self-hosted compiler
-
 - 2026-10-01 · B12 receiver assertion passed body views through a local-shared application callback and retained OWN0016 after type/accessor corrections · Retain the direct application with TypedBody.directApplication, copy it through Application.copyShared, and compare the owned application against a short body borrow · self-hosted compiler
 - 2026-09-30 · A temporary SemanticCases check root inferred compiler/src/semantic as the module source root and had no main · Check through a temporary compiler/src wrapper importing SemanticCases with a main, then remove both temporary files · B9 runtime slice frontend checks
-
 - 2026-09-30 · Allocator provision on an outer Shared.make did not cover allocations evaluated in its argument fields (SEM0071) · Allocate and provide each child before constructing the descriptor type; bounded frontend check caught it before push · B9 runtime slice structured snapshot
-
 - 2026-09-30 · Runtime slice fixtures wrote &[i32; 2], which both parsers treat as damaged slice syntax, so stage-only positives did not prove array-reference reborrows · Group the fixed array as &([i32; 2]) and assert the actual fixed referent and dereference/borrow/conversion chain in the existing snapshot · B9 runtime slices
-
 - 2026-10-01 · New boundary helpers used qualified enum values inside field patterns and a unit union variant with if-let, producing parser cascades in the bounded frontend check · Bind access then compare it, and match the unit unification outcome exhaustively before publishing · B9 runtime slice/pointer boundaries
-
 - 2026-10-01 · The combined array and slice fixture passed its assertions but exceeded the Linux one-second test gate after integration · Keep array diagnostics, slice region checks, and descriptor lowering in separate minimal source snapshots while retaining every assertion; CI verifies the resulting timings · B12 runtime-slice integration
 - 2026-09-30 · Full verification exported pinned LLVM 22 paths but Turbo strict environment filtering dropped SILK_TEST_CLANG and SILK_TEST_LLVM_AR, so NativeToolchain tests selected missing /usr/bin/llvm-ar and stopped before native acceptance · Declare both tool selections in the Turbo compiler test task environment so they reach tests and affect cache keys · CI toolchain
-
 - 2026-10-01 · The bounded B12 production check caught match-arm block results ignored, nullary if-let parser cascades, shadowed names and branch-owned borrowed slice projections · Return explicit match-block values, use nullary match, distinct bindings and owned Copy node projections; re-review immutable corrections before retry · self-hosted witness MIR
 - 2026-10-01 · Selfhost CLI timings from separate ubuntu-latest jobs disagreed by up to 40%: runners mix AMD EPYC 7763, EPYC 9V45/9V74 and Intel Xeon 6973P · Compare variants only on one runner (build both CLIs, alternate the order per command) and record `model name` with every timing · selfhost CLI performance
 - 2026-10-01 · A selfhost root silently died mid-run in the 15 GB cloud container; dmesg showed a memory cgroup OOM kill while a second root or an `llc` run on the 66 MB release bitcode was active · Run one selfhost root (semantic needs about 8 GB) or one large LLVM job at a time and check `free -g` first · selfhost CLI performance
 - 2026-10-01 · `pnpm --filter @silklang/llvm fixtures:verify` fails on origin/main with "core textual fixture is stale" (fixtures/core/representative.ll expects `call i32 @variadic(...)`, the renderer now prints `call i32 (i32, ...) @variadic(...)`), so it cannot gate byte identity · Compare `scripts/{advanced,core,declaration,metadata}-module.mjs text|bitcode` output between the base and changed dist instead · LLVM local-name perf
 - 2026-10-01 · An isolated agent worktree with no uncommitted changes was removed after the agent handed back, so resuming the same task found its directory gone (branch kept) · Recreate it with `git worktree add <path> <branch>` and rerun `pnpm install --frozen-lockfile` plus the CLI build (Turbo restores cached dist) · agent workflow
-
 - 2026-10-01 · A bounded cleanup probe found recursive metadata exploration before a late Vector<Frame> structural witness after a bootstrap memo-map crash · Check eligible sibling terminal witnesses before deeper descent; preserve growth guards and verify through realized discovery · compiler cleanup search
 - 2026-10-01 · The old-base and terminal-order candidate cleanup regressions both entered instance discovery but exceeded the same bounded window without completing their assertions · Keep the ordering change unproved, sync landed main optimizations, and require fresh structural evidence before another check or handoff · compiler cleanup search
 - 2026-10-01 · Dense owned Shared and borrowed metadata regression graphs introduced expensive path-local hook and affinity traversals, confounding cleanup-search timeout evidence · Use borrowed Shared metadata edges to retain structural unfolding while avoiding those independent demands; preserve same-snapshot cleanup assertions and validate the ordinary regression separately · compiler cleanup search
-
 - 2026-10-01 · B12 applied-qualifier witness tests (`Make<i32>.make(...)`) failed with Unsupported at the callee span; earlier handoffs believed the call reached checkQualifiedInterfaceCall · The parser lowers an applied qualifier to MemberExpression{MemberSelector{AppliedType}}, not FieldExpression{AppliedType}; a stdout probe (NativeDescriptor.writeAll from the test) named the rejection code and span in one ~20 min filtered test build. A temporary manifest rooting a wrapper that imports SemanticCases gives a ~3 min `silk check` before each build · self-hosted witness MIR
 - 2026-10-02 · An interrupted tool call killed a gated `dev-run` during startup, after it had taken `/private/tmp/silk-build-slot.lock`, so the lock stayed owned by a dead PID for about an hour and every later check or build was refused as "slot occupied" · Read the owner file, confirm that PID and its process group are gone, then remove the owner file and the lock directory. Owned runners must release their reservation on early failure or interruption · self-hosted compiler
 - 2026-10-02 · A gated runner retained the shared slot because its escaped-process scan matched a transient Codex "turn-ended" notifier whose argv contained chat text naming the artifact root · Verify the match is foreign and transient and that the runner's own group is gone before releasing; never act on the foreign process · self-hosted compiler
 - 2026-10-02 · Local dev-run receipts and scratch logs were reported as about 10:30Z, but `stat` prints local time (-03). The runs were actually at 11:01–11:08Z, after a 10:59Z local-execution hold that was delivered about 9 minutes late. A 500k memo-size probe stopped on a cleanup question (Entry⊂Semantic, 1.2M entries) that the good head also asks, so it isolated nothing · Report evidence times with `date -u` or `stat -t` under `TZ=UTC`. Read queued coordinator messages before starting local execution. Size a probe against a known-good baseline before attributing a cause · self-hosted compiler
 - 2026-10-02 · Two coordinator messages carried a commit SHA typed from memory before the push finished; both were wrong and needed corrections · Send a SHA only from the `git rev-parse --short HEAD` output of the same command that pushed · self-hosted compiler
 - 2026-10-02 · Selfhost test parsed `if let X.Some {value} = move Shared.with<A, B>(…) {` as `<`/`>` comparisons (PAR0001/SEM0135 cascade) and a `let mut s = …` rebound in the same block plus mid-call field reads of a `&mut` scope struct failed OWN0010/OWN0011/SEM0008 · bind generic calls to a `let` before `if let`; build loan-holding scope structs inside a helper function so the loan ends at the call boundary; copy shared fields out before `&mut` reborrowing a sibling field · silk compiler/selfhost
-- 2026-10-02 · A slow-test task listed three selfhost tests at ~880–940 ms that actually run in about 1 ms. The test runner prints sub-millisecond times in microseconds (`PASS  892 us`), and those were read as milliseconds · Parse the unit with the number (`PASS +[0-9]+ (ms|us)`), and rank slow tests only on `ms` entries · self-hosted compiler
+- 2026-10-02 · A slow-test task listed three selfhost tests at ~880–940 ms that actually run in about 1 ms. The test runner prints sub-millisecond times in microseconds (`PASS 892 us`), and those were read as milliseconds · Parse the unit with the number (`PASS +[0-9]+ (ms|us)`), and rank slow tests only on `ms` entries · self-hosted compiler
 - 2026-10-02 · Agents halted for long stretches after tool calls were rejected with "STOP what you are doing and wait for the user". Julia had not rejected anything; the rejections were harness/permission artifacts · Report the rejection to the coordinator in one line and retry once (or use an equivalent command). If it is rejected again, report it and continue with other work or fall back to CI · agent workflow
 - 2026-10-02 · A gated focused test started in the background was killed by a session restart and left this agent's owner file in /private/tmp/silk-build-slot.lock for about an hour, blocking other lanes · Run gated builds in the foreground when they fit the tool time limit; after any restart, check the slot for your own owner file, confirm its pid and process group are gone, then release it · self-hosted compiler
 - 2026-10-03 · Two cloud container restarts killed four background perf agents and an in-flight benchmark; uncommitted worktree edits survived but in-flight results were lost · Have each agent commit every validated change immediately, then resume it with its worktree intact · compiler perf
@@ -441,35 +225,16 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-02 · Cloud `gh` API calls were forbidden while Git fetch and push worked · Use the connected GitHub tools for PR creation and CI metadata · selfhost pipe operator
 - 2026-10-02 · A gap assertion nested a `Shared.with` callback inside another anonymous callable and hit bootstrap `SEM0199` · Read the shared owner first and make the owner and gap assertions in sibling callbacks · selfhost pipe operator
 - 2026-10-02 · The native selfhost CLI defaults to absent `/usr/bin/clang` and launches it with an empty environment, so the prepared LLVM binary also cannot find `ld` · Set `SILKC_CLANG` to a local wrapper invoking prepared LLVM 22 with `--ld-path=/usr/bin/ld` · selfhost pipe operator
-
 - 2026-10-03 · The shared local test script rejected an empty filter before acquiring the build slot · Give focused formatter cases a common `document` prefix and pass that nonempty filter · native formatter
-
-- 2026-10-03 · T3's generated `t3code/add-selfhost-formatter` branch was blocked by the repository push hook, so PR creation could not find its head · Push the workspace branch to `selfhost-formatter-document` with an explicit refspec · native formatter
-
-2026-10-03 · Auxiliary compiler manifest rooted inside format/ changed the module search base and made format.* imports unresolved · Keep the auxiliary entry point directly under compiler/src and delegate to format.Gate · Silk compiler formatter
-
-2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter
-
-2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter
-
-2026-10-03 · Corpus setup used exact whitespace replacements in authored Silk fixtures and failed after the formatter rewrote them · Materialize scenarios before formatting in the same verification process, then rebuild and run every scenario against the formatted compiler and live standard library · Silk compiler formatter
-
-2026-10-03 · Inline workflow configuration escaped TypeScript checking and used an obsolete Effect Config API spelling · Move configuration into the checked FormatterVerification actor and smoke-test the exact runtime entry · Silk compiler formatter
-
+- 2026-10-03 · T3's generated `t3code/add-selfhost-formatter` branch was blocked by the repository push hook, so PR creation could not find its head · Push the workspace branch to `selfhost-formatter-document` with an explicit refspec · native formatter 2026-10-03 · Auxiliary compiler manifest rooted inside format/ changed the module search base and made format.* imports unresolved · Keep the auxiliary entry point directly under compiler/src and delegate to format.Gate · Silk compiler formatter 2026-10-03 · Focused local helper supported only source test roots, preventing standalone formatter-gate diagnostics after CI stopped at the first file · Add an explicit --build-formatter-gate mode that uses the existing shared slot and release trap · Silk compiler formatter 2026-10-03 · An asynchronous git push of HEAD resolved after a local branch switch and published the wrong task head · Push an explicit local branch ref, await completion before switching, and restore the scoped remote using an exact force-with-lease · Silk compiler formatter 2026-10-03 · Corpus setup used exact whitespace replacements in authored Silk fixtures and failed after the formatter rewrote them · Materialize scenarios before formatting in the same verification process, then rebuild and run every scenario against the formatted compiler and live standard library · Silk compiler formatter 2026-10-03 · Inline workflow configuration escaped TypeScript checking and used an obsolete Effect Config API spelling · Move configuration into the checked FormatterVerification actor and smoke-test the exact runtime entry · Silk compiler formatter
 - 2026-10-03 · Debug test build of SemanticCases failed in clang with "Instruction does not dominate all uses! alloca i8, i32 16" while the release compiler built fine; `silk test` deletes its build scope, so the bitcode was gone · The bootstrap spilled a slice local into one alloca at its first index site inside a loop and reused it for indexing the same slice in a later loop; move the second loop's indexing into a helper function. To keep test-build bitcode, temporarily make `NativeToolchain.withBuildScope` skip release in the local `packages/compiler/dist` · self-hosted compiler
-
 - 2026-10-03 · A focused M1 identity test passed after adding OwnerKind variants, but full selfhost CI found RuntimeEncoding.kindCode was non-exhaustive because M1 did not import that actor · Exercise canonical declaration encoding in the focused identity claim so new owner kinds reach both the source index and runtime identity encoder · selfhost Step 8a
-
 - 2026-10-03 · A mechanical rewrite-context edit left a double comma in a multiline signature, producing downstream stable-owner errors in unrelated callers · Check parameter-list punctuation first when a signature edit causes a cluster of borrow diagnostics; bind optional rewrite contexts to owned locals before borrowing them · self-hosted compiler Step 8b
-
 - 2026-10-03 · The capture-flow prototype tried to move an Option field through `&mut`, match a dereferenced Option exclusively, and move a value while its match binding remained borrowed · Use `Intrinsic.replace` to retain a complete owned local, end match scopes before moving it, and compute owned failure facts before mutating the containing flow · self-hosted compiler Step 8b
-
 - 2026-10-03 · The bootstrap backend could not resolve `TypedBody.environmentOf` when its borrowed result was used directly as a match subject · Bind the returned view to a stable local before matching it · self-hosted compiler
 - 2026-10-03 · Background agents spawned with worktree isolation from a `selfhost` checkout got worktrees on `origin/main`, where the selfhost compiler sources are missing, and some later could not run git against any other worktree · Have each agent verify `git log -1` against the intended base before editing and `git reset --hard <base>` in its own clean worktree; create follow-up branches inside the agent's own worktree · self-hosted compiler
 - 2026-10-03 · A long multi-agent refactor of `compiler/src` went stale when `selfhost` advanced ~430 commits mid-session, and the old bootstrap CLI could not validate ports onto the new tip · Build a second bootstrap CLI from the new tip in a separate worktree, port each commit onto it, and serialize the ~5 min, ~8 GB `silk check` runs with `flock` on a 4-core host · self-hosted compiler
-
 - 2026-10-03 · Boolean literal patterns in a new MIR helper were rejected by the bootstrap parser, failing draft CI before compiler construction · Use `if`/`else` to select boolean-dependent operand transport · self-hosted compiler Step 8d
-
 - 2026-10-03 · Staged-callable helpers used `let value = if ...`, producing parser and downstream type errors because Silk conditionals are statements · Initialize an owned result and assign it in each conditional branch; use a named callback instead of nesting anonymous callbacks in bootstrap-built source · self-hosted compiler Step 8d
 - 2026-10-03 · GitHub Actions job log and artifact blob downloads return 403 through the cloud agent proxy, so CI timing artifacts and raw logs could not be fetched · Read failures with the GitHub MCP `get_job_logs` tool and take durations from check-run start/end times · agent workflow
 - 2026-10-03 · `oxlint` on a freshly created worktree reported type-aware errors for workspace imports because dependent packages had no `dist` yet · Build the filtered dependency graph (shared Turbo cache) before linting · agent workflow
@@ -491,15 +256,10 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · A handoff's cloud LLVM path was absent in the macOS worktree, so a bootstrap probe passed checking but failed tool selection · Verify the executable and version in this checkout; macOS LLVM 22.1.8 is at /opt/homebrew/opt/llvm/bin, including explicit test clang/ar selections · selfhost Step 7 review
 - 2026-10-04 · New structured assertions passed source review but the focused bootstrap build rejected three nested anonymous Shared.with callbacks with SEM0199 · Move the inner callback into a concept-named test helper; compiler-root success alone does not check SemanticCases · selfhost Step 7 review
 - 2026-10-04 · A generic Shared.with call directly after `if let ... = move` was parsed as comparison/template syntax, producing cascading diagnostics in a large root · Bind the call result first, then match the local; bootstrap-check the integrated root before native acceptance · selfhost Step 7 review
-
 - 2026-10-03 · A repeated text marker put callable signature reification in the implementation-head resolver and failed the bootstrap build · Anchor edits inside the owning function and inspect the full diff before the focused run · self-hosted compiler
-
 - 2026-10-03 · Formatting the large semantic roots rewrote tens of thousands of unrelated lines · Preserve the focused source patch before formatting; use canonical byte comparison to verify a reduced diff retains the checked program · self-hosted compiler
-
 - 2026-10-03 · Direct field writes on a borrowed Option<State> pattern failed SEM0036, and treating its binding as a reference failed SEM0171 · The binding denotes the borrowed place; pass `&mut value` to the owning State operation, as `scopeState` already does · self-hosted compiler Step 8d
-
 - 2026-10-03 · An `if let` assertion against the fieldless `MirLocalKind.Temp` case produced parser errors and a misleading missing-return diagnostic · Test the case with a `match` Boolean, then branch on the result · self-hosted compiler Step 8d
-
 - 2026-10-04 · A nested scalar-enum spelling such as `access: Access.Mutable` was parsed as a binding followed by an unexpected dot in a record pattern · Bind the field and compare it in the arm body · self-hosted compiler Step 8d
 - 2026-10-04 · A clean textual merge retained new callable sites using a Copy helper and consumed-place arity superseded by generic premise-aware queries, failing the next bootstrap build · Audit nonconflicting callers too; use the owning general Copy query and pass lexical constraints through consuming-place checks · selfhost Step 7 integration
 - 2026-10-04 · Lifetime-recipe fixtures used a runtime byte literal and failed typing before reaching their intended exact-instance assertions · Use an admitted phantom lifetime instance plus a borrow-anchored factory, preserving separate Static/Local applications without manufacturing a static loan · selfhost Step 7 tests
@@ -507,27 +267,11 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · Abstract inherent Self shared its provider handle, so nested nominal comparison trapped in Shared.conflict despite immutable views · Use the existing identity-safe sameNominal operation; a debugger on the compiled test binary isolates the trap without rebuilding · selfhost Step 7 integration
 - 2026-10-04 · llvm-strings joined adjacent test identities, so line-anchored extraction omitted 27 catalog entries and the native test exchange exited before execution · Extract identity occurrences, not whole lines, then use the ordinary TestExchange encoder · selfhost Step 7 diagnosis
 - 2026-10-04 · A clean upstream test merge still projected gap.span after source-preserving diagnostics made it a bound operation, failing SEM0026 before any assertions · Audit nonconflicting imported helpers against the owning Gap API and use BackendGap.span(gap) · selfhost Step 7 integration
-
 - 2026-10-04 · A formatter-shifted CI stack line was attributed to the preceding combined assertion, wasting native-call diagnosis effort · Inspect numbered lines in an exact native-formatted copy before assigning the failure; line 35511 was the later loan-conflict oracle · selfhost Step 8d
-
 - 2026-10-04 · A generic Shared.with call directly after move in an if-let condition parsed its type arguments as comparison operators · Bind the generic call result first, then match the owned local · selfhost Step 8d generic staging
-
-- 2026-10-04 · A standalone block after a `let x = match ...` in a new Step 8 test was parsed as
-  a struct literal, and reused `Some {value}` arm names conflicted with an outer pattern binding.
-  Return from named match-arm helpers and use distinct binding names; check the source-written
-  test root with bootstrap before starting native CI · Silk compiler Step 8.
-
-- 2026-10-04 · Step 8 capture assertions assumed a staged environment had only its new local marker,
-  and checked unavailable callable bounds at the whole call. Staging also retains F's declared
-  environment; callable argument failures preserve the operand span. Assert both retained regions
-  and the operand span independently. Native formatter probes also require a selection inside the
-  manifest source root; use a disposable source-root copy and remove it afterward. · Silk selfhost
-
-- 2026-10-04 · Step 8's application-kind comparison indexed a slice parameter separately inside
-  borrowed union match arms, producing a non-dominating 16-byte LLVM spill even in a release build.
-  A three-variant standalone probe reproduced the exact CI instruction numbers. Inspect each
-  argument's kind before branching instead of indexing inside nested match arms. · Silk selfhost
-
+- 2026-10-04 · A standalone block after a `let x = match ...` in a new Step 8 test was parsed as a struct literal, and reused `Some {value}` arm names conflicted with an outer pattern binding. Return from named match-arm helpers and use distinct binding names; check the source-written test root with bootstrap before starting native CI · Silk compiler Step 8.
+- 2026-10-04 · Step 8 capture assertions assumed a staged environment had only its new local marker, and checked unavailable callable bounds at the whole call. Staging also retains F's declared environment; callable argument failures preserve the operand span. Assert both retained regions and the operand span independently. Native formatter probes also require a selection inside the manifest source root; use a disposable source-root copy and remove it afterward. · Silk selfhost
+- 2026-10-04 · Step 8's application-kind comparison indexed a slice parameter separately inside borrowed union match arms, producing a non-dominating 16-byte LLVM spill even in a release build. A three-variant standalone probe reproduced the exact CI instruction numbers. Inspect each argument's kind before branching instead of indexing inside nested match arms. · Silk selfhost
 - 2026-10-04 · An affine staging assertion looked up the first MIR reference with its target's owner identity, selecting capture DropGlue before the ordinary Function reference and returning no application · Skip same-owner references without a Function application; retain both early-exit and normal-path cleanup assertions · Silk selfhost Step 8
 - 2026-10-04 · A read-only formatter probe exceeded execFileSync's default output buffer with the large semantic test root · Give the probe a bounded 16 MB maxBuffer · Silk selfhost Step 8 review
 - 2026-10-04 · A baseline native-compiler build was queued from the same worktree being edited, so it would have built the modified sources rather than the baseline · Build baselines from a separate detached worktree at the base commit · selfhost Step 10b
@@ -536,46 +280,32 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-04 · A selfhost PR that added a native corpus program failed "main-first bootstrap provenance" because `packages/compiler/test/support/corpus.ts` is a bootstrap input, and every commit in the range is checked · Land corpus programs on `main` first and merge main into selfhost; rebuild the selfhost branch without the bootstrap-input commit (a revert does not clear the check) · selfhost Step 10b
 - 2026-10-04 · A new local named `visible` shadowed a `&mut Vector` parameter of the same name, and the bootstrap reported SEM0056/SEM0171 at a later unrelated call rather than a shadowing error · Search the enclosing signature for a name before introducing a local; the codebase forbids shadowing · selfhost Step 10b
 - 2026-10-04 · Step 8 MIR assertions confused physical local 0 (Return) with parameter 0 and assumed a section descriptor snapshot copied directly from that parameter · Assert LocalKind.Parameter(index:0), then trace earlier unprojected Copies through reference-typed Temp storage; MIR Local reads already materialize a descriptor temporary · Silk selfhost Step 8
-
 - 2026-10-04 · Adding ten higher-order callable tests exhausted the 8 GiB Linux bootstrap heap while compiling SemanticCases, before assertion execution · Keep the callable-result tests in their own source root and run its unchanged assertions with the same Linux timing gate · Silk selfhost Step 8
 - 2026-10-04 · After Step 9b merged, the "Run M1 semantic cases" bootstrap compile of SemanticCases ran out of the 8192 MiB Node heap on every PR stacked above selfhost (9c, #775) while selfhost itself still passed · Raised that one step to 10240 MiB; measure peak live heap with --trace-gc before raising again and prefer splitting the SemanticCases root · selfhost CI
-
 - 2026-10-04 · Higher-order MIR assertions assumed source-ordered references and a move directly from a parameter; references are hash-sorted and move lowering introduces temporaries · Select by original producer identity and trace preceding unprojected Use assignments while retaining the final Move and cleanup claims · compiler
 - 2026-10-04 · A `match` used as a value with block arms that end in an expression failed SEM0087 and cascaded into SEM0056 borrowed-view errors · Initialize a mutable result before the match and assign it in the arm · selfhost covariant loans
 - 2026-10-04 · Canonicalizing completed section schemas exposed an existing schema-only staging oracle after a full CI compile · Assert the completed ordinary application and original ordinal separately from a still-deferred schema, while retaining capture order, direct calls and layout checks · selfhost Step 8
 - 2026-10-04 · Runtime calls with `string` in the signature reported a native `typed-form` gap at the call span, which looked like a MIR call-target failure · Body typing rejected the signature as `Unsupported` (`runtimeType` admission) and `bodyCoverageGap` maps that span to `typed-form`; check signature admission predicates before tracing MIR · selfhost runtime text
 - 2026-10-04 · Moving witness loan metadata to optional vector slots left stale element type arguments in callback helpers, and a rewrite arm reused an enclosing parameter name · Update both vector access generics and name transported lifetime pattern values explicitly before repeating the whole source check · selfhost Step 8
 - 2026-10-04 · A field-selection helper used `let code = if ...`, which Silk parsed as an invalid expression and then reported cascading ignored-value errors · Use a mutable result and an ordinary `if` statement; catch this with the source checker before a native build · selfhost Step 8
-
 - 2026-10-04 · Interface witness metadata compiled in source checking but release emission rejected `Vector<Option<Shared<Lifetime>>>` reachable from `Type` with SEM0053 in `Slot.dropValue` · Store each positional optional region in the owning `CallableWitness.OperandLoan` record, following the existing `Lifetime.Member` representation; retain the exact presence mask and lifetime walkers · self-hosted compiler
 - 2026-10-04 · Combining append-only test merge hunks left a function open because both sides shared the closing brace outside the conflict · Inspect the common suffix, close each retained function independently, and source-check the combined root before publishing · selfhost Step 8
 - 2026-10-04 · `role` used as a local or parameter name in Silk sources failed the bootstrap build with PAR0002 cascades (`role` is a keyword) · Name it `rolePath`/`selectedRole`; keyword names show up only after a full bootstrap compile · selfhost Step 9d
 - 2026-10-04 · After #766 merged, both the local focused SemanticCases run and Linux CI "Run M1 semantic cases" aborted with a JavaScript heap OOM at the 8192 MiB bootstrap heap (also on the unrelated step9c branch) · Treat it as root-wide heap headroom, not a branch defect; report to the coordinator instead of bisecting the branch · selfhost Step 9d
-
 - 2026-10-04 · Using reserved `union` as a local or pattern binding in a new union control caused parser recovery to claim an extra `Option` declaration and hundreds of misleading type errors · Fix the first PAR diagnostic and use `unionType`/`isStructuralUnion` before investigating downstream imports · selfhost Step 8
-
 - 2026-10-05 · A partial-cleanup assertion bound `index` inside a function already owning an `index` local, producing cascading OWN0011/SEM0135 errors · Use `fieldIndex` and fix the first SEM0048 before investigating borrowed-view cascades · selfhost Step 8
-
 - 2026-10-05 · Indexing a borrowed projection slice again while the first Payload arm still borrows it caused OWN0011 in a test oracle · Extract an owned payload handle before reading the tail field; source-check the helper before native execution · selfhost Step 8
-
 - 2026-10-05 · A nested generic Option.Some pattern inside a Return record failed bootstrap parsing before test execution · Destructure Return then match the optional value in a separate if-let, as existing compiler walkers do · selfhost Step 8
-
 - 2026-10-05 · Automatic merges combined newly assigned CallableOrigin and EffectComposite discriminator numbers without a text conflict, making the copier choose the wrong variant · Audit the entire combined tag table and every copier guard after variant integrations; reserve distinct tags across pending layers and retain existing corpus copy coverage · selfhost Step 8
-
 - 2026-10-05 · Passing a borrowed MIR pattern binding directly to Option.some<&Place> inferred the Place referent and failed SEM0100 in the provenance oracle · Write the explicit &place loan and source-check both roots before native execution · selfhost Step 8
-
 - 2026-10-05 · Generalizing every schema's lifetime/row deferral exposed 57 pre-existing diagnostics through named Effect provider sections · Compare against an isolated exact-head compiler, restrict new lifetime staging to anonymous schemas, and rerun the complete cheap CLI corpus; restored 82 PASS/0 FAIL · selfhost Step 8
-
 - 2026-10-05 · A helper nested a Shared.with lambda inside another lambda and failed SEM0199 during bootstrap checking · Give the inner predicate a named sibling function before taking a native build hold · selfhost Step 8
 - 2026-10-04 · A focused selfhost test failed with only `unhandled error: AssertionError` (the runner prints no assertion message), so the rejection code behind a failed `demandMir` was invisible · Add a throwaway helper that matches the answer's `GapCode`/`RejectionCode` with one `Testing.expect(false, ...)` per arm; the failing trace line names the code (here `Cycle` from `bodySignatureConstraints` demanding an `effect {}` block's derived signature) · selfhost Step 9 Effect literals
 - 2026-10-04 · The rebased Step 9 base stack did not type-check (`union` keyword local, missing call operands), so every focused check failed before reaching the new slice · Type-check the base head first (`node packages/cli/dist/bin.js check --manifest-path compiler/silk.toml` under the build slot) and keep base repairs in their own commit · selfhost Step 9 Effect literals
-
 - 2026-10-05 · A full-manifest source check was accidentally launched without the documented Node heap allowance and exhausted the default 4 GiB heap · Use the focused bootstrap check manifest with NODE_OPTIONS=--max-old-space-size=8192; rely on exact-head CI for the full compiler guard · selfhost Step 8
-
 - 2026-10-05 · A contextual repeated-family negative control demanded an abstract Body but expected the later opaque realization rejection · Demand the producer MIR, as existing opaque-return divergence controls do; retain Body demands for immediate contract and assignment diagnostics · selfhost Step 8
 - 2026-10-04 · In a worktree-isolated agent session, Bash refused heredocs, `/usr/bin/time`, and `VAR=... node` prefixes as "too complex to verify", blocking builds and Python edits · Write the command or edit script to a /tmp file with the Write tool and run it as `zsh /tmp/x.sh` or `python3 /tmp/x.py` · selfhost Step 9e
 - 2026-10-04 · `SILK_SELFHOST_CORPUS_CASES=""` selected zero programs and the corpus runner reported success instantly · Leave the variable unset to run the whole corpus · selfhost corpus
-
 - 2026-10-05 · `node --trace-gc` in `NODE_OPTIONS` made Node 24.18.1 exit 9 before compiling ("--trace-gc is not allowed in NODE_OPTIONS") · Pass `--trace-gc` and other V8 tracing flags on the `node` command line; keep only heap-size flags in `NODE_OPTIONS` · compiler perf
 - 2026-10-05 · `/usr/bin/time` was missing in the cloud container, so the first benchmark exited 127 immediately · `apt-get install -y time` before benchmarking · compiler perf
 - 2026-10-05 · A 665 MB heap snapshot could not be loaded with `JSON.parse(readFileSync(...))` (string longer than 0x1fffffe8) · Stream the numeric `nodes`/`edges` arrays from the buffer and parse only `strings` as JSON · compiler memory
@@ -586,63 +316,45 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · `packages/compiler/scripts/lifetime-benchmark.mjs` fails on main with `TypeError: undefined is not a function` in `retainedProofs` (line 307) · Profile lifetime analysis through the CLI or focused tests until the script is repaired · compiler perf
 - 2026-10-05 · CPU profiles of compiler sources run through tsx lost most function names · Profile the built `dist` JavaScript and map functions back to `src` by name · compiler perf
 - 2026-10-05 · A "light" focused vitest run of 14 compiler files started 4 workers of about 1.8 GB each beside a selfhost benchmark, drove the load average to 20 on 4 cores, hit a 30-minute limit and invalidated the benchmark's timing · Run compiler vitest files with `--maxWorkers=1` or 2 under the same lock as heavy jobs whenever a benchmark is timing · compiler perf
-
 - 2026-10-05 · An anonymous fixed-Static callback negative failed native assertions because environment lifetime proof was relabeled as a signature mismatch · Preserve UnsatisfiedLifetimeBound at a plain callable operand; keep authored inference and structural mismatch diagnostics separate · selfhost Step 8
-
 - 2026-10-05 · A focused bootstrap check manifest rooted directly in src/semantic treated src/semantic as the module root and produced unrelated unknown-import diagnostics · Put the temporary import-only root in compiler/src so hir/backend/semantic imports retain the compiler module root · selfhost Step 8
 - 2026-10-05 · Admitting piped `effect fn` sections turned ~50 corpus programs from a named `typed-form` gap at `|> Effect.provideMut<…>(…)` into hard FAILs (UnknownMember for a member-call Effect argument of a `provides`-bound call, TypeArgumentInference for Effect environment regions) that the earlier gap had hidden · Diff the full corpus outcome per program (not just counts) before and after any gap removal, and name each newly exposed deferral before publishing · selfhost Step 10
-
 - 2026-10-05 · A named section assertion expected the written Borrow syntax ordinal, but call inference deliberately rewrites the reference to the enclosing call region while preserving the Borrow origin · Derive expected lifetime evidence from the CallableCall site and independently retain its distinct Borrow argument and typed region · selfhost Step 8
-
 - 2026-10-05 · The selfhost workflow hit its 45-minute job timeout during HIR compilation after all callable and target assertions passed, leaving HIR and B11 unchecked · Allow 60 minutes for sequential native root builds while retaining every per-test timing gate · selfhost Step 8
 - 2026-10-05 · A Semantic-only PR failed "Run callable result cases" twice on the 2 s per-test gate (`interfaceCallableResultsKeepSelectedOriginalTargets` 2.0–2.5 s) while the same commit stacked in another PR ran it in 1.08 s; every step of the failing runs was ~1.5x slower (M1 semantic cases 15 min vs 10 min) · Compare the same test across runs and the step durations before suspecting the change; the borderline callable-result tests flake on slow runners · selfhost Step 10
 - 2026-10-05 · Codebase Memory could not index the bundled-CLI checkout because a pre-coordination or unverified generation was active · Inspect the worker log and use targeted source reads until indexing is available · compiler distribution
 - 2026-10-05 · Focused Oxlint on a CLI script missed a direct `process.env.PATH` warning that the full CI scan reported · Read explicit environment configuration through Effect Config; reproduce whole-scope lint only after its workspace declarations are built · CLI packaging
-
 - 2026-10-05 · Bootstrap artifact promotion depended on all main checks, so existing native corpus failures and archived conformance fixture paths prevented any selfhost download despite passing isolated Node/Bun bundle checks · Gate distribution on the dedicated bundled CLI job and leave broader CI failures visible · compiler distribution
 - 2026-10-05 · `run Svc.op()` failed body typing with a bare `Unsupported` at the call; the cause was `resolveTargetSchema` returning none for any declaration whose parent is not an `impl` (service operations) · Probe the rejection's code and span with temporary per-candidate `Testing.expect(false, ..)` lines, then search the schema/application path before the call checker · selfhost Step 9d
 - 2026-10-05 · Providers resolved for every recorded direct call, including `effect fn` constructions that are only stored, so an outer non-effect caller gapped on rows it never runs · Serve a callee's row only where the call executes; skip constructions that are not a `run` operand · selfhost Step 9d
 - 2026-10-05 · Focused SemanticCases runs took 10–15 min each while other agents' bootstrap compiles shared the machine, so every probe cycle stalled · Batch several candidate probes (code and span arms) into one run and keep probing to the first decisive split · selfhost Step 9d review
 - 2026-10-05 · Codebase Memory could not index the bundled-CLI checkout because a pre-coordination or unverified generation was active · Inspect the worker log and use targeted source reads until indexing is available · compiler distribution
 - 2026-10-05 · Focused Oxlint on a CLI script missed a direct `process.env.PATH` warning that the full CI scan reported · Read explicit environment configuration through Effect Config; reproduce whole-scope lint only after its workspace declarations are built · CLI packaging
-
 - 2026-10-05 · Bootstrap artifact promotion depended on all main checks, so existing native corpus failures and archived conformance fixture paths prevented any selfhost download despite passing isolated Node/Bun bundle checks · Gate distribution on the dedicated bundled CLI job and leave broader CI failures visible · compiler distribution
-
 - 2026-10-05 · Merging an updated selfhost base moved the fork point past an earlier main sync, so the bootstrap provenance guard rejected that clean landed merge · Validate the bootstrap tree against the landed main parent independently of the later fork point; continue rejecting novel bootstrap edits · selfhost CI
 - 2026-10-05 · Profiling one slow selfhost test was blocked: `silk test` rebuilds the test binary when it changes (so a wrapper script is overwritten), passes a temporary plan file that is deleted after the run, and a captured plan runs every test in the root · Capture the plan once, rewrite it with `TestExchange.decodePlan`/`encodePlan` from `packages/cli/dist` so every other entry is `Cached` (give it any `executionIdentity`), then run `compiler/build/test/llvm/<triple>/debug/silk-compiler --silk-test-plan <plan> --silk-test-result <receipt>` under `valgrind --tool=callgrind`. Read self cost, not inclusive: Effect frames make inclusive totals exceed 100%. In the debug test build ~90% of `interfaceCallableResults*` instructions are the byte-wise stdlib `memmove` · selfhost Step 8 timing (#807)
 - 2026-10-05 · Removing the call-site `effect-form` gap for declared `Effect<...>` results exposed producer-body rejections that had never been reached (a `never` match guard as `ConditionNotBool`, interface Effect construction as raw `Unsupported` during opaque realization, the mutable-place `run` rule) as hard corpus FAILs · Diff the full corpus after the change, probe each FAIL with a small program on the built compiler against a saved baseline binary, and name each newly reached deferral at its body site · selfhost Step 9 joins
 - 2026-10-05 · A worktree-isolated agent's shell guard refused compound commands (`$(...)`, `for` loops over `bash`, long heredocs) · Put helper commands in small scripts under `/tmp` and invoke them with plain arguments · selfhost Step 9 joins
 - 2026-10-06 · Bootstrap checking reported “Semantic analysis expected a terminal statement” for a new effect function that returned inside a loop and used `usize.ZERO` without importing `silk.usize` · Check the missing module import when this exception hides normal diagnostics; adding it restored the ordinary diagnostic pass · compiler incremental LLVM
-
 - 2026-10-05 · Main CI jobs stayed queued for 15 minutes and were cancelled with “The job was not acquired by Runner of type hosted even after multiple attempts” · Inspect check-run annotations to distinguish runner allocation from code failures, then retry only affected jobs · selfhost artifact distribution
-
 - 2026-10-05 · A newly landed main-first verifier guard rejected earlier feature-branch verifier edits even after a merge restored the main-owned files · Consolidate the feature onto the current selfhost base, retain corpus promises in JSON and exact rejection checks in the selfhost workflow, then verify provenance before a lease-protected push · selfhost Step 9 joins
 - 2026-10-05 · An observer MIR test failed with a bare AssertionError because the generic `observeWith(move log, onEvent, body())` wrapper call gapped as `typed-form` at the named callback argument, not in the new observer lowering · Probe the gap code first, then the span with per-candidate `backendGapAt` lines in one build; test the reader through a direct `Intrinsic.observeDiagnostics(...)` run · selfhost failure observer
 - 2026-10-05 · A use/release observer test spent two probe builds before showing that `useReleaseNonParking(Token {..}, useToken, releaseToken)` with plain `fn(&mut Token) -> once Effect<..>` callables fails body typing in selfhost (no selfhost test lowers use/release MIR at all) · Probe `demandBody` success before MIR facts; cover hold carries through `finalizeEffect`, which shares the carry path · selfhost failure observer
-
 - 2026-10-06 · Authored snapshot tar extraction inherited the restrictive workspace umask and lost recorded source file permissions · Restore with `tar --same-permissions` and verify every file mode as well as bytes · selfhost native seed
 - 2026-10-06 · Prebuilt cloud bootstrap/dist predates main and emits stale immutable generated test_runner errors; a Turbo rebuild invoked fallback pnpm and removed shared deps · Restore via inherited-proxy frozen pnpm install, patch effect-tsgo, regenerate sources and directly build current CLI dependency graph before native checks · self-build orchestration.
 - 2026-10-06 · A direct bootstrap native build reached tool selection and failed `MissingCapability: clang` despite `SILK_TEST_CLANG` being set; that variable selects test tools only · Put the prepared LLVM bin directory on PATH for production `silk build`, and keep the build under the shared heavy-work lock · selfhost exact IR CLI
-
 - 2026-10-06 · Shared worktree dependency links did not expose esbuild to the verification bundler and a direct script typecheck missed Node declarations/generated toolchain inputs · Set NODE_PATH to the existing esbuild package for bundling; pass compiler @types explicitly and materialize the ignored ToolchainIntegrity.generated.ts locally · self-build corpus tooling
-
 - 2026-10-06 · Codex attach_artifact stalled from both worker and coordinator for963/964 · Attempt attachment without holding merges, record pending retry in ledger · Silk orchestration.
 - 2026-10-06 · An outer Cases parser probe did not validate embedded source strings, so an invalid `&[Allocation; 1]` fixture consumed a native rebuild · Parse fixture text directly before native checks; references to fixed arrays use `&([Allocation; 1])` · self-build semantic
 - 2026-10-06 · Strict JSONL codec bootstrap checking rejected a borrowed Stage match, nested anonymous callback, and implicit mutable-reference moves · Use explicit borrowed matches/reborrows and a named source-observation helper; keep parser and focused native checks before merge · self-build diagnostic codec
 - 2026-10-06 · Tooling tests outside package roots could not resolve @effect/vitest, and mixed compiler source/dist imports split nominal source-span identity · Declare root tooling dependencies and use one supported compiler package facade throughout the actor and tests · compiler tooling
-
 - 2026-10-06 · Installing isolated root dependencies while package node_modules still linked to a shared worktree rewrote shared package links and launchers, mixing Vitest instances · Remove every package dependency symlink before installation; restore affected shared links under the common lock and verify runner identity · agent workflow
 - 2026-10-06 · A native test CLI filter containing `|` selected zero tests because filters are literal substrings · Retain the actual uncached plan and execute the same built runner with the shared `Gap` substring; verify two discovered, selected and executed cases · self-build URI/TOML CI repair
-
 - 2026-10-06 · Isolated inventory smoke archived the complete stdlib through execFileSync’s default 1MiB buffer and failed ENOBUFS · Set the existing smoke archive limit explicitly to 64MiB for the second fixture archive · standalone inventory publication
-
 - 2026-10-06 · Immediate NodeRuntime failure exit truncated inventory JSON still queued on stdout, and a permissive local umask produced non-Git fixture modes · Await the stdout write callback before red exit; create fixture sources with explicit Git0644 permissions · standalone inventory publication
 - 2026-10-06 · The HTTP explicit-Local guard fixture failed bootstrap checking on nested Shared callbacks and transient borrowed Vector element aliases · Use named sibling predicates and stable slice aliases, preserving the actual checked lifetime and every inference assertion · selfhost branch-CI lifetime repair
-
 - 2026-10-06 · Native receipt test discovery imported the compiler frontend before its ignored toolchain identity was generated in a clean N0 checkout · Build only the LLVM distribution and run the existing identity generator before the complete contract test glob · native contract CI setup
-
 - 2026-10-06 · A pnpm package build tried to refresh shared dependency links automatically, while a root-local type check missed the compiler package's Node types · Use direct package script binaries for owned local outputs and run the configured type check from the compiler package; CI keeps its frozen-install pnpm commands · native contract CI setup
-
 - 2026-10-06 · A local `silk build --manifest-path compiler/silk.toml` ran 13 minutes, then failed with `Unknown attribute kind (102)`: the bootstrap emits LLVM 22 bitcode but invokes the first `clang` on PATH and ignores `SILK_TEST_CLANG` · Install the pinned LLVM 22.1.8 into `.scratch/llvm-22.1.8` (see `.github/actions/setup-linux-llvm`) and put its `bin` first on PATH before building N0 · local self-build loop
 
 - 2026-10-06 · A CI round trip was lost to parse errors: `if let ... = move HashMap.get<K, V>(...)` parses as `move HashMap.get` followed by `<`, because `move` takes a place, and `run f() && g` parses as `run (f() && g)` · Bind generic calls to a local before `move`, bind `run` results to locals before combining them, and parse-check edited sources locally without building: copy them into a scratch package and run the bootstrap `silk format --check --manifest-path <scratch>/silk.toml <files>`, which reports `cannot format damaged source (PAR...)` for parse errors in seconds even for Semantic.silk · self-hosted compiler
