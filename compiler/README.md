@@ -107,8 +107,26 @@ An instance receives one hidden provider address per entry of its requirement ro
 service-role key order (D2), and its key names each provider's type. Running
 `Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
 `Svc.op(args)` calls the witness for the serving provider's type with the provider address as its
-receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
-sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
+receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`.
+Catalog `Intrinsic` type families outside the storage core, such as `Intrinsic.Execution`, report
+`core-type`.
+
+The storage core follows the bootstrap. `Allocation`, `RawBuffer<T>` and `Slot<'storage, T>` are
+reserved in type position, and `Intrinsic.SharedCore<T>` and `Intrinsic.StorageFailure` are sealed
+families; `semantic.SealedCore` owns their identities and record storage. An allocation is six
+target words (aligned base, requested bytes and alignment, reclaim tag, `malloc` context, active
+marker), a raw buffer is its allocation and element count, a slot is one element address, and a
+shared core addresses a local, non-atomic control block holding the strong count, the access
+state, its own allocation and the value. The storage primitives the standard library calls
+(`semantic.StorageOperation`) are typed from their written type arguments and expand to ordinary
+MIR: layout validation, bounds checks and count exhaustion trap, `run
+Intrinsic.systemAllocationAcquire(layout)` calls the sealed C `malloc` and fails with
+`StorageFailure` on a refused request, raw-buffer copies and fills call `memmove` and `memset`, and
+`Intrinsic.replace(place, value)` moves the displaced value out of a mutable place. Allocation glue
+calls `free` on its context, a raw buffer drops only its allocation, and shared-core glue counts
+references and drops the value and allocation with the last handle. Raw-buffer and slot contents
+stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
+standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
@@ -510,8 +528,8 @@ and `Intrinsic.NonParking` are witness-free properties recorded on generic bound
 representation parameter retains no region. An `Intrinsic.application` import selects the canonical
 module explicitly bound to the semantic request; an active import without that binding rejects at
 the import, and different bindings have separate query identities. Its imported members obey the
-usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
-such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
+usual visibility and selective-import rules. Other intrinsic families and `impl Intrinsic` are
+`Unsupported` until intrinsic applications exist.
 
 Body-sensitive representation-property proofs, row subtraction such as `Without<R, K>` (which
 belongs to the later provision and requirement-algebra work), requirements on type parameters,
