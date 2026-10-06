@@ -116,10 +116,6 @@ f(arguments..., providers..., success: address, failure: address) -> status  whe
 - `destination` has the callee's `E`. When the caller's failure type is wider (for example
   `NotFound` into `NotFound | Offline`), the edge block injects it into the caller's `Failure`.
   When the types are equal, emission may pass the caller's `Failure` directly.
-- A witness callee's `E` is the witness's own declared failure, which EFF-009 bounds by its
-  operation's and may be narrower, down to `never`. The call carries that witness failure
-  (`CallTarget.witnessFailure`), so a `never` witness has no edge and a narrower one is injected
-  like any other narrower callee failure.
 - Ordinary `fn` has no failure channel (EFF-006). A closed `run` in an ordinary function is a call
   with no failure edge.
 - Traps are unchanged: no status and no cleanup (FAIL-007).
@@ -342,7 +338,7 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 | `observer-callback`        | **new** (observer note)     | an `observeDiagnostics` callback that is not a direct function                                                                  | callback environments in the observer record                                             |
 | `failure-identity`         | **new** (observer note)     | an observed `fail` of a type other than a nominal, primitive or unit type                                                       | identity rendering for the remaining types                                               |
 | `typed-form`               | narrower                    | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land                                                              | per PR                                                                                   |
-| `interface-effect-witness` | narrower                    | an `effect fn` interface call that no `run` executes in place                                                                   | lowering stored interface Effect constructions; owner: Step 9 follow-up                  |
+| `interface-effect-witness` | narrower                    | an `effect fn` interface call that no `run` executes in place, or whose witness declares a failure other than the promised one  | lowering stored interface Effect constructions; owner: Step 9 follow-up                  |
 | `cleanup` (owned provider) | extended (Step 9d)          | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run)                                | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up                                 |
 
 Every gap is a structured `Unsupported` result naming the owner instance and span. None becomes a
