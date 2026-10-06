@@ -60,14 +60,16 @@ part of the evaluated subject (MATCH-002); typing lists every arm's binding decl
 unused binding is an owner too. `drop`, `move` or `match move` of a binding, a partial move out of
 one and moves that differ per arm or per path then use the ordinary owner states and drop flags.
 The bindings of a destructuring `let` belong to the enclosing block; those of a `match` or `if let`
-arm end with the arm, innermost first. The subject then drops only what no binding took, such as
-fields omitted with `..`. A static partial move leaves a hole in its owner: the owner is then
-dropped child by child, skipping moved children, and writing a moved child back makes it whole
-again. A hole beneath a type with a Drop hook is rejected as `OWN0002`. Holes that differ between
-joining paths, a maybe-moved partial owner, a write at a runtime index beside a moved element, a
-guard that changes an owner's state or consumes a binding of its arm (the bootstrap rejects such
-moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
-changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
+arm end with the arm, innermost first. The subject drops only what no binding took, such as fields
+omitted with `..`: a `match` arm drops it when the arm ends, while `if let` and `let` drop it, or
+the whole unmatched `if let` subject, once a path is selected and before it runs (PATT-008). A
+static partial move leaves a hole in its owner: the owner is then dropped child by child, skipping
+moved children, and writing a moved child back makes it whole again. A hole beneath a type with a
+Drop hook is rejected as `OWN0002`. Holes that differ between joining paths, a maybe-moved partial
+owner, a write at a runtime index beside a moved element, a guard that changes an owner's state or
+consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
+report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
+created temporaries still report the `cleanup` gap.
 Effect fn bodies are typed against their declared success, failure and requirement channels.
 Calling an `effect fn` builds an exact Effect whose representation is the call's application and
 written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect

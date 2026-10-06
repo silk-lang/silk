@@ -168,7 +168,8 @@ The facts that produce it come from typing and from a lowering-time cleanup stac
    functions MATCH-001). An owned place is a local or a projection of a consuming match's
    evaluated subject: once the arm is selected, each by-value binding that needs cleanup owns its
    part, in the arm's scope or, for a destructuring `let`, the enclosing block's. The subject keeps
-   a hole for each binding and drops only the rest when the arm ends.
+   a hole for each binding and drops only the rest: when a `match` arm ends, or for `if let` and
+   `let` as soon as a path is selected ([patterns PATT-008](../../apps/docs/content/reference/patterns-and-destructuring.md#patt-008--a-consuming-conditional-consumes-on-both-outcomes)).
 
 Ordinary functions cannot fail (EFF-006), so Step 6 exercises return, break and continue edges.
 Failure-edge cleanup uses the same stack and lands with Step 9's first fallible call.
