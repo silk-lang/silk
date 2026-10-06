@@ -31,6 +31,7 @@ import backend.RuntimeType {Projection as RuntimeProjection}
 import backend.Gap {Code as GapCode, Gap as BackendGap}
 import backend.DropGlue {
   Child as GlueChild,
+  CoreCleanup,
   Children as GlueChildren,
   DropGlue,
   Remainder,
@@ -75,6 +76,7 @@ import backend.Mir {
   RunPlan as MirRunPlan,
   JoinArm as MirJoinArm,
   NodePlan as MirNodePlan,
+  StoragePlan as MirStoragePlan,
   CarrierPlan as MirCarrierPlan,
   Block as MirBlock,
   Local as MirLocal,
@@ -191,6 +193,8 @@ import semantic.MixedBody {
   StaticArguments as MixedStaticArguments,
 }
 import semantic.SealedCore
+import semantic.SealedCore {Core as SealedKind, Field as CoreField, CFunction as SealedFunction}
+import semantic.StorageOperation {StorageOperation}
 import semantic.StaticExecution
 import semantic.StaticExecution {
   Binding as StaticBinding,
@@ -1045,6 +1049,8 @@ union ResolvedTarget {
   Intrinsic {member: IntrinsicMember, typeArguments: Vector<Shared<Type>>},
   /// A sealed Effect composition intrinsic and its written type and row arguments.
   Composition {operation: Composition, written: Vector<Argument>},
+  /// A sealed core storage primitive and its written type arguments.
+  Storage {operation: StorageOperation, typeArguments: Vector<Shared<Type>>},
   Tuple {ty: Shared<Type>, elements: Vector<Shared<Type>>},
   Selected {fact: SelectionFact},
 }
@@ -6524,12 +6530,6 @@ effect fn selectDeclaration(
   }
   if selected.count == usize.ZERO {
     let mut code = RejectionCode.UnknownName
-    // The sealed `silk/core` storage nominals need no import. Selfhost does not implement them
-    // yet, so an unresolved use of one of these three compiler-sealed names reports a named
-    // deferral instead of UnknownName; this only classifies a failure and selects no declaration.
-    if same(name, b"Allocation") || same(name, b"RawBuffer") || same(name, b"Slot") {
-      code = RejectionCode.CoreTypeUnavailable
-    }
     if external {
       code = RejectionCode.UnknownMember
     }
@@ -6796,6 +6796,85 @@ effect fn qualifiedTypeDeclaration(
   )
 }
 
+// Resolves one written application of a sealed core: no arguments for `Allocation` and
+// `Intrinsic.StorageFailure`, one type for `RawBuffer` and `Intrinsic.SharedCore`, and a lifetime
+// then a type for `Slot`. A wrong count points at the first excess argument, or at the list.
+effect fn sealedCoreType(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  moduleOrdinal: usize,
+  module: &ModuleId,
+  core: SealedKind,
+  application: Option<HirId>,
+  span: Span,
+  binders: &[Binder],
+  elision: &mut LifetimeElision,
+) -> Result<Shared<Type>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let expected = SealedCore.arity(core)
+  let mut supplied = Range.empty()
+  let mut listSpan = span
+  if let Option<HirId>.Some {value: arguments} = move application {
+    let written = run typeNode(&mut resolver.*, module, arguments)
+    if let Option<HeaderSyntax>.Some {value: found} = move written {
+      if let Node.TypeArguments {arguments: listed, environment, failures, requirements} = found.header {
+        if environment.present || failures.present || requirements.present {
+          return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span))
+        }
+        supplied = listed
+        listSpan = found.span
+      }
+    }
+  }
+  if supplied.length != expected {
+    let mut argumentSpan = listSpan
+    if supplied.length > expected {
+      let excess = run typeChild(&mut resolver.*, module, supplied, expected)
+      if let Option<HirId>.Some {value: child} = move excess {
+        let argument = run typeNode(&mut resolver.*, module, child)
+        if let Option<HeaderSyntax>.Some {value: argumentSyntax} = move argument { argumentSpan = argumentSyntax.span }
+      }
+    }
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run rejectArity(&resolver.*, module, argumentSpan, expected, supplied.length))
+  }
+  let mut arguments = Vector.make<Argument>()
+  let mut at = usize.ZERO
+  while at < supplied.length {
+    let child = run typeChild(&mut resolver.*, module, supplied, at)
+    let argument = match move child {
+      Option<HirId>.Some {value} => value
+      Option<HirId>.None => {
+        return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, listSpan))
+      }
+    }
+    if core == SealedKind.Slot && at == usize.ZERO {
+      let region = run writtenOrElidedLifetime(&mut resolver.*, module, HirRef.of(argument), span, binders, &mut elision.*)
+      match move region {
+        Result<Shared<Lifetime>, Shared<Rejection>>.Success {value} => {
+          run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move value})
+        }
+        Result<Shared<Lifetime>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
+        }
+      }
+    } else {
+      let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, argument, binders, &mut elision.*)
+      match move resolved {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => {
+          run Vector.append<Argument>(&mut arguments, Argument.Type {value: move value})
+        }
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Result.succeed<Shared<Type>, Shared<Rejection>>(run SealedCore.make(core, move arguments))
+}
+
 effect fn qualifiedType(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -6810,6 +6889,13 @@ effect fn qualifiedType(
 ) -> Result<Shared<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
+  // `Intrinsic.SharedCore<T>` and `Intrinsic.StorageFailure` are sealed core storage families.
+  if same(Bytes.asSlice(&segments[usize.ZERO]), b"Intrinsic") && segments.length == 2 {
+    if let Option<SealedKind>.Some {value: core} = move SealedCore.intrinsicFamily(Bytes.asSlice(&segments[usize.ONE])) {
+      return run sealedCoreType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, core,
+        move application, span, binders, &mut elision.*)
+    }
+  }
   let selected = run qualifiedTypeDeclaration(&mut resolver.*, &mut owner.*, &mut dependencies.*,
     moduleOrdinal, module, segments, span)
   let declaration = match move selected {
@@ -6872,7 +6958,8 @@ effect fn joinUnionMember(
       return Option.some<Shared<Rejection>>(move error)
     }
   }
-  if Shared.with<Type, bool>(&ty, borrowedOrBare) {
+  // A slot selection, directly or as fixed-array elements, is never a union member.
+  if Shared.with<Type, bool>(&ty, borrowedOrBare) || Shared.with<Type, bool>(&ty, SealedCore.storesSelection) {
     return Option.some<Shared<Rejection>>(
       run unionMemberRejection(&mut resolver.*, module, memberId),
     )
@@ -8860,28 +8947,11 @@ effect fn resolveType(
       }
       if segments.length == usize.ONE {
         let name = Bytes.asSlice(&segments[usize.ZERO])
-        // The compiler-sealed owner is reserved in type position before source names or binders.
-        if same(name, b"Allocation") {
-          if let Option<HirId>.Some {value: arguments} = move application {
-            let written = run typeNode(&mut resolver.*, &module, arguments)
-            if let Option<HeaderSyntax>.Some {value: found} = move written {
-              if let Node.TypeArguments {arguments: supplied, environment, failures, requirements} = found.header {
-                if supplied.length > usize.ZERO || environment.present || failures.present || requirements.present {
-                  let mut argumentSpan = found.span
-                  if supplied.length > usize.ZERO {
-                    let first = run typeChild(&mut resolver.*, &module, supplied, usize.ZERO)
-                    if let Option<HirId>.Some {value: child} = move first {
-                      let argument = run typeNode(&mut resolver.*, &module, child)
-                      if let Option<HeaderSyntax>.Some {value: argumentSyntax} = move argument { argumentSpan = argumentSyntax.span }
-                    }
-                  }
-                  return Result.failResult<Shared<Type>, Shared<Rejection>>(
-                    run rejectArity(&resolver.*, &module, argumentSpan, usize.ZERO, supplied.length))
-                }
-              }
-            }
-          }
-          return Result.succeed<Shared<Type>, Shared<Rejection>>(run SealedCore.allocation())
+        // The compiler-sealed storage owners are reserved in type position before source names or
+        // binders; expression and inherent-owner lookups of the same spelling stay ordinary.
+        if let Option<SealedKind>.Some {value: core} = move SealedCore.reservedName(name) {
+          return run sealedCoreType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, &module, core,
+            move application, value.span, binders, &mut elision.*)
         }
         let known = binders
         let mut at = usize.ZERO
@@ -8984,8 +9054,7 @@ effect fn resolveType(
             run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()}),
           )
         }
-        let applied = match &application { Option<HirId>.Some {..} => true _ => false }
-        let resolvedNamed = run namedType(
+        return run namedType(
           &mut resolver.*,
           &mut owner.*,
           &mut dependencies.*,
@@ -8998,17 +9067,6 @@ effect fn resolveType(
           binders,
           &mut elision.*,
         )
-        // An applied `RawBuffer<T>` or `Slot<'a, T>` that no visible generic declaration accepts
-        // names the sealed core storage family; selfhost does not implement it yet. This only
-        // classifies a failed resolution; a visible declaration of that name still wins.
-        if applied && (same(name, b"RawBuffer") || same(name, b"Slot")) {
-          if let Result<Shared<Type>, Shared<Rejection>>.Failure {..} = &resolvedNamed {
-            return Result.failResult<Shared<Type>, Shared<Rejection>>(
-              run reject(&resolver.*, &module, RejectionCode.CoreTypeUnavailable, parsed.span),
-            )
-          }
-        }
-        return move resolvedNamed
       }
       if segments.length == 2 {
         return run qualifiedType(
@@ -11426,6 +11484,15 @@ effect fn locationOfInstance(resolver: &mut Resolver, instance: &InstanceKey) ->
   InstanceLocation,
 > ! Cycle | OutOfMemoryError ? &mut Allocator {
   let identity = InstanceKey.identity(instance)
+  // Glue owned by a sealed core has no source declaration. Backend keys of glue are identified by
+  // their content, so its location only anchors query bookkeeping to an indexed module.
+  if let Option<Shared<Type>>.Some {..} = move InstanceKey.glueType(instance) {
+    let sealed = Shared.with<DeclarationId, Option<SealedKind>>(&identity, SealedCore.declarationCore)
+    if let Option<SealedKind>.Some {..} = move sealed {
+      if Vector.length<ModuleId>(&resolver.modules) == usize.ZERO { return Option.none<InstanceLocation>() }
+      return Option.some<InstanceLocation>(InstanceLocation {module: usize.ZERO, declaration: usize.MAX})
+    }
+  }
   return run locationOfIdentity(&mut resolver.*, &identity)
 }
 
@@ -14309,12 +14376,25 @@ effect fn scanFieldType(hir: &Module, id: HirId, binders: &[Binder], scan: &mut 
   }
   let mut effectType = false
   if let Node.Path {segments} = Module.node(hir, named.id) {
+    // A storage core has no source field references; only its written element types can generate
+    // lifetimes. Member typing still validates its arguments.
+    if sealedStorageName(hir, segments) {
+      if typeArguments.present {
+        if let Node.TypeArguments {arguments: supplied, ..} = Module.node(hir, typeArguments.id) {
+          let mut at = usize.ZERO
+          while at < supplied.length {
+            let argument = Module.child(hir, supplied, at)
+            let lifetime = match Module.node(hir, argument) { Node.Lifetime {..} => true _ => false }
+            if !lifetime { run scanFieldType(hir, argument, binders, &mut scan.*) }
+            at = at + usize.ONE
+          }
+        }
+      }
+      return ()
+    }
     if segments.length == usize.ONE {
       if let Node.Name {text} = Module.node(hir, Module.child(hir, segments, usize.ZERO)) {
         let spelling = Module.text(hir, text)
-        // Reserved Allocation has no lifetime parameters or source field references. Actual
-        // member typing still validates its zero arity; invalid arguments generate no lifetimes.
-        if same(spelling, b"Allocation") { return () }
         if hasBinder(binders, spelling) || same(spelling, b"never") || primitive(spelling) {
           return ()
         }
@@ -14371,6 +14451,26 @@ effect fn scanFieldType(hir: &Module, id: HirId, binders: &[Binder], scan: &mut 
 fn argumentsWriteLifetime(hir: &Module, arguments: HirId) -> bool {
   if let Node.TypeArguments {arguments: supplied, ..} = Module.node(hir, arguments) {
     return writesLifetime(hir, supplied)
+  }
+  return false
+}
+
+// Whether a written type path names a storage core: a reserved `Allocation`, `RawBuffer` or `Slot`,
+// or a sealed `Intrinsic` storage family.
+fn sealedStorageName(hir: &Module, segments: Range) -> bool {
+  if segments.length == usize.ONE {
+    if let Node.Name {text} = Module.node(hir, Module.child(hir, segments, usize.ZERO)) {
+      return match move SealedCore.reservedName(Module.text(hir, text)) { Option<SealedKind>.Some {..} => true _ => false }
+    }
+    return false
+  }
+  if segments.length != 2 { return false }
+  if let Node.Name {text: namespace} = Module.node(hir, Module.child(hir, segments, usize.ZERO)) {
+    if let Node.Name {text: family} = Module.node(hir, Module.child(hir, segments, usize.ONE)) {
+      if same(Module.text(hir, namespace), b"Intrinsic") {
+        return match move SealedCore.intrinsicFamily(Module.text(hir, family)) { Option<SealedKind>.Some {..} => true _ => false }
+      }
+    }
   }
   return false
 }
@@ -15998,6 +16098,32 @@ effect fn usesOwnedLifetime(value: &Shared<Type>, owner: &DeclarationId, ordinal
     at = at + usize.ONE
   }
   return false
+}
+
+// The arguments `bindings` give `owner`, one per ordinal up to the last it binds. An ordinal they
+// leave unbound keeps the owner's own lifetime parameter, which elision then leaves unchanged.
+effect fn appliedOwnArguments(bindings: &[Binding], owner: &DeclarationId) -> Vector<Argument>
+! OutOfMemoryError ? &mut Allocator {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    let owned = Shared.with<DeclarationId, bool>(&bindings[at].declaration,
+      fn(found: &DeclarationId) -> bool { return DeclarationId.equals(found, owner) })
+    if owned && bindings[at].ordinal >= count { count = bindings[at].ordinal + usize.ONE }
+    at = at + usize.ONE
+  }
+  let mut arguments = Vector.make<Argument>()
+  let mut ordinal = usize.ZERO
+  while ordinal < count {
+    let argument = match move bindingArgument(bindings, owner, ordinal) {
+      Option<Argument>.Some {value} => value
+      Option<Argument>.None => Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Parameter {
+        declaration: run DeclarationId.copy(owner), ordinal: ordinal})}
+    }
+    run Vector.append<Argument>(&mut arguments, move argument)
+    ordinal = ordinal + usize.ONE
+  }
+  return move arguments
 }
 
 fn bindingArgument(bindings: &[Binding], owner: &DeclarationId, ordinal: usize) -> Option<Argument> {
@@ -18720,6 +18846,17 @@ effect fn resolveSignatureUnder(
       return memberRejected(move error, move dependencies)
     }
   }
+  // Under an application, a lifetime a bound elides takes the application's argument for its
+  // ordinal, so a call proves the declaration's bounds exactly as that application instantiates
+  // them, such as the inferred environment of `F: once fn(&mut T) -> ()`.
+  let mut boundSupplied = Option.none<Vector<Argument>>()
+  if let Option<Vector<Argument>>.Some {value: arguments} = &ownSupplied {
+    boundSupplied = Option.some<Vector<Argument>>(run copyArguments(Vector.asSlice<Argument>(&arguments)))
+  } else {
+    if let Option<Application>.Some {..} = &application.* {
+      boundSupplied = Option.some<Vector<Argument>>(run appliedOwnArguments(contextBindings, &signatureOwner))
+    }
+  }
   let mut elision = LifetimeElision {
     owner: Option.some<DeclarationId>(run DeclarationId.copy(&signatureOwner)),
     nextOrdinal: ownCount,
@@ -18730,7 +18867,7 @@ effect fn resolveSignatureUnder(
     nested: false,
     renumber: Vector.make<usize>(),
     staticEnvironment: false,
-    supplied: move ownSupplied,
+    supplied: move boundSupplied,
     assumptions: Option.some<Vector<Constraint>>(run copyConstraints(Vector.asSlice<Constraint>(&ownerPremises))),
   }
   let declared = run resolveConstraints(
@@ -18744,6 +18881,7 @@ effect fn resolveSignatureUnder(
     &mut elision,
     value.isPublic,
   )
+  elision.supplied = move ownSupplied
   let mut constraints = match move declared {
     Result<Vector<Constraint>, Shared<Rejection>>.Success {value: found} => move found
     Result<Vector<Constraint>, Shared<Rejection>>.Failure {error} => {
@@ -20587,6 +20725,21 @@ union Consumption {
   PlaceBinding,
 }
 
+// The operand of a union injection that admission just appended at `node` around a place, which a
+// `move` consumes before its value is admitted; absent for any other node or an rvalue operand.
+effect fn admittedPlace(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[BodyNode], node: BodyNodeId) -> Option<BodyNodeId>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if node.index + usize.ONE != nodes.length { return Option.none<BodyNodeId>() }
+  let operand = match &nodes[node.index].kind {
+    BodyNodeKind.Expression {form: BodyExpression.UnionInject {value, ..}, ..} => value
+    _ => { return Option.none<BodyNodeId>() }
+  }
+  return match move run consumption(source, cursor, nodes, operand) {
+    Consumption.Rvalue => Option.none<BodyNodeId>()
+    _ => Option.some<BodyNodeId>(operand)
+  }
+}
+
 // The owned place a `move`, `drop`, consuming match or by-value receiver transfers out of.
 effect fn consumption(source: &SourceIndex, cursor: &AuthoredCursor, nodes: &[BodyNode], id: BodyNodeId) -> Consumption
 ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
@@ -22020,6 +22173,55 @@ effect fn typedIntrinsicTarget(
   return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
 }
 
+// A storage primitive's contract is instantiated from exactly its written type arguments, resolved
+// in the caller's binders. `replace` may omit its one type argument and takes it from its place.
+effect fn storageTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, moduleOrdinal: usize, operation: StorageOperation,
+  generics: HirRef, scope: &[Binder], span: Span) -> Result<ResolvedTarget, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let count = StorageOperation.typeArity(operation)
+  let mut typeArguments = Vector.make<Shared<Type>>()
+  if !generics.present {
+    if count != usize.ZERO && operation != StorageOperation.Replace {
+      return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, span, count, usize.ZERO))
+    }
+    return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Storage {operation: operation,
+      typeArguments: move typeArguments})
+  }
+  let mut elision = LifetimeElision {
+    owner: Option.none<DeclarationId>(), nextOrdinal: usize.ZERO, output: false,
+    resultDefault: Option.none<Shared<Lifetime>>(), generated: Vector.make<Shared<Lifetime>>(), invocation: false,
+    nested: false, renumber: Vector.make<usize>(), staticEnvironment: false,
+    supplied: Option.none<Vector<Argument>>(), assumptions: Option.none<Vector<Constraint>>(),
+  }
+  let syntax = run typeNode(&mut resolver.*, module, generics.id)
+  if let Option<HeaderSyntax>.Some {value: found} = move syntax {
+    if let Node.TypeArguments {arguments: supplied, environment, failures, requirements} = found.header {
+      if supplied.length != count {
+        return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, found.span, count, supplied.length))
+      }
+      if environment.present || failures.present || requirements.present {
+        return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span))
+      }
+      let mut at = usize.ZERO
+      while at < count {
+        let argument = match move run typeChild(&mut resolver.*, module, supplied, at) {
+          Option<HirId>.Some {value} => value
+          Option<HirId>.None => { return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, found.span)) }
+        }
+        match move run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, argument, scope, &mut elision) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => { run Vector.append<Shared<Type>>(&mut typeArguments, move value) }
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<ResolvedTarget, Shared<Rejection>>(move error) }
+        }
+        at = at + usize.ONE
+      }
+      return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Storage {operation: operation,
+        typeArguments: move typeArguments})
+    }
+  }
+  return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+}
+
 // A composition intrinsic's written arguments: the caught failure subset of `catchFailure`, the
 // service-role key a binding serves, or the optional `<A, E, ?R, ?S>` of a finalizer (preceded by
 // `Resource` for `useReleaseNonParking`).
@@ -22501,6 +22703,10 @@ effect fn intrinsicCallTarget(
   if let Option<Composition>.Some {value: operation} = move composition {
     return run compositionTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal,
       operation, syntax.generics, scope, span)
+  }
+  if let Option<StorageOperation>.Some {value: operation} = move StorageOperation.lookup(member) {
+    return run storageTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, operation,
+      syntax.generics, scope, span)
   }
   return match move intrinsicLookup(member) {
     Option<IntrinsicMember>.Some {value} => {
@@ -23247,6 +23453,9 @@ effect fn resolveNamedRepresentation(
     ResolvedTarget.Composition {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
+    ResolvedTarget.Storage {..} => {
+      return run invalidExactRepresentation(&resolver.*, module, span)
+    }
   }
   let count = Shared.with<Result<Answer, NoRejection>, usize>(
     &target.signature,
@@ -23420,6 +23629,8 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
     ResolvedTarget.Tuple {ty, elements} => run copyTupleTarget(&ty, &elements)
     ResolvedTarget.Composition {operation, written} => ResolvedTarget.Composition {operation: operation,
       written: run copyArguments(Vector.asSlice<Argument>(&written))}
+    ResolvedTarget.Storage {operation, typeArguments} => ResolvedTarget.Storage {operation: operation,
+      typeArguments: run copyTypes(Vector.asSlice<Shared<Type>>(&typeArguments))}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {
       declaration: run DeclarationId.copy(&declaration),
       ty: Shared.clone<Type>(&ty),
@@ -25610,10 +25821,12 @@ effect fn inferredRecordAnnotation(
   if !parsed.valid || segments.length == usize.ZERO || segments.length > 2 {
     return Result.succeed<Option<InferredAggregateTarget>, Shared<Rejection>>(Option.none<InferredAggregateTarget>())
   }
-  // A record constructor annotation is a type root. The reserved owner cannot become
-  // a source generic aggregate through the inference shortcut either.
-  if segments.length == usize.ONE && same(Bytes.asSlice(&segments[usize.ZERO]), b"Allocation") {
-    return Result.succeed<Option<InferredAggregateTarget>, Shared<Rejection>>(Option.none<InferredAggregateTarget>())
+  // A record constructor annotation is a type root. A reserved storage owner cannot become a
+  // source generic aggregate through the inference shortcut either.
+  if segments.length == usize.ONE {
+    if let Option<SealedKind>.Some {..} = move SealedCore.reservedName(Bytes.asSlice(&segments[usize.ZERO])) {
+      return Result.succeed<Option<InferredAggregateTarget>, Shared<Rejection>>(Option.none<InferredAggregateTarget>())
+    }
   }
   let moduleOrdinal = run internModule(&mut resolver.*, module)
   let mut selected = Result.failResult<SelectedDeclaration, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.NotType, parsed.span))
@@ -32161,6 +32374,469 @@ effect fn bindingChannels(resolver: &mut Resolver, owner: &mut Query<Word, Answe
 
 // `run` executes one Effect layer. Its residual failures and requirements must fit the enclosing
 // body's channels (EFF-003, EFF-006, FAIL-003).
+// The referent or element a storage operand borrows, with its access and region.
+struct StorageView {
+  target: Shared<Type>
+  access: Access
+  region: Shared<Lifetime>
+}
+
+// The referent of a reference operand, or the element of a slice operand when `slice` is set.
+effect fn storageView(value: &Shared<Type>, slice: bool) -> Option<StorageView> ! OutOfMemoryError ? &mut Allocator {
+  return match move run Type.copy(value) {
+    Type.Reference {referent, access, lifetime} => {
+      if slice { return Option.none<StorageView>() }
+      return Option.some<StorageView>(StorageView {target: move referent, access: access, region: move lifetime})
+    }
+    Type.Slice {element, access, lifetime} => {
+      if !slice { return Option.none<StorageView>() }
+      return Option.some<StorageView>(StorageView {target: move element, access: access, region: move lifetime})
+    }
+    _ => Option.none<StorageView>()
+  }
+}
+
+// The region of a `string` operand.
+effect fn storageText(value: &Shared<Type>) -> Option<Shared<Lifetime>> ! OutOfMemoryError ? &mut Allocator {
+  return match move run Type.copy(value) {
+    Type.String {lifetime} => Option.some<Shared<Lifetime>>(move lifetime)
+    _ => Option.none<Shared<Lifetime>>()
+  }
+}
+
+// Checks one storage primitive operand. An exact parameter type is the operand's context and is
+// then required with the ordinary argument adaptations; a structural parameter has no context.
+effect fn storageOperand<'scope>(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>, requiredBodies: &mut Vector<DeclarationId>,
+  arguments: CallArguments, at: usize, context: Option<Shared<Type>>, constraints: &[Constraint], contractBody: bool,
+  unsafeAllowed: bool, span: Span,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at)
+  let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, caller,
+    &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, argumentId, &context, constraints,
+    contractBody, false, unsafeAllowed)
+  let node = match move checked {
+    Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+    Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+  }
+  if let Option<Shared<Type>>.None = &context { return Result.succeed<BodyNodeId, Shared<Rejection>>(node) }
+  return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, &mut nodes.*, node, &context, span)
+}
+
+// The checked type of one operand node.
+effect fn storageOperandType(resolver: &Resolver, module: &ModuleId, nodes: &Vector<BodyNode>, node: BodyNodeId, span: Span)
+-> Result<Shared<Type>, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  return match move bodyExpressionType(Vector.asSlice<BodyNode>(nodes), &node) {
+    Option<Shared<Type>>.Some {value} => Result.succeed<Shared<Type>, Shared<Rejection>>(move value)
+    Option<Shared<Type>>.None => Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.TypeMismatch, span))
+  }
+}
+
+// The standard library's `Layout` record, which `layoutOf`, `sharedLayout` and
+// `systemAllocationAcquire` exchange as the bootstrap's intrinsic contracts name it. Its storage must
+// be exactly the byte count and then the alignment, both `usize`.
+effect fn layoutDescriptor(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, span: Span) -> Result<Shared<Type>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let path = run ModuleId.make(ModuleId.sourceOrigin(module), ModuleId.packageIdentity(module), b"silk/layout.silk")
+  let loaded = run source(&mut resolver.*, &path)
+  if let Option<&IndexedSource>.None = move sourceOf(&resolver.*, &loaded, &path) {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.MissingModule, span))
+  }
+  let ordinal = run internModule(&mut resolver.*, &path)
+  let none = Vector.make<Binder>()
+  let mut elision = LifetimeElision {
+    owner: Option.none<DeclarationId>(), nextOrdinal: usize.ZERO, output: false,
+    resultDefault: Option.none<Shared<Lifetime>>(), generated: Vector.make<Shared<Lifetime>>(), invocation: false,
+    nested: false, renumber: Vector.make<usize>(), staticEnvironment: false,
+    supplied: Option.none<Vector<Argument>>(), assumptions: Option.none<Vector<Constraint>>(),
+  }
+  let ty = match move run namedType(&mut resolver.*, &mut owner.*, &mut dependencies.*, ordinal, module, b"Layout", true, span,
+    Option.none<HirId>(), Vector.asSlice<Binder>(&none), &mut elision) {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Shared<Type>, Shared<Rejection>>(move error) }
+  }
+  let parts = match move run nominalParts(&mut resolver.*, &mut owner.*, &mut dependencies.*, &ty, span) {
+    Result<Vector<Shared<Type>>, Shared<Rejection>>.Success {value} => value
+    Result<Vector<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Shared<Type>, Shared<Rejection>>(move error) }
+  }
+  let word = run primitiveType(b"usize")
+  let listed = Vector.asSlice<Shared<Type>>(&parts)
+  if listed.length != 2 {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+  }
+  let counted = run Type.equalsShared(&listed[usize.ZERO], &word)
+  let aligned = run Type.equalsShared(&listed[usize.ONE], &word)
+  if !counted || !aligned {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+  }
+  return Result.succeed<Shared<Type>, Shared<Rejection>>(move ty)
+}
+
+// Checks one callable operand of `sharedWithMut`: a safe callable taking exactly `parameter` as
+// `&mut T` (or nothing), and producing `result` or, for the conflict policy, `never`. An affine
+// callable place must be moved into the call.
+effect fn storageCallable(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, nodes: &Vector<BodyNode>, node: BodyNodeId,
+  parameter: Option<Shared<Type>>, result: &Shared<Type>, divergent: bool, constraints: &[Constraint], span: Span)
+-> Option<Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mismatch = Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.TypeMismatch, span))
+  let ty = match move bodyExpressionType(Vector.asSlice<BodyNode>(nodes), &node) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return move mismatch }
+  }
+  let contract = match move run valueCallableContract(&ty, constraints) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return move mismatch }
+  }
+  let facts = match move run CallableContract.ofType(&contract) {
+    Option<CallableFacts>.Some {value} => value
+    Option<CallableFacts>.None => { return move mismatch }
+  }
+  if facts.isUnsafe { return move mismatch }
+  let listed = Vector.asSlice<Shared<Type>>(&facts.parameters)
+  match move parameter {
+    Option<Shared<Type>>.Some {value: element} => {
+      if listed.length != usize.ONE { return move mismatch }
+      let accepted = match move run storageView(&listed[usize.ZERO], false) {
+        Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &element)
+        Option<StorageView>.None => false
+      }
+      if !accepted { return move mismatch }
+    }
+    Option<Shared<Type>>.None => { if listed.length != usize.ZERO { return move mismatch } }
+  }
+  let exact = run Type.equalsShared(&facts.result, result)
+  let diverges = divergent && Shared.with<Type, bool>(&facts.result, neverType)
+  if !exact && !diverges { return move mismatch }
+  let entries = Vector.asSlice<BodyNode>(nodes)
+  if checkedPlace(entries, node) && !movedBodyValue(entries, node) {
+    let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &ty, constraints, span) {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
+    }
+    if !copied { return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.ExplicitMoveRequired, span)) }
+  }
+  return Option.none<Shared<Rejection>>()
+}
+
+// Checks one sealed storage primitive against its contract, instantiated from its type arguments.
+// Raw-buffer and slot contents stay owned by library code; only the operands' own types are checked.
+effect fn checkStorageCall<'scope>(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
+  dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut Vector<BodyNode>,
+  signatures: &mut Vector<SignatureDependency>, requiredBodies: &mut Vector<DeclarationId>,
+  expression: HirId, span: Span, operation: StorageOperation, typeArguments: Vector<Shared<Type>>, arguments: CallArguments,
+  expected: &Option<Shared<Type>>, constraints: &[Constraint], contractBody: bool, unsafeAllowed: bool, callAcknowledged: bool,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let unsafeOperation = StorageOperation.isUnsafe(operation)
+  if callAcknowledged && !unsafeOperation { return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeInvocation, span) }
+  if unsafeOperation && !unsafeAllowed && !callAcknowledged {
+    return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeAcknowledgement, span)
+  }
+  if CallArguments.length(arguments) != StorageOperation.arity(operation) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
+  }
+  let mut instantiation = move typeArguments
+  let word = run primitiveType(b"usize")
+  let mut checked = Vector.make<BodyNodeId>()
+  let mut ty = run Shared.make<Type>(Type.Unit)
+  // The one element type every element-generic primitive is instantiated with.
+  let mut element = run Shared.make<Type>(Type.Unit)
+  if Vector.length<Shared<Type>>(&instantiation) > usize.ZERO {
+    let written = Vector.asSlice<Shared<Type>>(&instantiation)
+    element = Shared.clone<Type>(&written[usize.ZERO])
+  }
+  if operation == StorageOperation.Replace {
+    let place = match move run storageOperand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
+      caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, arguments, usize.ZERO,
+      Option.none<Shared<Type>>(), constraints, contractBody, unsafeAllowed, span) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    // The displaced place is written like an assignment target.
+    if !mutablePlace(Vector.asSlice<BodyNode>(&nodes.*), Vector.asSlice<BodyLocal>(&statementScope.locals.*), place) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+    }
+    let placeType = match move run storageOperandType(&resolver.*, module, &nodes.*, place, span) {
+      Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    if Vector.length<Shared<Type>>(&instantiation) == usize.ONE && !run Type.equalsShared(&element, &placeType) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
+    }
+    let value = match move run storageOperand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
+      caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, arguments, usize.ONE,
+      Option.some<Shared<Type>>(Shared.clone<Type>(&placeType)), constraints, contractBody, unsafeAllowed, span) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value: node} => node
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+    }
+    run Vector.append<BodyNodeId>(&mut checked, place)
+    run Vector.append<BodyNodeId>(&mut checked, value)
+    instantiation = Vector.make<Shared<Type>>()
+    run Vector.append<Shared<Type>>(&mut instantiation, Shared.clone<Type>(&placeType))
+    ty = move placeType
+  } else {
+    // Exact operand contexts in parameter order; absence marks a structural parameter checked below.
+    let mut contexts = Vector.make<Option<Shared<Type>>>()
+    let allocation = run SealedCore.allocation()
+    match operation {
+      StorageOperation.RawBufferFrom => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&allocation)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.RawBufferSlot => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.RawBufferRead => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.RawBufferCopy => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.RawBufferFill => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(run primitiveType(b"u8")))
+      }
+      StorageOperation.RawBufferView => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.RawBufferViewMut => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.SlotWrite => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&element)))
+      }
+      StorageOperation.SharedFromAllocation => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&allocation)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&element)))
+      }
+      StorageOperation.SystemAllocationAcquire => {
+        let layout = match move run layoutDescriptor(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(move layout))
+      }
+      _ => {
+        let mut at = usize.ZERO
+        while at < StorageOperation.arity(operation) {
+          run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+          at = at + usize.ONE
+        }
+      }
+    }
+    let mut at = usize.ZERO
+    while at < StorageOperation.arity(operation) {
+      let listedContexts = Vector.asSlice<Option<Shared<Type>>>(&contexts)
+      let context = match &listedContexts[at] {
+        Option<Shared<Type>>.Some {value} => Option.some<Shared<Type>>(Shared.clone<Type>(&value))
+        Option<Shared<Type>>.None => Option.none<Shared<Type>>()
+      }
+      let node = match move run storageOperand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
+        caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, arguments, at, move context,
+        constraints, contractBody, unsafeAllowed, span) {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
+      run Vector.append<BodyNodeId>(&mut checked, node)
+      at = at + usize.ONE
+    }
+    let operands = Vector.asSlice<BodyNodeId>(&checked)
+    // The first operand's type, which every structural parameter reads.
+    let mut subject = run Shared.make<Type>(Type.Unit)
+    if operands.length > usize.ZERO {
+      subject = match move run storageOperandType(&resolver.*, module, &nodes.*, operands[usize.ZERO], span) {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
+    }
+    let buffer = run SealedCore.applied(SealedKind.RawBuffer, &element)
+    let shared = run SealedCore.applied(SealedKind.SharedCore, &element)
+    let mismatch = run reject(&resolver.*, module, RejectionCode.TypeMismatch, span)
+    match operation {
+      StorageOperation.RawBufferFrom => { ty = move buffer }
+      StorageOperation.RawBufferSlot => {
+        let view = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value} => value
+          Option<StorageView>.None => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        }
+        if view.access != Access.Mutable || !run Type.equalsShared(&view.target, &buffer) {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch)
+        }
+        ty = run SealedCore.slot(&view.region, &element)
+      }
+      StorageOperation.RawBufferCount => {
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &buffer)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = Shared.clone<Type>(&word)
+      }
+      StorageOperation.RawBufferRead => {
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &buffer)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = Shared.clone<Type>(&element)
+      }
+      StorageOperation.RawBufferCopy => {
+        let destination = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &buffer)
+          Option<StorageView>.None => false
+        }
+        let sourceType = match move run storageOperandType(&resolver.*, module, &nodes.*, operands[2], span) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+        let source = match move run storageView(&sourceType, true) {
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &element)
+          Option<StorageView>.None => false
+        }
+        if !destination || !source { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+      }
+      StorageOperation.RawBufferFill => {
+        let octet = run primitiveType(b"u8")
+        let bytes = run SealedCore.applied(SealedKind.RawBuffer, &octet)
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &bytes)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+      }
+      StorageOperation.RawBufferView => {
+        let view = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value} => value
+          Option<StorageView>.None => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        }
+        if !run Type.equalsShared(&view.target, &buffer) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = run Shared.make<Type>(Type.Slice {element: Shared.clone<Type>(&element), access: Access.Shared, lifetime: move view.region})
+      }
+      StorageOperation.RawBufferViewMut => {
+        let view = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value} => value
+          Option<StorageView>.None => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        }
+        if view.access != Access.Mutable || !run Type.equalsShared(&view.target, &buffer) {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch)
+        }
+        ty = run Shared.make<Type>(Type.Slice {element: Shared.clone<Type>(&element), access: Access.Mutable, lifetime: move view.region})
+      }
+      StorageOperation.SharedLayout => {
+        ty = match move run layoutDescriptor(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+      }
+      StorageOperation.LayoutOf => {
+        ty = match move run layoutDescriptor(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+      }
+      StorageOperation.SharedFromAllocation => { ty = move shared }
+      StorageOperation.SharedClone => {
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &shared)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = move shared
+      }
+      StorageOperation.SharedWithMut => {
+        let arguments = Vector.asSlice<Shared<Type>>(&instantiation)
+        let result = Shared.clone<Type>(&arguments[usize.ONE])
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &shared)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        let selected = run storageCallable(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &nodes.*, operands[usize.ONE],
+          Option.some<Shared<Type>>(Shared.clone<Type>(&element)), &result, false, constraints, span)
+        if let Option<Shared<Rejection>>.Some {value} = move selected { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
+        let conflict = run storageCallable(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &nodes.*, operands[2],
+          Option.none<Shared<Type>>(), &result, true, constraints, span)
+        if let Option<Shared<Rejection>>.Some {value} = move conflict { return Result.failResult<BodyNodeId, Shared<Rejection>>(move value) }
+        ty = move result
+      }
+      StorageOperation.SystemAllocationAcquire => {
+        ty = run Shared.make<Type>(Type.Effect {mode: CallableMode.Once,
+          environment: run Shared.make<Intersection>(Intersection {members: Vector.make<LifetimeMember>()}),
+          success: Shared.clone<Type>(&allocation), failure: run SealedCore.make(SealedKind.StorageFailure, Vector.make<Argument>()),
+          requirements: run Shared.make<Row>(Row.empty())})
+      }
+      StorageOperation.StringUtf8Bytes => {
+        let region = match move run storageText(&subject) {
+          Option<Shared<Lifetime>>.Some {value} => value
+          Option<Shared<Lifetime>>.None => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        }
+        ty = run Shared.make<Type>(Type.Slice {element: run primitiveType(b"u8"), access: Access.Shared, lifetime: move region})
+      }
+      StorageOperation.StringFromUtf8Unchecked => {
+        let view = match move run storageView(&subject, true) {
+          Option<StorageView>.Some {value} => value
+          Option<StorageView>.None => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        }
+        let octet = run primitiveType(b"u8")
+        if !run Type.equalsShared(&view.target, &octet) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = run Shared.make<Type>(Type.String {lifetime: move view.region})
+      }
+      StorageOperation.StringByteLength => {
+        let region = run storageText(&subject)
+        if let Option<Shared<Lifetime>>.None = move region { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = Shared.clone<Type>(&word)
+      }
+      _ => {
+        // The slot primitives consume one selection of exactly the instantiated element.
+        let mut selection = false
+        if SealedCore.isCore(&subject, SealedKind.Slot) {
+          if let Option<Shared<Type>>.Some {value: stored} = move SealedCore.element(&subject) {
+            selection = run Type.equalsShared(&stored, &element)
+          }
+        }
+        if !selection { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        if operation == StorageOperation.SlotTake || operation == StorageOperation.SlotCopy { ty = Shared.clone<Type>(&element) }
+        if operation == StorageOperation.SlotAddress { ty = run SealedCore.address(&element) }
+      }
+    }
+    // A read that leaves its storage initialized copies the element.
+    if operation == StorageOperation.RawBufferRead || operation == StorageOperation.SlotCopy {
+      let copied = match move run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &element, constraints, span) {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+      }
+      if !copied { return run bodyRejection(&resolver.*, module, RejectionCode.MissingConformance, span) }
+    }
+  }
+  let index = Vector.length<BodyNode>(&nodes.*)
+  run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+    origin: BodyOrigin {syntax: expression, span: span},
+    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.StorageCall {operation: operation,
+      typeArguments: move instantiation, arguments: move checked}},
+  })
+  return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, &mut nodes.*, BodyNodeId {index: index}, expected, span)
+}
+
 effect fn checkRun<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
@@ -32237,6 +32913,8 @@ fn immediateOperand(nodes: &[BodyNode], value: BodyNodeId) -> bool {
       return Shared.with<Type, bool>(&ty, fn(result: &Type) -> bool { return constructs(result, &declaration) })
     }
     if let BodyExpression.CallableCall {..} = &form { return Shared.with<Type, bool>(&ty, bareEffect) }
+    // The primitive allocation boundary is an Effect its run executes in place.
+    if let BodyExpression.StorageCall {operation, ..} = &form { return operation == StorageOperation.SystemAllocationAcquire }
     // An `effect fn` interface operation runs as one call of its selected witness.
     if let BodyExpression.InterfaceCall {isEffect, ..} = &form { return isEffect }
   }
@@ -33263,11 +33941,19 @@ effect fn checkExpressionUnder<'scope>(
         staticBody,
         unsafeAllowed,
       )
-      let operandNode = match move checked {
+      let mut operandNode = match move checked {
         Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
         Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
           return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
         }
+      }
+      // Admission at an expected union injects a place operand before the move could consume it.
+      // The move consumes the place itself, so that injection is retired and finishing the move
+      // admits the moved value instead.
+      let admitted = run admittedPlace(&resolver.source, cursor, Vector.asSlice<BodyNode>(&nodes.*), operandNode)
+      if let Option<BodyNodeId>.Some {value: injected} = move admitted {
+        drop Vector.pop<BodyNode>(&mut nodes.*)
+        operandNode = injected
       }
       ty = match & Vector.asSlice<BodyNode>(&nodes.*)[operandNode.index].kind {
         BodyNodeKind.Expression {ty: operandType, ..} => Shared.clone<Type>(&operandType)
@@ -34807,6 +35493,12 @@ effect fn checkInvocation<'scope>(
     }
     ResolvedTarget.Selected {..} => {
       return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+    ResolvedTarget.Storage {operation, typeArguments} => {
+      if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
+      return run checkStorageCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
+        caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, expression, span,
+        operation, move typeArguments, arguments, expected, constraints, contractBody, unsafeAllowed, callAcknowledged)
     }
     ResolvedTarget.Intrinsic {member, typeArguments} => {
       if callAcknowledged && !intrinsicIsUnsafe(member) {
@@ -36751,7 +37443,8 @@ effect fn copyTypeWithin(
   active: &[Shared<Type>],
 ) -> Result<bool, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  if Shared.with<Type, bool>(ty, SealedCore.allocationType) {
+  // No sealed core is Copy; no source premise or conformance can make one Copy.
+  if let Option<SealedKind>.Some {..} = move SealedCore.coreOf(ty) {
     return Result.succeed<bool, Shared<Rejection>>(false)
   }
 
@@ -36854,7 +37547,7 @@ effect fn boundProof(
 ) -> Result<BoundProof, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   if let Constraint.Copyable {subject} = &bound.* {
-    if Shared.with<Type, bool>(&subject, SealedCore.allocationType) {
+    if let Option<SealedKind>.Some {..} = move SealedCore.coreOf(&subject) {
       return Result.succeed<BoundProof, Shared<Rejection>>(BoundProof.Rejected)
     }
   }
@@ -37129,8 +37822,9 @@ effect fn cleanupFree(
   dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, visiting: &mut Vector<Shared<Type>>, span: Span,
 ) -> Result<bool, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  if Shared.with<Type, bool>(ty, SealedCore.allocationType) {
-    return Result.succeed<bool, Shared<Rejection>>(false)
+  // A sealed core's cleanup is its own: allocations release, shared cores count references.
+  if let Option<SealedKind>.Some {value: core} = move SealedCore.coreOf(ty) {
+    return Result.succeed<bool, Shared<Rejection>>(!SealedCore.ownsCleanup(core))
   }
 
   let declared = Vector.make<Constraint>()
@@ -41668,76 +42362,64 @@ effect fn siteRemainder(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   return Result.succeed<Option<Remainder>, Shared<Rejection>>(Option.some<Remainder>(Remainder {node: at, steps: move steps, levels: move levels}))
 }
 
-// Inspect owned storage independently of Copy/Drop shortcuts. A source Drop hook cannot
-// reclaim a compiler-sealed owner, and no parent recipe may hide an unresolved core child.
-effect fn storesAllocation(
-  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
-  dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, span: Span, active: &[Shared<Type>],
-) -> Result<bool, Shared<Rejection>>
+// The glue of one sealed core, following the bootstrap's cleanup: an allocation releases its
+// system storage through its reclaim context, a raw buffer releases its allocation without
+// discovering elements, and a shared core counts references and cleans its value and control block
+// with the last handle.
+effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: Vector<Dependency>,
+  instance: InstanceKey, ty: &Shared<Type>, core: SealedKind, observing: bool) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  if Shared.with<Type, bool>(ty, SealedCore.allocationType) {
-    return Result.succeed<bool, Shared<Rejection>>(true)
+  let mut tracked = move dependencies
+  let identity = InstanceKey.identity(&instance)
+  let gap = Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, Span.make(usize.ZERO, usize.ZERO)))}
+  let anchor = run DeclarationId.copyShared(&identity)
+  if core == SealedKind.Allocation {
+    let free = run SealedCore.cFunction(&anchor, SealedFunction.Free)
+    let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Allocation {free: move free}, observing)
+    return run storeMir(&mut resolver.*, move function, move tracked)
   }
-  let mut ancestors = run storedPropertyAncestors(ty, active)
-  let node = run Type.copy(ty)
-  let mut parts = Vector.make<Shared<Type>>()
-  match &node {
-    Type.Array {element, ..} => { run Vector.append<Shared<Type>>(&mut parts, Shared.clone<Type>(&element)) }
-    Type.Union {members} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&members)) }
-    Type.Anonymous {members, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&members)) }
-    Type.CallableValue {captures, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&captures)) }
-    Type.CallableSchema {captures, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&captures)) }
-    Type.EffectComposite {parts: stored, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&stored)) }
-    Type.EffectJoin {alternatives, ..} => { parts = run copyTypes(Vector.asSlice<Shared<Type>>(&alternatives)) }
-    Type.CallableStage {base, captures, ..} => {
-      run Vector.append<Shared<Type>>(&mut parts, Shared.clone<Type>(&base))
-      let supplied = Vector.asSlice<Shared<Type>>(&captures)
-      let mut at = usize.ZERO
-      while at < supplied.length {
-        run Vector.append<Shared<Type>>(&mut parts, Shared.clone<Type>(&supplied[at]))
-        at = at + usize.ONE
-      }
+  let allocationType = run SealedCore.allocationBeside(&anchor)
+  if core == SealedKind.RawBuffer {
+    let allocation = match move run glueChild(SealedCore.ordinal(CoreField.BufferAllocation), &allocationType) {
+      Option<GlueChild>.Some {value} => value
+      Option<GlueChild>.None => { return memberSuccess(move gap, move tracked) }
     }
-    Type.Nominal {..} => {
-      // Existing glue checking diagnoses inline cycles. This finite scan does not certify them.
-      if storedPropertyCycle(ty, Vector.asSlice<Shared<Type>>(&ancestors)) {
-        return Result.succeed<bool, Shared<Rejection>>(false)
-      }
-      parts = match move run nominalParts(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, span) {
-        Result<Vector<Shared<Type>>, Shared<Rejection>>.Success {value} => value
-        Result<Vector<Shared<Type>>, Shared<Rejection>>.Failure {error} => {
-          return Result.failResult<bool, Shared<Rejection>>(move error)
-        }
-      }
-      run Vector.append<Shared<Type>>(&mut ancestors, Shared.clone<Type>(ty))
-    }
-    _ => { return Result.succeed<bool, Shared<Rejection>>(false) }
+    let mut fields = Vector.make<GlueChild>()
+    run Vector.append<GlueChild>(&mut fields, move allocation)
+    let function = run DropGlue.lower(DropGlue {key: move instance, ty: Shared.clone<Type>(ty), hook: Option.none<InstanceKey>(),
+      children: GlueChildren.Fields {fields: move fields}}, observing)
+    return run storeMir(&mut resolver.*, move function, move tracked)
   }
-  let stored = Vector.asSlice<Shared<Type>>(&parts)
-  let mut at = usize.ZERO
-  while at < stored.length {
-    match move run storesAllocation(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[at], span,
-      Vector.asSlice<Shared<Type>>(&ancestors)) {
-      Result<bool, Shared<Rejection>>.Success {value} => {
-        if value { return Result.succeed<bool, Shared<Rejection>>(true) }
-      }
-      Result<bool, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
-    }
-    at = at + usize.ONE
+  if core != SealedKind.SharedCore { return memberSuccess(move gap, move tracked) }
+  let element = match move SealedCore.element(ty) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return memberSuccess(move gap, move tracked) }
   }
-  return Result.succeed<bool, Shared<Rejection>>(false)
-}
-
-// A core-owned glue key has no source location. Refuse it before every public/worklist lookup.
-effect fn sealedAllocationGlueGap(instance: &InstanceKey, span: Span) -> Option<Shared<BackendGap>>
-! OutOfMemoryError ? &mut Allocator {
-  if let Option<Shared<Type>>.Some {..} = move InstanceKey.glueType(instance) {
-    let identity = InstanceKey.identity(instance)
-    if Shared.with<DeclarationId, bool>(&identity, SealedCore.allocationDeclaration) {
-      return Option.some<Shared<BackendGap>>(run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, span)))
+  let needed = match move run glueNeeds(&mut resolver.*, &mut owner.*, &mut tracked, &element) {
+    Result<bool, Option<Shared<Rejection>>>.Success {value} => value
+    Result<bool, Option<Shared<Rejection>>>.Failure {error} => match move error {
+      Option<Shared<Rejection>>.Some {value} => { return run mirRejection(&identity, move value, move tracked) }
+      Option<Shared<Rejection>>.None => { return memberSuccess(move gap, move tracked) }
     }
   }
-  return Option.none<Shared<BackendGap>>()
+  let mut value = Option.none<GlueChild>()
+  if needed {
+    value = match move run glueChild(SealedCore.ordinal(CoreField.BlockValue), &element) {
+      Option<GlueChild>.Some {value: child} => Option.some<GlueChild>(move child)
+      Option<GlueChild>.None => { return memberSuccess(move gap, move tracked) }
+    }
+  }
+  let allocation = match move run glueChild(SealedCore.ordinal(CoreField.BlockAllocation), &allocationType) {
+    Option<GlueChild>.Some {value: child} => child
+    Option<GlueChild>.None => { return memberSuccess(move gap, move tracked) }
+  }
+  let block = match move run SealedCore.fieldType(ty, CoreField.CoreBlock) {
+    Option<Shared<Type>>.Some {value: addressed} => addressed
+    Option<Shared<Type>>.None => { return memberSuccess(move gap, move tracked) }
+  }
+  let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Shared {block: move block, value: move value,
+    allocation: move allocation}, observing)
+  return run storeMir(&mut resolver.*, move function, move tracked)
 }
 
 // Drop glue reads its type's Drop hook and member shapes, never a function body. A cleanup form
@@ -41748,11 +42430,9 @@ effect fn resolveGlueMir(resolver: &mut Resolver, owner: &mut Query<Word, Answer
   let mut dependencies = Vector.make<Dependency>()
   let identity = InstanceKey.identity(&instance)
   let gap = Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(GapCode.Cleanup, &identity, Span.make(usize.ZERO, usize.ZERO)))}
-  let active = Vector.make<Shared<Type>>()
-  match move run storesAllocation(&mut resolver.*, &mut owner.*, &mut dependencies, ty,
-    Span.make(usize.ZERO, usize.ZERO), Vector.asSlice<Shared<Type>>(&active)) {
-    Result<bool, Shared<Rejection>>.Success {value} => { if value { return memberSuccess(move gap, move dependencies) } }
-    Result<bool, Shared<Rejection>>.Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
+  // A sealed core cleans its own storage; source can install no hook on it.
+  if let Option<SealedKind>.Some {value: core} = move SealedCore.coreOf(ty) {
+    return run resolveCoreGlue(&mut resolver.*, &mut owner.*, move dependencies, move instance, ty, core, observing)
   }
   let hook = match move run dropHook(&mut resolver.*, &mut owner.*, &mut dependencies, ty) {
     Result<Option<InstanceKey>, Option<Shared<Rejection>>>.Success {value} => value
@@ -44400,6 +45080,151 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
   return Result.succeed<usize, GapCode>(Vector.length<MirRunPlan>(&steps.*) - usize.ONE)
 }
 
+// The target size, alignment and stride of one closed runtime type, demanded through the layout
+// query.
+effect fn measuredLayout(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, span: Span) -> Option<LayoutMetrics>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let application = run internLayoutType(&mut resolver.*, ty)
+  let layout = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, Key {family: Family.Layout, module: usize.ZERO,
+    name: application, declaration: usize.ZERO, member: usize.ZERO, external: false}, span)
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&layout, layoutIndex)
+  if let Option<usize>.Some {value} = move selected {
+    let layouts = Vector.asSlice<Shared<BackendLayout>>(&resolver.layoutValues)
+    return Option.some<LayoutMetrics>(Shared.with<BackendLayout, LayoutMetrics>(&layouts[value], BackendLayout.metrics))
+  }
+  return Option.none<LayoutMetrics>()
+}
+
+// One closed written type argument of a storage call.
+effect fn storageInstanceType(body: &Shared<TypedBody>, node: BodyNodeId, at: usize, callerBindings: &[Binding],
+  projections: &[RuntimeProjection]) -> Shared<Type> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let written = TypedBody.storageTypeArgument(body, node, at)
+  return match move written {
+    Option<Shared<Type>>.Some {value} => run RuntimeType.applyBindings(&value, callerBindings, projections)
+    Option<Shared<Type>>.None => { fail RevisionMismatch {} }
+  }
+}
+
+// The prepared invocation of one callable operand of `sharedWithMut` with the `written` operand
+// types, appended with the result its contract produces.
+effect fn storageCallableTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, argument: BodyNodeId, caller: &Application,
+  callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, own: &[ProviderEntry],
+  module: &ModuleId, written: Vector<Shared<Type>>, targets: &mut Vector<MirCallTarget>, results: &mut Vector<Shared<Type>>)
+-> Option<GapCode> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let callable = Shared.with<TypedBody, Option<Shared<Type>>>(body, fn(value: &TypedBody) -> Option<Shared<Type>> {
+    return nodeTypeAt(value, argument.index)
+  })
+  let receiver = match move callable {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Option.some<GapCode>(GapCode.TypedForm) }
+  }
+  let origin = Shared.with<TypedBody, BodyOrigin>(body, fn(value: &TypedBody) -> BodyOrigin { return TypedBody.nodeSlice(value)[argument.index].origin })
+  let closed = run RuntimeType.applyBindings(&receiver, callerBindings, projections)
+  let none = Vector.make<Constraint>()
+  let contract = match move run valueCallableContract(&closed, Vector.asSlice<Constraint>(&none)) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Option.some<GapCode>(GapCode.TypedForm) }
+  }
+  let produced = Shared.with<Type, Option<Shared<Type>>>(&contract, callableResult)
+  let result = match move produced {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return Option.some<GapCode>(GapCode.TypedForm) }
+  }
+  let inputs = CallableCallInputs {receiver: move receiver, inference: Shared.clone<DeclarationId>(identity),
+    bindings: run Shared.make<Vector<Binding>>(Vector.make<Binding>()), mode: Shared.with<Type, CallableMode>(&contract, callableInvocationMode),
+    callee: argument, result: Shared.clone<Type>(&result), count: Vector.length<Shared<Type>>(&written), origin: origin}
+  let constructed = match move run concreteCallableCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+    callerBindings, projections, move inputs, Vector.asSlice<Shared<Type>>(&written)) {
+    Result<MirCallTarget, GapCode>.Success {value} => value
+    Result<MirCallTarget, GapCode>.Failure {error} => { return Option.some<GapCode>(error) }
+  }
+  let unbound = Vector.make<BoundProvider>()
+  let target = match move run provideCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, move constructed, own,
+    Vector.asSlice<BoundProvider>(&unbound), module, origin.span) {
+    Result<MirCallTarget, GapCode>.Success {value} => value
+    Result<MirCallTarget, GapCode>.Failure {error} => { return Option.some<GapCode>(error) }
+  }
+  run Vector.append<MirCallTarget>(&mut targets.*, move target)
+  run Vector.append<Shared<Type>>(&mut results.*, run RuntimeType.applyBindings(&result, callerBindings, projections))
+  return Option.none<GapCode>()
+}
+
+// What one storage primitive's expansion needs from this instance: the measured layout of its
+// element or control block, the sealed C allocator declarations, the element's cleanup verdict
+// and `sharedWithMut`'s prepared invocations.
+effect fn storagePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, operation: StorageOperation,
+  caller: &Application, callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>,
+  own: &[ProviderEntry], module: &ModuleId, span: Span) -> Result<MirStoragePlan, GapCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let anchor = run SealedCore.identity(SealedKind.Allocation)
+  let mut externs = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut externs, run SealedCore.cFunction(&anchor, SealedFunction.Malloc))
+  run Vector.append<Shared<DeclarationId>>(&mut externs, run SealedCore.cFunction(&anchor, SealedFunction.Free))
+  run Vector.append<Shared<DeclarationId>>(&mut externs, run SealedCore.cFunction(&anchor, SealedFunction.Memmove))
+  run Vector.append<Shared<DeclarationId>>(&mut externs, run SealedCore.cFunction(&anchor, SealedFunction.Memset))
+  let mut element = run Shared.make<Type>(Type.Unit)
+  if StorageOperation.typeArity(operation) > usize.ZERO || operation == StorageOperation.Replace {
+    element = run storageInstanceType(body, node, usize.ZERO, callerBindings, projections)
+  }
+  let mut size = usize.ZERO
+  let mut alignment = usize.ONE
+  if StorageOperation.measures(operation) {
+    let mut measured = Shared.clone<Type>(&element)
+    if operation == StorageOperation.SharedLayout || operation == StorageOperation.SharedFromAllocation {
+      measured = run SealedCore.applied(SealedKind.SharedBlock, &element)
+    }
+    let facts = match move run measuredLayout(&mut resolver.*, &mut owner.*, &mut dependencies.*, &measured, span) {
+      Option<LayoutMetrics>.Some {value} => value
+      Option<LayoutMetrics>.None => { return Result.failResult<MirStoragePlan, GapCode>(GapCode.ScalarLayout) }
+    }
+    size = facts.size
+    alignment = facts.alignment
+    // Raw-buffer storage holds consecutive elements one stride apart.
+    if operation == StorageOperation.RawBufferFrom || operation == StorageOperation.RawBufferCopy {
+      size = match move LayoutMetrics.stride(&facts) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return Result.failResult<MirStoragePlan, GapCode>(GapCode.ScalarLayout) }
+      }
+    }
+  }
+  let mut cleanup = false
+  if operation == StorageOperation.SlotDrop {
+    cleanup = match move run glueNeeds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &element) {
+      Result<bool, Option<Shared<Rejection>>>.Success {value} => value
+      Result<bool, Option<Shared<Rejection>>>.Failure {..} => { return Result.failResult<MirStoragePlan, GapCode>(GapCode.Cleanup) }
+    }
+  }
+  let mut targets = Vector.make<MirCallTarget>()
+  let mut results = Vector.make<Shared<Type>>()
+  if operation == StorageOperation.SharedWithMut {
+    let useArgument = match move TypedBody.storageArgument(body, node, usize.ONE) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { fail RevisionMismatch {} }
+    }
+    let conflictArgument = match move TypedBody.storageArgument(body, node, 2) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { fail RevisionMismatch {} }
+    }
+    // The value is lent exclusively for the invocation alone.
+    let site = Shared.with<TypedBody, BodyOrigin>(body, fn(value: &TypedBody) -> BodyOrigin { return TypedBody.nodeSlice(value)[node.index].origin })
+    let mut lent = Vector.make<Shared<Type>>()
+    run Vector.append<Shared<Type>>(&mut lent, run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(&element),
+      access: Access.Mutable, lifetime: run Shared.make<Lifetime>(Lifetime.Local {
+        declaration: run DeclarationId.copy(Application.bodyDeclaration(caller)), ordinal: site.syntax.index})}))
+    let selected = run storageCallableTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, useArgument, caller,
+      callerBindings, projections, identity, own, module, move lent, &mut targets, &mut results)
+    if let Option<GapCode>.Some {value} = move selected { return Result.failResult<MirStoragePlan, GapCode>(value) }
+    let policy = run storageCallableTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, conflictArgument, caller,
+      callerBindings, projections, identity, own, module, Vector.make<Shared<Type>>(), &mut targets, &mut results)
+    if let Option<GapCode>.Some {value} = move policy { return Result.failResult<MirStoragePlan, GapCode>(value) }
+  }
+  return Result.succeed<MirStoragePlan, GapCode>(MirStoragePlan {node: node, size: size, alignment: alignment, externs: move externs,
+    cleanup: cleanup, targets: move targets, results: move results})
+}
+
 // A stored callable invoked with one argument, and the channels of the Effect its invocation runs.
 struct InvokedTarget {
   target: MirCallTarget
@@ -45239,6 +46064,7 @@ effect fn resolveMir(
   }
   let mut calls = Vector.make<MirCallTarget>()
   let mut plans = Vector.make<MirNodePlan>()
+  let mut storage = Vector.make<MirStoragePlan>()
   let mut carriers = Vector.make<MirCarrierPlan>()
   let reachedCalls = run MirFunction.callNodes(&typed)
   let callNodes = Vector.asSlice<BodyNodeId>(&reachedCalls)
@@ -45246,6 +46072,16 @@ effect fn resolveMir(
   let mut callRequest = Request.make()
   while callAt < callNodes.length {
     let node = callNodes[callAt]
+    if let Option<StorageOperation>.Some {value: operation} = move TypedBody.storageOperation(&typed, node) {
+      let site = Shared.with<TypedBody, Span>(&typed, fn(value: &TypedBody) -> Span { return TypedBody.nodeSlice(value)[node.index].origin.span })
+      match move run storagePlan(&mut resolver.*, &mut owner.*, &mut dependencies, &typed, node, operation, &callerApplication,
+        Vector.asSlice<Binding>(&callerBindings), storageProjection, &identity, Vector.asSlice<ProviderEntry>(&own), &module, site) {
+        Result<MirStoragePlan, GapCode>.Success {value} => { run Vector.append<MirStoragePlan>(&mut storage, move value) }
+        Result<MirStoragePlan, GapCode>.Failure {error} => {
+          return memberSuccess(Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap.make(error, &identity, site))}, move dependencies)
+        }
+      }
+    }
     let direct = TypedBody.directApplication(&typed, node)
     if let Option<Shared<Application>>.Some {value: recordedApplication} = move direct {
       let recorded = run Application.copyShared(&recordedApplication)
@@ -45501,6 +46337,7 @@ effect fn resolveMir(
         Vector.asSlice<Shared<Type>>(&addresses),
         move provided,
         move plans,
+        move storage,
         move carriers,
         move remainders,
         move needs,
@@ -45650,8 +46487,11 @@ effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
     let computed = run BackendLayout.tagged(Vector.asSlice<LayoutFieldInput>(&inputs))
     return run storeLayout(&mut resolver.*, move computed, move dependencies)
   }
-  // Anonymous aggregates and callable environments have ordinary ordered record storage.
-  let structuralFields = run Type.recordFields(&ty)
+  // Anonymous aggregates, callable environments and sealed cores have ordinary ordered record
+  // storage; a core's fields match the bootstrap's layout (SealedCore).
+  let mut structuralFields = run Type.recordFields(&ty)
+  let unstructured = match &structuralFields { Option<Vector<Shared<Type>>>.None => true _ => false }
+  if unstructured { structuralFields = run SealedCore.fields(&ty) }
   if let Option<Vector<Shared<Type>>>.Some {value: members} = move structuralFields {
     let mut dependencies = Vector.make<Dependency>()
     let mut inputs = Vector.make<LayoutFieldInput>()
@@ -46170,6 +47010,24 @@ effect fn foreignSignature(
 ) -> CAbi.Signature
 ! BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
+  // The C allocator functions the storage primitives expand to have compiler-owned signatures.
+  let sealed = Shared.with<DeclarationId, Option<SealedFunction>>(declaration, SealedCore.declarationFunction)
+  if let Option<SealedFunction>.Some {value: selected} = move sealed {
+    let span = Span.make(usize.ZERO, usize.ZERO)
+    let resultType = run SealedCore.cResult(selected)
+    let result = run foreignLane(&mut resolver.*, &mut owner.*, &mut dependencies.*, &resultType, declaration, span)
+    let written = run SealedCore.cParameters(selected)
+    let listed = Vector.asSlice<Shared<Type>>(&written)
+    let mut lanes = Vector.make<CAbi.Lane>()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector.append<CAbi.Lane>(&mut lanes, run foreignLane(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at],
+        declaration, span))
+      at = at + usize.ONE
+    }
+    return CAbi.Signature {declaration: Shared.clone<DeclarationId>(declaration), symbol: run Bytes.copy(SealedCore.cSymbol(selected)),
+      span: span, result: move result, parameters: move lanes, global: false}
+  }
   let key = run InstanceKey.named(declaration)
   let found = run locationOfInstance(&mut resolver.*, &key)
   let location = match move found {
@@ -53751,13 +54609,6 @@ impl Semantic {
     let identity = InstanceKey.identity(&instance)
     let owner = run DeclarationId.copyShared(&identity)
     let module = run ModuleId.copy(DeclarationId.moduleId(&owner))
-    let sealedGap = run sealedAllocationGlueGap(&instance, span)
-    if let Option<Shared<BackendGap>>.Some {value: gap} = move sealedGap {
-      let answer = run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(
-        memberSuccess(Value.Unsupported {gap: move gap}, Vector.make<Dependency>())))
-      run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
-      return move answer
-    }
     let location = match move run locationOfInstance(&mut self.resolver, &instance) {
       Option<InstanceLocation>.Some {value} => value
       Option<InstanceLocation>.None => {
@@ -53848,13 +54699,6 @@ impl Semantic {
     let declared = run DeclarationId.copyShared(&InstanceKey.identity(instance))
     let module = run ModuleId.copy(DeclarationId.moduleId(&declared))
     let span = Span.make(usize.ZERO, usize.ZERO)
-    let sealedGap = run sealedAllocationGlueGap(instance, span)
-    if let Option<Shared<BackendGap>>.Some {value: gap} = move sealedGap {
-      let answer = run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(
-        memberSuccess(Value.Unsupported {gap: move gap}, Vector.make<Dependency>())))
-      run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
-      return move answer
-    }
     let location = match move run locationOfInstance(&mut self.resolver, instance) {
       Option<InstanceLocation>.Some {value} => value
       _ => { return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(memberRejected(
@@ -53879,7 +54723,9 @@ impl Semantic {
     run selectRequest(&mut self.resolver, &request.*)
     let declared = run DeclarationId.copyShared(&InstanceKey.identity(instance))
     let module = run ModuleId.copy(DeclarationId.moduleId(&declared))
-    let held = run internModule(&mut self.resolver, &module)
+    // The glue of a sealed core belongs to no source module.
+    let sealed = SealedCore.declarationCore(&declared)
+    if let Option<SealedKind>.None = move sealed { drop run internModule(&mut self.resolver, &module) }
     let span = Span.make(usize.ZERO, usize.ZERO)
     let location = match move run locationOfInstance(&mut self.resolver, instance) {
       Option<InstanceLocation>.Some {value} => value
@@ -54252,11 +55098,6 @@ impl Semantic {
         run Vector.append<BackendVisit>(&mut pending, BackendVisit.Leave)
       }
       run Vector.append<InstanceKey>(&mut visited, InstanceKey.copy(&instance))
-      let sealedGap = run sealedAllocationGlueGap(&instance, entered.span)
-      if let Option<Shared<BackendGap>>.Some {value: gap} = move sealedGap {
-        run Vector.append<Shared<BackendGap>>(&mut gaps, move gap)
-        continue
-      }
       let found = run locationOfInstance(&mut self.resolver, &instance)
       let location = match move found {
         Option<InstanceLocation>.Some {value} => value
