@@ -1302,3 +1302,20 @@ Sealed Allocation admission can expose these pre-existing downstream gaps in `ur
 `toml-output`; their prior core-type refusal did not establish lifetime support. Reduced realized
 bootstrap analysis has no diagnostics for both source forms. Native focused cases retain exact
 success and negative code/span controls alongside the named refusals.
+
+### Native deferred by-value nominal lifetime shortening
+
+An inferred call lifetime fixed by an earlier caller-local operand can meet a later by-value
+nominal whose corresponding storage lifetime is Static. The bootstrap admits valid covariant
+storage, but native's direct nominal call lane still needs that region coercion. It reports the
+existing `borrow-region-relation` gap only for the original fresh callee lifetime slot when that
+slot was not explicitly supplied, actual Static differs from the already-bound caller-owned Local,
+and the existing member-query storage proof is covariant. A diagnostic-only copy replaces those
+lifetimes, and full Exact unification with copied bindings must prove no other mismatch remains.
+The operand and real inference bindings stay unchanged; this is no new type admission or solver.
+
+Equal evidence retains success. Fixed lifetime slots, reverse regions, different nominal owners,
+types, requirement rows and static extents, and lifetimes within invariant pointers or mutable
+referents retain ordinary type errors. A covariant-to-invariant imported field revision invalidates
+the cached diagnostic proof. `http-redirect` exposed this deferred lane after sealed Allocation
+admission; a reduced realized bootstrap source analysis has no diagnostics.

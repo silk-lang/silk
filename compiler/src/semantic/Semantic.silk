@@ -194,7 +194,7 @@ import semantic.StaticValue {
   Value as StaticData,
 }
 import semantic.StaticConstant
-import semantic.Target {Target as MachineTarget}
+import semantic.Target {Id as TargetId, Target as MachineTarget}
 import semantic.Type {
   ComparisonChild,
   AnonymousOccurrence,
@@ -256,6 +256,7 @@ import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
 import silk.sha2 {Sha256}
+import silk.testing {AssertionError, Testing}
 import silk.u8
 import silk.u32
 import silk.usize
@@ -26351,8 +26352,8 @@ effect fn checkInferredCallArgument<'scope>(
           ),
         )
       }
-      let deferred = run deferredCallArgument(parameter, &pattern, &actual, fresh, caller,
-        variables, Vector.asSlice<Binding>(&inferred.*),
+      let deferred = run deferredCallArgument(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+        parameter, &pattern, &actual, fresh, caller, variables, Vector.asSlice<Binding>(&inferred.*), explicit, callSpan,
       )
       if let Option<RejectionCode>.Some {value: reason} = move deferred {
         return run bodyRejection(&resolver.*, module, reason, callSpan)
@@ -26863,10 +26864,12 @@ effect fn lifetimeFlowsCovariantly(
 // Prove that one explicitly deferred relation is the only mismatch. The candidate and copied
 // bindings are diagnostic-only: neither can become the operand's type or a successful inference.
 effect fn deferredCallArgument(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
   parameter: &Shared<Type>, pattern: &Shared<Type>, evidence: &Shared<Type>,
   fresh: &DeclarationId, caller: &DeclarationId, variables: &[Shared<DeclarationId>],
-  bindings: &[Binding],
-) -> Option<RejectionCode> ! OutOfMemoryError ? &mut Allocator {
+  bindings: &[Binding], explicit: &[usize], span: Span,
+) -> Option<RejectionCode>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let authored = run Type.copy(parameter)
   let expected = run Type.copy(pattern)
   let actual = run Type.copy(evidence)
@@ -26920,6 +26923,59 @@ effect fn deferredCallArgument(
           referent: move referent, access: access, lifetime: move boundRegion,
         })
         reason = RejectionCode.BorrowRegionRelationUnavailable
+      }
+    }
+    // A naked nominal value has no loan adapter. Identify only a deferred shortening of an
+    // originally inferred callee lifetime already fixed by earlier caller-local evidence.
+    Type.Nominal {declaration: wantedOwner, arguments: wantedArguments, ..} => {
+      if let Type.Nominal {declaration: writtenOwner, arguments: writtenArguments, ..} = move authored {
+        if let Type.Nominal {declaration: actualOwner, isPublic, arguments: actualArguments} = move actual {
+          let wanted = Vector.asSlice<Argument>(&wantedArguments)
+          let written = Vector.asSlice<Argument>(&writtenArguments)
+          let offered = Vector.asSlice<Argument>(&actualArguments)
+          if !DeclarationId.equals(&writtenOwner, &wantedOwner) || !DeclarationId.equals(&actualOwner, &wantedOwner)
+            || written.length != wanted.length || offered.length != wanted.length { return Option.none<RejectionCode>() }
+          let mut changed = Vector.make<usize>()
+          let mut adjusted = Vector.make<Argument>()
+          let mut at = usize.ZERO
+          while at < offered.length {
+            let mut next = Argument.copy(&offered[at])
+            if let Argument.Lifetime {value: sourceRegion} = &offered[at] {
+              if let Argument.Lifetime {value: boundRegion} = &wanted[at] {
+                if !Lifetime.equalsShared(&sourceRegion, &boundRegion)
+                  && callerLocalRegion(&boundRegion, caller) && Shared.with<Lifetime, bool>(&sourceRegion, staticLifetime) {
+                  let ordinal = match &written[at] {
+                    Argument.Lifetime {value: binderRegion} => Shared.with<Lifetime, usize>(&binderRegion, fn(value: &Lifetime) -> usize {
+                      if let Lifetime.Parameter {declaration, ordinal} = &value.* {
+                        if DeclarationId.equals(&declaration, fresh) { return ordinal }
+                      }
+                      return usize.MAX
+                    })
+                    _ => usize.MAX
+                  }
+                  if ordinal == usize.MAX || fixedOrdinal(explicit, ordinal) {
+                    return Option.none<RejectionCode>()
+                  }
+                  next = Argument.Lifetime {value: Shared.clone<Lifetime>(&boundRegion)}
+                  run Vector.append<usize>(&mut changed, at)
+                }
+              }
+            }
+            run Vector.append<Argument>(&mut adjusted, move next)
+            at = at + usize.ONE
+          }
+          let positions = Vector.asSlice<usize>(&changed)
+          if positions.length == usize.ZERO { return Option.none<RejectionCode>() }
+          let mut active = Vector.make<DeclarationId>()
+          at = usize.ZERO
+          while at < positions.length {
+            if !run covariantLifetimeParameter(&mut resolver.*, &mut owner.*, &mut dependencies.*, &actualOwner,
+              offered, positions[at], &mut active, span) { return Option.none<RejectionCode>() }
+            at = at + usize.ONE
+          }
+          candidate = Option.some<Type>(Type.Nominal {declaration: move actualOwner, isPublic: isPublic, arguments: move adjusted})
+          reason = RejectionCode.BorrowRegionRelationUnavailable
+        }
       }
     }
     _ => ()
@@ -53376,4 +53432,140 @@ effect fn formalOpaqueApplication(resolver: &mut Resolver, module: &ModuleId, de
   }
   return Application {target: SpecializationTarget.Named {declaration: run DeclarationId.copy(producer)},
     arguments: move own, argumentOrdinals: move ownOrdinals, scopes: move scopes, statics: Vector.make<StaticSlot>()}
+}
+
+
+fn nominalTestReferenceRegion(value: &Type) -> Option<Shared<Lifetime>> {
+  if let Type.Reference {access, lifetime, ..} = &value.* {
+    if access == Access.Shared { return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(&lifetime)) }
+  }
+  return Option.none<Shared<Lifetime>>()
+}
+
+fn nominalTestBodyRegion(checked: &TypedBody) -> Option<Shared<Lifetime>> {
+  let nodes = TypedBody.nodeSlice(checked)
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {ty, ..} = &nodes[at].kind {
+      let borrowed = Shared.with<Type, Option<Shared<Lifetime>>>(&ty, nominalTestReferenceRegion)
+      if let Option<Shared<Lifetime>>.Some {value} = move borrowed { return Option.some<Shared<Lifetime>>(move value) }
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Shared<Lifetime>>()
+}
+
+fn nominalTestParameterRegion(value: &Type) -> Option<Shared<Lifetime>> {
+  if let Type.Nominal {arguments, ..} = &value.* {
+    let listed = Vector.asSlice<Argument>(&arguments)
+    if listed.length == usize.ONE {
+      if let Argument.Lifetime {value: validity} = &listed[usize.ZERO] {
+        return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(&validity))
+      }
+    }
+  }
+  return Option.none<Shared<Lifetime>>()
+}
+
+// A caller-owned Local cannot be written as a source generic argument. This private actor test
+// uses the real checked loan and source signatures, differing only in explicit-ordinal metadata.
+effect fn nominalRegionExplicitOrdinalClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run ModuleId.make(b"memory", b"example", b"nominal-explicit-local.silk")
+  let authored = Option.some<Bytes>(run Bytes.copy(b"struct Request<'a> { value: string<'a> }\nfn caller() -> i32 { let value = 1 let loan = &value return 0 }\nfn target<'a>(client: &'a i32, value: Request<'a>) -> i32 { return 42 }\nfn staticValue(value: Request<'static>) -> i32 { return 0 }\n"))
+  let revision = run Revision.publish(&Revision.make(), &id, &authored)
+  let mut store = Semantic.make(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option.none<FinalProfile>())
+  let mut request = Request.make()
+  let inventory = run Semantic.demandSourceInventory(&mut store, &mut request, &id)
+  let syntax = match move inventory {
+    SourceInventory.Present {syntax, ..} => move syntax
+    _ => { run Testing.expect(false, "the actual source census must be present") return () }
+  }
+  let functions = Vector.asSlice<NamedFunction>(&syntax.functions)
+  run Testing.expect(functions.length == 3, "the source supplies exactly the caller and two real signatures")
+  let caller = run DeclarationId.copy(&functions[usize.ZERO].declaration.identity)
+  let declared = run DeclarationId.copy(&functions[usize.ONE].declaration.identity)
+  run Testing.expect(DeclarationId.named(&caller, b"caller") && DeclarationId.named(&declared, b"target"),
+    "caller and callee are full source-derived canonical identities")
+  let answer = run Semantic.demandBody(&mut store, &mut request, &id, b"caller")
+  let body = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&answer, answerTypedBody) {
+    Option<Shared<TypedBody>>.Some {value} => move value
+    _ => { run Testing.expect(false, "the loan comes from a genuinely successful checked body") return () }
+  }
+  let observed = Shared.with<TypedBody, Option<Shared<Lifetime>>>(&body, nominalTestBodyRegion)
+  let region = match move observed {
+    Option<Shared<Lifetime>>.Some {value} => move value
+    _ => { run Testing.expect(false, "the checked caller retains its actual reference lifetime") return () }
+  }
+  run Testing.expect(callerLocalRegion(&region, &caller), "this is the actual caller's Local, not a foreign loan")
+  let signature = run Semantic.demandSignature(&mut store, &mut request, &id, b"target")
+  let original = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&signature,
+    fn(value: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(value, usize.ONE) }) {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { run Testing.expect(false, "the original parameter comes from the checked target header") return () }
+  }
+  let staticSignature = run Semantic.demandSignature(&mut store, &mut request, &id, b"staticValue")
+  let evidence = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&staticSignature,
+    fn(value: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(value, usize.ZERO) }) {
+    Option<Shared<Type>>.Some {value} => move value
+    _ => { run Testing.expect(false, "the Static nominal is actual source signature evidence") return () }
+  }
+  let writtenRegion = match move Shared.with<Type, Option<Shared<Lifetime>>>(&original, nominalTestParameterRegion) {
+    Option<Shared<Lifetime>>.Some {value} => move value
+    _ => { run Testing.expect(false, "the original nominal has one actual lifetime slot") return () }
+  }
+  let ordinal = Shared.with<Lifetime, usize>(&writtenRegion,
+    fn(value: &Lifetime) -> usize { return lifetimeOrdinalOf(value, &declared) })
+  run Testing.expect(ordinal != usize.MAX, "the explicit slot is the original source callee's actual lifetime ordinal")
+  let fresh = run DeclarationId.inference(&declared, b"explicit-local-negative")
+  let parameter = run Type.renameParameters(&original, &declared, &fresh)
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  let variable = run Shared.make<DeclarationId>(run DeclarationId.copy(&fresh))
+  run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(&variable))
+  let mut bindings = Vector.make<Binding>()
+  run Vector.append<Binding>(&mut bindings, Binding {declaration: Shared.clone<DeclarationId>(&variable),
+    ordinal: ordinal, value: Argument.Lifetime {value: Shared.clone<Lifetime>(&region)}})
+  let pattern = run Type.applyBindings(&parameter, Vector.asSlice<Binding>(&bindings), true)
+  let initialSlice = Vector.asSlice<Binding>(&bindings)
+  let initialBinding = &initialSlice[usize.ZERO]
+  let mut originalProof = Vector.make<Binding>()
+  run Vector.append<Binding>(&mut originalProof, Binding {declaration: Shared.clone<DeclarationId>(&initialBinding.declaration),
+    ordinal: initialBinding.ordinal, value: Argument.copy(&initialBinding.value)})
+  let originalFailure = run Type.unify(&parameter, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut originalProof)
+  run Testing.expect(match &originalFailure { Unification.Unified => false _ => true }, "the implicit operand starts with a real exact mismatch")
+  let mut dependencies = Vector.make<Dependency>()
+  let mut explicit = Vector.make<usize>()
+  let implicit = run deferredCallArgument(&mut store.resolver, &mut store.query, &mut dependencies,
+    &parameter, &pattern, &evidence, &fresh, &caller, Vector.asSlice<Shared<DeclarationId>>(&variables),
+    Vector.asSlice<Binding>(&bindings), Vector.asSlice<usize>(&explicit), Span.make(usize.ZERO, usize.ONE))
+  run Testing.expect(match &implicit { Option<RejectionCode>.Some {value} => value == RejectionCode.BorrowRegionRelationUnavailable _ => false },
+    "the implicit slot has a real tracked covariant member proof and sole deferred relation")
+  run Testing.expect(Vector.length<Dependency>(&dependencies) > usize.ZERO, "the proof retains actual member-query dependencies")
+  run Vector.append<usize>(&mut explicit, ordinal)
+  let fixed = run deferredCallArgument(&mut store.resolver, &mut store.query, &mut dependencies,
+    &parameter, &pattern, &evidence, &fresh, &caller, Vector.asSlice<Shared<DeclarationId>>(&variables),
+    Vector.asSlice<Binding>(&bindings), Vector.asSlice<usize>(&explicit), Span.make(usize.ZERO, usize.ONE))
+  run Testing.expect(match &fixed { Option<RejectionCode>.None => true _ => false },
+    "identical caller-local evidence fixed explicitly must not enter the inferred nominal gap")
+  run Testing.expect(Vector.length<Binding>(&bindings) == usize.ONE, "diagnostic candidates never append real inference bindings")
+  let retainedSlice = Vector.asSlice<Binding>(&bindings)
+  let retained = &retainedSlice[usize.ZERO]
+  let unchanged = match &retained.value {
+    Argument.Lifetime {value} => Lifetime.equalsShared(&value, &region)
+    _ => false
+  }
+  run Testing.expect(unchanged, "diagnostic candidates never replace the real caller-local binding")
+  let mut proof = Vector.make<Binding>()
+  run Vector.append<Binding>(&mut proof, Binding {declaration: Shared.clone<DeclarationId>(&retained.declaration), ordinal: retained.ordinal,
+    value: Argument.copy(&retained.value)})
+  let rejected = run Type.unify(&parameter, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut proof)
+  run Testing.expect(match &rejected { Unification.Unified => false _ => true }, "the original Static operand still fails exact inference")
+  return ()
+}
+
+test effect fn nominalRegionGapExcludesExplicitCallerLocal() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nominalRegionExplicitOrdinalClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  return ()
 }
