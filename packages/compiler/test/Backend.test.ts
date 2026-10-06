@@ -9,6 +9,10 @@ import { selectedForeignDollarSource } from './support/foreignDollarSymbol.js'
 import * as ForeignContract from '../src/ForeignContract.js'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { NodeServices } from '@effect/platform-node'
+import * as FileSystem from 'effect/FileSystem'
+import { llvmToolchain } from '../../../test/support/llvmToolchain.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
@@ -432,7 +436,30 @@ it.effect('emits native debug metadata only for debug requests', () =>
     assert.notInclude(release.ir, 'DICompileUnit')
     assert.notInclude(release.ir, '!dbg')
     assert.notInclude(release.ir, 'Debug Info Version')
-  }),
+
+    const toolchain = yield* Effect.try(() =>
+      llvmToolchain(['llvm-dis', 'opt'], 'source debug bitcode loading', () => {}),
+    )
+    if (yield* Effect.try(() => toolchain.unavailable())) return
+    const fs = yield* FileSystem.FileSystem
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-debug-bitcode-' })
+    const bitcode = `${directory}/debug.bc`
+    yield* fs.writeFile(bitcode, debug.bitcode)
+    const loaded = yield* Effect.try(() =>
+      spawnSync(toolchain.command('llvm-dis'), [bitcode, '-o', '-'], { encoding: 'utf8' }),
+    )
+    assert.strictEqual(loaded.status, 0, loaded.stderr)
+    assert.strictEqual(loaded.stderr, '')
+    assert.include(loaded.stdout, '!llvm.dbg.cu = ')
+    assert.match(loaded.stdout, /!\d+ = !\{i32 2, !"Debug Info Version", i32 3\}/)
+    const verified = yield* Effect.try(() =>
+      spawnSync(toolchain.command('opt'), ['-passes=verify', '-disable-output', bitcode], {
+        encoding: 'utf8',
+      }),
+    )
+    assert.strictEqual(verified.status, 0, verified.stderr)
+    assert.strictEqual(verified.stderr, '')
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
 it.effect('keeps string identity in LLVM debug metadata only', () =>
