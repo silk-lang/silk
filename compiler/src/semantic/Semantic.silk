@@ -1044,6 +1044,8 @@ union SelectionFact {
 union ResolvedTarget {
   Function {target: CallTarget},
   Constant {declaration: DeclarationId, ty: Shared<Type>},
+  /// An imported C static read by value, with its admitted scalar or pointer type.
+  ForeignStatic {declaration: DeclarationId, ty: Shared<Type>},
   Intrinsic {member: IntrinsicMember, typeArguments: Vector<Shared<Type>>},
   /// A sealed Effect composition intrinsic and its written type and row arguments.
   Composition {operation: Composition, written: Vector<Argument>},
@@ -19429,27 +19431,6 @@ fn answerLayoutUnsupported(answer: &Result<Answer, NoRejection>) -> bool {
   }
 }
 
-// Written type and row binders: elided lifetimes and implicit callable representations are not
-// generics a function value would need applied from its use site.
-fn signatureWrittenGenerics(answer: &Result<Answer, NoRejection>) -> usize {
-  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
-      let listed = Vector.asSlice<Shared<Type>>(&signature.typeParameters)
-      let mut count = Vector.length<RowParameter>(&signature.rowParameters)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        let ordinal = Shared.with<Type, usize>(&listed[at], fn(parameter: &Type) -> usize {
-          return match &parameter.* { Type.Parameter {ordinal, ..} => ordinal _ => usize.MAX }
-        })
-        if ordinal < signature.callableParameterStart { count = count + usize.ONE }
-        at = at + usize.ONE
-      }
-      return count
-    }
-  }
-  return usize.ZERO
-}
-
 fn signatureBinderCount(answer: &Result<Answer, NoRejection>) -> usize {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
@@ -19862,6 +19843,67 @@ fn capturedRegion(nodes: &[BodyNode], arguments: &[BodyNodeId]) -> Option<Shared
     at = at + usize.ONE
   }
   return Option.none<Shared<Lifetime>>()
+}
+
+// A lifetime binder that only the call's outcome mentions, such as an impl lifetime only the
+// result names, is chosen by the call's use rather than by an operand (LIFE-003). An ordinary
+// call's expected result fixes it; otherwise the outcome retains no operand region through it, so
+// it is 'static. A binder that nothing mentions stays uninferred.
+effect fn bindUseLifetimes(inference: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
+  callOwner: &Shared<DeclarationId>, binderCount: usize, expected: &Option<Shared<Type>>, effectTarget: bool,
+  inferred: &mut Vector<Binding>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut types = Vector.make<usize>()
+  let mut mentioned = Vector.make<usize>()
+  let mut rows = Vector.make<usize>()
+  let parameters = run signatureParameterTypes(inference)
+  let listed = Vector.asSlice<Shared<Type>>(&parameters)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Type.collectOwned(&listed[at], fresh, &mut types, &mut mentioned, &mut rows)
+    at = at + usize.ONE
+  }
+  let mut outcomeTypes = Vector.make<usize>()
+  let mut produced = Vector.make<usize>()
+  let mut outcomeRows = Vector.make<usize>()
+  let declared = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference, signatureResult)
+  if let Option<Shared<Type>>.Some {value: written} = &declared {
+    run Type.collectOwned(&written, fresh, &mut outcomeTypes, &mut produced, &mut outcomeRows)
+  }
+  let failure = run signatureFailure(inference)
+  run Type.collectOwned(&failure, fresh, &mut outcomeTypes, &mut produced, &mut outcomeRows)
+  let requirements = run signatureRequirements(inference)
+  run Type.collectOwnedRow(&requirements, fresh, &mut outcomeTypes, &mut produced, &mut outcomeRows)
+  let mut evidence = Vector.make<Binding>()
+  if !effectTarget {
+    if let Option<Shared<Type>>.Some {value: wanted} = &expected.* {
+      if let Option<Shared<Type>>.Some {value: written} = &declared {
+        let pattern = run Type.applyBindings(&written, Vector.asSlice<Binding>(&inferred.*), true)
+        let mut variables = Vector.make<Shared<DeclarationId>>()
+        run Vector.append<Shared<DeclarationId>>(&mut variables, Shared.clone<DeclarationId>(callOwner))
+        drop run Type.unify(&pattern, &wanted, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut evidence)
+      }
+    }
+  }
+  at = usize.ZERO
+  while at < binderCount {
+    let open = match move bindingArgumentAt(Vector.asSlice<Binding>(&inferred.*), at) {
+      Option<Argument>.Some {..} => false
+      Option<Argument>.None => containsOrdinal(&produced, at) && !containsOrdinal(&mentioned, at)
+    }
+    if open {
+      let mut region = run Shared.make<Lifetime>(Lifetime.Static)
+      if let Option<Argument>.Some {value: Argument.Lifetime {value: selected}} = move bindingArgumentAt(Vector.asSlice<Binding>(&evidence), at) {
+        let mut owned = Vector.make<usize>()
+        run Type.collectOwnedLifetime(&selected, fresh, &mut owned)
+        if Vector.length<usize>(&owned) == usize.ZERO { region = Shared.clone<Lifetime>(&selected) }
+      }
+      run Vector.append<Binding>(&mut inferred.*, Binding {declaration: Shared.clone<DeclarationId>(callOwner), ordinal: at,
+        value: Argument.Lifetime {value: move region}})
+    }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 fn bindingArgumentAt(bindings: &[Binding], ordinal: usize) -> Option<Argument> {
@@ -22826,6 +22868,108 @@ effect fn callConstantTarget(
   )
 }
 
+// The declared type of one imported C static. Its scalar or pointer type is read by copy; an
+// exported definition, a non-C ABI and linkage properties stay deferred.
+effect fn foreignStaticType(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  moduleOrdinal: usize,
+  ordinal: usize,
+  span: Span,
+) -> Result<Shared<Type>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let module = run resolvedModule(&resolver.*, moduleOrdinal)
+  let written = run foreignHeader(&mut resolver.*, &module, ordinal)
+  let deferred = match &written.gap {
+    Option<GapCode>.Some {..} => true
+    Option<GapCode>.None => false
+  }
+  if written.exported || deferred {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(
+      run reject(&resolver.*, &module, RejectionCode.ForeignStaticUnavailable, span),
+    )
+  }
+  let mut annotation = Option.none<HirId>()
+  let found = run header(&mut resolver.*, &module, ordinal)
+  if let Option<HeaderSyntax>.Some {value} = move found {
+    if let Node.StaticHeader {annotation: declared, ..} = value.header { annotation = Option.some<HirId>(declared) }
+  }
+  let typeSyntax = match move annotation {
+    Option<HirId>.Some {value} => value
+    Option<HirId>.None => {
+      return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, &module, RejectionCode.NotCallable, span))
+    }
+  }
+  let noBinders = Vector.make<Binder>()
+  // Foreign storage lives for the whole program, so an omitted reference lifetime is `'static`.
+  let mut elision = LifetimeElision {
+    owner: Option.none<DeclarationId>(),
+    nextOrdinal: usize.ZERO,
+    output: true,
+    resultDefault: Option.some<Shared<Lifetime>>(run Shared.make<Lifetime>(Lifetime.Static)),
+    generated: Vector.make<Shared<Lifetime>>(),
+    invocation: false,
+    nested: false,
+    renumber: Vector.make<usize>(),
+    staticEnvironment: false,
+    supplied: Option.none<Vector<Argument>>(),
+    assumptions: Option.none<Vector<Constraint>>(),
+  }
+  let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, typeSyntax,
+    Vector.asSlice<Binder>(&noBinders), &mut elision)
+  let ty = match move resolved {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Shared<Type>, Shared<Rejection>>(move error) }
+  }
+  let admitted = Shared.with<Type, bool>(&ty, foreignStaticAdmitted)
+  if !admitted {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(&resolver.*, &module, RejectionCode.ForeignType, span))
+  }
+  return Result.succeed<Shared<Type>, Shared<Rejection>>(move ty)
+}
+
+// A foreign static holds one immediate C scalar or pointer; it is never unit.
+fn foreignStaticAdmitted(value: &Type) -> bool {
+  return match &value.* {
+    Type.Unit => false
+    _ => CAbi.admit(value)
+  }
+}
+
+// Resolves an imported C static used by name as a value. The use site anchors any deferral.
+effect fn foreignStaticTarget(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  targetModule: &ModuleId,
+  target: &SelectedDeclaration,
+  span: Span,
+) -> Result<ResolvedTarget, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let selected = run foreignStaticType(&mut resolver.*, &mut owner.*, &mut dependencies.*, target.module, target.ordinal, span)
+  let ty = match move selected {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+      let code = Shared.with<Rejection, RejectionCode>(&error, fn(rejection: &Rejection) -> RejectionCode {
+        return rejection.code
+      })
+      if code == RejectionCode.ForeignStaticUnavailable || code == RejectionCode.ForeignType {
+        return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, code, span))
+      }
+      return Result.failResult<ResolvedTarget, Shared<Rejection>>(move error)
+    }
+  }
+  let identity = run declarationAt(&mut resolver.*, targetModule, target.ordinal)
+  if let Option<DeclarationId>.Some {value: declaration} = move identity {
+    return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.ForeignStatic {declaration: move declaration, ty: move ty})
+  }
+  return Result.failResult<ResolvedTarget, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.NotCallable, span))
+}
+
 // Resolves a source or foreign function used as a call, including its written generic prefix.
 effect fn callFunctionTarget(
   resolver: &mut Resolver,
@@ -23091,9 +23235,7 @@ effect fn callTarget(
   if let Node.StaticHeader {..} = declared.header {
     // This header is a foreign or exported static, both with required linkage.
     if bareValue {
-      return Result.failResult<ResolvedTarget, Shared<Rejection>>(
-        run reject(&resolver.*, module, RejectionCode.ForeignStaticUnavailable, span),
-      )
+      return run foreignStaticTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &targetModule, &target, span)
     }
     return Result.failResult<ResolvedTarget, Shared<Rejection>>(
       run reject(&resolver.*, module, RejectionCode.NotCallable, span),
@@ -23234,6 +23376,9 @@ effect fn resolveNamedRepresentation(
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
     ResolvedTarget.Constant {..} => {
+      return run invalidExactRepresentation(&resolver.*, module, span)
+    }
+    ResolvedTarget.ForeignStatic {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
     ResolvedTarget.Intrinsic {..} => {
@@ -23421,6 +23566,10 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
     ResolvedTarget.Storage {operation, typeArguments} => ResolvedTarget.Storage {operation: operation,
       typeArguments: run copyTypes(Vector.asSlice<Shared<Type>>(&typeArguments))}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {
+      declaration: run DeclarationId.copy(&declaration),
+      ty: Shared.clone<Type>(&ty),
+    }
+    ResolvedTarget.ForeignStatic {declaration, ty} => ResolvedTarget.ForeignStatic {
       declaration: run DeclarationId.copy(&declaration),
       ty: Shared.clone<Type>(&ty),
     }
@@ -27531,6 +27680,32 @@ effect fn embeddedExpression(
   return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
 }
 
+// One read of an imported C static, checked at its declared type.
+effect fn foreignStaticExpression(
+  resolver: &Resolver,
+  module: &ModuleId,
+  nodes: &mut Vector<BodyNode>,
+  expression: HirId,
+  span: Span,
+  declaration: DeclarationId,
+  ty: Shared<Type>,
+  expected: &Option<Shared<Type>>,
+) -> Result<BodyNodeId, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let index = Vector.length<BodyNode>(&nodes.*)
+  let mismatch = match &expected.* {
+    Option<Shared<Type>>.Some {value: wanted} => !run Type.equalsShared(&ty, &wanted)
+    Option<Shared<Type>>.None => false
+  }
+  run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+    origin: BodyOrigin {syntax: expression, span: span},
+    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.ForeignStatic {
+      declaration: run Shared.make<DeclarationId>(move declaration),
+    }},
+  })
+  if mismatch { return run checkExpectedValue(resolver, module, &mut nodes.*, BodyNodeId {index: index}, expected, span) }
+  return Result.succeed<BodyNodeId, Shared<Rejection>>(BodyNodeId {index: index})
+}
+
 // Checks one static reflection call. The owner is the call's single resolved type argument:
 // `reflectType<Owner>()` yields `Intrinsic.Type<Owner>`, and `reflectTypeKind<Owner>` accepts
 // exactly that descriptor and yields `u8`.
@@ -30693,7 +30868,9 @@ struct CheckedIdentifier {
 // Function values are handled by the construction path before this helper. An unbound identifier
 // here names a constant; a bound one names a local or runtime pattern binder.
 effect fn checkedIdentifier(
-  resolver: &Resolver,
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
   module: &ModuleId,
   cursor: &AuthoredCursor,
   locals: &[BodyLocal],
@@ -30706,7 +30883,7 @@ effect fn checkedIdentifier(
   span: Span,
   staticBody: bool,
 ) -> Result<CheckedIdentifier, Shared<Rejection>>
-! RevisionMismatch | OutOfMemoryError
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   if !bound {
     let found = run resolvedCall(calls, expression)
@@ -30714,7 +30891,7 @@ effect fn checkedIdentifier(
       Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} => value
       Option<Result<ResolvedTarget, Shared<Rejection>>>.None => {
         return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-          run reject(resolver, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
+          run reject(&resolver.*, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
         )
       }
     }
@@ -30722,20 +30899,24 @@ effect fn checkedIdentifier(
       Result<ResolvedTarget, Shared<Rejection>>.Success {
         value: ResolvedTarget.Constant {declaration, ty: constantType},
       } => {
-        if !staticBody {
-          return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-            run reject(resolver, module, RejectionCode.RuntimeConstantUnavailable, span),
-          )
+        if staticBody {
+          return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
+            ty: move constantType,
+            form: BodyExpression.Constant {
+              declaration: run Shared.make<DeclarationId>(move declaration),
+            },
+          })
         }
-        return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
-          ty: move constantType,
-          form: BodyExpression.Constant {
-            declaration: run Shared.make<DeclarationId>(move declaration),
-          },
-        })
+        let read = run runtimeConstantRead(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, move declaration, span)
+        return match move read {
+          Result<BodyExpression, Shared<Rejection>>.Success {value: form} => Result.succeed<CheckedIdentifier, Shared<Rejection>>(
+            CheckedIdentifier {ty: move constantType, form: move form},
+          )
+          Result<BodyExpression, Shared<Rejection>>.Failure {error} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(move error)
+        }
       }
       Result<ResolvedTarget, Shared<Rejection>>.Success {value: _} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-        run reject(resolver, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
+        run reject(&resolver.*, module, RejectionCode.UnknownName, run bodySpan(&resolver.source, cursor, name)),
       )
       Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(move error)
     }
@@ -30757,11 +30938,11 @@ effect fn checkedIdentifier(
   }
   if staticBody {
     return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-      run reject(resolver, module, RejectionCode.StaticPhaseViolation, run bodySpan(&resolver.source, cursor, name)),
+      run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, run bodySpan(&resolver.source, cursor, name)),
     )
   }
   return Result.failResult<CheckedIdentifier, Shared<Rejection>>(
-    run reject(resolver, module, RejectionCode.Unsupported, span),
+    run reject(&resolver.*, module, RejectionCode.Unsupported, span),
   )
 }
 
@@ -30976,11 +31157,23 @@ effect fn checkFieldAccess<'scope>(
     }
   }
   // A qualified constant is a declaration selection, not a runtime namespace value. Preserve
-  // enum and unit-variant construction above, then report ordinary constant materialization.
+  // enum and unit-variant construction above, then read the constant's published value.
   let constantSelection = run resolvedCall(calls, expression)
   if let Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} = move constantSelection {
-    if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {..}} = move value {
-      return run bodyRejection(&resolver.*, module, RejectionCode.RuntimeConstantUnavailable, span)
+    if let Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {declaration, ty: constantType}} = move value {
+      let read = run runtimeConstantRead(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, move declaration, span)
+      let form = match move read {
+        Result<BodyExpression, Shared<Rejection>>.Success {value: selected} => selected
+        Result<BodyExpression, Shared<Rejection>>.Failure {error} => {
+          return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
+        }
+      }
+      let index = Vector.length<BodyNode>(&nodes.*)
+      run Vector.append<BodyNode>(&mut nodes.*, BodyNode {
+        origin: BodyOrigin {syntax: expression, span: span},
+        kind: BodyNodeKind.Expression {ty: move constantType, form: move form},
+      })
+      return run checkExpectedValue(&resolver.*, module, &mut nodes.*, BodyNodeId {index: index}, expected, span)
     }
   }
   let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -32471,6 +32664,14 @@ effect fn checkExpressionUnder<'scope>(
             arguments: CallArguments.Written {range: Range.empty()}, pipeline: false},
           expected, constraints, contractBody, false, unsafeAllowed, false, true)
       }
+      Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {
+        value: Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.ForeignStatic {declaration, ty}},
+      } => {
+        if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
+        // Reading foreign storage observes memory outside Silk's ownership, so it needs `unsafe`.
+        if !unsafeAllowed { return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeAcknowledgement, span) }
+        return run foreignStaticExpression(&resolver.*, module, &mut nodes.*, expression, span, move declaration, move ty, expected)
+      }
       Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value: Result<ResolvedTarget, Shared<Rejection>>.Failure {error}} => {
         let rejectedValue = Shared.with<Rejection, bool>(&error, fn(value: &Rejection) -> bool {
           return value.code == RejectionCode.ForeignFunctionNotFirstClass || value.code == RejectionCode.ForeignStaticUnavailable
@@ -32665,7 +32866,7 @@ effect fn checkExpressionUnder<'scope>(
       diverges = true
     }
     Node.IdentifierExpression {name, binding} => {
-      let found = run checkedIdentifier(&resolver.*, module, cursor,
+      let found = run checkedIdentifier(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
         Vector.asSlice<BodyLocal>(&statementScope.locals.*), calls, Vector.asSlice<BodyNode>(&nodes.*),
         expression, name, binding.present, binding.id, span, staticBody)
       let identifier = match move found {
@@ -33766,8 +33967,9 @@ effect fn proveCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
   parameter: &Shared<Type>, contract: &Shared<Type>, span: Span,
 ) -> Option<Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let determined = Option.none<DeclarationId>()
   let source = match move run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-    declared, parameter, contract, span) {
+    declared, parameter, contract, &determined, span) {
     Result<Option<Shared<Type>>, Shared<Rejection>>.Success {value} => move value
     Result<Option<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
   }
@@ -33939,11 +34141,17 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
   -> Option<Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let actual = run Type.applyBindings(parameter, Vector.asSlice<Binding>(&inferred.*), true)
   let promised = run Type.applyBindings(contract, Vector.asSlice<Binding>(&inferred.*), true)
+  let mut pending = Option.none<DeclarationId>()
   if Shared.with<Type, bool>(&actual, genericSectionType) && run sectionContextUndetermined(&promised, fresh) {
-    return Option.none<Shared<Rejection>>()
+    // A generic function value has no exact contract until its use selects one. The positions
+    // this call already determined, such as the parameters, may select it; its instantiated
+    // result is then evidence for the still-open positions. Otherwise it stays deferred. A
+    // selection the determined positions reject is the call's error, not a deferral.
+    pending = Option.some<DeclarationId>(run DeclarationId.copy(fresh))
   }
-  let source = match move run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-    declared, &actual, &promised, span) {
+  let selected = run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+    declared, &actual, &promised, &pending, span)
+  let source = match move selected {
     Result<Option<Shared<Type>>, Shared<Rejection>>.Success {value} => move value
     Result<Option<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
   }
@@ -33989,9 +34197,16 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
       }
       let pattern = run Type.openInvocation(&wanted.result, &rigid)
       let evidence = run Type.openInvocation(&offered.result, &rigid)
-      let compared = run Type.unify(&pattern, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut trial,
-      )
-      drop compared
+      // A delayed Effect result is covariant in its run access, so its channels and environment
+      // are the evidence; the comparison later proves the access.
+      let delayed = run effectBound(&evidence, &pattern)
+      if let Option<EffectBound>.Some {value: effects} = move delayed {
+        run inferEffectBound(fresh, &mut trial, &effects)
+      } else {
+        let compared = run Type.unify(&pattern, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut trial,
+        )
+        drop compared
+      }
       let added = Vector.asSlice<Binding>(&trial)
       let mut checkAt = mark
       while checkAt < added.length {
@@ -34861,6 +35076,9 @@ effect fn checkInvocation<'scope>(
     ResolvedTarget.Constant {..} => {
       return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
     }
+    ResolvedTarget.ForeignStatic {..} => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
+    }
     ResolvedTarget.Composition {operation, written} => {
       if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
       return run checkComposition(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
@@ -35092,12 +35310,6 @@ effect fn checkInvocation<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span)
   }
   let effectTarget = Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureIsEffect)
-  // A generic `effect fn` value needs its application inferred from the use site's callable
-  // contract (for example a handler passed to `Effect.catchAll`); that stays a named gap.
-  if effectTarget && valueConstruction && Vector.length<Argument>(&target.explicit) == usize.ZERO &&
-    Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureWrittenGenerics) != usize.ZERO {
-    return run bodyRejection(&resolver.*, module, RejectionCode.EffectFormUnavailable, span)
-  }
   let unsafeCall = foreignCall || Shared.with<Result<Answer, NoRejection>, bool>(
     &target.signature,
     signatureUnsafe,
@@ -35293,13 +35505,21 @@ effect fn checkInvocation<'scope>(
   }
   // An `effect<'env> fn` environment that no parameter mentions is inferred from what the call
   // captures (lifetimes reference): the region a borrowed argument retains, else 'static. A
-  // deferred section has not captured its remaining operands yet, so it keeps the binder open.
+  // section, including a whole generic `effect fn` used as a value, has not captured its remaining
+  // operands yet: a binder they mention stays open for the invocation, and any other environment
+  // binder is fixed by the supplied suffix the same way.
   let mut environmentAt = usize.ZERO
-  if parameterOffset != usize.ZERO { environmentAt = binderCount }
+  let mut pendingTypes = Vector.make<usize>()
+  let mut pendingLifetimes = Vector.make<usize>()
+  let mut pendingRows = Vector.make<usize>()
+  if parameterOffset != usize.ZERO && !run sectionEvidence(&inference, &freshOwner, Vector.asSlice<Binding>(&inferred),
+    parameterOffset, &mut pendingTypes, &mut pendingLifetimes, &mut pendingRows) {
+    environmentAt = binderCount
+  }
   while environmentAt < binderCount {
     let open = match move bindingArgumentAt(Vector.asSlice<Binding>(&inferred), environmentAt) {
       Option<Argument>.Some {..} => false
-      Option<Argument>.None => Shared.with<Result<Answer, NoRejection>, bool>(&inference,
+      Option<Argument>.None => !containsOrdinal(&pendingLifetimes, environmentAt) && Shared.with<Result<Answer, NoRejection>, bool>(&inference,
         fn(answer: &Result<Answer, NoRejection>) -> bool { return signatureEnvironmentBinder(answer, environmentAt) })
     }
     if open {
@@ -35313,6 +35533,9 @@ effect fn checkInvocation<'scope>(
       })
     }
     environmentAt = environmentAt + usize.ONE
+  }
+  if parameterOffset == usize.ZERO && !valueConstruction {
+    run bindUseLifetimes(&inference, &freshOwner, &callOwner, binderCount, expected, effectTarget, &mut inferred)
   }
   let mut unresolvedAt = usize.ZERO
   while unresolvedAt < binderCount {
@@ -40075,51 +40298,43 @@ effect fn staticSpan(resolver: &mut Resolver, module: &ModuleId, id: HirId) -> S
   return Span.make(usize.ZERO, usize.ZERO)
 }
 
-// This loan is short: the machine resumes only after the reached constant's query facts
-// have been recorded on the same active provider dependency ledger.
-effect fn staticResolveNeeded<'source>(
-  port: &mut StaticPort<'source>,
-  module: &ModuleId,
-  declaration: &Shared<DeclarationId>,
+// The type-fact key of one canonical constant, or absence when this store has not indexed the
+// constant's module and declaration. Its initializer shares the module and declaration ordinals.
+effect fn constantKey(resolver: &mut Resolver, declaration: &Shared<DeclarationId>) -> Option<Key>
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let moduleOrdinal = Shared.with<DeclarationId, usize>(declaration, fn(identity: &DeclarationId) -> usize {
+    return knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(identity))
+  })
+  if moduleOrdinal == usize.MAX { return Option.none<Key>() }
+  let targetModule = run resolvedModule(&resolver.*, moduleOrdinal)
+  let located = run ordinalOfIdentity(&mut resolver.*, &targetModule, declaration)
+  return match move located {
+    Option<usize>.Some {value} => Option.some<Key>(Key {
+      family: Family.Constant, module: moduleOrdinal, name: usize.ZERO,
+      declaration: value, member: usize.ZERO, external: false,
+    })
+    Option<usize>.None => Option.none<Key>()
+  }
+}
+
+// One constant's published value from its content-keyed initializer answer. Every reader shares
+// that answer and records the same value edge; a rejected initializer rejects the reader. `None`
+// means the answer published no value.
+effect fn constantInitializer(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  constant: Key,
   span: Span,
 ) -> Result<Option<Shared<StaticData>>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
-  let moduleOrdinal = Shared.with<DeclarationId, usize>(declaration, fn(identity: &DeclarationId) -> usize {
-    return knownModuleOrdinal(&port.resolver.*, DeclarationId.moduleId(identity))
-  })
-  if moduleOrdinal == usize.MAX {
-    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
-      run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
-    )
-  }
-  let targetModule = run resolvedModule(&port.resolver.*, moduleOrdinal)
-  let located = run ordinalOfIdentity(&mut port.resolver.*, &targetModule, declaration)
-  let ordinal = match move located {
-    Option<usize>.Some {value} => value
-    Option<usize>.None => {
-      return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
-        run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
-      )
-    }
-  }
-  let declared = run demandChild(
-    &mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*,
-    Key {
-      family: Family.Constant, module: moduleOrdinal, name: usize.ZERO,
-      declaration: ordinal, member: usize.ZERO, external: false,
-    },
-    span,
-  )
-  let referencedType = Shared.with<Result<Answer, NoRejection>, TypeSelection>(&declared, selectedType)
-  if let Option<Shared<Rejection>>.Some {value} = move referencedType.rejected {
-    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
-  }
   let referenced = run demandChild(
-    &mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*,
+    &mut resolver.*, &mut owner.*, &mut dependencies.*,
     Key {
-      family: Family.Initializer, module: moduleOrdinal, name: usize.ZERO,
-      declaration: ordinal, member: usize.ZERO, external: false,
+      family: Family.Initializer, module: constant.module, name: usize.ZERO,
+      declaration: constant.declaration, member: usize.ZERO, external: false,
     },
     span,
   )
@@ -40133,6 +40348,72 @@ effect fn staticResolveNeeded<'source>(
     &referenced, initializerValue,
   )
   return Result.succeed<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
+}
+
+// A runtime body reads a constant as its published value at the declared type. The value has no
+// runtime storage, so the read is embedded exactly like a selected static value.
+effect fn runtimeConstantRead(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  module: &ModuleId,
+  declaration: DeclarationId,
+  span: Span,
+) -> Result<BodyExpression, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let identity = run Shared.make<DeclarationId>(move declaration)
+  let located = run constantKey(&mut resolver.*, &identity)
+  let constant = match move located {
+    Option<Key>.Some {value} => value
+    Option<Key>.None => {
+      return Result.failResult<BodyExpression, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.InvalidConstant, span),
+      )
+    }
+  }
+  let published = run constantInitializer(&mut resolver.*, &mut owner.*, &mut dependencies.*, constant, span)
+  let selected = match move published {
+    Result<Option<Shared<StaticData>>, Shared<Rejection>>.Success {value} => value
+    Result<Option<Shared<StaticData>>, Shared<Rejection>>.Failure {error} => {
+      return Result.failResult<BodyExpression, Shared<Rejection>>(move error)
+    }
+  }
+  return match move selected {
+    Option<Shared<StaticData>>.Some {value} => Result.succeed<BodyExpression, Shared<Rejection>>(
+      BodyExpression.Embedded {value: move value},
+    )
+    Option<Shared<StaticData>>.None => Result.failResult<BodyExpression, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.InvalidConstant, span),
+    )
+  }
+}
+
+// This loan is short: the machine resumes only after the reached constant's query facts
+// have been recorded on the same active provider dependency ledger.
+effect fn staticResolveNeeded<'source>(
+  port: &mut StaticPort<'source>,
+  module: &ModuleId,
+  declaration: &Shared<DeclarationId>,
+  span: Span,
+) -> Result<Option<Shared<StaticData>>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let located = run constantKey(&mut port.resolver.*, declaration)
+  let constant = match move located {
+    Option<Key>.Some {value} => value
+    Option<Key>.None => {
+      return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(
+        run reject(&port.resolver.*, module, RejectionCode.InvalidConstant, span),
+      )
+    }
+  }
+  let declared = run demandChild(&mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*, constant, span)
+  let referencedType = Shared.with<Result<Answer, NoRejection>, TypeSelection>(&declared, selectedType)
+  if let Option<Shared<Rejection>>.Some {value} = move referencedType.rejected {
+    return Result.failResult<Option<Shared<StaticData>>, Shared<Rejection>>(move value)
+  }
+  return run constantInitializer(&mut port.resolver.*, &mut port.query.*, &mut port.dependencies.*, constant, span)
 }
 
 /// Resolves the constant a static evaluation needed and supplies it as a binding. Answers whether
@@ -41044,14 +41325,18 @@ fn bodyCoverageGap(hir: &Module, span: Span) -> GapCode {
 
 
 // The query member that selects an instance's MIR producer: an ordinary or selected body, the C
-// entry shim, or drop glue.
+// entry shim, drop glue, or a C export shim.
 fn instanceMember(instance: &InstanceKey) -> usize {
   return match &instance.* {
     InstanceKey.Function {..} => usize.ZERO
     InstanceKey.Entry {..} => usize.MAX
     InstanceKey.DropGlue {..} => usize.MAX - usize.ONE
+    InstanceKey.Export {..} => exportMember()
   }
 }
+
+// The query member of a C export shim; distinct from the entry, glue and every selected body.
+fn exportMember() -> usize { return usize.MAX - 2 }
 
 // One glue child, or absence when its type mentions no declaration that could own cleanup.
 effect fn glueChild(index: usize, ty: &Shared<Type>) -> Option<GlueChild> ! OutOfMemoryError ? &mut Allocator {
@@ -44941,6 +45226,47 @@ fn callableResult(value: &Type) -> Option<Shared<Type>> {
   return match &value.* { Type.Callable {result, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&result)) _ => Option.none<Shared<Type>>() }
 }
 
+// Builds the C ABI shim of one exported definition after classifying every lane. A lane outside
+// the immediate scalar and pointer subset keeps its named C ABI gap.
+effect fn exportShim(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: Vector<Dependency>,
+  identity: &Shared<DeclarationId>,
+  key: Key,
+  symbol: &Shared<Bytes>,
+  written: ForeignHeader,
+  observing: bool,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut evidence = move dependencies
+  let location = InstanceLocation {module: key.module, declaration: key.declaration}
+  let classified = run Effect.result(cSignature(&mut resolver.*, &mut owner.*, &mut evidence, identity, location, move written))
+  let signature = match move classified {
+    Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+    Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner: gapOwner, source} => {
+        return memberSuccess(
+          Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap {code: code, owner: move gapOwner, source: move source})},
+          move evidence,
+        )
+      }
+      Cycle {} => { fail Cycle {} }
+      InvalidModulePath {} => { fail InvalidModulePath {} }
+      RevisionMismatch {} => { fail RevisionMismatch {} }
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+    }
+  }
+  let lanes = Vector.asSlice<CAbi.Lane>(&signature.parameters)
+  let mut parameters = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < lanes.length {
+    run Vector.append<Shared<Type>>(&mut parameters, Shared.clone<Type>(&lanes[at].ty))
+    at = at + usize.ONE
+  }
+  let shim = run MirFunction.cExport(identity, symbol, Vector.asSlice<Shared<Type>>(&parameters), &signature.result.ty, observing)
+  return run storeMir(&mut resolver.*, move shim, move evidence)
+}
+
 effect fn resolveMir(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -45043,22 +45369,34 @@ effect fn resolveMir(
     }
   }
   let selectedHeader = run header(&mut resolver.*, &module, key.declaration)
+  let mut linked = false
   if let Option<HeaderSyntax>.Some {value: syntax} = move selectedHeader {
-    if let Node.FunctionHeader {linkage, ..} = syntax.header {
-      if linkage.present {
-        let foreign = run foreignHeader(&mut resolver.*, &module, key.declaration)
-        let code = match move foreign.gap {
-          Option<GapCode>.Some {value: reason} => reason
-          Option<GapCode>.None => GapCode.ForeignContract
-        }
-        return memberSuccess(
-          Value.Unsupported {
-            gap: run Shared.make<BackendGap>(BackendGap.make(code, &identity, foreign.span)),
-          },
-          move dependencies,
-        )
+    if let Node.FunctionHeader {linkage, ..} = syntax.header { linked = linkage.present }
+  }
+  if linked {
+    let foreign = run foreignHeader(&mut resolver.*, &module, key.declaration)
+    if !foreign.exported {
+      let code = match move foreign.gap {
+        Option<GapCode>.Some {value: reason} => reason
+        Option<GapCode>.None => GapCode.ForeignContract
       }
+      return memberSuccess(
+        Value.Unsupported {
+          gap: run Shared.make<BackendGap>(BackendGap.make(code, &identity, foreign.span)),
+        },
+        move dependencies,
+      )
     }
+    if let Option<Shared<Bytes>>.Some {value: symbol} = move InstanceKey.exportSymbol(&instance) {
+      return run exportShim(&mut resolver.*, &mut owner.*, move dependencies, &identity, key, &symbol, move foreign, observing)
+    }
+    // The exported definition's own body lowers below like any ordinary function.
+  }
+  if key.member == exportMember() {
+    return memberRejected(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+      move dependencies,
+    )
   }
   if key.member == usize.MAX {
     let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
@@ -46096,8 +46434,16 @@ struct ForeignHeader {
   symbol: Bytes
   gap: Option<GapCode>
   span: Span
+  /// Whether the linkage defines this declaration for C callers (`export`) rather than importing it.
+  exported: bool
+  /// Whether the declaration is a C object (`static`) rather than a function.
+  global: bool
 }
 
+// Classifies one linked function or static header. A function import must be `unsafe`; an export
+// is an ordinary definition whose C lanes are checked separately. Both admit only the C ABI, no
+// generic, effect or static contract, and no callback or variadic lane. A static admits no
+// linkage properties.
 effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> ForeignHeader
 ! Cycle | OutOfMemoryError ? &mut Allocator {
   let observed = run source(&mut resolver.*, module)
@@ -46106,47 +46452,62 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
     let hir = IndexedSource.authored(value)
     if ordinal < declarations.length {
       let span = Module.span(hir, declarations[ordinal].header)
-      if let Node.FunctionHeader {name, contract, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
-        let mut symbolName = Bytes.make()
-        if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
-        let mut gap = Option.none<GapCode>()
-        if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
-          if !admittedForeignProperties(hir, properties, parameters) { gap = Option.some<GapCode>(GapCode.ForeignContract) }
-          if linkage.present {
-            let mut at = usize.ZERO
-            while at < parameters.length {
-              if let Node.Parameter {annotation, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
-                if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
-                  gap = Option.some<GapCode>(GapCode.CAbiCallback)
-                }
-              }
-              at = at + usize.ONE
-            }
-            if result.present {
-              if let Node.ForeignFunctionType {..} = Module.node(hir, result.id) {
-                gap = Option.some<GapCode>(GapCode.CAbiCallback)
-              }
-            }
+      if let Node.StaticHeader {name, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
+        if let Node.Linkage {direction, abi, symbol} = Module.node(hir, linkage) {
+          let mut symbolName = Bytes.make()
+          if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
+          if symbol.present {
+            if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { symbolName = run Bytes.copy(Module.text(hir, text)) }
           }
-          if variadic { gap = Option.some<GapCode>(GapCode.CAbiVariadic) }
-          if generics.length > usize.ZERO || isEffect || isStatic || !isUnsafe { gap = Option.some<GapCode>(GapCode.ForeignContract) }
+          let mut gap = Option.none<GapCode>()
+          if properties.length > usize.ZERO { gap = Option.some<GapCode>(GapCode.ForeignContract) }
+          let mut c = false
+          if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
+          if !c { gap = Option.some<GapCode>(GapCode.ForeignAbi) }
+          return ForeignHeader {symbol: move symbolName, gap: move gap, span: span, exported: direction == LinkageDirection.Export, global: true}
         }
+      }
+      if let Node.FunctionHeader {name, contract, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
         if linkage.present {
           if let Node.Linkage {direction, abi, symbol} = Module.node(hir, linkage.id) {
-            if direction == LinkageDirection.Export { gap = Option.some<GapCode>(GapCode.ForeignExport) }
-            let mut c = false
-            if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
-            if !c { gap = Option.some<GapCode>(GapCode.ForeignAbi) }
+            let exported = direction == LinkageDirection.Export
+            let mut symbolName = Bytes.make()
+            if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
             if symbol.present {
               if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { symbolName = run Bytes.copy(Module.text(hir, text)) }
             }
-            return ForeignHeader {symbol: move symbolName, gap: move gap, span: span}
+            let mut gap = Option.none<GapCode>()
+            if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
+              if !admittedForeignProperties(hir, properties, parameters) { gap = Option.some<GapCode>(GapCode.ForeignContract) }
+              let mut at = usize.ZERO
+              while at < parameters.length {
+                if let Node.Parameter {annotation, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
+                  if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
+                    gap = Option.some<GapCode>(GapCode.CAbiCallback)
+                  }
+                }
+                at = at + usize.ONE
+              }
+              if result.present {
+                if let Node.ForeignFunctionType {..} = Module.node(hir, result.id) {
+                  gap = Option.some<GapCode>(GapCode.CAbiCallback)
+                }
+              }
+              if variadic { gap = Option.some<GapCode>(GapCode.CAbiVariadic) }
+              if generics.length > usize.ZERO || isEffect || isStatic || (!isUnsafe && !exported) {
+                gap = Option.some<GapCode>(GapCode.ForeignContract)
+              }
+            }
+            let mut c = false
+            if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
+            if !c { gap = Option.some<GapCode>(GapCode.ForeignAbi) }
+            return ForeignHeader {symbol: move symbolName, gap: move gap, span: span, exported: exported, global: false}
           }
         }
       }
     }
   }
-  return ForeignHeader {symbol: Bytes.make(), gap: Option.some<GapCode>(GapCode.ForeignAbi), span: Span.make(usize.ZERO, usize.ZERO)}
+  return ForeignHeader {symbol: Bytes.make(), gap: Option.some<GapCode>(GapCode.ForeignAbi), span: Span.make(usize.ZERO, usize.ZERO), exported: false, global: false}
 }
 
 fn backendUnit(layout: LayoutMetrics) -> bool {
@@ -46236,8 +46597,41 @@ effect fn foreignSignature(
   }
   let module = run resolvedModule(&resolver.*, location.module)
   let written = run foreignHeader(&mut resolver.*, &module, location.declaration)
+  // A Silk call to an exported definition is not a C import; it keeps a named gap.
+  if written.exported { fail BackendGap.make(GapCode.ForeignExport, declaration, written.span) }
+  return run cSignature(&mut resolver.*, &mut owner.*, &mut dependencies.*, declaration, location, move written)
+}
+
+// Classifies the C lanes of one linked function whose header admitted the C contract.
+effect fn cSignature(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  declaration: &Shared<DeclarationId>,
+  location: InstanceLocation,
+  written: ForeignHeader,
+) -> CAbi.Signature
+! BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
   if let Option<GapCode>.Some {value} = move written.gap {
     fail BackendGap.make(value, declaration, written.span)
+  }
+  if written.global {
+    // A C object has one lane: the value its address holds.
+    let selected = run foreignStaticType(&mut resolver.*, &mut owner.*, &mut dependencies.*, location.module, location.declaration, written.span)
+    let objectType = match move selected {
+      Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { fail BackendGap.fromRejection(GapCode.ForeignStatic, declaration, &error) }
+    }
+    let object = run foreignLane(&mut resolver.*, &mut owner.*, &mut dependencies.*, &objectType, declaration, written.span)
+    return CAbi.Signature {
+      declaration: Shared.clone<DeclarationId>(declaration),
+      symbol: move written.symbol,
+      span: written.span,
+      result: move object,
+      parameters: Vector.make<CAbi.Lane>(),
+      global: true,
+    }
   }
   let signature = run demandChild(
     &mut resolver.*,
@@ -46303,6 +46697,7 @@ effect fn foreignSignature(
     span: written.span,
     result: move result,
     parameters: move parameters,
+    global: false,
   }
 }
 
@@ -54065,24 +54460,100 @@ impl Semantic {
       }
       return BackendBuild.Rejected {diagnostic: move value}
     }
-    return run Semantic.buildFrom(&mut self.*, module, move main, selected.span, closureNodes, false)
+    let mut roots = Vector.make<BuildRoot>()
+    run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Entry {main: move main}, span: selected.span})
+    return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&roots), selected.span, closureNodes, false)
   }
-  // Walks the instance graph from the entry. A program that runs any `observeDiagnostics` scope is
+  /// Builds an artifact whose roots are the active C exports of the selected runtime source. The
+  /// request's application module is what `import Intrinsic.application` binds inside it.
+  /// Demands only reached instances, then joins their definitions in content-symbol order.
+  pub effect fn buildRuntime(self: &mut Self, request: &mut Request, runtime: &ModuleId, closureNodes: usize) -> BackendBuild
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let origin = Span.make(usize.ZERO, usize.ZERO)
+    let listed = match move run exportCandidates(&mut self.resolver, runtime) {
+      Option<Vector<ExportCandidate>>.Some {value} => move value
+      Option<Vector<ExportCandidate>>.None => {
+        return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.MissingModule, origin)}
+      }
+    }
+    let moduleOrdinal = run internModule(&mut self.resolver, runtime)
+    // Root lookups observe governing conditions without a dependent answer.
+    let mut rootConditions = Vector.make<Dependency>()
+    let mut roots = Vector.make<BuildRoot>()
+    let mut gaps = Vector.make<Shared<BackendGap>>()
+    let candidates = Vector.asSlice<ExportCandidate>(&listed)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      at = at + usize.ONE
+      let active = run available(&mut self.resolver, &mut self.query, &mut rootConditions, runtime, candidate.declaration, candidate.span)
+      let present = match move active {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {error} => { return BackendBuild.Rejected {diagnostic: move error} }
+      }
+      if !present { continue }
+      let declared = run declarationAt(&mut self.resolver, runtime, candidate.declaration)
+      let function = match move declared {
+        Option<DeclarationId>.Some {value} => run Shared.make<DeclarationId>(move value)
+        Option<DeclarationId>.None => {
+          return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.UnknownName, candidate.span)}
+        }
+      }
+      let signature = run demandRaw(
+        &mut self.resolver,
+        &mut self.query,
+        Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: candidate.declaration, member: usize.ZERO, external: false},
+        candidate.span,
+      )
+      run recordRoot(&mut request.*, Family.Signature, runtime, Bytes.asSlice(&candidate.name), &signature)
+      let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&signature, answerRejection)
+      if let Option<Shared<Rejection>>.Some {value} = move failure {
+        let code = Shared.with<Rejection, RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
+          return rejection.code
+        })
+        let mut coverageGap = BackendGap.forRejection(code)
+        if code == RejectionCode.Unsupported { coverageGap = Option.some<GapCode>(GapCode.SignatureForm) }
+        if let Option<GapCode>.Some {value: gapCode} = move coverageGap {
+          run Vector.append<Shared<BackendGap>>(&mut gaps, run Shared.make<BackendGap>(BackendGap.fromRejection(gapCode, &function, &value)))
+          continue
+        }
+        return BackendBuild.Rejected {diagnostic: move value}
+      }
+      let symbol = run Shared.make<Bytes>(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
+      run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span})
+    }
+    if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
+      return BackendBuild.Unsupported {gaps: move gaps}
+    }
+    // A runtime whose arms select no export for this target provides no artifact root.
+    if Vector.length<BuildRoot>(&roots) == usize.ZERO {
+      return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.UnknownName, origin)}
+    }
+    return run Semantic.buildFrom(&mut self.*, runtime, Vector.asSlice<BuildRoot>(&roots), origin, closureNodes, false)
+  }
+  // Walks the instance graph from the roots. A program that runs any `observeDiagnostics` scope is
   // walked again with every function observing diagnostics (failure observer note N1).
-  effect fn buildFrom(self: &mut Self, module: &ModuleId, main: Shared<DeclarationId>, entrySpan: Span, closureNodes: usize,
+  effect fn buildFrom(self: &mut Self, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, closureNodes: usize,
     observing: bool) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator {
     let mut pending = Vector.make<BackendVisit>()
-    run Vector.append<BackendVisit>(
-      &mut pending,
-      BackendVisit.Enter {
-        key: InstanceKey.Entry {main: Shared.clone<DeclarationId>(&main)},
-        edge: Edge.Direct,
-        span: entrySpan,
-        module: run ModuleId.copy(module),
-      },
-    )
+    let mut rootAt = roots.length
+    // The worklist is a stack: push in reverse so roots are entered in their listed order.
+    while rootAt > usize.ZERO {
+      rootAt = rootAt - usize.ONE
+      run Vector.append<BackendVisit>(
+        &mut pending,
+        BackendVisit.Enter {
+          key: InstanceKey.copy(&roots[rootAt].key),
+          edge: Edge.Direct,
+          span: roots[rootAt].span,
+          module: run ModuleId.copy(module),
+        },
+      )
+    }
     let mut observes = false
     let mut admission = Admission.make()
     // Applications admitted by a finite closure certificate during this build.
@@ -54283,7 +54754,7 @@ impl Semantic {
       }
     }
     if observes && !observing {
-      return run Semantic.buildFrom(&mut self.*, module, move main, entrySpan, closureNodes, true)
+      return run Semantic.buildFrom(&mut self.*, module, roots, entrySpan, closureNodes, true)
     }
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
@@ -54525,6 +54996,60 @@ effect fn appendDistinctForeignDeclaration(
 union BackendVisit {
   Enter {key: InstanceKey, edge: Edge, span: Span, module: ModuleId},
   Leave,
+}
+
+// One artifact root: the generated C entry or one selected runtime C export, at its source span.
+struct BuildRoot {
+  key: InstanceKey
+  span: Span
+}
+
+// One module-level C export a runtime source declares, before its arms are evaluated.
+struct ExportCandidate {
+  declaration: usize
+  name: Bytes
+  symbol: Bytes
+  span: Span
+}
+
+// Lists every module-level `export "C" fn` of one source, or absence when the source is missing.
+effect fn exportCandidates(resolver: &mut Resolver, module: &ModuleId) -> Option<Vector<ExportCandidate>>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let hir = IndexedSource.authored(value)
+    let mut found = Vector.make<ExportCandidate>()
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let topLevel = match &declarations[at].parent {
+        Option<usize>.None => true
+        Option<usize>.Some {..} => false
+      }
+      if topLevel {
+        if let Node.FunctionHeader {name, linkage, ..} = Module.node(hir, declarations[at].header) {
+          if linkage.present {
+            if let Node.Linkage {direction, symbol, ..} = Module.node(hir, linkage.id) {
+              if direction == LinkageDirection.Export {
+                let mut written = Bytes.make()
+                if let Node.Name {text} = Module.node(hir, name) { written = run Bytes.copy(Module.text(hir, text)) }
+                let mut linked = run Bytes.copy(Bytes.asSlice(&written))
+                if symbol.present {
+                  if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { linked = run Bytes.copy(Module.text(hir, text)) }
+                }
+                run Vector.append<ExportCandidate>(&mut found, ExportCandidate {
+                  declaration: at, name: move written, symbol: move linked, span: Module.span(hir, declarations[at].header),
+                })
+              }
+            }
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Option.some<Vector<ExportCandidate>>(move found)
+  }
+  return Option.none<Vector<ExportCandidate>>()
 }
 
 struct BackendRequest {
@@ -54820,9 +55345,11 @@ effect fn sectionInferenceOwner(resolver: &mut Resolver, target: &DeclarationId)
 
 // Admission specializes a comparison contract, never the immutable value or its runtime key.
 // Target binders are opened before the context is introduced, including recursive owner uses.
+// With a pending call owner, positions mentioning its still-open variables are not evidence, and
+// a contract those positions leave undetermined is absent rather than rejected.
 effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, declared: &[Constraint], actual: &Shared<Type>,
-  promised: &Shared<Type>, span: Span) -> Result<Option<Shared<Type>>, Shared<Rejection>>
+  promised: &Shared<Type>, pending: &Option<DeclarationId>, span: Span) -> Result<Option<Shared<Type>>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let schema = match move Shared.with<Type, Option<Shared<SectionSchema>>>(actual, sectionSchemaOf) {
     Option<Shared<SectionSchema>>.Some {value} => move value
@@ -54863,16 +55390,32 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
       Option<Shared<Type>>.Some {value} => move value
       _ => { fail RevisionMismatch {} }
     }
-    run inferSectionCallableShape(&pattern, &parameters[at], Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+    if !run mentionsPending(&parameters[at], pending) {
+      run inferSectionCallableShape(&pattern, &parameters[at], Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+    }
     at = at + usize.ONE
   }
-  run inferSectionCallableShape(&facts.result, &wanted.result, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+  // Invoking an `effect fn` target constructs its Effect, whose channels carry the written result.
+  let mut wantedResult = Shared.clone<Type>(&wanted.result)
+  if facts.isEffect {
+    let delayed = Shared.with<Type, Option<EffectChannels>>(&wanted.result, effectChannels)
+    if let Option<EffectChannels>.Some {value: channels} = move delayed {
+      if !run mentionsPending(&channels.failure, pending) {
+        run inferSectionCallableShape(&facts.failure, &channels.failure, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+      }
+      wantedResult = move channels.success
+    }
+  }
+  if !run mentionsPending(&wantedResult, pending) {
+    run inferSectionCallableShape(&facts.result, &wantedResult, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+  }
   let freshIdentity = run Shared.make<DeclarationId>(run DeclarationId.copy(&fresh))
   let inferenceFailure = run inferFromProviderBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
     &opened, &freshIdentity, declared, &mut inferred, span)
   if let Option<Shared<Rejection>>.Some {value} = move inferenceFailure {
     return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move value)
   }
+  let undetermined = match &pending.* { Option<DeclarationId>.Some {..} => true _ => false }
   let mut bounds = Vector.make<Constraint>()
   at = usize.ZERO
   while at < facts.constraints {
@@ -54881,6 +55424,7 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
     if let Option<Constraint>.Some {value} = move bound {
       let applied = run bindConstraint(&value, Vector.asSlice<Binding>(&inferred))
       if run constraintMentionsOwner(&applied, &fresh) {
+        if undetermined { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
         return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.IncompatibleCallableSignature, span))
       }
       run Vector.append<Constraint>(&mut bounds, move applied)
@@ -54891,11 +55435,32 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
   let failed = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &premises,
     Vector.asSlice<Constraint>(&bounds), module, span)
   if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move value) }
-  let contract = run sectionInstantiatedContract(&opened, &copied.contract, Vector.asSlice<Binding>(&inferred))
+  let assigned = Vector.asSlice<Binding>(&inferred)
+  let mut result = run Type.applyBindings(&facts.result, assigned, true)
+  if facts.isEffect {
+    let constructed = match move run effectValueResult(&mut resolver.*, &mut owner.*, &mut dependencies.*, &opened, assigned,
+      Shared.clone<Type>(&result), run Type.applyBindings(&facts.failure, assigned, true),
+      run Row.applyBindings(&facts.requirements, assigned, true), declared, span) {
+      Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move error) }
+    }
+    result = move constructed
+  }
+  let contract = run sectionInstantiatedContract(&opened, &copied.contract, assigned, move result)
   if run typeMentionsOwner(&contract, &fresh) {
+    if undetermined { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
     return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.IncompatibleCallableSignature, span))
   }
   return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.some<Shared<Type>>(move contract))
+}
+
+// Whether a contextual position still mentions the calling inference's open variables.
+effect fn mentionsPending(value: &Shared<Type>, pending: &Option<DeclarationId>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  return match &pending.* {
+    Option<DeclarationId>.Some {value: caller} => run typeMentionsOwner(value, &caller)
+    Option<DeclarationId>.None => false
+  }
 }
 
 // Learn referent variables even when reference access or validity differs. This is inference
@@ -54921,7 +55486,10 @@ effect fn inferSectionCallableShape(pattern: &Shared<Type>, actual: &Shared<Type
   }
 }
 
-effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoRejection>>, visible: &Shared<Type>, bindings: &[Binding]) -> Shared<Type>
+// The section's invocation contract under one use's bindings. The use supplies the instantiated
+// result; like the blueprint's, it retains the regions the section captured.
+effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoRejection>>, visible: &Shared<Type>, bindings: &[Binding],
+  result: Shared<Type>) -> Shared<Type>
 ! OutOfMemoryError ? &mut Allocator {
   let facts = match move Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(signature, signatureFacts) {
     Option<SignatureFacts>.Some {value} => move value _ => { return absurd<Shared<Type>>() }
@@ -54939,9 +55507,10 @@ effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoReject
     run Vector.append<Shared<Type>>(&mut parameters, run Type.applyBindings(&parameter, bindings, true))
     at = at + usize.ONE
   }
+  let regions = run callableEnvironmentRegions(&shape.environment)
   return run Shared.make<Type>(Type.Callable {mode: shape.mode, isUnsafe: shape.isUnsafe, environment: move shape.environment,
     invocationBinders: shape.invocationBinders, invocationBounds: move shape.invocationBounds,
-    parameters: move parameters, result: run Type.applyBindings(&facts.result, bindings, true)})
+    parameters: move parameters, result: run capturedEffectResult(move result, Vector.asSlice<Shared<Lifetime>>(&regions))})
 }
 
 union NamedSectionTarget {
@@ -55044,6 +55613,47 @@ struct SectionSelection {
   deferred: Vector<usize>
 }
 
+// Collects the binders a section's still-unsupplied leading parameters mention, including the
+// invocation contracts of representation parameters they name. Only these are evidence a later
+// invocation supplies; false when the signature lacks one of those parameters.
+effect fn sectionEvidence(inference: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId, inferred: &[Binding],
+  remaining: usize, types: &mut Vector<usize>, lifetimes: &mut Vector<usize>, rows: &mut Vector<usize>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < remaining {
+    let parameter = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) }) {
+      Option<Shared<Type>>.Some {value} => move value
+      _ => { return false }
+    }
+    let applied = run Type.applyBindings(&parameter, inferred, true)
+    run Type.collectOwned(&applied, fresh, &mut types.*, &mut lifetimes.*, &mut rows.*)
+    at = at + usize.ONE
+  }
+  // Both written callable parameters and authored F: fn bounds expose their invocation
+  // contract as part of the remaining parameter's source shape.
+  let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(inference, signatureConstraintCount)
+  let mut expanded = true
+  while expanded {
+    let before = Vector.length<usize>(&types.*) + Vector.length<usize>(&lifetimes.*) + Vector.length<usize>(&rows.*)
+    at = usize.ZERO
+    while at < boundCount {
+      let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
+        fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
+      if let Option<Constraint>.Some {value: Constraint.Represents {parameter, contract}} = move bound {
+        let applied = run Type.applyBindings(&parameter, inferred, true)
+        if run sectionEligibleRepresentation(&applied, fresh, &types.*) {
+          let shape = run Type.applyBindings(&contract, inferred, true)
+          run Type.collectOwned(&shape, fresh, &mut types.*, &mut lifetimes.*, &mut rows.*)
+        }
+      }
+      at = at + usize.ONE
+    }
+    expanded = before != Vector.length<usize>(&types.*) + Vector.length<usize>(&lifetimes.*) + Vector.length<usize>(&rows.*)
+  }
+  return true
+}
+
 // Construction and later staging share the same bound-versus-free binder selection rule.
 effect fn sectionSelection(resolver: &Resolver, module: &ModuleId, target: &DeclarationId,
   schema: &TargetSchema, inference: &Shared<Result<Answer, NoRejection>>,
@@ -55055,41 +55665,13 @@ effect fn sectionSelection(resolver: &Resolver, module: &ModuleId, target: &Decl
   let mut eligibleTypes = Vector.make<usize>()
   let mut eligibleLifetimes = Vector.make<usize>()
   let mut eligibleRows = Vector.make<usize>()
-  let mut at = usize.ZERO
-  while at < remaining {
-    let parameter = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference,
-      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) }) {
-      Option<Shared<Type>>.Some {value} => move value
-      _ => { return Result.failResult<SectionSelection, Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span)) }
-    }
-    let applied = run Type.applyBindings(&parameter, inferred, true)
-    run Type.collectOwned(&applied, fresh, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows)
-    at = at + usize.ONE
+  if !run sectionEvidence(inference, fresh, inferred, remaining, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows) {
+    return Result.failResult<SectionSelection, Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span))
   }
-  // Both written callable parameters and authored F: fn bounds expose their invocation
-  // contract as part of the remaining parameter's source shape.
   let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(inference, signatureConstraintCount)
-  let mut expanded = true
-  while expanded {
-    let before = Vector.length<usize>(&eligibleTypes) + Vector.length<usize>(&eligibleLifetimes) + Vector.length<usize>(&eligibleRows)
-    at = usize.ZERO
-    while at < boundCount {
-      let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
-        fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
-      if let Option<Constraint>.Some {value: Constraint.Represents {parameter, contract}} = move bound {
-        let applied = run Type.applyBindings(&parameter, inferred, true)
-        if run sectionEligibleRepresentation(&applied, fresh, &eligibleTypes) {
-          let shape = run Type.applyBindings(&contract, inferred, true)
-          run Type.collectOwned(&shape, fresh, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows)
-        }
-      }
-      at = at + usize.ONE
-    }
-    expanded = before != Vector.length<usize>(&eligibleTypes) + Vector.length<usize>(&eligibleLifetimes) + Vector.length<usize>(&eligibleRows)
-  }
   // A provision selector inferred from the deferred operand's row is not implemented, so such a
   // section is a named deferral. A written selector is proved once the invocation infers the row.
-  at = usize.ZERO
+  let mut at = usize.ZERO
   while at < boundCount {
     let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
       fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
