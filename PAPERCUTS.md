@@ -314,3 +314,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-05 · Focused Oxlint on a CLI script missed a direct `process.env.PATH` warning that the full CI scan reported · Read explicit environment configuration through Effect Config; reproduce whole-scope lint only after its workspace declarations are built · CLI packaging
 
 - 2026-10-05 · Bootstrap artifact promotion depended on all main checks, so existing native corpus failures and archived conformance fixture paths prevented any selfhost download despite passing isolated Node/Bun bundle checks · Gate distribution on the dedicated bundled CLI job and leave broader CI failures visible · compiler distribution
+
+- 2026-10-06 · Shared worktree dependency links did not expose esbuild to the verification bundler and a direct script typecheck missed Node declarations/generated toolchain inputs · Set NODE_PATH to the existing esbuild package for bundling; pass compiler @types explicitly and materialize the ignored ToolchainIntegrity.generated.ts locally · self-build corpus tooling
