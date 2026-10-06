@@ -54,9 +54,10 @@ the default output links an executable. IR output does not invoke Clang. Success
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
 remain a named `intrinsic-member` gap. A repeated inferred shared-slice lifetime with distinct
-actual Local regions of the same caller requires the deferred common-validity proof and reports
-`slice-region-relation`; this does not admit fixed Static, incompatible access/element, or foreign
-owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate raw
+actual Local regions of the same caller is admitted at the region the binder already holds, and the
+body retains a `RegionRelation` safety obligation for the later checked caller-region/outlives
+stage; this does not admit fixed Static, incompatible access/element, or foreign owner evidence.
+See "Native typing retains unproven caller-local region relations" below. Immediate raw
 pointer weakening removes mutation capability and adds nullability, preserving invariant
 pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
 covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
@@ -1389,18 +1390,6 @@ main-first integration of both contracts. See
 [the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
 and validation details. Fatal traps retain their existing behavior and do not promise cleanup.
 
-### Native deferred String coercion
-
-The bootstrap accepts a static String at a shorter expected String lifetime. Native reports the
-existing `borrow-region-relation` gap until that ordinary lifetime mechanism is represented. This
-does not admit the conversion. The String guard requires actual Static and a nonstatic String
-expectation; a nonstatic-to-static String retains `TypeMismatch`.
-
-Sealed Allocation admission can expose this pre-existing downstream gap in `uri-rfc3986` and
-`toml-output`; their prior core-type refusal did not establish lifetime support. Reduced realized
-bootstrap analysis has no diagnostics for the source form. Native focused cases retain exact
-success and negative code/span controls alongside the named refusal.
-
 ### Native body-annotation lifetime elision by equality
 
 Under LIFE-003 a body annotation infers the lifetimes it omits from its uses. The bootstrap gives
@@ -1421,19 +1410,75 @@ argument's elided lifetime needs a slot of the call's own inference that the exp
 and every operand (including a static `String` and a caller-local loan) can shorten, which waits
 on caller-local region relations.
 
-### Native deferred by-value nominal lifetime shortening
+### Native typing retains unproven caller-local region relations
 
-An inferred call lifetime fixed by an earlier caller-local operand can meet a later by-value
-nominal whose corresponding storage lifetime is Static. The bootstrap admits valid covariant
-storage, but native's direct nominal call lane still needs that region coercion. It reports the
-existing `borrow-region-relation` gap only for the original fresh callee lifetime slot when that
-slot was not explicitly supplied, actual Static differs from the already-bound caller-owned Local,
-and the existing member-query storage proof is covariant. A diagnostic-only copy replaces those
-lifetimes, and full Exact unification with copied bindings must prove no other mismatch remains.
-The operand and real inference bindings stay unchanged; this is no new type admission or solver.
+- **Status:** implemented on 2026-10-06 for the self-build workstream; native borrow checking
+  (roadmap step 14) retires it.
+- **Rule:** lifetimes are covariant in reference, slice and `string` regions, shared referents,
+  array elements and covariant nominal storage (bootstrap `NominalVariance`). A `'static` region
+  shortens to any region, and a lifetime of the declaration enclosing a body outlives every loan
+  rooted in that body.
+- **Compilers:** the bootstrap admits these subtypes and proves every region relation in its borrow
+  checker. Native typing admits a `'static` region at a shorter expected or binder-fixed region as a
+  proven subtype, for example `return b"zero"` at an elided input region, `""` at `string<'text>`,
+  or by-value nominal storage at an inferred caller-local call lifetime. When a caller-local region
+  meets another region that typing cannot relate (a declared lifetime, another caller-local region,
+  or a region an earlier operand fixed for the same binder, including a `'static` Effect
+  environment such as `Effect.provideMut(program(), &mut allocator)`), native admits the value at the
+  expected region and the body keeps a `RegionRelation` safety obligation with the origin and both
+  regions. Native fixes an inferred binder by its first evidence, while the bootstrap solves for the
+  shortest region, so a binder an earlier operand fixed to `'static` also relates a later loan of a
+  declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
+  relations a call's operands retain are outlives premises of that call's own bound proofs, so
+  `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
+  proves its representation bound once. Such bodies are `ContractTyped` and counted by the
+  `SILK_GAP borrow-check` summary, so a program the bootstrap would reject for that relation still
+  compiles natively until step 14.
+- **Source migration:** none.
+- **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
+  widened to another, explicitly fixed lifetime slots, and owner, access, element, pointee,
+  extent, type-argument and requirement-row differences keep `TypeMismatch`. Native call arguments
+  still unify exactly apart from shared-loan shortening and this binder-region relation.
+- **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
+  `staticStringSubtypingPreservesOrdinaryMismatches`,
+  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence`,
+  `providedCallPrefixesMapLifetimesSeparately` and
+  `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
+  and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
 
-Equal evidence retains success. Fixed lifetime slots, reverse regions, different nominal owners,
-types, requirement rows and static extents, and lifetimes within invariant pointers or mutable
-referents retain ordinary type errors. A covariant-to-invariant imported field revision invalidates
-the cached diagnostic proof. `http-redirect` exposed this deferred lane after sealed Allocation
-admission; a reduced realized bootstrap source analysis has no diagnostics.
+### Native unconsumed Effect and callable arguments
+
+- **Status:** native gap; retires when native lowers a non-consuming by-value Effect argument.
+- **Compilers:** the bootstrap consumes an Effect or callable argument only when its run access is
+  `once` (`argumentConsumes`), and derives a composition's access from its retained environment
+  (COMPOSE-001), so a let-bound `runCases(&headers) |> Effect.provideMut<Allocator>(&mut allocator)`
+  may be passed by value without `move`, as in `run Effect.catchAll(program, recover)`. Native types
+  an invoked section's Effect at the access its generic contract proves conservatively. It reports
+  such an argument, and any shared- or mutable-access one, as unsupported (the `typed-form` gap)
+  instead of `ExplicitMoveRequired`, which it keeps for an exact `once` value, a reference to a
+  callable, and every return.
+- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk` and
+  `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
+
+### Native member bodies without implementation head bounds
+
+- **Status:** native gap; retires when native checks an implementation member's body under its
+  implementation head's bounds.
+- **Compilers:** the bootstrap checks `impl<T: Printable> Printable for Box<T>` members with
+  `T: Printable` as a premise, so `value.value.print()` selects the bound operation. Native member
+  bodies receive only the member signature's bounds, so a receiver call on such an enclosing type
+  parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
+  `UnknownMember`, which it keeps for a function's own unbounded type parameter.
+- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
+### Native service operations with a `Self` operand
+
+- **Status:** native gap; retires when native dispatches such an operation on its operand.
+- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
+  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
+  interface. Native serves a service operation from the run site's requirement row with no provider
+  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
+  `typed-form` gap) instead of a `TypeMismatch` at the operand.
+- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
+  `compiler/src/semantic/SemanticCases.silk`.
