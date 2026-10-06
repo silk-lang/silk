@@ -1,5 +1,9 @@
 # Papercuts
 
+- 2026-10-06 · Isolated source-startup Vitest and compiler emission failed because the ignored
+  ToolchainIntegrity.generated.ts was absent · Run the existing toolchain generator against the
+  isolated source catalog before direct compiler checks; keep that generated identity local · compiler
+
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
 - 2026-09-25 · Concurrent `pnpm exec` typechecks each triggered dependency auto-repair and raced
