@@ -129,6 +129,8 @@ import semantic.ModuleIndex {
   Candidate,
   CandidateKind,
   IndexedDeclaration,
+  FunctionInventory,
+  NamedFunction,
   ModuleIndex,
   NameObservation,
 }
@@ -253,6 +255,7 @@ import silk.option {Option}
 import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
+import silk.sha2 {Sha256}
 import silk.u8
 import silk.u32
 import silk.usize
@@ -777,6 +780,27 @@ pub struct Answer {
   identity: Option<Shared<Value>>
   // A completed body answer owns its direct-result evidence with the Query entry.
   bodyEvidence: Option<Shared<BodyEvidence>>
+}
+
+/// An actual namespace-import answer paired with its authored declaration address.
+pub struct InventoryImport {
+  pub declaration: DeclarationId
+  pub answer: Shared<Result<Answer, NoRejection>>
+}
+
+/// Copied source addresses; no Signature/Body success is inferred from syntax presence.
+pub union SourceInventory {
+  /// A missing path remains a retained observation for publication/revision.
+  Absent {pub observation: Observation},
+  Present {
+    pub observation: Observation,
+    /// SHA-256 of exact source bytes, including trivia.
+    pub sourceDigest: [u8; 32],
+    pub syntax: FunctionInventory,
+    /// One actual static-arm availability answer per syntax.functions entry, in the same order.
+    pub availability: Vector<Result<bool, Shared<Rejection>>>,
+    pub imports: Vector<InventoryImport>,
+  },
 }
 
 struct Root {
@@ -11550,6 +11574,74 @@ effect fn memberSignature(
     external: false,
   }
   return run demandRaw(&mut resolver.*, &mut query.*, key, anchor)
+}
+
+// Reuses normal arm selection and retains the actual walked condition roots for publication.
+// This gate runs on every identity request, before accessing an ordinary cached answer.
+effect fn requestAvailability(
+  resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
+  module: &ModuleId, ordinal: usize, span: Span,
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut dependencies = Vector.make<Dependency>()
+  let selected = run available(&mut resolver.*, &mut query.*, &mut dependencies, module, ordinal, span)
+  let walked = Vector.asSlice<Dependency>(&dependencies)
+  let mut at = usize.ZERO
+  while at < walked.length {
+    if walked[at].family == Family.Condition {
+      if let Option<DeclarationId>.Some {value: condition} = &walked[at].declaration {
+        let conditionModule = DeclarationId.moduleId(&condition)
+        let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(&condition))
+        let found = run ordinalOfIdentity(&mut resolver.*, conditionModule, &identity)
+        if let Option<usize>.Some {value: declaration} = move found {
+          let moduleOrdinal = run internModule(&mut resolver.*, conditionModule)
+          let answer = run demandRaw(&mut resolver.*, &mut query.*, Key {
+            family: Family.Condition, module: moduleOrdinal, name: usize.ZERO,
+            declaration: declaration, member: usize.ZERO, external: false,
+          }, span)
+          run recordRoot(&mut request.*, Family.Condition, conditionModule, DeclarationId.spelling(&condition), &answer)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move selected
+}
+
+// The canonical request gate shared by identity Signature and ordinary Body requests.
+effect fn requestMemberSignature(
+  resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
+  module: &ModuleId, ordinal: usize, span: Span,
+) -> Shared<Result<Answer, NoRejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let active = run requestAvailability(&mut resolver.*, &mut query.*, &mut request.*, module, ordinal, span)
+  match move active {
+    Result<bool, Shared<Rejection>>.Failure {error} => {
+      return run rootRejection(&mut resolver.*, module, move error)
+    }
+    Result<bool, Shared<Rejection>>.Success {value} => {
+      if !value { return run rejectAbsent(&mut resolver.*, module, span) }
+    }
+  }
+  return run memberSignature(&mut resolver.*, &mut query.*, module, ordinal, span)
+}
+
+effect fn requestMemberBody(
+  resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, request: &mut Request,
+  module: &ModuleId, ordinal: usize, span: Span,
+) -> Shared<Result<Answer, NoRejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let signature = run requestMemberSignature(&mut resolver.*, &mut query.*, &mut request.*, module, ordinal, span)
+  let typed = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&signature, signatureResult)
+  if let Option<Shared<Type>>.Some {value} = move typed {
+    drop value
+    let moduleOrdinal = run internModule(&mut resolver.*, module)
+    return run demandRaw(&mut resolver.*, &mut query.*, Key {
+      family: Family.Body, module: moduleOrdinal, name: usize.ZERO,
+      declaration: ordinal, member: usize.ZERO, external: false,
+    }, span)
+  }
+  return move signature
 }
 
 // For a member of an inherent `impl`, the rejecting answer that owner-wide uniqueness or the head
@@ -50287,6 +50379,72 @@ impl Semantic {
   pub fn sourceEvents(self: &Self) -> &[SourceEvent] {
     return SourceIndex.eventLog(&self.resolver.source)
   }
+  /// Copies named authored addresses and actual import namespaces from one canonical source.
+  /// Syntax does not admit bodies. Absent source and condition/import refusals retain observations.
+  pub effect fn demandSourceInventory(self: &mut Self, request: &mut Request, module: &ModuleId) -> SourceInventory
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let answer = run source(&mut self.resolver, module)
+    let observation = run SourceIndex.captureObservation(&self.resolver.source, module)
+    let indexed = match move sourceOf(&self.resolver, &answer, module) {
+      Option<&IndexedSource>.Some {value} => value
+      Option<&IndexedSource>.None => {
+        if Observation.isPresent(&observation) { fail RevisionMismatch {} }
+        return SourceInventory.Absent {observation: move observation}
+      }
+    }
+    let sourceDigest = Sha256.hash(SourceUnit.bytes(IndexedSource.sourceUnit(indexed)))
+    let copied = run ModuleIndex.copyFunctionInventory(IndexedSource.moduleIndex(indexed), IndexedSource.sourceUnit(indexed))
+    let mut syntax = match move copied {
+      Option<FunctionInventory>.Some {value} => move value
+      Option<FunctionInventory>.None => { fail RevisionMismatch {} }
+    }
+    let authenticated = run SourceIndex.authoredCursor(&mut self.resolver.source, &answer, module)
+    let cursor = match move authenticated {
+      Option<AuthoredCursor>.Some {value} => move value
+      Option<AuthoredCursor>.None => { fail RevisionMismatch {} }
+    }
+    let owned = Vector.asMutSlice<NamedFunction>(&mut syntax.functions)
+    let mut checked = usize.ZERO
+    while checked < owned.length {
+      let nameSpan = SourceIndex.authoredSpan(&self.resolver.source, &cursor, owned[checked].name)
+      owned[checked].nameSpan = match move nameSpan {
+        Option<Span>.Some {value} => value
+        Option<Span>.None => { fail RevisionMismatch {} }
+      }
+      checked = checked + usize.ONE
+    }
+    drop answer
+    let mut availability = Vector.make<Result<bool, Shared<Rejection>>>()
+    let functions = Vector.asSlice<NamedFunction>(&syntax.functions)
+    let mut at = usize.ZERO
+    while at < functions.length {
+      run Vector.append<Result<bool, Shared<Rejection>>>(&mut availability,
+        run requestAvailability(&mut self.resolver, &mut self.query, &mut request.*, module, functions[at].ordinal, functions[at].headerSpan))
+      at = at + usize.ONE
+    }
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    let mut imports = Vector.make<InventoryImport>()
+    let written = Vector.asSlice<IndexedDeclaration>(&syntax.imports)
+    at = usize.ZERO
+    while at < written.length {
+      let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(&written[at].identity))
+      let found = run ordinalOfIdentity(&mut self.resolver, module, &identity)
+      if let Option<usize>.Some {value: declaration} = move found {
+        let target = run demandRaw(&mut self.resolver, &mut self.query, Key {
+          family: Family.Import, module: moduleOrdinal, name: usize.ZERO,
+          declaration: declaration, member: usize.MAX, external: false,
+        }, Span.make(usize.ZERO, usize.ZERO))
+        run recordRoot(&mut request.*, Family.Import, module, DeclarationId.spelling(&written[at].identity), &target)
+        run Vector.append<InventoryImport>(&mut imports, InventoryImport {
+          declaration: run DeclarationId.copy(&written[at].identity), answer: move target,
+        })
+      } else { fail RevisionMismatch {} }
+      at = at + usize.ONE
+    }
+    return SourceInventory.Present {observation: move observation, sourceDigest: sourceDigest,
+      syntax: move syntax, availability: move availability, imports: move imports}
+  }
   /// Returns a complete name bucket, including an empty bucket, without resolving imports or types.
   /// Returns an anchored `MissingModule` rejection if the source path is absent.
   pub effect fn demandName(self: &mut Self, request: &mut Request, module: &ModuleId, name: &[u8]) -> Shared<
@@ -50947,9 +51105,10 @@ impl Semantic {
     let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(declaration))
     let found = run ordinalOfIdentity(&mut self.resolver, module, &identity)
     let answer = match move found {
-      Option<usize>.Some {value: ordinal} => run memberSignature(
+      Option<usize>.Some {value: ordinal} => run requestMemberSignature(
         &mut self.resolver,
         &mut self.query,
+        &mut request.*,
         module,
         ordinal,
         Span.make(usize.ZERO, usize.ZERO),
@@ -51372,6 +51531,25 @@ impl Semantic {
     run selectRequest(&mut self.resolver, &request.*)
     let answer = run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.Body)
     run recordRoot(&mut request.*, Family.Body, module, name, &answer)
+    return move answer
+  }
+  /// Types one exact authored function/operation through the same identity gates as SignatureOf.
+  /// An inactive declaration or refused membership cannot reuse a previously checked body.
+  /// Unsupported and rejection answers remain their actual discriminants; no-body syntax never
+  /// gains a fabricated checked body. This is ordinary abstract Body, not selected executable MIR.
+  pub effect fn demandBodyOf(self: &mut Self, request: &mut Request, declaration: &DeclarationId) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let module = DeclarationId.moduleId(declaration)
+    let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(declaration))
+    let found = run ordinalOfIdentity(&mut self.resolver, module, &identity)
+    let span = Span.make(usize.ZERO, usize.ZERO)
+    let answer = match move found {
+      Option<usize>.None => run rejectAbsent(&mut self.resolver, module, span)
+      Option<usize>.Some {value: ordinal} => run requestMemberBody(
+        &mut self.resolver, &mut self.query, &mut request.*, module, ordinal, span)
+    }
+    run recordRoot(&mut request.*, Family.Body, module, DeclarationId.spelling(declaration), &answer)
     return move answer
   }
   /// Demands the drop glue MIR of one type through the `Family.Mir` key the instance worklist
