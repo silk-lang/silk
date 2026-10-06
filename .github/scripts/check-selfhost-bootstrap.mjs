@@ -33,6 +33,7 @@ const guardedPaths = [
   '.github/actions/download-bootstrap/',
   '.github/scripts/bundle-selfhost-verification.mjs',
   '.github/scripts/test-selfhost-verification.mjs',
+  'compiler/scripts/CorpusVerification.ts',
   'compiler/scripts/FormatterVerification.ts',
   'compiler/scripts/runSelfhostCorpus.ts',
   'compiler/scripts/runSelfhostCorpus.test.ts',
