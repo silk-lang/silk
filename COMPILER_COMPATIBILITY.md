@@ -1270,6 +1270,7 @@ repeated invocation and capture-only drop glue.
   section controls; native retains its Unsupported provider-recipe boundary until Step 9 supplies
   that recipe, rather than admitting a partially inferred Effect construction.
 - **Source migration:** none.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
