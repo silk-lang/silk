@@ -16,6 +16,47 @@ import { ordinaryStorageSource } from './support/ordinaryStorageSource.js'
 import { independentExecutionFinalizedDestroy } from './support/corpus.js'
 
 it.effect(
+  'refuses invalid allocation requests before malloc and retains the nullable cleanup path',
+  () =>
+    Effect.gen(function* () {
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'allocation/preflight',
+        ascii(
+          `import silk.effect { Effect }
+import silk.usize
+effect fn acquire(bytes: usize, alignment: usize) -> i32 ! OutOfMemoryError {
+  let allocation = run Intrinsic.systemAllocationAcquire(Layout { bytes: bytes, alignment: alignment })
+  drop allocation
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
+export "C" fn main(bytes: usize, alignment: usize) -> i32 {
+  return run Effect.catchAll(acquire(bytes, alignment), recover)
+}`,
+        ),
+      )
+      assert.deepEqual(
+        Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
+        [],
+      )
+      assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+      const artifact = yield* Analysis.codegen(snapshot, { mode: 'release', verifyIr: true })
+      assert.match(artifact.ir, /allocation\d+_nonzero_alignment[^]*?icmp ne i64[^]*?br i1/)
+      assert.match(artifact.ir, /allocation\d+_alignment_remainder[^]*?and i64[^]*?icmp eq i64/)
+      assert.match(artifact.ir, /allocation\d+_aligned[^]*?llvm.uadd.with.overflow.i64/)
+      assert.match(
+        artifact.ir,
+        /allocation\d+_overflowed[^]*?br i1[^]*?allocation\d+_failure[^]*?allocation\d+_request/,
+      )
+      assert.match(artifact.ir, /allocation\d+_request[^]*?call ptr @malloc/)
+      assert.match(
+        artifact.ir,
+        /allocation\d+_missing[^]*?call void @free\(ptr[^]*?br label %allocation\d+_failure/,
+      )
+    }),
+)
+
+it.effect(
   'proves allocation through directly forwarded Effects without an executable startup root',
   () =>
     Effect.gen(function* () {
