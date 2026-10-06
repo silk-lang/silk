@@ -463,10 +463,13 @@ Each entry records:
     the bootstrap requires equal environments.
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
-  different join reports the named `nested-effect-join` gap. Constructing an interface operation's
-  Effect reports `interface-effect-witness`. An Effect result with no producer body (an interface
-  operation's) and Effect-producing callables inferred from `effect fn` values (handlers passed to
-  `Effect.catch`, `catchAll`, `flatMap`) remain `effect-form`.
+  different join reports the named `nested-effect-join` gap. A `run` of an `effect fn` interface
+  call is one call of the selected witness; constructing that Effect without running it in place,
+  or a witness whose failure differs from the promised one, reports `interface-effect-witness`. An
+  unapplied qualified call infers its interface application from the provider's one conformance.
+  An Effect result with no producer body (an interface operation's) and Effect-producing callables
+  inferred from `effect fn` values (handlers passed to `Effect.catch`, `catchAll`, `flatMap`)
+  remain `effect-form`.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
