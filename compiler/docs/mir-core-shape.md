@@ -36,7 +36,7 @@ Projection  = Field(i) | Payload(tag, ty) | VariantField(variant, field)
             | Index(local) | ConstIndex(n) | Deref
 Operand     = Copy(Place) | Move(Place) | Integer | Float | Boolean | Unit | StaticBytes
             | **Null(ty)** (failure observer)
-Rvalue      = Use | Unary | Binary | Bitcast | Ref(access, Place) | AddressOf(access, Place)
+Rvalue      = Use | Unary | Binary | UnsignedWiden(Operand, integer Type) | Bitcast | Ref(access, Place) | AddressOf(access, Place)
             | Aggregate | Slice { data: Operand, count: Operand /* unsigned usize */ } | SliceLength
             | Discriminant | Inject | Variant
             | **FunctionAddress(InstanceKey) | ContextOf(Place)** (failure observer)
