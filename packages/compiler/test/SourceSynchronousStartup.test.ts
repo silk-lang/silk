@@ -200,7 +200,7 @@ it.effect(
             ['main'],
           )
           const process = yield* Process.run(result.path, ['owned-input'])
-          assert.strictEqual(process.exitCode, status)
+          assert.strictEqual(Number(process.exitCode), status)
           assert.strictEqual(process.stdout, '')
           assert.strictEqual(process.stderr, '')
         }
