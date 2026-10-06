@@ -11,7 +11,7 @@ import backend.Layout {Layout}
 import semantic.Specialization {Application, Edge}
 import semantic.RuntimeEncoding
 import semantic.StaticValue
-import semantic.StaticValue {Sign as StaticSign, Value as StaticData}
+import semantic.StaticValue {FloatType as StaticFloatType, Sign as StaticSign, Value as StaticData}
 import hir.FloatingLiteral
 import silk.f32
 import silk.f64
@@ -158,6 +158,8 @@ pub union Rvalue {
   FunctionAddress {pub key: InstanceKey},
   /// The address of failure slot `place`'s context companion: a selected cause (N2).
   ContextOf {pub place: Place},
+  /// Reads the current value of an imported C object through its symbol's address.
+  ForeignStatic {pub declaration: Shared<DeclarationId>},
 }
 
 /// An integer or floating-point operation selected by a sealed scalar intrinsic that no source
@@ -588,6 +590,7 @@ union FailureSink {
 union View {
   Integer {ty: Shared<Type>, literal: HirId, origin: Origin},
   Embedded {value: Shared<StaticData>, ty: Shared<Type>, origin: Origin},
+  ForeignStatic {declaration: Shared<DeclarationId>, ty: Shared<Type>, origin: Origin},
   Float {ty: Shared<Type>, literal: HirId, origin: Origin},
   Text {ty: Shared<Type>, literal: HirId, origin: Origin},
   Boolean {value: bool, origin: Origin},
@@ -993,6 +996,9 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
               }
             }
             return View.Unsupported {origin: origin}
+          }
+          BodyExpression.ForeignStatic {declaration} => View.ForeignStatic {
+            declaration: Shared.clone<DeclarationId>(&declaration), ty: Shared.clone<Type>(&ty), origin: origin,
           }
           _ => View.Unsupported {origin: origin}
         }
@@ -1948,7 +1954,8 @@ effect fn decimalBytes(magnitude: u64) -> Bytes ! OutOfMemoryError ? &mut Alloca
   return run Bytes.copy(Vector.asSlice<u8>(&digits))
 }
 
-// A selected static value used at runtime; only scalar kinds have an operand representation yet.
+// A selected static scalar used at runtime. A character is its Unicode scalar value at its own
+// type; an f32 widens exactly to the f64 bit pattern that float operands carry.
 effect fn embeddedOperand(value: &Shared<StaticData>, ty: Shared<Type>) -> Option<Operand> ! OutOfMemoryError ? &mut Allocator {
   let kind = Shared.with<StaticData, usize>(value, fn(data: &StaticData) -> usize {
     return match & data.* {
@@ -1956,6 +1963,7 @@ effect fn embeddedOperand(value: &Shared<StaticData>, ty: Shared<Type>) -> Optio
       StaticData.Boolean {..} => 2
       StaticData.Integer {..} => 3
       StaticData.Float {..} => 4
+      StaticData.Character {..} => 5
       _ => 0
     }
   })
@@ -1979,18 +1987,38 @@ effect fn embeddedOperand(value: &Shared<StaticData>, ty: Shared<Type>) -> Optio
     let bits = Shared.with<StaticData, u64>(value, fn(data: &StaticData) -> u64 {
       return match & data.* { StaticData.Float {bits: raw, ..} => raw _ => 0 }
     })
+    let narrow = Shared.with<StaticData, bool>(value, fn(data: &StaticData) -> bool {
+      return match & data.* { StaticData.Float {ty: width, ..} => width == StaticFloatType.F32 _ => false }
+    })
+    if narrow {
+      return Option.some<Operand>(Operand.Float {bits: f64.toBits(f32.toF64(f32.fromBits(u64.toU32(bits)))), ty: move ty})
+    }
     return Option.some<Operand>(Operand.Float {bits: bits, ty: move ty})
+  }
+  if kind == 5 {
+    let scalar = Shared.with<StaticData, u32>(value, fn(data: &StaticData) -> u32 {
+      return match & data.* { StaticData.Character {scalar: code} => code _ => 0 }
+    })
+    return Option.some<Operand>(Operand.Integer {decimal: run decimalBytes(u32.toU64(scalar)), negative: false, ty: move ty})
   }
   return Option.none<Operand>()
 }
 
-// Materializes one embedded static value at its use: a scalar as a constant, a scalar enum as its
-// representation integer typed by the enum, and a fixed array element by element into a fresh
-// aggregate. Anything else is None, an explicit gap.
+// Materializes one embedded static value at its use: a scalar as a constant, text as a descriptor
+// over its immutable program-lifetime bytes, a scalar enum as its representation integer typed by
+// the enum, and a fixed array element by element into a fresh aggregate. Anything else is None,
+// an explicit gap.
 effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>, ty: &Shared<Type>, origin: Origin) -> Option<Operand>
 ! OutOfMemoryError ? &mut Allocator {
   let scalar = run embeddedOperand(value, Shared.clone<Type>(ty))
   if let Option<Operand>.Some {value: operand} = move scalar { return Option.some<Operand>(move operand) }
+  let text = run StaticValue.textBytes(value)
+  if let Option<Bytes>.Some {value: bytes} = move text {
+    let count = Bytes.length(&bytes)
+    let output = run temporary(&mut builder.*, ty, origin)
+    run assign(&mut builder.*, place(output), Rvalue.Slice {data: Operand.StaticBytes {bytes: move bytes}, count: run usizeOperand(usize.toU64(count))}, origin)
+    return Option.some<Operand>(Operand.Copy {place: place(output)})
+  }
   let isEnum = Shared.with<StaticData, bool>(value, fn(data: &StaticData) -> bool {
     return match & data.* { StaticData.Enum {..} => true _ => false }
   })
@@ -2554,6 +2582,13 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
         Option<Operand>.Some {value: operand} => operand
         Option<Operand>.None => run unsupported(&owner, origin, GapCode.TypedForm)
       }
+    }
+    // One read of a foreign C object lands in a temporary; its symbol is a separate C edge.
+    View.ForeignStatic {declaration, ty, origin} => {
+      run Vector.append<Shared<DeclarationId>>(&mut builder.*.function.externs, Shared.clone<DeclarationId>(&declaration))
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.ForeignStatic {declaration: move declaration}, origin)
+      return Operand.Copy {place: place(output)}
     }
     View.Local {index, ty, origin} => {
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -4778,6 +4813,9 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     View.Embedded {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
+    View.ForeignStatic {..} => {
+      run discard(&mut builder.*, body, hir, id)
+    }
     View.Local {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
@@ -5330,6 +5368,60 @@ impl MirFunction {
       contexts: Vector.make<ContextText>(),
     }
   }
+  /// Makes one C export shim as ordinary MIR: its C-classified scalar and pointer lanes pass
+  /// unchanged to the exported function's ordinary Silk instance, whose result it returns.
+  pub effect fn cExport(function: &Shared<DeclarationId>, symbol: &Shared<Bytes>, parameters: &[Shared<Type>],
+    result: &Shared<Type>, observing: bool) -> MirFunction
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let origin = Origin {syntax: HirId {index: usize.ZERO}, span: Span.make(usize.ZERO, usize.ZERO)}
+    let key = InstanceKey.Export {function: Shared.clone<DeclarationId>(function), symbol: Shared.clone<Bytes>(symbol)}
+    let callee = run InstanceKey.named(function)
+    let mut locals = Vector.make<Local>()
+    run Vector.append<Local>(&mut locals, Local {ty: Shared.clone<Type>(result), kind: LocalKind.Return, origin: origin})
+    let mut lanes = Vector.make<Shared<Type>>()
+    let mut arguments = Vector.make<Operand>()
+    let mut at = usize.ZERO
+    while at < parameters.length {
+      run Vector.append<Local>(&mut locals,
+        Local {ty: Shared.clone<Type>(&parameters[at]), kind: LocalKind.Parameter {index: at}, origin: origin})
+      run Vector.append<Shared<Type>>(&mut lanes, Shared.clone<Type>(&parameters[at]))
+      run Vector.append<Operand>(&mut arguments, Operand.Copy {place: place(at + usize.ONE)})
+      at = at + usize.ONE
+    }
+    let mut blocks = Vector.make<Block>()
+    run Vector.append<Block>(
+      &mut blocks,
+      Block {
+        statements: Vector.make<Statement>(),
+        terminator: Terminator.Call {
+          callee: Callee.Instance {key: InstanceKey.copy(&callee)},
+          arguments: move arguments,
+          providers: Vector.make<Operand>(),
+          diagnostics: run independentDiagnostics(observing),
+          destination: place(usize.ZERO),
+          normal: usize.ONE,
+          failure: Option.none<FailureEdge>(),
+          origin: origin,
+        },
+      },
+    )
+    run Vector.append<Block>(&mut blocks, Block {statements: Vector.make<Statement>(), terminator: Terminator.Return {origin: origin}})
+    let mut references = Vector.make<Reference>()
+    run Vector.append<Reference>(&mut references, Reference {key: move callee, edge: Edge.Direct, origin: origin})
+    return MirFunction {
+      key: move key,
+      safetyChecked: true,
+      result: Shared.clone<Type>(result),
+      parameters: move lanes,
+      locals: move locals,
+      blocks: move blocks,
+      references: move references,
+      externs: Vector.make<Shared<DeclarationId>>(),
+      observes: false,
+      contexts: Vector.make<ContextText>(),
+    }
+  }
   /// Lowers a closed body while preserving its unfinished safety status, without reading a callee body.
   pub effect fn lower(
     key: InstanceKey,
@@ -5611,6 +5703,9 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.Unit {origin} => View.Unit {origin: origin}
     View.Embedded {value, ty, origin} => View.Embedded {
       value: value, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
+    }
+    View.ForeignStatic {declaration, ty, origin} => View.ForeignStatic {
+      declaration: declaration, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
     }
     View.PlaceAssignment {target, value, origin} => View.PlaceAssignment {
       target: target,
