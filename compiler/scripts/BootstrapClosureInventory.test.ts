@@ -163,11 +163,11 @@ it.effect(
       const source = `pub fn identity<T>(value: T) -> T { return move value }
 fn selected(static value: i64) -> i32 { return 42 }
 fn unused() -> i32 { return 99 }
-fn completion() -> () { while true {} return }
+fn completion() -> i32 { let static value = 42 while true {} return value }
 pub fn main() -> i32 {
   let first = identity<i32>(selected(9007199254740993))
   let second = identity<u8>(1)
-  completion()
+  let completed = completion()
   return first
 }`
       // A retained object fixture isolates exporter claims; analyze() always uses the real seed plan.
@@ -240,7 +240,7 @@ pub fn main() -> i32 {
       assert.isTrue(completion.residualBodySites.some((site) => site.tag === 'While'))
       assert.isTrue(
         completion.residualBodySites.some(
-          (site) => site.tag === 'UnitLiteral' && site.origin._tag === 'Synthetic',
+          (site) => site.tag === 'IntegerLiteral' && site.origin._tag === 'Synthetic',
         ),
       )
       assert.deepEqual(
@@ -302,6 +302,13 @@ pub fn main() -> i32 { return run program() }`
         })),
       )
       assert.deepEqual(captured.missingProvenance, [])
+      const portable = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+        selected: captured,
+        requestedProfile: snapshot.configuration?.profile,
+        requestedComposition: snapshot.configuration?.composition,
+        composition: snapshot.composition,
+      })
+      assert.include(portable, 'PRESENT_IN_SELECTED_RESIDUAL_BODY')
       for (const instance of captured.instances.filter(
         (value) => value.origin.kind === 'Generated',
       ))

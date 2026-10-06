@@ -318,3 +318,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · Shared worktree dependency links did not expose esbuild to the verification bundler and a direct script typecheck missed Node declarations/generated toolchain inputs · Set NODE_PATH to the existing esbuild package for bundling; pass compiler @types explicitly and materialize the ignored ToolchainIntegrity.generated.ts locally · self-build corpus tooling
 
 - 2026-10-06 · Tooling tests outside package roots could not resolve @effect/vitest, and mixed compiler source/dist imports split nominal source-span identity · Declare root tooling dependencies and use one supported compiler package facade throughout the actor and tests · compiler tooling
+
+- 2026-10-06 · Installing isolated root dependencies while package node_modules still linked to a shared worktree rewrote shared package links and launchers, mixing Vitest instances · Remove every package dependency symlink before installation; restore affected shared links under the common lock and verify runner identity · agent workflow
