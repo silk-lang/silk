@@ -632,3 +632,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-10-06 · Installing isolated root dependencies while package node_modules still linked to a shared worktree rewrote shared package links and launchers, mixing Vitest instances · Remove every package dependency symlink before installation; restore affected shared links under the common lock and verify runner identity · agent workflow
 - 2026-10-06 · A native test CLI filter containing `|` selected zero tests because filters are literal substrings · Retain the actual uncached plan and execute the same built runner with the shared `Gap` substring; verify two discovered, selected and executed cases · self-build URI/TOML CI repair
+
+- 2026-10-06 · Isolated inventory smoke archived the complete stdlib through execFileSync’s default 1MiB buffer and failed ENOBUFS · Set the existing smoke archive limit explicitly to 64MiB for the second fixture archive · standalone inventory publication
+
+- 2026-10-06 · Immediate NodeRuntime failure exit truncated inventory JSON still queued on stdout, and a permissive local umask produced non-Git fixture modes · Await the stdout write callback before red exit; create fixture sources with explicit Git0644 permissions · standalone inventory publication

@@ -10,6 +10,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -135,6 +136,7 @@ chmod +x program
       env: { ...corpusEnvironment, ...environment },
       encoding: 'utf8',
       timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
     })
   writeFileSync(track, JSON.stringify(['trivial-features', 'scalar-reference-argument-order']))
   const corpus = invokeCorpus()
@@ -225,7 +227,12 @@ chmod +x program
       assert.notStrictEqual(invokeCorpus(['--mode', mode]).status, 0)
   }
   writeFileSync(track, JSON.stringify(['trivial-features']))
-  for (const args of [['--mode', 'unknown'], ['corpus'], ['--mode', 'corpus', 'extra']]) {
+  for (const args of [
+    ['--mode', 'unknown'],
+    ['corpus'],
+    ['--mode', 'corpus', 'extra'],
+    ['--mode', 'inventory', 'extra'],
+  ]) {
     const rejected = invokeCorpus(args)
     assert.notStrictEqual(rejected.status, 0)
     assert.match(rejected.stdout + rejected.stderr, /Usage:/)
@@ -244,8 +251,228 @@ chmod +x program
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
   assert.strictEqual(existsSync(sentinel), false)
+  // Synthetic producer authority exercises transport, not a real verified CI/run claim.
+  // Analyze only this tiny source; no native compiler/process lifecycle runs in inventory mode.
+  const inventoryCheckout = join(temporary, 'inventory-checkout')
+  mkdirSync(inventoryCheckout)
+  execFileSync('tar', ['-x', '-C', inventoryCheckout], {
+    input: execFileSync('git', ['archive', 'HEAD', 'packages/compiler/stdlib'], {
+      maxBuffer: 64 * 1024 * 1024,
+    }),
+  })
+  mkdirSync(join(inventoryCheckout, 'compiler/src'), { recursive: true })
+  writeFileSync(
+    join(inventoryCheckout, 'compiler/silk.toml'),
+    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n[build.composition]\nentry = { kind = "none" }\nruntimes = []\ndefaults = []\nretention = [{ module = "main", declaration = "main" }]\nrequirements = []\n',
+  )
+  const mainSource = join(inventoryCheckout, 'compiler/src/main.silk')
+  writeFileSync(
+    mainSource,
+    'fn helper(value: i32) -> i32 { return value + 1 }\nexport "C" fn main() -> i32 as "main" { return helper(0) }\n',
+  )
+  chmodSync(mainSource, 0o644)
+  chmodSync(join(inventoryCheckout, 'compiler/silk.toml'), 0o644)
+  const inventoryBootstrap = join(temporary, 'inventory-bootstrap.mjs')
+  copyFileSync(downloaded, inventoryBootstrap)
+  const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+  const inventoryFiles = (directory, relative = '') =>
+    readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+      const path = join(directory, entry.name)
+      const name = relative === '' ? entry.name : `${relative}/${entry.name}`
+      if (entry.isDirectory()) return inventoryFiles(path, name)
+      return [
+        {
+          path: name,
+          mode: (statSync(path).mode & 0o111) === 0 ? '100644' : '100755',
+          sha256: hash(readFileSync(path)),
+        },
+      ]
+    })
+  const digestFiles = (files) =>
+    hash(files.map(({ path, mode, sha256 }) => `${path}\0${mode}\0${sha256}\n`).join(''))
+  const requestFile = join(temporary, 'inventory-request.json')
+  const makeRequest = () => {
+    const files = ['compiler', 'packages/compiler/stdlib']
+      .flatMap((root) => inventoryFiles(join(inventoryCheckout, root), root))
+      .sort((a, b) => {
+        if (a.path < b.path) return -1
+        if (a.path > b.path) return 1
+        return 0
+      })
+    // git archive applies tar.umask rather than the exact recorded Git file mode.
+    for (const file of files)
+      chmodSync(join(inventoryCheckout, file.path), Number.parseInt(file.mode.slice(3), 8))
+    const archive = join(inventoryCheckout, 'authored-inputs.tar')
+    execFileSync('tar', [
+      '-cf',
+      archive,
+      '-C',
+      inventoryCheckout,
+      'compiler',
+      'packages/compiler/stdlib',
+    ])
+    const stdlibDigest = digestFiles(
+      files.filter((file) => file.path.startsWith('packages/compiler/stdlib/')),
+    )
+    return {
+      schemaVersion: 1,
+      directory: inventoryCheckout,
+      inputs: {
+        schemaVersion: 1,
+        sourceCommit: 'a'.repeat(40),
+        roots: ['compiler', 'packages/compiler/stdlib'],
+        files,
+        normalizedDigest: digestFiles(files),
+        compilerDigest: digestFiles(files.filter((file) => file.path.startsWith('compiler/'))),
+        stdlibDigest,
+        archive: 'authored-inputs.tar',
+        archiveSha256: hash(readFileSync(archive)),
+      },
+      bootstrap: {
+        commit: 'b'.repeat(40),
+        runId: '123',
+        file: inventoryBootstrap,
+        sha256: hash(readFileSync(inventoryBootstrap)),
+        stdlibDigest,
+      },
+      profile: {
+        name: 'release-with-debug',
+        target: process.arch === 'arm64' ? 'aarch64-unknown-linux-gnu' : 'x86_64-unknown-linux-gnu',
+        optimization: 'speed',
+        debug: true,
+      },
+    }
+  }
+  const invokeInventory = (request) => {
+    writeFileSync(requestFile, JSON.stringify(request))
+    return invokeCorpus(['--mode', 'inventory'], { SILK_INVENTORY_REQUEST: requestFile })
+  }
+  const request = makeRequest()
+  const inventorySourcesBefore = sourceDigests(inventoryCheckout)
+  const inventory = invokeInventory(request)
+  const receipt = JSON.parse(inventory.stdout)
+  assert.strictEqual(
+    inventory.status,
+    0,
+    JSON.stringify({
+      status: receipt.status,
+      failure: receipt.failure,
+      diagnostics: receipt.diagnostics,
+      selectedStatus: receipt.selected?.status,
+      missing: receipt.selected?.missingProvenance,
+      ownership: receipt.selected?.unavailableOwnership,
+      violations: receipt.selected?.violations,
+      stderr: inventory.stderr,
+    }),
+  )
+  assert.strictEqual(receipt.schemaVersion, 1)
+  assert.strictEqual(receipt.status, 'Complete')
+  assert.strictEqual(receipt.evidence, 'SELECTED_ANALYSIS_CLOSURE_ONLY')
+  assert.deepStrictEqual(receipt.inputs, request.inputs)
+  assert.deepStrictEqual(receipt.bootstrap, request.bootstrap)
+  assert.strictEqual(
+    receipt.selected.residualSiteScope,
+    'PARENT_INSTANCE_ARTIFACT_AND_ORIGINAL_DECLARATION',
+  )
+  assert.strictEqual(receipt.selected.executionKeyScope, 'LOCAL_COMPLETE_KEY_RECORDS')
+  assert.ok(receipt.selected.selectedAuthoredFunctions.some((fn) => fn.name.spelling === 'main'))
+  assert.ok(receipt.selected.reachedExecutionEdges.length > 0)
+  assert.strictEqual(receipt.compilation.requestedProfile.target, request.profile.target)
+  assert.strictEqual(
+    receipt.compilation.requestedProfile.optimization,
+    request.profile.optimization,
+  )
+  assert.strictEqual(receipt.compilation.requestedProfile.debug, request.profile.debug)
+  assert.strictEqual(receipt.compilation.requestedComposition.entry.kind, 'none')
+  assert.deepStrictEqual(receipt.compilation.requestedComposition.retention, [
+    { module: 'main', declaration: 'main' },
+  ])
+  assert.strictEqual(receipt.compilation.artifact, 'NativeExecutable')
+  assert.strictEqual(receipt.compilation.stage, 'final')
+  for (const edge of receipt.selected.reachedExecutionEdges) {
+    assert.ok(receipt.selected.executionKeys[edge.owner])
+    assert.ok(receipt.selected.executionKeys[edge.target])
+  }
+  assert.deepStrictEqual(sourceDigests(inventoryCheckout), inventorySourcesBefore)
+  assert.deepStrictEqual(
+    ['compiler', 'packages/compiler/stdlib']
+      .flatMap((root) => inventoryFiles(join(inventoryCheckout, root), root))
+      .sort((a, b) => a.path.localeCompare(b.path)),
+    request.inputs.files.toSorted((a, b) => a.path.localeCompare(b.path)),
+  )
+  assert.strictEqual(existsSync(join(inventoryCheckout, 'node_modules')), false)
+  const unavailable = invokeInventory({
+    ...request,
+    bootstrap: { ...request.bootstrap, sha256: '0'.repeat(64) },
+  })
+  assert.notStrictEqual(unavailable.status, 0)
+  const unavailableReceipt = JSON.parse(unavailable.stdout)
+  assert.strictEqual(unavailableReceipt.status, 'Incomplete')
+  assert.strictEqual(unavailableReceipt.failure.stage, 'Verification')
+  assert.strictEqual(unavailableReceipt.selected, undefined)
+  assert.match(unavailable.stderr, /Incomplete/)
+  writeFileSync(mainSource, 'export "C" fn main() -> i32 as "main" { return missing }\n')
+  const incomplete = invokeInventory(makeRequest())
+  assert.notStrictEqual(incomplete.status, 0)
+  const incompleteReceipt = JSON.parse(incomplete.stdout)
+  assert.strictEqual(incompleteReceipt.status, 'Incomplete')
+  assert.strictEqual(incompleteReceipt.evidence, 'SELECTED_ANALYSIS_CLOSURE_ONLY')
+  assert.ok(
+    incompleteReceipt.failure !== undefined ||
+      incompleteReceipt.diagnostics.some((diagnostic) => diagnostic.severity === 'error'),
+  )
+  // This is a separate unchanged default-startup request, never a fallback for the
+  // explicit C-export fixture or a whole-compiler/native-generation readiness claim.
+  writeFileSync(
+    join(inventoryCheckout, 'compiler/silk.toml'),
+    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  writeFileSync(mainSource, 'pub fn main() -> i32 { return 0 }\n')
+  const defaultRequest = makeRequest()
+  const defaultSourceBefore = sourceDigests(inventoryCheckout)
+  const defaultResult = invokeInventory(defaultRequest)
+  const defaultReceipt = JSON.parse(defaultResult.stdout)
+  assert.deepStrictEqual(defaultReceipt.inputs, defaultRequest.inputs)
+  assert.deepStrictEqual(defaultReceipt.bootstrap, defaultRequest.bootstrap)
+  assert.strictEqual(defaultReceipt.compilation.requestedProfile.target, request.profile.target)
+  assert.strictEqual(
+    defaultReceipt.compilation.requestedProfile.optimization,
+    request.profile.optimization,
+  )
+  assert.strictEqual(defaultReceipt.compilation.requestedProfile.debug, request.profile.debug)
+  if (defaultReceipt.status === 'Incomplete') {
+    assert.notStrictEqual(defaultResult.status, 0)
+    assert.ok(defaultReceipt.selected.missingProvenance.length > 0)
+    assert.match(defaultResult.stderr, /Incomplete/)
+  } else {
+    // A corrected collector may legitimately complete this tiny request; historical
+    // MissingAuthored receipts stay unchanged and this is still selected-analysis evidence.
+    assert.strictEqual(defaultReceipt.status, 'Complete')
+    assert.strictEqual(defaultResult.status, 0)
+    assert.deepStrictEqual(defaultReceipt.selected.missingProvenance, [])
+  }
+  assert.deepStrictEqual(sourceDigests(inventoryCheckout), defaultSourceBefore)
   process.stdout.write(
-    'Standalone formatter, full-pin and complete readonly corpus modes passed without node_modules; manifest, live pins/stdlib and unchanged inputs verified\n',
+    `Default startup selected inventory observed ${defaultReceipt.status}; strict/native readiness unclaimed\n`,
+  )
+  const malformed = invokeInventory({ ...request, schemaVersion: 2 })
+  assert.notStrictEqual(malformed.status, 0)
+  assert.strictEqual(malformed.stdout, '')
+  writeFileSync(requestFile, '{broken')
+  const malformedJson = invokeCorpus(['--mode', 'inventory'], {
+    SILK_INVENTORY_REQUEST: requestFile,
+  })
+  assert.notStrictEqual(malformedJson.status, 0)
+  assert.strictEqual(malformedJson.stdout, '')
+  assert.notStrictEqual(
+    invokeCorpus(['--mode', 'inventory'], { SILK_INVENTORY_REQUEST: '' }).status,
+    0,
+  )
+  assert.deepStrictEqual(readFileSync(inventoryBootstrap), readFileSync(downloaded))
+  assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
+  assert.strictEqual(existsSync(sentinel), false)
+  process.stdout.write(
+    'Standalone formatter, full-pin, complete readonly corpus and inventory modes passed without node_modules; manifest, live pins/stdlib and unchanged inputs verified\n',
   )
 } finally {
   rmSync(temporary, { recursive: true, force: true })
