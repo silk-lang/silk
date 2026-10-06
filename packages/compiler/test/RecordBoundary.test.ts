@@ -1,8 +1,102 @@
 import * as Fs from 'node:fs'
 import * as Path from 'node:path'
 import { assert, it } from '@effect/vitest'
+import * as Effect from 'effect/Effect'
+import * as AggregateIdentity from '../src/AggregateIdentity.js'
+import * as Analysis from '../src/Analysis.js'
+import * as Intrinsic from '../src/Intrinsic.js'
+import * as Type from '../src/Type.js'
+import * as AnalysisFixture from './support/AnalysisFixture.js'
 
 const source = Path.join(import.meta.dirname, '..', 'src')
+
+it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair results', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'record/result-pairs',
+      new TextEncoder().encode(`pub fn main() -> usize {
+        let first = (1usize, 2usize)
+        let second = (3usize, 4usize)
+        return first.0 + second.1
+      }`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const tuples = [...snapshot.index.generatedAggregates.values()].filter(
+      (aggregate) => aggregate.aggregateKind === 'AnonymousPositional',
+    )
+    assert.lengthOf(tuples, 2)
+    const first = tuples.at(0)
+    const second = tuples.at(1)
+    if (first === undefined || second === undefined)
+      throw new Error('expected two selected tuple occurrences')
+    assert.strictEqual(first.identity._tag, 'AnonymousAggregateIdentity')
+    assert.strictEqual(second.identity._tag, 'AnonymousAggregateIdentity')
+    if (
+      first.identity._tag !== 'AnonymousAggregateIdentity' ||
+      second.identity._tag !== 'AnonymousAggregateIdentity'
+    )
+      throw new Error('expected retained ordinary anonymous tuple occurrences')
+    const occurrence = first.identity
+    const otherOccurrence = second.identity
+    let facts: ReturnType<typeof AggregateIdentity.generated> | undefined
+    const selected = Intrinsic.instantiateResult(
+      Intrinsic.generatedUsizePair,
+      new Map(),
+      (fields) => {
+        facts = AggregateIdentity.generated(
+          occurrence,
+          first.anchor,
+          fields.map((type) => ({ type, anchor: first.anchor })),
+        )
+        return facts.type
+      },
+    )
+    assert.isDefined(facts)
+    if (facts === undefined) throw new Error('expected generated owned pair facts')
+    assert.isTrue(Type.equals(selected, AggregateIdentity.nominal(occurrence)))
+    assert.deepEqual(
+      facts.struct.fields.map((field) => [
+        field.member,
+        field.visibility,
+        field.declaredType._tag === 'Resolved' ? field.declaredType.type : undefined,
+      ]),
+      [
+        [{ _tag: 'OrdinalAggregateMember', ordinal: 0 }, 'Public', 'usize'],
+        [{ _tag: 'OrdinalAggregateMember', ordinal: 1 }, 'Public', 'usize'],
+      ],
+    )
+    const replay = Intrinsic.instantiateResult(
+      Intrinsic.generatedUsizePair,
+      new Map(),
+      (fields) =>
+        AggregateIdentity.generated(
+          occurrence,
+          first.anchor,
+          fields.map((type) => ({ type, anchor: first.anchor })),
+        ).type,
+    )
+    const other = Intrinsic.instantiateResult(
+      Intrinsic.generatedUsizePair,
+      new Map(),
+      (fields) =>
+        AggregateIdentity.generated(
+          otherOccurrence,
+          second.anchor,
+          fields.map((type) => ({ type, anchor: second.anchor })),
+        ).type,
+    )
+    assert.isTrue(
+      Type.equals(selected, replay),
+      'the selected artifact/NodeRef owns stable result facts',
+    )
+    assert.isFalse(
+      Type.equals(selected, other),
+      'a different occurrence does not share a fabricated nominal result',
+    )
+    assert.strictEqual(facts.struct.identity._tag, 'AnonymousAggregateIdentity')
+    assert.strictEqual(facts.struct.name._tag, 'Unavailable')
+  }),
+)
 
 it('has no public re-analysis surface or legacy lowering module', () => {
   const files = Fs.readdirSync(source, { recursive: true, encoding: 'utf8' })

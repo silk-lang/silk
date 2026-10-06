@@ -184,7 +184,8 @@ export function analyzeArguments(
       builtinParameters =
         builtin?.parameters ?? contract?.parameters.map((parameter) => parameter.type) ?? []
       builtinTypeParameters = builtin?.typeParameters ?? contract?.binders ?? []
-      const result = builtin?.result ?? contract?.result
+      const result =
+        builtin === undefined ? contract?.result : Intrinsic.closedResultType(builtin.result)
       builtinLifetimes = freeLifetimeBinders([
         ...builtinParameters,
         ...(result === undefined ? [] : [result]),
@@ -2268,7 +2269,7 @@ export interface BuiltinSignature {
   readonly operation: Tir.BuiltinOperation
   readonly typeParameters?: ReadonlyArray<Type.Parameter>
   readonly parameters: ReadonlyArray<SemanticType>
-  readonly result: SemanticType
+  readonly result: Intrinsic.ResultPolicy
   readonly unsafe?: boolean
 }
 
@@ -2306,14 +2307,18 @@ export const instantiateBuiltinSignature = (
   call: AuthoredHir.Expression,
   resolution: ResolutionContext,
 ): BuiltinSignature => {
-  const binders = freeLifetimeBinders([...signature.parameters, signature.result])
+  const result = Intrinsic.closedResultType(signature.result)
+  const binders = freeLifetimeBinders([
+    ...signature.parameters,
+    ...(result === undefined ? [] : [result]),
+  ])
   const selected = selectedCallLifetimes(call, binders, resolution)
   return {
     ...signature,
     parameters: signature.parameters.map((parameter) =>
       Type.substitute(parameter, selected.substitution),
     ),
-    result: Type.substitute(signature.result, selected.substitution),
+    result: Intrinsic.substituteResult(signature.result, selected.substitution),
   }
 }
 
@@ -2544,6 +2549,28 @@ export const boundOperationReference = (
   }
 }
 
+/** A generated call result is unavailable as a stable source-callable function item. */
+export const builtinFunctionReference = (
+  signature: BuiltinSignature,
+  actor: string,
+  operation: string,
+  anchor: AuthoredHir.Anchor,
+): CallReferenceFact => {
+  const result = Intrinsic.closedResultType(signature.result)
+  if (result === undefined) return { _tag: 'Unavailable', anchor }
+  return {
+    _tag: 'ResolvedBuiltin',
+    spelling: `${actor}.${operation}`,
+    anchor,
+    actor,
+    operation: signature.operation,
+    intrinsic: signature.id,
+    parameters: signature.parameters,
+    result,
+    unsafe: signature.unsafe === true,
+  }
+}
+
 export const resolvedFunctionReference = (
   context: SemanticContext.SemanticContext,
   node: AuthoredHir.Expression,
@@ -2583,17 +2610,7 @@ export const resolvedFunctionReference = (
     if (signature === undefined) {
       return undefined
     }
-    return {
-      _tag: 'ResolvedBuiltin',
-      spelling: `${qualifier}.${member}`,
-      anchor: second.anchor,
-      actor: qualifier,
-      operation: signature.operation,
-      intrinsic: signature.id,
-      parameters: signature.parameters,
-      result: signature.result,
-      unsafe: signature.unsafe === true,
-    }
+    return builtinFunctionReference(signature, qualifier, member, second.anchor)
   }
   if (qualifierLookup._tag === 'Resolved') {
     const associated = Semantic.resolveAssociatedName(
