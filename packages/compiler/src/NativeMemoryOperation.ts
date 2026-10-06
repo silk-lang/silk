@@ -72,6 +72,44 @@ export const emit = (context: Context, operation: Operation) => {
       }
       const one = Emitter.integerUnsigned(builder, usizeType, 1n)
       const zero = Emitter.integerUnsigned(builder, usizeType, 0n)
+      const failed = Emitter.block(body, `allocation${operation.destination.ordinal}_failure`)
+      const aligned = Emitter.block(body, `allocation${operation.destination.ordinal}_aligned`)
+      const nonzero = Emitter.integerCompare(
+        body,
+        'ne',
+        alignment,
+        zero,
+        `allocation${operation.destination.ordinal}_nonzero_alignment`,
+      )
+      const nonzeroAlignment = Emitter.block(
+        body,
+        `allocation${operation.destination.ordinal}_nonzero_alignment`,
+      )
+      Emitter.conditionalBranch(body, nonzero, nonzeroAlignment, failed)
+      Emitter.setInsertionPoint(body, nonzeroAlignment)
+      const previous = Emitter.binary(
+        body,
+        'sub',
+        alignment,
+        one,
+        `allocation${operation.destination.ordinal}_previous_alignment`,
+      )
+      const remainder = Emitter.binary(
+        body,
+        'and',
+        alignment,
+        previous,
+        `allocation${operation.destination.ordinal}_alignment_remainder`,
+      )
+      const powerOfTwo = Emitter.integerCompare(
+        body,
+        'eq',
+        remainder,
+        zero,
+        `allocation${operation.destination.ordinal}_power_of_two_alignment`,
+      )
+      Emitter.conditionalBranch(body, powerOfTwo, aligned, failed)
+      Emitter.setInsertionPoint(body, aligned)
       const padding = Emitter.binary(
         body,
         'sub',
@@ -112,6 +150,9 @@ export const emit = (context: Context, operation: Operation) => {
         [1],
         `allocation${operation.destination.ordinal}_overflowed`,
       )
+      const request = Emitter.block(body, `allocation${operation.destination.ordinal}_request`)
+      Emitter.conditionalBranch(body, overflowed, failed, request)
+      Emitter.setInsertionPoint(body, request)
       const empty = Emitter.integerCompare(
         body,
         'eq',
@@ -147,19 +188,17 @@ export const emit = (context: Context, operation: Operation) => {
         zero,
         `allocation${operation.destination.ordinal}_missing`,
       )
-      const rejected = Emitter.binary(
+      const missingAllocation = Emitter.block(
         body,
-        'or',
-        overflowed,
-        missing,
-        `allocation${operation.destination.ordinal}_rejected`,
+        `allocation${operation.destination.ordinal}_missing`,
       )
-      const failed = Emitter.block(body, `allocation${operation.destination.ordinal}_failure`)
       const acquired = Emitter.block(body, `allocation${operation.destination.ordinal}_success`)
-      Emitter.conditionalBranch(body, rejected, failed, acquired)
-      Emitter.setInsertionPoint(body, failed)
+      Emitter.conditionalBranch(body, missing, missingAllocation, acquired)
+      Emitter.setInsertionPoint(body, missingAllocation)
       if (free === undefined) throw new RangeError('LLVM allocation lost release shim')
       Emitter.callDirect(body, free, [raw])
+      Emitter.branch(body, failed)
+      Emitter.setInsertionPoint(body, failed)
       NativeHostFailure.emit(hostFailure, operation)
       Emitter.setInsertionPoint(body, acquired)
       const advanced = Emitter.binary(
