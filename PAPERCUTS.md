@@ -6,6 +6,8 @@
 
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
+- 2026-10-06 · A trailing body-end comment in the Allocation cleanup helper was parser-accepted but rejected by the native formatter at helper offset 4802/full-file offset 1643422 · An explicit unit return (#1043) preserves all assertions and passes full formatting safety and idempotence; the general formatter behavior remains a named follow-up · self-build orchestration
+
 - 2026-10-06 · Bootstrap `silk format` rewrites large unchanged native compiler actors and reports damaged large test sources without a diagnostic location · Keep task patches focused, use the native formatter safety gate for repository formatting, and validate new test fragments in an isolated exact-body root · self-hosted compiler
 
 - 2026-10-04 · New recipe actors and controls used unsupported conditional-expression initializers and temporary slice projections, wasting focused build cycles · Use typed mutable scalar locals with ordinary if statements, bind stable slice owners before indexing borrowed non-Copy values, and run Effect Boolean comparisons into locals before assertions · selfhost Step 7 instance recipes
