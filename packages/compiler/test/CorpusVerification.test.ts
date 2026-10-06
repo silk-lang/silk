@@ -59,7 +59,7 @@ it.effect('verifies all live pins and declared profiles/runs without changing it
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const self = yield* fixture()
-    yield* fs.writeFileString(self.pins, JSON.stringify(['literal']))
+    yield* fs.writeFileString(self.pins, '["literal"]')
     // An unpinned failing case must not execute.
     yield* Verification.run(self, [literal, { ...literal, name: 'unselected', nativeCSources: {} }])
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
@@ -80,8 +80,8 @@ it.effect('rejects invalid pins before invoking the supplied compiler', () =>
     const fs = yield* FileSystem.FileSystem
     const self = yield* fixture()
     assert.strictEqual((yield* Effect.result(Verification.run(self, [literal])))._tag, 'Failure')
-    for (const pins of [[], ['literal', 'literal'], ['literal', 'missing'], [''], null]) {
-      yield* fs.writeFileString(self.pins, JSON.stringify(pins))
+    for (const pins of ['[]', '["literal","literal"]', '["literal","missing"]', '[""]', 'null']) {
+      yield* fs.writeFileString(self.pins, pins)
       assert.strictEqual((yield* Effect.result(Verification.run(self, [literal])))._tag, 'Failure')
       assert.isFalse(yield* fs.exists(`${self.compiler}.profiles`))
     }
@@ -92,7 +92,7 @@ it.effect('fails pinned unsupported and mismatched outcomes', () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const self = yield* fixture()
-    yield* fs.writeFileString(self.pins, JSON.stringify(['literal']))
+    yield* fs.writeFileString(self.pins, '["literal"]')
     for (const program of [
       { ...literal, nativeCSources: {} },
       { ...literal, nativeStdout: 'wrong' },
