@@ -118,6 +118,26 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
     }),
   )
 
+  it.effect('rejects an expired deadline even when the direct command already exited zero', () =>
+    fixture(function* (root) {
+      const source = `const {spawn}=require('node:child_process');spawn(process.execPath,['-e','console.log("held pipe");setInterval(()=>{},60000)'],{stdio:['ignore','inherit','inherit']});process.exit(0)`
+      const result = yield* NativeProcess.run({
+        command: [process.execPath, '-e', source],
+        cwd: root,
+        resourceFile: join(root, 'rss'),
+        timeCommand: process.env.SILK_TEST_GNU_TIME ?? '/usr/bin/time',
+        timeoutMs: 350,
+      })
+      assert.strictEqual(result.deadline.expired, true)
+      assert.strictEqual(result.measurement.exitCode, 0)
+      assert.strictEqual(result.measurement.signal, null)
+      assert.strictEqual(result.measurement.stdout, 'held pipe\n')
+      assert.match(result.measurement.error, /deadline exceeded/)
+      assert.strictEqual(NativeProcess.succeeded(result.measurement), false)
+      assert.notStrictEqual(result.resources.bytes, null)
+    }),
+  )
+
   it.effect(
     'rejects invalid deadlines and stale files including dangling symlinks before spawn',
     () =>
