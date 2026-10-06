@@ -7,6 +7,12 @@ import * as Lifetime from '../src/Lifetime.js'
 import * as Type from '../src/Type.js'
 import * as Projections from './support/projections.js'
 
+const closedBuiltinResult = (operation: Intrinsic.Operation): Type.Type => {
+  if (operation.rule._tag !== 'BuiltinRule' || operation.rule.result._tag !== 'ClosedResult')
+    throw new Error('String builtins require closed result contracts')
+  return operation.rule.result.type
+}
+
 const encoder = new TextEncoder()
 
 const source = `fn view(bytes: &[u8]) -> string {
@@ -41,9 +47,9 @@ it('publishes the minimal portable string intrinsic catalog with exact signature
                 ? []
                 : operation.rule.parameters.flatMap((parameter, ordinal) =>
                     Type.storageLifetimes(parameter).some((input) =>
-                      Type.storageLifetimes(
-                        operation.rule._tag === 'BuiltinRule' ? operation.rule.result : Type.unit,
-                      ).some((output) => Lifetime.equals(input, output)),
+                      Type.storageLifetimes(closedBuiltinResult(operation)).some((output) =>
+                        Lifetime.equals(input, output),
+                      ),
                     )
                       ? [ordinal]
                       : [],
@@ -212,7 +218,10 @@ it('publishes a safe runtime shared subrange retaining only its source lifetime'
   const parameter = operation.rule.parameters.at(0)
   assert.isDefined(parameter)
   if (parameter === undefined) return
-  assert.deepEqual(Type.storageLifetimes(parameter), Type.storageLifetimes(operation.rule.result))
+  assert.deepEqual(
+    Type.storageLifetimes(parameter),
+    Type.storageLifetimes(closedBuiltinResult(operation)),
+  )
 })
 
 it.effect('rejects escaping a subrange of local backing storage', () =>

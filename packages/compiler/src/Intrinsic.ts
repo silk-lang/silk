@@ -54,6 +54,40 @@ export const normalizeRuntimeTargets = (
   targets: ReadonlyArray<Target.Id>,
 ): ReadonlyArray<Target.Id> => runtimeTargets.filter((target) => targets.includes(target))
 
+/** A primitive either returns a closed type or constructs an ordinary occurrence-owned pair. */
+export type ResultPolicy =
+  | { readonly _tag: 'ClosedResult'; readonly type: Type.Type }
+  | { readonly _tag: 'GeneratedUsizePair' }
+
+export const closedResult = (type: Type.Type): ResultPolicy => ({ _tag: 'ClosedResult', type })
+
+/** This owned pair is generated at the selected call, never assigned a source declaration. */
+export const generatedUsizePair: ResultPolicy = { _tag: 'GeneratedUsizePair' }
+
+/** Only closed results can be named as an intrinsic function item or source witness result. */
+export const closedResultType = (self: ResultPolicy): Type.Type | undefined =>
+  self._tag === 'ClosedResult' ? self.type : undefined
+
+export const substituteResult = (
+  self: ResultPolicy,
+  substitution: ReadonlyMap<string, Type.GenericArgument>,
+): ResultPolicy =>
+  self._tag === 'ClosedResult' ? closedResult(Type.substitute(self.type, substitution)) : self
+
+/** The caller owns the selected occurrence and registers its ordinary aggregate facts. */
+export const instantiateResult = (
+  self: ResultPolicy,
+  substitution: ReadonlyMap<string, Type.GenericArgument>,
+  generate: (fields: ReadonlyArray<Type.Type>) => Type.Nominal,
+): Type.Type => {
+  switch (self._tag) {
+    case 'ClosedResult':
+      return Type.substitute(self.type, substitution)
+    case 'GeneratedUsizePair':
+      return generate(['usize', 'usize'])
+  }
+}
+
 /** The elaboration rule selected by an intrinsic operation identity. */
 export type Rule =
   | {
@@ -61,7 +95,7 @@ export type Rule =
       readonly operation: Tir.BuiltinOperation
       readonly typeParameters: ReadonlyArray<Type.Parameter>
       readonly parameters: ReadonlyArray<Type.Type>
-      readonly result: Type.Type
+      readonly result: ResultPolicy
     }
   | {
       readonly _tag: 'ContractRule'
@@ -250,7 +284,7 @@ const builtin = (options: {
   readonly semanticParameters: ReadonlyArray<Type.Type>
   readonly callParameters?: ReadonlyArray<Type.Type>
   readonly result: string
-  readonly semanticResult: Type.Type
+  readonly semanticResult: ResultPolicy
   readonly unsafe?: boolean
   readonly targets?: ReadonlyArray<Target.Id>
 }): BuiltinOperation => {
@@ -934,7 +968,7 @@ const scalarOperation = (scalar: Scalar.Scalar, operation: Scalar.Operation): Op
     semanticParameters: [...semanticParameters, ...semanticCarrierParameters],
     callParameters: [...contractParameters, ...semanticCarrierParameters],
     result,
-    semanticResult,
+    semanticResult: closedResult(semanticResult),
   })
 }
 
@@ -950,7 +984,7 @@ const stringOperations = [
       parameters: [valueParameter('bytes', '&[u8]')],
       semanticParameters: [byteSlice],
       result: 'string',
-      semanticResult: Type.string(byteSlice.lifetime),
+      semanticResult: closedResult(Type.string(byteSlice.lifetime)),
       unsafe: true,
     }),
     invariant:
@@ -963,7 +997,7 @@ const stringOperations = [
     parameters: [valueParameter('value', 'string')],
     semanticParameters: [Type.string(byteSlice.lifetime)],
     result: '&[u8]',
-    semanticResult: byteSlice,
+    semanticResult: closedResult(byteSlice),
   }),
   builtin({
     actor: 'string',
@@ -972,7 +1006,7 @@ const stringOperations = [
     parameters: [valueParameter('value', 'string')],
     semanticParameters: [Type.string(contractLifetime('byteLength'))],
     result: 'usize',
-    semanticResult: 'usize',
+    semanticResult: closedResult('usize'),
   }),
   builtin({
     actor: 'string',
@@ -984,7 +1018,7 @@ const stringOperations = [
       Type.string(contractLifetime('equalsExact')),
     ],
     result: 'bool',
-    semanticResult: 'bool',
+    semanticResult: closedResult('bool'),
   }),
 ]
 
@@ -1412,7 +1446,7 @@ const assemblyOperation: BuiltinOperation = {
     operation: 'NativeAssembly',
     typeParameters: [assemblyResult],
     parameters: assemblyParameters,
-    result: assemblyResult,
+    result: closedResult(assemblyResult),
   },
 }
 
@@ -1466,7 +1500,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '&[T]',
-    semanticResult: Type.slice('Shared', rawElement, contractLifetime('sliceView')),
+    semanticResult: closedResult(Type.slice('Shared', rawElement, contractLifetime('sliceView'))),
   }),
   builtin({
     actor: 'Layout',
@@ -1477,7 +1511,7 @@ const intrinsicOperations = [
     parameters: [],
     semanticParameters: [],
     result: 'Layout',
-    semanticResult: Type.layout,
+    semanticResult: closedResult(Type.layout),
   }),
   builtin({
     actor: 'Execution',
@@ -1488,7 +1522,7 @@ const intrinsicOperations = [
     parameters: [],
     semanticParameters: [],
     result: 'Layout',
-    semanticResult: Type.layout,
+    semanticResult: closedResult(Type.layout),
   }),
   builtin({
     actor: 'Execution',
@@ -1509,7 +1543,7 @@ const intrinsicOperations = [
       representedExecutionReady,
     ],
     result: 'Execution<A>',
-    semanticResult: Type.execution(executionResult),
+    semanticResult: closedResult(Type.execution(executionResult)),
     unsafe: true,
   }),
   builtin({
@@ -1531,11 +1565,13 @@ const intrinsicOperations = [
       representedSuspension,
     ],
     result: 'Effect<()>',
-    semanticResult: Type.effect(
-      Type.unit,
-      [],
-      { environment: contractLifetime('drive'), lifetimeBinders: [] },
-      'Take',
+    semanticResult: closedResult(
+      Type.effect(
+        Type.unit,
+        [],
+        { environment: contractLifetime('drive'), lifetimeBinders: [] },
+        'Take',
+      ),
     ),
   }),
   builtin({
@@ -1553,7 +1589,7 @@ const intrinsicOperations = [
       ),
     ],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
   }),
   builtin({
     actor: 'Wake',
@@ -1562,7 +1598,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('wake', 'Wake')],
     semanticParameters: [Type.wake],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
   }),
   builtin({
     actor: 'Parking',
@@ -1573,11 +1609,13 @@ const intrinsicOperations = [
     parameters: [valueParameter('register', 'F')],
     semanticParameters: [representedRegistration],
     result: 'Effect<()>',
-    semanticResult: Type.effect(
-      Type.unit,
-      [],
-      { environment: contractLifetime('park'), lifetimeBinders: [] },
-      'Take',
+    semanticResult: closedResult(
+      Type.effect(
+        Type.unit,
+        [],
+        { environment: contractLifetime('park'), lifetimeBinders: [] },
+        'Take',
+      ),
     ),
   }),
   builtin({
@@ -1589,7 +1627,7 @@ const intrinsicOperations = [
     parameters: [],
     semanticParameters: [],
     result: 'Layout',
-    semanticResult: Type.layout,
+    semanticResult: closedResult(Type.layout),
   }),
   builtin({
     actor: 'Shared',
@@ -1600,7 +1638,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('allocation', 'Allocation'), valueParameter('value', 'T')],
     semanticParameters: [Type.allocation, sharedElement],
     result: 'SharedCore<T>',
-    semanticResult: Type.sharedCore(sharedElement),
+    semanticResult: closedResult(Type.sharedCore(sharedElement)),
     unsafe: true,
   }),
   builtin({
@@ -1614,7 +1652,7 @@ const intrinsicOperations = [
       Type.reference('Shared', Type.sharedCore(sharedElement), contractLifetime('clone')),
     ],
     result: 'SharedCore<T>',
-    semanticResult: Type.sharedCore(sharedElement),
+    semanticResult: closedResult(Type.sharedCore(sharedElement)),
   }),
   builtin({
     actor: 'Shared',
@@ -1643,7 +1681,7 @@ const intrinsicOperations = [
       ),
     ],
     result: 'A',
-    semanticResult: sharedResult,
+    semanticResult: closedResult(sharedResult),
   }),
   builtin({
     actor: 'Storage',
@@ -1652,12 +1690,14 @@ const intrinsicOperations = [
     parameters: [valueParameter('layout', 'Layout')],
     semanticParameters: [Type.layout],
     result: 'Effect<Allocation ! Intrinsic.StorageFailure>',
-    semanticResult: Type.effect(
-      Type.allocation,
-      [Type.storageFailure],
-      { environment: contractLifetime('acquire'), lifetimeBinders: [] },
-      undefined,
-      [],
+    semanticResult: closedResult(
+      Type.effect(
+        Type.allocation,
+        [Type.storageFailure],
+        { environment: contractLifetime('acquire'), lifetimeBinders: [] },
+        undefined,
+        [],
+      ),
     ),
   }),
   builtin({
@@ -1669,7 +1709,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('allocation', 'Allocation'), valueParameter('count', 'usize')],
     semanticParameters: [Type.allocation, 'usize'],
     result: 'RawBuffer<T>',
-    semanticResult: Type.rawBuffer(rawElement),
+    semanticResult: closedResult(Type.rawBuffer(rawElement)),
     unsafe: true,
   }),
   builtin({
@@ -1689,7 +1729,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '&[T]',
-    semanticResult: Type.slice('Shared', rawElement, contractLifetime('view')),
+    semanticResult: closedResult(Type.slice('Shared', rawElement, contractLifetime('view'))),
     unsafe: true,
   }),
   builtin({
@@ -1709,7 +1749,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '&mut [T]',
-    semanticResult: Type.slice('Exclusive', rawElement, contractLifetime('viewMut')),
+    semanticResult: closedResult(Type.slice('Exclusive', rawElement, contractLifetime('viewMut'))),
     unsafe: true,
   }),
   builtin({
@@ -1724,7 +1764,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: 'Slot<T>',
-    semanticResult: Type.slot(rawElement, contractLifetime('slot')),
+    semanticResult: closedResult(Type.slot(rawElement, contractLifetime('slot'))),
     unsafe: true,
   }),
   builtin({
@@ -1738,7 +1778,7 @@ const intrinsicOperations = [
       Type.reference('Shared', Type.rawBuffer(rawElement), contractLifetime('count')),
     ],
     result: 'usize',
-    semanticResult: 'usize',
+    semanticResult: closedResult('usize'),
   }),
   builtin({
     actor: 'RawBuffer',
@@ -1752,7 +1792,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: 'T',
-    semanticResult: rawElement,
+    semanticResult: closedResult(rawElement),
     unsafe: true,
   }),
   builtin({
@@ -1774,7 +1814,7 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -1794,7 +1834,7 @@ const intrinsicOperations = [
       'u8',
     ],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -1815,14 +1855,16 @@ const intrinsicOperations = [
       }),
     ],
     result: '?[*]const u8',
-    semanticResult: Type.pointer({
-      mutable: false,
-      pointee: 'u8',
-      nullable: true,
-      extent: 'Many',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: false,
+        pointee: 'u8',
+        nullable: true,
+        extent: 'Many',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
     unsafe: true,
   }),
   builtin({
@@ -1834,7 +1876,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('pointer', 'From')],
     semanticParameters: [pointerSource],
     result: 'To',
-    semanticResult: pointerDestination,
+    semanticResult: closedResult(pointerDestination),
     unsafe: true,
   }),
   builtin({
@@ -1846,7 +1888,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('pointer', 'From')],
     semanticParameters: [pointerSource],
     result: 'To',
-    semanticResult: pointerDestination,
+    semanticResult: closedResult(pointerDestination),
     unsafe: true,
   }),
   builtin({
@@ -1858,14 +1900,16 @@ const intrinsicOperations = [
     parameters: [valueParameter('slot', 'Slot<T>')],
     semanticParameters: [Type.slot(rawElement, contractLifetime('slotAccess'))],
     result: '*mut T',
-    semanticResult: Type.pointer({
-      mutable: true,
-      pointee: rawElement,
-      nullable: false,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: true,
+        pointee: rawElement,
+        nullable: false,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -1885,7 +1929,7 @@ const intrinsicOperations = [
       }),
     ],
     result: 'T',
-    semanticResult: pointerElement,
+    semanticResult: closedResult(pointerElement),
     unsafe: true,
   }),
   builtin({
@@ -1907,7 +1951,7 @@ const intrinsicOperations = [
       pointerElement,
     ],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -1919,14 +1963,16 @@ const intrinsicOperations = [
     parameters: [],
     semanticParameters: [],
     result: '?*mut T',
-    semanticResult: Type.pointer({
-      mutable: true,
-      pointee: pointerElement,
-      nullable: true,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: true,
+        pointee: pointerElement,
+        nullable: true,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -1937,7 +1983,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('pointer', 'P')],
     semanticParameters: [pointerSource],
     result: 'bool',
-    semanticResult: 'bool',
+    semanticResult: closedResult('bool'),
   }),
   builtin({
     actor: 'Pointer',
@@ -1948,7 +1994,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('pointer', 'P')],
     semanticParameters: [pointerSource],
     result: 'usize',
-    semanticResult: 'usize',
+    semanticResult: closedResult('usize'),
   }),
   builtin({
     actor: 'Pointer',
@@ -1959,14 +2005,16 @@ const intrinsicOperations = [
     parameters: [valueParameter('value', '&T')],
     semanticParameters: [Type.reference('Shared', pointerElement, contractLifetime('fromRef'))],
     result: '*const T',
-    semanticResult: Type.pointer({
-      mutable: false,
-      pointee: pointerElement,
-      nullable: false,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: false,
+        pointee: pointerElement,
+        nullable: false,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -1979,14 +2027,16 @@ const intrinsicOperations = [
       Type.reference('Exclusive', pointerElement, contractLifetime('fromMutRef')),
     ],
     result: '*mut T',
-    semanticResult: Type.pointer({
-      mutable: true,
-      pointee: pointerElement,
-      nullable: false,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: true,
+        pointee: pointerElement,
+        nullable: false,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -1997,14 +2047,16 @@ const intrinsicOperations = [
     parameters: [valueParameter('values', '&[T]')],
     semanticParameters: [Type.slice('Shared', pointerElement, contractLifetime('fromSlice'))],
     result: '?[*]const T',
-    semanticResult: Type.pointer({
-      mutable: false,
-      pointee: pointerElement,
-      nullable: true,
-      extent: 'Many',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: false,
+        pointee: pointerElement,
+        nullable: true,
+        extent: 'Many',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -2015,14 +2067,16 @@ const intrinsicOperations = [
     parameters: [valueParameter('values', '&mut [T]')],
     semanticParameters: [Type.slice('Exclusive', pointerElement, contractLifetime('fromMutSlice'))],
     result: '?[*]mut T',
-    semanticResult: Type.pointer({
-      mutable: true,
-      pointee: pointerElement,
-      nullable: true,
-      extent: 'Many',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: true,
+        pointee: pointerElement,
+        nullable: true,
+        extent: 'Many',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
   }),
   builtin({
     actor: 'Pointer',
@@ -2043,14 +2097,16 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '*const T',
-    semanticResult: Type.pointer({
-      mutable: false,
-      pointee: pointerElement,
-      nullable: false,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: false,
+        pointee: pointerElement,
+        nullable: false,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
     unsafe: true,
   }),
   builtin({
@@ -2072,14 +2128,16 @@ const intrinsicOperations = [
       'usize',
     ],
     result: '*mut T',
-    semanticResult: Type.pointer({
-      mutable: true,
-      pointee: pointerElement,
-      nullable: false,
-      extent: 'Single',
-      alignment: 'Natural',
-      addressSpace: 0,
-    }),
+    semanticResult: closedResult(
+      Type.pointer({
+        mutable: true,
+        pointee: pointerElement,
+        nullable: false,
+        extent: 'Single',
+        alignment: 'Natural',
+        addressSpace: 0,
+      }),
+    ),
     unsafe: true,
   }),
   builtin({
@@ -2100,7 +2158,7 @@ const intrinsicOperations = [
       }),
     ],
     result: 'T',
-    semanticResult: pointerElement,
+    semanticResult: closedResult(pointerElement),
     unsafe: true,
   }),
   builtin({
@@ -2122,7 +2180,7 @@ const intrinsicOperations = [
       pointerElement,
     ],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -2134,7 +2192,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('slot', 'Slot<T>'), valueParameter('value', 'T')],
     semanticParameters: [Type.slot(rawElement, contractLifetime('slotAccess')), rawElement],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -2146,7 +2204,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('slot', 'Slot<T>')],
     semanticParameters: [Type.slot(rawElement, contractLifetime('slotAccess'))],
     result: 'T',
-    semanticResult: rawElement,
+    semanticResult: closedResult(rawElement),
     unsafe: true,
   }),
   builtin({
@@ -2158,7 +2216,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('slot', 'Slot<T>')],
     semanticParameters: [Type.slot(rawElement, contractLifetime('slotAccess'))],
     result: 'T',
-    semanticResult: rawElement,
+    semanticResult: closedResult(rawElement),
     unsafe: true,
   }),
   builtin({
@@ -2170,7 +2228,7 @@ const intrinsicOperations = [
     parameters: [valueParameter('slot', 'Slot<T>')],
     semanticParameters: [Type.slot(rawElement, contractLifetime('slotAccess'))],
     result: '()',
-    semanticResult: Type.unit,
+    semanticResult: closedResult(Type.unit),
     unsafe: true,
   }),
   builtin({
@@ -2205,15 +2263,17 @@ const intrinsicOperations = [
       ),
     ],
     result: 'once Effect<A ! E ? R | S>',
-    semanticResult: Type.effectWithRows(
-      finalizationSuccess,
-      finalizationFailureRow,
-      finalizationEnvironment,
-      'Take',
-      RowAlgebra.union(
-        Type.requirementRowPolicy(),
-        finalizationProtectedRow,
-        finalizationFinalizerRow,
+    semanticResult: closedResult(
+      Type.effectWithRows(
+        finalizationSuccess,
+        finalizationFailureRow,
+        finalizationEnvironment,
+        'Take',
+        RowAlgebra.union(
+          Type.requirementRowPolicy(),
+          finalizationProtectedRow,
+          finalizationFinalizerRow,
+        ),
       ),
     ),
   }),
@@ -2249,15 +2309,17 @@ const intrinsicOperations = [
       ),
     ],
     result: 'once Effect<A ! E ? R | S>',
-    semanticResult: Type.effectWithRows(
-      nonParkingFinalizationSuccess,
-      nonParkingFinalizationFailureRow,
-      nonParkingFinalizationEnvironment,
-      'Take',
-      RowAlgebra.union(
-        Type.requirementRowPolicy(),
-        nonParkingFinalizationProtectedRow,
-        nonParkingFinalizationFinalizerRow,
+    semanticResult: closedResult(
+      Type.effectWithRows(
+        nonParkingFinalizationSuccess,
+        nonParkingFinalizationFailureRow,
+        nonParkingFinalizationEnvironment,
+        'Take',
+        RowAlgebra.union(
+          Type.requirementRowPolicy(),
+          nonParkingFinalizationProtectedRow,
+          nonParkingFinalizationFinalizerRow,
+        ),
       ),
     ),
   }),
@@ -2286,15 +2348,17 @@ const intrinsicOperations = [
     ],
     semanticParameters: [nonParkingResource, nonParkingResourceUse, nonParkingResourceRelease],
     result: 'once Effect<A ! E ? R | S>',
-    semanticResult: Type.effectWithRows(
-      nonParkingResourceSuccess,
-      nonParkingResourceFailureRow,
-      { environment: nonParkingResourceEnvironment, lifetimeBinders: [] },
-      'Take',
-      RowAlgebra.union(
-        Type.requirementRowPolicy(),
-        nonParkingResourceUseRow,
-        nonParkingResourceReleaseRow,
+    semanticResult: closedResult(
+      Type.effectWithRows(
+        nonParkingResourceSuccess,
+        nonParkingResourceFailureRow,
+        { environment: nonParkingResourceEnvironment, lifetimeBinders: [] },
+        'Take',
+        RowAlgebra.union(
+          Type.requirementRowPolicy(),
+          nonParkingResourceUseRow,
+          nonParkingResourceReleaseRow,
+        ),
       ),
     ),
   }),
@@ -2324,7 +2388,7 @@ const intrinsicOperations = [
       observedEffect,
     ],
     result: 'once Effect<A ? R>',
-    semanticResult: observedEffect,
+    semanticResult: closedResult(observedEffect),
   }),
   builtin({
     actor: 'Effect',
@@ -2335,7 +2399,7 @@ const intrinsicOperations = [
     parameters: [],
     semanticParameters: [],
     result: 'usize',
-    semanticResult: 'usize',
+    semanticResult: closedResult('usize'),
   }),
   builtin({
     actor: 'Effect',
@@ -2354,12 +2418,14 @@ const intrinsicOperations = [
       ),
     ],
     result: 'Effect<A ! E ? R>',
-    semanticResult: Type.effectWithRows(
-      suspensionSuccess,
-      suspensionFailureRow,
-      { environment: contractLifetime('suspendEffect'), lifetimeBinders: [] },
-      'Take',
-      suspensionRequirementRow,
+    semanticResult: closedResult(
+      Type.effectWithRows(
+        suspensionSuccess,
+        suspensionFailureRow,
+        { environment: contractLifetime('suspendEffect'), lifetimeBinders: [] },
+        'Take',
+        suspensionRequirementRow,
+      ),
     ),
   }),
   contractEffect({

@@ -1708,7 +1708,8 @@ export const complete = (
               ? operation
               : undefined
           const parameters = builtin?.callParameters
-          const result = builtin?.rule.result
+          const result =
+            builtin === undefined ? undefined : Intrinsic.closedResultType(builtin.rule.result)
           const compatibility =
             parameters === undefined || result === undefined
               ? undefined
