@@ -8,34 +8,85 @@
 //!
 //! # Details
 //! Entries recorded under one hash are presented oldest first, so a lookup finds the same equal
-//! entry a full scan of the table finds first. Recording and finding the first candidate take
-//! expected constant time; only entries whose hashes collide share a chain.
+//! entry a full scan of the table finds first. Each bucket chains its entries in table order and
+//! the bucket count doubles before it falls under four thirds of the entry count, so recording
+//! and finding the first candidate take expected constant time. Only entries whose hashes collide
+//! reach the caller's comparison.
 //!
 //! # Gotchas
 //! The index cannot check the caller's hash. A hash that differs for two equal values lets the
 //! table hold both, and a lookup then finds only the entry recorded under the probe's own hash.
 
 import silk.allocator {Allocator, OutOfMemoryError}
-import silk.hash {Hash, Word}
-import silk.hash_map {HashMap}
-import silk.option {Option}
+import silk.hash {Hash}
 import silk.u8
+import silk.u64
 import silk.usize
 import silk.vector {Vector}
 
-// The oldest and newest entry recorded under one hash.
-struct Chain {
-  first: usize
-  last: usize
-}
-
-impl Copy for Chain {}
-
 /// The entries of one append-only table, bucketed by caller-computed hashes.
 pub struct InternIndex {
-  chains: HashMap<Word, Chain>
-  // For each recorded entry, the next newer entry recorded under the same hash, or `usize.MAX`.
+  // Each bucket's oldest and newest entry plus one, or zero for an empty bucket.
+  heads: Vector<usize>
+  tails: Vector<usize>
+  // For each recorded entry, its hash and the next newer entry in its bucket, or `usize.MAX`.
+  hashes: Vector<u64>
   successors: Vector<usize>
+}
+
+// The bucket of one hash in a power-of-two table. The hash is mixed first, so callers may key
+// entries by small ordinals.
+fn bucketOf(hash: u64, width: usize) -> usize {
+  return u64.toUsize(u64.bitAnd(Hash.mix(&Hash.seed(0), hash), usize.toU64(width - usize.ONE)))
+}
+
+// The first entry, from `entry` along its bucket chain, recorded under exactly `hash`.
+fn withHash(index: &InternIndex, entry: usize, hash: u64) -> usize {
+  let mut at = entry
+  while at != usize.MAX && Vector.get<u64>(&index.hashes, at) != hash {
+    at = Vector.get<usize>(&index.successors, at)
+  }
+  return at
+}
+
+// Appends one recorded entry to the tail of its bucket chain.
+fn link(index: &mut InternIndex, entry: usize, width: usize) -> () {
+  let bucket = bucketOf(Vector.get<u64>(&index.hashes, entry), width)
+  let tail = Vector.get<usize>(&index.tails, bucket)
+  if tail == usize.ZERO {
+    Vector.set<usize>(&mut index.heads, bucket, entry + usize.ONE)
+  } else {
+    Vector.set<usize>(&mut index.successors, tail - usize.ONE, entry)
+  }
+  Vector.set<usize>(&mut index.tails, bucket, entry + usize.ONE)
+  return ()
+}
+
+effect fn emptyBuckets(width: usize) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut buckets = Vector.make<usize>()
+  run Vector.reserveExact<usize>(&mut buckets, width)
+  let mut at = usize.ZERO
+  while at < width {
+    run Vector.append<usize>(&mut buckets, usize.ZERO)
+    at = at + usize.ONE
+  }
+  return move buckets
+}
+
+// Relinks every recorded entry, in table order, into a table of `width` buckets.
+effect fn rebuild(index: &mut InternIndex, width: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let heads = run emptyBuckets(width)
+  let tails = run emptyBuckets(width)
+  index.heads = move heads
+  index.tails = move tails
+  let count = Vector.length<u64>(&index.hashes)
+  let mut entry = usize.ZERO
+  while entry < count {
+    Vector.set<usize>(&mut index.successors, entry, usize.MAX)
+    link(&mut index.*, entry, width)
+    entry = entry + usize.ONE
+  }
+  return ()
 }
 
 impl InternIndex {
@@ -57,19 +108,28 @@ impl InternIndex {
   }
   /// Creates an index that has recorded no entry. It allocates nothing until the first record.
   pub fn make() -> InternIndex {
-    return InternIndex {chains: HashMap.make<Word, Chain>(Hash.seed(0)), successors: Vector.make<usize>()}
+    return InternIndex {
+      heads: Vector.make<usize>(),
+      tails: Vector.make<usize>(),
+      hashes: Vector.make<u64>(),
+      successors: Vector.make<usize>(),
+    }
   }
   /// Returns the oldest entry recorded under `hash`, or `usize.MAX` when none is.
   pub fn first(self: &Self, hash: u64) -> usize {
-    let found = HashMap.get<Word, Chain>(&self.chains, Hash.word(hash))
-    if let Option<Chain>.Some {value} = move found {
-      return value.first
+    let width = Vector.length<usize>(&self.heads)
+    if width == usize.ZERO {
+      return usize.MAX
     }
-    return usize.MAX
+    let head = Vector.get<usize>(&self.heads, bucketOf(hash, width))
+    if head == usize.ZERO {
+      return usize.MAX
+    }
+    return withHash(self, head - usize.ONE, hash)
   }
   /// Returns the next newer entry recorded under the same hash as `entry`, or `usize.MAX`.
   pub fn after(self: &Self, entry: usize) -> usize {
-    return Vector.get<usize>(&self.successors, entry)
+    return withHash(self, Vector.get<usize>(&self.successors, entry), Vector.get<u64>(&self.hashes, entry))
   }
   /// Records the table's next entry under `hash`; its ordinal is the number of earlier records.
   ///
@@ -77,16 +137,19 @@ impl InternIndex {
   ///
   /// Record every table entry exactly once and in table order.
   pub effect fn record(self: &mut Self, hash: u64) -> () ! OutOfMemoryError ? &mut Allocator {
-    let entry = Vector.length<usize>(&self.successors)
+    let entry = Vector.length<u64>(&self.hashes)
+    run Vector.append<u64>(&mut self.hashes, hash)
     run Vector.append<usize>(&mut self.successors, usize.MAX)
-    let mut first = entry
-    let found = HashMap.get<Word, Chain>(&self.chains, Hash.word(hash))
-    if let Option<Chain>.Some {value} = move found {
-      Vector.set<usize>(&mut self.successors, value.last, entry)
-      first = value.first
+    let width = Vector.length<usize>(&self.heads)
+    if width * 3 < (entry + usize.ONE) * 4 {
+      let mut grown = width + width
+      if grown == usize.ZERO {
+        grown = 16
+      }
+      run rebuild(&mut self.*, grown)
+      return ()
     }
-    let replaced = run HashMap.insert<Word, Chain>(&mut self.chains, Hash.word(hash), Chain {first: first, last: entry})
-    drop replaced
+    link(&mut self.*, entry, width)
     return ()
   }
 }
