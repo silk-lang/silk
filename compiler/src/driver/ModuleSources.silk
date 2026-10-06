@@ -11,18 +11,24 @@ import silk.option {Option}
 import silk.result {Result}
 import silk.string {String}
 import silk.toml_scanner {TomlError}
-import silk.toml_value {Toml}
+import silk.toml_value {Toml, Value as TomlValue}
 import silk.usize
 import silk.vector {Vector}
 
 /// A manifest without a package root, or an entry outside that root's module directory.
 pub struct InvalidSourceRoot {}
 
+/// A `[build].composition` whose default runtime candidates do not resolve to exactly one named
+/// runtime module or none (ARTIFACT-001).
+pub struct InvalidBuildComposition {}
+
 /// The owned filesystem roots and separately published module contents for one build.
 pub struct ModuleSources {
   root: Path
   standardLibrary: Option<Path>
   entry: ModuleId
+  /// The selected runtime source module, an additional analysis root (ARTIFACT-002).
+  runtime: Option<ModuleId>
   revision: Revision
   attempted: Vector<ModuleId>
 }
@@ -63,8 +69,72 @@ effect fn readOptional(path: &Path) -> Option<Bytes>
   }
 }
 
-effect fn sourceRoot(source: &Path) -> Path
-! FileError | TomlError | InvalidSourceRoot | OutOfMemoryError
+// The package module directory and the logical path of its selected default runtime source.
+struct PackageRoot {
+  directory: Path
+  runtime: Option<Bytes>
+}
+
+fn sameText(left: &[u8], right: &[u8]) -> bool {
+  return left.length == right.length && startsWith(left, right)
+}
+
+// Resolves `[build].composition`: no default candidate selects no runtime; exactly one names a
+// listed runtime whose module source is the logical path returned here; any other shape is invalid.
+effect fn defaultRuntime(document: &TomlValue) -> Option<Bytes>
+! InvalidBuildComposition | OutOfMemoryError ? &mut Allocator {
+  let build = Toml.field(document, "build")
+  let composition = match move Toml.fieldAt(move build, "composition") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return Option.none<Bytes>() }
+  }
+  let defaults = match move Toml.field(composition, "defaults") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return Option.none<Bytes>() }
+  }
+  let listed = match &defaults.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed { fail InvalidBuildComposition {} }
+  if let Option<&TomlValue>.None = move Toml.item(defaults, usize.ZERO) { return Option.none<Bytes>() }
+  // Two default candidates are ambiguous even when both would compile for the target.
+  if let Option<&TomlValue>.Some {..} = move Toml.item(defaults, usize.ONE) { fail InvalidBuildComposition {} }
+  let selected = match move Toml.asString(Toml.item(defaults, usize.ZERO)) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { fail InvalidBuildComposition {} }
+  }
+  let runtimes = match move Toml.field(composition, "runtimes") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { fail InvalidBuildComposition {} }
+  }
+  let mut at = usize.ZERO
+  while true {
+    let descriptor = match move Toml.item(runtimes, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let named = match move Toml.asString(Toml.field(descriptor, "name")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { fail InvalidBuildComposition {} }
+    }
+    if sameText(named, selected) {
+      let module = match move Toml.asString(Toml.field(descriptor, "module")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => { fail InvalidBuildComposition {} }
+      }
+      let mut logical = run Bytes.copy(module)
+      run Bytes.append(&mut logical, b".silk")
+      return Option.some<Bytes>(move logical)
+    }
+  }
+  // A named default that the composition does not list never falls back to a hosted runtime.
+  fail InvalidBuildComposition {}
+}
+
+effect fn sourceRoot(source: &Path) -> PackageRoot
+! FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
   let parent = run Path.parent(source)
   let mut directory = match move parent {
@@ -83,7 +153,8 @@ effect fn sourceRoot(source: &Path) -> Path
         let entry = run Path.join(&directory, rootText)
         let moduleDirectory = run Path.parent(&entry)
         if let Option<Path>.Some {value: selected} = move moduleDirectory {
-          return move selected
+          let runtime = run defaultRuntime(&document)
+          return PackageRoot {directory: move selected, runtime: move runtime}
         }
       }
       fail InvalidSourceRoot {}
@@ -95,7 +166,7 @@ effect fn sourceRoot(source: &Path) -> Path
       break
     }
   }
-  return move fallback
+  return PackageRoot {directory: move fallback, runtime: Option.none<Bytes>()}
 }
 
 effect fn logicalEntry(root: &Path, source: &Path) -> Bytes
@@ -116,13 +187,19 @@ effect fn logicalEntry(root: &Path, source: &Path) -> Bytes
   return move logical
 }
 
-/// Reads the entry and nearest package manifest; no imported module is read here.
+/// Reads the entry and nearest package manifest, including its selected default runtime; no
+/// imported or runtime module is read here.
 pub effect fn make(source: &Path, standardLibrary: Option<Path>) -> ModuleSources
-! FileError | TomlError | InvalidSourceRoot | InvalidModulePath | OutOfMemoryError
+! FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
-  let root = run sourceRoot(source)
+  let located = run sourceRoot(source)
+  let PackageRoot {directory: root, runtime: selectedRuntime} = move located
   let logical = run logicalEntry(&root, source)
   let entry = run ModuleId.make(b"file", Path.rawBytes(&root), Bytes.asSlice(&logical))
+  let mut runtime = Option.none<ModuleId>()
+  if let Option<Bytes>.Some {value} = move selectedRuntime {
+    runtime = Option.some<ModuleId>(run ModuleId.make(b"file", Path.rawBytes(&root), Bytes.asSlice(&value)))
+  }
   let content = Option.some<Bytes>(run FileSystem.readFile(source))
   let revision = run Revision.publish(&Revision.make(), &entry, &content)
   let mut attempted = Vector.make<ModuleId>()
@@ -131,6 +208,7 @@ pub effect fn make(source: &Path, standardLibrary: Option<Path>) -> ModuleSource
     root: move root,
     standardLibrary: move standardLibrary,
     entry: move entry,
+    runtime: move runtime,
     revision: move revision,
     attempted: move attempted,
   }
@@ -138,6 +216,14 @@ pub effect fn make(source: &Path, standardLibrary: Option<Path>) -> ModuleSource
 
 /// Borrows the canonical entry identity inside its package's module directory.
 pub fn entry(self: &ModuleSources) -> &ModuleId { return &self.entry }
+
+/// Borrows the selected runtime source module, absent when the package selects no runtime.
+pub fn runtime(self: &ModuleSources) -> Option<&ModuleId> {
+  return match &self.runtime {
+    Option<ModuleId>.Some {value} => Option.some<&ModuleId>(&value)
+    Option<ModuleId>.None => Option.none<&ModuleId>()
+  }
+}
 
 /// All canonical observations actually published, including explicit absence. This retained
 /// ledger survives Semantic.revise clearing the previous query trace.

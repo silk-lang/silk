@@ -54,9 +54,10 @@ the default output links an executable. IR output does not invoke Clang. Success
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
 remain a named `intrinsic-member` gap. A repeated inferred shared-slice lifetime with distinct
-actual Local regions of the same caller requires the deferred common-validity proof and reports
-`slice-region-relation`; this does not admit fixed Static, incompatible access/element, or foreign
-owner evidence. That gap exits through the later checked caller-region/outlives stage. Immediate raw
+actual Local regions of the same caller is admitted at the region the binder already holds, and the
+body retains a `RegionRelation` safety obligation for the later checked caller-region/outlives
+stage; this does not admit fixed Static, incompatible access/element, or foreign owner evidence.
+See "Native typing retains unproven caller-local region relations" below. Immediate raw
 pointer weakening removes mutation capability and adds nullability, preserving invariant
 pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
 covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
@@ -103,6 +104,24 @@ Each entry records:
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
+### Result-only call lifetimes in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1076.
+- **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
+  the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
+  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
+- **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
+  call: a complete ordinary call takes the region its expected result names, and otherwise binds
+  `'static`, since the outcome retains no operand region through that binder. A binder nothing
+  mentions stays `UninferredParameter`. Sections and function values keep their existing
+  result-only binder gaps.
+- **Source migration:** none.
+- **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
+  selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
+  bootstrap infers the shorter region.
+- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
 - **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
@@ -124,6 +143,53 @@ Each entry records:
 - **Evidence:** the existing `staticIntrinsicContractsRejectUnknownMembersAndMismatches` fixture
   asserts known versus unknown membership and the exact backend gap span. The corpus runner check
   compares the complete committed runtime/mixed spellings with `Intrinsic.inventory()`.
+
+### Sealed core storage in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1080 (Stage 1 sealed core storage workstream);
+  verification is pending that PR's CI.
+- **Rule:** the storage core types follow the reference, the standard library and the bootstrap.
+  `Allocation` is six target words, `RawBuffer<T>` is its allocation and element count,
+  `Slot<'storage, T>` is one element address, and `Intrinsic.SharedCore<T>` addresses a local,
+  non-atomic control block. Only the primitives the standard library calls are implemented, each
+  expanding to ordinary MIR; shared-core drop glue counts references, and raw-buffer and slot
+  contents stay owned by library code.
+- **Compilers:** both compilers name the standard library's `silk/layout` `Layout` record in the
+  contracts of `layoutOf`, `sharedLayout` and `systemAllocationAcquire`; selfhost resolves it from
+  the standard-library module and requires its storage to be exactly two `usize` fields. Selfhost
+  calls the sealed C `malloc`, `free`, `memmove` and `memset` declarations where the bootstrap emits
+  LLVM memory intrinsics; the observable allocation, refusal and trap behavior is the same.
+  Execution storage (`Intrinsic.Execution`, `Intrinsic.Wake`) remains the `core-type` deferral.
+- **Source migration:** none. A source type named `Slot`, `RawBuffer` or `Allocation` cannot be
+  named in type position; inherent owners and expression paths of the same spelling stay ordinary.
+  A stored core contributes only its written element types to its container's field lifetimes.
+- **Diagnostics and limits:** contract violations reject with `TypeMismatch`, `CallArity`,
+  `TypeArity`, `MissingConformance` for a non-Copy read, and the unsafe acknowledgement codes. A
+  stored `systemAllocationAcquire` Effect that is not run in place reports the `effect-form` gap.
+- **Evidence:** `sealedCoreLayoutsAndCleanup` and `storagePrimitivesFollowTheirContracts` in
+  `compiler/src/semantic/SemanticCases.silk`, and the native corpus programs that use the storage
+  core.
+
+### Generic record union members and cleanup re-entry in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1089 (Stage 1 self-build, the `union-form` gap in
+  `silk/vector.silk`).
+- **Rule:** a nominal application is a structural-union member even while its arguments are open,
+  so a generic body injects into and matches `Empty<T> | Full<T>`; each closed instance maps the
+  authored member to its canonical tag. Instance discovery admits a re-entry with changed type
+  arguments while it runs inside a Drop hook's cleanup and every type argument stays within the
+  owned structure of the value whose cleanup selected the hook (GEN-006).
+- **Compilers:** both compilers admit nominal union members and follow cleanup re-entry under an
+  immutable root. The bootstrap tracks the root together with the selected hook's own type
+  arguments as a frame; selfhost keeps the single root the reference names and requires every
+  later type argument, including a nested hook's, to lie within that root's structural parts and
+  nominal fields, unfolding a declaration again only at a strictly smaller instantiation.
+- **Source migration:** none.
+- **Diagnostics and limits:** growth outside the root's owned structure, including a hook that
+  drops a larger value of its own type, keeps `ExpandingSpecialization`. A closed instance whose
+  members collapse to one runtime identity keeps the `union-form` gap.
+- **Evidence:** `genericRecordUnionsInjectAndMatchInGenericBodies` and
+  `cleanupReentryStaysWithinItsOwnedRoot` in `compiler/src/semantic/SemanticCases.silk`.
 
 ### Static aggregate reflection subset in selfhost
 
@@ -419,7 +485,7 @@ Each entry records:
   result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
   independently; immutable construction evidence keeps its original binder ordinal. A named
   function value passed to a callable parameter whose promised contract the earlier evidence
-  already closes takes its remaining type binders from that contract before any deferral, as the
+  already closes, or to a checked scalar intrinsic's carrier parameter, takes its remaining type binders from that contract before any deferral, as the
   bootstrap's function-item inference does; lifetime binders and borrowed type evidence still wait
   for the invocation.
 - **Enclosing impl binders:** a section or function value whose target is an inherent member of a
@@ -457,7 +523,8 @@ Each entry records:
   `enclosingOwnerSectionsRetainTheirClosedParameterTypes` covers a piped deferred section over an
   impl member and impl members used as carrier values; `providedCallPrefixesMapLifetimesSeparately`
   covers a result-only binder taken from a closed promise and the open-promise result-inference
-  deferral.
+  deferral. `sealedScalarAndPointerFamiliesTypeAndLowerFromTheCatalog` covers generic impl members as
+  checked scalar carriers.
 
 ### Effect joins in selfhost
 
@@ -477,10 +544,13 @@ Each entry records:
     the bootstrap requires equal environments.
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
-  different join reports the named `nested-effect-join` gap. Constructing an interface operation's
-  Effect reports `interface-effect-witness`. An Effect result with no producer body (an interface
-  operation's) and Effect-producing callables inferred from `effect fn` values (handlers passed to
-  `Effect.catch`, `catchAll`, `flatMap`) remain `effect-form`.
+  different join reports the named `nested-effect-join` gap. An Effect result with no producer
+  body (an interface operation's declared `Effect<...>` result) remains `effect-form`. An
+  `effect fn` handler passed to `Effect.catch`, `catchAll` or `flatMap`, including a generic one
+  such as `effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32`, is instantiated from the
+  parameters its use determined, and its constructed Effect infers the call's remaining channels.
+  A handler whose callable bound still cannot be inferred remains `effect-form`. Interface
+  `effect fn` calls have their own entry below.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
@@ -488,6 +558,41 @@ Each entry records:
   `effect-higher-order-values`, `opaque-effect`, `ordinary-union-executable-members`,
   `match-statement-arm-control` and `effect-access-forwarding`.
 - **Owner:** nested join re-injection and Effect-producing callable inference: #567 Step 9
+  follow-ups.
+
+### Interface `effect fn` operations in selfhost
+
+- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); narrower
+  remainders below.
+- **Rule:** [INTF-006](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-006--a-qualified-interface-call-requires-one-static-application)
+  lets an unapplied qualified call `Interface.operation(value)` take its one application from the
+  provider's conformances. Under
+  [INTF-005](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-005--interface-operations-use-their-declared-ownership-and-effect-contracts)
+  and [EFF-009](apps/docs/content/reference/effect-contracts.md#eff-009--declared-failure-and-requirement-channels-are-upper-bounds),
+  calling an `effect fn` operation constructs the Effect its applied contract promises, with the
+  interface's failure `E` and row `?R`; those channels bound every conforming witness.
+- **Compilers:** both infer the application from the provider's conformance heads and reject a
+  provider with several applications (bootstrap `SEM0202`, selfhost `AmbiguousConformanceMethod`)
+  or none (`MissingConformance`). Selfhost executes a `run` whose immediate operand is such a call
+  as one direct call of the selected witness; there is no adapter or runtime dispatch. The call's
+  failure edge has the witness's own declared failure, which EFF-009 bounds by the promised one,
+  and injects it into the promised failure's sink; a `never` witness gets no edge. Service
+  operations dispatched to a provider's witness lower the same way. Selfhost infers the provider
+  from the first operand only; the bootstrap uses the operand whose declared type is `Self` or
+  `&Self`.
+- **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
+  to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
+  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The
+  pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+- **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
+  and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
+  failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
+  `never` witness of a fallible operation, and the ambiguous, missing, bound and returned
+  rejections at their call spans. `ownedProviderServesGenericBinding` asserts the same edges for
+  service witnesses run directly and inside a bound section. `providersServeRowsInKeyOrder` lowers
+  `run Present.present(value)` to a witness call. The native corpus pins `borrowed-outcome-stream`,
+  `generic-inline-effect-conformance` and `scalar-display`.
+- **Owner:** stored constructions, receiver-method, operator and pipeline forms: #567 Step 9
   follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
@@ -640,26 +745,50 @@ Each entry records:
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
 
-### Native entry uses a generated C `main` until it compiles the source runtime
+### Native entry uses a generated C `main` unless the build selects a source runtime
 
 - **Status:** temporary divergence approved by Julia on 2026-10-02
   ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
-  decision Q1). It is retired when selfhost compiles `silk/native_start` as the runtime root and
-  the `Entry { main }` key is deleted.
+  decision Q1). Selected source runtimes are implemented natively as of 2026-10-06. The rest is
+  retired when selfhost compiles `silk/native_start` as the default hosted runtime root and the
+  `Entry { main }` key is deleted.
 - **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
   to ENTRY-003 put program entry in source. The runtime module calls the application, provides
   `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
   generated invocation adapter.
-- **Compilers:** the bootstrap follows the rule through `silk/native_start`. Selfhost's
-  `Entry { main }` key emits a C `main` that calls `fn main() -> i32` directly and reports
-  `entry-signature` for every other signature, including `pub effect fn main`. Compiling
-  `native_start` needs `Execution` frames and the diagnostic observer intrinsics, which follow the
-  suspension stage.
+  [ARTIFACT-001](apps/docs/content/reference/artifact-roots-and-requirements.md#artifact-001--form-stage-and-runtime-are-separate)
+  and ARTIFACT-002 select the runtime from the build composition and bind `Intrinsic.application`
+  to the application module.
+- **Compilers:** the bootstrap follows the rule through `silk/native_start`, or through the runtime
+  that `[build].composition` selects. Selfhost reads the `defaults` and `runtimes` of
+  `[build].composition` in the nearest `silk.toml`. One default selects that runtime module as a
+  second analysis root. Its active module-level `export "C" fn` declarations are then the only
+  build roots. Each one is a C ABI definition with the requested symbol that forwards
+  immediate scalar and pointer lanes, including C narrow-integer extensions, to the ordinary Silk
+  definition. `import Intrinsic.application` binds the application module. Two defaults, or a
+  default that `runtimes` does not list, stop the build. An absent source is a `MissingModule`
+  rejection at the runtime module. No default keeps the generated entry: `Entry { main }` emits
+  a C `main` that calls `fn main() -> i32` directly and reports `entry-signature` for every other
+  signature, including `pub effect fn main`. Compiling `native_start` needs `Execution` frames and
+  the diagnostic observer intrinsics, which follow the suspension stage.
+
+  Selfhost does not yet read profile `runtime` requests (`none` or a named runtime), composition
+  `retention`, `components` or `requirements`, and it does not make exports declared outside the
+  selected runtime module build roots. A Silk call to an exported definition remains the
+  `foreign-export` gap. An export lane outside the immediate C subset keeps its C ABI gap. Compiling
+  the bodies of `silk/native_start_sync` natively also depends on the generic Effect handler,
+  provider, callable-bound and core storage work that other selfhost stages own. An `unsafe` read
+  of an imported C static of scalar or pointer type loads the external object named by its linkage
+  symbol; exported statics remain `ForeignStaticUnavailable`.
 - **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
   compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
-  reaches the generated `main`.
+  reaches the generated `main`. The compiler package selects `silk/native_start_sync` in
+  `compiler/silk.toml`. An unhandled failure from the compiler's `main` exits with status 1 and
+  no diagnostic report.
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
+  `SemanticCases` covers runtime C export roots, lane extensions, inactive arms, absent runtime
+  sources, and manifest default selection.
 
 ### Selfhost failure reports carry origin only
 
@@ -1300,36 +1429,95 @@ main-first integration of both contracts. See
 [the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
 and validation details. Fatal traps retain their existing behavior and do not promise cleanup.
 
-### Native deferred String coercion and written-pattern lifetime elision
+### Native body-annotation lifetime elision by equality
 
-The bootstrap accepts a static String at a shorter expected String lifetime and permits omitted
-reference lifetimes in an otherwise matching written union-pattern type. Native reports the
-existing `borrow-region-relation` and `body-lifetime-elision` gaps respectively until those
-ordinary lifetime mechanisms are represented. This does not admit either conversion or selection.
-The String guard requires actual Static and a nonstatic String expectation. The pattern guard
-retains the specific annotation's generated lifetime evidence and requires exact nominal owners,
-static and row arguments, reference access and referents, and every other structural component.
-Any ordinary mismatch retains `TypeMismatch`, including a conflicting explicit lifetime, a
-nonstatic-to-static String, or another mismatching type argument after an omitted reference.
+Under LIFE-003 a body annotation infers the lifetimes it omits from its uses. The bootstrap gives
+each one a body-scoped region and solves the body's outlives constraints. Native infers each one
+by equality with the value the annotation describes: a pattern annotation or variant qualifier
+from the subject it matches, a binding annotation from its initializer, and a written constructor
+qualifier from its operands or a same-owner expectation. Every written part must still agree
+exactly, so a conflicting explicit lifetime, a different owner, referent or access, and any other
+mismatching argument keep `TypeMismatch`.
 
-Sealed Allocation admission can expose these pre-existing downstream gaps in `uri-rfc3986` and
-`toml-output`; their prior core-type refusal did not establish lifetime support. Reduced realized
-bootstrap analysis has no diagnostics for both source forms. Native focused cases retain exact
-success and negative code/span controls alongside the named refusals.
+Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
+elides a lifetime checks its initializer without contextual expectation, so a context-typed
+initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
+exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit
+call-site generic arguments and qualified calls that elide a lifetime, and a constructor whose
+elided lifetime is reached only through an alias, keep the `body-lifetime-elision` gap: a call
+argument's elided lifetime needs a slot of the call's own inference that the expected result
+and every operand (including a static `String` and a caller-local loan) can shorten, which waits
+on caller-local region relations.
 
-### Native deferred by-value nominal lifetime shortening
+### Native typing retains unproven caller-local region relations
 
-An inferred call lifetime fixed by an earlier caller-local operand can meet a later by-value
-nominal whose corresponding storage lifetime is Static. The bootstrap admits valid covariant
-storage, but native's direct nominal call lane still needs that region coercion. It reports the
-existing `borrow-region-relation` gap only for the original fresh callee lifetime slot when that
-slot was not explicitly supplied, actual Static differs from the already-bound caller-owned Local,
-and the existing member-query storage proof is covariant. A diagnostic-only copy replaces those
-lifetimes, and full Exact unification with copied bindings must prove no other mismatch remains.
-The operand and real inference bindings stay unchanged; this is no new type admission or solver.
+- **Status:** implemented on 2026-10-06 for the self-build workstream; native borrow checking
+  (roadmap step 14) retires it.
+- **Rule:** lifetimes are covariant in reference, slice and `string` regions, shared referents,
+  array elements and covariant nominal storage (bootstrap `NominalVariance`). A `'static` region
+  shortens to any region, and a lifetime of the declaration enclosing a body outlives every loan
+  rooted in that body.
+- **Compilers:** the bootstrap admits these subtypes and proves every region relation in its borrow
+  checker. Native typing admits a `'static` region at a shorter expected or binder-fixed region as a
+  proven subtype, for example `return b"zero"` at an elided input region, `""` at `string<'text>`,
+  or by-value nominal storage at an inferred caller-local call lifetime. When a caller-local region
+  meets another region that typing cannot relate (a declared lifetime, another caller-local region,
+  or a region an earlier operand fixed for the same binder, including a `'static` Effect
+  environment such as `Effect.provideMut(program(), &mut allocator)`), native admits the value at the
+  expected region and the body keeps a `RegionRelation` safety obligation with the origin and both
+  regions. Native fixes an inferred binder by its first evidence, while the bootstrap solves for the
+  shortest region, so a binder an earlier operand fixed to `'static` also relates a later loan of a
+  declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
+  relations a call's operands retain are outlives premises of that call's own bound proofs, so
+  `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
+  proves its representation bound once. Such bodies are `ContractTyped` and counted by the
+  `SILK_GAP borrow-check` summary, so a program the bootstrap would reject for that relation still
+  compiles natively until step 14.
+- **Source migration:** none.
+- **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
+  widened to another, explicitly fixed lifetime slots, and owner, access, element, pointee,
+  extent, type-argument and requirement-row differences keep `TypeMismatch`. Native call arguments
+  still unify exactly apart from shared-loan shortening and this binder-region relation.
+- **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
+  `staticStringSubtypingPreservesOrdinaryMismatches`,
+  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence`,
+  `providedCallPrefixesMapLifetimesSeparately` and
+  `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
+  and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
 
-Equal evidence retains success. Fixed lifetime slots, reverse regions, different nominal owners,
-types, requirement rows and static extents, and lifetimes within invariant pointers or mutable
-referents retain ordinary type errors. A covariant-to-invariant imported field revision invalidates
-the cached diagnostic proof. `http-redirect` exposed this deferred lane after sealed Allocation
-admission; a reduced realized bootstrap source analysis has no diagnostics.
+### Native unconsumed Effect and callable arguments
+
+- **Status:** native gap; retires when native lowers a non-consuming by-value Effect argument.
+- **Compilers:** the bootstrap consumes an Effect or callable argument only when its run access is
+  `once` (`argumentConsumes`), and derives a composition's access from its retained environment
+  (COMPOSE-001), so a let-bound `runCases(&headers) |> Effect.provideMut<Allocator>(&mut allocator)`
+  may be passed by value without `move`, as in `run Effect.catchAll(program, recover)`. Native types
+  an invoked section's Effect at the access its generic contract proves conservatively. It reports
+  such an argument, and any shared- or mutable-access one, as unsupported (the `typed-form` gap)
+  instead of `ExplicitMoveRequired`, which it keeps for an exact `once` value, a reference to a
+  callable, and every return.
+- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk` and
+  `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
+
+### Native member bodies without implementation head bounds
+
+- **Status:** native gap; retires when native checks an implementation member's body under its
+  implementation head's bounds.
+- **Compilers:** the bootstrap checks `impl<T: Printable> Printable for Box<T>` members with
+  `T: Printable` as a premise, so `value.value.print()` selects the bound operation. Native member
+  bodies receive only the member signature's bounds, so a receiver call on such an enclosing type
+  parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
+  `UnknownMember`, which it keeps for a function's own unbounded type parameter.
+- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
+### Native service operations with a `Self` operand
+
+- **Status:** native gap; retires when native dispatches such an operation on its operand.
+- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
+  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
+  interface. Native serves a service operation from the run site's requirement row with no provider
+  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
+  `typed-form` gap) instead of a `TypeMismatch` at the operand.
+- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
+  `compiler/src/semantic/SemanticCases.silk`.

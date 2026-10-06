@@ -6,7 +6,7 @@
 //! call path before following it. This module does not discover executable roots or emit code.
 
 import semantic.DeclarationId {DeclarationId, Part as DeclarationPart, Projection as DeclarationProjection, OwnerStep}
-import semantic.Lifetime {Lifetime}
+import semantic.Lifetime {Lifetime, Numbering}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.RuntimeEncoding
 import semantic.RuntimeEncoding {Coordinates}
@@ -40,6 +40,7 @@ pub union Target {
 
 /// One application after call inference and conformance selection have completed.
 /// Lifetime arguments are retained here for semantic validity and erased only in runtime equality.
+/// A selected instance's application numbers its caller regions canonically ([`Numbering`]).
 pub struct Application {
   pub target: Target
   pub arguments: Vector<Argument>
@@ -122,6 +123,8 @@ pub union Edge {
   Direct,
   Witness,
   FieldWitness {pub field: FieldDescent},
+  /// A Drop hook selected by the cleanup of `owner`, the value a function dropped.
+  Cleanup {pub owner: Shared<Type>},
 }
 
 /// A finite request, a repeated runtime identity, or the exact path that grows recursively.
@@ -538,6 +541,7 @@ fn witnesses(edge: &Edge) -> bool {
     Edge.Direct => false
     Edge.Witness => true
     Edge.FieldWitness {..} => true
+    Edge.Cleanup {..} => false
   }
 }
 
@@ -861,6 +865,51 @@ impl Application {
       argumentOrdinals: run copyOrdinals(Vector.asSlice<usize>(&self.argumentOrdinals)), scopes: move scopes,
       statics: run copyStatics(Vector.asSlice<StaticSlot>(&self.statics))}
   }
+  /// Renames the caller regions of every input through `numbering`, in canonical order: an
+  /// operation's contract and provider, own arguments, then enclosing scopes in lexical order.
+  ///
+  /// # Details
+  ///
+  /// This is the region part of an instance's canonical identity; see [`Numbering`]. Ordinals,
+  /// scope owners and static values are kept. The caller's static roots evaluate a static value
+  /// once per body, without instance bindings or loans, and a pure static value holds no
+  /// reference, slice, pointer or callable, so it names no caller region.
+  pub effect fn numberRegions(self: &Self, numbering: &mut Numbering) -> Application
+  ! OutOfMemoryError ? &mut Allocator {
+    let owner = body(self)
+    let mut target = Target.Named {declaration: run DeclarationId.copy(owner)}
+    if let Target.Operation {contract, provider, operation, implementation} = &self.target {
+      let numberedContract = run Type.numberRegions(&contract, owner, &mut numbering.*)
+      let numberedProvider = run Type.numberRegions(&provider, owner, &mut numbering.*)
+      target = Target.Operation {contract: move numberedContract, provider: move numberedProvider,
+        operation: run DeclarationId.copy(&operation), implementation: run DeclarationId.copy(&implementation)}
+    }
+    let mut arguments = Vector.make<Argument>()
+    let own = Vector.asSlice<Argument>(&self.arguments)
+    let mut at = usize.ZERO
+    while at < own.length {
+      run Vector.append<Argument>(&mut arguments, run Argument.numberRegions(&own[at], owner, &mut numbering.*))
+      at = at + usize.ONE
+    }
+    let mut scopes = Vector.make<ScopeBinding>()
+    let enclosing = Vector.asSlice<ScopeBinding>(&self.scopes)
+    at = usize.ZERO
+    while at < enclosing.length {
+      let mut values = Vector.make<Argument>()
+      let previous = Vector.asSlice<Argument>(&enclosing[at].arguments)
+      let mut index = usize.ZERO
+      while index < previous.length {
+        run Vector.append<Argument>(&mut values, run Argument.numberRegions(&previous[index], owner, &mut numbering.*))
+        index = index + usize.ONE
+      }
+      run Vector.append<ScopeBinding>(&mut scopes, ScopeBinding {owner: Shared.clone<DeclarationId>(&enclosing[at].owner), arguments: move values,
+        argumentOrdinals: run copyOrdinals(Vector.asSlice<usize>(&enclosing[at].argumentOrdinals))})
+      at = at + usize.ONE
+    }
+    return Application {target: move target, arguments: move arguments,
+      argumentOrdinals: run copyOrdinals(Vector.asSlice<usize>(&self.argumentOrdinals)), scopes: move scopes,
+      statics: run copyStatics(Vector.asSlice<StaticSlot>(&self.statics))}
+  }
   /// The exact simultaneous binding environment for signature, body and layout substitution.
   pub effect fn bindings(self: &Self) -> Vector<Binding> ! OutOfMemoryError ? &mut Allocator {
     let mut output = Vector.make<Binding>()
@@ -905,6 +954,29 @@ impl Application {
   /// Compares code identities after lifetime erasure only.
   pub effect fn runtimeEquals(left: &Self, right: &Self) -> bool ! OutOfMemoryError ? &mut Allocator {
     return run sameApplication(left, right, true)
+  }
+  /// Whether two applications share their target, binding layout and static values, and every
+  /// non-type binding is runtime-equal: only their type arguments may differ.
+  pub effect fn sameNonTypeArguments(older: &Self, newer: &Self) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if !DeclarationId.equals(body(older), body(newer)) { return false }
+    if let Target.Operation {..} = &newer.target {
+      if !run sameTarget(&older.target, &newer.target, true) { return false }
+    }
+    if !run sameApplicationStatics(older, newer) { return false }
+    let olderBindings = run Application.bindings(older)
+    let newerBindings = run Application.bindings(newer)
+    let first = Vector.asSlice<Binding>(&olderBindings)
+    let second = Vector.asSlice<Binding>(&newerBindings)
+    if first.length != second.length { return false }
+    let mut at = usize.ZERO
+    while at < first.length {
+      if first[at].ordinal != second[at].ordinal || !sameOwner(&first[at].declaration, &second[at].declaration) { return false }
+      if !typeArgument(&first[at].value) || !typeArgument(&second[at].value) {
+        if !run sameArgument(&first[at].value, &second[at].value, true) { return false }
+      }
+      at = at + usize.ONE
+    }
+    return true
   }
   /// Whether all type, row, and selected-operation evidence is concrete for runtime use.
   /// Lifetime validity remains the responsibility of source typing and conformance proof.
@@ -1033,7 +1105,19 @@ impl Admission {
     }
     return move path
   }
-  /// Follows a changing-static edge already covered by a finite closure certificate.
+  /// The edges that reached the active applications, in [`Admission.path`] order.
+  pub effect fn edges(self: &Self) -> Vector<Edge> ! OutOfMemoryError ? &mut Allocator {
+    let mut edges = Vector.make<Edge>()
+    let listed = Vector.asSlice<Step>(&self.active)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector.append<Edge>(&mut edges, Edge.copy(&listed[at].edge))
+      at = at + usize.ONE
+    }
+    return move edges
+  }
+  /// Follows an edge already covered by finite evidence: a changing-static closure certificate or
+  /// a cleanup measure.
   pub effect fn enterChain(self: &mut Self, application: &Application, edge: Edge) -> () ! OutOfMemoryError ? &mut Allocator {
     run Vector.append<Step>(&mut self.active, Step {application: run copyApplication(application), edge: move edge})
     return ()
@@ -1190,6 +1274,10 @@ fn callableTarget(value: &Type) -> Option<Shared<Application>> {
   }
 }
 
+fn typeArgument(value: &Argument) -> bool {
+  return match &value.* { Argument.Type {..} => true _ => false }
+}
+
 fn typeArgumentCount(arguments: &[Argument]) -> usize {
   let mut count = usize.ZERO
   let mut at = usize.ZERO
@@ -1212,6 +1300,7 @@ impl Edge {
           field: Shared.clone<Type>(&field.field),
         },
       }
+      Edge.Cleanup {owner} => Edge.Cleanup {owner: Shared.clone<Type>(&owner)}
     }
   }
 }

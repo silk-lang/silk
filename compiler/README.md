@@ -13,9 +13,11 @@ destination. Named tuple construction and ordinal places share record storage. F
 one element layout, stride and logical length; indexing checks the logical bound before access or
 an indexed assignment's replacement expression, including for empty and zero-size storage.
 Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
-equality, and member or `_` match arms with guards lower to MIR switches. Unions of argument-free
-records store an unsigned tag (canonical member order) before the largest member; nominal
-`union` declarations tag variants in declaration order and lay each variant out like a record.
+equality, and member or `_` match arms with guards lower to MIR switches. Unions of records store
+an unsigned tag (canonical member order) before the largest member; a generic body may inject into
+and match a union of generic record applications such as `Empty<T> | Full<T>`, and each closed
+instance maps the authored member to its canonical tag. Nominal `union` declarations tag variants
+in declaration order and lay each variant out like a record.
 Record, structural-union and nominal-union matches bind fields as places and switch on the tag.
 A tuple or `.{ ... }` literal constructs its immediately expected named tuple or struct; otherwise
 it creates an occurrence-nominal anonymous aggregate laid out as an ordinary record of its members.
@@ -25,15 +27,22 @@ computed under those applications; standard-library Option and Result use the sa
 as user declarations. Runtime text (`string<'static>`) and byte-string (`&'static [u8]`) literals
 store their decoded bytes in a private constant and build the same address-and-byte-length
 descriptor as a slice. Slice subranges and unions with string or f64 members remain follow-up work.
-Exact lifetime-bearing semantic instances are validated separately. Complete selected MIR recipes
+Semantic instances keep `'static` and region-sharing evidence but number caller-local regions by
+first appearance, so call sites that lend different locals share one instance; each semantic
+instance is validated separately. Complete selected MIR recipes
 and their ordered call/drop graph determine emitted identities after finite reachability closes.
 Equivalent recipes share code; different direct or transitive cleanup receives distinct symbols,
 while physically equivalent types still share layouts. This is target-neutral and handles recursive
 instances without encoding discovery ordinals or LLVM text. The build answer retains its emission
 plan for structural inspection alongside the emitted module.
 Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
-certify LLVM executability. MIR, layouts and foreign signatures are validated before closure
-planning, while backend-only emission restrictions remain loud gaps on the completed build.
+certify LLVM executability. Re-entering a generic function with different type arguments is
+`ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
+the re-entry runs inside a Drop hook's cleanup and every type argument stays within the owned
+structure of the value whose cleanup selected the hook (GEN-006): `Vector<Bytes>` cleanup reaches
+`Vector<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
+MIR, layouts and foreign signatures are validated before closure planning, while backend-only
+emission restrictions remain loud gaps on the completed build.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
 by-value receiver of an affine place. The place is a local or match subject plus static field,
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
@@ -55,13 +64,21 @@ each incoming edge; elsewhere no flag exists. An owner that may be moved when a 
 tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
 rvalues used only as places are dropped at the end of their full expression unless a borrowing
 `let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
-path. A static partial move, including a match binding moved out of a consumed subject, leaves a
-hole in its owner: the owner is then dropped child by child, skipping moved children, and writing
-a moved child back makes it whole again. A hole beneath a type with a Drop hook is rejected as
-`OWN0002`. Holes that differ between joining paths, a maybe-moved partial owner, a write at a
-runtime index beside a moved element, a guard that changes an owner's state (the bootstrap rejects
-such moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
-changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
+path. Once a consuming match selects an arm, each by-value binding that needs cleanup owns its
+part of the evaluated subject (MATCH-002); typing lists every arm's binding declarations, so an
+unused binding is an owner too. `drop`, `move` or `match move` of a binding, a partial move out of
+one and moves that differ per arm or per path then use the ordinary owner states and drop flags.
+The bindings of a destructuring `let` belong to the enclosing block; those of a `match` or `if let`
+arm end with the arm, innermost first. The subject drops only what no binding took, such as fields
+omitted with `..`: a `match` arm drops it when the arm ends, while `if let` and `let` drop it, or
+the whole unmatched `if let` subject, once a path is selected and before it runs (PATT-008). A
+static partial move leaves a hole in its owner: the owner is then dropped child by child, skipping
+moved children, and writing a moved child back makes it whole again. A hole beneath a type with a
+Drop hook is rejected as `OWN0002`. Holes that differ between joining paths, a maybe-moved partial
+owner, a write at a runtime index beside a moved element, a guard that changes an owner's state or
+consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
+report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
+created temporaries still report the `cleanup` gap.
 Effect fn bodies are typed against their declared success, failure and requirement channels.
 Calling an `effect fn` builds an exact Effect whose representation is the call's application and
 written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect
@@ -97,10 +114,43 @@ An instance receives one hidden provider address per entry of its requirement ro
 service-role key order (D2), and its key names each provider's type. Running
 `Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
 `Svc.op(args)` calls the witness for the serving provider's type with the provider address as its
-receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`. The
-sealed `silk/core` storage nominals (`Allocation`, `RawBuffer`, `Slot`) report `core-type`.
+receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`.
+Catalog `Intrinsic` type families outside the storage core, such as `Intrinsic.Execution`, report
+`core-type`.
+
+The storage core follows the bootstrap. `Allocation`, `RawBuffer<T>` and `Slot<'storage, T>` are
+reserved in type position, and `Intrinsic.SharedCore<T>` and `Intrinsic.StorageFailure` are sealed
+families; `semantic.SealedCore` owns their identities and record storage. An allocation is six
+target words (aligned base, requested bytes and alignment, reclaim tag, `malloc` context, active
+marker), a raw buffer is its allocation and element count, a slot is one element address, and a
+shared core addresses a local, non-atomic control block holding the strong count, the access
+state, its own allocation and the value. The storage primitives the standard library calls
+(`semantic.StorageOperation`) are typed from their written type arguments and expand to ordinary
+MIR: layout validation, bounds checks and count exhaustion trap, `run
+Intrinsic.systemAllocationAcquire(layout)` calls the sealed C `malloc` and fails with
+`StorageFailure` on a refused request, raw-buffer copies and fills call `memmove` and `memset`, and
+`Intrinsic.replace(place, value)` moves the displaced value out of a mutable place. Allocation glue
+calls `free` on its context, a raw buffer drops only its allocation, and shared-core glue counts
+references and drops the value and allocation with the last handle. Raw-buffer and slot contents
+stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
+standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
 Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
 reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
+Typing therefore admits covariant region subtyping without the borrow checker. At an expected
+value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
+referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
+region shortens to any region, and a lifetime of the declaration enclosing a body outlives every
+loan rooted in that body, both of which are proven. A caller-local region (a loan rooted in the body)
+meeting another region that typing cannot relate, such as a declared lifetime, another
+caller-local region, or a region an earlier call operand fixed for the same binder (including a
+`'static` Effect environment), is admitted at the expected region, and the body retains a
+`RegionRelation` safety obligation naming its origin and both regions for step 14. A binder an
+earlier operand fixed to `'static` likewise relates a later loan of a declared lifetime, since
+inferred `'static` evidence never requires `'static`. The relations
+a call's operands retain are premises (offered outlives wanted) of that call's own bound proofs,
+such as a provision section's `once Effect<'env; ...>` representation bound. A fixed
+`'static` expectation of a shorter region, a declared region widened to another, and any owner,
+access, element, pointee or type-argument difference stay type errors.
 
 Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> --stdlib <directory>
 --optimization <none|speed> --debug <true|false>`.
@@ -485,8 +535,8 @@ and `Intrinsic.NonParking` are witness-free properties recorded on generic bound
 representation parameter retains no region. An `Intrinsic.application` import selects the canonical
 module explicitly bound to the semantic request; an active import without that binding rejects at
 the import, and different bindings have separate query identities. Its imported members obey the
-usual visibility and selective-import rules. Other intrinsic families, `impl Intrinsic`, and calls
-such as `Intrinsic.replace(place, value)` are `Unsupported` until intrinsic applications exist.
+usual visibility and selective-import rules. Other intrinsic families and `impl Intrinsic` are
+`Unsupported` until intrinsic applications exist.
 
 Body-sensitive representation-property proofs, row subtraction such as `Without<R, K>` (which
 belongs to the later provision and requirement-algebra work), requirements on type parameters,
@@ -563,6 +613,14 @@ different type is `TypeMismatch`. Runtime calls are `StaticPhaseViolation`; an u
 expression publishes no value. Static execution records reached body and initializer dependencies
 and enforces step, depth, and retained-value limits, including retained text provenance. Returned
 text aliases preserve their original authored spans.
+
+A runtime body reads a local or namespace-qualified constant, such as `usize.MAX`, as its published
+value at the declared type. The read demands the constant's content-keyed initializer and records
+that value edge, so every reader shares one evaluation, and a rejected initializer rejects the reader
+with the initializer's own diagnostic. MIR materializes the value at its use: integers with their
+exact sign and magnitude, `bool`, floats (an `f32` widened exactly to the f64 operand bits), `char`
+as its scalar value, and text as a descriptor over its program-lifetime bytes. A `char` value still
+has no runtime layout and reports the `scalar-layout` gap.
 
 The sealed `Intrinsic` surface supplies target and final-profile facts and static text operations.
 One explicit final build profile controls selected static-if arms; inactive arms contribute no
@@ -748,8 +806,8 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
   pointer-sized ranges and other target selection; target constants; static parameters; and package
   parameters.
 - **M2.5, ownership, Effects, and remaining bodies:** borrow and capture safety, Effect bodies and
-  calls, `unsafe` calls, partial application, aggregate construction and member access, constant
-  reads such as `return limit`, and provision algebra such as `Without<R, K>`.
+  calls, `unsafe` calls, partial application, aggregate construction and member access, and
+  provision algebra such as `Without<R, K>`.
 - **M2.6, representation and reflection:** layout, offsets, and rejecting infinite by-value storage
   such as `struct Node { next: Node }`.
 - **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.

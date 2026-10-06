@@ -24,7 +24,7 @@ import semantic.SourceRevision {Revision}
 import semantic.Specialization {Application as SpecializationApplication, ScopeBinding, StaticSlot, Target as SpecializationTarget}
 import semantic.Type {Argument, Binding, Comparison, ComparisonChild, CallableFieldInput, Outlives, Row, RowParameter, Type, Unification}
 import semantic.Target {Id as TargetId, Target as MachineTarget}
-import semantic.TypedBody {AggregateField as BodyAggregateField, Expression as BodyExpression, Node as BodyNode, NodeId as BodyNodeId, NodeKind as BodyNodeKind, TypedBody}
+import semantic.TypedBody {AggregateField as BodyAggregateField, Expression as BodyExpression, Node as BodyNode, NodeId as BodyNodeId, NodeKind as BodyNodeKind, SafetyObligation as BodySafetyObligation, Stage as BodyStage, TypedBody}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
@@ -131,6 +131,41 @@ fn rejectsSpan(
     return Shared.with<Rejection, bool>(&value, fn(diagnostic: &Rejection) -> bool {
       return diagnostic.code == code && diagnostic.span.start == start && diagnostic.span.end == end
     })
+  }
+  return false
+}
+
+// Whether a successful body retains an open region relation within the spelled source whose
+// offered region is one of the body's own caller-local regions.
+fn retainsRegionRelation(answer: &Shared<Result<Answer, NoRejection>>, text: string, spelling: string,
+  occurrence: usize) -> bool {
+  let start = offsetOf(text, spelling, occurrence)
+  if start == usize.MAX { return false }
+  let end = start + String.utf8Bytes(spelling).length
+  let checked = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(answer, checkedBody)
+  if let Option<Shared<TypedBody>>.Some {value} = move checked {
+    return Shared.with<TypedBody, bool>(&value, fn(body: &TypedBody) -> bool { return bodyRetainsRegionRelation(body, start, end) })
+  }
+  return false
+}
+
+fn bodyRetainsRegionRelation(body: &TypedBody, start: usize, end: usize) -> bool {
+  let stage = TypedBody.checkingStage(body)
+  if let BodyStage.ContractTyped {obligations} = &stage.* {
+    let entries = Vector.asSlice<BodySafetyObligation>(&obligations)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if let BodySafetyObligation.RegionRelation {origin, offered, ..} = &entries[at] {
+        let local = Shared.with<Lifetime, bool>(&offered, fn(region: &Lifetime) -> bool {
+          return match &region.* {
+            Lifetime.Local {declaration, ..} => DeclarationId.equals(&declaration, TypedBody.declarationId(body))
+            _ => false
+          }
+        })
+        if local && origin.span.start >= start && origin.span.end <= end { return true }
+      }
+      at = at + usize.ONE
+    }
   }
   return false
 }
@@ -2164,40 +2199,45 @@ fn main() -> i32 { return through(Marker {})(40) }
   let mut loan = false
   if let Option<usize>.Some {value: index} = move selected {
     if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
-      loan = interfaceCallableBorrowTarget(function, SpecializationApplication.bodyDeclaration(&application), syntax)
-        && interfaceCallableBorrowTemporary(function)
+      loan = interfaceCallableBorrowTarget(function) && interfaceCallableBorrowTemporary(function)
     }
   }
-  run Testing.expect(succeeded(&producer) && loan,
-    "the witnessed implementation's original lifetime slot receives the actual through operand region")
+  // The loan's caller-local identity is the call edge's; the canonical key keeps only that it is a
+  // caller region, not `'static`.
+  run Testing.expect(succeeded(&producer) && syntax != usize.MAX && loan,
+    "the witnessed implementation's original lifetime slot receives the through receiver loan as its first caller region")
 }
-fn interfaceCallableBorrowTarget(value: &MirFunction, caller: &DeclarationId, syntax: usize) -> bool {
+fn interfaceCallableBorrowTarget(value: &MirFunction) -> bool {
   let references = Vector.asSlice<MirReference>(&value.references)
   let mut at = usize.ZERO
   while at < references.length {
     let selected = InstanceKey.application(&references[at].key)
     if let Option<Shared<SpecializationApplication>>.Some {value: application} = move selected {
       if Shared.with<SpecializationApplication, bool>(&application,
-        fn(target: &SpecializationApplication) -> bool { return interfaceCallableBorrowApplication(target, caller, syntax) }) { return true }
+        interfaceCallableBorrowApplication) { return true }
     }
     at = at + usize.ONE
   }
   return false
 }
-fn interfaceCallableBorrowApplication(value: &SpecializationApplication, caller: &DeclarationId, syntax: usize) -> bool {
+fn interfaceCallableBorrowApplication(value: &SpecializationApplication) -> bool {
   if !DeclarationId.named(SpecializationApplication.bodyDeclaration(value), b"make") { return false }
   let arguments = Vector.asSlice<Argument>(&value.arguments)
   let mut at = usize.ZERO
   while at < arguments.length {
     if let Argument.Lifetime {value: region} = &arguments[at] {
-      if Shared.with<Lifetime, bool>(&region,
-        fn(lifetime: &Lifetime) -> bool { return interfaceCallableThroughLoan(lifetime, caller, syntax) }) { return true }
+      if Shared.with<Lifetime, bool>(&region, firstCallerRegion) { return true }
     }
     at = at + usize.ONE
   }
   return false
 }
-fn interfaceCallableThroughLoan(value: &Lifetime, caller: &DeclarationId, syntax: usize) -> bool {
+// A canonical instance numbers its first caller region, never `'static`, as `Supplied {0}`.
+fn firstCallerRegion(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Supplied {ordinal} => ordinal == usize.ZERO _ => false }
+}
+// The actual loan of `caller`'s call at `syntax`, as its typed body and call edge retain it.
+fn callerCallLoan(value: &Lifetime, caller: &DeclarationId, syntax: usize) -> bool {
   if let Lifetime.Local {declaration, ordinal} = &value.* { return ordinal == syntax && syntax != usize.MAX && DeclarationId.equals(&declaration, caller) }
   return false
 }
@@ -3359,16 +3399,22 @@ fn main() -> i32 {
   let typed = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&source, checkedBody)
   let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&entry, selectedMirIndex)
   let mut original = false
+  let mut shared = false
   if let Option<Shared<TypedBody>>.Some {value: body} = move typed {
     if let Option<usize>.Some {value: index} = move selected {
       if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
         original = Shared.with<TypedBody, bool>(&body,
           fn(value: &TypedBody) -> bool { return namedLifetimeSectionMir(function, value) })
+        let keys = run namedSectionCombineKeys(function)
+        let listed = Vector.asSlice<InstanceKey>(&keys)
+        if listed.length == 2 { shared = run InstanceKey.sameApplication(&listed[usize.ZERO], &listed[usize.ONE]) }
       }
     }
   }
   run Testing.expect(succeeded(&entry) && original,
-    "two staged invocations retain distinct Borrow arguments, select their caller call regions, and append left/right from stored fields 1/0")
+    "two staged invocations lend distinct caller call loans as Borrow arguments, and append left/right from stored fields 1/0")
+  run Testing.expect(shared,
+    "both staged invocations select one canonical combine instance whose loan is its first caller region")
 }
 struct NamedSectionInvocationSite {
   syntax: usize
@@ -3402,7 +3448,7 @@ fn namedSectionCallLoan(site: &NamedSectionInvocationSite, caller: &DeclarationI
 fn namedSectionLoanType(value: &Type, caller: &DeclarationId, syntax: usize) -> bool {
   if let Type.Reference {lifetime, ..} = &value.* {
     return Shared.with<Lifetime, bool>(&lifetime,
-      fn(region: &Lifetime) -> bool { return interfaceCallableThroughLoan(region, caller, syntax) })
+      fn(region: &Lifetime) -> bool { return callerCallLoan(region, caller, syntax) })
   }
   return false
 }
@@ -3420,12 +3466,7 @@ fn namedLifetimeSectionMir(function: &MirFunction, body: &TypedBody) -> bool {
         let selected = Shared.with<SpecializationApplication, bool>(&application,
           fn(value: &SpecializationApplication) -> bool { return DeclarationId.named(SpecializationApplication.bodyDeclaration(value), b"combine") })
         if selected {
-          let site = match move namedLifetimeInvocationAt(body, count) { Option<NamedSectionInvocationSite>.Some {value} => move value _ => { return false } }
-          let syntax = site.syntax
-          if !Shared.with<SpecializationApplication, bool>(&application,
-            fn(value: &SpecializationApplication) -> bool { return namedSectionInvocationLifetime(value, TypedBody.declarationId(body), syntax) }) {
-            return false
-          }
+          if !Shared.with<SpecializationApplication, bool>(&application, namedSectionInvocationLifetime) { return false }
           let operands = Vector.asSlice<MirOperand>(&arguments)
           if operands.length != 3 { return false }
           if let MirOperand.Copy {place: left} = &operands[usize.ONE] {
@@ -3446,15 +3487,31 @@ fn namedSectionCaptureField(place: &MirPlace, field: usize) -> bool {
   if projections.length != usize.ONE { return false }
   return match &projections[usize.ZERO] { MirProjection.Field {index} => index == field _ => false }
 }
-fn namedSectionInvocationLifetime(application: &SpecializationApplication, caller: &DeclarationId, syntax: usize) -> bool {
+// Each canonical `combine` instance numbers its caller call loan as its first caller region.
+fn namedSectionInvocationLifetime(application: &SpecializationApplication) -> bool {
   let arguments = Vector.asSlice<Argument>(&application.arguments)
   let ordinals = Vector.asSlice<usize>(&application.argumentOrdinals)
   if arguments.length != usize.ONE || ordinals.length != usize.ONE || ordinals[usize.ZERO] != usize.ZERO { return false }
   return match &arguments[usize.ZERO] {
-    Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value,
-      fn(region: &Lifetime) -> bool { return interfaceCallableThroughLoan(region, caller, syntax) })
+    Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value, firstCallerRegion)
     _ => false
   }
+}
+// The instance key of every MIR call to `combine`, in block order.
+effect fn namedSectionCombineKeys(function: &MirFunction) -> Vector<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
+  let mut keys = Vector.make<InstanceKey>()
+  let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+      let identity = InstanceKey.identity(&key)
+      if Shared.with<DeclarationId, bool>(&identity, fn(found: &DeclarationId) -> bool { return DeclarationId.named(found, b"combine") }) {
+        run Vector.append<InstanceKey>(&mut keys, InstanceKey.copy(&key))
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move keys
 }
 
 test effect fn namedLifetimeSectionsKeepEffectProviderBoundary() -> ()
@@ -3566,6 +3623,24 @@ fn clocked() -> i32 {
   let clock = FixedClock { marker: 0 }
   return run now() |> provided<Clock>(&clock)
 }
+effect fn stamped(value: &i32) -> i32 ? &Clock { return value.* }
+fn borrowedClock() -> i32 {
+  let clock = FixedClock { marker: 0 }
+  let x = 40
+  return run stamped(&x) |> provided<Clock>(&clock)
+}
+effect fn stampedFrom<'p>(value: &'p i32, extra: &i32) -> i32 ? &Clock { return value.* + extra.* }
+fn declaredClock<'p>(value: &'p i32) -> i32 {
+  let clock = FixedClock { marker: 0 }
+  let x = 2
+  return run stampedFrom(value, &x) |> provided<Clock>(&clock)
+}
+effect fn runOnce<'env>(pending: once Effect<'env; i32>) -> i32 { return run move pending }
+fn passedOn() -> i32 {
+  let clock = FixedClock { marker: 0 }
+  let provision = now() |> provided<Clock>(&clock)
+  return run runOnce(provision)
+}
 fn unprovided() -> i32 { return run now() |> mapped(addTwo) }
 fn selected() -> i32 {
   let clock = FixedClock { marker: 0 }
@@ -3579,11 +3654,23 @@ fn absentKey() -> i32 {
   let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
   let mut request = Request.make()
   let local = run Semantic.demandBody(&mut store, &mut request, &id, b"local")
-  run Testing.expect(rejectsSpan(&local, RejectionCode.BorrowRegionRelationUnavailable, text, "read(&x) |> mapped(addTwo)", 0),
-    "a section environment fixed by a 'static callable and a caller-local Effect is a named region deferral")
+  run Testing.expect(retainsRegionRelation(&local, text, "read(&x) |> mapped(addTwo)", 0),
+    "a section environment fixed by a 'static callable and a caller-local Effect relate as an open obligation")
   let clocked = run Semantic.demandMir(&mut store, &mut request, &id, b"clocked")
   run Testing.expect(succeeded(&clocked) && originalCallableInvocationCount(&store, &clocked, b"provided", 2) == usize.ONE,
     "a provision section with a written selector proves its bound once the invocation infers the source row")
+  let borrowedClock = run Semantic.demandBody(&mut store, &mut request, &id, b"borrowedClock")
+  run Testing.expect(retainsRegionRelation(&borrowedClock, text, "stamped(&x) |> provided<Clock>(&clock)", 0),
+    "a provider loan and a distinct caller-local Effect relate as an open obligation that the invocation's bounds assume")
+  let borrowedMir = run Semantic.demandMir(&mut store, &mut request, &id, b"borrowedClock")
+  run Testing.expect(succeeded(&borrowedMir) && originalCallableInvocationCount(&store, &borrowedMir, b"provided", 2) == usize.ONE,
+    "lowering selects the section's application under the relations its operand retained")
+  let declaredClock = run Semantic.demandBody(&mut store, &mut request, &id, b"declaredClock")
+  run Testing.expect(retainsRegionRelation(&declaredClock, text, "stampedFrom(value, &x) |> provided<Clock>(&clock)", 0),
+    "the caller's own lifetime in a piped Effect outlives the provider loan, so only its caller-local loan relates")
+  let passedOn = run Semantic.demandBody(&mut store, &mut request, &id, b"passedOn")
+  run Testing.expect(rejectsSpan(&passedOn, RejectionCode.Unsupported, text, "provision", usize.ONE),
+    "an invoked section's Effect passed by value without move is the bootstrap's unconsumed argument")
   let selected = run Semantic.demandBody(&mut store, &mut request, &id, b"selected")
   run Testing.expect(rejectsSpan(&selected, RejectionCode.ProviderSectionUnavailable, text, "provided(&clock)", 0),
     "a provision section whose selector waits for the piped Effect is a named deferral")
