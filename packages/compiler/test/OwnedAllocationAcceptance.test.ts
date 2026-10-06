@@ -274,7 +274,10 @@ fn envelope(layout: Layout) -> Envelope {
 fn reconstruct(descriptor: Envelope) -> Layout {
   let Envelope {payload: fields} = move descriptor
   return match move fields {
-    Parts {alignmentLabel: size, bytesLabel: alignment} => Layout {alignment: alignment, bytes: size}
+    Parts {alignmentLabel: size, bytesLabel: alignment} => {
+      let rebuilt = Layout {alignment: alignment, bytes: size}
+      return move rebuilt
+    }
   }
 }
 fn project(parts: Parts) -> Layout {
@@ -316,11 +319,12 @@ it.effect('rejects altered descriptor components and preserves measured mismatch
       ['arithmetic', 'Layout {bytes: measured.bytes + 0, alignment: measured.alignment}'],
       ['unknown', 'Layout {bytes: 8, alignment: 8}'],
       ['wrong', 'Layout {bytes: other.bytes, alignment: other.alignment}'],
+      ['cycle', 'loopDescriptor(Layout {bytes: measured.bytes, alignment: measured.alignment})'],
     ] as const
     const functions = cases.map(
       ([name, layout]) => `effect fn ${name}() -> i32 ! OutOfMemoryError {
   let measured = Intrinsic.sharedLayout<i32>()
-  let other = Intrinsic.sharedLayout<i64>()
+  let other = Intrinsic.sharedLayout<u32>()
   let layout = ${layout}
   let allocation = run Intrinsic.systemAllocationAcquire(move layout)
   unsafe { let core = Intrinsic.sharedFromAllocation<i32>(move allocation, 42) drop core }
@@ -330,6 +334,7 @@ it.effect('rejects altered descriptor components and preserves measured mismatch
     const text = `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
 import silk.layout { Layout }
+fn loopDescriptor(layout: Layout) -> Layout { return loopDescriptor(move layout) }
 ${functions.join('\n')}
 effect fn overwritten() -> i32 ! OutOfMemoryError {
   let measured = Intrinsic.sharedLayout<i32>()
@@ -354,28 +359,31 @@ pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`
     const diagnostics = Analysis.diagnostics(snapshot)
     assert.deepEqual(
       diagnostics.map((diagnostic) => diagnostic.code),
-      Array(6).fill('SEM0138'),
+      Array(7).fill('SEM0138'),
     )
     for (const diagnostic of diagnostics) {
       assert.strictEqual(diagnostic.relatedSpans?.length, 1)
       assert.strictEqual(diagnostic.span.sourceId, 'local-shared-allocation/descriptor-controls')
-      const initializer = diagnostic.relatedSpans?.at(0)?.span
-      assert.isDefined(initializer)
-      if (initializer !== undefined)
-        assert.isTrue(
-          source.slice(initializer.start, initializer.end).includes('sharedFromAllocation'),
-        )
+      assert.isTrue(
+        source.slice(diagnostic.span.start, diagnostic.span.end).includes('sharedFromAllocation'),
+      )
+      assert.strictEqual(
+        diagnostic.relatedSpans?.at(0)?.span.sourceId,
+        'local-shared-allocation/descriptor-controls',
+      )
     }
     const wrong = diagnostics.find(
       (diagnostic) =>
         diagnostic.reason._tag === 'LocalSharedLayoutMismatch' &&
-        diagnostic.reason.actual === 'i64',
+        diagnostic.reason.actual === 'u32',
     )
     assert.isDefined(wrong)
-    if (wrong !== undefined)
+    const measuredOrigin = wrong?.relatedSpans?.at(0)?.span
+    assert.isDefined(measuredOrigin)
+    if (measuredOrigin !== undefined)
       assert.strictEqual(
-        source.slice(wrong.span.start, wrong.span.end),
-        'Intrinsic.sharedLayout<i64>()',
+        source.slice(measuredOrigin.start, measuredOrigin.end),
+        'Intrinsic.sharedLayout<u32>()',
       )
   }),
 )
@@ -389,14 +397,14 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct Ready {}
 fn ready(state: &Ready) -> () { return () }
-effect fn other() -> i64 { return 41 }
+effect fn other() -> i32 { return 41 }
 effect fn create<
   F: once Effect<'static; i32> + Intrinsic.Detached,
-  G: once Effect<'static; i64> + Intrinsic.Detached,
+  G: once Effect<'static; i32> + Intrinsic.Detached,
   R: fn<'static>(&Ready) -> () + Intrinsic.Detached + Intrinsic.NonParking
 >(body: F, different: G, onReady: R) -> Intrinsic.Execution<i32> ! OutOfMemoryError {
   let first = Intrinsic.executionLayout<i32, F, Ready, R>()
-  let second = Intrinsic.executionLayout<i64, G, Ready, R>()
+  let second = Intrinsic.executionLayout<i32, G, Ready, R>()
   drop different
   let layout = Layout {alignment: second.alignment, bytes: first.bytes}
   let allocation = run Intrinsic.systemAllocationAcquire(move layout)

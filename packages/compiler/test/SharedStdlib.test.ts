@@ -230,6 +230,9 @@ effect fn construct() -> i32 ! OutOfMemoryError {
   let mut allocator = ReconstructingAllocator {}
   let shared = run (Shared.make<i32>(42) |> Effect.provideMut<Allocator>(&mut allocator))
   drop shared
+  let mut standard = Allocator.systemAllocatorProvider()
+  let sibling = run (Shared.make<i32>(43) |> Effect.provideMut<Allocator>(&mut standard))
+  drop sibling
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }

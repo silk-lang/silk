@@ -222,7 +222,9 @@ const projectOrigin = (
   if (subject._tag === 'ConcreteOrigin' || subject._tag === 'ExecutionOrigin') {
     // SharedLayout and ExecutionLayout's existing result contract stores Bytes then Alignment.
     // No source nominal, field name, or same-shaped constructor creates a measured root.
-    const role = field.ordinal === 0 ? 'Bytes' : field.ordinal === 1 ? 'Alignment' : undefined
+    let role: MeasurementComponentOrigin['role'] | undefined
+    if (field.ordinal === 0) role = 'Bytes'
+    else if (field.ordinal === 1) role = 'Alignment'
     return role === undefined
       ? { _tag: 'InvalidOrigin', description: 'unknown measurement component provenance', span }
       : { _tag: 'MeasurementComponentOrigin', role, measurement: subject, span: subject.span }
@@ -330,6 +332,9 @@ const nestedStatements = (
       if (statement._tag === 'While') visit(statement.body)
       for (const expression of Tir.statementExpressions(statement).flatMap(Tir.expressionTree)) {
         if (expression._tag === 'EffectBlock') visit(expression.statements)
+        if (expression._tag === 'Match')
+          for (const arm of expression.arms)
+            if (arm.body._tag === 'Block') visit(arm.body.statements)
       }
     }
   }
@@ -756,7 +761,11 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
         .map((arm) =>
           arm.body._tag === 'Expression'
             ? originOf(arm.body.expression, instance, parameterOrigins, resolving, activeBindings)
-            : unreached,
+            : Tir.returnExpressions(arm.body.statements)
+                .map((returned) =>
+                  originOf(returned, instance, parameterOrigins, resolving, activeBindings),
+                )
+                .reduce(mergeOrigin, unreached),
         )
         .reduce(mergeOrigin, unreached)
     if (expression._tag === 'BuiltinCall' && expression.operation === 'SharedLayout') {
@@ -781,10 +790,14 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
       return {
         _tag: 'ExecutionOrigin',
         arguments: expression.typeArguments.map((argument) =>
-          Type.substituteGenericArgument(
-            argument,
-            instance.substitution,
-            instance.specialization.compatibility,
+          Instances.concreteEffectRepresentationArgument(
+            instance.function,
+            instance.key,
+            Type.substituteGenericArgument(
+              argument,
+              instance.substitution,
+              instance.specialization.compatibility,
+            ),
           ),
         ),
         span: expression.span,
@@ -1172,7 +1185,9 @@ export const plan = (discovery: Instances.Discovery, index: DeclarationIndex.Ind
             span: origin.span,
           }
         arguments_[layoutParameter] = origin.layout
-        const implementationOrigin = resolve(substitute(summarize(target, new Set()), arguments_))
+        const implementationOrigin = matchingPair(
+          resolve(substitute(summarize(target, new Set()), arguments_)),
+        )
         return implementationOrigin._tag === 'UnreachedOrigin'
           ? resolve(origin.layout, providers)
           : implementationOrigin
