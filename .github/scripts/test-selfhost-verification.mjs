@@ -149,6 +149,57 @@ chmod +x program
   // A configured bootstrap executable must still remain untouched in corpus mode.
   assert.strictEqual(invokeCorpus(undefined, { SILK_BOOTSTRAP: bootstrap }).status, 0)
   assert.strictEqual(existsSync(sentinel), false)
+  // Full mode uses the same immutable artifact but executes every regular case. The fake
+  // compiler intentionally produces unpinned mismatches; those remain observations here.
+  const full = invokeCorpus(['--mode', 'corpus-full'], { SILK_BOOTSTRAP: bootstrap })
+  assert.strictEqual(full.status, 0, full.stdout + full.stderr)
+  const prefix = 'SELFHOST_CORPUS_MANIFEST='
+  assert.ok(full.stdout.startsWith(prefix))
+  const lines = full.stdout.trimEnd().split('\n')
+  const manifestRecords = lines.filter((line) => line.startsWith(prefix))
+  assert.strictEqual(manifestRecords.length, 1)
+  const manifest = JSON.parse(manifestRecords[0].slice(prefix.length))
+  assert.strictEqual(manifest.schemaVersion, 1)
+  assert.strictEqual(manifest.mode, 'corpus-full')
+  assert.deepStrictEqual(manifest.required, ['trivial-features', 'scalar-reference-argument-order'])
+  const names = manifest.programs.map((program) => program.name)
+  assert.strictEqual(new Set(names).size, names.length)
+  assert.ok(names.length > manifest.required.length)
+  assert.deepStrictEqual(
+    lines
+      .filter((line) => /^(PASS|FAIL|UNSUPPORTED) /.test(line))
+      .map((line) => line.split(' ')[1].split(':')[0]),
+    names,
+  )
+  assert.deepStrictEqual(
+    lines
+      .filter((line) => line.startsWith('SELFHOST_CASE_TIMING='))
+      .map((line) => JSON.parse(line.slice('SELFHOST_CASE_TIMING='.length)).name),
+    names,
+  )
+  assert.match(full.stdout, /^PASS scalar-reference-read$/m)
+  assert.deepStrictEqual(
+    manifest.programs.find((program) => program.name === 'scalar-reference-read').profiles,
+    [{ name: 'optimized', optimization: 'speed', debug: false }],
+  )
+  assert.deepStrictEqual(
+    manifest.programs.find((program) => program.name === 'scalar-reference-argument-order')
+      .profiles,
+    [
+      { name: 'debug', optimization: 'none', debug: true },
+      { name: 'optimized', optimization: 'speed', debug: false },
+    ],
+  )
+  assert.deepStrictEqual(
+    manifest.programs.find((program) => program.name === 'divide-by-zero-trap').expected,
+    { _tag: 'Trap' },
+  )
+  assert.match(full.stdout, /^FAIL /m)
+  assert.match(full.stdout, /^UNSUPPORTED /m)
+  assert.deepStrictEqual(readFileSync(downloaded), readFileSync(bundle))
+  assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
+  assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
+  assert.strictEqual(existsSync(sentinel), false)
   const callsBeforeRejections = readFileSync(calls, 'utf8')
   for (const pins of [
     [],
@@ -156,7 +207,8 @@ chmod +x program
     ['trivial-features', 'unknown'],
   ]) {
     writeFileSync(track, JSON.stringify(pins))
-    assert.notStrictEqual(invokeCorpus().status, 0)
+    for (const mode of ['corpus', 'corpus-full'])
+      assert.notStrictEqual(invokeCorpus(['--mode', mode]).status, 0)
   }
   writeFileSync(track, JSON.stringify(['trivial-features']))
   for (const args of [['--mode', 'unknown'], ['corpus'], ['--mode', 'corpus', 'extra']]) {
@@ -168,12 +220,18 @@ chmod +x program
     invokeCorpus(undefined, { SILK_SELFHOST_CORPUS_CASES: 'trivial-features' }).status,
     0,
   )
+  assert.notStrictEqual(
+    invokeCorpus(['--mode', 'corpus-full'], { SILK_SELFHOST_CORPUS_CASES: 'trivial-features' })
+      .status,
+    0,
+  )
+  assert.notStrictEqual(invokeCorpus(['--mode', 'corpus-full'], { SILKC: '' }).status, 0)
   assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
   assert.strictEqual(existsSync(sentinel), false)
   process.stdout.write(
-    'Standalone formatter and full-pin corpus modes passed without node_modules; live pins/stdlib and unchanged corpus inputs verified\n',
+    'Standalone formatter, full-pin and complete readonly corpus modes passed without node_modules; manifest, live pins/stdlib and unchanged inputs verified\n',
   )
 } finally {
   rmSync(temporary, { recursive: true, force: true })

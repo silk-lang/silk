@@ -25,9 +25,10 @@ const result = await build({
         const verification = Effect.gen(function* () {
           if (mode === 'formatter') return yield* Verification.runConfigured(process.execPath)
           if (mode === 'corpus') return yield* CorpusVerification.runConfigured()
+          if (mode === 'corpus-full') return yield* CorpusVerification.runConfigured('corpus-full')
           return yield* new CorpusVerification.VerificationError({
             operation: 'select verification mode',
-            message: 'Usage: selfhost-verification.mjs [--mode formatter|corpus]',
+            message: 'Usage: selfhost-verification.mjs [--mode formatter|corpus|corpus-full]',
             reason: { _tag: 'InvalidInput' },
           })
         })
