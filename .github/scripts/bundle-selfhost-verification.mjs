@@ -13,10 +13,12 @@ const result = await build({
       import { realpathSync } from 'node:fs'
       import { pathToFileURL } from 'node:url'
       import * as Effect from 'effect/Effect'
+      import * as Console from 'effect/Console'
       import * as NodeRuntime from '@effect/platform-node/NodeRuntime'
       import * as NodeServices from '@effect/platform-node/NodeServices'
       import * as Verification from '../../compiler/scripts/FormatterVerification.js'
       import * as CorpusVerification from '../../compiler/scripts/CorpusVerification.js'
+      import * as InventoryVerification from '../../compiler/scripts/InventoryVerification.js'
       export const runtimeIntrinsicNames = Verification.runtimeIntrinsicNames
       if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
         const args = process.argv.slice(2)
@@ -25,14 +27,20 @@ const result = await build({
         const verification = Effect.gen(function* () {
           if (mode === 'formatter') return yield* Verification.runConfigured(process.execPath)
           if (mode === 'corpus') return yield* CorpusVerification.runConfigured()
+          if (mode === 'inventory') return yield* InventoryVerification.runConfigured().pipe(
+            Effect.tapError((error) => Console.error(error.message)),
+          )
           if (mode === 'corpus-full') return yield* CorpusVerification.runConfigured('corpus-full')
           return yield* new CorpusVerification.VerificationError({
             operation: 'select verification mode',
-            message: 'Usage: selfhost-verification.mjs [--mode formatter|corpus|corpus-full]',
+            message: 'Usage: selfhost-verification.mjs [--mode formatter|corpus|corpus-full|inventory]',
             reason: { _tag: 'InvalidInput' },
           })
         })
-        NodeRuntime.runMain(verification.pipe(Effect.provide(NodeServices.layer)))
+        // Keep inventory stdout a single parseable JSON transport, including red Incomplete.
+        NodeRuntime.runMain(verification.pipe(Effect.provide(NodeServices.layer)), {
+          disableErrorReporting: mode === 'inventory',
+        })
       }
     `,
     resolveDir: resolve('packages/compiler'),
