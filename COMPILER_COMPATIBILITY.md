@@ -47,7 +47,9 @@ validated facts; cached Pool or instance answers are outside M2.3. See
 coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `ContractTyped` body
 still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
-scalar, reference, record and sequence forms through demanded MIR and LLVM text. It emits a
+scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
+`silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
+the default output links an executable. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
