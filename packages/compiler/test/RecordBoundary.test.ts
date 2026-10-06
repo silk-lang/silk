@@ -15,9 +15,10 @@ it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'record/result-pairs',
-      new TextEncoder().encode(`pub fn main() -> usize {
-        let first = (1usize, 2usize)
-        let second = (3usize, 4usize)
+      new TextEncoder().encode(`fn element() -> usize { return 1 }
+      pub fn main() -> usize {
+        let first = (element(), element())
+        let second = (element(), element())
         return first.0 + second.1
       }`),
     )
@@ -28,15 +29,14 @@ it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair
     assert.lengthOf(tuples, 2)
     const first = tuples.at(0) ?? unreachable('expected the first selected tuple occurrence')
     const second = tuples.at(1) ?? unreachable('expected the second selected tuple occurrence')
-    const occurrence = first.identity ?? unreachable('expected first tuple identity')
-    const otherOccurrence = second.identity ?? unreachable('expected second tuple identity')
-    assert.strictEqual(occurrence._tag, 'AnonymousAggregateIdentity')
-    assert.strictEqual(otherOccurrence._tag, 'AnonymousAggregateIdentity')
-    if (
-      occurrence._tag !== 'AnonymousAggregateIdentity' ||
-      otherOccurrence._tag !== 'AnonymousAggregateIdentity'
-    )
-      unreachable('expected retained ordinary anonymous tuple occurrences')
+    const occurrence =
+      first.identity?._tag === 'AnonymousAggregateIdentity'
+        ? first.identity
+        : unreachable('expected first retained anonymous tuple identity')
+    const otherOccurrence =
+      second.identity?._tag === 'AnonymousAggregateIdentity'
+        ? second.identity
+        : unreachable('expected second retained anonymous tuple identity')
     const generatedFacts: Array<ReturnType<typeof AggregateIdentity.generated>> = []
     const selected = Intrinsic.instantiateResult(
       Intrinsic.generatedUsizePair,
