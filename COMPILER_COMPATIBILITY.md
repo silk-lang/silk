@@ -1270,3 +1270,18 @@ repeated invocation and capture-only drop glue.
   section controls; native retains its Unsupported provider-recipe boundary until Step 9 supplies
   that recipe, rather than admitting a partially inferred Effect construction.
 - **Source migration:** none.
+
+## Explicit synchronous source startup
+
+The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
+Effect requiring shared or mutable `HostInput`. It captures an owned argument/environment snapshot, lends a
+lexical provider, returns successful status unchanged, and drops typed initialization or application
+failures before returning one. It installs no Execution or diagnostic observer. The default
+`silk/native_start` and its broader application signatures retain their existing behavior.
+
+This source addition does not remove the self-hosted compiler's generated plain-i32 entry or claim
+native source-runtime support. Ordinary plain-i32 adaptation belongs to
+[#931](https://github.com/julia-script/silk/issues/931); native routing and adapter removal follow
+main-first integration of both contracts. See
+[the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
+and validation details. Fatal traps retain their existing behavior and do not promise cleanup.

@@ -1,5 +1,9 @@
 # Papercuts
 
+- 2026-10-06 · Isolated source-startup Vitest and compiler emission failed because the ignored
+  ToolchainIntegrity.generated.ts was absent · Run the existing toolchain generator against the
+  isolated source catalog before direct compiler checks; keep that generated identity local · compiler
+
 Format: date · symptom · fix · project. Check here first when tooling is slow or fails mysteriously.
 
 - 2026-10-06 · Bootstrap `silk format` rewrites large unchanged native compiler actors and reports damaged large test sources without a diagnostic location · Keep task patches focused, use the native formatter safety gate for repository formatting, and validate new test fragments in an isolated exact-body root · self-hosted compiler

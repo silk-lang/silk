@@ -163,12 +163,20 @@ provides `HostInput`, catches unhandled failures with `Effect.catchAll(..., fail
 status 1. The compiler has no entry adapter and no root providers. Nothing in D1–D4 is special at
 entry: `catchAll` and `provideMut` there lower like anywhere else.
 
-Selfhost today does not compile `native_start`. That needs `Execution` (coroutine frames) and the
-diagnostic observer intrinsics, which come after suspension. Instead, the `Entry { main }` key
-emits a generated C `main` that calls `fn main() -> i32`; every other signature reports
-`entry-signature`. Decision Q1 keeps that until `native_start` compiles. An unhandled failure
-cannot reach the shim: `fn main` is an ordinary
-function, so its `run`s are closed (EFF-006), and `pub effect fn main` stays `entry-signature`.
+The explicit source module `silk/native_start_sync` supplies an ordinary lexical mutable
+`HostInput` provider to an i32 application Effect. The exclusive provider also satisfies shared
+access (SERV-006). Its ordinary generic failure callback drops the owned error and returns
+status 1, including initialization failure; the local provider releases its captured input
+after the loan ends. Its `NonParking` bound rejects parking. This composition needs neither
+Execution nor an observer; full `silk/native_start` retains those separate dependencies. See
+[the source startup contract](source-synchronous-startup.md).
+
+Selfhost currently still emits the generated C entry for `fn main() -> i32`; other entry
+signatures report `entry-signature`. The generated adapter can be removed only after the
+synchronous Effect source contract and the ordinary plain-i32 source adaptation
+([#931](https://github.com/julia-script/silk/issues/931)) are integrated, validated, and selected
+through the ordinary source runtime mechanism. This source module's presence alone does not
+change native entry routing. Full suspension and observer support remain separate work.
 
 ### D6. Suspension stays a named gap
 
