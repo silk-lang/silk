@@ -7170,6 +7170,21 @@ export const httpRedirectCorpusProgram = Object.freeze({
   expected: { _tag: 'Completes', result: 0 },
 } satisfies CorpusProgram)
 
+/** The same application contract under full hosted startup and explicit synchronous startup. */
+export const synchronousStartupSuccess = `import silk.host_input { HostInput, HostInputError }
+pub effect fn main() -> i32 ! HostInputError ? &mut HostInput {
+  let count = run HostInput.argumentCount()
+  if count == 0 { return 2 }
+  return 17
+}`
+
+export const synchronousStartupFailure = `import silk.host_input { HostInput, HostInputError }
+pub struct StartupProblem {}
+pub effect fn main() -> i32 ! StartupProblem | HostInputError ? &mut HostInput {
+  let count = run HostInput.argumentCount()
+  fail StartupProblem {}
+}`
+
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
     name: 'owned-allocation-preflight-refusal',
@@ -7253,6 +7268,20 @@ int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expec
       { name: 'optimized', optimization: 'speed', debug: false },
     ],
     expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'source-startup-host-input-i32-success',
+    source: synchronousStartupSuccess,
+    nativeStdout: '',
+    nativeStderr: '',
+    nativeRuns: [{}, { arguments: ['owned-input'] }],
+    expected: { _tag: 'Completes', result: 17 },
+  },
+  {
+    name: 'source-startup-host-input-i32-failure',
+    source: synchronousStartupFailure,
+    nativeStdout: '',
+    expected: { _tag: 'Completes', result: 1 },
   },
   {
     // Same erased Guard layout, distinct selected hooks. Counters also reject omitted cleanup.
