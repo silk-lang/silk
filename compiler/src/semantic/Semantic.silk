@@ -39,6 +39,11 @@ import backend.DropGlue {
 }
 import backend.InstanceKey {InstanceKey, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
+import backend.InstanceIdentity {InstanceIdentity}
+import semantic.RuntimeEncoding {Coordinates}
+import backend.InstanceText {InstanceText as InstanceDefinition}
+import backend.InstanceText
+import hir.Fingerprint
 import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity}
 import backend.Layout {
   Abi as BackendAbi,
@@ -341,8 +346,10 @@ pub enum Family {
   Mir,
   /// Backend-neutral storage, field offsets and ABI facts for one type on this store's target.
   Layout,
-  /// Validated MIR, layouts and foreign signatures awaiting closed-graph emission planning.
+  /// Source-validated immutable emission inputs for one instance.
   EmissionInputs,
+  /// One LLVM definition keyed by the complete immutable emission input content.
+  LlvmText,
 }
 
 /// A function contract resolved from its written header, including binders, bounds, and channels.
@@ -677,6 +684,8 @@ pub union Value {
   LayoutUnsupported,
   /// The position of validated emission inputs in this store's immutable answer arena.
   EmissionInputs {pub index: usize},
+  /// The position of an immutable per-instance LLVM answer in this store.
+  LlvmText {pub index: usize},
   /// A reached backend form outside the current implementation.
   Unsupported {pub gap: Shared<BackendGap>},
 }
@@ -1195,6 +1204,8 @@ struct Resolver {
   mirValues: Vector<MirFunction>
   layoutValues: Vector<Shared<BackendLayout>>
   emissionInputs: Vector<EmissionInputs>
+  llvmInputs: Vector<LlvmInput>
+  llvmValues: Vector<InstanceDefinition>
   modules: Vector<ModuleId>
   names: Vector<Bytes>
   applications: Vector<Shared<Type>>
@@ -2424,6 +2435,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
     Value.OriginPlan {..} => false
     Value.OriginEvidence {..} => false
     Value.EmissionInputs {..} => false
+    Value.LlvmText {..} => false
     Value.Unsupported {..} => false
   }
 }
@@ -2877,6 +2889,9 @@ effect fn identityOfFact(fact: &Value) -> Option<Shared<Value>> ! OutOfMemoryErr
     }
     Value.OriginPlan {..} => { return Option.none<Shared<Value>>() }
     Value.OriginEvidence {..} => { return Option.none<Shared<Value>>() }
+    Value.LlvmText {..} => {
+      return Option.none<Shared<Value>>()
+    }
     Value.EmissionInputs {..} => {
       return Option.none<Shared<Value>>()
     }
@@ -3212,7 +3227,7 @@ fn sameKey(left: Key, right: Key) -> bool {
   if left.family == Family.Layout || right.family == Family.Layout {
     return left.family == Family.Layout && right.family == Family.Layout && left.name == right.name
   }
-  if left.family == Family.Mir || left.family == Family.EmissionInputs || right.family == Family.Mir || right.family == Family.EmissionInputs {
+  if left.family == Family.Mir || left.family == Family.EmissionInputs || left.family == Family.LlvmText || right.family == Family.Mir || right.family == Family.EmissionInputs || right.family == Family.LlvmText {
     return left.family == right.family && left.name == right.name
   }
   return left.family == right.family && left.module == right.module && left.name == right.name && left.declaration == right.declaration && left.member == right.member && left.external == right.external
@@ -3417,13 +3432,26 @@ fn originContext(resolver: &Resolver, key: Key) -> OriginContext {
 }
 
 effect fn internKey(resolver: &mut Resolver, key: Key) -> Word ! OutOfMemoryError ? &mut Allocator {
-  let context = demandContext(&resolver.*, key)
-  let origin = originContext(&resolver.*, key)
+  let mut application = resolver.currentApplication
+  let mut profile = resolver.profileSlot
+  let mut context = demandContext(&resolver.*, key)
+  let mut origin = originContext(&resolver.*, key)
+  if key.family == Family.LlvmText {
+    // Every semantic, profile and target input is already in this immutable content subject.
+    // Request scopes must not cause the same definition to be produced more than once.
+    application = usize.MAX
+    profile = usize.MAX
+    context = usize.MAX
+    origin = OriginContext {active: false, key: key}
+  }
   let mut at = usize.ZERO
   while at < Vector.length<ScopedKey>(&resolver.keys) {
     let known = Vector.get<ScopedKey>(&resolver.keys, at)
-    let sameApplication = key.family == Family.Layout || known.application == resolver.currentApplication
-    if sameApplication && known.profile == resolver.profileSlot && known.condition == context && sameOriginContext(&known.origin, &origin) && sameKey(known.key, key) {
+    let sameApplication = key.family == Family.Layout || known.application == application
+    if sameApplication && known.profile == profile && known.condition == context && sameOriginContext(
+      &known.origin,
+      &origin,
+    ) && sameKey(known.key, key) {
       if key.family == Family.Mir || key.family == Family.EmissionInputs {
         let mut keys = Vector.asMutSlice<ScopedKey>(&mut resolver.*.keys)
         keys[at].key = key
@@ -3434,7 +3462,13 @@ effect fn internKey(resolver: &mut Resolver, key: Key) -> Word ! OutOfMemoryErro
   }
   run Vector.append<ScopedKey>(
     &mut resolver.keys,
-    ScopedKey {key: key, application: resolver.currentApplication, profile: resolver.profileSlot, condition: context, origin: origin},
+    ScopedKey {
+      key: key,
+      application: application,
+      profile: profile,
+      condition: context,
+      origin: origin,
+    },
   )
   return Hash.word(usize.toU64(at))
 }
@@ -4471,6 +4505,7 @@ effect fn resolve(
     Family.Mir => run resolveMir(&mut resolver.*, &mut owner.*, key)
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.EmissionInputs => run resolveEmissionInputs(&mut resolver.*, &mut owner.*, key)
+    Family.LlvmText => run resolveLlvmText(&mut resolver.*, key)
   }
 }
 
@@ -19198,6 +19233,16 @@ fn answerEmissionInputsIndex(answer: &Result<Answer, NoRejection>) -> Option<usi
       _ => Option.none<usize>()
     }
     Result<Answer, NoRejection>.Failure {error: _} => Option.none<usize>()
+  }
+}
+
+fn answerLlvmTextIndex(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.LlvmText {index}} => Option.some<usize>(index)
+      _ => Option.none<usize>()
+    }
+    _ => Option.none<usize>()
   }
 }
 
@@ -44640,11 +44685,368 @@ struct EmissionInputs {
   mir: usize
   layouts: Vector<TypeLayout>
   foreign: Vector<CAbi.Signature>
+  llvm: usize
+  identities: Vector<InstanceIdentity>
+}
+
+// Content subjects retain the latest validated preparation. Successful text answers are immutable;
+// gaps retain source evidence so a retry uses current origins after an edit.
+struct LlvmInput {
+  content: Bytes
+  emission: usize
+  dependencies: Vector<Dependency>
+  observations: Vector<Shared<Observation>>
 }
 
 fn layoutDemandAt(types: &Vector<LayoutDemand>, index: usize) -> LayoutDemand {
   let entries = Vector.asSlice<LayoutDemand>(types)
   return LayoutDemand {ty: Shared.clone<Type>(&entries[index].ty), span: entries[index].span}
+}
+
+effect fn copyEmissionDependencies(values: &[Dependency]) -> Vector<Dependency>
+! OutOfMemoryError
+? &mut Allocator {
+  let mut result = Vector.make<Dependency>()
+  let mut at = usize.ZERO
+  while at < values.length {
+    let value = &values[at]
+    let mut name = Option.none<Bytes>()
+    if let Option<Bytes>.Some {value: bytes} = &value.name {
+      name = Option.some<Bytes>(run Bytes.copy(Bytes.asSlice(&bytes)))
+    }
+    let mut declaration = Option.none<DeclarationId>()
+    if let Option<DeclarationId>.Some {value: identity} = &value.declaration {
+      declaration = Option.some<DeclarationId>(run DeclarationId.copy(&identity))
+    }
+    run Vector.append<Dependency>(
+      &mut result,
+      Dependency {
+        family: value.family,
+        module: run ModuleId.copy(&value.module),
+        name: move name,
+        declaration: move declaration,
+        member: match & value.member {
+          Option<usize>.Some {value: ordinal} => Option.some<usize>(ordinal)
+          _ => Option.none<usize>()
+        },
+        external: value.external,
+      },
+    )
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn appendSignatureContent(
+  output: &mut Bytes,
+  signature: &Shared<Result<Answer, NoRejection>>,
+  declaration: &DeclarationId,
+  coordinates: &mut Coordinates,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(signature, signatureParameterCount)
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(count))
+  let mut at = usize.ZERO
+  while at < count {
+    let selected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+        return signatureParameterAt(answer, at)
+      },
+    )
+    if let Option<Shared<Type>>.Some {value} = move selected {
+      let encoded = run Type.encoding(&value, declaration, true, &mut coordinates.*)
+      run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&encoded))
+    }
+    at = at + usize.ONE
+  }
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(
+    signature,
+    signatureFacts,
+  )
+  if let Option<SignatureFacts>.Some {value: facts} = move selected {
+    let result = run Type.encoding(&facts.result, declaration, true, &mut coordinates.*)
+    let failure = run Type.encoding(&facts.failure, declaration, true, &mut coordinates.*)
+    let required = run Row.encoding(&facts.requirements, declaration, true, &mut coordinates.*)
+    run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&result))
+    run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&failure))
+    run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&required))
+  }
+  return ()
+}
+
+// Read headers and signature answers only. This terminates for recursive instance references.
+effect fn emissionSignatureContent(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  mir: usize,
+  coordinates: &mut Coordinates,
+) -> Bytes ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
+  let recipe = run InstanceRecipe.make(&functions[mir])
+  let callees = Vector.asSlice<InstanceKey>(&recipe.callees)
+  let mut result = Bytes.make()
+  let mut at = usize.ZERO
+  while at < callees.length {
+    if let InstanceKey.Function {..} = &callees[at] {
+      let located = run locationOfInstance(&mut resolver.*, &callees[at])
+      if let Option<InstanceLocation>.Some {value: location} = move located {
+        let signature = run demandChild(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut dependencies.*,
+          Key {
+            family: Family.Signature,
+            module: location.module,
+            name: usize.ZERO,
+            declaration: location.declaration,
+            member: usize.ZERO,
+            external: false,
+          },
+          Span.make(usize.ZERO, usize.ZERO),
+        )
+        let identityHandle = InstanceKey.identity(&callees[at])
+        let identity = run DeclarationId.copyShared(&identityHandle)
+        run appendSignatureContent(&mut result, &signature, &identity, &mut coordinates.*)
+        // Header syntax also covers written binders, bounds, static slots and Effect channels.
+        let module = run resolvedModule(&resolver.*, location.module)
+        let loaded = run source(&mut resolver.*, &module)
+        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+          &resolver.*,
+          &loaded,
+          &module,
+        ) {
+          let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+          let bytes = run Fingerprint.header(
+            IndexedSource.authored(indexed),
+            declarations[location.declaration].header,
+          )
+          run RuntimeEncoding.field(&mut result, Vector.asSlice<u8>(&bytes))
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// Local proof ordinals are module HIR indices. Resolve only their enclosing declaration headers
+// and encode relative coordinates, so an earlier sibling body cannot rename these instances.
+effect fn resolveInstanceCoordinates(resolver: &mut Resolver, coordinates: &mut Coordinates) -> ()
+! Cycle | OutOfMemoryError
+? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < Vector.length<RuntimeEncoding.LocalOrigin>(&coordinates.origins) {
+    let entries = Vector.asSlice<RuntimeEncoding.LocalOrigin>(&coordinates.origins)
+    let identity = run DeclarationId.copy(&entries[at].owner)
+    let module = run ModuleId.copy(DeclarationId.moduleId(&identity))
+    let loaded = run source(&mut resolver.*, &module)
+    let mut base = Option.none<usize>()
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+      &resolver.*,
+      &loaded,
+      &module,
+    ) {
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut candidate = usize.ZERO
+      let mut depth = usize.ZERO
+      while candidate < declarations.length {
+        let declaration = &declarations[candidate]
+        let owners = DeclarationId.ownerSteps(&declaration.identity).length
+        if owners > depth && DeclarationId.isPrefixOf(&declaration.identity, &identity) {
+          depth = owners
+          base = Option.some<usize>(declaration.header.index)
+        }
+        candidate = candidate + usize.ONE
+      }
+    }
+    let mut current = Vector.asMutSlice<RuntimeEncoding.LocalOrigin>(&mut coordinates.origins)
+    current[at].base = move base
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn instanceIdentityInputs(function: &MirFunction, coordinates: &mut Coordinates) -> Vector<
+  InstanceIdentity,
+> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Vector.make<InstanceIdentity>()
+  run Vector.append<InstanceIdentity>(
+    &mut result,
+    run InstanceIdentity.make(&function.key, &mut coordinates.*),
+  )
+  let recipe = run InstanceRecipe.make(function)
+  let callees = Vector.asSlice<InstanceKey>(&recipe.callees)
+  let mut at = usize.ZERO
+  while at < callees.length {
+    run Vector.append<InstanceIdentity>(
+      &mut result,
+      run InstanceIdentity.make(&callees[at], &mut coordinates.*),
+    )
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn internLlvmInput(
+  resolver: &mut Resolver,
+  emission: usize,
+  content: Bytes,
+  dependencies: &[Dependency],
+) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut observations = Vector.make<Shared<Observation>>()
+  let frames = Vector.asSlice<SourceFrame>(&resolver.frames)
+  let source = Vector.asSlice<Shared<Observation>>(&frames[frames.length - usize.ONE].observations)
+  let mut at = usize.ZERO
+  while at < source.length {
+    run Vector.append<Shared<Observation>>(
+      &mut observations,
+      Shared.clone<Observation>(&source[at]),
+    )
+    at = at + usize.ONE
+  }
+  let copied = run copyEmissionDependencies(dependencies)
+  let inputs = Vector.asSlice<LlvmInput>(&resolver.llvmInputs)
+  at = usize.ZERO
+  while at < inputs.length {
+    if same(Bytes.asSlice(&inputs[at].content), Bytes.asSlice(&content)) {
+      break
+    }
+    at = at + usize.ONE
+  }
+  if at < inputs.length {
+    // Equal successful content keeps its completed answer. A source-validated gap retries
+    // with the latest origins and dependency evidence after an edit.
+    let current = Vector.asMutSlice<LlvmInput>(&mut resolver.llvmInputs)
+    current[at].emission = emission
+    current[at].dependencies = move copied
+    current[at].observations = move observations
+  } else {
+    run Vector.append<LlvmInput>(
+      &mut resolver.llvmInputs,
+      LlvmInput {
+        content: move content,
+        emission: emission,
+        dependencies: move copied,
+        observations: move observations,
+      },
+    )
+  }
+  return at
+}
+
+effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let inputs = Vector.asSlice<LlvmInput>(&resolver.llvmInputs)
+  let observations = Vector.asSlice<Shared<Observation>>(&inputs[subject].observations)
+  let mut frames = Vector.asMutSlice<SourceFrame>(&mut resolver.frames)
+  let mut frame = &mut frames[frames.length - usize.ONE]
+  let mut at = usize.ZERO
+  while at < observations.length {
+    run appendObservation(&mut frame.*, &observations[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Pure query over a complete immutable content subject. Its dependency ledger records the
+// prepared MIR/layout/signature facts; its validity follows from content, not source revisions.
+effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
+! OutOfMemoryError
+? &mut Allocator {
+  let subjects = Vector.asSlice<LlvmInput>(&resolver.llvmInputs)
+  let subject = &subjects[key.name]
+  let inputs = Vector.asSlice<EmissionInputs>(&resolver.emissionInputs)
+  let input = &inputs[subject.emission]
+  let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
+  let function = &functions[input.mir]
+  let dependencies = run copyEmissionDependencies(Vector.asSlice<Dependency>(&subject.dependencies))
+  let emitted = run Effect.result(
+    LlvmText.emit(
+      function,
+      &resolver.target,
+      Vector.asSlice<TypeLayout>(&input.layouts),
+      Vector.asSlice<CAbi.Signature>(&input.foreign),
+      Vector.asSlice<InstanceIdentity>(&input.identities),
+    ),
+  )
+  let text = match move emitted {
+    Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner, source} => {
+        let gap = run Shared.make<BackendGap>(
+          BackendGap {code: code, owner: move owner, source: move source},
+        )
+        run observeLlvmGap(&mut resolver.*, key.name)
+        return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
+      }
+      OutOfMemoryError {} => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+  let foreign = run Effect.result(
+    LlvmText.foreignDeclarations(Vector.asSlice<CAbi.Signature>(&input.foreign)),
+  )
+  let declarations = match move foreign {
+    Result<Vector<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<Vector<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner, source} => {
+        let gap = run Shared.make<BackendGap>(
+          BackendGap {code: code, owner: move owner, source: move source},
+        )
+        run observeLlvmGap(&mut resolver.*, key.name)
+        return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
+      }
+      OutOfMemoryError {} => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+  let identities = Vector.asSlice<InstanceIdentity>(&input.identities)
+  let value = InstanceDefinition {
+    encoding: run Bytes.copy(Bytes.asSlice(&identities[usize.ZERO].encoding)),
+    symbol: run Bytes.copy(Bytes.asSlice(&identities[usize.ZERO].symbol)),
+    text: move text,
+    foreign: move declarations,
+    safetyChecked: function.safetyChecked,
+  }
+  let index = Vector.length<InstanceDefinition>(&resolver.llvmValues)
+  run Vector.append<InstanceDefinition>(&mut resolver.llvmValues, move value)
+  return memberSuccess(Value.LlvmText {index: index}, move dependencies)
+}
+
+effect fn demandPreparedText(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+  prepared: &Shared<Result<Answer, NoRejection>>,
+) -> Shared<Result<Answer, NoRejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(
+    prepared,
+    answerEmissionInputsIndex,
+  )
+  if let Option<usize>.Some {value} = move index {
+    let inputs = Vector.asSlice<EmissionInputs>(&resolver.emissionInputs)
+    let content = inputs[value].llvm
+    return run demandRaw(
+      &mut resolver.*,
+      &mut owner.*,
+      Key {
+        family: Family.LlvmText,
+        module: key.module,
+        name: content,
+        declaration: key.declaration,
+        member: key.member,
+        external: false,
+      },
+      Span.make(usize.ZERO, usize.ZERO),
+    )
+  }
+  return Shared.clone<Result<Answer, NoRejection>>(prepared)
 }
 
 effect fn resolveEmissionInputs(
@@ -44812,9 +45214,56 @@ effect fn resolveEmissionInputs(
     }
     at = at + usize.ONE
   }
+  let mut coordinates = RuntimeEncoding.coordinates()
+  let initialFunctions = Vector.asSlice<MirFunction>(&resolver.mirValues)
+  let collected = run instanceIdentityInputs(&initialFunctions[mirIndex], &mut coordinates)
+  drop collected
+  // Signature facts can also contain local evidence; collect it before assigning coordinates.
+  let collectedSignatures = run emissionSignatureContent(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut dependencies,
+    mirIndex,
+    &mut coordinates,
+  )
+  drop collectedSignatures
+  run resolveInstanceCoordinates(&mut resolver.*, &mut coordinates)
+  let mut replay = Vector.make<Dependency>()
+  let signatures = run emissionSignatureContent(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut replay,
+    mirIndex,
+    &mut coordinates,
+  )
+  let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
+  let identities = run instanceIdentityInputs(&functions[mirIndex], &mut coordinates)
+  let content = run InstanceText.contentWith(
+    &functions[mirIndex],
+    &resolver.target,
+    Vector.asSlice<TypeLayout>(&layouts),
+    Vector.asSlice<CAbi.Signature>(&foreign),
+    Bytes.asSlice(&signatures),
+    Vector.asSlice<InstanceIdentity>(&identities),
+  )
   let index = Vector.length<EmissionInputs>(&resolver.emissionInputs)
   run Vector.append<EmissionInputs>(&mut resolver.*.emissionInputs,
-    EmissionInputs {mir: mirIndex, layouts: move layouts, foreign: move foreign})
+    EmissionInputs {
+      mir: mirIndex,
+      layouts: move layouts,
+      foreign: move foreign,
+      llvm: usize.MAX,
+      identities: move identities,
+    },
+  )
+  let llvm = run internLlvmInput(
+    &mut resolver.*,
+    index,
+    move content,
+    Vector.asSlice<Dependency>(&dependencies),
+  )
+  let inputs = Vector.asMutSlice<EmissionInputs>(&mut resolver.emissionInputs)
+  inputs[index].llvm = llvm
   return memberSuccess(Value.EmissionInputs {index: index}, move dependencies)
 }
 
@@ -50402,6 +50851,8 @@ impl Semantic {
         mirValues: Vector.make<MirFunction>(),
         layoutValues: Vector.make<Shared<BackendLayout>>(),
         emissionInputs: Vector.make<EmissionInputs>(),
+        llvmInputs: Vector.make<LlvmInput>(),
+        llvmValues: Vector.make<InstanceDefinition>(),
         modules: Vector.make<ModuleId>(),
         names: Vector.make<Bytes>(),
         applications: Vector.make<Shared<Type>>(),
@@ -51777,6 +52228,52 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
     return move answer
   }
+  /// Source-validates one instance and returns its immutable content-keyed LLVM answer.
+  pub effect fn demandInstanceText(
+    self: &mut Self,
+    request: &mut Request,
+    instance: &InstanceKey,
+    observing: bool,
+  ) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let declared = run DeclarationId.copyShared(&InstanceKey.identity(instance))
+    let module = run ModuleId.copy(DeclarationId.moduleId(&declared))
+    let held = run internModule(&mut self.resolver, &module)
+    let span = Span.make(usize.ZERO, usize.ZERO)
+    let location = match move run locationOfInstance(&mut self.resolver, instance) {
+      Option<InstanceLocation>.Some {value} => value
+      _ => {
+        return run Shared.make<Result<Answer, NoRejection>>(
+          Result.succeed<Answer, NoRejection>(
+            memberRejected(
+              run reject(&self.resolver, &module, RejectionCode.UnknownMember, span),
+              Vector.make<Dependency>(),
+            ),
+          ),
+        )
+      }
+    }
+    let name = run internBackendInstance(&mut self.resolver, instance, observing)
+    let key = Key {
+      family: Family.EmissionInputs,
+      module: location.module,
+      name: name,
+      declaration: location.declaration,
+      member: instanceMember(instance),
+      external: false,
+    }
+    let prepared = run demandRaw(&mut self.resolver, &mut self.query, key, span)
+    run recordRoot(&mut request.*, Family.EmissionInputs, &module, b"", &prepared)
+    let answer = run demandPreparedText(&mut self.resolver, &mut self.query, key, &prepared)
+    run recordRoot(&mut request.*, Family.LlvmText, &module, b"", &answer)
+    return move answer
+  }
+  /// Immutable definition arena; positions are published only by completed LLVM text queries.
+  pub fn instanceTexts(self: &Self) -> &[InstanceDefinition] {
+    return Vector.asSlice<InstanceDefinition>(&self.resolver.llvmValues)
+  }
   /// Demands the selected residual body of one function under its complete semantic application.
   ///
   /// # Details
@@ -51942,7 +52439,7 @@ impl Semantic {
     // Applications admitted by a finite closure certificate during this build.
     let mut certified = Vector.make<Application>()
     let mut visited = Vector.make<InstanceKey>()
-    let mut emitted = Vector.make<usize>()
+    let mut emitted = Vector.make<CollectedText>()
     let mut gaps = Vector.make<Shared<BackendGap>>()
     while Vector.length<BackendVisit>(&pending) > usize.ZERO {
       let visit = match move Vector.pop<BackendVisit>(&mut pending) {
@@ -52065,12 +52562,13 @@ impl Semantic {
         member: member,
         external: false,
       }
-      let answer = run demandRaw(
+      let prepared = run demandRaw(
         &mut self.resolver,
         &mut self.query,
         key,
         Span.make(usize.ZERO, usize.ZERO),
       )
+      let answer = run demandPreparedText(&mut self.resolver, &mut self.query, key, &prepared)
       let rejected = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
         &answer,
         answerRejection,
@@ -52091,17 +52589,20 @@ impl Semantic {
         &answer,
         answerBackendGap,
       )
-      // Resolve every exact application before considering runtime emission sharing.
+      // Validate every exact application before collecting its content answer.
       if let Option<Shared<BackendGap>>.Some {value} = move gap {
         run Vector.append<Shared<BackendGap>>(&mut gaps, move value)
         continue
       }
       let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(
         &answer,
-        answerEmissionInputsIndex,
+        answerLlvmTextIndex,
       )
       if let Option<usize>.Some {value} = move index {
-        run Vector.append<usize>(&mut emitted, value)
+        run Vector.append<CollectedText>(
+          &mut emitted,
+          CollectedText {key: InstanceKey.copy(&instance), index: value},
+        )
       }
       let mir = run demandRaw(
         &mut self.resolver,
@@ -52143,7 +52644,12 @@ impl Semantic {
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
     }
-    return run assembleEmission(&self.resolver, Vector.asSlice<usize>(&emitted), module, entrySpan)
+    return run assembleEmission(
+      &self.resolver,
+      Vector.asSlice<CollectedText>(&emitted),
+      module,
+      entrySpan,
+    )
   }
 }
 
@@ -52157,18 +52663,9 @@ fn slotAt(slots: &Vector<StaticSlot>, at: usize) -> StaticSlot {
   return StaticSlot {ordinal: listed[at].ordinal, value: StaticValue.copy(&listed[at].value)}
 }
 
-// Build identities only after every exact semantic application has been admitted and validated.
-effect fn emissionRecipes(resolver: &Resolver, reached: &[usize]) -> Vector<InstanceRecipe>
-! OutOfMemoryError ? &mut Allocator {
-  let inputs = Vector.asSlice<EmissionInputs>(&resolver.emissionInputs)
-  let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
-  let mut recipes = Vector.make<InstanceRecipe>()
-  let mut at = usize.ZERO
-  while at < reached.length {
-    run Vector.append<InstanceRecipe>(&mut recipes, run InstanceRecipe.make(&functions[inputs[reached[at]].mir]))
-    at = at + usize.ONE
-  }
-  return move recipes
+struct CollectedText {
+  key: InstanceKey
+  index: usize
 }
 
 effect fn emissionOrder(plan: &EmissionPlan) -> Vector<usize>
@@ -52196,14 +52693,14 @@ effect fn emissionOrder(plan: &EmissionPlan) -> Vector<usize>
   return move order
 }
 
-effect fn emissionDeclarations(resolver: &Resolver, reached: &[usize]) -> Option<Vector<LlvmText.Declaration>>
-! BackendGap | OutOfMemoryError ? &mut Allocator {
-  let inputs = Vector.asSlice<EmissionInputs>(&resolver.emissionInputs)
+effect fn emissionDeclarations(resolver: &Resolver, reached: &[CollectedText]) -> Option<
+  Vector<LlvmText.Declaration>,
+> ! BackendGap | OutOfMemoryError ? &mut Allocator {
+  let inputs = Vector.asSlice<InstanceDefinition>(&resolver.llvmValues)
   let mut declarations = Vector.make<LlvmText.Declaration>()
   let mut at = usize.ZERO
   while at < reached.length {
-    let foreign = run LlvmText.foreignDeclarations(Vector.asSlice<CAbi.Signature>(&inputs[reached[at]].foreign))
-    let entries = Vector.asSlice<LlvmText.Declaration>(&foreign)
+    let entries = Vector.asSlice<LlvmText.Declaration>(&inputs[reached[at].index].foreign)
     let mut entry = usize.ZERO
     while entry < entries.length {
       if !run appendDistinctForeignDeclaration(&mut declarations, &entries[entry]) {
@@ -52253,19 +52750,21 @@ effect fn appendOrderedDeclarations(text: &mut Bytes, declarations: &Vector<Llvm
   return ()
 }
 
-effect fn emitResolvedDefinitions(resolver: &Resolver, reached: &[usize], plan: &EmissionPlan, order: &[usize], text: &mut Bytes) -> usize
-! BackendGap | OutOfMemoryError ? &mut Allocator {
-  let inputs = Vector.asSlice<EmissionInputs>(&resolver.emissionInputs)
-  let functions = Vector.asSlice<MirFunction>(&resolver.mirValues)
+effect fn appendResolvedDefinitions(
+  resolver: &Resolver,
+  reached: &[CollectedText],
+  plan: &EmissionPlan,
+  order: &[usize],
+  text: &mut Bytes,
+) -> usize ! BackendGap | OutOfMemoryError ? &mut Allocator {
+  let inputs = Vector.asSlice<InstanceDefinition>(&resolver.llvmValues)
   let identities = Vector.asSlice<EmissionIdentity>(&plan.identities)
   let mut unchecked = usize.ZERO
   let mut at = usize.ZERO
   while at < order.length {
     let identity = &identities[order[at]]
-    let input = &inputs[reached[identity.representative]]
-    let definition = run LlvmText.emit(&functions[input.mir], &resolver.target,
-      Vector.asSlice<TypeLayout>(&input.layouts), Vector.asSlice<CAbi.Signature>(&input.foreign), plan)
-    run Bytes.append(&mut text.*, Bytes.asSlice(&definition))
+    let input = &inputs[reached[identity.representative].index]
+    run Bytes.append(&mut text.*, Bytes.asSlice(&input.text))
     run Bytes.append(&mut text.*, b"\n")
     if !identity.safetyChecked { unchecked = unchecked + usize.ONE }
     at = at + usize.ONE
@@ -52273,8 +52772,12 @@ effect fn emitResolvedDefinitions(resolver: &Resolver, reached: &[usize], plan: 
   return unchecked
 }
 
-effect fn assembleEmission(resolver: &Resolver, reached: &[usize], module: &ModuleId, span: Span) -> BackendBuild
-! OutOfMemoryError ? &mut Allocator {
+effect fn assembleEmission(
+  resolver: &Resolver,
+  reached: &[CollectedText],
+  module: &ModuleId,
+  span: Span,
+) -> BackendBuild ! OutOfMemoryError ? &mut Allocator {
   let assembled = run Effect.result(assembleEmissionChecked(resolver, reached, module, span))
   return match move assembled {
     Result<BackendBuild, BackendGap | OutOfMemoryError>.Success {value} => move value
@@ -52290,10 +52793,26 @@ effect fn assembleEmission(resolver: &Resolver, reached: &[usize], module: &Modu
   }
 }
 
-effect fn assembleEmissionChecked(resolver: &Resolver, reached: &[usize], module: &ModuleId, span: Span) -> BackendBuild
-! BackendGap | OutOfMemoryError ? &mut Allocator {
-  let recipes = run emissionRecipes(resolver, reached)
-  let plan = run EmissionPlan.make(Vector.asSlice<InstanceRecipe>(&recipes))
+effect fn assembleEmissionChecked(
+  resolver: &Resolver,
+  reached: &[CollectedText],
+  module: &ModuleId,
+  span: Span,
+) -> BackendBuild ! BackendGap | OutOfMemoryError ? &mut Allocator {
+  let mut plan = EmissionPlan.empty()
+  let values = Vector.asSlice<InstanceDefinition>(&resolver.llvmValues)
+  let mut at = usize.ZERO
+  while at < reached.length {
+    let value = &values[reached[at].index]
+    run EmissionPlan.include(
+      &mut plan,
+      &reached[at].key,
+      Bytes.asSlice(&value.encoding),
+      Bytes.asSlice(&value.symbol),
+      value.safetyChecked,
+    )
+    at = at + usize.ONE
+  }
   if EmissionPlan.hasSymbolConflict(&plan) {
     return BackendBuild.Rejected {diagnostic: run reject(resolver, module, RejectionCode.InstanceSymbolConflict, span)}
   }
@@ -52306,7 +52825,13 @@ effect fn assembleEmissionChecked(resolver: &Resolver, reached: &[usize], module
   let mut text = run LlvmText.declarations()
   run appendEmissionDeclarations(&mut text, &foreign)
   let order = run emissionOrder(&plan)
-  let unchecked = run emitResolvedDefinitions(resolver, reached, &plan, Vector.asSlice<usize>(&order), &mut text)
+  let unchecked = run appendResolvedDefinitions(
+    resolver,
+    reached,
+    &plan,
+    Vector.asSlice<usize>(&order),
+    &mut text,
+  )
   return BackendBuild.Module {text: move text, uncheckedBodies: unchecked, plan: move plan}
 }
 
