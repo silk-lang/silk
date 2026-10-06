@@ -636,3 +636,4 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · Isolated inventory smoke archived the complete stdlib through execFileSync’s default 1MiB buffer and failed ENOBUFS · Set the existing smoke archive limit explicitly to 64MiB for the second fixture archive · standalone inventory publication
 
 - 2026-10-06 · Immediate NodeRuntime failure exit truncated inventory JSON still queued on stdout, and a permissive local umask produced non-Git fixture modes · Await the stdout write callback before red exit; create fixture sources with explicit Git0644 permissions · standalone inventory publication
+- 2026-10-06 · The HTTP explicit-Local guard fixture failed bootstrap checking on nested Shared callbacks and transient borrowed Vector element aliases · Use named sibling predicates and stable slice aliases, preserving the actual checked lifetime and every inference assertion · selfhost branch-CI lifetime repair
