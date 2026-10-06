@@ -39,7 +39,7 @@ const encoder = new TextEncoder()
 it('keeps generated pair results unavailable as closed callable and witness contracts', () => {
   const signature = CallResolution.builtinSignature('Intrinsic', 'layoutOf')
   assert.isDefined(signature)
-  if (signature === undefined) throw new Error('expected the existing layoutOf primitive')
+  if (signature === undefined) unreachable('expected the existing layoutOf primitive')
   const anchor: import('../src/AuthoredHir.js').Anchor = {
     _tag: 'AuthoredAnchor',
     owner: AuthoredIdentity.module('file', 'result-policy'),
@@ -66,7 +66,7 @@ it('keeps generated pair results unavailable as closed callable and witness cont
     substitution,
     () => {
       generatedCalls++
-      throw new Error('a closed result must not manufacture an occurrence')
+      return unreachable('a closed result must not manufacture an occurrence')
     },
   )
   assert.strictEqual(closed, 'u32')

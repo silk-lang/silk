@@ -7,6 +7,7 @@ import * as Analysis from '../src/Analysis.js'
 import * as Intrinsic from '../src/Intrinsic.js'
 import * as Type from '../src/Type.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import { unreachable } from './support/raise.js'
 
 const source = Path.join(import.meta.dirname, '..', 'src')
 
@@ -25,34 +26,33 @@ it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair
       (aggregate) => aggregate.aggregateKind === 'AnonymousPositional',
     )
     assert.lengthOf(tuples, 2)
-    const first = tuples.at(0)
-    const second = tuples.at(1)
-    if (first === undefined || second === undefined)
-      throw new Error('expected two selected tuple occurrences')
+    const first = tuples.at(0) ?? unreachable('expected the first selected tuple occurrence')
+    const second = tuples.at(1) ?? unreachable('expected the second selected tuple occurrence')
     assert.strictEqual(first.identity._tag, 'AnonymousAggregateIdentity')
     assert.strictEqual(second.identity._tag, 'AnonymousAggregateIdentity')
     if (
       first.identity._tag !== 'AnonymousAggregateIdentity' ||
       second.identity._tag !== 'AnonymousAggregateIdentity'
     )
-      throw new Error('expected retained ordinary anonymous tuple occurrences')
+      unreachable('expected retained ordinary anonymous tuple occurrences')
     const occurrence = first.identity
     const otherOccurrence = second.identity
-    let facts: ReturnType<typeof AggregateIdentity.generated> | undefined
+    const generatedFacts: Array<ReturnType<typeof AggregateIdentity.generated>> = []
     const selected = Intrinsic.instantiateResult(
       Intrinsic.generatedUsizePair,
       new Map(),
       (fields) => {
-        facts = AggregateIdentity.generated(
+        const facts = AggregateIdentity.generated(
           occurrence,
           first.anchor,
           fields.map((type) => ({ type, anchor: first.anchor })),
         )
+        generatedFacts.push(facts)
         return facts.type
       },
     )
-    assert.isDefined(facts)
-    if (facts === undefined) throw new Error('expected generated owned pair facts')
+    assert.lengthOf(generatedFacts, 1)
+    const facts = generatedFacts.at(0) ?? unreachable('expected generated owned pair facts')
     assert.isTrue(Type.equals(selected, AggregateIdentity.nominal(occurrence)))
     assert.deepEqual(
       facts.struct.fields.map((field) => [
