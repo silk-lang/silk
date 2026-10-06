@@ -103,6 +103,23 @@ Each entry records:
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
+### Result-only call lifetimes in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1076.
+- **Rule:** a lifetime binder that no parameter mentions, such as the impl lifetime of
+  `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() -> TrailerPolicy<'names> }`, is chosen
+  by the call's use (LIFE-003): no operand constrains the region of the result.
+- **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
+  call: a complete ordinary call takes the region its expected result names, and otherwise binds
+  `'static`, since the result retains no operand region through that binder. Sections and function
+  values keep their existing result-only binder gaps.
+- **Source migration:** none.
+- **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
+  selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
+  bootstrap infers the shorter region.
+- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
 - **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
@@ -464,9 +481,12 @@ Each entry records:
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
   different join reports the named `nested-effect-join` gap. An Effect result with no producer
-  body (an interface operation's declared `Effect<...>` result) and Effect-producing callables
-  inferred from `effect fn` values (handlers passed to `Effect.catch`, `catchAll`, `flatMap`)
-  remain `effect-form`. Interface `effect fn` calls have their own entry below.
+  body (an interface operation's declared `Effect<...>` result) remains `effect-form`. An
+  `effect fn` handler passed to `Effect.catch`, `catchAll` or `flatMap`, including a generic one
+  such as `effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32`, is instantiated from the
+  parameters its use determined, and its constructed Effect infers the call's remaining channels.
+  A handler whose callable bound still cannot be inferred remains `effect-form`. Interface
+  `effect fn` calls have their own entry below.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
