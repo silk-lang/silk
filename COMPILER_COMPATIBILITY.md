@@ -1285,3 +1285,20 @@ native source-runtime support. Ordinary plain-i32 adaptation belongs to
 main-first integration of both contracts. See
 [the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
 and validation details. Fatal traps retain their existing behavior and do not promise cleanup.
+
+### Native deferred String coercion and written-pattern lifetime elision
+
+The bootstrap accepts a static String at a shorter expected String lifetime and permits omitted
+reference lifetimes in an otherwise matching written union-pattern type. Native reports the
+existing `borrow-region-relation` and `body-lifetime-elision` gaps respectively until those
+ordinary lifetime mechanisms are represented. This does not admit either conversion or selection.
+The String guard requires actual Static and a nonstatic String expectation. The pattern guard
+retains the specific annotation's generated lifetime evidence and requires exact nominal owners,
+static and row arguments, reference access and referents, and every other structural component.
+Any ordinary mismatch retains `TypeMismatch`, including a conflicting explicit lifetime, a
+nonstatic-to-static String, or another mismatching type argument after an omitted reference.
+
+Sealed Allocation admission can expose these pre-existing downstream gaps in `uri-rfc3986` and
+`toml-output`; their prior core-type refusal did not establish lifetime support. Reduced realized
+bootstrap analysis has no diagnostics for both source forms. Native focused cases retain exact
+success and negative code/span controls alongside the named refusals.
