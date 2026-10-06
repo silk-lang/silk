@@ -1242,6 +1242,16 @@ fn isFloating(kind: Representation) -> bool {
 // Traps when an integer value lies outside the destination integer range (CONV-002).
 effect fn integerRangeGuard(writer: &mut Writer, input: &Value, output: Representation) -> ()
 ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Bytes>.Some {value: condition} = move run integerRangeViolation(&mut writer.*, input, output) {
+    run trapWhen(&mut writer.*, Bytes.asSlice(&condition))
+  }
+  return ()
+}
+
+// The condition that an integer value lies outside the destination integer range, or absence
+// when every source value fits.
+effect fn integerRangeViolation(writer: &mut Writer, input: &Value, output: Representation) -> Option<Bytes>
+! OutOfMemoryError ? &mut Allocator {
   let source = input.scalar
   let mut below = Option.none<Bytes>()
   if source.signed && (!output.signed || output.bits < source.bits) {
@@ -1263,10 +1273,77 @@ effect fn integerRangeGuard(writer: &mut Writer, input: &Value, output: Represen
     }
     Option<Bytes>.None => move above
   }
-  if let Option<Bytes>.Some {value: condition} = move invalid {
-    run trapWhen(&mut writer.*, Bytes.asSlice(&condition))
+  return move invalid
+}
+
+fn characterType(ty: &Shared<Type>) -> bool {
+  return Shared.with<Type, bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.Primitive {name} => same(Bytes.asSlice(&name), b"char")
+      _ => false
+    }
+  })
+}
+
+// Whether an integer is exactly representable in an integer type, or is a Unicode scalar value:
+// at most 0x10FFFF and outside the surrogates 0xD800 to 0xDFFF.
+effect fn emitFits(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  operand: &Operand, ty: &Shared<Type>, span: Span) -> Value ! Gap | OutOfMemoryError ? &mut Allocator {
+  let input = run emitNumeric(&mut writer.*, function, target, layouts, operand, span)
+  if !isIntegral(input.scalar) || !numericPrimitive(ty) { return run typedFormGap(function, span) }
+  let boolean = booleanRepresentation()
+  let value = Bytes.asSlice(&input.text)
+  if characterType(ty) {
+    let above = run instruction(&mut writer.*, b"icmp ugt", input.scalar, value, b"1114111")
+    let low = run instruction(&mut writer.*, b"icmp uge", input.scalar, value, b"55296")
+    let high = run instruction(&mut writer.*, b"icmp ule", input.scalar, value, b"57343")
+    let surrogate = run instruction(&mut writer.*, b"and", boolean, Bytes.asSlice(&low), Bytes.asSlice(&high))
+    let invalid = run instruction(&mut writer.*, b"or", boolean, Bytes.asSlice(&above), Bytes.asSlice(&surrogate))
+    return Value {scalar: boolean, text: run instruction(&mut writer.*, b"xor", boolean, Bytes.asSlice(&invalid), b"true")}
   }
-  return ()
+  let output = scalar(ty, target)
+  if !isIntegral(output) { return run typedFormGap(function, span) }
+  return match move run integerRangeViolation(&mut writer.*, &input, output) {
+    Option<Bytes>.Some {value: invalid} => Value {scalar: boolean,
+      text: run instruction(&mut writer.*, b"xor", boolean, Bytes.asSlice(&invalid), b"true")}
+    Option<Bytes>.None => Value {scalar: boolean, text: run Bytes.copy(b"true")}
+  }
+}
+
+// Calls `@llvm.<s|u><stem>.with.overflow` and returns the result pair.
+effect fn overflowPair(writer: &mut Writer, stem: &[u8], kind: Representation, left: &[u8], right: &[u8]) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let pair = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&pair))
+  run append(&mut writer.*, b" = call ")
+  run aggregateType(&mut writer.*, kind)
+  run append(&mut writer.*, b" ")
+  run overflowIntrinsic(&mut writer.*, stem, kind)
+  run append(&mut writer.*, b"(")
+  run typeName(&mut writer.*, kind)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, left)
+  run append(&mut writer.*, b", ")
+  run typeName(&mut writer.*, kind)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, right)
+  run append(&mut writer.*, b")\n")
+  return move pair
+}
+
+// Extracts field `index` (0 the wrapped value, 1 the overflow flag) of an overflow pair.
+effect fn pairField(writer: &mut Writer, kind: Representation, pair: &[u8], index: usize) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let name = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&name))
+  run append(&mut writer.*, b" = extractvalue ")
+  run aggregateType(&mut writer.*, kind)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, pair)
+  run append(&mut writer.*, b", ")
+  run decimal(&mut writer.*, index)
+  run append(&mut writer.*, b"\n")
+  return move name
 }
 
 // Traps when a floating value is NaN or truncates outside the destination integer range. The
@@ -1397,6 +1474,23 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
     }
     return Value {scalar: kind, text: run instruction(&mut writer.*, opcode, kind, l, r)}
   }
+  let boolean = booleanRepresentation()
+  if operation == ScalarBinary.AddOverflows || operation == ScalarBinary.SubtractOverflows || operation == ScalarBinary.MultiplyOverflows {
+    let mut stem: &[u8] = b"add"
+    if operation == ScalarBinary.SubtractOverflows { stem = b"sub" }
+    if operation == ScalarBinary.MultiplyOverflows { stem = b"mul" }
+    let pair = run overflowPair(&mut writer.*, stem, kind, l, r)
+    return Value {scalar: boolean, text: run pairField(&mut writer.*, kind, Bytes.asSlice(&pair), usize.ONE)}
+  }
+  if operation == ScalarBinary.DivisionUndefined {
+    let zero = run instruction(&mut writer.*, b"icmp eq", kind, r, b"0")
+    if !kind.signed { return Value {scalar: boolean, text: move zero} }
+    let minimum = run minimumText(kind)
+    let lowest = run instruction(&mut writer.*, b"icmp eq", kind, l, Bytes.asSlice(&minimum))
+    let negative = run instruction(&mut writer.*, b"icmp eq", kind, r, b"-1")
+    let overflow = run instruction(&mut writer.*, b"and", boolean, Bytes.asSlice(&lowest), Bytes.asSlice(&negative))
+    return Value {scalar: boolean, text: run instruction(&mut writer.*, b"or", boolean, Bytes.asSlice(&zero), Bytes.asSlice(&overflow))}
+  }
   if operation == ScalarBinary.WrappingAdd { return Value {scalar: kind, text: run instruction(&mut writer.*, b"add", kind, l, r)} }
   if operation == ScalarBinary.WrappingSubtract { return Value {scalar: kind, text: run instruction(&mut writer.*, b"sub", kind, l, r)} }
   if operation == ScalarBinary.WrappingMultiply { return Value {scalar: kind, text: run instruction(&mut writer.*, b"mul", kind, l, r)} }
@@ -1420,35 +1514,9 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
     return Value {scalar: kind, text: run callIntrinsic(&mut writer.*, name, kind, Vector.asSlice<Bytes>(&operands))}
   }
   // A saturating product clamps an overflowing result toward the sign of the exact product.
-  let pair = run temp(&mut writer.*)
-  run append(&mut writer.*, Bytes.asSlice(&pair))
-  run append(&mut writer.*, b" = call ")
-  run aggregateType(&mut writer.*, kind)
-  run append(&mut writer.*, b" ")
-  run overflowIntrinsic(&mut writer.*, b"mul", kind)
-  run append(&mut writer.*, b"(")
-  run typeName(&mut writer.*, kind)
-  run append(&mut writer.*, b" ")
-  run append(&mut writer.*, l)
-  run append(&mut writer.*, b", ")
-  run typeName(&mut writer.*, kind)
-  run append(&mut writer.*, b" ")
-  run append(&mut writer.*, r)
-  run append(&mut writer.*, b")\n")
-  let wrapped = run temp(&mut writer.*)
-  run append(&mut writer.*, Bytes.asSlice(&wrapped))
-  run append(&mut writer.*, b" = extractvalue ")
-  run aggregateType(&mut writer.*, kind)
-  run append(&mut writer.*, b" ")
-  run append(&mut writer.*, Bytes.asSlice(&pair))
-  run append(&mut writer.*, b", 0\n")
-  let overflow = run temp(&mut writer.*)
-  run append(&mut writer.*, Bytes.asSlice(&overflow))
-  run append(&mut writer.*, b" = extractvalue ")
-  run aggregateType(&mut writer.*, kind)
-  run append(&mut writer.*, b" ")
-  run append(&mut writer.*, Bytes.asSlice(&pair))
-  run append(&mut writer.*, b", 1\n")
+  let pair = run overflowPair(&mut writer.*, b"mul", kind, l, r)
+  let wrapped = run pairField(&mut writer.*, kind, Bytes.asSlice(&pair), usize.ZERO)
+  let overflow = run pairField(&mut writer.*, kind, Bytes.asSlice(&pair), usize.ONE)
   let maximum = run maximumText(kind)
   let mut bound = run Bytes.copy(Bytes.asSlice(&maximum))
   if kind.signed {
@@ -1630,6 +1698,7 @@ effect fn emitScalarRvalue(
     }
     Rvalue.Use {value} => run emitOperand(&mut writer.*, function, target, layouts, &value)
     Rvalue.Convert {value, ty} => run emitConvert(&mut writer.*, function, target, layouts, &value, &ty, span)
+    Rvalue.Fits {value, ty} => run emitFits(&mut writer.*, function, target, layouts, &value, &ty, span)
     Rvalue.ScalarUnary {operation, value} => run emitScalarUnary(&mut writer.*, function, target, layouts, operation, &value, span)
     Rvalue.ScalarBinary {operation, left, right} => run emitScalarBinary(&mut writer.*, function, target, layouts, operation, &left, &right, span)
     Rvalue.AddressIntegerConversion {operand, destinationType} => {
