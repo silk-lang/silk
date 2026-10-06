@@ -91,18 +91,26 @@ before assembly.
 **Caller regions are numbered, not named.** A selected instance cannot observe which caller-local
 region its caller lent. It observes only whether an input region is `'static` and which of its
 inputs share a region: impl and cleanup selection match `'static` heads and repeated region
-binders, and its proofs use only its own declared outlives bounds. Constructing an `InstanceKey`
-therefore numbers every caller region of the application and its provider types by first
-appearance (`Lifetime.Supplied`), in one walk over the operation contract and provider, own
-arguments, enclosing scope arguments, then provider keys and types, including regions nested in
-type arguments, callable environments and nested applications. A caller region is a `Local` borrow
-region or the caller instance's own `Supplied` region. `'static`, declaration-owned parameters and
-invocation binders keep their identities, and static values hold no caller region. The renaming is
+binders, and its proofs use only its own declared outlives bounds, substituted with its inputs.
+Relations between distinct caller-local regions are borrow obligations of the caller's body,
+proved before the call is selected; they are never premises of instance validation or selection.
+A change that needs such a premise must carry it in the key as a fact over the numbered regions.
+Constructing an `InstanceKey` therefore numbers every caller region of the application and its
+provider types by first appearance (`Lifetime.Supplied`), in one walk over the operation contract
+and provider, own arguments, enclosing scope arguments, then provider keys and types, including
+regions nested in type arguments, callable environments and nested applications. A caller region
+is a `Local` borrow region or the caller instance's own `Supplied` region. `'static`,
+declaration-owned parameters and invocation binders keep their identities. Static values are kept
+unchanged: the caller's static roots evaluate them once per body, without instance bindings or
+loans, and a pure static value holds no reference, slice, pointer or callable. The renaming is
 injective, so `'static`-ness and region sharing are exact. `accepts(&first)` and
 `accepts(&second)` share one instance, and every callee reached by forwarding a borrowed parameter
-is lowered once per region pattern rather than once per call site. Inside an instance, `Supplied`
-regions behave like caller-local regions: they are rigid, never `'static`, and never the instance
-body's own loans. Requirement providers are matched against the call edge's actual application
+is lowered once per region pattern rather than once per call site. The walk follows the stored
+member order of intersections and normalized unions. Where that order derives from the original
+regions, two call sites with one region pattern can still number differently; this only misses
+sharing and never merges distinguishable instances. Inside an instance, `Supplied` regions behave
+like caller-local regions: they are rigid, never `'static`, and never the instance body's own
+loans. Requirement providers are matched against the call edge's actual application
 (`CallTarget.application`) before the key numbers its regions, so a region shared between an
 argument and a provider stays shared.
 
