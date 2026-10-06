@@ -182,6 +182,20 @@ chmod +x program
     manifest.programs.find((program) => program.name === 'scalar-reference-read').profiles,
     [{ name: 'optimized', optimization: 'speed', debug: false }],
   )
+  assert.strictEqual(
+    Object.hasOwn(
+      manifest.programs.find((program) => program.name === 'scalar-reference-read'),
+      'stdout',
+    ),
+    false,
+  )
+  assert.strictEqual(
+    Object.hasOwn(
+      manifest.programs.find((program) => program.name === 'scalar-reference-read'),
+      'stderr',
+    ),
+    false,
+  )
   assert.deepStrictEqual(
     manifest.programs.find((program) => program.name === 'scalar-reference-argument-order')
       .profiles,

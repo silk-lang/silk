@@ -36,8 +36,8 @@ export const Manifest = Schema.Struct({
         Schema.TaggedStruct('Completes', { result: Schema.Finite }),
         Schema.TaggedStruct('Trap', {}),
       ]),
-      stdout: Schema.String,
-      stderr: Schema.String,
+      stdout: Schema.optionalKey(Schema.String),
+      stderr: Schema.optionalKey(Schema.String),
     }),
   ),
 })
@@ -183,8 +183,8 @@ export const runFull = Effect.fn('CorpusVerification.runFull')(function* (
         closeStderr: run.closeStderr ?? false,
       })),
       expected: program.expected,
-      stdout: program.nativeStdout ?? '',
-      stderr: program.nativeStderr ?? '',
+      ...(program.nativeStdout === undefined ? {} : { stdout: program.nativeStdout }),
+      ...(program.nativeStderr === undefined ? {} : { stderr: program.nativeStderr }),
     })),
   }).pipe(
     Effect.mapError(

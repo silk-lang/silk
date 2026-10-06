@@ -84,7 +84,7 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     yield* fs.writeFileString(self.pins, '["literal"]')
     const corpus: ReadonlyArray<CorpusProgram> = [
       literal,
-      { ...literal, name: 'observed-failure', expected: { _tag: 'Completes', result: 41 } },
+      { ...literal, name: 'observed-failure', nativeStdout: '', nativeStderr: '' },
       { ...literal, name: 'observed-gap', nativeCSources: {} },
       { ...literal, name: 'observed-trap', expected: { _tag: 'Trap' } },
     ]
@@ -119,6 +119,10 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
       { arguments: ['two'], closeStderr: false },
     ])
     assert.deepEqual(manifest.programs.at(3)?.expected, { _tag: 'Trap' })
+    assert.strictEqual(manifest.programs.at(0)?.stdout, 'witness\n')
+    assert.strictEqual(manifest.programs.at(0)?.stderr, 'stderr witness\n')
+    assert.strictEqual(manifest.programs.at(1)?.stdout, '')
+    assert.strictEqual(manifest.programs.at(1)?.stderr, '')
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
     // A failing unpinned case executes until its first mismatch; unsupported link inputs do
