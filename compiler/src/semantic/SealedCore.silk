@@ -1,11 +1,23 @@
-//! Compiler-authenticated identities of sealed core owners.
+//! Compiler-authenticated identities and storage records of the sealed core owners.
 //!
 //! # When to use
-//! Use this actor when a semantic rule must recognize a compiler-owned type rather than a
+//! Use this actor when a semantic or backend rule must recognize a compiler-owned type rather than a
 //! same-spelled source declaration. These identities never identify an indexed source module.
+//!
+//! # Details
+//! `Allocation`, `RawBuffer<T>` and `Slot<'storage, T>` are the `silk/core` storage nominals, and
+//! `Intrinsic.SharedCore<T>` and `Intrinsic.StorageFailure` are sealed `Intrinsic` families. The
+//! private `SharedBlock<T>` is the control block one `SharedCore<T>` addresses; source cannot name
+//! it. Every core is an ordinary record whose layout matches the bootstrap: an allocation is six
+//! target words (aligned base, requested bytes and alignment, reclaim tag, reclaim context and
+//! active marker), a raw buffer is its allocation and element count, a slot is one element address,
+//! a shared core is one control-block address, and a control block holds the strong count, the
+//! access state, its own allocation and the value. The C allocator functions the storage
+//! primitives expand to are sealed foreign declarations of the same module.
 
-import hir.Hir {OwnerKind}
+import hir.Hir {Access, Multiplicity, OwnerKind}
 import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.Lifetime {Lifetime}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Type {Argument, Type}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -14,6 +26,52 @@ import silk.option {Option}
 import silk.shared {Shared}
 import silk.usize
 import silk.vector {Vector}
+
+/// One sealed core owner.
+pub enum Core {
+  /// `Allocation`: one affine owner of system storage and its private reclaim authority.
+  Allocation,
+  /// `RawBuffer<T>`: an allocation adopted as typed storage for a recorded element count.
+  RawBuffer,
+  /// `Slot<'storage, T>`: one selected element of a raw buffer.
+  Slot,
+  /// `Intrinsic.SharedCore<T>`: one strong handle to a local, non-atomic control block.
+  SharedCore,
+  /// The control block one `SharedCore<T>` addresses; it has no source spelling.
+  SharedBlock,
+  /// `Intrinsic.StorageFailure`: the refusal of the primitive allocation boundary.
+  StorageFailure,
+}
+
+/// One named field of a core record, by its ordinal.
+pub enum Field {
+  AllocationBase,
+  AllocationBytes,
+  AllocationAlignment,
+  AllocationReclaim,
+  AllocationContext,
+  AllocationActive,
+  BufferAllocation,
+  BufferCount,
+  SlotAddress,
+  CoreBlock,
+  BlockStrong,
+  BlockAccess,
+  BlockAllocation,
+  BlockValue,
+}
+
+/// One C allocator function a storage primitive expands to.
+pub enum CFunction {
+  /// `malloc(bytes: usize) -> ?[*]mut u8`.
+  Malloc,
+  /// `free(address: ?[*]mut u8) -> ()`.
+  Free,
+  /// `memmove(destination: ?[*]mut u8, source: ?[*]mut u8, bytes: usize) -> ?[*]mut u8`.
+  Memmove,
+  /// `memset(destination: ?[*]mut u8, value: i32, bytes: usize) -> ?[*]mut u8`.
+  Memset,
+}
 
 fn same(left: &[u8], right: &[u8]) -> bool {
   if left.length != right.length {
@@ -29,53 +87,379 @@ fn same(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
-/// The exact owner identity of canonical Allocation, including its reserved non-source origin.
-pub fn allocationDeclaration(value: &DeclarationId) -> bool {
-  let module = DeclarationId.moduleId(value)
-  if !same(ModuleId.sourceOrigin(module), b"compiler-sealed-core") || !same(
-    ModuleId.packageIdentity(module),
-    b"silk",
-  ) || !same(ModuleId.logicalPath(module), b"silk/core") {
-    return false
+fn coreName(core: Core) -> &'static [u8] {
+  return match core {
+    Core.Allocation => b"Allocation"
+    Core.RawBuffer => b"RawBuffer"
+    Core.Slot => b"Slot"
+    Core.SharedCore => b"SharedCore"
+    Core.SharedBlock => b"SharedBlock"
+    Core.StorageFailure => b"StorageFailure"
+  }
+}
+
+fn cores() -> [Core; 6] {
+  return [Core.Allocation, Core.RawBuffer, Core.Slot, Core.SharedCore, Core.SharedBlock, Core.StorageFailure]
+}
+
+/// The C symbol of one allocator function.
+pub fn cSymbol(function: CFunction) -> &'static [u8] {
+  return match function {
+    CFunction.Malloc => b"malloc"
+    CFunction.Free => b"free"
+    CFunction.Memmove => b"memmove"
+    CFunction.Memset => b"memset"
+  }
+}
+
+fn cFunctions() -> [CFunction; 4] {
+  return [CFunction.Malloc, CFunction.Free, CFunction.Memmove, CFunction.Memset]
+}
+
+// Whether a module identity is the reserved non-source module of every sealed core.
+fn sealedModule(module: &ModuleId) -> bool {
+  return same(ModuleId.sourceOrigin(module), b"compiler-sealed-core") && same(ModuleId.packageIdentity(module), b"silk")
+    && same(ModuleId.logicalPath(module), b"silk/core")
+}
+
+// The one owner step of a sealed declaration with `kind`, or absence.
+fn sealedStep(value: &DeclarationId, kind: OwnerKind) -> Option<usize> {
+  if !sealedModule(DeclarationId.moduleId(value)) {
+    return Option.none<usize>()
   }
   let owners = DeclarationId.ownerSteps(value)
-  if owners.length != usize.ONE {
-    return false
+  if owners.length != usize.ONE || owners[usize.ZERO].kind != kind || owners[usize.ZERO].occurrence != usize.ZERO {
+    return Option.none<usize>()
   }
-  if owners[usize.ZERO].kind != OwnerKind.Struct || owners[usize.ZERO].occurrence != usize.ZERO {
-    return false
-  }
-  return match & owners[usize.ZERO].name {
-    Option<Bytes>.Some {value: name} => same(Bytes.asSlice(&name), b"Allocation")
-    _ => false
-  }
+  return Option.some<usize>(usize.ZERO)
 }
 
-/// Recognizes the sealed Allocation owner; malformed arguments cannot grant it source ownership.
-pub fn allocationType(value: &Type) -> bool {
+/// The sealed core a declaration identity names; a same-spelled source declaration names none.
+pub fn declarationCore(value: &DeclarationId) -> Option<Core> {
+  if let Option<usize>.None = move sealedStep(value, OwnerKind.Struct) {
+    return Option.none<Core>()
+  }
+  let owners = DeclarationId.ownerSteps(value)
+  let listed = cores()
+  let all: &[Core] = &listed
+  let mut at = usize.ZERO
+  while at < all.length {
+    let candidate = all[at]
+    let named = match & owners[usize.ZERO].name {
+      Option<Bytes>.Some {value: name} => same(Bytes.asSlice(&name), coreName(candidate))
+      Option<Bytes>.None => false
+    }
+    if named {
+      return Option.some<Core>(candidate)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<Core>()
+}
+
+/// The sealed core a type applies, if any.
+pub fn typeCore(value: &Type) -> Option<Core> {
   return match & value.* {
-    Type.Nominal {declaration, ..} => allocationDeclaration(&declaration)
+    Type.Nominal {declaration, ..} => declarationCore(&declaration)
+    _ => Option.none<Core>()
+  }
+}
+
+/// The sealed core a shared type handle applies, if any.
+pub fn coreOf(value: &Shared<Type>) -> Option<Core> {
+  return Shared.with<Type, Option<Core>>(value, typeCore)
+}
+
+/// Whether a type applies exactly the sealed core `wanted`.
+pub fn isCore(value: &Shared<Type>, wanted: Core) -> bool {
+  return match move coreOf(value) {
+    Option<Core>.Some {value: core} => core == wanted
+    Option<Core>.None => false
+  }
+}
+
+/// The sealed C allocator function a declaration identity names, if any.
+pub fn declarationFunction(value: &DeclarationId) -> Option<CFunction> {
+  if let Option<usize>.None = move sealedStep(value, OwnerKind.Function) {
+    return Option.none<CFunction>()
+  }
+  let owners = DeclarationId.ownerSteps(value)
+  let listed = cFunctions()
+  let all: &[CFunction] = &listed
+  let mut at = usize.ZERO
+  while at < all.length {
+    let candidate = all[at]
+    let named = match & owners[usize.ZERO].name {
+      Option<Bytes>.Some {value: name} => same(Bytes.asSlice(&name), cSymbol(candidate))
+      Option<Bytes>.None => false
+    }
+    if named {
+      return Option.some<CFunction>(candidate)
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<CFunction>()
+}
+
+/// Whether a value type stores a slot selection, directly or as fixed-array elements. A structural
+/// union may not store one.
+pub fn storesSelection(value: &Type) -> bool {
+  return match & value.* {
+    Type.Nominal {declaration, ..} => match move declarationCore(&declaration) {
+      Option<Core>.Some {value: core} => core == Core.Slot
+      Option<Core>.None => false
+    }
+    Type.Array {element, ..} => Shared.with<Type, bool>(&element, storesSelection)
     _ => false
   }
 }
 
-/// Mints the zero-argument Allocation type without admitting construction, layout or release.
-pub effect fn allocation() -> Shared<Type> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
-  let module = run ModuleId.make(b"compiler-sealed-core", b"silk", b"silk/core")
+/// Whether dropping a complete value of the core runs cleanup. A slot owns no initialized value and
+/// a storage failure holds nothing; a control block is only ever cleaned field by field.
+pub fn ownsCleanup(core: Core) -> bool {
+  return core == Core.Allocation || core == Core.RawBuffer || core == Core.SharedCore
+}
+
+/// The number of type and lifetime arguments a core applies.
+pub fn arity(core: Core) -> usize {
+  return match core {
+    Core.Allocation => usize.ZERO
+    Core.StorageFailure => usize.ZERO
+    Core.Slot => 2
+    _ => usize.ONE
+  }
+}
+
+/// The ordinal of one named field in its core record.
+pub fn ordinal(field: Field) -> usize {
+  return match field {
+    Field.AllocationBase => usize.ZERO
+    Field.AllocationBytes => usize.ONE
+    Field.AllocationAlignment => 2
+    Field.AllocationReclaim => 3
+    Field.AllocationContext => 4
+    Field.AllocationActive => 5
+    Field.BufferAllocation => usize.ZERO
+    Field.BufferCount => usize.ONE
+    Field.SlotAddress => usize.ZERO
+    Field.CoreBlock => usize.ZERO
+    Field.BlockStrong => usize.ZERO
+    Field.BlockAccess => usize.ONE
+    Field.BlockAllocation => 2
+    Field.BlockValue => 3
+  }
+}
+
+effect fn step(name: &[u8], kind: OwnerKind) -> Vector<OwnerStep> ! OutOfMemoryError ? &mut Allocator {
   let mut owners = Vector.make<OwnerStep>()
-  run Vector.append<OwnerStep>(
-    &mut owners,
-    OwnerStep {
-      kind: OwnerKind.Struct,
-      name: Option.some<Bytes>(run Bytes.copy(b"Allocation")),
-      occurrence: usize.ZERO,
-    },
-  )
-  return run Shared.make<Type>(
-    Type.Nominal {
-      declaration: DeclarationId.fromParts(move module, move owners),
-      isPublic: true,
-      arguments: Vector.make<Argument>(),
-    },
-  )
+  run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: kind, name: Option.some<Bytes>(run Bytes.copy(name)),
+    occurrence: usize.ZERO})
+  return move owners
+}
+
+/// Mints the reserved identity of one core.
+pub effect fn identity(core: Core) -> DeclarationId ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let module = run ModuleId.make(b"compiler-sealed-core", b"silk", b"silk/core")
+  return DeclarationId.fromParts(move module, run step(coreName(core), OwnerKind.Struct))
+}
+
+// Another core or C function of the sealed module that `anchor` belongs to.
+effect fn sibling(anchor: &DeclarationId, name: &[u8], kind: OwnerKind) -> DeclarationId ! OutOfMemoryError ? &mut Allocator {
+  let module = run ModuleId.copy(DeclarationId.moduleId(anchor))
+  return DeclarationId.fromParts(move module, run step(name, kind))
+}
+
+/// `Allocation`, minted beside an existing core identity `anchor`.
+pub effect fn allocationBeside(anchor: &DeclarationId) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run nominal(run sibling(anchor, coreName(Core.Allocation), OwnerKind.Struct), Vector.make<Argument>())
+}
+
+/// The sealed C function declaration, minted beside an existing core identity `anchor`.
+pub effect fn cFunction(anchor: &DeclarationId, selected: CFunction) -> Shared<DeclarationId>
+! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<DeclarationId>(run sibling(anchor, cSymbol(selected), OwnerKind.Function))
+}
+
+effect fn nominal(declaration: DeclarationId, arguments: Vector<Argument>) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Nominal {declaration: move declaration, isPublic: true, arguments: move arguments})
+}
+
+/// Mints one core application whose arguments follow its binders: none for `Allocation` and
+/// `StorageFailure`, the lifetime and then the element for `Slot`, and the element otherwise.
+pub effect fn make(core: Core, arguments: Vector<Argument>) -> Shared<Type> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  return run nominal(run identity(core), move arguments)
+}
+
+/// Mints `Allocation`.
+pub effect fn allocation() -> Shared<Type> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  return run make(Core.Allocation, Vector.make<Argument>())
+}
+
+effect fn elementArguments(element: &Shared<Type>) -> Vector<Argument> ! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut arguments, Argument.Type {value: Shared.clone<Type>(element)})
+  return move arguments
+}
+
+/// Mints a core of one element: `RawBuffer<T>`, `SharedCore<T>` or `SharedBlock<T>`.
+pub effect fn applied(core: Core, element: &Shared<Type>) -> Shared<Type> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  return run make(core, run elementArguments(element))
+}
+
+/// Mints `Slot<'storage, T>`.
+pub effect fn slot(region: &Shared<Lifetime>, element: &Shared<Type>) -> Shared<Type> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let mut arguments = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: Shared.clone<Lifetime>(region)})
+  run Vector.append<Argument>(&mut arguments, Argument.Type {value: Shared.clone<Type>(element)})
+  return run make(Core.Slot, move arguments)
+}
+
+// The core identity a type applies, copied, or absence.
+effect fn coreIdentity(value: &Shared<Type>) -> Option<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  let node = run Type.copy(value)
+  if let Type.Nominal {declaration, ..} = move node {
+    if let Option<Core>.Some {..} = move declarationCore(&declaration) {
+      return Option.some<DeclarationId>(move declaration)
+    }
+  }
+  return Option.none<DeclarationId>()
+}
+
+/// The element type a `RawBuffer`, `Slot`, `SharedCore` or `SharedBlock` stores.
+pub fn element(value: &Shared<Type>) -> Option<Shared<Type>> {
+  return Shared.with<Type, Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> {
+    if let Type.Nominal {arguments, ..} = &node.* {
+      let supplied = Vector.asSlice<Argument>(&arguments)
+      if supplied.length > usize.ZERO {
+        if let Argument.Type {value: last} = &supplied[supplied.length - usize.ONE] {
+          return Option.some<Shared<Type>>(Shared.clone<Type>(&last))
+        }
+      }
+    }
+    return Option.none<Shared<Type>>()
+  })
+}
+
+/// The selection lifetime of a `Slot<'storage, T>`.
+pub fn slotRegion(value: &Shared<Type>) -> Option<Shared<Lifetime>> {
+  return Shared.with<Type, Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> {
+    if let Type.Nominal {arguments, ..} = &node.* {
+      let supplied = Vector.asSlice<Argument>(&arguments)
+      if supplied.length > usize.ZERO {
+        if let Argument.Lifetime {value: region} = &supplied[usize.ZERO] {
+          return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(&region))
+        }
+      }
+    }
+    return Option.none<Shared<Lifetime>>()
+  })
+}
+
+effect fn primitive(name: &[u8]) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(name)})
+}
+
+/// A non-null exclusive address of one `pointee`.
+pub effect fn address(pointee: &Shared<Type>) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Pointer {pointee: Shared.clone<Type>(pointee), access: Access.Mutable, nullable: false,
+    multiplicity: Multiplicity.Single, alignment: Option.none<u64>()})
+}
+
+/// The nullable byte address the C allocator functions take and return.
+pub effect fn bytes() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared.make<Type>(Type.Pointer {pointee: run primitive(b"u8"), access: Access.Mutable, nullable: true,
+    multiplicity: Multiplicity.Many, alignment: Option.none<u64>()})
+}
+
+/// The C parameter types of one allocator function.
+pub effect fn cParameters(selected: CFunction) -> Vector<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let mut parameters = Vector.make<Shared<Type>>()
+  match selected {
+    CFunction.Malloc => { run Vector.append<Shared<Type>>(&mut parameters, run primitive(b"usize")) }
+    CFunction.Free => { run Vector.append<Shared<Type>>(&mut parameters, run bytes()) }
+    CFunction.Memmove => {
+      run Vector.append<Shared<Type>>(&mut parameters, run bytes())
+      run Vector.append<Shared<Type>>(&mut parameters, run bytes())
+      run Vector.append<Shared<Type>>(&mut parameters, run primitive(b"usize"))
+    }
+    CFunction.Memset => {
+      run Vector.append<Shared<Type>>(&mut parameters, run bytes())
+      run Vector.append<Shared<Type>>(&mut parameters, run primitive(b"i32"))
+      run Vector.append<Shared<Type>>(&mut parameters, run primitive(b"usize"))
+    }
+  }
+  return move parameters
+}
+
+/// The C result type of one allocator function.
+pub effect fn cResult(selected: CFunction) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  if selected == CFunction.Free {
+    return run Shared.make<Type>(Type.Unit)
+  }
+  return run bytes()
+}
+
+/// The ordered runtime fields of a core record, or absence for any other type. Field types of an
+/// element-generic core retain its element.
+pub effect fn fields(value: &Shared<Type>) -> Option<Vector<Shared<Type>>> ! OutOfMemoryError ? &mut Allocator {
+  let anchor = match move run coreIdentity(value) {
+    Option<DeclarationId>.Some {value: found} => found
+    Option<DeclarationId>.None => { return Option.none<Vector<Shared<Type>>>() }
+  }
+  let core = match move declarationCore(&anchor) {
+    Option<Core>.Some {value: found} => found
+    Option<Core>.None => { return Option.none<Vector<Shared<Type>>>() }
+  }
+  let mut fields = Vector.make<Shared<Type>>()
+  if core == Core.StorageFailure {
+    return Option.some<Vector<Shared<Type>>>(move fields)
+  }
+  let word = run primitive(b"usize")
+  let allocation = run nominal(run sibling(&anchor, coreName(Core.Allocation), OwnerKind.Struct), Vector.make<Argument>())
+  if core == Core.Allocation {
+    let mut at = usize.ZERO
+    while at < 6 {
+      run Vector.append<Shared<Type>>(&mut fields, Shared.clone<Type>(&word))
+      at = at + usize.ONE
+    }
+    return Option.some<Vector<Shared<Type>>>(move fields)
+  }
+  let stored = match move element(value) {
+    Option<Shared<Type>>.Some {value: found} => found
+    Option<Shared<Type>>.None => { return Option.none<Vector<Shared<Type>>>() }
+  }
+  match core {
+    Core.RawBuffer => {
+      run Vector.append<Shared<Type>>(&mut fields, move allocation)
+      run Vector.append<Shared<Type>>(&mut fields, move word)
+    }
+    Core.Slot => { run Vector.append<Shared<Type>>(&mut fields, run address(&stored)) }
+    Core.SharedCore => {
+      let block = run nominal(run sibling(&anchor, coreName(Core.SharedBlock), OwnerKind.Struct), run elementArguments(&stored))
+      run Vector.append<Shared<Type>>(&mut fields, run address(&block))
+    }
+    Core.SharedBlock => {
+      run Vector.append<Shared<Type>>(&mut fields, Shared.clone<Type>(&word))
+      run Vector.append<Shared<Type>>(&mut fields, move word)
+      run Vector.append<Shared<Type>>(&mut fields, move allocation)
+      run Vector.append<Shared<Type>>(&mut fields, move stored)
+    }
+    _ => { return Option.none<Vector<Shared<Type>>>() }
+  }
+  return Option.some<Vector<Shared<Type>>>(move fields)
+}
+
+/// The type of the record field at `field`'s ordinal in the core `value` applies, or absence for a
+/// type that is not a core.
+pub effect fn fieldType(value: &Shared<Type>, field: Field) -> Option<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let listed = match move run fields(value) {
+    Option<Vector<Shared<Type>>>.Some {value: found} => found
+    Option<Vector<Shared<Type>>>.None => { return Option.none<Shared<Type>>() }
+  }
+  let entries = Vector.asSlice<Shared<Type>>(&listed)
+  let at = ordinal(field)
+  if at >= entries.length {
+    return Option.none<Shared<Type>>()
+  }
+  return Option.some<Shared<Type>>(Shared.clone<Type>(&entries[at]))
 }

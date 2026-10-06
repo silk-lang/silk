@@ -125,6 +125,31 @@ Each entry records:
   asserts known versus unknown membership and the exact backend gap span. The corpus runner check
   compares the complete committed runtime/mixed spellings with `Intrinsic.inventory()`.
 
+### Sealed core storage in selfhost
+
+- **Status:** implemented on 2026-10-06 on branch `selfhost-core-storage` (Stage 1 sealed core
+  storage workstream); verification is pending that PR's CI.
+- **Rule:** the storage core types follow the reference, the standard library and the bootstrap.
+  `Allocation` is six target words, `RawBuffer<T>` is its allocation and element count,
+  `Slot<'storage, T>` is one element address, and `Intrinsic.SharedCore<T>` addresses a local,
+  non-atomic control block. Only the primitives the standard library calls are implemented, each
+  expanding to ordinary MIR; shared-core drop glue counts references, and raw-buffer and slot
+  contents stay owned by library code.
+- **Compilers:** both compilers name the standard library's `silk/layout` `Layout` record in the
+  contracts of `layoutOf`, `sharedLayout` and `systemAllocationAcquire`; selfhost resolves it from
+  the standard-library module and requires its storage to be exactly two `usize` fields. Selfhost
+  calls the sealed C `malloc`, `free`, `memmove` and `memset` declarations where the bootstrap emits
+  LLVM memory intrinsics; the observable allocation, refusal and trap behavior is the same.
+  Execution storage (`Intrinsic.Execution`, `Intrinsic.Wake`) remains the `core-type` deferral.
+- **Source migration:** none. A source type named `Slot`, `RawBuffer` or `Allocation` cannot be
+  named in type position; inherent owners and expression paths of the same spelling stay ordinary.
+- **Diagnostics and limits:** contract violations reject with `TypeMismatch`, `CallArity`,
+  `TypeArity`, `MissingConformance` for a non-Copy read, and the unsafe acknowledgement codes. A
+  stored `systemAllocationAcquire` Effect that is not run in place reports the `effect-form` gap.
+- **Evidence:** `sealedCoreLayoutsAndCleanup` and `storagePrimitivesFollowTheirContracts` in
+  `compiler/src/semantic/SemanticCases.silk`, and the native corpus programs that use the storage
+  core.
+
 ### Static aggregate reflection subset in selfhost
 
 - **Status:** implemented on 2026-10-02 on PR #664 (B12 c39, decision D2); verification is pending
