@@ -37,7 +37,8 @@ Projection  = Field(i) | Payload(tag, ty) | VariantField(variant, field)
 Operand     = Copy(Place) | Move(Place) | Integer | Float | Boolean | Unit | StaticBytes
             | **Null(ty)** (failure observer)
 Rvalue      = Use | Unary | Binary | Bitcast | Ref(access, Place) | AddressOf(access, Place)
-            | Aggregate | Slice | SliceLength | Discriminant | Inject | Variant
+            | Aggregate | Slice { data: Operand, count: Operand /* unsigned usize */ } | SliceLength
+            | Discriminant | Inject | Variant
             | **FunctionAddress(InstanceKey) | ContextOf(Place)** (failure observer)
 Statement   = Assign(Place, Rvalue) | Drop(Place, InstanceKey, diagnostics)
             | **FailureContext { destination, source: Option<Place>, origin }** (failure observer)
