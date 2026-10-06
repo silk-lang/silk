@@ -67,7 +67,8 @@ tag; `Index` reads its index from a local; `ConstIndex` is a compile-time index;
 through a reference or raw pointer.
 
 Local types are semantic `Type`s with the instance's bindings applied. Lifetimes are retained as
-evidence, including in exact semantic instance keys. A projection's type comes from
+evidence, including in semantic instance keys, where caller regions are numbered canonically (below).
+A projection's type comes from
 its base type and the type's `MemberShape`. Only `Payload` carries its type, because the
 structural-union member list would otherwise have to be renormalized at each use.
 
@@ -75,16 +76,35 @@ structural-union member list would otherwise have to be renormalized at each use
 offsets, tag encoding and ABI class. A Wasm backend would read the same MIR and `Layout`.
 
 **Selected instance identity and LLVM answers.** `InstanceKey` retains the complete semantic
-application and a canonical lifetime-erased runtime family. Semantic queries validate every exact
-application; layout interning uses runtime type equality. Linkage symbols use exact instance
-content, including lifetime, static, enclosing-scope and provider evidence. Local borrow regions
-are encoded as declaration-relative coordinates, so sibling-body HIR renumbering cannot rename
-them. Originated context lookup uses local table ordinals, retaining only the emitted diagnostic
-texts in the content subject. Definition, call,
+application and a canonical lifetime-erased runtime family. Semantic queries validate every
+application; layout interning uses runtime type equality. Linkage symbols use the instance's
+canonical content, including lifetime, static, enclosing-scope and provider evidence. Local borrow
+regions in emission content are encoded as declaration-relative coordinates, so sibling-body HIR
+renumbering cannot rename them. Originated context lookup uses local table ordinals, retaining only
+the emitted diagnostic texts in the content subject. Definition, call,
 function-address and drop references use that same body-independent identity; recursive and
-mutually recursive instances require no body-derived SCC identity. Exact lifetime applications
-remain distinct even when their current instructions happen to agree. The C shim alone keeps
-`main`; full bytes distinguish genuine digest collisions before assembly.
+mutually recursive instances require no body-derived SCC identity. Lifetime applications that
+differ in `'static` or in region sharing remain distinct even when their current instructions
+happen to agree. The C shim alone keeps `main`; full bytes distinguish genuine digest collisions
+before assembly.
+
+**Caller regions are numbered, not named.** A selected instance cannot observe which caller-local
+region its caller lent. It observes only whether an input region is `'static` and which of its
+inputs share a region: impl and cleanup selection match `'static` heads and repeated region
+binders, and its proofs use only its own declared outlives bounds. Constructing an `InstanceKey`
+therefore numbers every caller region of the application and its provider types by first
+appearance (`Lifetime.Supplied`), in one walk over the operation contract and provider, own
+arguments, enclosing scope arguments, then provider keys and types, including regions nested in
+type arguments, callable environments and nested applications. A caller region is a `Local` borrow
+region or the caller instance's own `Supplied` region. `'static`, declaration-owned parameters and
+invocation binders keep their identities, and static values hold no caller region. The renaming is
+injective, so `'static`-ness and region sharing are exact. `accepts(&first)` and
+`accepts(&second)` share one instance, and every callee reached by forwarding a borrowed parameter
+is lowered once per region pattern rather than once per call site. Inside an instance, `Supplied`
+regions behave like caller-local regions: they are rigid, never `'static`, and never the instance
+body's own loans. Requirement providers are matched against the call edge's actual application
+(`CallTarget.application`) before the key numbers its regions, so a region shared between an
+argument and a provider stays shared.
 
 Source-dependent emission preparation is a query over the instance's MIR, its layouts, foreign
 signatures and its callees' signatures and exact identities. It validates those facts before

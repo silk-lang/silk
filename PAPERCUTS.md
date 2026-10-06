@@ -644,3 +644,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · A pnpm package build tried to refresh shared dependency links automatically, while a root-local type check missed the compiler package's Node types · Use direct package script binaries for owned local outputs and run the configured type check from the compiler package; CI keeps its frozen-install pnpm commands · native contract CI setup
 
 - 2026-10-06 · A local `silk build --manifest-path compiler/silk.toml` ran 13 minutes, then failed with `Unknown attribute kind (102)`: the bootstrap emits LLVM 22 bitcode but invokes the first `clang` on PATH and ignores `SILK_TEST_CLANG` · Install the pinned LLVM 22.1.8 into `.scratch/llvm-22.1.8` (see `.github/actions/setup-linux-llvm`) and put its `bin` first on PATH before building N0 · local self-build loop
+
+- 2026-10-06 · CI artifact downloads (`*.blob.core.windows.net`) are refused by the agent egress proxy, so the `selfhost-corpus-timings` artifact cannot be fetched from an agent session · Read `SELFHOST_CASE_TIMING` lines from the corpus job log instead; keep the log request narrow · selfhost agent loop
