@@ -16,9 +16,23 @@ const result = await build({
       import * as NodeRuntime from '@effect/platform-node/NodeRuntime'
       import * as NodeServices from '@effect/platform-node/NodeServices'
       import * as Verification from '../../compiler/scripts/FormatterVerification.js'
+      import * as CorpusVerification from '../../compiler/scripts/CorpusVerification.js'
       export const runtimeIntrinsicNames = Verification.runtimeIntrinsicNames
-      if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)
-        NodeRuntime.runMain(Verification.runConfigured(process.execPath).pipe(Effect.provide(NodeServices.layer)))
+      if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+        const args = process.argv.slice(2)
+        let mode = args.length === 0 ? 'formatter' : undefined
+        if (args.length === 2 && args[0] === '--mode') mode = args[1]
+        const verification = Effect.gen(function* () {
+          if (mode === 'formatter') return yield* Verification.runConfigured(process.execPath)
+          if (mode === 'corpus') return yield* CorpusVerification.runConfigured()
+          return yield* new CorpusVerification.VerificationError({
+            operation: 'select verification mode',
+            message: 'Usage: selfhost-verification.mjs [--mode formatter|corpus]',
+            reason: { _tag: 'InvalidInput' },
+          })
+        })
+        NodeRuntime.runMain(verification.pipe(Effect.provide(NodeServices.layer)))
+      }
     `,
     resolveDir: resolve('packages/compiler'),
     sourcefile: 'selfhost-verification.mjs',

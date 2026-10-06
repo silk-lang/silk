@@ -216,7 +216,11 @@ const compareRun = (
   return undefined
 }
 
-export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
+export const runCase = (
+  silkc: string,
+  program: CorpusProgram,
+  stdlib = fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
+): CaseResult => {
   const fixtureGaps = unsupportedFixture(program)
   if (fixtureGaps.length > 0)
     return { name: program.name, status: 'unsupported', gaps: fixtureGaps }
@@ -237,7 +241,7 @@ export const runCase = (silkc: string, program: CorpusProgram): CaseResult => {
           '-o',
           'program',
           '--stdlib',
-          fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
+          stdlib,
           '--optimization',
           profile.optimization,
           '--debug',
@@ -333,6 +337,7 @@ export const runCorpus = (
   corpus: ReadonlyArray<CorpusProgram>,
   required: ReadonlyArray<string>,
   selected?: ReadonlyArray<string>,
+  stdlib?: string,
 ): number => {
   const selectedSet = selected === undefined ? undefined : new Set(selected)
   const programs =
@@ -343,7 +348,7 @@ export const runCorpus = (
   const executable = silkc.includes('/') ? resolve(silkc) : silkc
   const results = programs.map((program) => {
     const started = performance.now()
-    const result = runCase(executable, program)
+    const result = runCase(executable, program, stdlib)
     process.stdout.write(
       `SELFHOST_CASE_TIMING=${JSON.stringify({ name: program.name, elapsedMs: Math.round(performance.now() - started) })}\n`,
     )

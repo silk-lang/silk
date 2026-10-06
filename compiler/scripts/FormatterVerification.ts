@@ -6,10 +6,10 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Stream from 'effect/Stream'
-import * as Schema from 'effect/Schema'
 import * as ChildProcess from 'effect/unstable/process/ChildProcess'
 import * as ChildProcessSpawner from 'effect/unstable/process/ChildProcessSpawner'
 import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
+import * as CorpusVerification from './CorpusVerification.js'
 
 /** Canonical runtime members checked against the consuming selfhost checkout. */
 export const runtimeIntrinsicNames = Intrinsic.inventory()
@@ -49,53 +49,15 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
   self: FormatterVerification,
 ): Effect.fn.Return<
   void,
-  VerificationError | PlatformError.PlatformError,
-  FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+  VerificationError | CorpusVerification.VerificationError | PlatformError.PlatformError,
+  Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
   // Corpus construction uses literal whitespace replacements in authored fixtures.
   // Materialize it once before formatting; its runner still reads the live stdlib.
-  const { nativeCorpus } = yield* Effect.tryPromise({
-    try: () => import('../../packages/compiler/test/support/corpus.js'),
-    catch: (cause) =>
-      new VerificationError({
-        message: 'Could not materialize native corpus scenarios',
-        operation: 'materialize corpus',
-        reason: { _tag: 'WrappedFailure', cause },
-      }),
-  })
-  const { runCorpus } = yield* Effect.tryPromise({
-    try: () => import('./runSelfhostCorpus.js'),
-    catch: (cause) =>
-      new VerificationError({
-        message: 'Could not load the native corpus runner',
-        operation: 'load corpus runner',
-        reason: { _tag: 'WrappedFailure', cause },
-      }),
-  })
+  const corpus = yield* CorpusVerification.materialize()
+  const pins = yield* CorpusVerification.readPins(self, corpus)
   const fs = yield* FileSystem.FileSystem
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
-  // Feature promises belong to selfhost, not the publishing main revision.
-  const trackSource = yield* fs.readFileString(
-    `${self.repository}/compiler/scripts/selfhost-track.json`,
-  )
-  const track = yield* Schema.decodeEffect(
-    Schema.fromJsonString(Schema.NonEmptyArray(Schema.NonEmptyString)),
-  )(trackSource).pipe(
-    Effect.mapError(
-      (cause) =>
-        new VerificationError({
-          operation: 'read selfhost track',
-          message: 'Invalid selfhost corpus track',
-          reason: { _tag: 'WrappedFailure', cause },
-        }),
-    ),
-  )
-  if (new Set(track).size !== track.length)
-    return yield* new VerificationError({
-      operation: 'read selfhost track',
-      message: 'Duplicate selfhost corpus names',
-      reason: { _tag: 'InvalidInput' },
-    })
   const catalog = yield* fs.readFileString(
     `${self.repository}/compiler/src/semantic/IntrinsicCatalog.silk`,
   )
@@ -166,21 +128,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
       operation: 'rebuild formatted compiler',
       reason: { _tag: 'Exit', code: rebuilt },
     })
-  const result = yield* Effect.try({
-    try: () => runCorpus(self.compiler, nativeCorpus, track, self.selected),
-    catch: (cause) =>
-      new VerificationError({
-        message: 'Native corpus execution failed',
-        operation: 'run native corpus',
-        reason: { _tag: 'WrappedFailure', cause },
-      }),
-  })
-  if (result !== 0)
-    return yield* new VerificationError({
-      message: `Native corpus verification exited with ${result}`,
-      operation: 'verify native corpus',
-      reason: { _tag: 'Exit', code: result },
-    })
+  yield* CorpusVerification.execute(self, corpus, pins, self.selected)
 })
 
 /** Resolves CI configuration from the repository directory, then runs verification. */
@@ -188,7 +136,10 @@ export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(fu
   node: string,
 ): Effect.fn.Return<
   void,
-  Config.ConfigError | VerificationError | PlatformError.PlatformError,
+  | Config.ConfigError
+  | VerificationError
+  | CorpusVerification.VerificationError
+  | PlatformError.PlatformError,
   Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
   const path = yield* Path.Path
