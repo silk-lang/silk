@@ -27,7 +27,8 @@ import semantic.DeclarationId {DeclarationId}
 import semantic.Type {Argument, Binding, ArrayShape, CallableFieldInput, Requirement, Row, RowParameter, Type}
 import semantic.Lifetime {Intersection, Member as Region}
 import semantic.Intrinsic as CheckedIntrinsic
-import semantic.Intrinsic {Member as IntrinsicMember}
+import semantic.Intrinsic {Member as IntrinsicMember, Primitive as IntrinsicPrimitive}
+import semantic.ScalarOperation {Code as ScalarCode, Scalar, ScalarOperation}
 import semantic.TypedBody {
   ConsumedPlace as BodyConsumedPlace,
   Expression as BodyExpression,
@@ -133,8 +134,17 @@ pub union Rvalue {
   AddressOf {pub access: Access, pub place: Place},
   Unary {pub operation: PrefixOperator, pub value: Operand},
   Binary {pub operation: InfixOperator, pub left: Operand, pub right: Operand},
-  /// Zero-extends an unsigned integer primitive into a strictly wider integer primitive.
-  UnsignedWiden {pub value: Operand, pub ty: Shared<Type>},
+  /// A scalar operation with no source operator; both operands have the same scalar type.
+  ScalarBinary {pub operation: ScalarBinary, pub left: Operand, pub right: Operand},
+  /// A floating-point classification or square root.
+  ScalarUnary {pub operation: ScalarUnary, pub value: Operand},
+  /// Converts a numeric scalar to the numeric scalar `ty`. An integer result outside `ty`'s range
+  /// traps, as does a NaN or out-of-range floating source of an integer result; an integer or
+  /// wider floating source of a floating result rounds to nearest, ties to even.
+  Convert {pub value: Operand, pub ty: Shared<Type>},
+  /// Whether an integer is exactly representable as the integer `ty`; for `char`, whether it is a
+  /// Unicode scalar value.
+  Fits {pub value: Operand, pub ty: Shared<Type>},
   /// Compiler expansion transports native data-address bits through exactly target usize.
   AddressIntegerConversion {pub operand: Operand, pub destinationType: Shared<Type>},
   Bitcast {pub value: Operand, pub ty: Shared<Type>},
@@ -148,6 +158,50 @@ pub union Rvalue {
   FunctionAddress {pub key: InstanceKey},
   /// The address of failure slot `place`'s context companion: a selected cause (N2).
   ContextOf {pub place: Place},
+}
+
+/// An integer or floating-point operation selected by a sealed scalar intrinsic that no source
+/// operator spells.
+pub enum ScalarBinary {
+  /// Traps unless the count is less than the operand width.
+  ShiftLeft,
+  /// Logical for unsigned and arithmetic for signed operands; traps unless the count is less than
+  /// the operand width.
+  ShiftRight,
+  /// Rotates by the count modulo the operand width.
+  RotateLeft,
+  RotateRight,
+  /// Modulo 2^width arithmetic.
+  WrappingAdd,
+  WrappingSubtract,
+  WrappingMultiply,
+  /// Clamps at the operand type's minimum or maximum.
+  SaturatingAdd,
+  SaturatingSubtract,
+  SaturatingMultiply,
+  /// IEEE 754 totalOrder of two floating values: whether `left` orders before or equals `right`.
+  TotalOrder,
+  /// Whether the exact sum, difference or product leaves the operand type's range.
+  AddOverflows,
+  SubtractOverflows,
+  MultiplyOverflows,
+  /// Whether `left / right` is undefined: a zero divisor, or the signed minimum divided by -1.
+  DivisionUndefined,
+}
+
+/// A floating-point operation selected by a sealed scalar intrinsic.
+pub enum ScalarUnary {
+  IsNaN,
+  IsInfinite,
+  IsFinite,
+  IsNormal,
+  IsSubnormal,
+  IsSignNegative,
+  /// The correctly rounded IEEE 754 square root.
+  Sqrt,
+  /// The bootstrap's deterministic sine and cosine kernels.
+  Sin,
+  Cos,
 }
 
 pub union Statement {
@@ -325,7 +379,11 @@ pub struct CallOperand {
 
 pub struct CallTarget {
   pub node: BodyNodeId
+  /// The canonical callee instance; see [`InstanceKey.withProviders`].
   pub key: InstanceKey
+  /// The call edge's actual application, before `key` numbered its caller regions. Providers are
+  /// served from these actual regions.
+  pub application: Application
   pub edge: Edge
   /// Descriptor projections between a temporary source view and its original environment.
   pub receiverDereferences: usize
@@ -433,6 +491,15 @@ struct BoundPlace {
   place: Place
 }
 
+/// The prepared invocations of one checked scalar operation's carriers (by call node).
+pub struct CarrierPlan {
+  pub node: BodyNodeId
+  /// Invoked with the operation's exact result when it exists.
+  pub present: CallTarget
+  /// Invoked with no argument otherwise.
+  pub absent: CallTarget
+}
+
 /// The expansion prepared for one `run` of a composed Effect: its steps, each after the steps it
 /// runs, so the root is last.
 pub struct NodePlan {
@@ -488,6 +555,8 @@ struct Builder {
   failure: usize
   // The expansions of runs of composed Effects, each consumed by its run node.
   plans: Vector<NodePlan>
+  // The carrier invocations of checked scalar operations, each consumed by its call node.
+  carriers: Vector<CarrierPlan>
   // This function's `Provider` locals in canonical requirement-key order.
   providers: Vector<usize>
   // The current observer and selected-cause addresses passed to Silk callees; absent unless the
@@ -2647,7 +2716,10 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Intrinsic {member, node: callNode, ty, origin} => {
-      if member == IntrinsicMember.ObserveUnhandled { return run observeUnhandled(&mut builder.*, &ty, origin) }
+      if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ObserveUnhandled) { return run observeUnhandled(&mut builder.*, &ty, origin) }
+      if let Option<ScalarOperation>.Some {value: checked} = move checkedOperation(member) {
+        return run checkedScalar(&mut builder.*, body, hir, callNode, checked, &ty, origin)
+      }
       let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, member, &ty, origin)
       let output = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(output), move operation, origin)
@@ -2707,25 +2779,40 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   }
 }
 
-// Capture borrowed scalar operands before a later argument can change their referents.
-effect fn intrinsicOperand(
+// Lowers argument `index` of an intrinsic call in source order, like an ordinary call argument.
+effect fn intrinsicArgument(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
   hir: &Module,
-  child: BodyNodeId,
-  member: IntrinsicMember,
+  callNode: BodyNodeId,
+  index: usize,
   origin: Origin,
 ) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
-  let input = run expression(&mut builder.*, body, hir, child)
-  if !CheckedIntrinsic.borrowsOperands(member) { return move input }
   let owner = InstanceKey.identity(&builder.function.key)
-  let mut borrowed = match move input {
-    Operand.Copy {place: selected} => move selected
-    Operand.Move {place: selected} => move selected
-    _ => run unsupported(&owner, origin, GapCode.ExpectedPlace)
+  let child = match move childAt(body, callNode, index) {
+    Option<BodyNodeId>.Some {value} => value
+    Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
   }
+  return run expression(&mut builder.*, body, hir, child)
+}
+
+// Lowers one scalar operand, reading a borrowed operand's referent before a later argument can
+// change it.
+effect fn scalarOperand(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  index: usize,
+  operation: ScalarOperation,
+  origin: Origin,
+) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let input = run intrinsicArgument(&mut builder.*, body, hir, callNode, index, origin)
+  if !ScalarOperation.borrows(operation) { return move input }
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut borrowed = run operandPlace(&owner, move input, origin)
   run Vector.append<Projection>(&mut borrowed.projections, Projection.Deref)
-  let ty = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"i32")})
+  let ty = run CheckedIntrinsic.scalarType(ScalarOperation.operand(operation))
   let output = run temporary(&mut builder.*, &ty, origin)
   run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move borrowed}}, origin)
   return Operand.Copy {place: place(output)}
@@ -2740,77 +2827,242 @@ effect fn intrinsicRvalue(
   ty: &Shared<Type>,
   origin: Origin,
 ) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  return match member {
+    IntrinsicMember.Scalar {operation} => run scalarRvalue(&mut builder.*, body, hir, callNode, operation, ty, origin)
+    IntrinsicMember.Primitive {primitive} => run primitiveRvalue(&mut builder.*, body, hir, callNode, primitive, ty, origin)
+  }
+}
+
+// The MIR operation of a scalar intrinsic with no source operator, if it has one.
+fn scalarBinary(code: ScalarCode) -> Option<ScalarBinary> {
+  return match code {
+    ScalarCode.ShiftLeft => Option.some<ScalarBinary>(ScalarBinary.ShiftLeft)
+    ScalarCode.ShiftRight => Option.some<ScalarBinary>(ScalarBinary.ShiftRight)
+    ScalarCode.RotateLeft => Option.some<ScalarBinary>(ScalarBinary.RotateLeft)
+    ScalarCode.RotateRight => Option.some<ScalarBinary>(ScalarBinary.RotateRight)
+    ScalarCode.WrappingAdd => Option.some<ScalarBinary>(ScalarBinary.WrappingAdd)
+    ScalarCode.WrappingSubtract => Option.some<ScalarBinary>(ScalarBinary.WrappingSubtract)
+    ScalarCode.WrappingMultiply => Option.some<ScalarBinary>(ScalarBinary.WrappingMultiply)
+    ScalarCode.SaturatingAdd => Option.some<ScalarBinary>(ScalarBinary.SaturatingAdd)
+    ScalarCode.SaturatingSubtract => Option.some<ScalarBinary>(ScalarBinary.SaturatingSubtract)
+    ScalarCode.SaturatingMultiply => Option.some<ScalarBinary>(ScalarBinary.SaturatingMultiply)
+    ScalarCode.TotalOrder => Option.some<ScalarBinary>(ScalarBinary.TotalOrder)
+    _ => Option.none<ScalarBinary>()
+  }
+}
+
+fn scalarUnary(code: ScalarCode) -> Option<ScalarUnary> {
+  return match code {
+    ScalarCode.IsNaN => Option.some<ScalarUnary>(ScalarUnary.IsNaN)
+    ScalarCode.IsInfinite => Option.some<ScalarUnary>(ScalarUnary.IsInfinite)
+    ScalarCode.IsFinite => Option.some<ScalarUnary>(ScalarUnary.IsFinite)
+    ScalarCode.IsNormal => Option.some<ScalarUnary>(ScalarUnary.IsNormal)
+    ScalarCode.IsSubnormal => Option.some<ScalarUnary>(ScalarUnary.IsSubnormal)
+    ScalarCode.IsSignNegative => Option.some<ScalarUnary>(ScalarUnary.IsSignNegative)
+    ScalarCode.Sqrt => Option.some<ScalarUnary>(ScalarUnary.Sqrt)
+    ScalarCode.Sin => Option.some<ScalarUnary>(ScalarUnary.Sin)
+    ScalarCode.Cos => Option.some<ScalarUnary>(ScalarUnary.Cos)
+    _ => Option.none<ScalarUnary>()
+  }
+}
+
+// Scalar intrinsics with a source operator reuse it; the rest select one scalar MIR operation.
+// Negations without an operator subtract from zero with their own overflow policy.
+effect fn scalarRvalue(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  operation: ScalarOperation,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
-  let first = match move childAt(body, callNode, usize.ZERO) {
-    Option<BodyNodeId>.Some {value} => value
-    Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
-  }
-  let left = run intrinsicOperand(&mut builder.*, body, hir, first, member, origin)
-  if let Option<InfixOperator>.Some {value: binary} = move CheckedIntrinsic.binary(member) {
-    let second = match move childAt(body, callNode, usize.ONE) {
-      Option<BodyNodeId>.Some {value} => value
-      Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
+  let first = run scalarOperand(&mut builder.*, body, hir, callNode, usize.ZERO, operation, origin)
+  if ScalarOperation.arity(operation) == usize.ONE {
+    if let Option<PrefixOperator>.Some {value: prefix} = move ScalarOperation.prefix(operation) {
+      return Rvalue.Unary {operation: prefix, value: move first}
     }
-    let right = run intrinsicOperand(&mut builder.*, body, hir, second, member, origin)
-    return Rvalue.Binary {operation: binary, left: move left, right: move right}
-  }
-  if let Option<PrefixOperator>.Some {value: unary} = move CheckedIntrinsic.unary(member) {
-    return Rvalue.Unary {operation: unary, value: move left}
-  }
-  if member == IntrinsicMember.U8ToI32 {
-    return Rvalue.UnsignedWiden {value: move left, ty: Shared.clone<Type>(ty)}
-  }
-  if CheckedIntrinsic.isBitcast(member) {
-    return Rvalue.Bitcast {value: move left, ty: Shared.clone<Type>(ty)}
-  }
-  // Pointer requalification keeps the address and representation.
-  if member == IntrinsicMember.PointerRequalify {
-    return Rvalue.Use {value: move left}
-  }
-  // CONV-002: a negative `isize` traps; otherwise the same-width bits are the `usize`.
-  if member == IntrinsicMember.IsizeToUsize {
-    let signed = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"isize")})
-    let captured = run temporary(&mut builder.*, &signed, origin)
-    run assign(&mut builder.*, place(captured), Rvalue.Use {value: move left}, origin)
-    let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
-    let condition = run temporary(&mut builder.*, &boolean, origin)
-    run assign(&mut builder.*, place(condition), Rvalue.Binary {
-      operation: InfixOperator.GreaterOrEqual,
-      left: Operand.Copy {place: place(captured)},
-      right: Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: move signed},
-    }, origin)
-    let safe = run block(&mut builder.*, origin)
-    let trap = run block(&mut builder.*, origin)
-    terminate(&mut builder.*, Terminator.Branch {
-      condition: Operand.Copy {place: place(condition)}, thenBlock: safe, elseBlock: trap, origin: origin,
-    })
-    resume(&mut builder.*, trap)
-    terminate(&mut builder.*, Terminator.Trap {origin: origin})
-    resume(&mut builder.*, safe)
-    return Rvalue.Use {value: Operand.Copy {place: place(captured)}}
-  }
-  if member == IntrinsicMember.PointerFromSlice {
-    return Rvalue.SliceData {place: run operandPlace(&owner, move left, origin)}
-  }
-  if member == IntrinsicMember.PointerRead {
-    let mut read = run operandPlace(&owner, move left, origin)
-    run Vector.append<Projection>(&mut read.projections, Projection.Deref)
-    return Rvalue.Use {value: Operand.Copy {place: move read}}
-  }
-  if member == IntrinsicMember.PointerAt {
-    let second = match move childAt(body, callNode, usize.ONE) {
-      Option<BodyNodeId>.Some {value} => value
-      Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
+    if let Option<ScalarUnary>.Some {value: unary} = move scalarUnary(operation.code) {
+      return Rvalue.ScalarUnary {operation: unary, value: move first}
     }
-    let index = run intrinsicOperand(&mut builder.*, body, hir, second, member, origin)
-    let pointee = Shared.with<Type, Option<Shared<Type>>>(ty, pointeeOf)
-    let element = match move pointee {
-      Option<Shared<Type>>.Some {value} => value
-      Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+    if operation.code == ScalarCode.WrappingNegate || operation.code == ScalarCode.SaturatingNegate {
+      let zero = Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: Shared.clone<Type>(ty)}
+      let mut subtract = ScalarBinary.WrappingSubtract
+      if operation.code == ScalarCode.SaturatingNegate { subtract = ScalarBinary.SaturatingSubtract }
+      return Rvalue.ScalarBinary {operation: subtract, left: move zero, right: move first}
     }
-    return Rvalue.PointerOffset {pointer: move left, index: move index, element: move element}
+    if operation.code == ScalarCode.ToBits || operation.code == ScalarCode.FromBits {
+      return Rvalue.Bitcast {value: move first, ty: Shared.clone<Type>(ty)}
+    }
+    if operation.code == ScalarCode.Convert {
+      return Rvalue.Convert {value: move first, ty: Shared.clone<Type>(ty)}
+    }
+    return run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  }
+  let second = run scalarOperand(&mut builder.*, body, hir, callNode, usize.ONE, operation, origin)
+  if let Option<InfixOperator>.Some {value: infix} = move ScalarOperation.infix(operation) {
+    return Rvalue.Binary {operation: infix, left: move first, right: move second}
+  }
+  if let Option<ScalarBinary>.Some {value: binary} = move scalarBinary(operation.code) {
+    return Rvalue.ScalarBinary {operation: binary, left: move first, right: move second}
   }
   return run unsupported(&owner, origin, GapCode.IntrinsicMember)
+}
+
+// The instance type of argument `index` of an intrinsic call.
+effect fn intrinsicArgumentType(builder: &Builder, body: &Shared<TypedBody>, callNode: BodyNodeId, index: usize) -> Option<Shared<Type>>
+! OutOfMemoryError ? &mut Allocator {
+  return match move childAt(body, callNode, index) {
+    Option<BodyNodeId>.Some {value: child} => run instanceNodeType(&builder.*, body, child)
+    Option<BodyNodeId>.None => Option.none<Shared<Type>>()
+  }
+}
+
+// Continues only when `condition` holds; otherwise the program traps.
+effect fn trapUnless(builder: &mut Builder, condition: Operand, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  let safe = run block(&mut builder.*, origin)
+  let trap = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move condition, thenBlock: safe, elseBlock: trap, origin: origin})
+  resume(&mut builder.*, trap)
+  terminate(&mut builder.*, Terminator.Trap {origin: origin})
+  resume(&mut builder.*, safe)
+  return ()
+}
+
+effect fn primitiveRvalue(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  primitive: IntrinsicPrimitive,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  // A null pointer has no argument.
+  if primitive == IntrinsicPrimitive.PointerNull {
+    return Rvalue.Use {value: Operand.Null {ty: Shared.clone<Type>(ty)}}
+  }
+  let first = run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ZERO, origin)
+  return match primitive {
+    IntrinsicPrimitive.PointerFromSlice => Rvalue.SliceData {place: run operandPlace(&owner, move first, origin)}
+    IntrinsicPrimitive.PointerFromMutSlice => Rvalue.SliceData {place: run operandPlace(&owner, move first, origin)}
+    // Address formation keeps the referent's address and representation.
+    IntrinsicPrimitive.PointerFromRef => Rvalue.Use {value: move first}
+    IntrinsicPrimitive.PointerFromMutRef => Rvalue.Use {value: move first}
+    // Qualifier changes keep the address and representation.
+    IntrinsicPrimitive.PointerRequalify => Rvalue.Use {value: move first}
+    IntrinsicPrimitive.PointerReinterpret => Rvalue.Use {value: move first}
+    IntrinsicPrimitive.PointerBytes => Rvalue.Use {value: move first}
+    IntrinsicPrimitive.PointerAddress => Rvalue.AddressIntegerConversion {operand: move first, destinationType: Shared.clone<Type>(ty)}
+    IntrinsicPrimitive.PointerIsNull => {
+      let pointer = match move run intrinsicArgumentType(&builder.*, body, callNode, usize.ZERO) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+      }
+      return Rvalue.Binary {operation: InfixOperator.Equals, left: move first, right: Operand.Null {ty: move pointer}}
+    }
+    IntrinsicPrimitive.PointerRead => {
+      let mut read = run operandPlace(&owner, move first, origin)
+      run Vector.append<Projection>(&mut read.projections, Projection.Deref)
+      return Rvalue.Use {value: Operand.Copy {place: move read}}
+    }
+    IntrinsicPrimitive.PointerReadUnaligned => {
+      let mut read = run operandPlace(&owner, move first, origin)
+      run Vector.append<Projection>(&mut read.projections, Projection.Deref)
+      return Rvalue.Use {value: Operand.Copy {place: move read}}
+    }
+    IntrinsicPrimitive.PointerWrite => run pointerWrite(&mut builder.*, body, hir, callNode, move first, origin)
+    IntrinsicPrimitive.PointerWriteUnaligned => run pointerWrite(&mut builder.*, body, hir, callNode, move first, origin)
+    IntrinsicPrimitive.PointerAt => run pointerAt(&mut builder.*, body, hir, callNode, move first, ty, origin)
+    IntrinsicPrimitive.PointerAtMut => run pointerAt(&mut builder.*, body, hir, callNode, move first, ty, origin)
+    IntrinsicPrimitive.SliceView => run sliceView(&mut builder.*, body, hir, callNode, move first, ty, origin)
+    _ => run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  }
+}
+
+// Stores the second argument through the first; the call's own value is unit.
+effect fn pointerWrite(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  pointer: Operand,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let value = run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ONE, origin)
+  let mut written = run operandPlace(&owner, move pointer, origin)
+  run Vector.append<Projection>(&mut written.projections, Projection.Deref)
+  run assign(&mut builder.*, move written, Rvalue.Use {value: move value}, origin)
+  return Rvalue.Use {value: Operand.Unit}
+}
+
+effect fn pointerAt(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  pointer: Operand,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let index = run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ONE, origin)
+  let element = match move Shared.with<Type, Option<Shared<Type>>>(ty, pointeeOf) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+  }
+  return Rvalue.PointerOffset {pointer: move pointer, index: move index, element: move element}
+}
+
+// `sliceView(values, offset, length)` traps unless `offset <= values.length` and
+// `length <= values.length - offset`, then describes `length` elements from `offset`.
+effect fn sliceView(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  values: Operand,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Rvalue ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let offset = run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ONE, origin)
+  let length = run intrinsicArgument(&mut builder.*, body, hir, callNode, 2, origin)
+  let element = match move Type.sliceElement(ty) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+  }
+  let descriptor = run operandPlace(&owner, move values, origin)
+  let word = run CheckedIntrinsic.scalarType(Scalar.Usize)
+  let boolean = run CheckedIntrinsic.scalarType(Scalar.Bool)
+  let count = run temporary(&mut builder.*, &word, origin)
+  run assign(&mut builder.*, place(count), Rvalue.SliceLength {place: run copyPlace(&descriptor)}, origin)
+  let start = run temporary(&mut builder.*, &word, origin)
+  run assign(&mut builder.*, place(start), Rvalue.Use {value: move offset}, origin)
+  let extent = run temporary(&mut builder.*, &word, origin)
+  run assign(&mut builder.*, place(extent), Rvalue.Use {value: move length}, origin)
+  let within = run temporary(&mut builder.*, &boolean, origin)
+  run assign(&mut builder.*, place(within), Rvalue.Binary {operation: InfixOperator.LessOrEqual,
+    left: Operand.Copy {place: place(start)}, right: Operand.Copy {place: place(count)}}, origin)
+  run trapUnless(&mut builder.*, Operand.Copy {place: place(within)}, origin)
+  let remaining = run temporary(&mut builder.*, &word, origin)
+  run assign(&mut builder.*, place(remaining), Rvalue.Binary {operation: InfixOperator.Subtract,
+    left: Operand.Copy {place: place(count)}, right: Operand.Copy {place: place(start)}}, origin)
+  let fits = run temporary(&mut builder.*, &boolean, origin)
+  run assign(&mut builder.*, place(fits), Rvalue.Binary {operation: InfixOperator.LessOrEqual,
+    left: Operand.Copy {place: place(extent)}, right: Operand.Copy {place: place(remaining)}}, origin)
+  run trapUnless(&mut builder.*, Operand.Copy {place: place(fits)}, origin)
+  let addressType = run Shared.make<Type>(Type.Pointer {pointee: Shared.clone<Type>(&element), access: Access.Shared,
+    nullable: true, multiplicity: Multiplicity.Many, alignment: Option.none<u64>()})
+  let data = run temporary(&mut builder.*, &addressType, origin)
+  run assign(&mut builder.*, place(data), Rvalue.SliceData {place: move descriptor}, origin)
+  let selected = run temporary(&mut builder.*, &addressType, origin)
+  run assign(&mut builder.*, place(selected), Rvalue.PointerOffset {pointer: Operand.Copy {place: place(data)},
+    index: Operand.Copy {place: place(start)}, element: move element}, origin)
+  return Rvalue.Slice {data: Operand.Copy {place: place(selected)}, count: Operand.Copy {place: place(extent)}}
 }
 
 fn pointeeOf(value: &Type) -> Option<Shared<Type>> {
@@ -3591,6 +3843,110 @@ effect fn widenInto(builder: &mut Builder, caught: usize, from: &Shared<Type>, d
     }
   }
   return ()
+}
+
+// A checked scalar operation decides whether its exact result exists, then invokes exactly one
+// carrier: `present` with that result, or `absent`. Each path consumes only its own carrier.
+effect fn checkedScalar(
+  builder: &mut Builder,
+  body: &Shared<TypedBody>,
+  hir: &Module,
+  callNode: BodyNodeId,
+  operation: ScalarOperation,
+  ty: &Shared<Type>,
+  origin: Origin,
+) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let plan = match move takeCarrierPlan(&mut builder.*, callNode) {
+    Option<CarrierPlan>.Some {value} => value
+    Option<CarrierPlan>.None => run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  }
+  let arity = ScalarOperation.arity(operation)
+  let operandType = run CheckedIntrinsic.scalarType(ScalarOperation.operand(operation))
+  let valueType = run CheckedIntrinsic.scalarType(ScalarOperation.result(operation))
+  let boolean = run CheckedIntrinsic.scalarType(Scalar.Bool)
+  let left = run temporary(&mut builder.*, &operandType, origin)
+  let first = run scalarOperand(&mut builder.*, body, hir, callNode, usize.ZERO, operation, origin)
+  run assign(&mut builder.*, place(left), Rvalue.Use {value: move first}, origin)
+  let right = run temporary(&mut builder.*, &operandType, origin)
+  if arity == 2 {
+    let second = run scalarOperand(&mut builder.*, body, hir, callNode, usize.ONE, operation, origin)
+    run assign(&mut builder.*, place(right), Rvalue.Use {value: move second}, origin)
+  }
+  let present = run intrinsicArgument(&mut builder.*, body, hir, callNode, arity, origin)
+  let absent = run intrinsicArgument(&mut builder.*, body, hir, callNode, arity + usize.ONE, origin)
+  if !builder.live { return Operand.Unit }
+  let presentPlace = run operandPlace(&owner, move present, origin)
+  let absentPlace = run operandPlace(&owner, move absent, origin)
+  let exists = run temporary(&mut builder.*, &boolean, origin)
+  if operation.code == ScalarCode.CheckedConvert {
+    run assign(&mut builder.*, place(exists), Rvalue.Fits {value: Operand.Copy {place: place(left)},
+      ty: Shared.clone<Type>(&valueType)}, origin)
+  } else {
+    let mut failure = ScalarBinary.DivisionUndefined
+    if operation.code == ScalarCode.CheckedAdd { failure = ScalarBinary.AddOverflows }
+    if operation.code == ScalarCode.CheckedSubtract { failure = ScalarBinary.SubtractOverflows }
+    if operation.code == ScalarCode.CheckedMultiply { failure = ScalarBinary.MultiplyOverflows }
+    let undefined = run temporary(&mut builder.*, &boolean, origin)
+    run assign(&mut builder.*, place(undefined), Rvalue.ScalarBinary {operation: failure,
+      left: Operand.Copy {place: place(left)}, right: Operand.Copy {place: place(right)}}, origin)
+    run assign(&mut builder.*, place(exists), Rvalue.Unary {operation: PrefixOperator.Not,
+      value: Operand.Copy {place: place(undefined)}}, origin)
+  }
+  let output = run temporary(&mut builder.*, ty, origin)
+  let presentBlock = run block(&mut builder.*, origin)
+  let absentBlock = run block(&mut builder.*, origin)
+  let joined = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(exists)}, thenBlock: presentBlock,
+    elseBlock: absentBlock, origin: origin})
+  resume(&mut builder.*, presentBlock)
+  // On this path the operation is defined, so its ordinary or wrapping form is exact.
+  let mut exact = Rvalue.Convert {value: Operand.Copy {place: place(left)}, ty: Shared.clone<Type>(&valueType)}
+  if operation.code == ScalarCode.CheckedAdd || operation.code == ScalarCode.CheckedSubtract || operation.code == ScalarCode.CheckedMultiply {
+    let mut wrapping = ScalarBinary.WrappingAdd
+    if operation.code == ScalarCode.CheckedSubtract { wrapping = ScalarBinary.WrappingSubtract }
+    if operation.code == ScalarCode.CheckedMultiply { wrapping = ScalarBinary.WrappingMultiply }
+    exact = Rvalue.ScalarBinary {operation: wrapping, left: Operand.Copy {place: place(left)}, right: Operand.Copy {place: place(right)}}
+  }
+  if operation.code == ScalarCode.CheckedDivide || operation.code == ScalarCode.CheckedRemainder {
+    let mut quotient = InfixOperator.Divide
+    if operation.code == ScalarCode.CheckedRemainder { quotient = InfixOperator.Remainder }
+    exact = Rvalue.Binary {operation: quotient, left: Operand.Copy {place: place(left)}, right: Operand.Copy {place: place(right)}}
+  }
+  let produced = run temporary(&mut builder.*, &valueType, origin)
+  run assign(&mut builder.*, place(produced), move exact, origin)
+  let never = run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+  let unbound = Vector.make<BoundPlace>()
+  run planCall(&mut builder.*, &plan.present, &presentPlace, run singleOperand(Operand.Copy {place: place(produced)}), ty,
+    &never, output, &FailureSink.Propagate, Vector.asSlice<BoundPlace>(&unbound), origin)
+  terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+  resume(&mut builder.*, absentBlock)
+  run planCall(&mut builder.*, &plan.absent, &absentPlace, Vector.make<Operand>(), ty, &never, output, &FailureSink.Propagate,
+    Vector.asSlice<BoundPlace>(&unbound), origin)
+  terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+  resume(&mut builder.*, joined)
+  return Operand.Move {place: place(output)}
+}
+
+fn takeCarrierPlan(builder: &mut Builder, node: BodyNodeId) -> Option<CarrierPlan> {
+  let mut at = usize.ZERO
+  while at < Vector.length<CarrierPlan>(&builder.carriers) {
+    if Vector.asSlice<CarrierPlan>(&builder.carriers)[at].node.index == node.index {
+      return Option.some<CarrierPlan>(Vector.remove<CarrierPlan>(&mut builder.*.carriers, at))
+    }
+    at = at + usize.ONE
+  }
+  return Option.none<CarrierPlan>()
+}
+
+fn checkedOperation(member: IntrinsicMember) -> Option<ScalarOperation> {
+  return match member {
+    IntrinsicMember.Scalar {operation} => {
+      if ScalarOperation.checked(operation) { return Option.some<ScalarOperation>(operation) }
+      return Option.none<ScalarOperation>()
+    }
+    IntrinsicMember.Primitive {..} => Option.none<ScalarOperation>()
+  }
 }
 
 fn takePlan(builder: &mut Builder, node: BodyNodeId) -> Option<Vector<RunPlan>> {
@@ -4759,13 +5115,15 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
       }
       run Vector.append<BodyNodeId>(&mut output.*, node)
     }
-    View.Intrinsic {node, ..} => {
+    View.Intrinsic {member, node, ..} => {
       let mut at = usize.ZERO
       while true {
         let child = match move childAt(body, node, at) { Option<BodyNodeId>.Some {value} => value _ => { break } }
         drop run collectCallNodes(body, child, &mut output.*)
         at = at + usize.ONE
       }
+      // A checked scalar operation invokes one of its carriers.
+      if let Option<ScalarOperation>.Some {..} = move checkedOperation(member) { run Vector.append<BodyNodeId>(&mut output.*, node) }
     }
     View.Aggregate {node, ..} => {
       let mut at = usize.ZERO
@@ -4983,6 +5341,7 @@ impl MirFunction {
     providers: &[Shared<Type>],
     calls: Vector<CallTarget>,
     plans: Vector<NodePlan>,
+    carriers: Vector<CarrierPlan>,
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
     projections: Vector<RuntimeProjection>,
@@ -5086,6 +5445,7 @@ impl MirFunction {
       needs: move needs,
       failure: failureLocal,
       plans: move plans,
+      carriers: move carriers,
       providers: move providerLocals,
       diagnostics: move diagnostics,
       sites: move sites,

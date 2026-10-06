@@ -464,10 +464,10 @@ Each entry records:
     the bootstrap requires equal environments.
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
-  different join reports the named `nested-effect-join` gap. Constructing an interface operation's
-  Effect reports `interface-effect-witness`. An Effect result with no producer body (an interface
-  operation's) and Effect-producing callables inferred from `effect fn` values (handlers passed to
-  `Effect.catch`, `catchAll`, `flatMap`) remain `effect-form`.
+  different join reports the named `nested-effect-join` gap. An Effect result with no producer
+  body (an interface operation's declared `Effect<...>` result) and Effect-producing callables
+  inferred from `effect fn` values (handlers passed to `Effect.catch`, `catchAll`, `flatMap`)
+  remain `effect-form`. Interface `effect fn` calls have their own entry below.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
@@ -476,6 +476,38 @@ Each entry records:
   `match-statement-arm-control` and `effect-access-forwarding`.
 - **Owner:** nested join re-injection and Effect-producing callable inference: #567 Step 9
   follow-ups.
+
+### Interface `effect fn` operations in selfhost
+
+- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); narrower
+  remainders below.
+- **Rule:** [INTF-006](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-006--a-qualified-interface-call-requires-one-static-application)
+  lets an unapplied qualified call `Interface.operation(value)` take its one application from the
+  provider's conformances. Under
+  [INTF-005](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-005--interface-operations-use-their-declared-ownership-and-effect-contracts)
+  and [EFF-009](apps/docs/content/reference/effect-contracts.md#eff-009--declared-failure-and-requirement-channels-are-upper-bounds),
+  calling an `effect fn` operation constructs the Effect its applied contract promises, with the
+  interface's failure `E` and row `?R`; those channels bound every conforming witness.
+- **Compilers:** both infer the application from the provider's conformance heads and reject a
+  provider with several applications (bootstrap `SEM0202`, selfhost `AmbiguousConformanceMethod`)
+  or none (`MissingConformance`). Selfhost executes a `run` whose immediate operand is such a call
+  as one direct call of the selected witness, with the call's failure edge typed by the promised
+  failure; there is no adapter or runtime dispatch. Selfhost infers the provider from the first
+  operand only; the bootstrap uses the operand whose declared type is `Self` or `&Self`.
+- **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
+  to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
+  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. MIR
+  reports `interface-effect-witness` when the selected witness declares a failure other than the
+  promised one (for example `never` against `! Problem`): that call needs failure-edge adaptation.
+  The pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+- **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
+  and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
+  failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, the narrower
+  witness gap, and the ambiguous, missing, bound and returned rejections at their call spans.
+  `providersServeRowsInKeyOrder` lowers `run Present.present(value)` to a witness call. The native
+  corpus pins `borrowed-outcome-stream` and `generic-inline-effect-conformance`.
+- **Owner:** stored constructions, failure adaptation, receiver-method, operator and pipeline
+  forms: #567 Step 9 follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 
@@ -1287,19 +1319,25 @@ main-first integration of both contracts. See
 [the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
 and validation details. Fatal traps retain their existing behavior and do not promise cleanup.
 
-### Native deferred written-pattern lifetime elision
+### Native body-annotation lifetime elision by equality
 
-The bootstrap permits omitted reference lifetimes in an otherwise matching written union-pattern
-type. Native reports the existing `body-lifetime-elision` gap until that ordinary lifetime
-mechanism is represented. This does not admit the selection. The pattern guard retains the specific
-annotation's generated lifetime evidence and requires exact nominal owners, static and row
-arguments, reference access and referents, and every other structural component. Any ordinary
-mismatch retains `TypeMismatch`, including a conflicting explicit lifetime or another mismatching
-type argument after an omitted reference.
+Under LIFE-003 a body annotation infers the lifetimes it omits from its uses. The bootstrap gives
+each one a body-scoped region and solves the body's outlives constraints. Native infers each one
+by equality with the value the annotation describes: a pattern annotation or variant qualifier
+from the subject it matches, a binding annotation from its initializer, and a written constructor
+qualifier from its operands or a same-owner expectation. Every written part must still agree
+exactly, so a conflicting explicit lifetime, a different owner, referent or access, and any other
+mismatching argument keep `TypeMismatch`.
 
-Sealed Allocation admission can expose this pre-existing downstream gap; a prior core-type refusal
-did not establish lifetime support. Native focused cases retain exact success and negative
-code/span controls alongside the named refusal.
+Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
+elides a lifetime checks its initializer without contextual expectation, so a context-typed
+initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
+exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit
+call-site generic arguments and qualified calls that elide a lifetime, and a constructor whose
+elided lifetime is reached only through an alias, keep the `body-lifetime-elision` gap: a call
+argument's elided lifetime needs a slot of the call's own inference that the expected result
+and every operand (including a static `String` and a caller-local loan) can shorten, which waits
+on caller-local region relations.
 
 ### Native typing retains unproven caller-local region relations
 
