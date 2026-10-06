@@ -7,6 +7,8 @@ import * as Path from 'effect/Path'
 import * as Result from 'effect/Result'
 import * as Schema from 'effect/Schema'
 import * as Analysis from '@silklang/compiler/Analysis'
+import * as AuthoredIdentity from '@silklang/compiler/AuthoredIdentity'
+import type * as DeclarationFacts from '@silklang/compiler/DeclarationFacts'
 import * as Instances from '@silklang/compiler/Instances'
 import * as SourceFile from '@silklang/compiler/SourceFile'
 import * as StaticValue from '@silklang/compiler/StaticValue'
@@ -44,6 +46,304 @@ const retainingMain = Effect.fnUntraced(function* (root: string, bytes: Uint8Arr
     ),
   )
 })
+
+const inlineSource = `interface Read<T> { fn read(self: &Self) -> T }
+struct Box<T> { value: T }
+impl<T: Copy> Read<T> for Box<T> { fn read(self: &Self) -> T { return self.value } }
+struct Other { value: i32 }
+impl Read<i32> for Other { fn read(self: &Self) -> i32 { return self.value } }
+struct Mapped { value: i32 }
+impl Mapped { fn read(self: &Self) -> i32 { return self.value } }
+impl Read<i32> for Mapped { read: Mapped.read }
+fn get<T, P: Read<T>>(provider: &P) -> T { return Read<T>.read(provider) }
+service Source { effect fn load() -> i32 ? &mut Source }
+struct Provider {}
+impl Source for Provider { effect fn load(self: &mut Self) -> i32 { return 42 } }
+pub fn main() -> i32 {
+  let first = Box<i32> { value: 42 }
+  let narrow = Box<u8> { value: 1 }
+  let other = Other { value: 3 }
+  let mapped = Mapped { value: 4 }
+  let mut provider = Provider {}
+  let value = get<i32, Box<i32>>(&first)
+  let byte = get<u8, Box<u8>>(&narrow)
+  let second = get<i32, Other>(&other)
+  let third = get<i32, Mapped>(&mapped)
+  let supplied = run Intrinsic.bindRequirementMut<Source>(Source.load(), &mut provider)
+  return value + second + third + supplied
+}`
+
+it.effect('preserves authored inline operation tokens separately from compiler lookup names', () =>
+  Effect.gen(function* () {
+    const root = 'inventory/inline'
+    const snapshot = yield* retainingMain(root, ascii(inlineSource))
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    const captured = yield* Inventory.capture(snapshot)
+    assert.strictEqual(captured.status, 'Complete')
+    assert.deepEqual(captured.missingProvenance, [])
+    const inline = captured.selectedAuthoredFunctions.filter((value) => {
+      const declaration = Analysis.declarationForIdentity(snapshot, {
+        _tag: 'DeclarationIdentity',
+        id: value.id,
+      })
+      return (
+        declaration?._tag === 'FunctionDeclaration' &&
+        declaration.conformanceImplementation !== undefined
+      )
+    })
+    assert.strictEqual(inline.length, 3)
+    const reads = inline.filter((value) => value.name.spelling === 'read')
+    assert.strictEqual(reads.length, 2)
+    assert.notDeepEqual(reads.at(0)?.owner, reads.at(1)?.owner)
+    assert.notDeepEqual(reads.at(0)?.id, reads.at(1)?.id)
+    const specializationCounts = reads
+      .map(
+        (value) =>
+          captured.instances.filter(
+            (instance) =>
+              instance.originalDeclaration?.sourceId === value.id.sourceId &&
+              instance.originalDeclaration.ordinal === value.id.ordinal,
+          ).length,
+      )
+      .toSorted((a, b) => a - b)
+    assert.deepEqual(specializationCounts, [1, 2])
+    for (const value of inline) {
+      const declaration = Analysis.declarationForIdentity(snapshot, {
+        _tag: 'DeclarationIdentity',
+        id: value.id,
+      })
+      if (
+        declaration?._tag !== 'FunctionDeclaration' ||
+        declaration.conformanceImplementation === undefined ||
+        declaration.name._tag !== 'Present'
+      )
+        return yield* Effect.die('expected actual inline FunctionDeclaration')
+      assert.strictEqual(value.lookupName, declaration.name.spelling)
+      assert.notStrictEqual(value.lookupName, value.name.spelling)
+      assert.strictEqual(value.name.spelling, declaration.conformanceImplementation.operation)
+      assert.strictEqual(
+        inlineSource.slice(value.name.span.start, value.name.span.end),
+        value.name.spelling,
+      )
+      const module = Analysis.declarationIndex(snapshot).modules.find(
+        (value) => value.module === root,
+      )
+      const conformance = module?.conformances.find(
+        (value) => value.ordinal === declaration.conformanceImplementation?.ordinal,
+      )
+      const operations =
+        conformance?.operations.filter(
+          (operation) =>
+            operation.form === 'Inline' &&
+            operation.name._tag === 'Present' &&
+            operation.name.spelling === value.name.spelling,
+        ) ?? []
+      assert.strictEqual(operations.length, 1)
+      const operation = operations.at(0) ?? unreachable('expected exact inline operation')
+      assert.strictEqual(
+        AuthoredIdentity.anchorKey(operation.anchor),
+        AuthoredIdentity.anchorKey(value.anchor),
+      )
+      assert.strictEqual(
+        AuthoredIdentity.anchorKey(operation.name.anchor),
+        AuthoredIdentity.anchorKey(value.name.anchor),
+      )
+      assert.isTrue(AuthoredIdentity.equals(value.name.anchor.owner, value.owner))
+    }
+    const mapped =
+      captured.selectedAuthoredFunctions.find(
+        (value) =>
+          value.canonical._tag === 'Canonical' && value.canonical.id.name === 'Mapped.read',
+      ) ?? unreachable('expected mapped function')
+    assert.strictEqual(mapped.name.spelling, 'read')
+    assert.strictEqual(mapped.lookupName, 'read')
+    const original = inline.at(0) ?? unreachable('expected selected inline declaration')
+    const declaration = Analysis.declarationForIdentity(snapshot, {
+      _tag: 'DeclarationIdentity',
+      id: original.id,
+    })
+    if (
+      declaration?._tag !== 'FunctionDeclaration' ||
+      declaration.conformanceImplementation === undefined
+    )
+      return yield* Effect.die('expected inline metadata for refusal controls')
+    const implementation = declaration.conformanceImplementation
+    const ordinal = implementation.ordinal
+    const reviseConformance = (
+      change: (value: DeclarationFacts.ConformanceFact) => DeclarationFacts.ConformanceFact,
+    ): Analysis.Snapshot => ({
+      ...snapshot,
+      index: {
+        ...snapshot.index,
+        modules: snapshot.index.modules.map((module) =>
+          module.module !== root
+            ? module
+            : {
+                ...module,
+                conformances: module.conformances.map((value) =>
+                  value.ordinal !== ordinal ? value : change(value),
+                ),
+              },
+        ),
+      },
+    })
+    const reviseDeclaration = (
+      change: (value: DeclarationFacts.DeclarationFact) => DeclarationFacts.DeclarationFact,
+    ): Analysis.Snapshot => ({
+      ...snapshot,
+      index: {
+        ...snapshot.index,
+        modules: snapshot.index.modules.map((module) =>
+          module.module !== root
+            ? module
+            : {
+                ...module,
+                members: module.members.map((value) =>
+                  value._tag !== 'FunctionDeclaration' ||
+                  value.id.sourceId !== original.id.sourceId ||
+                  value.id.ordinal !== original.id.ordinal
+                    ? value
+                    : change(value),
+                ),
+              },
+        ),
+      },
+    })
+    const invalidInputs: ReadonlyArray<readonly [string, Analysis.Snapshot]> = [
+      [
+        'absent conformance',
+        reviseConformance((value) => ({ ...value, ordinal: ordinal + 1_000_000 })),
+      ],
+      [
+        'duplicate conformance',
+        {
+          ...snapshot,
+          index: {
+            ...snapshot.index,
+            modules: snapshot.index.modules.map((module) => ({
+              ...module,
+              conformances: module.conformances.flatMap((value) =>
+                module.module === root && value.ordinal === ordinal ? [value, value] : [value],
+              ),
+            })),
+          },
+        },
+      ],
+      [
+        'wrong operation',
+        reviseConformance((value) => ({
+          ...value,
+          operations: value.operations.map((operation) => ({
+            ...operation,
+            name: { ...operation.name, _tag: 'Present', spelling: 'different-token' },
+          })),
+        })),
+      ],
+      [
+        'wrong header anchor',
+        reviseConformance((value) => ({
+          ...value,
+          operations: value.operations.map((operation) => ({
+            ...operation,
+            anchor: mapped.anchor,
+          })),
+        })),
+      ],
+      [
+        'wrong name anchor',
+        reviseConformance((value) => ({
+          ...value,
+          operations: value.operations.map((operation) => ({
+            ...operation,
+            name: { ...operation.name, anchor: mapped.name.anchor },
+          })),
+        })),
+      ],
+      [
+        'mapped operation',
+        reviseConformance((value) => ({
+          ...value,
+          operations: value.operations.map((operation) => ({ ...operation, form: 'Mapped' })),
+        })),
+      ],
+      [
+        'absent metadata',
+        reviseDeclaration((value) => {
+          const { conformanceImplementation: _missing, ...rest } = value
+          return rest
+        }),
+      ],
+      [
+        'wrong metadata ordinal',
+        reviseDeclaration((value) => ({
+          ...value,
+          conformanceImplementation: {
+            ...implementation,
+            ordinal: ordinal + 1_000_000,
+          },
+        })),
+      ],
+      [
+        'wrong metadata operation',
+        reviseDeclaration((value) => ({
+          ...value,
+          conformanceImplementation: {
+            ...implementation,
+            operation: 'different-token',
+          },
+        })),
+      ],
+      ['wrong owner', reviseDeclaration((value) => ({ ...value, owner: mapped.owner }))],
+      [
+        'wrong raw token',
+        {
+          ...snapshot,
+          closure: {
+            ...snapshot.closure,
+            sources: new Map(
+              [...snapshot.closure.sources].map(([module, file]) => [
+                module,
+                module !== root
+                  ? file
+                  : SourceFile.make(
+                      root,
+                      ascii(
+                        inlineSource.slice(0, original.name.span.start) +
+                          'x'.repeat(original.name.span.end - original.name.span.start) +
+                          inlineSource.slice(original.name.span.end),
+                      ),
+                    ),
+              ]),
+            ),
+          },
+        },
+      ],
+    ]
+    for (const [label, input] of invalidInputs) {
+      const refused = yield* Inventory.capture(input)
+      assert.strictEqual(refused.status, 'Incomplete', label)
+      assert.isAbove(refused.missingProvenance.length, 0, label)
+      const affected = refused.instances.filter(
+        (value) =>
+          value.origin.kind === 'MissingAuthoredProvenance' &&
+          value.origin.declaration.sourceId === original.id.sourceId &&
+          value.origin.declaration.ordinal === original.id.ordinal,
+      )
+      assert.isAbove(affected.length, 0, label)
+      assert.isTrue(
+        affected.every((value) => value.originalDeclaration === undefined),
+        label,
+      )
+      assert.isFalse(
+        refused.selectedAuthoredFunctions.some(
+          (value) =>
+            value.id.sourceId === original.id.sourceId && value.id.ordinal === original.id.ordinal,
+        ),
+        label,
+      )
+    }
+  }),
+)
 
 it.effect(
   'checks immutable snapshot, embedded stdlib, executable and archive receipts before analysis',
