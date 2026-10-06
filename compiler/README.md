@@ -116,7 +116,9 @@ region shortens to any region, which is proven. A caller-local region (a loan ro
 meeting another region that typing cannot relate, such as a declared lifetime, another
 caller-local region, or a region an earlier call operand fixed for the same binder (including a
 `'static` Effect environment), is admitted at the expected region, and the body retains a
-`RegionRelation` safety obligation naming its origin and both regions for step 14. A fixed
+`RegionRelation` safety obligation naming its origin and both regions for step 14. The relations
+a call's operands retain are premises (offered outlives wanted) of that call's own bound proofs,
+such as a provision section's `once Effect<'env; ...>` representation bound. A fixed
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors. A lifetime binder that
 only a call's result names, such as the impl lifetime of `AlpnConfig.defaults()`, takes its
