@@ -460,6 +460,13 @@ it.effect(
           f.encode()
         },
         (f) => {
+          f.footer.extra = 'unversioned field'
+          f.encode()
+        },
+        (f) => {
+          f.inventory.unversioned = true
+        },
+        (f) => {
           f.footer.strict_success = true
           f.encode()
         },
@@ -484,6 +491,12 @@ it.effect(
         },
         (f) => {
           f.inventory.bootstrap.sha256 = '9'.repeat(64)
+        },
+        (f) => {
+          f.inventory.compilation.profile.input.debug = false
+        },
+        (f) => {
+          f.inventory.compilation.requestedProfile.target = 'other-target'
         },
         (f) => {
           f.footer.consumed_seed_receipt_raw = f.rawSeed.trimEnd()
@@ -587,6 +600,49 @@ it.effect(
       assert.isNull(nativeIncomplete.json.coverage.namedFunctions)
       assert.isNull(nativeIncomplete.json.ranks)
     }),
+)
+
+it.effect('only complete canonical authored states authorize selected joins', () =>
+  Effect.gen(function* () {
+    for (const kind of ['Unidentified', 'Duplicate']) {
+      const f = fixture()
+      const original = f.functions[0].original
+      const canonical = original.canonical.id
+      original.canonical =
+        kind === 'Unidentified'
+          ? { _tag: kind }
+          : {
+              _tag: kind,
+              original: canonical,
+              cause: {
+                _tag: 'DiagnosticIdentity',
+                phase: 'semantic',
+                code: 'SEM0001',
+                span: { _tag: 'At', anchor: original.anchor },
+                ordinal: 0,
+              },
+            }
+      yield* refuses(f.input)
+      f.inventory.status = 'Incomplete'
+      f.inventory.selected.status = 'Incomplete'
+      const result = yield* Report.report(f.input)
+      assert.isNull(result.json.ranks)
+      assert.strictEqual(result.json.evidence.joins.length, 2)
+      assert.deepEqual(result.json.evidence.unselectedNativeFunctions, [
+        {
+          declaration: f.phaseRows[0].declaration,
+          nameSpan: f.phaseRows[0].name_span,
+          source_observation: f.phaseRows[0].source_observation,
+          reason: 'NOT_JOINED_TO_SELECTED_ORIGINAL',
+        },
+      ])
+      assert.strictEqual(result.json.evidence.uncovered[0].reason, 'non-canonical-authored-state')
+      assert.deepEqual(result.json.evidence.uncovered[0].original.canonical, original.canonical)
+    }
+    const f = fixture()
+    f.functions[0].original.canonical = { _tag: 'Canonical', id: { module: 'guessed' } }
+    yield* refuses(f.input)
+  }),
 )
 
 it.effect('ambiguous and unmatched NAME addresses never choose a flat-name/ordinal match', () =>
@@ -737,6 +793,16 @@ it.effect(
       const f = fixture()
       f.input.expected.buildProfile = { debug: false, optimization: 'speed' }
       f.input.corpus.pins.profile = { debug: false, optimization: 'speed' }
+      f.inventory.analysisToolchain.components.push({
+        kind: 'Runtime',
+        id: 'runtime',
+        digest: '4'.repeat(64),
+        dependencies: ['compiler'],
+      })
+      f.inventory.analysisToolchain.components[0].dependencies = ['compiler', 'runtime']
+      f.input.expected.analysisToolchain = structuredClone(f.inventory.analysisToolchain)
+      f.input.expected.analysisToolchain.components.reverse()
+      f.input.expected.analysisToolchain.components[1].dependencies.reverse()
       const original = f.functions[0].original
       const key = {
         ...f.keys[0],
@@ -1161,6 +1227,11 @@ it.effect(
       f.input.native = [...f.moduleRows, ...copied, f.footer]
         .map((r) => JSON.stringify(r) + '\n')
         .join('')
+      // Match the V03 actor's published JSON transport, which exports span scalar fields.
+      const wire = Schema.fromJsonString(Schema.Unknown)
+      f.input.bootstrap = yield* Schema.decodeEffect(wire)(
+        yield* Schema.encodeEffect(wire)(f.inventory),
+      )
       const report = yield* Report.report(f.input)
       assert.strictEqual(report.json.evidence.joins.length, 2)
       assert.deepEqual(

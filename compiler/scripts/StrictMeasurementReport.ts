@@ -16,7 +16,7 @@ export class ValidationError extends Data.TaggedError('StrictMeasurementReportEr
 const reject = (phase: ValidationError['phase'], message: string) =>
   new ValidationError({ phase, message })
 const decode = Effect.fnUntraced(function* <A>(schema: Schema.Decoder<A>, input: unknown) {
-  return yield* Schema.decodeUnknownEffect(schema)(input).pipe(
+  return yield* Schema.decodeUnknownEffect(schema)(input, { onExcessProperty: 'error' }).pipe(
     Effect.mapError(
       (cause) => new ValidationError({ phase: 'Transport', message: cause.message, cause }),
     ),
@@ -169,9 +169,34 @@ const Anchor = Schema.TaggedStruct('AuthoredAnchor', {
   owner: Owner,
   path: Schema.Array(Schema.TaggedStruct('LocalSegment', { role: S, occurrence: N })),
 })
+const Location = Schema.Union([
+  Schema.TaggedStruct('At', { anchor: Anchor, edge: Schema.optionalKey(Schema.Literal('End')) }),
+  Schema.TaggedStruct('In', {
+    parts: Schema.Array(
+      Schema.Union([
+        Schema.TaggedStruct('Literal', { at: Anchor, range: Span }),
+        Schema.TaggedStruct('Parameter', { scope: Schema.optionalKey(S), ordinal: N, range: Span }),
+      ]),
+    ),
+    fallback: Anchor,
+  }),
+])
+const CanonicalState = Schema.Union([
+  Schema.TaggedStruct('Canonical', { id: Canonical }),
+  Schema.TaggedStruct('Duplicate', {
+    original: Canonical,
+    cause: Schema.TaggedStruct('DiagnosticIdentity', {
+      phase: Schema.Literals(['lexical', 'parser', 'module', 'semantic', 'ownership', 'layout']),
+      code: S,
+      span: Location,
+      ordinal: N,
+    }),
+  }),
+  Schema.TaggedStruct('Unidentified', {}),
+])
 const Authored = Schema.Struct({
   id: Id,
-  canonical: object,
+  canonical: CanonicalState,
   lookupName: Schema.optionalKey(S),
   owner: Owner,
   anchor: Anchor,
@@ -541,7 +566,14 @@ const collect = Effect.fnUntraced(function* (input: Input) {
     inventory.bootstrap.stdlibDigest !== snapshot.stdlibDigest ||
     !same(graphPins(inventory.analysisToolchain), graphPins(expectedGraph)) ||
     (inventory.compilation !== undefined &&
-      !same(inventory.compilation, input.expected.compilation))
+      (!same(inventory.compilation, input.expected.compilation) ||
+        inventory.compilation.requestedProfile.target !== footer.target ||
+        inventory.compilation.requestedProfile.optimization !== footer.profile.optimization ||
+        inventory.compilation.requestedProfile.debug !== footer.profile.debug ||
+        (inventory.compilation.profile !== undefined &&
+          (inventory.compilation.profile.input.target !== footer.target ||
+            inventory.compilation.profile.input.optimization !== footer.profile.optimization ||
+            inventory.compilation.profile.input.debug !== footer.profile.debug))))
   )
     return yield* reject('Pins', 'Bootstrap/toolchain/compilation pins differ')
   if (
@@ -564,7 +596,7 @@ const collect = Effect.fnUntraced(function* (input: Input) {
       build.inputs.stdlib.sha256 !== snapshot.stdlibDigest ||
       !same(
         [...build.inputs.compiler.files, ...build.inputs.stdlib.files].sort((a, b) =>
-          compareBytes(a.path, b.path),
+          compareFilePaths(a.path, b.path),
         ),
         sortedFiles,
       ))
@@ -869,6 +901,9 @@ const collect = Effect.fnUntraced(function* (input: Input) {
       selected.unavailableOwnership.length > 0 ||
       selected.specializationFailures.length > 0 ||
       selected.violations.length > 0 ||
+      selected.selectedAuthoredFunctions.some(
+        (original) => original.canonical._tag !== 'Canonical',
+      ) ||
       selected.instances.some(
         (i) => i.origin.kind === 'MissingAuthoredProvenance' || i.artifact === undefined,
       ))
@@ -946,6 +981,10 @@ const rank = (data: Effect.Success<ReturnType<typeof collect>>) => {
   const selectedKeys = new Set<string>()
   const uncovered = []
   for (const original of data.originals.values()) {
+    if (original.canonical._tag !== 'Canonical') {
+      uncovered.push({ original, reason: 'non-canonical-authored-state' })
+      continue
+    }
     const source = data.bootstrapSources.get(original.id.sourceId)
     const candidates =
       source === undefined
@@ -1100,6 +1139,16 @@ const rank = (data: Effect.Success<ReturnType<typeof collect>>) => {
   return {
     joins,
     uncovered,
+    unselectedNativeFunctions: [...data.pairs.entries()]
+      .filter(([key]) => !selectedKeys.has(key))
+      .flatMap(([, pair]) =>
+        pair.slice(0, 1).map((row) => ({
+          declaration: row.declaration,
+          nameSpan: row.name_span,
+          source_observation: row.source_observation,
+          reason: 'NOT_JOINED_TO_SELECTED_ORIGINAL',
+        })),
+      ),
     sites: [...sites.values()],
     noSite,
     phaseOutcomes,
