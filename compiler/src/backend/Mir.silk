@@ -35,6 +35,7 @@ import semantic.TypedBody {
   AggregateField as BodyAggregateField,
   EnumMember as BodyEnumMember,
   MatchArm as BodyMatchArm,
+  MatchSyntax as BodyMatchSyntax,
   Pattern as BodyPattern,
   SubjectAccess as BodySubjectAccess,
   UnionMember as BodyUnionMember,
@@ -76,8 +77,9 @@ pub union LocalKind {
   /// The address of the context of the failure the current recovery handler selected, or null
   /// when none is selected (N2).
   Cause,
-  /// A `bool` that records whether owned local `local` still needs its drop, where ownership
-  /// differs between the paths that reach a join (MIR core shape §3).
+  /// A `bool` that records whether an owner stored in local `local` still needs its drop, where
+  /// ownership differs between the paths that reach a join (MIR core shape §3). The owner is the
+  /// local itself or the part of a consumed match subject that one by-value binding owns.
   DropFlag {pub local: usize},
 }
 
@@ -273,9 +275,13 @@ enum OwnerState {
   Maybe,
 }
 
-// One local whose value needs cleanup, in acquisition order within its scope.
+// One owned place whose value needs cleanup, in acquisition order within its scope: a local, or the
+// part `path` of a consuming match's evaluated subject that one by-value binding owns (MATCH-002).
 struct Owner {
   local: usize
+  path: Vector<Projection>
+  // The subject node of the match whose binding owns `path`, or MAX for a local's own owner.
+  subject: usize
   ty: Shared<Type>
   state: OwnerState
   // The owner's drop flag local, allocated by the first join whose paths disagree.
@@ -304,8 +310,9 @@ union Release {
   Whole {local: usize},
   // A projection of a local (OWN-004), consumed at body node `node`.
   Partial {local: usize, node: usize},
-  // A binding projected from match subject node `subject` (MATCH-002), consumed at `node`.
-  Binding {subject: usize, node: usize},
+  // A place `steps` deep below match subject node `subject`, inside one of its by-value bindings
+  // (MATCH-002), consumed at body node `node`.
+  Binding {subject: usize, node: usize, steps: usize},
 }
 
 /// A checked call's resolved canonical target, prepared without demanding its body.
@@ -529,7 +536,18 @@ union View {
   StagedCallable {node: BodyNodeId, count: usize, ty: Shared<Type>, origin: Origin},
   EnumMember {member: BodyEnumMember, ty: Shared<Type>, origin: Origin},
   EnumValue {value: BodyNodeId, ty: Shared<Type>, origin: Origin},
-  Match {node: BodyNodeId, subject: BodyNodeId, place: bool, consumes: bool, release: Release, tags: usize, count: usize, ty: Shared<Type>, origin: Origin},
+  Match {
+    node: BodyNodeId,
+    subject: BodyNodeId,
+    place: bool,
+    consumes: bool,
+    release: Release,
+    tags: usize,
+    count: usize,
+    syntax: BodyMatchSyntax,
+    ty: Shared<Type>,
+    origin: Origin,
+  },
   VariantConstruct {node: BodyNodeId, tag: usize, count: usize, ty: Shared<Type>, origin: Origin},
   UnionInject {tag: usize, value: BodyNodeId, ty: Shared<Type>, source: Shared<Type>, origin: Origin},
   PatternBinding {node: BodyNodeId, subject: BodyNodeId, ty: Shared<Type>, origin: Origin},
@@ -842,11 +860,11 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
           BodyExpression.VariantConstruct {tag, fields} => View.VariantConstruct {
             node: id, tag: tag, count: Vector.length<BodyAggregateField>(&fields), ty: Shared.clone<Type>(&ty), origin: origin,
           }
-          BodyExpression.Match {subject, access, tags, arms, ..} => View.Match {
+          BodyExpression.Match {subject, access, tags, arms, syntax, ..} => View.Match {
             node: id, subject: subject, place: match &access { BodySubjectAccess.Place {..} => true _ => false },
             consumes: match &access { BodySubjectAccess.Consume {..} => true _ => false },
             release: match &access { BodySubjectAccess.Consume {consumed} => releaseOf(&consumed, id) _ => Release.Value },
-            tags: tags, count: Vector.length<BodyMatchArm>(&arms),
+            tags: tags, count: Vector.length<BodyMatchArm>(&arms), syntax: syntax,
             ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.UnionInject {tag, value} => View.UnionInject {
@@ -1109,7 +1127,8 @@ fn releaseOf(consumed: &Option<BodyConsumedPlace>, node: BodyNodeId) -> Release 
         if whole { return Release.Whole {local: local.index + usize.ONE} }
         return Release.Partial {local: local.index + usize.ONE, node: node.index}
       }
-      BodyPlaceRoot.Subject {subject} => Release.Binding {subject: subject.index, node: node.index}
+      BodyPlaceRoot.Subject {subject} => Release.Binding {subject: subject.index, node: node.index,
+        steps: Vector.length<BodyPlaceStep>(&value.steps)}
     }
   }
   return Release.Value
@@ -1125,12 +1144,44 @@ fn ownerState(builder: &Builder, index: usize) -> OwnerState {
   return owners[index].state
 }
 
+// How many projections below its local the place of owner `index` lies: zero for a local's owner.
+fn ownerDepth(builder: &Builder, index: usize) -> usize {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  return Vector.length<Projection>(&owners[index].path)
+}
+
+// The owner of local `local` itself; the binding owners of a subject stored there are not.
 fn ownerIndex(builder: &Builder, local: usize) -> usize {
   let owners = Vector.asSlice<Owner>(&builder.owners)
   let mut at = owners.length
   while at > usize.ZERO {
     at = at - usize.ONE
-    if owners[at].local == local { return at }
+    if owners[at].local == local && owners[at].subject == usize.MAX { return at }
+  }
+  return usize.MAX
+}
+
+// The binding owner of match subject node `subject` that contains the place `steps` deep that
+// site `node` consumes: one whose path the site's moved path extends, or MAX.
+fn bindingOwnerIndex(builder: &Builder, subject: usize, node: usize, steps: usize) -> usize {
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  let remainder = remainderIndex(builder, node)
+  let mut at = owners.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if owners[at].subject == subject {
+      let path = Vector.asSlice<Projection>(&owners[at].path)
+      let mut contains = path.length <= steps
+      if contains && path.length != usize.ZERO {
+        contains = remainder != usize.MAX
+        let mut depth = usize.ZERO
+        while contains && depth < path.length {
+          contains = stepMatches(builder, remainder, depth, &path[depth])
+          depth = depth + usize.ONE
+        }
+      }
+      if contains { return at }
+    }
   }
   return usize.MAX
 }
@@ -1138,7 +1189,8 @@ fn ownerIndex(builder: &Builder, local: usize) -> usize {
 // A local whose value needs cleanup becomes a live owner of the innermost scope.
 effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>, needed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   if !needed { return () }
-  return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX, holes: Vector.make<usize>()})
+  return run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, path: Vector.make<Projection>(), subject: usize.MAX,
+    ty: Shared.clone<Type>(ty), state: OwnerState.Live, flag: usize.MAX, holes: Vector.make<usize>()})
 }
 
 // A moved owner has no holes left to track.
@@ -1155,38 +1207,38 @@ fn setState(builder: &mut Builder, index: usize, state: OwnerState) -> () {
 }
 
 // Applies one consuming site. A partial move of a value that needs cleanup leaves a hole in its
-// owner, which is then dropped child by child (OWN-004, MATCH-002).
+// owner, which is then dropped child by child (OWN-004). A place inside a by-value binding of a
+// consumed match subject is released from that binding's owner (MATCH-002).
 effect fn applyRelease(builder: &mut Builder, release: &Release, needed: bool, origin: Origin) -> ()
 ! Gap | OutOfMemoryError ? &mut Allocator {
-  let mut root = usize.MAX
+  let mut index = usize.MAX
   let mut site = usize.MAX
   match &release.* {
     Release.Value => { return () }
     Release.Whole {local} => {
-      let index = ownerIndex(&builder.*, local)
-      if index != usize.MAX { run markMoved(&mut builder.*, index, origin) }
+      let whole = ownerIndex(&builder.*, local)
+      if whole != usize.MAX { run markMoved(&mut builder.*, whole, origin) }
       return ()
     }
     Release.Partial {local, node} => {
-      root = local
+      if !needed { return () }
+      index = ownerIndex(&builder.*, local)
       site = node
     }
-    Release.Binding {subject, node} => {
-      // Only a consuming match's own evaluated copy owns its bindings.
-      if let Option<usize>.Some {value: selected} = move scrutineePlace(&builder.*, BodyNodeId {index: subject}) {
-        let evaluated = Vector.asSlice<Scrutinee>(&builder.scrutinees)
-        if Vector.length<Projection>(&evaluated[selected].place.projections) == usize.ZERO { root = evaluated[selected].place.local }
-      }
+    Release.Binding {subject, node, steps} => {
+      if !needed { return () }
+      index = bindingOwnerIndex(&builder.*, subject, node, steps)
+      if index != usize.MAX && ownerDepth(&builder.*, index) == steps { return run markMoved(&mut builder.*, index, origin) }
       site = node
     }
   }
-  if !needed { return () }
   let owner = InstanceKey.identity(&builder.function.key)
-  let index = ownerIndex(&builder.*, root)
   let remainder = remainderIndex(&builder.*, site)
-  if index == usize.MAX || remainder == usize.MAX || ownerState(&builder.*, index) != OwnerState.Live || remainderHooked(&builder.*, remainder) {
+  if index == usize.MAX || remainder == usize.MAX || ownerState(&builder.*, index) != OwnerState.Live {
     return run unsupported(&owner, origin, GapCode.Cleanup)
   }
+  // A hole beneath a Drop-hooked part of the owner cannot be cleaned (OWN-004).
+  if remainderHooked(&builder.*, remainder, ownerDepth(&builder.*, index)) { return run unsupported(&owner, origin, GapCode.Cleanup) }
   let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
   return run Vector.append<usize>(&mut owners[index].holes, remainder)
 }
@@ -1201,10 +1253,12 @@ fn remainderIndex(builder: &Builder, node: usize) -> usize {
   return usize.MAX
 }
 
-fn remainderHooked(builder: &Builder, remainder: usize) -> bool {
+// Whether a level of remainder `remainder` from depth `from` on, inside the owner it is a hole of,
+// has a Drop hook.
+fn remainderHooked(builder: &Builder, remainder: usize, from: usize) -> bool {
   let remainders = Vector.asSlice<Remainder>(&builder.remainders)
   let levels = Vector.asSlice<RemainderLevel>(&remainders[remainder].levels)
-  let mut at = usize.ZERO
+  let mut at = from
   while at < levels.length {
     if levels[at].hooked { return true }
     at = at + usize.ONE
@@ -1260,7 +1314,7 @@ effect fn copyStates(states: &Vector<OwnerSnapshot>) -> Vector<OwnerSnapshot> ! 
 // Returns to the owners and states a branch started from.
 effect fn restoreOwners(builder: &mut Builder, states: &Vector<OwnerSnapshot>) -> () ! OutOfMemoryError ? &mut Allocator {
   let saved = Vector.asSlice<OwnerSnapshot>(states)
-  while Vector.length<Owner>(&builder.owners) > saved.length { drop Vector.pop<Owner>(&mut builder.*.owners) }
+  truncateOwners(&mut builder.*, saved.length)
   let mut at = usize.ZERO
   while at < saved.length {
     let holes = run copyHoles(&saved[at].holes)
@@ -1418,23 +1472,30 @@ effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () !
   let owners = Vector.asSlice<Owner>(&builder.owners)
   let state = owners[index].state
   if state == OwnerState.Moved { return () }
-  let local = owners[index].local
   let flag = owners[index].flag
   let ty = Shared.clone<Type>(&owners[index].ty)
   let partial = Vector.length<usize>(&owners[index].holes) != usize.ZERO
+  let depth = Vector.length<Projection>(&owners[index].path)
+  let mut owned = place(owners[index].local)
+  let path = Vector.asSlice<Projection>(&owners[index].path)
+  let mut at = usize.ZERO
+  while at < path.length {
+    run Vector.append<Projection>(&mut owned.projections, run copyProjection(&path[at]))
+    at = at + usize.ONE
+  }
   let owner = InstanceKey.identity(&builder.function.key)
   // A partial owner is never passed to its glue: its remaining children are dropped one by one.
   if partial {
     if state != OwnerState.Live { return run unsupported(&owner, origin, GapCode.Cleanup) }
     let holes = run copyHoles(&owners[index].holes)
-    return run dropRemainder(&mut builder.*, place(local), Vector.asSlice<usize>(&holes), usize.ZERO, origin)
+    return run dropRemainder(&mut builder.*, move owned, Vector.asSlice<usize>(&holes), depth, origin)
   }
-  if state == OwnerState.Live { return run dropPlace(&mut builder.*, place(local), &ty, &owner, origin) }
+  if state == OwnerState.Live { return run dropPlace(&mut builder.*, move owned, &ty, &owner, origin) }
   let dropping = run block(&mut builder.*, origin)
   let after = run block(&mut builder.*, origin)
   terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(flag)}, thenBlock: dropping, elseBlock: after, origin: origin})
   resume(&mut builder.*, dropping)
-  run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
+  run dropPlace(&mut builder.*, move owned, &ty, &owner, origin)
   terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
   resume(&mut builder.*, after)
   return ()
@@ -1627,8 +1688,7 @@ effect fn closeScope(builder: &mut Builder, origin: Origin) -> () ! Gap | OutOfM
     Option<usize>.None => usize.ZERO
   }
   if builder.live { run dropOwnersFrom(&mut builder.*, start, origin) }
-  while Vector.length<Owner>(&builder.owners) > start { drop Vector.pop<Owner>(&mut builder.*.owners) }
-  return ()
+  return truncateOwners(&mut builder.*, start)
 }
 
 // Whether an expression produces a fresh owned value rather than reading an existing place.
@@ -2564,8 +2624,8 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       run assign(&mut builder.*, place(output), Rvalue.Use {value: move input}, origin)
       return Operand.Copy {place: place(output)}
     }
-    View.Match {node, subject, place: placeMatch, consumes, release, tags, count, ty, origin} => {
-      return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, consumes, &release, tags, count, &ty, origin)
+    View.Match {node, subject, place: placeMatch, consumes, release, tags, count, syntax, ty, origin} => {
+      return run lowerMatch(&mut builder.*, body, hir, node, subject, placeMatch, consumes, &release, tags, count, syntax, &ty, origin)
     }
     View.VariantConstruct {node, tag, count, ty, origin} => {
       let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
@@ -2946,9 +3006,62 @@ fn scrutineePlace(builder: &Builder, subject: BodyNodeId) -> Option<usize> {
   return Option.none<usize>()
 }
 
+// Once consuming arm `arm` is selected, each of its by-value bindings that needs cleanup owns its
+// part of the evaluated subject, whose owner is `scrutinee`, until the binding's scope ends: the
+// arm, or for a destructuring `let` the enclosing block (MATCH-002, PATT-006). The subject keeps
+// only what no binding took.
+effect fn bindArm(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, subject: BodyNodeId,
+  scrutinee: usize, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let local = Vector.asSlice<Owner>(&builder.owners)[scrutinee].local
+  let mut binding = usize.ZERO
+  while true {
+    let declared = match move TypedBody.armBinding(body, node, arm, binding) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { break }
+    }
+    binding = binding + usize.ONE
+    if !CleanupNeeds.node(&builder.needs, declared.index) { continue }
+    let ty = match move run instanceNodeType(&builder.*, body, declared) {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    }
+    let mut path = Vector.make<Projection>()
+    let mut step = usize.ZERO
+    while true {
+      let selected = match move bindingStepAt(body, declared, step) {
+        Option<BodyPlaceStep>.Some {value} => value
+        Option<BodyPlaceStep>.None => { break }
+      }
+      run Vector.append<Projection>(&mut path, run lowerStep(&builder.*, &selected, origin))
+      step = step + usize.ONE
+    }
+    if Vector.length<Projection>(&path) == usize.ZERO {
+      // A whole-value binding takes the complete subject.
+      run markMoved(&mut builder.*, scrutinee, origin)
+    } else {
+      let remainder = remainderIndex(&builder.*, declared.index)
+      if remainder == usize.MAX || remainderHooked(&builder.*, remainder, usize.ZERO) {
+        return run unsupported(&owner, origin, GapCode.Cleanup)
+      }
+      let mut owners = Vector.asMutSlice<Owner>(&mut builder.*.owners)
+      run Vector.append<usize>(&mut owners[scrutinee].holes, remainder)
+    }
+    run Vector.append<Owner>(&mut builder.*.owners, Owner {local: local, path: move path, subject: subject.index, ty: move ty,
+      state: OwnerState.Live, flag: usize.MAX, holes: Vector.make<usize>()})
+  }
+  return ()
+}
+
+fn truncateOwners(builder: &mut Builder, length: usize) -> () {
+  while Vector.length<Owner>(&builder.owners) > length { drop Vector.pop<Owner>(&mut builder.*.owners) }
+  return ()
+}
+
 // The subject is evaluated once: a place match keeps its projected storage, other matches read one
 // copy. Enum values are switched directly; a union switches on its tag. A false guard resumes
-// dispatch at the following arm.
+// dispatch at the following arm. A consuming match's `syntax` fixes where the selected arm's binding
+// owners and the subject parts no binding took end (`MatchSyntax`).
 effect fn lowerMatch(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
@@ -2960,10 +3073,16 @@ effect fn lowerMatch(
   release: &Release,
   tags: usize,
   count: usize,
+  syntax: BodyMatchSyntax,
   ty: &Shared<Type>,
   origin: Origin,
 ) -> Operand ! Gap | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
+  // A destructuring `let` leaves its bindings' owners in the enclosing scope (PATT-006).
+  let declaring = syntax == BodyMatchSyntax.Let
+  // `if let` and `let` drop the subject parts no binding took once a path is selected, before it
+  // runs (PATT-008); a written match keeps them until the arm ends (MATCH-002).
+  let selecting = syntax != BodyMatchSyntax.Match
   let subjectType = match move run instanceNodeType(&builder.*, body, subject) {
     Option<Shared<Type>>.Some {value} => value
     Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
@@ -2978,12 +3097,12 @@ effect fn lowerMatch(
     scrutinee = place(copied)
   }
   // A consuming match moves the subject into its evaluated copy, which owns the active payload
-  // until the selected arm ends (MATCH-002).
+  // until the selected arm ends, less the parts its by-value bindings take (MATCH-002).
   let mut scrutineeOwner = usize.MAX
   if consumes {
     let needed = CleanupNeeds.node(&builder.needs, subject.index)
     run applyRelease(&mut builder.*, release, needed, origin)
-    run openScope(&mut builder.*)
+    if !declaring { run openScope(&mut builder.*) }
     let before = Vector.length<Owner>(&builder.owners)
     run acquire(&mut builder.*, scrutinee.local, &subjectType, needed)
     if Vector.length<Owner>(&builder.owners) > before { scrutineeOwner = before }
@@ -3091,6 +3210,15 @@ effect fn lowerMatch(
       run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, at + usize.ONE, armOrigin)
     }
     resume(&mut builder.*, resultBlock)
+    // The selected arm's by-value bindings take their parts of the subject (MATCH-002).
+    let bindingOwners = Vector.length<Owner>(&builder.owners)
+    if scrutineeOwner != usize.MAX {
+      run bindArm(&mut builder.*, body, node, at, subject, scrutineeOwner, armOrigin)
+      if selecting {
+        run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
+        run markMoved(&mut builder.*, scrutineeOwner, armOrigin)
+      }
+    }
     // A block arm runs as statements; a transfer inside it leaves the arm without reaching the join.
     if blockNode(body, result) {
       run statement(&mut builder.*, body, hir, result)
@@ -3109,11 +3237,19 @@ effect fn lowerMatch(
       }
       run endTemporaries(&mut builder.*, armPending, armOrigin)
     }
+    // Arm-local binding owners end with their arm, innermost first; then a written match's subject
+    // drops what no binding took.
     if builder.live {
-      if scrutineeOwner != usize.MAX {
+      if !declaring { run dropOwnersFrom(&mut builder.*, bindingOwners, armOrigin) }
+      if scrutineeOwner != usize.MAX && !selecting {
         run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
         run markMoved(&mut builder.*, scrutineeOwner, armOrigin)
       }
+    }
+    if !declaring { truncateOwners(&mut builder.*, bindingOwners) }
+    // A destructuring `let`'s subject owns nothing more, while its bindings stay with the block.
+    if declaring && scrutineeOwner != usize.MAX { drop Vector.remove<Owner>(&mut builder.*.owners, scrutineeOwner) }
+    if builder.live {
       run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
       terminate(&mut builder.*, Terminator.Goto {target: join, origin: armOrigin})
       joined = true
@@ -3124,7 +3260,7 @@ effect fn lowerMatch(
     resume(&mut builder.*, join)
     run joinOwners(&mut builder.*, Vector.asSlice<Arrival>(&arrivals), origin)
   }
-  if consumes { run closeScope(&mut builder.*, origin) }
+  if consumes && !declaring { run closeScope(&mut builder.*, origin) }
   if !joined { return Operand.Unit }
   if !valued { return Operand.Unit }
   return Operand.Copy {place: place(output)}
@@ -5069,9 +5205,9 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.EnumValue {ty, value, origin} => View.EnumValue {
       ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin,
     }
-    View.Match {ty, node, subject, place: placeMatch, consumes, release, tags, count, origin} => View.Match {
+    View.Match {ty, node, subject, place: placeMatch, consumes, release, tags, count, syntax, origin} => View.Match {
       ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, subject: subject, place: placeMatch, consumes: consumes,
-      release: move release, tags: tags, count: count, origin: origin,
+      release: move release, tags: tags, count: count, syntax: syntax, origin: origin,
     }
     View.VariantConstruct {ty, node, tag, count, origin} => View.VariantConstruct {
       ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, tag: tag, count: count, origin: origin,
