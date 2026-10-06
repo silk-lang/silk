@@ -25,7 +25,9 @@ computed under those applications; standard-library Option and Result use the sa
 as user declarations. Runtime text (`string<'static>`) and byte-string (`&'static [u8]`) literals
 store their decoded bytes in a private constant and build the same address-and-byte-length
 descriptor as a slice. Slice subranges and unions with string or f64 members remain follow-up work.
-Exact lifetime-bearing semantic instances are validated separately. Complete selected MIR recipes
+Semantic instances keep `'static` and region-sharing evidence but number caller-local regions by
+first appearance, so call sites that lend different locals share one instance; each semantic
+instance is validated separately. Complete selected MIR recipes
 and their ordered call/drop graph determine emitted identities after finite reachability closes.
 Equivalent recipes share code; different direct or transitive cleanup receives distinct symbols,
 while physically equivalent types still share layouts. This is target-neutral and handles recursive
