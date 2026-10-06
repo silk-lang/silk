@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { dirname, join } from 'node:path'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
@@ -615,8 +616,30 @@ const collect = Effect.fnUntraced(function* (input: Input) {
     return yield* reject('Pins', 'Original NativeBuild tool binding differs')
   const stageNames = ['native-build', 'smoke-build', 'smoke-run']
   for (const [at, stage] of build.stages.entries()) {
+    const snapshotDirectory = build.inputs?.directory
+    const smokeDirectory = join(dirname(build.output.path), 'smoke')
+    const expectedCommand =
+      at < 2 && snapshotDirectory !== undefined
+        ? [
+            at === 0 ? build.seed.path : build.output.path,
+            'build',
+            at === 0
+              ? join(snapshotDirectory, 'compiler/src/main.silk')
+              : join(smokeDirectory, 'main.silk'),
+            '-o',
+            at === 0 ? build.output.path : join(smokeDirectory, 'program'),
+            '--stdlib',
+            join(snapshotDirectory, 'packages/compiler/stdlib'),
+            '--optimization',
+            build.profile.optimization,
+            '--debug',
+            String(build.profile.debug),
+          ]
+        : [join(smokeDirectory, 'program')]
     if (
       stage.name !== stageNames[at] ||
+      !same(stage.command, expectedCommand) ||
+      (at < 2 && snapshotDirectory === undefined) ||
       stage.wallTimeMs < 0 ||
       !same(stage.measurementCommand.slice(6), stage.command) ||
       (build.linker !== null && stage.linkerEnvironment?.SILKC_CLANG !== build.linker.path)
@@ -809,6 +832,7 @@ const collect = Effect.fnUntraced(function* (input: Input) {
     originals.set(idKey(original.id), original)
   }
   const instances = new Set<string>()
+  const selectedOriginalIds = new Set<string>()
   for (const instance of selected?.instances ?? []) {
     const k = text([instance.key, instance.artifact])
     if (instances.has(k))
@@ -836,7 +860,7 @@ const collect = Effect.fnUntraced(function* (input: Input) {
         const canonical = yield* decode(Canonical, original.canonical.id)
         if (
           !same(canonical, instance.key.declaration) ||
-          !same(instance.artifact?.owner, original.owner)
+          (instance.artifact !== undefined && !same(instance.artifact.owner, original.owner))
         )
           return yield* reject(
             'Identity',
@@ -846,11 +870,11 @@ const collect = Effect.fnUntraced(function* (input: Input) {
       if (
         original === undefined ||
         instance.originalDeclaration === undefined ||
-        instance.artifact === undefined ||
         !same(instance.originalDeclaration, original.id) ||
         !same(instance.originalDeclarationSpan, original.declarationSpan)
       )
         return yield* reject('Identity', 'Residual parent original provenance differs')
+      if (instance.artifact !== undefined) selectedOriginalIds.add(idKey(original.id))
     }
     const nodes = new Set<number>()
     for (const site of instance.residualBodySites) {
@@ -892,6 +916,13 @@ const collect = Effect.fnUntraced(function* (input: Input) {
     (inventory.failure !== undefined ||
       inventory.compilation?.profile === undefined ||
       inventory.compilation.artifactIdentity === undefined ||
+      !pathOK('compiler/' + inventory.compilation.root) ||
+      !modules.some(
+        (module) =>
+          module.role === 'compiler-subject' &&
+          module.present &&
+          module.source_file === 'compiler/' + inventory.compilation?.root,
+      ) ||
       inventory.consumedSources === undefined ||
       inventory.diagnostics === undefined ||
       inventory.diagnostics.some((d) => d.severity === 'error') ||
@@ -903,6 +934,9 @@ const collect = Effect.fnUntraced(function* (input: Input) {
       selected.violations.length > 0 ||
       selected.selectedAuthoredFunctions.some(
         (original) => original.canonical._tag !== 'Canonical',
+      ) ||
+      selected.selectedAuthoredFunctions.some(
+        (original) => !selectedOriginalIds.has(idKey(original.id)),
       ) ||
       selected.instances.some(
         (i) => i.origin.kind === 'MissingAuthoredProvenance' || i.artifact === undefined,
@@ -980,9 +1014,20 @@ const rank = (data: Effect.Success<ReturnType<typeof collect>>) => {
   const joins = []
   const selectedKeys = new Set<string>()
   const uncovered = []
+  const selectedOriginals = new Set(
+    (data.inventory.selected?.instances ?? [])
+      .filter((instance) => instance.origin.kind === 'Authored' && instance.artifact !== undefined)
+      .flatMap((instance) =>
+        instance.originalDeclaration === undefined ? [] : [idKey(instance.originalDeclaration)],
+      ),
+  )
   for (const original of data.originals.values()) {
     if (original.canonical._tag !== 'Canonical') {
       uncovered.push({ original, reason: 'non-canonical-authored-state' })
+      continue
+    }
+    if (!selectedOriginals.has(idKey(original.id))) {
+      uncovered.push({ original, reason: 'NO_SELECTED_AUTHORED_INSTANCE' })
       continue
     }
     const source = data.bootstrapSources.get(original.id.sourceId)
@@ -1035,7 +1080,7 @@ const rank = (data: Effect.Success<ReturnType<typeof collect>>) => {
       }
   const presence = new Set<string>()
   for (const instance of data.inventory.selected?.instances ?? []) {
-    if (instance.originalDeclaration === undefined) continue
+    if (instance.artifact === undefined || instance.originalDeclaration === undefined) continue
     const key = originalToNative.get(idKey(instance.originalDeclaration))
     if (key === undefined) continue
     for (const site of instance.residualBodySites) {
@@ -1153,6 +1198,17 @@ const rank = (data: Effect.Success<ReturnType<typeof collect>>) => {
     noSite,
     phaseOutcomes,
     rankings,
+    incompleteAuthoredInstances: (data.inventory.selected?.instances ?? [])
+      .filter((instance) => instance.origin.kind === 'Authored' && instance.artifact === undefined)
+      .map((instance) => ({
+        key: instance.key,
+        origin: instance.origin,
+        originalDeclaration: instance.originalDeclaration,
+        originalDeclarationSpan: instance.originalDeclarationSpan,
+        reason: 'MISSING_SELECTED_ARTIFACT',
+        observedSites: instance.residualBodySites.length,
+        presenceCredit: false,
+      })),
     nonAuthoredInstances: (data.inventory.selected?.instances ?? [])
       .filter((i) => i.origin.kind !== 'Authored')
       .map((i) => ({ key: i.key, artifact: i.artifact, origin: i.origin })),

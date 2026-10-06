@@ -467,6 +467,12 @@ it.effect(
           f.inventory.unversioned = true
         },
         (f) => {
+          f.inventory.compilation.root = 'src/other-root.silk'
+        },
+        (f) => {
+          f.inventory.selected.instances.splice(0, 1)
+        },
+        (f) => {
           f.footer.strict_success = true
           f.encode()
         },
@@ -599,6 +605,52 @@ it.effect(
       const nativeIncomplete = yield* Report.report(n.input)
       assert.isNull(nativeIncomplete.json.coverage.namedFunctions)
       assert.isNull(nativeIncomplete.json.ranks)
+      const orphan = fixture()
+      orphan.inventory.selected.instances.splice(0, 1)
+      orphan.inventory.status = 'Incomplete'
+      orphan.inventory.selected.status = 'Incomplete'
+      const partial = yield* Report.report(orphan.input)
+      assert.isNull(partial.json.ranks)
+      assert.strictEqual(partial.json.evidence.joins.length, 2)
+      assert.strictEqual(partial.json.evidence.uncovered[0].reason, 'NO_SELECTED_AUTHORED_INSTANCE')
+      const missingArtifact = fixture()
+      delete missingArtifact.inventory.selected.instances[0].artifact
+      missingArtifact.inventory.status = 'Incomplete'
+      missingArtifact.inventory.selected.status = 'Incomplete'
+      missingArtifact.inventory.selected.missingProvenance = ['actual-missing-artifact']
+      const audit = yield* Report.report(missingArtifact.input)
+      assert.isNull(audit.json.ranks)
+      assert.strictEqual(audit.json.evidence.joins.length, 2)
+      assert.strictEqual(audit.json.evidence.uncovered[0].reason, 'NO_SELECTED_AUTHORED_INSTANCE')
+      assert.strictEqual(
+        audit.json.evidence.incompleteAuthoredInstances[0].reason,
+        'MISSING_SELECTED_ARTIFACT',
+      )
+      assert.deepEqual(
+        audit.json.evidence.incompleteAuthoredInstances[0].key,
+        missingArtifact.inventory.selected.instances[0].key,
+      )
+      const sibling = fixture()
+      const artifactless = structuredClone(sibling.inventory.selected.instances[0])
+      delete artifactless.artifact
+      artifactless.key.evidence = ['artifactless-context']
+      sibling.inventory.selected.instances[0].residualBodySites = []
+      sibling.inventory.selected.instances.push(artifactless)
+      sibling.inventory.status = 'Incomplete'
+      sibling.inventory.selected.status = 'Incomplete'
+      sibling.inventory.selected.missingProvenance = ['artifactless-sibling']
+      const noCredit = yield* Report.report(sibling.input)
+      const ordinarySites = noCredit.json.evidence.sites.filter(
+        (site) => site.function.owners.at(-1).name === 'ordinary',
+      )
+      assert.isNotEmpty(ordinarySites)
+      assert.isTrue(
+        ordinarySites.every((site) => !site.evidence.includes('PRESENT_IN_SELECTED_RESIDUAL_BODY')),
+      )
+      missingArtifact.inventory.status = 'Complete'
+      missingArtifact.inventory.selected.status = 'Complete'
+      missingArtifact.inventory.selected.missingProvenance = []
+      yield* refuses(missingArtifact.input)
     }),
 )
 
@@ -768,9 +820,41 @@ it.effect(
         outputSha256: '7'.repeat(64),
       }
       f.input.build.stages = [
-        makeStage('native-build', ['N0', 'build', 'compiler/src/main.silk'], 0),
-        makeStage('smoke-build', ['N1', 'build', '/smoke/main.silk'], 0),
-        makeStage('smoke-run', ['/smoke/program'], 42),
+        makeStage(
+          'native-build',
+          [
+            'N0',
+            'build',
+            '/fixture/snapshot/compiler/src/main.silk',
+            '-o',
+            'N1',
+            '--stdlib',
+            '/fixture/snapshot/packages/compiler/stdlib',
+            '--optimization',
+            'speed',
+            '--debug',
+            'false',
+          ],
+          0,
+        ),
+        makeStage(
+          'smoke-build',
+          [
+            'N1',
+            'build',
+            'smoke/main.silk',
+            '-o',
+            'smoke/program',
+            '--stdlib',
+            '/fixture/snapshot/packages/compiler/stdlib',
+            '--optimization',
+            'speed',
+            '--debug',
+            'false',
+          ],
+          0,
+        ),
+        makeStage('smoke-run', ['smoke/program'], 42),
       ]
       const result = yield* Report.report(f.input)
       assert.strictEqual(result.json.originalStage.status, 'passed')
@@ -782,6 +866,23 @@ it.effect(
       yield* refuses(f.input)
       f.input.build.stages[2].stdout = ''
       f.input.build.stages[0].error = 'measurement failed'
+      yield* refuses(f.input)
+      f.input.build.stages[0].error = null
+      f.input.build.stages[0].command[10] = 'true'
+      f.input.build.stages[0].measurementCommand[16] = 'true'
+      yield* refuses(f.input)
+      f.input.build.stages[0].command[10] = 'false'
+      f.input.build.stages[0].measurementCommand[16] = 'false'
+      f.input.build.stages[2].command = ['different-program']
+      f.input.build.stages[2].measurementCommand = [
+        '/time',
+        '-f',
+        '%M',
+        '-o',
+        '/rss',
+        '--',
+        'different-program',
+      ]
       yield* refuses(f.input)
     }),
 )
@@ -1219,8 +1320,24 @@ it.effect(
           )
           .join(''),
       )
+      f.inventory.compilation.root = 'src/result.silk'
       f.inventory.selected.selectedAuthoredFunctions = originals
-      f.inventory.selected.instances = []
+      // Synthetic selected containers only: actual public original identity/name bytes above.
+      f.inventory.selected.instances = originals.map((original) => ({
+        key: {
+          identity: 'synthetic-container-control',
+          declaration: original.canonical.id,
+          typeArguments: [],
+          staticArguments: [],
+          contractRow: [],
+          evidence: [],
+        },
+        artifact: { owner: original.owner, request: { _tag: 'Check' } },
+        origin: { kind: 'Authored', declaration: original.id },
+        originalDeclaration: original.id,
+        originalDeclarationSpan: original.declarationSpan,
+        residualBodySites: [],
+      }))
       f.inventory.selected.executionKeys = []
       f.inventory.selected.reachedExecutionEdges = []
       f.inventory.consumedSources[0] = { module: sourceId, path, sha256: Snapshot.hash(bytes) }
