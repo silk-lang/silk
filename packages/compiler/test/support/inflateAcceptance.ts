@@ -612,6 +612,6 @@ effect fn recover(error: OutOfMemoryError | DecodeError) -> i32 { return 99 }
 pub fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
   let work = exercise() |> Effect.provideMut<Allocator>(&mut allocator)
-  return run Effect.catchAll(work, recover)
+  return run Effect.catchAll(move work, recover)
 }
 `
