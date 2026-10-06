@@ -215,6 +215,9 @@ it.layer(NodeServices.layer)((it) => {
           'version',
           'seed',
           'source',
+          'profile-name',
+          'profile-optimization',
+          'profile-debug',
         ]) {
           yield* fixture(function* ({ root, options }) {
             executable(options.seed, producer())
@@ -227,12 +230,29 @@ it.layer(NodeServices.layer)((it) => {
             }
             if (fault === 'nonexecutable') chmodSync(clang, 0o444)
             if (fault === 'directory') clang = options.snapshot
-            if (['digest', 'version', 'seed', 'source'].includes(fault)) {
+            if (
+              [
+                'digest',
+                'version',
+                'seed',
+                'source',
+                'profile-name',
+                'profile-optimization',
+                'profile-debug',
+              ].includes(fault)
+            ) {
               const seed = yield* Schema.decodeEffect(Schema.fromJsonString(NativeSeed.SeedSchema))(
                 readFileSync(options.seedReceipt, 'utf8'),
               )
               const changed = {
                 ...seed,
+                profile: {
+                  ...seed.profile,
+                  name: fault === 'profile-name' ? 'invented-profile' : seed.profile.name,
+                  optimization:
+                    fault === 'profile-optimization' ? 'none' : seed.profile.optimization,
+                  debug: fault === 'profile-debug' ? false : seed.profile.debug,
+                },
                 toolchain: {
                   ...seed.toolchain,
                   clang: {

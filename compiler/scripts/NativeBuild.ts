@@ -252,6 +252,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       producer.bootstrap.stdlib.authority !== 'embedded-verified-main' ||
       producer.bootstrap.stdlib.normalizedDigest !== manifest.stdlibDigest ||
       producer.profile.target !== target ||
+      producer.profile.name !== 'release-with-debug' ||
+      producer.profile.optimization !== 'speed' ||
+      producer.profile.debug !== true ||
       !/^[a-f0-9]{64}$/.test(producer.toolchain.clang.sha256) ||
       producer.toolchain.clang.version.trim() === ''
     )
