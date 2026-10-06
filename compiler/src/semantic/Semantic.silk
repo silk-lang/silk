@@ -84,7 +84,7 @@ import backend.Mir {
   Rvalue as MirRvalue,
   Statement as MirStatement,
 }
-import hir.Intern {Symbol}
+import hir.Intern {StringTable, Symbol}
 import lexer.Span {Span}
 import semantic.RuntimeEncoding
 import semantic.Capture
@@ -147,6 +147,7 @@ import semantic.OpaqueRealization {Evidence as OpaqueLeaf, Producer as OpaquePro
 import semantic.Operator {ResultType as OperatorResultType}
 import semantic.Operator {Family as OperatorFamily}
 import semantic.Operator {Spelling as OperatorSpelling}
+import semantic.InternIndex {InternIndex}
 import semantic.Query {Cycle, Query}
 import semantic.Rejection {
   GenericKind,
@@ -255,7 +256,8 @@ import semantic.TypedBody {
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.hash {Hash, Word}
+import silk.hash {Hash, HashKey, HashSeed, Word}
+import silk.hash_map {HashMap}
 import silk.option {Option}
 import silk.pointer {Pointer}
 import silk.result {Result}
@@ -885,6 +887,45 @@ struct ScopedKey {
 
 impl Copy for ScopedKey {}
 
+// The scope identity `internKey` interns: the fields `sameKey` compares for the key's family,
+// under one request application, profile, condition context and origin transaction. Layout is
+// application-free.
+fn sameScopedKey(left: &ScopedKey, right: &ScopedKey) -> bool {
+  let sameApplication = left.key.family == Family.Layout || left.application == right.application
+  return sameApplication && left.profile == right.profile && left.condition == right.condition
+    && sameOriginContext(&left.origin, &right.origin) && sameKey(left.key, right.key)
+}
+
+// Hashes exactly the fields `sameKey` compares: Layout and the content-addressed backend
+// families are named by their interned subject alone.
+fn hashKey(hashed: u64, key: Key) -> u64 {
+  let named = Hash.combine(Hash.combine(hashed, u8.toU64(Family.value(key.family))), usize.toU64(key.name))
+  if key.family == Family.Layout || key.family == Family.Mir || key.family == Family.EmissionInputs || key.family == Family.LlvmText {
+    return named
+  }
+  let placed = Hash.combine(Hash.combine(named, usize.toU64(key.module)), usize.toU64(key.declaration))
+  let member = Hash.combine(placed, usize.toU64(key.member))
+  if key.external {
+    return Hash.combine(member, 1)
+  }
+  return Hash.combine(member, 0)
+}
+
+// Hashes exactly the fields `sameScopedKey` compares.
+fn hashScopedKey(value: &ScopedKey, seed: &HashSeed) -> u64 {
+  let mut hashed = hashKey(Hash.mix(seed, usize.toU64(value.profile)), value.key)
+  if value.key.family != Family.Layout {
+    hashed = Hash.combine(hashed, usize.toU64(value.application))
+  }
+  hashed = Hash.combine(hashed, usize.toU64(value.condition))
+  if value.origin.active {
+    return hashKey(Hash.combine(hashed, 1), value.origin.key)
+  }
+  return Hash.combine(hashed, 0)
+}
+
+impl HashKey for ScopedKey { equals: ScopedKey.sameScopedKey hash: ScopedKey.hashScopedKey }
+
 struct InstanceLocation {
   module: usize
   declaration: usize
@@ -1206,16 +1247,25 @@ struct Resolver {
   emissionInputs: Vector<EmissionInputs>
   llvmInputs: Vector<LlvmInput>
   llvmValues: Vector<InstanceDefinition>
+  // Each interned table below keeps its lookup beside it, so interning never scans the table.
   modules: Vector<ModuleId>
-  names: Vector<Bytes>
+  moduleLookup: InternIndex
+  names: StringTable
   applications: Vector<Shared<Type>>
+  applicationLookup: InternIndex
   layoutTypes: Vector<Shared<Type>>
+  layoutTypeLookup: InternIndex
   backendInstances: Vector<BackendInstance>
+  backendInstanceLookup: InternIndex
   // Semantic applications of selected bodies; a Body key's member is one plus this index.
   originEvidence: Vector<CallableOrigin.Producer>
   originPlans: Vector<CallableOrigin.Plan>
   selectedApplications: Vector<Application>
+  selectedApplicationLookup: InternIndex
+  llvmInputLookup: InternIndex
   keys: Vector<ScopedKey>
+  // The ordinal in `keys` of every interned scoped key.
+  keyLookup: HashMap<ScopedKey, usize>
   // The request-selected application module ordinal, or MAX when no binding was supplied.
   currentApplication: usize
   active: Vector<Word>
@@ -3236,31 +3286,37 @@ fn sameKey(left: Key, right: Key) -> bool {
 effect fn internApplication(resolver: &mut Resolver, application: &Shared<Type>) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
+  let hashed = Type.hash(application)
   let known = Vector.asSlice<Shared<Type>>(&resolver.applications)
-  let mut at = usize.ZERO
-  while at < known.length {
+  let mut at = InternIndex.first(&resolver.applicationLookup, hashed)
+  while at != usize.MAX {
     if run Type.equalsShared(&known[at], application) {
       return at
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.applicationLookup, at)
   }
+  let interned = known.length
   run Vector.append<Shared<Type>>(&mut resolver.applications, Shared.clone<Type>(application))
-  return at
+  run InternIndex.record(&mut resolver.applicationLookup, hashed)
+  return interned
 }
 
 effect fn internLayoutType(resolver: &mut Resolver, ty: &Shared<Type>) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
+  let hashed = Type.hash(ty)
   let known = Vector.asSlice<Shared<Type>>(&resolver.layoutTypes)
-  let mut at = usize.ZERO
-  while at < known.length {
+  let mut at = InternIndex.first(&resolver.layoutTypeLookup, hashed)
+  while at != usize.MAX {
     if run Type.runtimeEqualsShared(&known[at], ty) {
       return at
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.layoutTypeLookup, at)
   }
+  let interned = known.length
   run Vector.append<Shared<Type>>(&mut resolver.layoutTypes, Shared.clone<Type>(ty))
-  return at
+  run InternIndex.record(&mut resolver.layoutTypeLookup, hashed)
+  return interned
 }
 
 // One backend query subject: an instance, lowered for a program that does or does not observe
@@ -3273,16 +3329,19 @@ struct BackendInstance {
 effect fn internBackendInstance(resolver: &mut Resolver, instance: &InstanceKey, observing: bool) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
+  let hashed = InstanceKey.runtimeHash(instance)
   let known = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
-  let mut at = usize.ZERO
-  while at < known.length {
+  let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
+  while at != usize.MAX {
     if known[at].observing == observing && run InstanceKey.sameApplication(&known[at].key, instance) {
       return at
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
+  let interned = known.length
   run Vector.append<BackendInstance>(&mut resolver.*.backendInstances, BackendInstance {key: InstanceKey.copy(instance), observing: observing})
-  return at
+  run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
+  return interned
 }
 
 fn applicationLength(value: &Type) -> usize {
@@ -3325,16 +3384,14 @@ fn applicationMatches(value: &Type, declaration: &DeclarationId) -> bool {
 effect fn internModule(resolver: &mut Resolver, module: &ModuleId) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
-  let known = Vector.asSlice<ModuleId>(&resolver.modules)
-  let mut at = usize.ZERO
-  while at < known.length {
-    if ModuleId.equals(&known[at], module) {
-      return at
-    }
-    at = at + usize.ONE
+  let known = knownModuleOrdinal(&resolver.*, module)
+  if known != usize.MAX {
+    return known
   }
+  let interned = Vector.length<ModuleId>(&resolver.modules)
   run Vector.append<ModuleId>(&mut resolver.modules, run ModuleId.copy(module))
-  return at
+  run InternIndex.record(&mut resolver.moduleLookup, ModuleId.hash(module))
+  return interned
 }
 
 effect fn selectRequest(resolver: &mut Resolver, request: &Request) -> ()
@@ -3350,16 +3407,8 @@ effect fn selectRequest(resolver: &mut Resolver, request: &Request) -> ()
 effect fn internName(resolver: &mut Resolver, name: &[u8]) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
-  let known = Vector.asSlice<Bytes>(&resolver.names)
-  let mut at = usize.ZERO
-  while at < known.length {
-    if same(Bytes.asSlice(&known[at]), name) {
-      return at
-    }
-    at = at + usize.ONE
-  }
-  run Vector.append<Bytes>(&mut resolver.names, run Bytes.copy(name))
-  return at
+  let symbol = run StringTable.intern(&mut resolver.names, name)
+  return symbol.index
 }
 
 // The condition evaluation that a newly demanded key runs under. A condition starts its own
@@ -3444,33 +3493,25 @@ effect fn internKey(resolver: &mut Resolver, key: Key) -> Word ! OutOfMemoryErro
     context = usize.MAX
     origin = OriginContext {active: false, key: key}
   }
-  let mut at = usize.ZERO
-  while at < Vector.length<ScopedKey>(&resolver.keys) {
-    let known = Vector.get<ScopedKey>(&resolver.keys, at)
-    let sameApplication = key.family == Family.Layout || known.application == application
-    if sameApplication && known.profile == profile && known.condition == context && sameOriginContext(
-      &known.origin,
-      &origin,
-    ) && sameKey(known.key, key) {
-      if key.family == Family.Mir || key.family == Family.EmissionInputs {
-        let mut keys = Vector.asMutSlice<ScopedKey>(&mut resolver.*.keys)
-        keys[at].key = key
-      }
-      return Hash.word(usize.toU64(at))
-    }
-    at = at + usize.ONE
+  let scoped = ScopedKey {
+    key: key,
+    application: application,
+    profile: profile,
+    condition: context,
+    origin: origin,
   }
-  run Vector.append<ScopedKey>(
-    &mut resolver.keys,
-    ScopedKey {
-      key: key,
-      application: application,
-      profile: profile,
-      condition: context,
-      origin: origin,
-    },
-  )
-  return Hash.word(usize.toU64(at))
+  if let Option<usize>.Some {value: at} = move HashMap.get<ScopedKey, usize>(&resolver.keyLookup, scoped) {
+    if key.family == Family.Mir || key.family == Family.EmissionInputs {
+      let mut keys = Vector.asMutSlice<ScopedKey>(&mut resolver.*.keys)
+      keys[at].key = key
+    }
+    return Hash.word(usize.toU64(at))
+  }
+  let interned = Vector.length<ScopedKey>(&resolver.keys)
+  run Vector.append<ScopedKey>(&mut resolver.keys, scoped)
+  let replaced = run HashMap.insert<ScopedKey, usize>(&mut resolver.keyLookup, scoped, interned)
+  drop replaced
+  return Hash.word(usize.toU64(interned))
 }
 
 effect fn rejectWithRelated(
@@ -4361,8 +4402,7 @@ effect fn dependency(resolver: &mut Resolver, key: Key) -> Dependency
   let module = run ModuleId.copy(&modules[key.module])
   let mut name = Option.none<Bytes>()
   if key.family == Family.Name {
-    let names = Vector.asSlice<Bytes>(&resolver.names)
-    name = Option.some<Bytes>(run Bytes.copy(Bytes.asSlice(&names[key.name])))
+    name = Option.some<Bytes>(run Bytes.copy(StringTable.get(&resolver.names, Symbol {index: key.name})))
   }
   let mut declaration = Option.none<DeclarationId>()
   let mut member = Option.none<usize>()
@@ -4836,8 +4876,7 @@ effect fn resolvedModule(resolver: &Resolver, ordinal: usize) -> ModuleId
 effect fn resolvedName(resolver: &Resolver, ordinal: usize) -> Bytes
 ! OutOfMemoryError
 ? &mut Allocator {
-  let names = Vector.asSlice<Bytes>(&resolver.names)
-  return run Bytes.copy(Bytes.asSlice(&names[ordinal]))
+  return run Bytes.copy(StringTable.get(&resolver.names, Symbol {index: ordinal}))
 }
 
 effect fn resolveBucket(
@@ -11412,26 +11451,14 @@ effect fn locationOfInstance(resolver: &mut Resolver, instance: &InstanceKey) ->
 effect fn locationOfIdentity(resolver: &mut Resolver, identity: &Shared<DeclarationId>) -> Option<
   InstanceLocation,
 > ! Cycle | OutOfMemoryError ? &mut Allocator {
-  let count = Vector.length<ModuleId>(&resolver.modules)
-  let mut moduleIndex = usize.ZERO
-  while moduleIndex < count {
-    let known = Vector.asSlice<ModuleId>(&resolver.modules)
-    let sameModule = Shared.with<DeclarationId, bool>(
-      identity,
-      fn(id: &DeclarationId) -> bool {
-        return ModuleId.equals(&known[moduleIndex], DeclarationId.moduleId(id))
-      },
-    )
-    if sameModule {
-      let module = run resolvedModule(&resolver.*, moduleIndex)
-      let found = run ordinalOfIdentity(&mut resolver.*, &module, identity)
-      if let Option<usize>.Some {value} = move found {
-        return Option.some<InstanceLocation>(
-          InstanceLocation {module: moduleIndex, declaration: value},
-        )
-      }
-    }
-    moduleIndex = moduleIndex + usize.ONE
+  let moduleIndex = identityModuleOrdinal(&resolver.*, identity)
+  if moduleIndex == usize.MAX {
+    return Option.none<InstanceLocation>()
+  }
+  let module = run resolvedModule(&resolver.*, moduleIndex)
+  let found = run ordinalOfIdentity(&mut resolver.*, &module, identity)
+  if let Option<usize>.Some {value} = move found {
+    return Option.some<InstanceLocation>(InstanceLocation {module: moduleIndex, declaration: value})
   }
   return Option.none<InstanceLocation>()
 }
@@ -12974,40 +13001,22 @@ effect fn resolveInherentMembers(
 
 // Resolve propagated diagnostic evidence, not the requesting instance's module.
 fn rejectionModuleOrdinal(resolver: &Resolver, diagnostic: &Shared<Rejection>) -> usize {
-  let modules = Vector.asSlice<ModuleId>(&resolver.modules)
-  let mut at = usize.ZERO
-  while at < modules.length {
-    if Shared.with<Rejection, bool>(diagnostic, fn(value: &Rejection) -> bool {
-      return ModuleId.equals(&value.module, &modules[at])
-    }) { return at }
-    at = at + usize.ONE
-  }
-  return usize.MAX
+  return Shared.with<Rejection, usize>(diagnostic, fn(value: &Rejection) -> usize {
+    return knownModuleOrdinal(resolver, &value.module)
+  })
 }
 
 // The interned ordinal of the module that declares a nominal type, if this store knows it.
 fn declaringModuleOrdinal(resolver: &Resolver, value: &Shared<Type>) -> usize {
-  let modules = Vector.asSlice<ModuleId>(&resolver.modules)
-  let mut at = usize.ZERO
-  while at < modules.length {
-    let candidate = &modules[at]
-    if Shared.with<Type, bool>(
-      value,
-      fn(applied: &Type) -> bool {
-        return match & applied.* {
-          Type.Nominal {declaration, ..} => ModuleId.equals(
-            DeclarationId.moduleId(&declaration),
-            candidate,
-          )
-          _ => false
-        }
-      },
-    ) {
-      return at
-    }
-    at = at + usize.ONE
-  }
-  return usize.MAX
+  return Shared.with<Type, usize>(
+    value,
+    fn(applied: &Type) -> usize {
+      return match & applied.* {
+        Type.Nominal {declaration, ..} => knownModuleOrdinal(resolver, DeclarationId.moduleId(&declaration))
+        _ => usize.MAX
+      }
+    },
+  )
 }
 
 // Whether two providers have the same owner: one nominal declaration, or one foundational spelling.
@@ -13320,14 +13329,15 @@ fn termsBefore(first: &HeadTerms, second: &HeadTerms) -> bool {
   )
 }
 
+// The interned ordinal of `module`, or `usize.MAX` when this store has not interned it.
 fn knownModuleOrdinal(resolver: &Resolver, module: &ModuleId) -> usize {
   let modules = Vector.asSlice<ModuleId>(&resolver.modules)
-  let mut at = usize.ZERO
-  while at < modules.length {
+  let mut at = InternIndex.first(&resolver.moduleLookup, ModuleId.hash(module))
+  while at != usize.MAX {
     if ModuleId.equals(&modules[at], module) {
       return at
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.moduleLookup, at)
   }
   return usize.MAX
 }
@@ -17784,21 +17794,12 @@ fn namesOperation(answer: &Result<Answer, NoRejection>, member: &Shared<Declarat
 
 // The interned ordinal of the module that declares `identity`, or `usize.MAX`.
 fn identityModuleOrdinal(resolver: &Resolver, identity: &Shared<DeclarationId>) -> usize {
-  let modules = Vector.asSlice<ModuleId>(&resolver.modules)
-  let mut at = usize.ZERO
-  while at < modules.length {
-    let candidate = &modules[at]
-    if Shared.with<DeclarationId, bool>(
-      identity,
-      fn(declaration: &DeclarationId) -> bool {
-        return ModuleId.equals(DeclarationId.moduleId(declaration), candidate)
-      },
-    ) {
-      return at
-    }
-    at = at + usize.ONE
-  }
-  return usize.MAX
+  return Shared.with<DeclarationId, usize>(
+    identity,
+    fn(declaration: &DeclarationId) -> usize {
+      return knownModuleOrdinal(resolver, DeclarationId.moduleId(declaration))
+    },
+  )
 }
 
 // A scalar or `string` provider has no source actor, so its source witnesses are inline.
@@ -44976,15 +44977,16 @@ effect fn internLlvmInput(
     at = at + usize.ONE
   }
   let copied = run copyEmissionDependencies(dependencies)
+  let hashed = RuntimeEncoding.hash(0, Bytes.asSlice(&content))
   let inputs = Vector.asSlice<LlvmInput>(&resolver.llvmInputs)
-  at = usize.ZERO
-  while at < inputs.length {
+  at = InternIndex.first(&resolver.llvmInputLookup, hashed)
+  while at != usize.MAX {
     if same(Bytes.asSlice(&inputs[at].content), Bytes.asSlice(&content)) {
       break
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.llvmInputLookup, at)
   }
-  if at < inputs.length {
+  if at != usize.MAX {
     // Equal successful content keeps its completed answer. A source-validated gap retries
     // with the latest origins and dependency evidence after an edit.
     let current = Vector.asMutSlice<LlvmInput>(&mut resolver.llvmInputs)
@@ -44992,6 +44994,7 @@ effect fn internLlvmInput(
     current[at].dependencies = move copied
     current[at].observations = move observations
   } else {
+    at = Vector.length<LlvmInput>(&resolver.llvmInputs)
     run Vector.append<LlvmInput>(
       &mut resolver.llvmInputs,
       LlvmInput {
@@ -45001,6 +45004,7 @@ effect fn internLlvmInput(
         observations: move observations,
       },
     )
+    run InternIndex.record(&mut resolver.llvmInputLookup, hashed)
   }
   return at
 }
@@ -45569,16 +45573,19 @@ effect fn selectedApplicationAt(resolver: &Resolver, at: usize) -> Application !
 effect fn internSelectedApplication(resolver: &mut Resolver, application: &Application) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
+  let hashed = Application.hash(application)
   let known = Vector.asSlice<Application>(&resolver.selectedApplications)
-  let mut at = usize.ZERO
-  while at < known.length {
+  let mut at = InternIndex.first(&resolver.selectedApplicationLookup, hashed)
+  while at != usize.MAX {
     if run Application.equals(&known[at], application) {
       return at
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&resolver.selectedApplicationLookup, at)
   }
+  let interned = known.length
   run Vector.append<Application>(&mut resolver.*.selectedApplications, run Application.copy(application))
-  return at
+  run InternIndex.record(&mut resolver.selectedApplicationLookup, hashed)
+  return interned
 }
 
 fn staticScalarCode(value: &StaticData) -> usize {
@@ -50924,14 +50931,21 @@ impl Semantic {
         llvmInputs: Vector.make<LlvmInput>(),
         llvmValues: Vector.make<InstanceDefinition>(),
         modules: Vector.make<ModuleId>(),
-        names: Vector.make<Bytes>(),
+        moduleLookup: InternIndex.make(),
+        names: StringTable.make(),
         applications: Vector.make<Shared<Type>>(),
+        applicationLookup: InternIndex.make(),
         layoutTypes: Vector.make<Shared<Type>>(),
+        layoutTypeLookup: InternIndex.make(),
         backendInstances: Vector.make<BackendInstance>(),
+        backendInstanceLookup: InternIndex.make(),
         originPlans: Vector.make<CallableOrigin.Plan>(),
         originEvidence: Vector.make<CallableOrigin.Producer>(),
         selectedApplications: Vector.make<Application>(),
+        selectedApplicationLookup: InternIndex.make(),
+        llvmInputLookup: InternIndex.make(),
         keys: Vector.make<ScopedKey>(),
+        keyLookup: HashMap.make<ScopedKey, usize>(Hash.seed(0)),
         currentApplication: usize.MAX,
         active: Vector.make<Word>(),
         frames: Vector.make<SourceFrame>(),
@@ -52508,7 +52522,9 @@ impl Semantic {
     let mut admission = Admission.make()
     // Applications admitted by a finite closure certificate during this build.
     let mut certified = Vector.make<Application>()
+    let mut certifiedLookup = InternIndex.make()
     let mut visited = Vector.make<InstanceKey>()
+    let mut visitedLookup = InternIndex.make()
     let mut emitted = Vector.make<CollectedText>()
     let mut gaps = Vector.make<Shared<BackendGap>>()
     while Vector.length<BackendVisit>(&pending) > usize.ZERO {
@@ -52544,13 +52560,13 @@ impl Semantic {
           Decision.ChangingStatic {..} => {
             let mut admitted = false
             let known = Vector.asSlice<Application>(&certified)
-            let mut knownAt = usize.ZERO
-            while knownAt < known.length {
+            let mut knownAt = InternIndex.first(&certifiedLookup, Application.hash(&application))
+            while knownAt != usize.MAX {
               if run Application.equals(&known[knownAt], &application) {
                 admitted = true
                 break
               }
-              knownAt = knownAt + usize.ONE
+              knownAt = InternIndex.after(&certifiedLookup, knownAt)
             }
             if !admitted {
               let ancestorPath = run Admission.path(&admission)
@@ -52567,6 +52583,7 @@ impl Semantic {
                   let mut reachedAt = usize.ZERO
                   while reachedAt < reached.length {
                     run Vector.append<Application>(&mut certified, run Application.copy(&reached[reachedAt]))
+                    run InternIndex.record(&mut certifiedLookup, Application.hash(&reached[reachedAt]))
                     reachedAt = reachedAt + usize.ONE
                   }
                 }
@@ -52597,7 +52614,7 @@ impl Semantic {
           }
         }
       }
-      if run applicationVisited(Vector.asSlice<InstanceKey>(&visited), &instance) {
+      if run applicationVisited(Vector.asSlice<InstanceKey>(&visited), &visitedLookup, &instance) {
         if leave {
           Admission.leave(&mut admission)
         }
@@ -52607,6 +52624,7 @@ impl Semantic {
         run Vector.append<BackendVisit>(&mut pending, BackendVisit.Leave)
       }
       run Vector.append<InstanceKey>(&mut visited, InstanceKey.copy(&instance))
+      run InternIndex.record(&mut visitedLookup, InstanceKey.runtimeHash(&instance))
       let sealedGap = run sealedAllocationGlueGap(&instance, entered.span)
       if let Option<Shared<BackendGap>>.Some {value: gap} = move sealedGap {
         run Vector.append<Shared<BackendGap>>(&mut gaps, move gap)
@@ -52905,15 +52923,15 @@ effect fn assembleEmissionChecked(
   return BackendBuild.Module {text: move text, uncheckedBodies: unchecked, plan: move plan}
 }
 
-effect fn applicationVisited(visited: &[InstanceKey], instance: &InstanceKey) -> bool
+effect fn applicationVisited(visited: &[InstanceKey], lookup: &InternIndex, instance: &InstanceKey) -> bool
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut at = usize.ZERO
-  while at < visited.length {
+  let mut at = InternIndex.first(lookup, InstanceKey.runtimeHash(instance))
+  while at != usize.MAX {
     if run InstanceKey.sameApplication(&visited[at], instance) {
       return true
     }
-    at = at + usize.ONE
+    at = InternIndex.after(lookup, at)
   }
   return false
 }
