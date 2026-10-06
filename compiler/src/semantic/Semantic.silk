@@ -38151,16 +38151,6 @@ fn scalarSubject(value: &Type) -> bool {
   return scalarType(value) || pointerSizedIntegerType(value)
 }
 
-fn completeNominal(value: &Shared<Type>) -> bool {
-  if Type.hasOpenRuntimeParameters(value) { return false }
-  return Shared.with<Type, bool>(value, fn(node: &Type) -> bool {
-    return match &node.* {
-      Type.Nominal {..} => true
-      _ => false
-    }
-  })
-}
-
 // Source record identity is valid during abstract body checking. Runtime completeness belongs
 // to MIR realization and Layout, never to admission of a caller-owned generic pattern.
 effect fn declaredRecord(resolver: &mut Resolver, value: &Shared<Type>) -> bool
@@ -38178,12 +38168,14 @@ effect fn declaredRecord(resolver: &mut Resolver, value: &Shared<Type>) -> bool
   return false
 }
 
-// Source members may retain exact callable or generic evidence before monomorphization.
+// Source members may retain exact callable or generic evidence before monomorphization. A nominal
+// member has its own finite identity even while its arguments are open (`Empty<T>` in `Vector<T>`).
 // Every physical layout and source ordinal still requires the complete canonical storage map.
 fn sourceUnionMember(value: &Shared<Type>) -> bool {
-  return completeNominal(value) || Shared.with<Type, bool>(value, scalarSubject)
+  return Shared.with<Type, bool>(value, scalarSubject)
     || Type.closedCallableStorage(value) || Shared.with<Type, bool>(value, fn(ty: &Type) -> bool {
       return match &ty.* {
+        Type.Nominal {..} => true
         Type.Parameter {..} => true
         Type.CallableValue {..} => true
         Type.CallableSchema {..} => true
@@ -55179,6 +55171,7 @@ impl Semantic {
           edge: Edge.Direct,
           span: roots[rootAt].span,
           module: run ModuleId.copy(module),
+          cleanup: Option.none<Shared<Type>>(),
         },
       )
     }
@@ -55189,6 +55182,8 @@ impl Semantic {
     let mut visited = Vector.make<InstanceKey>()
     let mut emitted = Vector.make<CollectedText>()
     let mut gaps = Vector.make<Shared<BackendGap>>()
+    // Each cleanup root's owned-structure answers reached during this build.
+    let mut cleanupAnswers = Vector.make<CleanupAnswer>()
     while Vector.length<BackendVisit>(&pending) > usize.ZERO {
       let visit = match move Vector.pop<BackendVisit>(&mut pending) {
         Option<BackendVisit>.Some {value} => move value
@@ -55201,11 +55196,12 @@ impl Semantic {
           Admission.leave(&mut admission)
           continue
         }
-        BackendVisit.Enter {key: instance, edge, span, module: sourceModule} => BackendRequest {
+        BackendVisit.Enter {key: instance, edge, span, module: sourceModule, cleanup} => BackendRequest {
           key: move instance,
           edge: move edge,
           span: span,
           module: move sourceModule,
+          cleanup: move cleanup,
         }
       }
       let instance = move entered.key
@@ -55213,8 +55209,13 @@ impl Semantic {
       // Entry shims and drop glue carry no application to admit; only function instances specialize.
       if let Option<Shared<Application>>.Some {..} = move InstanceKey.application(&instance) {
         let application = run InstanceKey.selected(&instance)
-        let enteredEdge = Edge.copy(&entered.edge)
-        let decision = run Admission.enter(&mut admission, &application, move entered.edge)
+        // A Drop hook drop glue reaches is selected by the cleanup of the value its run started from.
+        let mut reaching = move entered.edge
+        if let Option<Shared<Type>>.Some {value: owner} = &entered.cleanup {
+          reaching = Edge.Cleanup {owner: Shared.clone<Type>(&owner)}
+        }
+        let enteredEdge = Edge.copy(&reaching)
+        let decision = run Admission.enter(&mut admission, &application, move reaching)
         match move decision {
           Decision.Entered => {
             leave = true
@@ -55269,9 +55270,14 @@ impl Semantic {
             continue
           }
           Decision.Rejected {path} => {
-            return BackendBuild.Rejected {
-              diagnostic: run rejectSpecialization(&entered.module, entered.span, Option.none<RelatedSite>(), move path),
+            if !run cleanupAdmits(&mut self.resolver, &mut self.query, &mut cleanupAnswers, &admission, &application,
+              &enteredEdge, Vector.asSlice<Application>(&path)) {
+              return BackendBuild.Rejected {
+                diagnostic: run rejectSpecialization(&entered.module, entered.span, Option.none<RelatedSite>(), move path),
+              }
             }
+            run Admission.enterChain(&mut admission, &application, move enteredEdge)
+            leave = true
           }
         }
       }
@@ -55365,6 +55371,15 @@ impl Semantic {
         let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
         if functions[selectedMir].observes { observes = true }
         let callerModule = run resolvedModule(&self.resolver, location.module)
+        // Drop glue passes its root on to the child glue and Drop hook it reaches; a function's
+        // own references start outside any cleanup.
+        let mut passed = Option.none<Shared<Type>>()
+        if let Option<Shared<Type>>.Some {value: glued} = move InstanceKey.glueType(&instance) {
+          passed = Option.some<Shared<Type>>(move glued)
+          if let Option<Shared<Type>>.Some {value: root} = &entered.cleanup {
+            passed = Option.some<Shared<Type>>(Shared.clone<Type>(&root))
+          }
+        }
         let references = Vector.asSlice<MirReference>(&functions[selectedMir].references)
         let mut edge = usize.ZERO
         while edge < references.length {
@@ -55375,6 +55390,7 @@ impl Semantic {
               edge: Edge.copy(&references[edge].edge),
               span: references[edge].origin.span,
               module: run ModuleId.copy(&callerModule),
+              cleanup: copyCleanupRoot(&passed),
             },
           )
           edge = edge + usize.ONE
@@ -55396,6 +55412,179 @@ impl Semantic {
   }
 }
 
+// Whether one candidate lies within one cleanup root's owned structure (GEN-006), answered once
+// per build.
+struct CleanupAnswer {
+  root: Shared<Type>
+  candidate: Shared<Type>
+  within: bool
+}
+
+fn copyCleanupRoot(root: &Option<Shared<Type>>) -> Option<Shared<Type>> {
+  return match &root.* {
+    Option<Shared<Type>>.Some {value} => Option.some<Shared<Type>>(Shared.clone<Type>(&value))
+    Option<Shared<Type>>.None => Option.none<Shared<Type>>()
+  }
+}
+
+// A re-entry the ordinary recursion guard rejects is admitted while it runs inside a Drop hook's
+// cleanup and its type arguments stay within the cleanup root's finite owned structure (GEN-006,
+// bootstrap `cleanupPermitsSpecialization`). The measure is replayed along the active path only
+// when such a re-entry occurs; every argument other than a type argument stays runtime-equal.
+effect fn cleanupAdmits(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>,
+  answers: &mut Vector<CleanupAnswer>, admission: &Admission, application: &Application, edge: &Edge,
+  rejected: &[Application]) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if rejected.length == usize.ZERO || !run Application.sameNonTypeArguments(&rejected[usize.ZERO], application) {
+    return false
+  }
+  let path = run Admission.path(admission)
+  let edges = run Admission.edges(admission)
+  let applications = Vector.asSlice<Application>(&path)
+  let reached = Vector.asSlice<Edge>(&edges)
+  let mut measure = Option.none<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < applications.length {
+    let next = run cleanupTransition(&mut resolver.*, &mut query.*, &mut answers.*, &measure, &applications[at], &reached[at])
+    measure = move next
+    at = at + usize.ONE
+  }
+  let admitted = run cleanupTransition(&mut resolver.*, &mut query.*, &mut answers.*, &measure, application, edge)
+  return match &admitted { Option<Shared<Type>>.Some {..} => true _ => false }
+}
+
+// The cleanup measure after one step (bootstrap `cleanupTransition`). A Drop hook selected from an
+// unmeasured step starts a measure at the value whose cleanup selected it. Inside a measure, a hook
+// keeps the root only while that value lies within the root's owned structure, and every step only
+// while each of its type arguments does; otherwise the measure ends and the ordinary guard applies.
+effect fn cleanupTransition(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>,
+  answers: &mut Vector<CleanupAnswer>, measure: &Option<Shared<Type>>, application: &Application, edge: &Edge)
+  -> Option<Shared<Type>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let root = match &measure.* {
+    Option<Shared<Type>>.Some {value} => Shared.clone<Type>(&value)
+    Option<Shared<Type>>.None => {
+      return match &edge.* {
+        Edge.Cleanup {owner} => Option.some<Shared<Type>>(Shared.clone<Type>(&owner))
+        _ => Option.none<Shared<Type>>()
+      }
+    }
+  }
+  if let Edge.Cleanup {owner} = &edge.* {
+    if !run withinCleanup(&mut resolver.*, &mut query.*, &mut answers.*, &root, &owner) {
+      return Option.none<Shared<Type>>()
+    }
+  }
+  let bindings = run Application.bindings(application)
+  let listed = Vector.asSlice<Binding>(&bindings)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Argument.Type {value} = &listed[at].value {
+      if !run withinCleanup(&mut resolver.*, &mut query.*, &mut answers.*, &root, &value) {
+        return Option.none<Shared<Type>>()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<Shared<Type>>(move root)
+}
+
+// Whether `candidate` is runtime-equal to the root or lies within its owned structure: a
+// structural part, or a field of a nominal application within it.
+effect fn withinCleanup(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>,
+  answers: &mut Vector<CleanupAnswer>, root: &Shared<Type>, candidate: &Shared<Type>) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let known = Vector.asSlice<CleanupAnswer>(&answers.*)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if run Type.runtimeEqualsShared(&known[at].candidate, candidate) {
+      if run Type.runtimeEqualsShared(&known[at].root, root) { return known[at].within }
+    }
+    at = at + usize.ONE
+  }
+  let mut unfolded = Vector.make<Shared<Type>>()
+  let mut path = Vector.make<Shared<Type>>()
+  let within = run searchCleanup(&mut resolver.*, &mut query.*, root, candidate, &mut unfolded, &mut path)
+  run Vector.append<CleanupAnswer>(&mut answers.*, CleanupAnswer {root: Shared.clone<Type>(root),
+    candidate: Shared.clone<Type>(candidate), within: within})
+  return within
+}
+
+// Searches a value's structural parts and the fields of each nominal application within it. A
+// nominal declaration unfolds beneath itself only at a strictly smaller instantiation, and each
+// application unfolds once, so the search is finite.
+effect fn searchCleanup(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, value: &Shared<Type>,
+  candidate: &Shared<Type>, unfolded: &mut Vector<Shared<Type>>, path: &mut Vector<Shared<Type>>) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if run Type.runtimeEqualsShared(value, candidate) { return true }
+  let children = run RuntimeType.inputs(value)
+  let parts = Vector.asSlice<Shared<Type>>(&children)
+  let mut at = usize.ZERO
+  while at < parts.length {
+    if run searchCleanup(&mut resolver.*, &mut query.*, &parts[at], candidate, &mut unfolded.*, &mut path.*) { return true }
+    at = at + usize.ONE
+  }
+  if !Shared.with<Type, bool>(value, isNominalType) { return false }
+  if run containsRuntimeType(Vector.asSlice<Shared<Type>>(&unfolded.*), value) { return false }
+  let enclosing = Vector.asSlice<Shared<Type>>(&path.*)
+  at = enclosing.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if sameNominal(&enclosing[at], value) {
+      if !run strictlySmallerNominal(value, &enclosing[at]) { return false }
+      break
+    }
+  }
+  run Vector.append<Shared<Type>>(&mut unfolded.*, Shared.clone<Type>(value))
+  let mut dependencies = Vector.make<Dependency>()
+  let fields = match move run nominalParts(&mut resolver.*, &mut query.*, &mut dependencies, value, Span.make(usize.ZERO, usize.ZERO)) {
+    Result<Vector<Shared<Type>>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Vector<Shared<Type>>, Shared<Rejection>>.Failure {error} => {
+      drop error
+      return false
+    }
+  }
+  let depth = Vector.length<Shared<Type>>(&path.*)
+  run Vector.append<Shared<Type>>(&mut path.*, Shared.clone<Type>(value))
+  let listed = Vector.asSlice<Shared<Type>>(&fields)
+  let mut found = false
+  at = usize.ZERO
+  while at < listed.length && !found {
+    found = run searchCleanup(&mut resolver.*, &mut query.*, &listed[at], candidate, &mut unfolded.*, &mut path.*)
+    at = at + usize.ONE
+  }
+  Vector.truncate<Shared<Type>>(&mut path.*, depth)
+  return found
+}
+
+effect fn containsRuntimeType(values: &[Shared<Type>], value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if run Type.runtimeEqualsShared(&values[at], value) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Every type argument of a same-declaration application equals the prior one's or lies strictly
+// inside it, and at least one lies strictly inside.
+effect fn strictlySmallerNominal(candidate: &Shared<Type>, prior: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let next = run RuntimeType.inputs(candidate)
+  let previous = run RuntimeType.inputs(prior)
+  let second = Vector.asSlice<Shared<Type>>(&next)
+  let first = Vector.asSlice<Shared<Type>>(&previous)
+  if first.length != second.length { return false }
+  let mut strict = false
+  let mut at = usize.ZERO
+  while at < first.length {
+    if !run Type.runtimeEqualsShared(&first[at], &second[at]) {
+      if !run Type.strictRuntimeSubterm(&second[at], &first[at]) { return false }
+      strict = true
+    }
+    at = at + usize.ONE
+  }
+  return strict
+}
 
 fn slotCount(slots: &Vector<StaticSlot>) -> usize {
   return Vector.length<StaticSlot>(slots)
@@ -55622,7 +55811,9 @@ effect fn appendDistinctForeignDeclaration(
 }
 
 union BackendVisit {
-  Enter {key: InstanceKey, edge: Edge, span: Span, module: ModuleId},
+  /// `cleanup` is the root whose cleanup reached this instance through drop glue: the value a
+  /// function dropped, carried unchanged through nested glue to the Drop hooks it selects.
+  Enter {key: InstanceKey, edge: Edge, span: Span, module: ModuleId, cleanup: Option<Shared<Type>>},
   Leave,
 }
 
@@ -55685,6 +55876,7 @@ struct BackendRequest {
   edge: Edge
   span: Span
   module: ModuleId
+  cleanup: Option<Shared<Type>>
 }
 
 // One demand-local finite-closure transaction rooted at a changing-static edge. It follows every
