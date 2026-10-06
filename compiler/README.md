@@ -114,7 +114,8 @@ reached bodies retain safety obligations. The TypeScript bootstrap compiler stil
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
 referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
-region shortens to any region, which is proven. A caller-local region (a loan rooted in the body)
+region shortens to any region, and a lifetime of the declaration enclosing a body outlives every
+loan rooted in that body, both of which are proven. A caller-local region (a loan rooted in the body)
 meeting another region that typing cannot relate, such as a declared lifetime, another
 caller-local region, or a region an earlier call operand fixed for the same binder (including a
 `'static` Effect environment), is admitted at the expected region, and the body retains a

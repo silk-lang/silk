@@ -1390,7 +1390,8 @@ on caller-local region relations.
   (roadmap step 14) retires it.
 - **Rule:** lifetimes are covariant in reference, slice and `string` regions, shared referents,
   array elements and covariant nominal storage (bootstrap `NominalVariance`). A `'static` region
-  shortens to any region.
+  shortens to any region, and a lifetime of the declaration enclosing a body outlives every loan
+  rooted in that body.
 - **Compilers:** the bootstrap admits these subtypes and proves every region relation in its borrow
   checker. Native typing admits a `'static` region at a shorter expected or binder-fixed region as a
   proven subtype, for example `return b"zero"` at an elided input region, `""` at `string<'text>`,
