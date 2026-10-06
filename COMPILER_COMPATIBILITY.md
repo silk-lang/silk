@@ -658,7 +658,9 @@ Each entry records:
   selected runtime module build roots. A Silk call to an exported definition remains the
   `foreign-export` gap. An export lane outside the immediate C subset keeps its C ABI gap. Compiling
   the bodies of `silk/native_start_sync` natively also depends on the generic Effect handler,
-  provider, callable-bound, foreign static and core storage work that other selfhost stages own.
+  provider, callable-bound and core storage work that other selfhost stages own. An `unsafe` read
+  of an imported C static of scalar or pointer type loads the external object named by its linkage
+  symbol; exported statics remain `ForeignStaticUnavailable`.
 - **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
   compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
   reaches the generated `main`. The compiler package selects `silk/native_start_sync` in
