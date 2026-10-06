@@ -8,6 +8,7 @@ import type * as PlatformError from 'effect/PlatformError'
 import * as Result from 'effect/Result'
 import * as Schema from 'effect/Schema'
 import * as Analysis from '@silklang/compiler/Analysis'
+import * as AuthoredIdentity from '@silklang/compiler/AuthoredIdentity'
 import * as CompilationProfile from '@silklang/compiler/CompilationProfile'
 import type * as ConfigurationError from '@silklang/compiler/ConfigurationError'
 import type * as ConfigurationOrigin from '@silklang/compiler/ConfigurationOrigin'
@@ -239,6 +240,33 @@ const authored = (snapshot: Analysis.Snapshot, declaration: DeclarationFacts.Dec
   const registry = Analysis.nameResolution(snapshot).contexts
   const declarationSpan = registry.spanOf(declaration.anchor)
   if (declaration.name._tag !== 'Present') return undefined
+  let tokenName = declaration.name
+  const implementation = declaration.conformanceImplementation
+  if (implementation !== undefined) {
+    const conformances = Analysis.declarationIndex(snapshot)
+      .modules.filter((module) => module.module === declaration.id.sourceId)
+      .flatMap((module) => module.conformances)
+      .filter(
+        (conformance) =>
+          conformance.module === declaration.id.sourceId &&
+          conformance.ordinal === implementation.ordinal,
+      )
+    const conformance = conformances.at(0)
+    if (conformances.length !== 1 || conformance === undefined) return undefined
+    const operations = conformance.operations.filter(
+      (operation) =>
+        operation.form === 'Inline' &&
+        operation.name._tag === 'Present' &&
+        operation.name.spelling === implementation.operation &&
+        AuthoredIdentity.anchorKey(operation.anchor) ===
+          AuthoredIdentity.anchorKey(declaration.anchor) &&
+        AuthoredIdentity.anchorKey(operation.name.anchor) ===
+          AuthoredIdentity.anchorKey(declaration.name.anchor),
+    )
+    const operation = operations.at(0)
+    if (operations.length !== 1 || operation?.name._tag !== 'Present') return undefined
+    tokenName = operation.name
+  }
   const nameSpan = registry.spanOf(declaration.name.anchor)
   const source = snapshot.closure.sources.get(nameSpan.sourceId)
   if (
@@ -246,14 +274,17 @@ const authored = (snapshot: Analysis.Snapshot, declaration: DeclarationFacts.Dec
     nameSpan.sourceId !== declaration.id.sourceId ||
     nameSpan.sourceId !== declaration.owner.module ||
     declarationSpan.sourceId !== nameSpan.sourceId ||
+    !AuthoredIdentity.equals(declaration.anchor.owner, declaration.owner) ||
+    !AuthoredIdentity.equals(tokenName.anchor.owner, declaration.owner) ||
     nameSpan.start === nameSpan.end ||
+    registry.of(declaration.anchor) === undefined ||
     registry.of(declaration.name.anchor) === undefined
   )
     return undefined
   const spelling = SourceFile.spelling(source, nameSpan)
   if (
     Option.isNone(spelling) ||
-    spelling.value !== declaration.name.spelling ||
+    spelling.value !== tokenName.spelling ||
     declarationSpan.start === declarationSpan.end
   )
     return undefined
@@ -263,6 +294,7 @@ const authored = (snapshot: Analysis.Snapshot, declaration: DeclarationFacts.Dec
     owner: declaration.owner,
     anchor: declaration.anchor,
     declarationSpan: span(declarationSpan),
+    lookupName: declaration.name.spelling,
     name: { spelling: spelling.value, anchor: declaration.name.anchor, span: span(nameSpan) },
   }
 }
