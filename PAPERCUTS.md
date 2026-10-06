@@ -618,3 +618,5 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · A direct bootstrap native build reached tool selection and failed `MissingCapability: clang` despite `SILK_TEST_CLANG` being set; that variable selects test tools only · Put the prepared LLVM bin directory on PATH for production `silk build`, and keep the build under the shared heavy-work lock · selfhost exact IR CLI
 
 - 2026-10-06 · Shared worktree dependency links did not expose esbuild to the verification bundler and a direct script typecheck missed Node declarations/generated toolchain inputs · Set NODE_PATH to the existing esbuild package for bundling; pass compiler @types explicitly and materialize the ignored ToolchainIntegrity.generated.ts locally · self-build corpus tooling
+
+- 2026-10-06 · Codex attach_artifact stalled from both worker and coordinator for963/964 · Attempt attachment without holding merges, record pending retry in ledger · Silk orchestration.
