@@ -9,6 +9,8 @@ import * as Schema from 'effect/Schema'
 import * as Analysis from '@silklang/compiler/Analysis'
 import * as Instances from '@silklang/compiler/Instances'
 import * as SourceFile from '@silklang/compiler/SourceFile'
+import * as StaticValue from '@silklang/compiler/StaticValue'
+import * as Type from '@silklang/compiler/Type'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as Layer from 'effect/Layer'
 import * as Tir from '@silklang/compiler/Tir'
@@ -243,11 +245,48 @@ pub fn main() -> i32 {
           (site) => site.tag === 'IntegerLiteral' && site.origin._tag === 'Synthetic',
         ),
       )
+      assert.strictEqual(captured.executionKeyScope, 'LOCAL_COMPLETE_KEY_RECORDS')
+      assert.isTrue(
+        captured.reachedExecutionEdges.every(
+          (edge) =>
+            Number.isInteger(edge.owner) &&
+            edge.owner >= 0 &&
+            edge.owner < captured.executionKeys.length &&
+            Number.isInteger(edge.target) &&
+            edge.target >= 0 &&
+            edge.target < captured.executionKeys.length,
+        ),
+      )
+      const fullKey = (value: Instances.InstanceKey) => ({
+        identity: Instances.keyText(value),
+        declaration: value.declaration,
+        typeArguments: value.typeArguments.map(Type.encodeGenericArgument),
+        staticArguments: value.staticArguments.map(StaticValue.encode),
+        contractRow: value.contractRow,
+        evidence: value.evidence,
+      })
+      assert.deepEqual(
+        captured.reachedExecutionEdges.map((edge) => ({
+          ...edge,
+          owner: captured.executionKeys.at(edge.owner),
+          target: captured.executionKeys.at(edge.target),
+        })),
+        snapshot.instances.executionEdges.map((edge) => ({
+          kind: edge.kind,
+          owner: fullKey(edge.owner),
+          target: fullKey(edge.target),
+          providers: (edge.providers ?? []).map((provider) => ({
+            capability: Type.encode(provider.capability),
+            providerType: Type.encode(provider.providerType),
+            role: provider.role,
+          })),
+        })),
+      )
       assert.deepEqual(
         captured.reachedExecutionEdges.map((edge) => [
           edge.kind,
-          edge.owner.identity,
-          edge.target.identity,
+          captured.executionKeys.at(edge.owner)?.identity,
+          captured.executionKeys.at(edge.target)?.identity,
         ]),
         snapshot.instances.executionEdges.map((edge) => [
           edge.kind,
@@ -255,12 +294,49 @@ pub fn main() -> i32 {
           Instances.keyText(edge.target),
         ]),
       )
-      const original =
-        snapshot.instances.instances.at(0) ?? unreachable('expected selected instance')
-      assert.deepEqual(
-        captured.instances.at(0)?.residualBodySites.map((site) => site.node),
-        Tir.nodesOf(original.function).map((node) => node.id),
+      assert.strictEqual(
+        captured.residualSiteScope,
+        'PARENT_INSTANCE_ARTIFACT_AND_ORIGINAL_DECLARATION',
       )
+      for (const [at, parent] of captured.instances.entries()) {
+        const original =
+          snapshot.instances.instances.at(at) ?? unreachable('expected selected instance')
+        const declaration = Analysis.declarationForIdentity(snapshot, {
+          _tag: 'DeclarationIdentity',
+          id: original.function.declaration.id,
+        })
+        const originalSpan =
+          declaration === undefined
+            ? undefined
+            : Analysis.nameResolution(snapshot).contexts.spanOf(declaration.anchor)
+        assert.deepEqual(
+          parent.residualBodySites.map((site) => ({
+            ...site,
+            instance: parent.key.identity,
+            artifact: parent.artifact,
+            originalDeclaration: parent.originalDeclaration,
+            originalDeclarationSpan: parent.originalDeclarationSpan,
+          })),
+          Tir.nodesOf(original.function).map((node) => ({
+            evidence: 'PRESENT_IN_SELECTED_RESIDUAL_BODY',
+            instance: Instances.keyText(original.key),
+            artifact: original.function.artifact,
+            originalDeclaration: declaration?.id,
+            originalDeclarationSpan:
+              originalSpan === undefined
+                ? undefined
+                : {
+                    sourceId: originalSpan.sourceId,
+                    start: originalSpan.start,
+                    end: originalSpan.end,
+                  },
+            node: node.id,
+            tag: '_tag' in node && typeof node._tag === 'string' ? node._tag : 'Unknown',
+            origin: node.origin,
+            span: { sourceId: node.span.sourceId, start: node.span.start, end: node.span.end },
+          })),
+        )
+      }
     }),
 )
 
@@ -268,21 +344,19 @@ it.effect(
   'preserves actual cleanup/provider edges and intrinsic spans without inventing generated names',
   () =>
     Effect.gen(function* () {
-      const source = `import silk.effect { Effect }
-service Source { effect fn load() -> i32 ? &mut Source }
+      const source = `service Source { effect fn load() -> i32 ? &mut Source }
 struct Provider {}
 impl Provider { effect fn load(self: &mut Self) -> i32 { return 42 } }
 impl Source for Provider { load: Provider.load }
-struct Owned { storage: RawBuffer<i32> }
+struct Owned { value: i32 }
 impl Drop for Owned { fn drop(self: &mut Owned) -> () { return () } }
 fn makeOwned() -> Owned { return makeOwned() }
-effect fn program() -> i32 {
+pub fn main() -> i32 {
   let mut provider = Provider {}
   let owned = makeOwned()
   drop owned
-  return run Source.load() |> Effect.provideMut<Source>(&mut provider)
-}
-pub fn main() -> i32 { return run program() }`
+  return run Intrinsic.bindRequirementMut<Source>(Source.load(), &mut provider)
+}`
       const snapshot = yield* retainingMain('inventory/providers', ascii(source))
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
       const captured = yield* Inventory.capture(snapshot)
@@ -312,6 +386,47 @@ pub fn main() -> i32 { return run program() }`
       for (const instance of captured.instances.filter(
         (value) => value.origin.kind === 'Generated',
       ))
-        assert.isUndefined(instance.residualBodySites.at(0)?.originalDeclaration)
+        assert.isUndefined(instance.originalDeclaration)
+    }),
+)
+
+it.effect(
+  'keeps differing full records with equal identity separate and preserves edge order',
+  () =>
+    Effect.gen(function* () {
+      // Pure codec controls do not represent a compiler-produced snapshot or successful analysis.
+      const first: Inventory.EncodedInstanceKey = {
+        identity: 'same-identity-control',
+        declaration: { _tag: 'CanonicalDeclarationId', module: 'control', name: 'first' },
+        typeArguments: [],
+        staticArguments: [],
+        contractRow: [],
+        evidence: [],
+      }
+      const other = { ...first, evidence: ['different-full-record-control'] }
+      const edge: Inventory.KeyedExecutionEdge = {
+        kind: 'Runtime',
+        owner: first,
+        target: first,
+        providers: [
+          {
+            capability: 'capability-control',
+            providerType: 'provider-control',
+            role: 'role-control',
+          },
+        ],
+      }
+      const edges = [edge, { ...edge, owner: other }, edge]
+      const compact = yield* Inventory.encodeExecutionEdges(edges)
+      assert.strictEqual(compact.executionKeyScope, 'LOCAL_COMPLETE_KEY_RECORDS')
+      assert.deepEqual(compact.executionKeys, [first, other])
+      assert.deepEqual(
+        compact.reachedExecutionEdges.map((value) => ({
+          ...value,
+          owner: compact.executionKeys.at(value.owner),
+          target: compact.executionKeys.at(value.target),
+        })),
+        edges,
+      )
     }),
 )

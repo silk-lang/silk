@@ -185,6 +185,56 @@ const providers = (values: ReadonlyArray<Instances.CallProvider> | undefined) =>
     role: value.role,
   }))
 
+export type EncodedInstanceKey = ReturnType<typeof key>
+export interface KeyedExecutionEdge {
+  readonly kind: Instances.ExecutionEdge['kind']
+  readonly owner: EncodedInstanceKey
+  readonly target: EncodedInstanceKey
+  readonly providers: ReturnType<typeof providers>
+}
+
+const executionKeyTable = (edges: ReadonlyArray<KeyedExecutionEdge>) => {
+  const executionKeys: Array<EncodedInstanceKey> = []
+  const executionKeyIndices = new Map<string, number>()
+  const reference = (encoded: EncodedInstanceKey): number => {
+    const equality = JSON.stringify(encoded)
+    const found = executionKeyIndices.get(equality)
+    if (found !== undefined) return found
+    const at = executionKeys.length
+    executionKeys.push(encoded)
+    executionKeyIndices.set(equality, at)
+    return at
+  }
+  const reachedExecutionEdges = edges.map((edge) => ({
+    ...edge,
+    owner: reference(edge.owner),
+    target: reference(edge.target),
+  }))
+  return {
+    executionKeyScope: 'LOCAL_COMPLETE_KEY_RECORDS' as const,
+    executionKeys,
+    reachedExecutionEdges,
+  }
+}
+
+/** Lossless local references over full already-encoded records; this does not analyze source. */
+export const encodeExecutionEdges = Effect.fn('BootstrapClosureInventory.encodeExecutionEdges')(
+  function* (
+    edges: ReadonlyArray<KeyedExecutionEdge>,
+  ): Effect.fn.Return<ReturnType<typeof executionKeyTable>, InventoryError> {
+    return yield* Effect.try({
+      try: () => executionKeyTable(edges),
+      catch: (cause) =>
+        new InventoryError({
+          operation: 'encode execution edges',
+          message: 'Execution key records are unavailable',
+          reason: 'WrappedFailure',
+          cause,
+        }),
+    })
+  },
+)
+
 const authored = (snapshot: Analysis.Snapshot, declaration: DeclarationFacts.DeclarationFact) => {
   const registry = Analysis.nameResolution(snapshot).contexts
   const declarationSpan = registry.spanOf(declaration.anchor)
@@ -256,20 +306,30 @@ const facts = (snapshot: Analysis.Snapshot) => {
       key: key(instance.key),
       origin,
       artifact,
+      originalDeclaration: original?.id,
+      originalDeclarationSpan: original?.declarationSpan,
       residualBodySites: Tir.nodesOf(instance.function).map((node) => ({
         evidence: 'PRESENT_IN_SELECTED_RESIDUAL_BODY' as const,
-        instance: Instances.keyText(instance.key),
-        artifact,
         node: node.id,
         tag: '_tag' in node && typeof node._tag === 'string' ? node._tag : 'Unknown',
         origin: node.origin,
         span: span(node.span),
-        originalDeclaration: original?.id,
-        originalDeclarationSpan: original?.declarationSpan,
       })),
     }
   })
+  const execution = executionKeyTable(
+    discovery.executionEdges.map((edge) => ({
+      kind: edge.kind,
+      owner: key(edge.owner),
+      target: key(edge.target),
+      providers: providers(edge.providers),
+    })),
+  )
   return {
+    ...execution,
+    // Node identity is (this containing instance key, artifact, node id). Original provenance
+    // is also inherited from the parent; no per-node copy changes or weakens that authority.
+    residualSiteScope: 'PARENT_INSTANCE_ARTIFACT_AND_ORIGINAL_DECLARATION' as const,
     status:
       !snapshot.diagnostics.some((diagnostic) => diagnostic.severity === 'error') &&
       snapshot.closure.resolutionFailures.length === 0 &&
@@ -282,12 +342,6 @@ const facts = (snapshot: Analysis.Snapshot) => {
         : ('Incomplete' as const),
     selectedAuthoredFunctions: [...authoredFunctions.values()],
     instances,
-    reachedExecutionEdges: discovery.executionEdges.map((edge) => ({
-      kind: edge.kind,
-      owner: key(edge.owner),
-      target: key(edge.target),
-      providers: providers(edge.providers),
-    })),
     reachedIntrinsics: discovery.intrinsics.map((call) => ({
       operation: call.operation,
       span: span(call.span),
