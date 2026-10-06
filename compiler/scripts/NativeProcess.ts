@@ -85,11 +85,13 @@ export interface Invocation {
   readonly cwd: string
   readonly resourceFile: string
   readonly timeCommand: string
+  readonly env?: ProcessOptions['env']
 }
 export interface Measurement {
   readonly command: ReadonlyArray<string>
   readonly measurementCommand: ReadonlyArray<string>
   readonly cwd: string
+  readonly linkerEnvironment: { readonly SILKC_CLANG: string } | null
   readonly exitCode: number | null
   readonly signal: string | null
   readonly stdout: string
@@ -109,11 +111,12 @@ export const run = Effect.fn('NativeProcess.run')(function* ({
   cwd,
   resourceFile,
   timeCommand,
+  env,
 }: Invocation): Effect.fn.Return<Measurement, never, FileSystem.FileSystem> {
   const fs = yield* FileSystem.FileSystem
   const measurementCommand = [timeCommand, '-f', '%M', '-o', resourceFile, '--', ...command]
   const started = yield* Effect.sync(() => performance.now())
-  const result = yield* execute(timeCommand, measurementCommand.slice(1), { cwd }).pipe(
+  const result = yield* execute(timeCommand, measurementCommand.slice(1), { cwd, env }).pipe(
     Effect.map((outcome) => ({ ...outcome, error: null })),
     Effect.catch((error) =>
       Effect.succeed({
@@ -145,6 +148,7 @@ export const run = Effect.fn('NativeProcess.run')(function* ({
     command,
     measurementCommand,
     cwd,
+    linkerEnvironment: env?.SILKC_CLANG === undefined ? null : { SILKC_CLANG: env.SILKC_CLANG },
     exitCode: result.status,
     signal,
     stdout: result.stdout.toString('utf8'),

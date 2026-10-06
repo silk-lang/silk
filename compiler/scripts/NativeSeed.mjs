@@ -21,7 +21,7 @@ import {
 export class NativeSeedError extends Data.TaggedError('NativeSeedError') {}
 const invalid = (message) => Effect.fail(new NativeSeedError({ message }))
 const ToolSchema = Schema.Struct({ sha256: Schema.String, version: Schema.String })
-const SeedSchema = Schema.Struct({
+export const SeedSchema = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   stage: Schema.String,
   sourceCommit: Schema.String,
