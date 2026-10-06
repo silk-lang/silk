@@ -328,3 +328,7 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 - 2026-10-06 · Isolated inventory smoke archived the complete stdlib through execFileSync’s default 1MiB buffer and failed ENOBUFS · Set the existing smoke archive limit explicitly to 64MiB for the second fixture archive · standalone inventory publication
 
 - 2026-10-06 · Immediate NodeRuntime failure exit truncated inventory JSON still queued on stdout, and a permissive local umask produced non-Git fixture modes · Await the stdout write callback before red exit; create fixture sources with explicit Git0644 permissions · standalone inventory publication
+
+- 2026-10-06 · Native receipt test discovery imported the compiler frontend before its ignored toolchain identity was generated in a clean N0 checkout · Build only the LLVM distribution and run the existing identity generator before the complete contract test glob · native contract CI setup
+
+- 2026-10-06 · A pnpm package build tried to refresh shared dependency links automatically, while a root-local type check missed the compiler package's Node types · Use direct package script binaries for owned local outputs and run the configured type check from the compiler package; CI keeps its frozen-install pnpm commands · native contract CI setup
