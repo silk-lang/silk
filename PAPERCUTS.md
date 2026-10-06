@@ -645,4 +645,6 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-10-06 · A worktree-isolated agent had multi-line Python heredoc edits refused as "too complex to verify that it stays inside the worktree", and Actions log/artifact blob downloads still return 403 through the agent proxy · Write the edit script to the scratchpad and run it with one plain command; read CI results through the GitHub MCP job-log tool with a small tail · selfhost scalar intrinsics
 
+- 2026-10-06 · Comparing corpus PASS sets and shard failures needed hundreds of log lines that do not fit in context · Request a tail of ~700 lines from the GitHub MCP job-log tool: the oversized result is saved to a tool-results file, which a small scratchpad script parses for PASS/FAIL lines, gap counts and failing tests · selfhost scalar intrinsics
+
 - 2026-10-06 · A local `silk build --manifest-path compiler/silk.toml` ran 13 minutes, then failed with `Unknown attribute kind (102)`: the bootstrap emits LLVM 22 bitcode but invokes the first `clang` on PATH and ignores `SILK_TEST_CLANG` · Install the pinned LLVM 22.1.8 into `.scratch/llvm-22.1.8` (see `.github/actions/setup-linux-llvm`) and put its `bin` first on PATH before building N0 · local self-build loop
