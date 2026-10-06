@@ -421,6 +421,14 @@ own declared contract. `Execution.make` and Fiber task preparation define their 
 contracts separately; those failures belong to owned execution construction, not to
 `Effect.suspend`.
 
+At the native `Intrinsic.systemAllocationAcquire` boundary, alignment must be a nonzero power of
+two, and adding the alignment padding to the byte count must fit target `usize`. Invalid requests
+return the canonical `Intrinsic.StorageFailure` before calling the platform allocator or creating
+allocation ownership. The ordinary system allocator maps that refusal to `OutOfMemoryError` through
+`Intrinsic.catchFailure`. A valid zero-byte request still acquires and releases one allocation;
+its logical byte count remains zero. A null platform result follows the existing storage-refusal
+path and creates no allocation ticket.
+
 **Diagnostics:** No allocator-specific conformance or recursion diagnostic applies merely because
 an allocator is reachable from suspendable code.
 
