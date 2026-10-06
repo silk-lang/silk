@@ -538,23 +538,26 @@ Each entry records:
 - **Compilers:** both infer the application from the provider's conformance heads and reject a
   provider with several applications (bootstrap `SEM0202`, selfhost `AmbiguousConformanceMethod`)
   or none (`MissingConformance`). Selfhost executes a `run` whose immediate operand is such a call
-  as one direct call of the selected witness, with the call's failure edge typed by the promised
-  failure; there is no adapter or runtime dispatch. Selfhost infers the provider from the first
-  operand only; the bootstrap uses the operand whose declared type is `Self` or `&Self`.
+  as one direct call of the selected witness; there is no adapter or runtime dispatch. The call's
+  failure edge has the witness's own declared failure, which EFF-009 bounds by the promised one,
+  and injects it into the promised failure's sink; a `never` witness gets no edge. Service
+  operations dispatched to a provider's witness lower the same way. Selfhost infers the provider
+  from the first operand only; the bootstrap uses the operand whose declared type is `Self` or
+  `&Self`.
 - **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
   to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
-  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. MIR
-  reports `interface-effect-witness` when the selected witness declares a failure other than the
-  promised one (for example `never` against `! Problem`): that call needs failure-edge adaptation.
-  The pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The
+  pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
-  failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, the narrower
-  witness gap, and the ambiguous, missing, bound and returned rejections at their call spans.
-  `providersServeRowsInKeyOrder` lowers `run Present.present(value)` to a witness call. The native
-  corpus pins `borrowed-outcome-stream` and `generic-inline-effect-conformance`.
-- **Owner:** stored constructions, failure adaptation, receiver-method, operator and pipeline
-  forms: #567 Step 9 follow-ups.
+  failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
+  `never` witness of a fallible operation, and the ambiguous, missing, bound and returned
+  rejections at their call spans. `ownedProviderServesGenericBinding` asserts the same edges for
+  service witnesses run directly and inside a bound section. `providersServeRowsInKeyOrder` lowers
+  `run Present.present(value)` to a witness call. The native corpus pins `borrowed-outcome-stream`,
+  `generic-inline-effect-conformance` and `scalar-display`.
+- **Owner:** stored constructions, receiver-method, operator and pipeline forms: #567 Step 9
+  follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 
