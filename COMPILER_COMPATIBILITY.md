@@ -106,13 +106,14 @@ Each entry records:
 ### Result-only call lifetimes in selfhost
 
 - **Status:** implemented on 2026-10-06 on PR #1076.
-- **Rule:** a lifetime binder that no parameter mentions, such as the impl lifetime of
-  `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() -> TrailerPolicy<'names> }`, is chosen
-  by the call's use (LIFE-003): no operand constrains the region of the result.
+- **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
+  the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
+  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
-  `'static`, since the result retains no operand region through that binder. Sections and function
-  values keep their existing result-only binder gaps.
+  `'static`, since the outcome retains no operand region through that binder. A binder nothing
+  mentions stays `UninferredParameter`. Sections and function values keep their existing
+  result-only binder gaps.
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
