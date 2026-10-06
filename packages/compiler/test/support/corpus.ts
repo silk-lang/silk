@@ -1,4 +1,5 @@
 import type * as RuntimeComponent from '../../src/RuntimeComponent.js'
+import { ordinaryStorageSource } from './ordinaryStorageSource.js'
 import { aesGcmAcceptanceSource } from './aesGcmAcceptance.js'
 import { borrowedTemporaryStream, borrowedTemporaryLifecycle } from './borrowedTemporaries.js'
 import { partialSuspension } from './partialSuspension.js'
@@ -7170,6 +7171,89 @@ export const httpRedirectCorpusProgram = Object.freeze({
 } satisfies CorpusProgram)
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
+  {
+    name: 'owned-allocation-preflight-refusal',
+    source: ordinaryStorageSource(`import silk.effect { Effect }
+import silk.usize
+import silk.compilation
+unsafe extern "C" fn silk_allocation_reset(refuse: i32) -> ()
+unsafe extern "C" fn silk_allocation_check(size: usize, calls: i32, releases: i32, debug: i32) -> i32
+effect fn allocate(bytes: usize, alignment: usize) -> i32 ! OutOfMemoryError {
+  let allocation = run Intrinsic.systemAllocationAcquire(Layout { bytes: bytes, alignment: alignment })
+  drop allocation
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
+fn check(bytes: usize, alignment: usize, refuse: i32, result: i32, physical: usize, calls: i32, releases: i32) -> bool {
+  unsafe silk_allocation_reset(refuse)
+  let actual = run Effect.catchAll(allocate(bytes, alignment), recover)
+  let mut debug = 0
+  if compilation.debug { debug = 1 }
+  return actual == result && unsafe silk_allocation_check(physical, calls, releases, debug) == 42
+}
+pub fn main() -> i32 {
+  if !check(11, 0, 0, 7, 0, 0, 0) { return 1 }
+  if !check(11, 3, 0, 7, 0, 0, 0) { return 2 }
+  if !check(usize.MAX, 2, 0, 7, 0, 0, 0) { return 3 }
+  if !check(0, 1, 0, 42, 1, 1, 1) { return 4 }
+  if !check(0, 16, 0, 42, 15, 1, 1) { return 5 }
+  if !check(11, 1, 0, 42, 11, 1, 1) { return 6 }
+  if !check(11, 16, 0, 42, 26, 1, 1) { return 8 }
+  if !check(11, 16, 1, 7, 26, 1, 0) { return 9 }
+  let high = usize.MAX / 2 + 1
+  if !check(0, high, 1, 7, high - 1, 1, 0) { return 10 }
+  return 42
+}`),
+    nativeCSources: {
+      allocation_counter: `#include <stddef.h>
+#include <stdint.h>
+/* Fixture storage backs only small requests; huge valid alignments are refused by malloc.
+ * Counting starts in the source main, after the hosted runtime's own allocations. */
+_Alignas(max_align_t) static unsigned char arena[8 * 1024 * 1024];
+static size_t used;
+static int active, refuse, calls, frees, releases, live, invalid_release;
+static size_t requested;
+static void *ticket;
+void *malloc(size_t size) {
+  if (active) { calls++; requested = size; }
+  if ((active && refuse) || used > sizeof(arena) - 32 || size > sizeof(arena) - used - 32) return NULL;
+  used = (used + 15) & ~(size_t)15;
+  void *result = arena + used;
+  used += size ? size : 1;
+  if (active) { ticket = result; live++; }
+  return result;
+}
+void free(void *pointer) {
+  if (!active) return;
+  frees++;
+  /* free(NULL) is inert and may disappear under optimization; it reclaims no ticket. */
+  if (!pointer) return;
+  releases++;
+  if (pointer != ticket || live != 1) invalid_release++;
+  else live--;
+}
+void silk_allocation_reset(int32_t should_refuse) {
+  active = 1; refuse = should_refuse;
+  calls = frees = releases = live = invalid_release = 0;
+  requested = 0; ticket = NULL;
+}
+int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expected_releases, int32_t debug) {
+  int32_t result = requested == size && calls == expected_calls &&
+    releases == expected_releases &&
+    (expected_calls == 0 ? frees == 0 : expected_releases == 0 || frees == expected_releases) &&
+    (!debug || expected_calls != 1 || expected_releases != 0 || frees == 1) &&
+    live == 0 && invalid_release == 0 ? 42 : 0;
+  active = 0;
+  return result;
+}
+`,
+    },
+    nativeProfiles: [
+      { name: 'debug', optimization: 'none', debug: true },
+      { name: 'optimized', optimization: 'speed', debug: false },
+    ],
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     // Same erased Guard layout, distinct selected hooks. Counters also reject omitted cleanup.
     // Separate callers isolate generic glue from the bootstrap's lifetime-erased caller reuse.
