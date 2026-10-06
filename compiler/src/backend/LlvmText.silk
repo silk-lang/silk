@@ -1787,6 +1787,11 @@ effect fn emitScalarRvalue(
       let owner = InstanceKey.identity(&function.key)
       fail Gap.make(GapCode.TypedForm, &owner, span)
     }
+    // Loaded by its statement, which retains the classified C object.
+    Rvalue.ForeignStatic {..} => {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.TypedForm, &owner, span)
+    }
     Rvalue.Ref {place, ..} => {
       let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
       return Value {
@@ -2600,6 +2605,36 @@ effect fn emitCall(
   return ()
 }
 
+// Copies the current value of one classified C object into its destination place.
+effect fn emitForeignStaticRead(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &[TypeLayout],
+  foreign: &[CAbi.Signature],
+  destination: &Place,
+  declaration: &Shared<DeclarationId>,
+  span: Span,
+) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let index = foreignSignatureIndex(foreign, declaration)
+  if index == usize.MAX || !foreign[index].global {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.make(GapCode.ForeignStatic, &owner, span)
+  }
+  let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
+  let mut symbol = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+  run append(&mut symbol, b"@")
+  run quoted(&mut symbol, Bytes.asSlice(&foreign[index].symbol))
+  let object = Address {
+    ty: Shared.clone<Type>(&output.ty),
+    text: move symbol.text,
+    alignment: foreign[index].result.layout.alignment,
+    representation: output.representation,
+  }
+  let value = run loadAddress(&mut writer.*, &object)
+  return run storeValue(&mut writer.*, &output, &value)
+}
+
 effect fn emitBlock(
   writer: &mut Writer,
   function: &MirFunction,
@@ -2615,17 +2650,21 @@ effect fn emitBlock(
   while at < statements.length {
     match & statements[at] {
       Statement.Assign {destination, value, origin} => {
-        if let Rvalue.FunctionAddress {key} = &value {
+        match &value {
           // A callback's address is its emitted symbol (failure observer note N1).
-          let address = run emitPlace(&mut writer.*, function, target, layouts, &destination)
-          let symbol = run InstanceIdentity.name(identities, &key)
-          run append(&mut writer.*, b"store ptr @")
-          run append(&mut writer.*, Bytes.asSlice(&symbol))
-          run append(&mut writer.*, b", ptr ")
-          run append(&mut writer.*, Bytes.asSlice(&address.text))
-          run append(&mut writer.*, b"\n")
-        } else {
-          run emitAssign(&mut writer.*, function, target, layouts, &destination, &value, origin.span)
+          Rvalue.FunctionAddress {key} => {
+            let address = run emitPlace(&mut writer.*, function, target, layouts, &destination)
+            let symbol = run InstanceIdentity.name(identities, &key)
+            run append(&mut writer.*, b"store ptr @")
+            run append(&mut writer.*, Bytes.asSlice(&symbol))
+            run append(&mut writer.*, b", ptr ")
+            run append(&mut writer.*, Bytes.asSlice(&address.text))
+            run append(&mut writer.*, b"\n")
+          }
+          Rvalue.ForeignStatic {declaration} => {
+            run emitForeignStaticRead(&mut writer.*, function, target, layouts, foreign, &destination, &declaration, origin.span)
+          }
+          _ => { run emitAssign(&mut writer.*, function, target, layouts, &destination, &value, origin.span) }
         }
       }
       // A drop calls the glue of the place's type with the place's address (MIR core shape §3),
@@ -2841,13 +2880,20 @@ pub effect fn emit(
     at = at + usize.ONE
   }
   let fallible = failureLocal(function) != usize.MAX
+  // A C export shim keeps its requested linkage name and the C narrow-integer extension rules.
+  let exported = match &function.key {
+    InstanceKey.Export {..} => true
+    _ => false
+  }
   run append(&mut writer, b"define ")
+  if exported { run cExtension(&mut writer, result) }
   if fallible { run append(&mut writer, b"i1") }
   else if result.aggregate { run append(&mut writer, b"void") }
   else { run typeName(&mut writer, result) }
   run append(&mut writer, b" @")
   let symbol = run InstanceIdentity.name(identities, &function.key)
-  run append(&mut writer, Bytes.asSlice(&symbol))
+  if exported { run quoted(&mut writer, Bytes.asSlice(&symbol)) }
+  else { run append(&mut writer, Bytes.asSlice(&symbol)) }
   writer.symbol = move symbol
   run append(&mut writer, b"(")
   let leadingOutput = result.aggregate && !fallible
@@ -2858,9 +2904,12 @@ pub effect fn emit(
       run append(&mut writer, b", ")
     }
     let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.span)
+    let lane = storageRepresentation(&parameters[at], target, facts)
     if facts.abi == Abi.Indirect { run append(&mut writer, b"ptr") }
-    else { run typeName(&mut writer, storageRepresentation(&parameters[at], target, facts)) }
-    run append(&mut writer, b" %p")
+    else { run typeName(&mut writer, lane) }
+    run append(&mut writer, b" ")
+    if exported { run cExtension(&mut writer, lane) }
+    run append(&mut writer, b"%p")
     run decimal(&mut writer, at)
     at = at + usize.ONE
   }
@@ -2897,6 +2946,15 @@ pub effect fn emit(
   run append(&mut writer, b"}\n")
   run Bytes.append(&mut writer.constants, Bytes.asSlice(&writer.text))
   return move writer.constants
+}
+
+// The extension attribute, with its trailing space, that C requires of a narrow integer lane.
+effect fn cExtension(writer: &mut Writer, lane: Representation) -> () ! OutOfMemoryError ? &mut Allocator {
+  if lane.aggregate || lane.pointer || lane.floating || lane.unit || lane.bits == usize.ZERO || lane.bits >= 32 {
+    return ()
+  }
+  if lane.signed { return run append(&mut writer.*, b"signext ") }
+  return run append(&mut writer.*, b"zeroext ")
 }
 
 /// One deduplicated declaration candidate owned by an instance answer.
@@ -2967,6 +3025,20 @@ pub effect fn foreignDeclarations(foreign: &[CAbi.Signature]) -> Vector<Declarat
   while at < foreign.length {
     let signature = &foreign[at]
     let mut writer = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    if signature.global {
+      // A C object is an external global of its value lane, defined by the C side.
+      run append(&mut writer, b"@")
+      run quoted(&mut writer, Bytes.asSlice(&signature.symbol))
+      run append(&mut writer, b" = external global ")
+      run laneType(&mut writer, &signature.result, &signature.declaration, signature.span)
+      run append(&mut writer, b"\n")
+      run Vector.append<Declaration>(
+        &mut output,
+        Declaration {symbol: run Bytes.copy(Bytes.asSlice(&signature.symbol)), text: move writer.text},
+      )
+      at = at + usize.ONE
+      continue
+    }
     run append(&mut writer, b"declare ")
     run extension(&mut writer, signature.result.extension)
     run laneType(&mut writer, &signature.result, &signature.declaration, signature.span)

@@ -103,6 +103,24 @@ Each entry records:
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
+### Result-only call lifetimes in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1076.
+- **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
+  the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
+  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
+- **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
+  call: a complete ordinary call takes the region its expected result names, and otherwise binds
+  `'static`, since the outcome retains no operand region through that binder. A binder nothing
+  mentions stays `UninferredParameter`. Sections and function values keep their existing
+  result-only binder gaps.
+- **Source migration:** none.
+- **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
+  selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
+  bootstrap infers the shorter region.
+- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
 - **Status:** native coverage classification approved by the B8 coordinator on 2026-09-30;
@@ -464,9 +482,12 @@ Each entry records:
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
   different join reports the named `nested-effect-join` gap. An Effect result with no producer
-  body (an interface operation's declared `Effect<...>` result) and Effect-producing callables
-  inferred from `effect fn` values (handlers passed to `Effect.catch`, `catchAll`, `flatMap`)
-  remain `effect-form`. Interface `effect fn` calls have their own entry below.
+  body (an interface operation's declared `Effect<...>` result) remains `effect-form`. An
+  `effect fn` handler passed to `Effect.catch`, `catchAll` or `flatMap`, including a generic one
+  such as `effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32`, is instantiated from the
+  parameters its use determined, and its constructed Effect infers the call's remaining channels.
+  A handler whose callable bound still cannot be inferred remains `effect-form`. Interface
+  `effect fn` calls have their own entry below.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
@@ -658,26 +679,50 @@ Each entry records:
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
 
-### Native entry uses a generated C `main` until it compiles the source runtime
+### Native entry uses a generated C `main` unless the build selects a source runtime
 
 - **Status:** temporary divergence approved by Julia on 2026-10-02
   ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
-  decision Q1). It is retired when selfhost compiles `silk/native_start` as the runtime root and
-  the `Entry { main }` key is deleted.
+  decision Q1). Selected source runtimes are implemented natively as of 2026-10-06. The rest is
+  retired when selfhost compiles `silk/native_start` as the default hosted runtime root and the
+  `Entry { main }` key is deleted.
 - **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
   to ENTRY-003 put program entry in source. The runtime module calls the application, provides
   `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
   generated invocation adapter.
-- **Compilers:** the bootstrap follows the rule through `silk/native_start`. Selfhost's
-  `Entry { main }` key emits a C `main` that calls `fn main() -> i32` directly and reports
-  `entry-signature` for every other signature, including `pub effect fn main`. Compiling
-  `native_start` needs `Execution` frames and the diagnostic observer intrinsics, which follow the
-  suspension stage.
+  [ARTIFACT-001](apps/docs/content/reference/artifact-roots-and-requirements.md#artifact-001--form-stage-and-runtime-are-separate)
+  and ARTIFACT-002 select the runtime from the build composition and bind `Intrinsic.application`
+  to the application module.
+- **Compilers:** the bootstrap follows the rule through `silk/native_start`, or through the runtime
+  that `[build].composition` selects. Selfhost reads the `defaults` and `runtimes` of
+  `[build].composition` in the nearest `silk.toml`. One default selects that runtime module as a
+  second analysis root. Its active module-level `export "C" fn` declarations are then the only
+  build roots. Each one is a C ABI definition with the requested symbol that forwards
+  immediate scalar and pointer lanes, including C narrow-integer extensions, to the ordinary Silk
+  definition. `import Intrinsic.application` binds the application module. Two defaults, or a
+  default that `runtimes` does not list, stop the build. An absent source is a `MissingModule`
+  rejection at the runtime module. No default keeps the generated entry: `Entry { main }` emits
+  a C `main` that calls `fn main() -> i32` directly and reports `entry-signature` for every other
+  signature, including `pub effect fn main`. Compiling `native_start` needs `Execution` frames and
+  the diagnostic observer intrinsics, which follow the suspension stage.
+
+  Selfhost does not yet read profile `runtime` requests (`none` or a named runtime), composition
+  `retention`, `components` or `requirements`, and it does not make exports declared outside the
+  selected runtime module build roots. A Silk call to an exported definition remains the
+  `foreign-export` gap. An export lane outside the immediate C subset keeps its C ABI gap. Compiling
+  the bodies of `silk/native_start_sync` natively also depends on the generic Effect handler,
+  provider, callable-bound and core storage work that other selfhost stages own. An `unsafe` read
+  of an imported C static of scalar or pointer type loads the external object named by its linkage
+  symbol; exported statics remain `ForeignStaticUnavailable`.
 - **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
   compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
-  reaches the generated `main`.
+  reaches the generated `main`. The compiler package selects `silk/native_start_sync` in
+  `compiler/silk.toml`. An unhandled failure from the compiler's `main` exits with status 1 and
+  no diagnostic report.
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
+  `SemanticCases` covers runtime C export roots, lane extensions, inactive arms, absent runtime
+  sources, and manifest default selection.
 
 ### Selfhost failure reports carry origin only
 
