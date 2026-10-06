@@ -411,17 +411,27 @@ it.effect('refuses diagnosed trap bodies before backend emission', () =>
 
 it.effect('emits native debug metadata only for debug requests', () =>
   Effect.gen(function* () {
-    const debug = yield* emit(nestedSource, {
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'golden/program',
+      ascii(nestedSource),
+      'x86_64-unknown-linux-gnu',
+    )
+    const debug = yield* Analysis.codegen(snapshot, {
       mode: 'debug',
       sources: new Map([['golden/program', ascii(nestedSource)]]),
+      verifyIr: true,
     })
-    const release = yield* emit(nestedSource, { mode: 'release' })
+    const release = yield* Analysis.codegen(snapshot, { mode: 'release', verifyIr: true })
 
     assert.include(debug.ir, '!DICompileUnit(')
     assert.include(debug.ir, '!DISubprogram(')
+    assert.include(debug.ir, '!DILocation(')
     assert.include(debug.ir, '!dbg')
+    assert.include(debug.ir, '!llvm.module.flags = ')
+    assert.match(debug.ir, /!\d+ = !\{i32 2, !"Debug Info Version", i32 3\}/)
     assert.notInclude(release.ir, 'DICompileUnit')
     assert.notInclude(release.ir, '!dbg')
+    assert.notInclude(release.ir, 'Debug Info Version')
   }),
 )
 

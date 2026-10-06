@@ -843,6 +843,15 @@ const initializeDebugInfo = Effect.fn('NativeProgram.initializeDebugInfo')(funct
     compileUnit = yield* LlvmMetadata.compileUnit(builder, file, producer, {})
     if (compileUnit !== undefined) {
       yield* LlvmMetadata.named(builder, 'llvm.dbg.cu', [compileUnit])
+      // LLVM discards source debug metadata on load without its supported format version.
+      const i32 = yield* LlvmType.integer(builder, 32)
+      yield* LlvmMetadata.named(builder, 'llvm.module.flags', [
+        yield* LlvmMetadata.tuple(builder, [
+          yield* LlvmMetadata.constant(builder, yield* Constant.integerUnsigned(builder, i32, 2)),
+          yield* LlvmMetadata.string(builder, 'Debug Info Version'),
+          yield* LlvmMetadata.constant(builder, yield* Constant.integerUnsigned(builder, i32, 3)),
+        ]),
+      ])
     }
   }
 
