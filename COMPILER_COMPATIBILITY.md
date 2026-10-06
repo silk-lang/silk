@@ -626,26 +626,48 @@ Each entry records:
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
 
-### Native entry uses a generated C `main` until it compiles the source runtime
+### Native entry uses a generated C `main` unless the build selects a source runtime
 
 - **Status:** temporary divergence approved by Julia on 2026-10-02
   ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
-  decision Q1). It is retired when selfhost compiles `silk/native_start` as the runtime root and
-  the `Entry { main }` key is deleted.
+  decision Q1). Selected source runtimes are implemented natively as of 2026-10-06. The rest is
+  retired when selfhost compiles `silk/native_start` as the default hosted runtime root and the
+  `Entry { main }` key is deleted.
 - **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
   to ENTRY-003 put program entry in source. The runtime module calls the application, provides
   `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
   generated invocation adapter.
-- **Compilers:** the bootstrap follows the rule through `silk/native_start`. Selfhost's
-  `Entry { main }` key emits a C `main` that calls `fn main() -> i32` directly and reports
-  `entry-signature` for every other signature, including `pub effect fn main`. Compiling
-  `native_start` needs `Execution` frames and the diagnostic observer intrinsics, which follow the
-  suspension stage.
+  [ARTIFACT-001](apps/docs/content/reference/artifact-roots-and-requirements.md#artifact-001--form-stage-and-runtime-are-separate)
+  and ARTIFACT-002 select the runtime from the build composition and bind `Intrinsic.application`
+  to the application module.
+- **Compilers:** the bootstrap follows the rule through `silk/native_start`, or through the runtime
+  that `[build].composition` selects. Selfhost reads the `defaults` and `runtimes` of
+  `[build].composition` in the nearest `silk.toml`. One default selects that runtime module as a
+  second analysis root. Its active module-level `export "C" fn` declarations are then the only
+  build roots. Each one is a C ABI definition with the requested symbol that forwards
+  immediate scalar and pointer lanes, including C narrow-integer extensions, to the ordinary Silk
+  definition. `import Intrinsic.application` binds the application module. Two defaults, or a
+  default that `runtimes` does not list, stop the build. An absent source is a `MissingModule`
+  rejection at the runtime module. No default keeps the generated entry: `Entry { main }` emits
+  a C `main` that calls `fn main() -> i32` directly and reports `entry-signature` for every other
+  signature, including `pub effect fn main`. Compiling `native_start` needs `Execution` frames and
+  the diagnostic observer intrinsics, which follow the suspension stage.
+
+  Selfhost does not yet read profile `runtime` requests (`none` or a named runtime), composition
+  `retention`, `components` or `requirements`, and it does not make exports declared outside the
+  selected runtime module build roots. A Silk call to an exported definition remains the
+  `foreign-export` gap. An export lane outside the immediate C subset keeps its C ABI gap. Compiling
+  the bodies of `silk/native_start_sync` natively also depends on the generic Effect handler,
+  provider, callable-bound, foreign static and core storage work that other selfhost stages own.
 - **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
   compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
-  reaches the generated `main`.
+  reaches the generated `main`. The compiler package selects `silk/native_start_sync` in
+  `compiler/silk.toml`. An unhandled failure from the compiler's `main` exits with status 1 and
+  no diagnostic report.
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
+  `SemanticCases` covers runtime C export roots, lane extensions, inactive arms, absent runtime
+  sources, and manifest default selection.
 
 ### Selfhost failure reports carry origin only
 

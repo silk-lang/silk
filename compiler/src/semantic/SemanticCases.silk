@@ -142,6 +142,8 @@ import semantic.TypedBody {
 }
 import backend.Mir {SwitchCase as MirSwitchCase, FailureEdge as MirFailureEdge, Diagnostics as MirDiagnostics, ContextText as MirContextText}
 import semantic.SourceRevision {Observation, Revision}
+import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, ModuleSources}
+import silk.toml_scanner {TomlError}
 import semantic.StaticValue
 import semantic.StaticConstant
 import semantic.StaticText
@@ -24592,6 +24594,168 @@ fn entryGap(built: &BackendBuild) -> bool {
     }
   }
   return false
+}
+
+// The definition text that starts with `header`, through its closing brace; empty when absent.
+fn definitionAt<'a>(text: &'a [u8], header: &[u8]) -> &'a [u8] {
+  let mut start = usize.ZERO
+  while start + header.length <= text.length {
+    if sameBytes(Slice.view<u8>(text, start, header.length), header) {
+      let mut end = start + header.length
+      while end < text.length && !(text[end] == 125 && text[end - usize.ONE] == 10) {
+        end = end + usize.ONE
+      }
+      return Slice.view<u8>(text, start, end - start)
+    }
+    start = start + usize.ONE
+  }
+  return Slice.view<u8>(text, usize.ZERO, usize.ZERO)
+}
+
+test effect fn selectedRuntimeExportsAreTheBuildRoots() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run runtimeRootClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn runtimeRootClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let runtime = run module("runtime-roots.silk")
+  let application = run module("runtime-application.silk")
+  let lanes = run module("runtime-lanes.silk")
+  let absent = run module("runtime-absent.silk")
+  let runtimeText = """import Intrinsic.application
+fn forward(count: i32, values: ?[*]const u8) -> i32 { return application.answer(count) }
+export "C" fn enter(count: i32, values: ?[*]const u8) -> i32 as "main" { return forward(count, values) }
+export "C" fn narrow(value: i8) -> u16 as "silk_narrow" { return 7 }
+static if false {
+  export "C" fn inactive() -> i32 as "silk_inactive" { return 1 }
+}
+"""
+  let laneText = """export "C" fn flag(value: bool) -> i32 as "silk_flag" { return 0 }
+"""
+  let runtimeSource = run present(runtimeText)
+  let applicationSource = run present("pub fn answer(count: i32) -> i32 { return count + 1 }\n")
+  let laneSource = run present(laneText)
+  let first = run Revision.publish(&Revision.make(), &runtime, &runtimeSource)
+  let second = run Revision.publish(&first, &application, &applicationSource)
+  let revision = run Revision.publish(&second, &lanes, &laneSource)
+  let mut store = Semantic.make(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option.none<FinalProfile>())
+  let mut request = Request.forApplication(run ModuleId.copy(&application))
+  let built = run Semantic.buildRuntime(&mut store, &mut request, &runtime, staticClosureNodes)
+  let mut rooted = false
+  if let BackendBuild.Module {text, ..} = &built {
+    let ir = Bytes.asSlice(&text)
+    let shim = definitionAt(ir, b"define i32 @\"main\"(i32 %p0, ptr %p1) {")
+    rooted = containsIr(shim, b" = call i32 @silk_") && containsIr(ir, b"define zeroext i16 @\"silk_narrow\"(i8 signext %p0) {")
+      && !containsIr(ir, b"silk_inactive") && !containsIr(ir, b"define i32 @main(")
+  }
+  run Testing.expect(rooted,
+    "active runtime C exports are the only roots: each forwards its C lanes under the requested symbol, and Intrinsic.application reaches the application")
+  let mut laneRequest = Request.forApplication(run ModuleId.copy(&application))
+  let narrowed = run Semantic.buildRuntime(&mut store, &mut laneRequest, &lanes, staticClosureNodes)
+  let mut absentRequest = Request.forApplication(run ModuleId.copy(&application))
+  let missing = run Semantic.buildRuntime(&mut store, &mut absentRequest, &absent, staticClosureNodes)
+  let missingRuntime = match &missing {
+    BackendBuild.Rejected {diagnostic} => Shared.with<Rejection, bool>(&diagnostic, fn(found: &Rejection) -> bool {
+      return found.code == RejectionCode.MissingModule && ModuleId.equals(&found.module, &absent)
+    })
+    _ => false
+  }
+  run Testing.expect(foreignContractGapAt(&narrowed, offsetOf(laneText, "export \"C\" fn flag", usize.ZERO)) && missingRuntime,
+    "an export lane outside the C scalar and pointer subset keeps its named gap, and an absent runtime source is rejected at that module")
+  return ()
+}
+
+test effect fn packageCompositionSelectsOneDefaultRuntime() -> ()
+! FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  return run compositionClaims() |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn writePackageFile(directory: &Path, name: string, contents: &[u8]) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(directory, name)
+  return run FileSystem.writeFile(&path, contents)
+}
+
+// Whether reading the package fails only because its build composition selects no single runtime.
+effect fn compositionRefused(source: &Path) -> bool
+! FileError | TomlError | InvalidSourceRoot | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let attempted = run Effect.result(ModuleSourceFiles.make(source, Option.none<Path>()))
+  return match move attempted {
+    Result<ModuleSources, FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | OutOfMemoryError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<ModuleSources, FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidBuildComposition refused => {
+        drop refused
+        return true
+      }
+      FileError failure => { fail move failure }
+      TomlError failure => { fail move failure }
+      InvalidSourceRoot failure => { fail move failure }
+      InvalidModulePath failure => { fail move failure }
+      OutOfMemoryError failure => { fail move failure }
+    }
+  }
+}
+
+effect fn compositionClaims() -> ()
+! FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let parent = run Path.make("/tmp")
+  let temp = run FileSystem.temporaryDirectory(&parent, "silk-runtime-composition-")
+  let support = run Path.join(&temp.path, "support")
+  run FileSystem.createDirectory(&support)
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"other\", module = \"unused\" }, { name = \"start\", module = \"support/start\" }], defaults = [\"start\"], retention = [], requirements = [] }\n")
+  run writePackageFile(&temp.path, "main.silk", b"pub fn answer() -> i32 { return 42 }\n")
+  run writePackageFile(&support, "start.silk", b"import Intrinsic.application\nexport \"C\" fn enter() -> i32 as \"main\" { return application.answer() }\n")
+  let source = run Path.join(&temp.path, "main.silk")
+  let mut sources = run ModuleSourceFiles.make(&source, Option.none<Path>())
+  let application = run ModuleId.copy(ModuleSourceFiles.entry(&sources))
+  let selected = match ModuleSourceFiles.runtime(&sources) {
+    Option<&ModuleId>.Some {value} => Option.some<ModuleId>(run ModuleId.copy(value))
+    Option<&ModuleId>.None => Option.none<ModuleId>()
+  }
+  let runtime = match move selected {
+    Option<ModuleId>.Some {value} => move value
+    Option<ModuleId>.None => {
+      run Testing.expect(false, "the single default candidate selects its listed runtime module")
+      return ()
+    }
+  }
+  let mut store = Semantic.make(run ModuleSourceFiles.revision(&sources), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option.none<FinalProfile>())
+  let mut request = Request.forApplication(run ModuleId.copy(&application))
+  let mut built = run Semantic.buildRuntime(&mut store, &mut request, &runtime, staticClosureNodes)
+  while run ModuleSourceFiles.publishObserved(&mut sources, Semantic.sourceEvents(&store)) {
+    Semantic.revise(&mut store, run ModuleSourceFiles.revision(&sources))
+    request = Request.forApplication(run ModuleId.copy(&application))
+    built = run Semantic.buildRuntime(&mut store, &mut request, &runtime, staticClosureNodes)
+  }
+  let rooted = match &built {
+    BackendBuild.Module {text, ..} => containsIr(Bytes.asSlice(&text), b"define i32 @\"main\"() {")
+    _ => false
+  }
+  run Testing.expect(sameBytes(ModuleId.logicalPath(&runtime), b"support/start.silk") && rooted,
+    "the default names a listed package module, which is read on demand and roots the build with its C export")
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"start\", \"start\"], retention = [], requirements = [] }\n")
+  let ambiguous = run compositionRefused(&source)
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"hosted\"], retention = [], requirements = [] }\n")
+  let unlisted = run compositionRefused(&source)
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [], retention = [], requirements = [] }\n")
+  let plain = run ModuleSourceFiles.make(&source, Option.none<Path>())
+  let unselected = match ModuleSourceFiles.runtime(&plain) {
+    Option<&ModuleId>.Some {..} => false
+    Option<&ModuleId>.None => true
+  }
+  run Testing.expect(ambiguous && unlisted && unselected,
+    "two default candidates are ambiguous, an unlisted default never falls back, and no default selects no runtime")
+  run FileSystem.release(move temp)
+  return ()
 }
 
 // The instance key of the first call in a MIR function, absent without one.

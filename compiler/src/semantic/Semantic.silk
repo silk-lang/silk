@@ -39815,14 +39815,18 @@ fn bodyCoverageGap(hir: &Module, span: Span) -> GapCode {
 
 
 // The query member that selects an instance's MIR producer: an ordinary or selected body, the C
-// entry shim, or drop glue.
+// entry shim, drop glue, or a C export shim.
 fn instanceMember(instance: &InstanceKey) -> usize {
   return match &instance.* {
     InstanceKey.Function {..} => usize.ZERO
     InstanceKey.Entry {..} => usize.MAX
     InstanceKey.DropGlue {..} => usize.MAX - usize.ONE
+    InstanceKey.Export {..} => exportMember()
   }
 }
+
+// The query member of a C export shim; distinct from the entry, glue and every selected body.
+fn exportMember() -> usize { return usize.MAX - 2 }
 
 // One glue child, or absence when its type mentions no declaration that could own cleanup.
 effect fn glueChild(index: usize, ty: &Shared<Type>) -> Option<GlueChild> ! OutOfMemoryError ? &mut Allocator {
@@ -43464,6 +43468,47 @@ fn callableResult(value: &Type) -> Option<Shared<Type>> {
   return match &value.* { Type.Callable {result, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&result)) _ => Option.none<Shared<Type>>() }
 }
 
+// Builds the C ABI shim of one exported definition after classifying every lane. A lane outside
+// the immediate scalar and pointer subset keeps its named C ABI gap.
+effect fn exportShim(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: Vector<Dependency>,
+  identity: &Shared<DeclarationId>,
+  key: Key,
+  symbol: &Shared<Bytes>,
+  written: ForeignHeader,
+  observing: bool,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut evidence = move dependencies
+  let location = InstanceLocation {module: key.module, declaration: key.declaration}
+  let classified = run Effect.result(cSignature(&mut resolver.*, &mut owner.*, &mut evidence, identity, location, move written))
+  let signature = match move classified {
+    Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+    Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner: gapOwner, source} => {
+        return memberSuccess(
+          Value.Unsupported {gap: run Shared.make<BackendGap>(BackendGap {code: code, owner: move gapOwner, source: move source})},
+          move evidence,
+        )
+      }
+      Cycle {} => { fail Cycle {} }
+      InvalidModulePath {} => { fail InvalidModulePath {} }
+      RevisionMismatch {} => { fail RevisionMismatch {} }
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+    }
+  }
+  let lanes = Vector.asSlice<CAbi.Lane>(&signature.parameters)
+  let mut parameters = Vector.make<Shared<Type>>()
+  let mut at = usize.ZERO
+  while at < lanes.length {
+    run Vector.append<Shared<Type>>(&mut parameters, Shared.clone<Type>(&lanes[at].ty))
+    at = at + usize.ONE
+  }
+  let shim = run MirFunction.cExport(identity, symbol, Vector.asSlice<Shared<Type>>(&parameters), &signature.result.ty, observing)
+  return run storeMir(&mut resolver.*, move shim, move evidence)
+}
+
 effect fn resolveMir(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -43566,22 +43611,34 @@ effect fn resolveMir(
     }
   }
   let selectedHeader = run header(&mut resolver.*, &module, key.declaration)
+  let mut linked = false
   if let Option<HeaderSyntax>.Some {value: syntax} = move selectedHeader {
-    if let Node.FunctionHeader {linkage, ..} = syntax.header {
-      if linkage.present {
-        let foreign = run foreignHeader(&mut resolver.*, &module, key.declaration)
-        let code = match move foreign.gap {
-          Option<GapCode>.Some {value: reason} => reason
-          Option<GapCode>.None => GapCode.ForeignContract
-        }
-        return memberSuccess(
-          Value.Unsupported {
-            gap: run Shared.make<BackendGap>(BackendGap.make(code, &identity, foreign.span)),
-          },
-          move dependencies,
-        )
+    if let Node.FunctionHeader {linkage, ..} = syntax.header { linked = linkage.present }
+  }
+  if linked {
+    let foreign = run foreignHeader(&mut resolver.*, &module, key.declaration)
+    if !foreign.exported {
+      let code = match move foreign.gap {
+        Option<GapCode>.Some {value: reason} => reason
+        Option<GapCode>.None => GapCode.ForeignContract
       }
+      return memberSuccess(
+        Value.Unsupported {
+          gap: run Shared.make<BackendGap>(BackendGap.make(code, &identity, foreign.span)),
+        },
+        move dependencies,
+      )
     }
+    if let Option<Shared<Bytes>>.Some {value: symbol} = move InstanceKey.exportSymbol(&instance) {
+      return run exportShim(&mut resolver.*, &mut owner.*, move dependencies, &identity, key, &symbol, move foreign, observing)
+    }
+    // The exported definition's own body lowers below like any ordinary function.
+  }
+  if key.member == exportMember() {
+    return memberRejected(
+      run reject(&resolver.*, &module, RejectionCode.Unsupported, Span.make(usize.ZERO, usize.ZERO)),
+      move dependencies,
+    )
   }
   if key.member == usize.MAX {
     let parameterCount = Shared.with<Result<Answer, NoRejection>, usize>(
@@ -44559,8 +44616,13 @@ struct ForeignHeader {
   symbol: Bytes
   gap: Option<GapCode>
   span: Span
+  /// Whether the linkage defines this function for C callers (`export`) rather than importing it.
+  exported: bool
 }
 
+// Classifies one linked function header. An import must be `unsafe`; an export is an ordinary
+// definition whose C lanes are checked separately. Both admit only the C ABI, no generic, effect
+// or static contract, and no callback or variadic lane.
 effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> ForeignHeader
 ! Cycle | OutOfMemoryError ? &mut Allocator {
   let observed = run source(&mut resolver.*, module)
@@ -44570,46 +44632,46 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
     if ordinal < declarations.length {
       let span = Module.span(hir, declarations[ordinal].header)
       if let Node.FunctionHeader {name, contract, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
-        let mut symbolName = Bytes.make()
-        if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
-        let mut gap = Option.none<GapCode>()
-        if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
-          if !admittedForeignProperties(hir, properties, parameters) { gap = Option.some<GapCode>(GapCode.ForeignContract) }
-          if linkage.present {
-            let mut at = usize.ZERO
-            while at < parameters.length {
-              if let Node.Parameter {annotation, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
-                if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
-                  gap = Option.some<GapCode>(GapCode.CAbiCallback)
-                }
-              }
-              at = at + usize.ONE
-            }
-            if result.present {
-              if let Node.ForeignFunctionType {..} = Module.node(hir, result.id) {
-                gap = Option.some<GapCode>(GapCode.CAbiCallback)
-              }
-            }
-          }
-          if variadic { gap = Option.some<GapCode>(GapCode.CAbiVariadic) }
-          if generics.length > usize.ZERO || isEffect || isStatic || !isUnsafe { gap = Option.some<GapCode>(GapCode.ForeignContract) }
-        }
         if linkage.present {
           if let Node.Linkage {direction, abi, symbol} = Module.node(hir, linkage.id) {
-            if direction == LinkageDirection.Export { gap = Option.some<GapCode>(GapCode.ForeignExport) }
-            let mut c = false
-            if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
-            if !c { gap = Option.some<GapCode>(GapCode.ForeignAbi) }
+            let exported = direction == LinkageDirection.Export
+            let mut symbolName = Bytes.make()
+            if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
             if symbol.present {
               if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { symbolName = run Bytes.copy(Module.text(hir, text)) }
             }
-            return ForeignHeader {symbol: move symbolName, gap: move gap, span: span}
+            let mut gap = Option.none<GapCode>()
+            if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
+              if !admittedForeignProperties(hir, properties, parameters) { gap = Option.some<GapCode>(GapCode.ForeignContract) }
+              let mut at = usize.ZERO
+              while at < parameters.length {
+                if let Node.Parameter {annotation, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
+                  if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
+                    gap = Option.some<GapCode>(GapCode.CAbiCallback)
+                  }
+                }
+                at = at + usize.ONE
+              }
+              if result.present {
+                if let Node.ForeignFunctionType {..} = Module.node(hir, result.id) {
+                  gap = Option.some<GapCode>(GapCode.CAbiCallback)
+                }
+              }
+              if variadic { gap = Option.some<GapCode>(GapCode.CAbiVariadic) }
+              if generics.length > usize.ZERO || isEffect || isStatic || (!isUnsafe && !exported) {
+                gap = Option.some<GapCode>(GapCode.ForeignContract)
+              }
+            }
+            let mut c = false
+            if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
+            if !c { gap = Option.some<GapCode>(GapCode.ForeignAbi) }
+            return ForeignHeader {symbol: move symbolName, gap: move gap, span: span, exported: exported}
           }
         }
       }
     }
   }
-  return ForeignHeader {symbol: Bytes.make(), gap: Option.some<GapCode>(GapCode.ForeignAbi), span: Span.make(usize.ZERO, usize.ZERO)}
+  return ForeignHeader {symbol: Bytes.make(), gap: Option.some<GapCode>(GapCode.ForeignAbi), span: Span.make(usize.ZERO, usize.ZERO), exported: false}
 }
 
 fn backendUnit(layout: LayoutMetrics) -> bool {
@@ -44681,6 +44743,22 @@ effect fn foreignSignature(
   }
   let module = run resolvedModule(&resolver.*, location.module)
   let written = run foreignHeader(&mut resolver.*, &module, location.declaration)
+  // A Silk call to an exported definition is not a C import; it keeps a named gap.
+  if written.exported { fail BackendGap.make(GapCode.ForeignExport, declaration, written.span) }
+  return run cSignature(&mut resolver.*, &mut owner.*, &mut dependencies.*, declaration, location, move written)
+}
+
+// Classifies the C lanes of one linked function whose header admitted the C contract.
+effect fn cSignature(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  declaration: &Shared<DeclarationId>,
+  location: InstanceLocation,
+  written: ForeignHeader,
+) -> CAbi.Signature
+! BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator {
   if let Option<GapCode>.Some {value} = move written.gap {
     fail BackendGap.make(value, declaration, written.span)
   }
@@ -52517,24 +52595,100 @@ impl Semantic {
       }
       return BackendBuild.Rejected {diagnostic: move value}
     }
-    return run Semantic.buildFrom(&mut self.*, module, move main, selected.span, closureNodes, false)
+    let mut roots = Vector.make<BuildRoot>()
+    run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Entry {main: move main}, span: selected.span})
+    return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&roots), selected.span, closureNodes, false)
   }
-  // Walks the instance graph from the entry. A program that runs any `observeDiagnostics` scope is
+  /// Builds an artifact whose roots are the active C exports of the selected runtime source. The
+  /// request's application module is what `import Intrinsic.application` binds inside it.
+  /// Demands only reached instances, then joins their definitions in content-symbol order.
+  pub effect fn buildRuntime(self: &mut Self, request: &mut Request, runtime: &ModuleId, closureNodes: usize) -> BackendBuild
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    run selectRequest(&mut self.resolver, &request.*)
+    let origin = Span.make(usize.ZERO, usize.ZERO)
+    let listed = match move run exportCandidates(&mut self.resolver, runtime) {
+      Option<Vector<ExportCandidate>>.Some {value} => move value
+      Option<Vector<ExportCandidate>>.None => {
+        return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.MissingModule, origin)}
+      }
+    }
+    let moduleOrdinal = run internModule(&mut self.resolver, runtime)
+    // Root lookups observe governing conditions without a dependent answer.
+    let mut rootConditions = Vector.make<Dependency>()
+    let mut roots = Vector.make<BuildRoot>()
+    let mut gaps = Vector.make<Shared<BackendGap>>()
+    let candidates = Vector.asSlice<ExportCandidate>(&listed)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      at = at + usize.ONE
+      let active = run available(&mut self.resolver, &mut self.query, &mut rootConditions, runtime, candidate.declaration, candidate.span)
+      let present = match move active {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {error} => { return BackendBuild.Rejected {diagnostic: move error} }
+      }
+      if !present { continue }
+      let declared = run declarationAt(&mut self.resolver, runtime, candidate.declaration)
+      let function = match move declared {
+        Option<DeclarationId>.Some {value} => run Shared.make<DeclarationId>(move value)
+        Option<DeclarationId>.None => {
+          return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.UnknownName, candidate.span)}
+        }
+      }
+      let signature = run demandRaw(
+        &mut self.resolver,
+        &mut self.query,
+        Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: candidate.declaration, member: usize.ZERO, external: false},
+        candidate.span,
+      )
+      run recordRoot(&mut request.*, Family.Signature, runtime, Bytes.asSlice(&candidate.name), &signature)
+      let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&signature, answerRejection)
+      if let Option<Shared<Rejection>>.Some {value} = move failure {
+        let code = Shared.with<Rejection, RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
+          return rejection.code
+        })
+        let mut coverageGap = BackendGap.forRejection(code)
+        if code == RejectionCode.Unsupported { coverageGap = Option.some<GapCode>(GapCode.SignatureForm) }
+        if let Option<GapCode>.Some {value: gapCode} = move coverageGap {
+          run Vector.append<Shared<BackendGap>>(&mut gaps, run Shared.make<BackendGap>(BackendGap.fromRejection(gapCode, &function, &value)))
+          continue
+        }
+        return BackendBuild.Rejected {diagnostic: move value}
+      }
+      let symbol = run Shared.make<Bytes>(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
+      run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span})
+    }
+    if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
+      return BackendBuild.Unsupported {gaps: move gaps}
+    }
+    // A runtime whose arms select no export for this target provides no artifact root.
+    if Vector.length<BuildRoot>(&roots) == usize.ZERO {
+      return BackendBuild.Rejected {diagnostic: run reject(&self.resolver, runtime, RejectionCode.UnknownName, origin)}
+    }
+    return run Semantic.buildFrom(&mut self.*, runtime, Vector.asSlice<BuildRoot>(&roots), origin, closureNodes, false)
+  }
+  // Walks the instance graph from the roots. A program that runs any `observeDiagnostics` scope is
   // walked again with every function observing diagnostics (failure observer note N1).
-  effect fn buildFrom(self: &mut Self, module: &ModuleId, main: Shared<DeclarationId>, entrySpan: Span, closureNodes: usize,
+  effect fn buildFrom(self: &mut Self, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, closureNodes: usize,
     observing: bool) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator {
     let mut pending = Vector.make<BackendVisit>()
-    run Vector.append<BackendVisit>(
-      &mut pending,
-      BackendVisit.Enter {
-        key: InstanceKey.Entry {main: Shared.clone<DeclarationId>(&main)},
-        edge: Edge.Direct,
-        span: entrySpan,
-        module: run ModuleId.copy(module),
-      },
-    )
+    let mut rootAt = roots.length
+    // The worklist is a stack: push in reverse so roots are entered in their listed order.
+    while rootAt > usize.ZERO {
+      rootAt = rootAt - usize.ONE
+      run Vector.append<BackendVisit>(
+        &mut pending,
+        BackendVisit.Enter {
+          key: InstanceKey.copy(&roots[rootAt].key),
+          edge: Edge.Direct,
+          span: roots[rootAt].span,
+          module: run ModuleId.copy(module),
+        },
+      )
+    }
     let mut observes = false
     let mut admission = Admission.make()
     // Applications admitted by a finite closure certificate during this build.
@@ -52740,7 +52894,7 @@ impl Semantic {
       }
     }
     if observes && !observing {
-      return run Semantic.buildFrom(&mut self.*, module, move main, entrySpan, closureNodes, true)
+      return run Semantic.buildFrom(&mut self.*, module, roots, entrySpan, closureNodes, true)
     }
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
@@ -52982,6 +53136,60 @@ effect fn appendDistinctForeignDeclaration(
 union BackendVisit {
   Enter {key: InstanceKey, edge: Edge, span: Span, module: ModuleId},
   Leave,
+}
+
+// One artifact root: the generated C entry or one selected runtime C export, at its source span.
+struct BuildRoot {
+  key: InstanceKey
+  span: Span
+}
+
+// One module-level C export a runtime source declares, before its arms are evaluated.
+struct ExportCandidate {
+  declaration: usize
+  name: Bytes
+  symbol: Bytes
+  span: Span
+}
+
+// Lists every module-level `export "C" fn` of one source, or absence when the source is missing.
+effect fn exportCandidates(resolver: &mut Resolver, module: &ModuleId) -> Option<Vector<ExportCandidate>>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let hir = IndexedSource.authored(value)
+    let mut found = Vector.make<ExportCandidate>()
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let topLevel = match &declarations[at].parent {
+        Option<usize>.None => true
+        Option<usize>.Some {..} => false
+      }
+      if topLevel {
+        if let Node.FunctionHeader {name, linkage, ..} = Module.node(hir, declarations[at].header) {
+          if linkage.present {
+            if let Node.Linkage {direction, symbol, ..} = Module.node(hir, linkage.id) {
+              if direction == LinkageDirection.Export {
+                let mut written = Bytes.make()
+                if let Node.Name {text} = Module.node(hir, name) { written = run Bytes.copy(Module.text(hir, text)) }
+                let mut linked = run Bytes.copy(Bytes.asSlice(&written))
+                if symbol.present {
+                  if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { linked = run Bytes.copy(Module.text(hir, text)) }
+                }
+                run Vector.append<ExportCandidate>(&mut found, ExportCandidate {
+                  declaration: at, name: move written, symbol: move linked, span: Module.span(hir, declarations[at].header),
+                })
+              }
+            }
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Option.some<Vector<ExportCandidate>>(move found)
+  }
+  return Option.none<Vector<ExportCandidate>>()
 }
 
 struct BackendRequest {
