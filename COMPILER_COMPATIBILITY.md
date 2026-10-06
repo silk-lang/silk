@@ -463,13 +463,10 @@ Each entry records:
     the bootstrap requires equal environments.
 - **Diagnostics and limits:** a `match` mixing an Effect with another value is
   `IncompatibleMatchResults`. A return or arm that already holds several alternatives of a
-  different join reports the named `nested-effect-join` gap. A `run` of an `effect fn` interface
-  call is one call of the selected witness; constructing that Effect without running it in place,
-  or a witness whose failure differs from the promised one, reports `interface-effect-witness`. An
-  unapplied qualified call infers its interface application from the provider's one conformance.
-  An Effect result with no producer body (an interface operation's) and Effect-producing callables
+  different join reports the named `nested-effect-join` gap. An Effect result with no producer
+  body (an interface operation's declared `Effect<...>` result) and Effect-producing callables
   inferred from `effect fn` values (handlers passed to `Effect.catch`, `catchAll`, `flatMap`)
-  remain `effect-form`.
+  remain `effect-form`. Interface `effect fn` calls have their own entry below.
 - **Evidence:** `effectJoinsRunOnlyTheSelectedAlternative`, `effectJoinsCleanOnlyTheStoredAlternative`
   and `effectJoinsAdmitOnlyCoveredEffects` assert injections, tag switches calling the block on each
   tag's payload, failure edges, join glue, Copy derivation, admission failures and the gap codes;
@@ -478,6 +475,38 @@ Each entry records:
   `match-statement-arm-control` and `effect-access-forwarding`.
 - **Owner:** nested join re-injection and Effect-producing callable inference: #567 Step 9
   follow-ups.
+
+### Interface `effect fn` operations in selfhost
+
+- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); narrower
+  remainders below.
+- **Rule:** [INTF-006](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-006--a-qualified-interface-call-requires-one-static-application)
+  lets an unapplied qualified call `Interface.operation(value)` take its one application from the
+  provider's conformances. Under
+  [INTF-005](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-005--interface-operations-use-their-declared-ownership-and-effect-contracts)
+  and [EFF-009](apps/docs/content/reference/effect-contracts.md#eff-009--declared-failure-and-requirement-channels-are-upper-bounds),
+  calling an `effect fn` operation constructs the Effect its applied contract promises, with the
+  interface's failure `E` and row `?R`; those channels bound every conforming witness.
+- **Compilers:** both infer the application from the provider's conformance heads and reject a
+  provider with several applications (bootstrap `SEM0202`, selfhost `AmbiguousConformanceMethod`)
+  or none (`MissingConformance`). Selfhost executes a `run` whose immediate operand is such a call
+  as one direct call of the selected witness, with the call's failure edge typed by the promised
+  failure; there is no adapter or runtime dispatch. Selfhost infers the provider from the first
+  operand only; the bootstrap uses the operand whose declared type is `Self` or `&Self`.
+- **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
+  to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
+  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. MIR
+  reports `interface-effect-witness` when the selected witness declares a failure other than the
+  promised one (for example `never` against `! Problem`): that call needs failure-edge adaptation.
+  The pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+- **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
+  and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
+  failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, the narrower
+  witness gap, and the ambiguous, missing, bound and returned rejections at their call spans.
+  `providersServeRowsInKeyOrder` lowers `run Present.present(value)` to a witness call. The native
+  corpus pins `borrowed-outcome-stream` and `generic-inline-effect-conformance`.
+- **Owner:** stored constructions, failure adaptation, receiver-method, operator and pipeline
+  forms: #567 Step 9 follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 
