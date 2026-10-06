@@ -26844,6 +26844,10 @@ effect fn checkInferredCallArgument<'scope>(
                 form: BodyExpression.Move {value: node, consumed: move consumed}},
             })
             node = moved
+          } else if Shared.with<Type, bool>(&actual, lentArgument) {
+            // The bootstrap does not consume an Effect or callable value whose run access is not
+            // `once` when it is passed by value; native has no such non-consuming argument yet.
+            code = Option.some<RejectionCode>(RejectionCode.Unsupported)
           } else {
             code = Option.some<RejectionCode>(RejectionCode.ExplicitMoveRequired)
           }
@@ -26856,6 +26860,15 @@ effect fn checkInferredCallArgument<'scope>(
     }
   }
   return Result.succeed<BodyNodeId, Shared<Rejection>>(node)
+}
+
+// An Effect or callable value (not a reference to one) whose run access is shared or mutable. The
+// bootstrap passes such a value by value without consuming its place (`argumentConsumes`).
+fn lentArgument(value: &Type) -> bool {
+  return match &value.* {
+    Type.Reference {..} => false
+    _ => callableInvocationMode(value) != CallableMode.Once
+  }
 }
 
 // A source-written mutable callable parameter is a reusable environment view in the
@@ -27286,8 +27299,8 @@ effect fn lifetimeFlowsCovariantly(
   }
 }
 
-// A caller-local region a boundary admitted where it fixes another region, before the body retains
-// the pair as a `RegionRelation` safety obligation.
+// A region a boundary admitted where it fixes another region without proof, before the body
+// retains the pair as a `RegionRelation` safety obligation.
 struct RegionPair {
   offered: Shared<Lifetime>
   wanted: Shared<Lifetime>
@@ -27409,12 +27422,39 @@ effect fn admitsRegions(
   return false
 }
 
+// The ordinal of an inference binder `fresh` owns, or usize.MAX for any other region.
+fn freshLifetimeOrdinal(region: &Shared<Lifetime>, fresh: &DeclarationId) -> usize {
+  return Shared.with<Lifetime, usize>(region, fn(value: &Lifetime) -> usize {
+    if let Lifetime.Parameter {declaration, ordinal} = &value.* {
+      if DeclarationId.equals(&declaration, fresh) { return ordinal }
+    }
+    return usize.MAX
+  })
+}
+
+// Whether a later operand's covariant region `source` meets `bound`, the region an earlier operand
+// fixed for the same inferred binder: a caller-local region or inferred 'static. An offered
+// 'static outlives every region, which is proven. A caller-local region, or any region where the
+// binder holds 'static (inferred 'static evidence never requires 'static), relates to `bound` as a
+// pair typing cannot prove yet. A bound declared region, and any other pair, is a mismatch.
+effect fn relatesToFixedRegion(bound: &Shared<Lifetime>, source: &Shared<Lifetime>, caller: &DeclarationId,
+  relations: &mut Vector<RegionPair>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if Lifetime.equalsShared(bound, source) { return false }
+  let staticBound = Shared.with<Lifetime, bool>(bound, staticLifetime)
+  if !staticBound && !callerLocalRegion(bound, caller) { return false }
+  if Shared.with<Lifetime, bool>(source, staticLifetime) { return true }
+  if !staticBound && !callerLocalRegion(source, caller) { return false }
+  run Vector.append<RegionPair>(&mut relations.*, RegionPair {offered: Shared.clone<Lifetime>(source),
+    wanted: Shared.clone<Lifetime>(bound)})
+  return true
+}
+
 // An argument whose only mismatch is a covariant region that its inferred binder already holds
 // differently: an earlier operand fixed the binder to a caller-local region or 'static. The
 // candidate replaces the argument's region with the bound one, and Exact unification with copied
 // bindings proves no other mismatch remains; the caller matches the candidate against its real
-// bindings. An offered 'static is proven to outlive the bound region; a caller-local offered
-// region is a relation typing cannot prove yet. Variance follows the bootstrap NominalVariance.
+// bindings. An explicitly written binder is never related. Variance follows the bootstrap
+// NominalVariance.
 effect fn relatedCallArgument(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
   parameter: &Shared<Type>, pattern: &Shared<Type>, evidence: &Shared<Type>,
@@ -27428,53 +27468,30 @@ effect fn relatedCallArgument(
   let mut candidate = Option.none<Type>()
   let mut relations = Vector.make<RegionPair>()
   match move expected {
+    // Shared slices and references are covariant in their region, so a later operand meets the
+    // region an earlier operand fixed for the same inferred binder (`relatesToFixedRegion`).
     Type.Slice {lifetime: boundRegion, ..} => {
-      let variable = match move authored {
-        Type.Slice {access, lifetime: binderRegion, ..} =>
-          access == Access.Shared && Shared.with<Lifetime, bool>(&binderRegion, fn(value: &Lifetime) -> bool {
-            if let Lifetime.Parameter {declaration, ..} = &value.* {
-              return DeclarationId.equals(&declaration, fresh)
-            }
-            return false
-          })
-        _ => false
+      let mut ordinal = usize.MAX
+      if let Type.Slice {access, lifetime: binderRegion, ..} = move authored {
+        if access == Access.Shared { ordinal = freshLifetimeOrdinal(&binderRegion, fresh) }
       }
-      if !variable || !callerLocalRegion(&boundRegion, caller) { return Option.none<RelatedArgument>() }
+      if ordinal == usize.MAX || fixedOrdinal(explicit, ordinal) { return Option.none<RelatedArgument>() }
       if let Type.Slice {element, access, lifetime: sourceRegion} = move actual {
         if access != Access.Shared { return Option.none<RelatedArgument>() }
-        if !callerLocalRegion(&sourceRegion, caller) || Lifetime.equalsShared(&boundRegion, &sourceRegion) {
-          return Option.none<RelatedArgument>()
-        }
-        run Vector.append<RegionPair>(&mut relations, RegionPair {
-          offered: Shared.clone<Lifetime>(&sourceRegion), wanted: Shared.clone<Lifetime>(&boundRegion),
-        })
+        if !run relatesToFixedRegion(&boundRegion, &sourceRegion, caller, &mut relations) { return Option.none<RelatedArgument>() }
         candidate = Option.some<Type>(Type.Slice {
           element: move element, access: Access.Shared, lifetime: move boundRegion,
         })
       }
     }
-    // References are covariant in their lifetime, so a binder fixed by an earlier operand (for
-    // example a 'static Effect environment) and a distinct caller-local borrow have a common region.
     Type.Reference {lifetime: boundRegion, ..} => {
-      let variable = match move authored {
-        Type.Reference {lifetime: binderRegion, ..} =>
-          Shared.with<Lifetime, bool>(&binderRegion, fn(value: &Lifetime) -> bool {
-            if let Lifetime.Parameter {declaration, ..} = &value.* {
-              return DeclarationId.equals(&declaration, fresh)
-            }
-            return false
-          })
-        _ => false
+      let mut ordinal = usize.MAX
+      if let Type.Reference {lifetime: binderRegion, ..} = move authored {
+        ordinal = freshLifetimeOrdinal(&binderRegion, fresh)
       }
-      let fixedRegion = callerLocalRegion(&boundRegion, caller) || Shared.with<Lifetime, bool>(&boundRegion, staticLifetime)
-      if !variable || !fixedRegion { return Option.none<RelatedArgument>() }
+      if ordinal == usize.MAX || fixedOrdinal(explicit, ordinal) { return Option.none<RelatedArgument>() }
       if let Type.Reference {referent, access, lifetime: sourceRegion} = move actual {
-        if !callerLocalRegion(&sourceRegion, caller) || Lifetime.equalsShared(&boundRegion, &sourceRegion) {
-          return Option.none<RelatedArgument>()
-        }
-        run Vector.append<RegionPair>(&mut relations, RegionPair {
-          offered: Shared.clone<Lifetime>(&sourceRegion), wanted: Shared.clone<Lifetime>(&boundRegion),
-        })
+        if !run relatesToFixedRegion(&boundRegion, &sourceRegion, caller, &mut relations) { return Option.none<RelatedArgument>() }
         candidate = Option.some<Type>(Type.Reference {
           referent: move referent, access: access, lifetime: move boundRegion,
         })
@@ -27500,12 +27517,7 @@ effect fn relatedCallArgument(
                 if !Lifetime.equalsShared(&sourceRegion, &boundRegion)
                   && callerLocalRegion(&boundRegion, caller) && Shared.with<Lifetime, bool>(&sourceRegion, staticLifetime) {
                   let ordinal = match &written[at] {
-                    Argument.Lifetime {value: binderRegion} => Shared.with<Lifetime, usize>(&binderRegion, fn(value: &Lifetime) -> usize {
-                      if let Lifetime.Parameter {declaration, ordinal} = &value.* {
-                        if DeclarationId.equals(&declaration, fresh) { return ordinal }
-                      }
-                      return usize.MAX
-                    })
+                    Argument.Lifetime {value: binderRegion} => freshLifetimeOrdinal(&binderRegion, fresh)
                     _ => usize.MAX
                   }
                   if ordinal == usize.MAX || fixedOrdinal(explicit, ordinal) {

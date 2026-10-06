@@ -1354,10 +1354,15 @@ on caller-local region relations.
   or a region an earlier operand fixed for the same binder, including a `'static` Effect
   environment such as `Effect.provideMut(program(), &mut allocator)`), native admits the value at the
   expected region and the body keeps a `RegionRelation` safety obligation with the origin and both
-  regions. Such bodies are `ContractTyped` and counted by the `SILK_GAP borrow-check` summary, so a
-  program the bootstrap would reject for that relation still compiles natively until step 14. A
-  lifetime binder that only a call's result names takes its region from the expected type, or
-  `'static` without one, in both compilers.
+  regions. Native fixes an inferred binder by its first evidence, while the bootstrap solves for the
+  shortest region, so a binder an earlier operand fixed to `'static` also relates a later loan of a
+  declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
+  relations a call's operands retain are outlives premises of that call's own bound proofs, so
+  `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
+  proves its representation bound once. Such bodies are `ContractTyped` and counted by the
+  `SILK_GAP borrow-check` summary, so a program the bootstrap would reject for that relation still
+  compiles natively until step 14. A lifetime binder that only a call's result names takes its
+  region from the expected type, or `'static` without one, in both compilers.
 - **Source migration:** none.
 - **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
   widened to another, explicitly fixed lifetime slots, and owner, access, element, pointee,
@@ -1369,3 +1374,13 @@ on caller-local region relations.
   `providedCallPrefixesMapLifetimesSeparately` and
   `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
   and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
+
+### Native unconsumed Effect and callable arguments
+
+- **Status:** native gap; retires when native lowers a non-consuming by-value Effect argument.
+- **Compilers:** the bootstrap consumes an Effect or callable argument only when its run access is
+  `once` (`argumentConsumes`), so a let-bound Effect with shared or mutable run access may be passed
+  by value without `move`, as in `run Effect.catchAll(program, recover)`. Native reports that
+  argument as unsupported (the `typed-form` gap) instead of `ExplicitMoveRequired`, which it keeps
+  for a `once` value, a reference to a callable, and every return.
+- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk`.
