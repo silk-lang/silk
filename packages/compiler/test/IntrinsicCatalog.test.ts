@@ -16,6 +16,8 @@ import * as Arr from 'effect/Array'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as Intrinsic from '../src/Intrinsic.js'
+import * as CallResolution from '../src/CallResolution.js'
+import * as AuthoredIdentity from '../src/AuthoredIdentity.js'
 import * as Lifetime from '../src/Lifetime.js'
 import * as ProjectAnalysis from '../src/ProjectAnalysis.js'
 import * as Scalar from '../src/Scalar.js'
@@ -33,6 +35,47 @@ import * as NativeDeclare from '../src/NativeDeclare.js'
 import * as NativeType from '../src/NativeType.js'
 
 const encoder = new TextEncoder()
+
+it('keeps generated pair results unavailable as closed callable and witness contracts', () => {
+  const signature = CallResolution.builtinSignature('Intrinsic', 'layoutOf')
+  assert.isDefined(signature)
+  if (signature === undefined) unreachable('expected the existing layoutOf primitive')
+  const anchor: import('../src/AuthoredHir.js').Anchor = {
+    _tag: 'AuthoredAnchor',
+    owner: AuthoredIdentity.module('file', 'result-policy'),
+    path: [],
+  }
+  const generated = { ...signature, result: Intrinsic.generatedUsizePair }
+  assert.deepEqual(
+    CallResolution.builtinFunctionReference(generated, 'Intrinsic', 'layoutOf', anchor),
+    {
+      _tag: 'Unavailable',
+      anchor,
+    },
+  )
+  assert.strictEqual(Intrinsic.closedResultType(generated.result), undefined)
+  assert.strictEqual(
+    CallResolution.builtinFunctionReference(signature, 'Intrinsic', 'layoutOf', anchor)._tag,
+    'ResolvedBuiltin',
+  )
+  const parameter = Type.parameter({ module: 'result-policy', name: 'closed' }, 0, 'T')
+  const substitution = new Map([[Type.key(parameter), 'u32' as const]])
+  let generatedCalls = 0
+  const closed = Intrinsic.instantiateResult(
+    Intrinsic.closedResult(parameter),
+    substitution,
+    () => {
+      generatedCalls++
+      return unreachable('a closed result must not manufacture an occurrence')
+    },
+  )
+  assert.strictEqual(closed, 'u32')
+  assert.strictEqual(generatedCalls, 0)
+  assert.deepEqual(
+    Intrinsic.substituteResult(Intrinsic.closedResult(parameter), substitution),
+    Intrinsic.closedResult('u32'),
+  )
+})
 
 const key = (actor: string, operation: string): string => `${actor}.${operation}`
 
