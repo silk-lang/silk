@@ -107,7 +107,7 @@ Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> 
 The output defaults to an executable. `--emit llvm-ir` writes the exact completed backend module
 bytes to the requested file, returns success without invoking Clang, and creates no intermediate
 executable or temporary IR file. Invalid or repeated output selectors fail before source loading.
-With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.mjs
+With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
 <native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup together.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
