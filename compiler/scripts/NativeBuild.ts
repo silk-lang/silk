@@ -9,6 +9,7 @@ import * as FileSystem from 'effect/FileSystem'
 import type { PlatformError } from 'effect/PlatformError'
 import * as Schema from 'effect/Schema'
 import * as NativeProcess from './NativeProcess.ts'
+import * as NativeSeed from './NativeSeed.mjs'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
 
 export class NativeBuildError extends Data.TaggedError('NativeBuildError')<{
@@ -29,6 +30,18 @@ export interface BuildReceipt {
   target: string
   profile: { optimization: string; debug: boolean }
   seed: Generation
+  linker: {
+    requestedPath: string
+    path: string
+    sha256: string
+    version: string
+    expected: { sha256: string; version: string }
+    matchesSeed: boolean
+    seedReceiptSha256: string
+    seedProfile: Schema.Schema.Type<typeof NativeSeed.SeedSchema>['profile']
+    linkProfile: { target: string; optimization: string; debug: boolean }
+    environmentPolicy: 'standard-host-with-verified-clang'
+  } | null
   output: Generation
   inputs: {
     directory: string
@@ -51,12 +64,29 @@ export interface BuildReceipt {
 }
 export interface BuildOptions {
   readonly seed: string
+  readonly seedReceipt: string
+  readonly clang: string
+  readonly environment?: Readonly<Record<string, string | undefined>> | undefined
   readonly snapshot: string
   readonly outputDirectory: string
   readonly corpusSource?: string | undefined
   readonly optimization?: string | undefined
   readonly debug?: boolean | undefined
   readonly timeCommand?: string | undefined
+}
+// Forward standard process necessities only; compiler/tool overrides come from verified inputs.
+// Never serialize this environment: measurement exposes only the verified SILKC_CLANG binding.
+const allowedEnvironment = ['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE']
+const nativeEnvironment = (
+  current: Readonly<Record<string, string | undefined>>,
+  clang: string,
+): Readonly<Record<string, string>> => {
+  const env: Record<string, string> = { SILKC_CLANG: clang }
+  for (const name of allowedEnvironment) {
+    const value = current[name]
+    if (value !== undefined) env[name] = value
+  }
+  return env
 }
 const encodeReceipt = Effect.fnUntraced(function* (receipt: BuildReceipt) {
   return yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(receipt).pipe(
@@ -128,6 +158,9 @@ const hostTarget = Effect.fnUntraced(function* () {
 /** One N0 build in a fresh directory, then only N1 may produce the smoke executable. */
 export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   seed,
+  seedReceipt,
+  clang,
+  environment = process.env,
   snapshot,
   outputDirectory,
   corpusSource = fileURLToPath(
@@ -143,6 +176,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
 > {
   const fs = yield* FileSystem.FileSystem
   seed = resolve(seed)
+  seedReceipt = resolve(seedReceipt)
+  clang = resolve(clang)
+  environment = nativeEnvironment(environment, clang)
   snapshot = resolve(snapshot)
   outputDirectory = resolve(outputDirectory)
   corpusSource = resolve(corpusSource)
@@ -165,6 +201,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     target,
     profile: { optimization, debug },
     seed: { generation: 'N0', path: seed, sha256: null },
+    linker: null,
     inputs: null,
     output: { generation: 'N1', path: join(outputDirectory, 'N1'), sha256: null },
     smoke: null,
@@ -188,6 +225,81 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       compiler: { sha256: manifest.compilerDigest, files: compilerFiles },
       stdlib: { sha256: manifest.stdlibDigest, files: stdlibFiles },
     }
+    currentStage = 'linker-preflight'
+    const seedReceiptBytes = yield* fs.readFile(seedReceipt)
+    const seedReceiptSha256 = SourceSnapshot.hash(seedReceiptBytes)
+    const producer = yield* Schema.decodeEffect(Schema.fromJsonString(NativeSeed.SeedSchema))(
+      Buffer.from(seedReceiptBytes).toString('utf8'),
+    ).pipe(
+      Effect.mapError(
+        (error) =>
+          new NativeBuildError({
+            message: error.message,
+            reason: 'RejectedInput',
+          }),
+      ),
+    )
+    if (
+      producer.stage !== 'N0' ||
+      producer.binary.path !== 'N0' ||
+      producer.binary.mode !== '0555' ||
+      producer.binary.sha256 !== receipt.seed.sha256 ||
+      producer.sourceCommit !== manifest.sourceCommit ||
+      producer.inputSnapshot.archiveSha256 !== manifest.archiveSha256 ||
+      producer.inputSnapshot.normalizedDigest !== manifest.normalizedDigest ||
+      producer.inputSnapshot.compilerDigest !== manifest.compilerDigest ||
+      producer.inputSnapshot.stdlibDigest !== manifest.stdlibDigest ||
+      producer.bootstrap.stdlib.authority !== 'embedded-verified-main' ||
+      producer.bootstrap.stdlib.normalizedDigest !== manifest.stdlibDigest ||
+      producer.profile.target !== target ||
+      producer.profile.name !== 'release-with-debug' ||
+      producer.profile.optimization !== 'speed' ||
+      producer.profile.debug !== true ||
+      !/^[a-f0-9]{64}$/.test(producer.toolchain.clang.sha256) ||
+      producer.toolchain.clang.version.trim() === ''
+    )
+      return yield* reject('native seed receipt does not bind these N0/source/tool inputs')
+    const inspectClang = Effect.fnUntraced(function* () {
+      const path = yield* fs.realPath(clang)
+      const info = yield* fs.stat(path)
+      if (info.type !== 'File' || (info.mode & 0o111) === 0)
+        return yield* reject('verified clang target must be a regular executable')
+      const sha256 = yield* fileHash(path)
+      const result = yield* NativeProcess.execute(path, ['--version'], {
+        env: nativeEnvironment(environment, path),
+      }).pipe(
+        Effect.mapError(
+          (error) =>
+            new NativeBuildError({
+              message: error.message,
+              reason: 'ExternalFailure',
+              cause: error,
+            }),
+        ),
+      )
+      if (result.status !== 0 || result.signal !== null)
+        return yield* reject('cannot read verified clang version')
+      const version = result.stdout.toString('utf8').trim()
+      if ((yield* fileHash(path)) !== sha256 || (yield* fs.realPath(clang)) !== path)
+        return yield* reject('clang changed while reading its identity')
+      return { path, sha256, version }
+    })
+    const tool = yield* inspectClang()
+    receipt.linker = {
+      requestedPath: clang,
+      ...tool,
+      expected: producer.toolchain.clang,
+      matchesSeed:
+        tool.sha256 === producer.toolchain.clang.sha256 &&
+        tool.version === producer.toolchain.clang.version,
+      seedReceiptSha256,
+      seedProfile: producer.profile,
+      linkProfile: { target, optimization, debug },
+      environmentPolicy: 'standard-host-with-verified-clang',
+    }
+    if (!receipt.linker.matchesSeed)
+      return yield* reject('clang SHA256/version differs from N0 seed toolchain')
+    const env = nativeEnvironment(environment, tool.path)
     const program = yield* smokeProgram(corpusSource)
     receipt.smoke = {
       name: 'trivial-features',
@@ -201,6 +313,15 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       if ((yield* executableHash(seed, true)) !== receipt.seed.sha256)
         return yield* reject('N0 changed during native build/smoke')
       yield* SourceSnapshot.verifySnapshot({ directory: snapshot, receipt: manifest })
+      if ((yield* fileHash(seedReceipt)) !== seedReceiptSha256)
+        return yield* reject('N0 seed receipt changed during native build/smoke')
+      const current = yield* inspectClang()
+      if (
+        current.path !== tool.path ||
+        current.sha256 !== tool.sha256 ||
+        current.version !== tool.version
+      )
+        return yield* reject('verified clang changed during native build/smoke')
     })
     const invoke = Effect.fnUntraced(function* (
       name: string,
@@ -214,6 +335,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         cwd,
         resourceFile: join(outputDirectory, `${name}-rss.txt`),
         timeCommand,
+        env,
       })
       receipt.stages.push({ name, ...result })
       yield* checkInputs()
@@ -291,6 +413,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         parseArgs({
           options: {
             seed: { type: 'string' },
+            'seed-receipt': { type: 'string' },
+            clang: { type: 'string' },
             snapshot: { type: 'string' },
             output: { type: 'string' },
             'corpus-source': { type: 'string' },
@@ -306,12 +430,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
           cause,
         }),
     })
-    if (!values.seed || !values.snapshot || !values.output)
+    if (
+      !values.seed ||
+      !values['seed-receipt'] ||
+      !values.clang ||
+      !values.snapshot ||
+      !values.output
+    )
       return yield* reject(
-        'usage: node compiler/scripts/NativeBuild.ts --seed /immutable/N0 --snapshot /snapshot --output /fresh/run',
+        'usage: node compiler/scripts/NativeBuild.ts --seed /immutable/N0 --seed-receipt /immutable/seed-receipt.json --clang /verified/clang --snapshot /snapshot --output /fresh/run',
       )
     const receipt = yield* buildAndSmoke({
       seed: values.seed,
+      seedReceipt: values['seed-receipt'],
+      clang: values.clang,
       snapshot: values.snapshot,
       outputDirectory: values.output,
       corpusSource: values['corpus-source'],
