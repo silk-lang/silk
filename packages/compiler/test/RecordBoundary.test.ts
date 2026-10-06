@@ -28,15 +28,15 @@ it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair
     assert.lengthOf(tuples, 2)
     const first = tuples.at(0) ?? unreachable('expected the first selected tuple occurrence')
     const second = tuples.at(1) ?? unreachable('expected the second selected tuple occurrence')
-    assert.strictEqual(first.identity._tag, 'AnonymousAggregateIdentity')
-    assert.strictEqual(second.identity._tag, 'AnonymousAggregateIdentity')
+    const occurrence = first.identity ?? unreachable('expected first tuple identity')
+    const otherOccurrence = second.identity ?? unreachable('expected second tuple identity')
+    assert.strictEqual(occurrence._tag, 'AnonymousAggregateIdentity')
+    assert.strictEqual(otherOccurrence._tag, 'AnonymousAggregateIdentity')
     if (
-      first.identity._tag !== 'AnonymousAggregateIdentity' ||
-      second.identity._tag !== 'AnonymousAggregateIdentity'
+      occurrence._tag !== 'AnonymousAggregateIdentity' ||
+      otherOccurrence._tag !== 'AnonymousAggregateIdentity'
     )
       unreachable('expected retained ordinary anonymous tuple occurrences')
-    const occurrence = first.identity
-    const otherOccurrence = second.identity
     const generatedFacts: Array<ReturnType<typeof AggregateIdentity.generated>> = []
     const selected = Intrinsic.instantiateResult(
       Intrinsic.generatedUsizePair,
@@ -93,7 +93,7 @@ it.effect('shares ordinary positional facts with occurrence-owned intrinsic pair
       Type.equals(selected, other),
       'a different occurrence does not share a fabricated nominal result',
     )
-    assert.strictEqual(facts.struct.identity._tag, 'AnonymousAggregateIdentity')
+    assert.deepEqual(facts.struct.identity, occurrence)
     assert.strictEqual(facts.struct.name._tag, 'Unavailable')
   }),
 )
