@@ -355,7 +355,9 @@ pub fn main() -> i32 {
   let mut provider = Provider {}
   let owned = makeOwned()
   drop owned
-  return run Intrinsic.bindRequirementMut<Source>(Source.load(), &mut provider)
+  let finish = fn(value: i32) -> i32 { return value }
+  let result = run Intrinsic.bindRequirementMut<Source>(Source.load(), &mut provider)
+  return finish(result)
 }`
       const snapshot = yield* retainingMain('inventory/providers', ascii(source))
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
@@ -383,10 +385,9 @@ pub fn main() -> i32 {
         composition: snapshot.composition,
       })
       assert.include(portable, 'PRESENT_IN_SELECTED_RESIDUAL_BODY')
-      for (const instance of captured.instances.filter(
-        (value) => value.origin.kind === 'Generated',
-      ))
-        assert.isUndefined(instance.originalDeclaration)
+      const generated = captured.instances.filter((value) => value.origin.kind === 'Generated')
+      assert.isAbove(generated.length, 0)
+      for (const instance of generated) assert.isUndefined(instance.originalDeclaration)
     }),
 )
 
