@@ -1379,8 +1379,12 @@ on caller-local region relations.
 
 - **Status:** native gap; retires when native lowers a non-consuming by-value Effect argument.
 - **Compilers:** the bootstrap consumes an Effect or callable argument only when its run access is
-  `once` (`argumentConsumes`), so a let-bound Effect with shared or mutable run access may be passed
-  by value without `move`, as in `run Effect.catchAll(program, recover)`. Native reports that
-  argument as unsupported (the `typed-form` gap) instead of `ExplicitMoveRequired`, which it keeps
-  for a `once` value, a reference to a callable, and every return.
-- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk`.
+  `once` (`argumentConsumes`), and derives a composition's access from its retained environment
+  (COMPOSE-001), so a let-bound `runCases(&headers) |> Effect.provideMut<Allocator>(&mut allocator)`
+  may be passed by value without `move`, as in `run Effect.catchAll(program, recover)`. Native types
+  an invoked section's Effect at the access its generic contract proves conservatively. It reports
+  such an argument, and any shared- or mutable-access one, as unsupported (the `typed-form` gap)
+  instead of `ExplicitMoveRequired`, which it keeps for an exact `once` value, a reference to a
+  callable, and every return.
+- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk` and
+  `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
