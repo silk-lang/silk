@@ -621,3 +621,4 @@ HEAD...@{u}` before reporting a head, and confirm each claimed deliverable again
 
 - 2026-10-06 · Codex attach_artifact stalled from both worker and coordinator for963/964 · Attempt attachment without holding merges, record pending retry in ledger · Silk orchestration.
 - 2026-10-06 · An outer Cases parser probe did not validate embedded source strings, so an invalid `&[Allocation; 1]` fixture consumed a native rebuild · Parse fixture text directly before native checks; references to fixed arrays use `&([Allocation; 1])` · self-build semantic
+- 2026-10-06 · Strict JSONL codec bootstrap checking rejected a borrowed Stage match, nested anonymous callback, and implicit mutable-reference moves · Use explicit borrowed matches/reborrows and a named source-observation helper; keep parser and focused native checks before merge · self-build diagnostic codec
