@@ -269,6 +269,12 @@ own observer from `fn main() -> i32` already runs under the bootstrap. For examp
 prints `identity` and `origin` on event 5 and returns `1` prints `main.Missing` and
 `main.load (main:29:37)` and exits through the handler. That is a candidate corpus program (Q9).
 
+One more gap sits between the readers and `native_diagnostics`, outside this note: its
+`observeWith(move state, onEvent, body)` wrapper passes a named callback to a bounded generic `F`.
+Selfhost lowers that callback argument in the wrapper's caller as `typed-form` today (found while
+testing step 2). A direct `Intrinsic.observeDiagnostics(state, onEvent, body)` lowers. The
+callable-value follow-up owns it.
+
 ## 4. Gap codes
 
 | Code                | Change    | Raised where                                                               | Exit condition                       |

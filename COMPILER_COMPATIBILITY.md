@@ -636,6 +636,40 @@ Each entry records:
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
 
+### Selfhost failure reports carry origin only
+
+- **Status:** temporary divergence, roadmap [#567](https://github.com/julia-script/silk/issues/567)
+  decision Q2, designed in
+  [compiler/docs/failure-observer-and-trace.md](compiler/docs/failure-observer-and-trace.md)
+  (2026-10-05). It is retired row by row by that note's N7 follow-up (frames, causes, fatal traps)
+  and by the suspension stage's executable-closure summary (SEM0216, SEM0217).
+- **Rule:** [TERM-004](apps/docs/content/reference/program-termination-and-reporting.md#term-004--a-failure-report-has-one-stable-minimum)
+  to TERM-008 and
+  [FAIL-006](apps/docs/content/reference/typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context):
+  a report under a lexical observer names the failure's identity, its origin, the logical path to
+  `main`, and `while handling` causes; observed traps report a fatal line.
+- **Compilers:** both compilers thread an observer and a cause through every function, drop glue
+  included, once the program runs any observation, and nothing otherwise. The bootstrap builds the
+  full logical trace. Selfhost lowers `observeDiagnostics` and `observeUnhandled` (note N1-N4) with
+  origin-only context carried by `FailureContext`:
+  - `observeUnhandled` passes handle `0`, so the hosted report prints the identity and origin, then
+    `[trace truncated]`. No logical frames and no `while handling` causes are recorded.
+  - Observed traps stay bare traps (no event 6).
+  - SEM0216 and SEM0217 are not diagnosed; a context-free `observeUnhandled` returns `0` at run
+    time, as the bootstrap's null observer does.
+  - A capturing callback reports `observer-callback`; an observed `fail` of a type that is not
+    nominal, primitive or unit reports `failure-identity`.
+  - Selfhost infers omitted `observeDiagnostics` type arguments from the operands; the bootstrap
+    requires all four (SEM0051). A fallible body or a misshapen callback is an argument type
+    mismatch at that argument in both (bootstrap SEM0012).
+- **Source migration:** write the four type arguments, as `silk/native_diagnostics` does. No
+  corpus program reaches an observer under selfhost until `silk/native_start` compiles (Q1).
+- **Diagnostics and limits:** the missing report parts are runtime presentation only; status and
+  cleanup are unchanged.
+- **Evidence:** `observedFailuresCarryOriginContext`, `observationsCarryContextThroughExpansions`,
+  `nestedObservationsStartFresh` and `observedInstancesEmitTheContextAbi` in
+  `compiler/src/semantic/SemanticCases.silk`.
+
 ### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
 
 - **Status:** temporary divergence, Step 9e of

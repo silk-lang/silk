@@ -1,7 +1,7 @@
 //! Target-neutral selected MIR recipes, before resolving their runtime callee graph.
 
 import backend.InstanceKey {InstanceKey}
-import backend.Mir {AggregateField, Block, Callee, FailureEdge, Local, LocalKind, MirFunction, Operand, Place, Projection, Rvalue, Statement, SwitchCase, Terminator}
+import backend.Mir {AggregateField, Block, Callee, ContextText, Diagnostics, FailureEdge, Local, LocalKind, MirFunction, Operand, Place, Projection, Rvalue, Statement, SwitchCase, Terminator}
 import hir.Hir {Access, InfixOperator, PrefixOperator}
 import semantic.DeclarationId {DeclarationId}
 import semantic.RuntimeEncoding
@@ -148,6 +148,10 @@ effect fn operand(output: &mut Bytes, value: &Operand, owner: &DeclarationId) ->
       run RuntimeEncoding.word(&mut output.*, 6)
       run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&bytes))
     }
+    Operand.Null {ty} => {
+      run RuntimeEncoding.word(&mut output.*, 7)
+      run runtimeType(&mut output.*, &ty, owner)
+    }
   }
   return ()
 }
@@ -247,6 +251,12 @@ effect fn rvalue(output: &mut Bytes, value: &Rvalue, owner: &DeclarationId) -> (
       run operand(&mut output.*, &offset, owner)
       run runtimeType(&mut output.*, &element, owner)
     }
+    // The function's site is an edge encoded by its statement.
+    Rvalue.FunctionAddress {..} => { run RuntimeEncoding.word(&mut output.*, 14) }
+    Rvalue.ContextOf {place: source} => {
+      run RuntimeEncoding.word(&mut output.*, 15)
+      run place(&mut output.*, &source, owner)
+    }
   }
   return ()
 }
@@ -265,17 +275,47 @@ effect fn statement(output: &mut Bytes, callees: &mut Vector<InstanceKey>, value
       run RuntimeEncoding.word(&mut output.*, 0)
       run place(&mut output.*, &destination, owner)
       run rvalue(&mut output.*, &source, owner)
+      if let Rvalue.FunctionAddress {key} = &source { run edge(&mut output.*, &mut callees.*, &key) }
     }
-    Statement.Drop {destination, glue, origin: _} => {
+    Statement.Drop {destination, glue, diagnostics, origin: _} => {
       run RuntimeEncoding.word(&mut output.*, 1)
       run place(&mut output.*, &destination, owner)
       run edge(&mut output.*, &mut callees.*, &glue)
+      run hidden(&mut output.*, &diagnostics, owner)
+    }
+    Statement.FailureContext {destination, source, origin} => {
+      run RuntimeEncoding.word(&mut output.*, 2)
+      run place(&mut output.*, &destination, owner)
+      match &source {
+        Option<Place>.Some {value: carried} => {
+          run RuntimeEncoding.word(&mut output.*, 1)
+          run place(&mut output.*, &carried, owner)
+        }
+        // Its texts are encoded with the function's context table, by origin.
+        Option<Place>.None => {
+          run RuntimeEncoding.word(&mut output.*, 0)
+          run index(&mut output.*, origin.syntax.index)
+          run index(&mut output.*, origin.span.start)
+        }
+      }
     }
   }
   return ()
 }
 
-effect fn callee(output: &mut Bytes, callees: &mut Vector<InstanceKey>, value: &Callee) -> ()
+effect fn hidden(output: &mut Bytes, value: &Option<Diagnostics>, owner: &DeclarationId) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Option<Diagnostics>.Some {value: observed} => {
+      run RuntimeEncoding.word(&mut output.*, 1)
+      run operand(&mut output.*, &observed.observer, owner)
+      run operand(&mut output.*, &observed.cause, owner)
+    }
+    Option<Diagnostics>.None => { run RuntimeEncoding.word(&mut output.*, 0) }
+  }
+  return ()
+}
+
+effect fn callee(output: &mut Bytes, callees: &mut Vector<InstanceKey>, value: &Callee, owner: &DeclarationId) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   match &value.* {
     Callee.Instance {key} => {
@@ -286,6 +326,10 @@ effect fn callee(output: &mut Bytes, callees: &mut Vector<InstanceKey>, value: &
       run RuntimeEncoding.word(&mut output.*, 1)
       let identity = run DeclarationId.copyShared(&declaration)
       run RuntimeEncoding.declaration(&mut output.*, &identity)
+    }
+    Callee.Indirect {address} => {
+      run RuntimeEncoding.word(&mut output.*, 2)
+      run operand(&mut output.*, &address, owner)
     }
   }
   return ()
@@ -305,11 +349,12 @@ effect fn terminator(output: &mut Bytes, callees: &mut Vector<InstanceKey>, valu
       run index(&mut output.*, elseBlock)
     }
     Terminator.Return {origin: _} => { run RuntimeEncoding.word(&mut output.*, 2) }
-    Terminator.Call {callee: target, arguments, providers, destination, normal, failure, origin: _} => {
+    Terminator.Call {callee: target, arguments, providers, diagnostics, destination, normal, failure, origin: _} => {
       run RuntimeEncoding.word(&mut output.*, 3)
-      run callee(&mut output.*, &mut callees.*, &target)
+      run callee(&mut output.*, &mut callees.*, &target, owner)
       run operands(&mut output.*, &arguments, owner)
       run operands(&mut output.*, &providers, owner)
+      run hidden(&mut output.*, &diagnostics, owner)
       run place(&mut output.*, &destination, owner)
       run index(&mut output.*, normal)
       match &failure {
@@ -381,6 +426,9 @@ effect fn locals(output: &mut Bytes, function: &MirFunction, owner: &Declaration
         run RuntimeEncoding.word(&mut output.*, 2)
         run index(&mut output.*, provider)
       }
+      // The diagnostic addresses change the ABI of a program that observes diagnostics (N1, N2).
+      LocalKind.Observer => { run RuntimeEncoding.word(&mut output.*, 3) }
+      LocalKind.Cause => { run RuntimeEncoding.word(&mut output.*, 4) }
       _ => { run RuntimeEncoding.word(&mut output.*, 0) }
     }
     at = at + usize.ONE
@@ -408,6 +456,23 @@ impl InstanceRecipe {
     let mut at = usize.ZERO
     while at < blocks.length {
       run block(&mut shape, &mut callees, &blocks[at], &owner)
+      at = at + usize.ONE
+    }
+    // Originated failure contexts store these texts (failure observer note N3).
+    let contexts = Vector.asSlice<ContextText>(&function.contexts)
+    run index(&mut shape, contexts.length)
+    at = usize.ZERO
+    while at < contexts.length {
+      run index(&mut shape, contexts[at].origin.syntax.index)
+      run index(&mut shape, contexts[at].origin.span.start)
+      let identities = Vector.asSlice<Bytes>(&contexts[at].identities)
+      run index(&mut shape, identities.length)
+      let mut identityAt = usize.ZERO
+      while identityAt < identities.length {
+        run RuntimeEncoding.field(&mut shape, Bytes.asSlice(&identities[identityAt]))
+        identityAt = identityAt + usize.ONE
+      }
+      run RuntimeEncoding.field(&mut shape, Bytes.asSlice(&contexts[at].label))
       at = at + usize.ONE
     }
     return InstanceRecipe {key: InstanceKey.copy(&function.key), shape: move shape,
