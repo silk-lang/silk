@@ -1303,17 +1303,20 @@ success and negative code/span controls alongside the named refusal.
 Under LIFE-003 a body annotation infers the lifetimes it omits from its uses. The bootstrap gives
 each one a body-scoped region and solves the body's outlives constraints. Native infers each one
 by equality with the value the annotation describes: a pattern annotation or variant qualifier
-from the subject it matches, a binding annotation from its initializer, and a written constructor
-qualifier from its operands or a same-owner expectation. Every written part must still agree
-exactly, so a conflicting explicit lifetime, a different owner, referent or access, and any other
-mismatching argument keep `TypeMismatch`.
+from the subject it matches, a binding annotation from its initializer, a written constructor
+qualifier from its operands or a same-owner expectation, and an explicit call argument from the
+call's operands or else its expected result. Every written part must still agree exactly, so a
+conflicting explicit lifetime, a different owner, referent or access, and any other mismatching
+argument keep `TypeMismatch`.
 
 Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
 elides a lifetime checks its initializer without contextual expectation, so a context-typed
 initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
-exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit call-site generic
-arguments and qualified calls that elide a lifetime, and a constructor whose elided lifetime is
-reached only through an alias, keep the `body-lifetime-elision` gap.
+exact region, so a later assignment with a different nonlocal lifetime is refused. An explicit
+call argument lifetime that neither an operand nor the expected result determines, an elided
+lifetime in a service operation's explicit arguments, an owner qualifier of a call, or an exact
+`typeof` representation, and a constructor whose elided lifetime is reached only through an alias
+keep the `body-lifetime-elision` gap.
 
 ### Native deferred by-value nominal lifetime shortening
 
