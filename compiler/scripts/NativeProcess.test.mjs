@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as Config from 'effect/Config'
 import * as Exit from 'effect/Exit'
 import * as Cause from 'effect/Cause'
 import * as Fiber from 'effect/Fiber'
@@ -14,7 +15,7 @@ const require = createRequire(new URL('../../packages/cli/package.json', import.
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 
 const fixture = Effect.fnUntraced(
-  /** @param {(root:string,fs:import('effect/FileSystem').FileSystem) => import('effect/Effect').Effect<void,import('./NativeProcess.ts').NativeProcessError|import('effect/PlatformError').PlatformError,import('effect/FileSystem').FileSystem|import('effect/Scope').Scope>} */
+  /** @param {(root:string,fs:import('effect/FileSystem').FileSystem) => import('effect/Effect').Effect<void,import('./NativeProcess.ts').NativeProcessError|import('effect/PlatformError').PlatformError|import('effect/Config').ConfigError,import('effect/FileSystem').FileSystem|import('effect/Scope').Scope>} */
   function* (use) {
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-process-deadline-' })
@@ -79,7 +80,9 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
           command,
           cwd: root,
           resourceFile: join(root, 'rss'),
-          timeCommand: process.env.SILK_TEST_GNU_TIME ?? '/usr/bin/time',
+          timeCommand: yield* Config.String('SILK_TEST_GNU_TIME').pipe(
+            Config.withDefault('/usr/bin/time'),
+          ),
           timeoutMs: 300,
         })
         assert.deepStrictEqual(result.deadline, { timeoutMs: 300, expired: false })
@@ -125,7 +128,9 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         command: [process.execPath, '-e', source],
         cwd: root,
         resourceFile: join(root, 'rss'),
-        timeCommand: process.env.SILK_TEST_GNU_TIME ?? '/usr/bin/time',
+        timeCommand: yield* Config.String('SILK_TEST_GNU_TIME').pipe(
+          Config.withDefault('/usr/bin/time'),
+        ),
         timeoutMs: 350,
       })
       assert.strictEqual(result.deadline.expired, true)
@@ -160,7 +165,9 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
             command: [process.execPath, '-e', source],
             cwd: root,
             resourceFile,
-            timeCommand: process.env.SILK_TEST_GNU_TIME ?? '/usr/bin/time',
+            timeCommand: yield* Config.String('SILK_TEST_GNU_TIME').pipe(
+              Config.withDefault('/usr/bin/time'),
+            ),
             timeoutMs: 300,
           })
           assert.match(result.measurement.error, /must be fresh/)
