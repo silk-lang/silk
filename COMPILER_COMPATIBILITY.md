@@ -1344,22 +1344,37 @@ main-first integration of both contracts. See
 [the source startup contract](compiler/docs/source-synchronous-startup.md) for selection, ownership,
 and validation details. Fatal traps retain their existing behavior and do not promise cleanup.
 
-### Native deferred String coercion and written-pattern lifetime elision
+### Native deferred String coercion
 
-The bootstrap accepts a static String at a shorter expected String lifetime and permits omitted
-reference lifetimes in an otherwise matching written union-pattern type. Native reports the
-existing `borrow-region-relation` and `body-lifetime-elision` gaps respectively until those
-ordinary lifetime mechanisms are represented. This does not admit either conversion or selection.
-The String guard requires actual Static and a nonstatic String expectation. The pattern guard
-retains the specific annotation's generated lifetime evidence and requires exact nominal owners,
-static and row arguments, reference access and referents, and every other structural component.
-Any ordinary mismatch retains `TypeMismatch`, including a conflicting explicit lifetime, a
-nonstatic-to-static String, or another mismatching type argument after an omitted reference.
+The bootstrap accepts a static String at a shorter expected String lifetime. Native reports the
+existing `borrow-region-relation` gap until that ordinary lifetime mechanism is represented. This
+does not admit the conversion. The String guard requires actual Static and a nonstatic String
+expectation; a nonstatic-to-static String retains `TypeMismatch`.
 
-Sealed Allocation admission can expose these pre-existing downstream gaps in `uri-rfc3986` and
+Sealed Allocation admission can expose this pre-existing downstream gap in `uri-rfc3986` and
 `toml-output`; their prior core-type refusal did not establish lifetime support. Reduced realized
-bootstrap analysis has no diagnostics for both source forms. Native focused cases retain exact
-success and negative code/span controls alongside the named refusals.
+bootstrap analysis has no diagnostics for the source form. Native focused cases retain exact
+success and negative code/span controls alongside the named refusal.
+
+### Native body-annotation lifetime elision by equality
+
+Under LIFE-003 a body annotation infers the lifetimes it omits from its uses. The bootstrap gives
+each one a body-scoped region and solves the body's outlives constraints. Native infers each one
+by equality with the value the annotation describes: a pattern annotation or variant qualifier
+from the subject it matches, a binding annotation from its initializer, and a written constructor
+qualifier from its operands or a same-owner expectation. Every written part must still agree
+exactly, so a conflicting explicit lifetime, a different owner, referent or access, and any other
+mismatching argument keep `TypeMismatch`.
+
+Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
+elides a lifetime checks its initializer without contextual expectation, so a context-typed
+initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
+exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit
+call-site generic arguments and qualified calls that elide a lifetime, and a constructor whose
+elided lifetime is reached only through an alias, keep the `body-lifetime-elision` gap: a call
+argument's elided lifetime needs a slot of the call's own inference that the expected result
+and every operand (including a static `String` and a caller-local loan) can shorten, which waits
+on caller-local region relations.
 
 ### Native deferred by-value nominal lifetime shortening
 
