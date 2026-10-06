@@ -1400,3 +1400,14 @@ on caller-local region relations.
   `UnknownMember`, which it keeps for a function's own unbounded type parameter.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
   `compiler/src/semantic/SemanticCases.silk`.
+
+### Native service operations with a `Self` operand
+
+- **Status:** native gap; retires when native dispatches such an operation on its operand.
+- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
+  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
+  interface. Native serves a service operation from the run site's requirement row with no provider
+  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
+  `typed-form` gap) instead of a `TypeMismatch` at the operand.
+- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
+  `compiler/src/semantic/SemanticCases.silk`.
