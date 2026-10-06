@@ -321,15 +321,15 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 
 ## 4. Gap codes
 
-| Code               | Change                      | Raised where                                                            | Exit condition                     |
-| ------------------ | --------------------------- | ----------------------------------------------------------------------- | ---------------------------------- |
-| `suspension`       | **new** (named with Step 4) | MIR lowering reaches `suspendEffect` or `park`                          | suspension stage                   |
-| `effect-instance`  | **deleted**                 | was: instance with a non-empty row, or an `effect fn` interface witness | Step 9 provider PR                 |
-| `entry-signature`  | unchanged                   | `Entry { main }` with any signature except `fn main() -> i32`           | Q1                                 |
-| `intrinsic-member` | unchanged                   | `execution*`, `wake`, `observeUnhandled`, `observeDiagnostics`          | suspension stage and observer note |
-| `typed-form`       | narrower                    | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land      | per PR                             |
-| `interface-effect-witness` | **new** (Step 9d)   | an `effect fn` witness reached through an interface call, or a `run` of such a call's Effect | lowering interface Effect constructions with their failure edge; owner: Step 9 follow-up |
-| `cleanup` (owned provider) | extended (Step 9d)  | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run) | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up |
+| Code                       | Change                      | Raised where                                                                                     | Exit condition                                                                                                       |
+| -------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `suspension`               | **new** (named with Step 4) | MIR lowering reaches `suspendEffect` or `park`                                                   | suspension stage                                                                                                     |
+| `effect-instance`          | **deleted**                 | was: instance with a non-empty row, or an `effect fn` interface witness                          | Step 9 provider PR                                                                                                   |
+| `entry-signature`          | unchanged                   | `Entry { main }` with any signature except `fn main() -> i32`                                    | Q1                                                                                                                   |
+| `intrinsic-member`         | unchanged                   | `execution*`, `wake`, `observeUnhandled`, `observeDiagnostics`                                   | suspension stage; the observer intrinsics leave it with [the observer note](failure-observer-and-trace.md) §7 step 2 |
+| `typed-form`               | narrower                    | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land                               | per PR                                                                                                               |
+| `interface-effect-witness` | **new** (Step 9d)           | an `effect fn` witness reached through an interface call, or a `run` of such a call's Effect     | lowering interface Effect constructions with their failure edge; owner: Step 9 follow-up                             |
+| `cleanup` (owned provider) | extended (Step 9d)          | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run) | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up                                                             |
 
 Every gap is a structured `Unsupported` result naming the owner instance and span. None becomes a
 trap stub.
@@ -342,7 +342,7 @@ trap stub.
 | runners            | generated per Effect site (`CatchEffectRunner`, ...), keyed by `EffectExecutionContract.key` (success, failure row, requirement row)                                                                                                | the construction site's own instance, keyed by application plus providers; intrinsic composites expanded at run sites | no                                |
 | providers          | statically selected provider references appended after captures; runner specialized per provider witness (`effectRunner.providers`)                                                                                                 | the same idea: `providers` in the key, address `Provider` locals                                                      | no                                |
 | failure return     | `EffectOutcome` sum returned by value (tag lane, widest payload's lanes)                                                                                                                                                            | status flag plus success and failure out-slots                                                                        | no                                |
-| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | none until the first reader; then origin-only (Q2)                                                                    | yes, in unhandled-failure reports |
+| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | none until the first reader; then origin-only (Q2), designed in [the observer note](failure-observer-and-trace.md)    | yes, in unhandled-failure reports |
 | entry              | source runtime `silk/native_start` (ENTRY-001), no compiler adapter                                                                                                                                                                 | generated C `main` calling `fn main() -> i32` (Q1)                                                                    | yes: `effect fn main` unsupported |
 | suspension         | coroutine frames, `SuspendEffectRegion`                                                                                                                                                                                             | gap `suspension`                                                                                                      | yes: unsupported                  |
 
@@ -387,6 +387,7 @@ All three recommendations accepted on PR #708:
 2. **Failure context (Q2).** The `FailureContext` statement stays reserved. Origin-only context is
    added by the PR that adds its first reader (the observer and trace note due before milestone
    (i-b)), not in Step 9. The trace gap belongs to that PR. This refines the 2026-09-30 decision
-   about which PR ships it; the origin-only content is unchanged.
+   about which PR ships it; the origin-only content is unchanged. The note is
+   [failure-observer-and-trace.md](failure-observer-and-trace.md).
 3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
    covers becomes either supported or `suspension`.
