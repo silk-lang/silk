@@ -10,6 +10,8 @@ import backend.Mir {
   AggregateField,
   Block,
   Callee,
+  ContextText,
+  Diagnostics,
   FailureEdge,
   Local,
   LocalKind,
@@ -27,6 +29,7 @@ import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Target {Target}
 import semantic.Type {Type}
+import semantic.TypedBody {Origin}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.pointer {Pointer}
@@ -862,6 +865,7 @@ effect fn emitOperand(
       scalar: Representation {aggregate: false, size: usize.ZERO, bits: usize.ZERO, signed: false, unit: true, pointer: false, floating: false},
       text: Bytes.make(),
     }
+    Operand.Null {..} => Value {scalar: pointerRepresentation(target), text: run Bytes.copy(b"null")}
     Operand.StaticBytes {bytes} => Value {
       scalar: Representation {aggregate: false, size: usize.ZERO, bits: u32.toUsize(Target.pointerBits(target)),
         signed: false, unit: false, pointer: true, floating: false},
@@ -1038,6 +1042,12 @@ effect fn emitScalarRvalue(
       let owner = InstanceKey.identity(&function.key)
       fail Gap.make(GapCode.TypedForm, &owner, span)
     }
+    Rvalue.ContextOf {place} => Value {scalar: pointerRepresentation(target), text: run companionAddress(function, place.local)}
+    // Stored by its statement, where the emission plan resolves the symbol.
+    Rvalue.FunctionAddress {..} => {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.TypedForm, &owner, span)
+    }
     Rvalue.Ref {place, ..} => {
       let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
       return Value {
@@ -1159,8 +1169,21 @@ effect fn emitScalarRvalue(
         }
       }
       if lhs.scalar.pointer {
-        let owner = InstanceKey.identity(&function.key)
-        fail Gap.make(GapCode.TypedForm, &owner, span)
+        // Addresses compare only for identity, such as a null observer or cause (N4).
+        if operation != InfixOperator.Equals && operation != InfixOperator.NotEquals {
+          let owner = InstanceKey.identity(&function.key)
+          fail Gap.make(GapCode.TypedForm, &owner, span)
+        }
+        let name = run temp(&mut writer.*)
+        run append(&mut writer.*, Bytes.asSlice(&name))
+        run append(&mut writer.*, integerOpcode(operation, false))
+        run append(&mut writer.*, b"ptr ")
+        run append(&mut writer.*, Bytes.asSlice(&lhs.text))
+        run append(&mut writer.*, b", ")
+        run append(&mut writer.*, Bytes.asSlice(&rhs.text))
+        run append(&mut writer.*, b"\n")
+        return Value {scalar: Representation {aggregate: false, size: usize.ZERO, bits: usize.ONE, signed: false, unit: false,
+          pointer: false, floating: false}, text: move name}
       }
       match operation {
         InfixOperator.Add => {
@@ -1383,6 +1406,201 @@ fn providerLocalAt(function: &MirFunction, index: usize) -> usize {
   return usize.MAX
 }
 
+/// The hidden `Observer` (0) or `Cause` (1) local, or `usize.MAX` when the program does not
+/// observe diagnostics (failure observer note N1, N2).
+fn diagnosticLocal(function: &MirFunction, wanted: usize) -> usize {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let kind = match &locals[at].kind {
+      LocalKind.Observer => usize.ZERO
+      LocalKind.Cause => usize.ONE
+      _ => usize.MAX
+    }
+    if kind == wanted { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// The address of failure slot `local`'s context companion: the caller's `%context` for the
+// `Failure` local, else this function's own `%cN` (failure observer note N3).
+effect fn companionAddress(function: &MirFunction, local: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if local == failureLocal(function) { return run Bytes.copy(b"%context") }
+  let mut name = Writer {text: run Bytes.copy(b"%c"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+  run decimal(&mut name, local)
+  return move name.text
+}
+
+effect fn addLocal(listed: &mut Vector<usize>, local: usize, skipped: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if local == skipped { return () }
+  let entries = Vector.asSlice<usize>(&listed.*)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at] == local { return () }
+    at = at + usize.ONE
+  }
+  return run Vector.append<usize>(&mut listed.*, local)
+}
+
+// The failure slots that own a companion: those a context statement, a selected cause or a
+// call edge of a program that observes diagnostics names, except `Failure`.
+effect fn companionLocals(function: &MirFunction) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let skipped = failureLocal(function)
+  let mut listed = Vector.make<usize>()
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let statements = Vector.asSlice<Statement>(&blocks[at].statements)
+    let mut statementAt = usize.ZERO
+    while statementAt < statements.length {
+      match &statements[statementAt] {
+        Statement.FailureContext {destination, source, ..} => {
+          run addLocal(&mut listed, destination.local, skipped)
+          if let Option<Place>.Some {value: from} = &source { run addLocal(&mut listed, from.local, skipped) }
+        }
+        Statement.Assign {value, ..} => {
+          if let Rvalue.ContextOf {place} = &value { run addLocal(&mut listed, place.local, skipped) }
+        }
+        _ => {}
+      }
+      statementAt = statementAt + usize.ONE
+    }
+    if let Terminator.Call {failure, diagnostics, ..} = &blocks[at].terminator {
+      if let Option<FailureEdge>.Some {value: edge} = &failure {
+        if let Option<Diagnostics>.Some {..} = &diagnostics { run addLocal(&mut listed, edge.destination.local, skipped) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move listed
+}
+
+// Stores one string descriptor `{address, length}` at `offset` of a companion.
+effect fn storeText(writer: &mut Writer, companion: &[u8], offset: usize, word: usize, address: &[u8], length: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let data = run byteOffset(&mut writer.*, companion, offset)
+  run append(&mut writer.*, b"store ptr ")
+  run append(&mut writer.*, address)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&data))
+  run append(&mut writer.*, b"\n")
+  let size = run byteOffset(&mut writer.*, companion, offset + word)
+  run append(&mut writer.*, b"store i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, length)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&size))
+  return run append(&mut writer.*, b"\n")
+}
+
+effect fn decimalText(value: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+  run decimal(&mut text, value)
+  return move text.text
+}
+
+// Writes a failure slot's companion `[identity, label]` (failure observer note N3): carried word by
+// word from `source`'s, or originated from the function's context table, selecting a union's
+// active member identity by its tag.
+effect fn emitFailureContext(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  destination: &Place, source: &Option<Place>, origin: Origin) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let word = u32.toUsize(Target.pointerBits(target)) / 8
+  let into = run companionAddress(function, destination.local)
+  if let Option<Place>.Some {value: from} = &source.* {
+    let carried = run companionAddress(function, from.local)
+    let mut part = usize.ZERO
+    while part < 4 {
+      let read = run byteOffset(&mut writer.*, Bytes.asSlice(&carried), part * word)
+      let written = run byteOffset(&mut writer.*, Bytes.asSlice(&into), part * word)
+      let value = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&value))
+      run append(&mut writer.*, b" = load i")
+      run decimal(&mut writer.*, word * 8)
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&read))
+      run append(&mut writer.*, b"\nstore i")
+      run decimal(&mut writer.*, word * 8)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, Bytes.asSlice(&value))
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&written))
+      run append(&mut writer.*, b"\n")
+      part = part + usize.ONE
+    }
+    return ()
+  }
+  let texts = Vector.asSlice<ContextText>(&function.contexts)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < texts.length && found == usize.MAX {
+    if texts[at].origin.syntax.index == origin.syntax.index && texts[at].origin.span.start == origin.span.start { found = at }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.make(GapCode.TypedForm, &owner, origin.span)
+  }
+  let identities = Vector.asSlice<Bytes>(&texts[found].identities)
+  let mut address = run staticBytes(&mut writer.*, Bytes.asSlice(&identities[usize.ZERO]))
+  let mut length = run decimalText(Bytes.length(&identities[usize.ZERO]))
+  if identities.length > usize.ONE {
+    // The active member's tag selects its identity.
+    let slot = run emitPlace(&mut writer.*, function, target, layouts, destination)
+    let kind = tagRepresentation(run taggedFact(layouts, &slot.ty, function, origin.span))
+    let tag = run temp(&mut writer.*)
+    run append(&mut writer.*, Bytes.asSlice(&tag))
+    run append(&mut writer.*, b" = load ")
+    run typeName(&mut writer.*, kind)
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&slot.text))
+    run append(&mut writer.*, b"\n")
+    let mut member = usize.ONE
+    while member < identities.length {
+      let candidate = run staticBytes(&mut writer.*, Bytes.asSlice(&identities[member]))
+      let matched = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&matched))
+      run append(&mut writer.*, b" = icmp eq ")
+      run typeName(&mut writer.*, kind)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, Bytes.asSlice(&tag))
+      run append(&mut writer.*, b", ")
+      run decimal(&mut writer.*, member)
+      run append(&mut writer.*, b"\n")
+      let selected = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&selected))
+      run append(&mut writer.*, b" = select i1 ")
+      run append(&mut writer.*, Bytes.asSlice(&matched))
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&candidate))
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&address))
+      run append(&mut writer.*, b"\n")
+      let measured = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&measured))
+      run append(&mut writer.*, b" = select i1 ")
+      run append(&mut writer.*, Bytes.asSlice(&matched))
+      run append(&mut writer.*, b", i")
+      run decimal(&mut writer.*, word * 8)
+      run append(&mut writer.*, b" ")
+      run decimal(&mut writer.*, Bytes.length(&identities[member]))
+      run append(&mut writer.*, b", i")
+      run decimal(&mut writer.*, word * 8)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, Bytes.asSlice(&length))
+      run append(&mut writer.*, b"\n")
+      address = move selected
+      length = move measured
+      member = member + usize.ONE
+    }
+  }
+  run storeText(&mut writer.*, Bytes.asSlice(&into), usize.ZERO, word, Bytes.asSlice(&address), Bytes.asSlice(&length))
+  let label = run staticBytes(&mut writer.*, Bytes.asSlice(&texts[found].label))
+  let labelLength = run decimalText(Bytes.length(&texts[found].label))
+  return run storeText(&mut writer.*, Bytes.asSlice(&into), word + word, word, Bytes.asSlice(&label), Bytes.asSlice(&labelLength))
+}
+
 /// The `Failure` local of a fallible function, or `usize.MAX` when it cannot fail.
 fn failureLocal(function: &MirFunction) -> usize {
   let locals = Vector.asSlice<Local>(&function.locals)
@@ -1440,6 +1658,7 @@ effect fn emitCall(
   callee: &Callee,
   arguments: &Vector<Operand>,
   providers: &Vector<Operand>,
+  diagnostics: &Option<Diagnostics>,
   destination: &Place,
   normal: usize,
   failure: &Option<FailureEdge>,
@@ -1458,10 +1677,19 @@ effect fn emitCall(
   // A fallible callee takes success and failure out-addresses after its arguments and returns a
   // status: 0 continues at `normal`, 1 at the failure edge (D3).
   let mut failed = Option.none<Address>()
+  let mut context = Option.none<Bytes>()
   let mut handler = usize.MAX
   if let Option<FailureEdge>.Some {value: edge} = &failure.* {
     failed = Option.some<Address>(run emitPlace(&mut writer.*, function, target, layouts, &edge.destination))
+    // In a program that observes diagnostics the callee also writes the destination's companion (N3).
+    if let Option<Diagnostics>.Some {..} = &diagnostics.* {
+      context = Option.some<Bytes>(run companionAddress(function, edge.destination.local))
+    }
     handler = edge.target
+  }
+  let mut indirect = Option.none<Value>()
+  if let Callee.Indirect {address} = &callee.* {
+    indirect = Option.some<Value>(run emitOperand(&mut writer.*, function, target, layouts, &address))
   }
   let fallible = handler != usize.MAX
   // Provider addresses follow the written arguments (D2).
@@ -1471,6 +1699,11 @@ effect fn emitCall(
   while providerAt < hidden.length {
     run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &hidden[providerAt]))
     providerAt = providerAt + usize.ONE
+  }
+  // An observed callee then takes the observer and selected-cause addresses (N1, N2).
+  if let Option<Diagnostics>.Some {value: observed} = &diagnostics.* {
+    run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &observed.observer))
+    run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &observed.cause))
   }
   let values = Vector.asSlice<Operand>(arguments)
   let mut evaluated = Vector.make<Value>()
@@ -1503,6 +1736,12 @@ effect fn emitCall(
     run append(&mut writer.*, b" @")
     let symbol = run EmissionPlan.symbol(plan, &key)
     run append(&mut writer.*, Bytes.asSlice(&symbol))
+  } else if let Option<Value>.Some {value: address} = &indirect {
+    if fallible { run append(&mut writer.*, b"i1") }
+    else if kind.aggregate { run append(&mut writer.*, b"void") }
+    else { run typeName(&mut writer.*, kind) }
+    run append(&mut writer.*, b" ")
+    run append(&mut writer.*, Bytes.asSlice(&address.text))
   }
   run append(&mut writer.*, b"(")
   let leadingOutput = kind.aggregate && !fallible
@@ -1546,6 +1785,10 @@ effect fn emitCall(
     run append(&mut writer.*, Bytes.asSlice(&output.text))
     run append(&mut writer.*, b", ptr ")
     run append(&mut writer.*, Bytes.asSlice(&failureSlot.text))
+    if let Option<Bytes>.Some {value: companion} = &context {
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&companion))
+    }
   }
   run append(&mut writer.*, b")\n")
   if fallible {
@@ -1583,17 +1826,44 @@ effect fn emitBlock(
   while at < statements.length {
     match & statements[at] {
       Statement.Assign {destination, value, origin} => {
-        run emitAssign(&mut writer.*, function, target, layouts, &destination, &value, origin.span)
+        if let Rvalue.FunctionAddress {key} = &value {
+          // A callback's address is its emitted symbol (failure observer note N1).
+          let address = run emitPlace(&mut writer.*, function, target, layouts, &destination)
+          let symbol = run EmissionPlan.symbol(plan, &key)
+          run append(&mut writer.*, b"store ptr @")
+          run append(&mut writer.*, Bytes.asSlice(&symbol))
+          run append(&mut writer.*, b", ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&address.text))
+          run append(&mut writer.*, b"\n")
+        } else {
+          run emitAssign(&mut writer.*, function, target, layouts, &destination, &value, origin.span)
+        }
       }
-      // A drop calls the glue of the place's type with the place's address (MIR core shape §3).
-      Statement.Drop {destination, glue, origin} => {
+      // A drop calls the glue of the place's type with the place's address (MIR core shape §3),
+      // then the current observer and cause in a program that observes diagnostics.
+      Statement.Drop {destination, glue, diagnostics, origin} => {
         let address = run emitPlace(&mut writer.*, function, target, layouts, &destination)
+        let mut hidden = Vector.make<Value>()
+        if let Option<Diagnostics>.Some {value: observed} = &diagnostics {
+          run Vector.append<Value>(&mut hidden, run emitOperand(&mut writer.*, function, target, layouts, &observed.observer))
+          run Vector.append<Value>(&mut hidden, run emitOperand(&mut writer.*, function, target, layouts, &observed.cause))
+        }
         let symbol = run EmissionPlan.symbol(plan, &glue)
         run append(&mut writer.*, b"call void @")
         run append(&mut writer.*, Bytes.asSlice(&symbol))
         run append(&mut writer.*, b"(ptr ")
         run append(&mut writer.*, Bytes.asSlice(&address.text))
+        let passed = Vector.asSlice<Value>(&hidden)
+        let mut hiddenAt = usize.ZERO
+        while hiddenAt < passed.length {
+          run append(&mut writer.*, b", ptr ")
+          run append(&mut writer.*, Bytes.asSlice(&passed[hiddenAt].text))
+          hiddenAt = hiddenAt + usize.ONE
+        }
         run append(&mut writer.*, b")\n")
+      }
+      Statement.FailureContext {destination, source, origin} => {
+        run emitFailureContext(&mut writer.*, function, target, layouts, &destination, &source, origin)
       }
     }
     at = at + usize.ONE
@@ -1617,7 +1887,7 @@ effect fn emitBlock(
     Terminator.Return {origin} => {
       run emitReturn(&mut writer.*, function, target, layouts, origin.span)
     }
-    Terminator.Call {callee, arguments, providers, destination, normal, failure, origin} => {
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, normal, failure, origin} => {
       run emitCall(
         &mut writer.*,
         function,
@@ -1628,6 +1898,7 @@ effect fn emitBlock(
         &callee,
         &arguments,
         &providers,
+        &diagnostics,
         &destination,
         normal,
         &failure,
@@ -1732,6 +2003,30 @@ effect fn emitEntrySlots(
     run append(&mut writer.*, b"\n")
     provider = provider + usize.ONE
   }
+  // Every failure slot except `Failure` owns a fixed-size context companion; `Failure`'s is the
+  // caller's `%context` (failure observer note N3).
+  let companions = run companionLocals(function)
+  let owned = Vector.asSlice<usize>(&companions)
+  let word = u32.toUsize(Target.pointerBits(target)) / 8
+  let mut companionAt = usize.ZERO
+  while companionAt < owned.length {
+    run append(&mut writer.*, Bytes.asSlice(&run companionAddress(function, owned[companionAt])))
+    run append(&mut writer.*, b" = alloca [4 x i")
+    run decimal(&mut writer.*, word * 8)
+    run append(&mut writer.*, b"], align ")
+    run decimal(&mut writer.*, word)
+    run append(&mut writer.*, b"\n")
+    companionAt = companionAt + usize.ONE
+  }
+  // An observed function's observer and selected-cause addresses land in their locals (N1, N2).
+  let observer = diagnosticLocal(function, usize.ZERO)
+  if observer != usize.MAX {
+    run append(&mut writer.*, b"store ptr %observer, ptr ")
+    run localName(&mut writer.*, observer)
+    run append(&mut writer.*, b"\nstore ptr %cause, ptr ")
+    run localName(&mut writer.*, diagnosticLocal(function, usize.ONE))
+    run append(&mut writer.*, b"\n")
+  }
   return ()
 }
 
@@ -1784,9 +2079,15 @@ pub effect fn emit(function: &MirFunction, target: &Target, layouts: &[TypeLayou
     run decimal(&mut writer, providerCount)
     providerCount = providerCount + usize.ONE
   }
+  let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
+  if observed {
+    if parameters.length > usize.ZERO || providerCount > usize.ZERO || leadingOutput { run append(&mut writer, b", ") }
+    run append(&mut writer, b"ptr %observer, ptr %cause")
+  }
   if fallible {
-    if parameters.length > usize.ZERO || providerCount > usize.ZERO { run append(&mut writer, b", ") }
+    if parameters.length > usize.ZERO || providerCount > usize.ZERO || observed { run append(&mut writer, b", ") }
     run append(&mut writer, b"ptr %out, ptr %fail")
+    if observed { run append(&mut writer, b", ptr %context") }
   }
   run append(&mut writer, b") {\n")
   let blocks = Vector.asSlice<Block>(&function.blocks)
