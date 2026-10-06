@@ -73,19 +73,29 @@ structural-union member list would otherwise have to be renormalized at each use
 **Relation to Layout.** MIR states _which_ field, never _where_. Emission asks `Layout` for
 offsets, tag encoding and ABI class. A Wasm backend would read the same MIR and `Layout`.
 
-**Selected instance identity.** `InstanceKey` retains the complete semantic application and a
-canonical lifetime-erased runtime family. Semantic queries validate every exact application;
-layout interning uses runtime type equality. After finite reachability closes, `InstanceRecipe`
-encodes each selected MIR body and its ordered exact call/drop targets without origins, target
-layout facts or LLVM text. `EmissionPlan` refines runtime families by these recipes and their
-callee classes, including cycles, then encodes each root's reachable minimized graph. Full bytes
-decide equality and interning; content digests shorten symbols. Equivalent lifetime instances
-share one definition; differing direct or transitive cleanup splits every affected caller.
-Root-local numbering makes identity independent of discovery order and unrelated instances.
-Definitions, calls and drops all resolve through the same completed plan. The C shim alone keeps
-the ABI name `main`; genuine digest collisions reject before emission.
-Finite-closure evidence certifies complete lowered successors, not executable backend output.
-LLVM-only restrictions are checked when the completed plan is emitted and remain build gaps.
+**Selected instance identity and LLVM answers.** `InstanceKey` retains the complete semantic
+application and a canonical lifetime-erased runtime family. Semantic queries validate every exact
+application; layout interning uses runtime type equality. Linkage symbols use exact instance
+content, including lifetime, static, enclosing-scope and provider evidence. Local borrow regions
+are encoded as declaration-relative coordinates, so sibling-body HIR renumbering cannot rename
+them. Originated context lookup uses local table ordinals, retaining only the emitted diagnostic
+texts in the content subject. Definition, call,
+function-address and drop references use that same body-independent identity; recursive and
+mutually recursive instances require no body-derived SCC identity. Exact lifetime applications
+remain distinct even when their current instructions happen to agree. The C shim alone keeps
+`main`; full bytes distinguish genuine digest collisions before assembly.
+
+Source-dependent emission preparation is a query over the instance's MIR, its layouts, foreign
+signatures and its callees' signatures and exact identities. It validates those facts before
+interning a complete immutable content subject. Each LLVM definition is then a query answer over
+that content: the instance's own selected instructions and all emission inputs, with recorded
+MIR/layout/signature dependencies. Body edits can change the edited instance's text without
+changing its symbol or its callers' content subjects; signature edits invalidate callers. Text
+queries use the existing scoped publication rules and retain immutable completed answers.
+Final assembly gathers these answers and their identity metadata, checks conflicts, and sorts
+by symbol. It never rebuilds reached-graph identity or regenerates definitions outside queries.
+Finite-closure evidence certifies complete lowered successors, not executable backend output;
+LLVM-only restrictions remain gaps produced by the instance text query.
 
 **Bounds checks are explicit.** `SliceLength` or the static array length, a compare, then `Branch`
 to a `Trap` block. `Index` is therefore a plain address step. Arithmetic overflow and division
