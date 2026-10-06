@@ -1,8 +1,13 @@
 //! Exact semantic keys and canonical erased runtime families for selected instances.
+//!
+//! A key is canonical by construction: its application and provider types number their caller
+//! regions by first appearance ([`Numbering`]), so call sites that lend different caller-local
+//! regions in the same pattern share one instance.
 
 import hir.Hir {OwnerKind}
 import semantic.DeclarationId {DeclarationId}
 import semantic.InternIndex {InternIndex}
+import semantic.Lifetime {Numbering}
 import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target}
 import semantic.Type {Argument, Requirement, Type}
 import semantic.RuntimeEncoding
@@ -17,8 +22,9 @@ import silk.u64
 import silk.usize
 import silk.vector {Vector}
 
-/// One canonical selected application, the C entry shim, or one type's drop glue. Cached
-/// projections are derived once.
+/// One canonical selected application, the generated C entry shim, one C export shim, or one
+/// type's drop glue. Cached projections are derived once. Caller regions are numbered canonically;
+/// `'static`, region sharing and every type, row, static and provider input remain exact.
 pub union InstanceKey {
   Function {
     pub application: Shared<Application>,
@@ -28,6 +34,9 @@ pub union InstanceKey {
     providers: Shared<Vector<ProviderEntry>>,
   },
   Entry {pub main: Shared<DeclarationId>},
+  /// The C ABI definition of `export "C" fn function(...) as "symbol"`: it forwards its C lanes to
+  /// the ordinary Silk instance of `function`. Its linkage name is exactly `symbol`.
+  Export {pub function: Shared<DeclarationId>, pub symbol: Shared<Bytes>},
   /// Cleans one complete value of `ty` through `&mut ty`: its Drop hook, then its children. The
   /// exact `ty` is its semantic identity; the runtime family erases lifetimes. Definitions use exact body-independent identity. `owner` attributes cleanup.
   DropGlue {pub ty: Shared<Type>, owner: Shared<DeclarationId>, runtime: Shared<Bytes>},
@@ -98,7 +107,7 @@ effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &
 }
 
 impl InstanceKey {
-  /// Copies this function's semantic application for path admission.
+  /// Copies this function's canonical semantic application for path admission and lowering.
   pub effect fn selected(self: &Self) -> Application ! OutOfMemoryError ? &mut Allocator {
     if let Option<Shared<Application>>.Some {value} = move InstanceKey.application(self) {
       return run Application.copyShared(&value)
@@ -108,18 +117,43 @@ impl InstanceKey {
       arguments: Vector.make<Argument>(), argumentOrdinals: Vector.make<usize>(), scopes: Vector.make<ScopeBinding>(),
       statics: Vector.make<StaticSlot>()}
   }
-  /// Constructs a key from its canonical application; all cached fields are derived here.
+  /// Constructs the canonical key of a call edge's actual application; all cached fields are
+  /// derived here.
   pub effect fn function(application: Application) -> InstanceKey
   ! OutOfMemoryError
   ? &mut Allocator {
     return run InstanceKey.withProviders(move application, Vector.make<ProviderEntry>())
   }
   /// Constructs a key whose requirement row is served by `providers`, in canonical key order.
-  pub effect fn withProviders(application: Application, providers: Vector<ProviderEntry>) -> InstanceKey
+  ///
+  /// # Details
+  ///
+  /// `actual` and `served` carry the call edge's actual regions. One numbering renames the caller
+  /// regions of both, application first, so a region shared between an argument and a provider
+  /// stays shared.
+  pub effect fn withProviders(actual: Application, served: Vector<ProviderEntry>) -> InstanceKey
   ! OutOfMemoryError
   ? &mut Allocator {
-    let mut runtime = run Application.runtime(&application)
+    let mut numbering = Numbering.make()
+    let application = run Application.numberRegions(&actual, &mut numbering)
     let owner = run DeclarationId.copy(Application.bodyDeclaration(&application))
+    let mut providers = Vector.make<ProviderEntry>()
+    let entries = Vector.asSlice<ProviderEntry>(&served)
+    let mut entryAt = usize.ZERO
+    while entryAt < entries.length {
+      let mut roleType = Option.none<Shared<Type>>()
+      if let Option<Shared<Type>>.Some {value: written} = &entries[entryAt].key.roleType {
+        roleType = Option.some<Shared<Type>>(run Type.numberRegions(&written, &owner, &mut numbering))
+      }
+      let capability = run Type.numberRegions(&entries[entryAt].key.capability, &owner, &mut numbering)
+      let provider = run Type.numberRegions(&entries[entryAt].provider, &owner, &mut numbering)
+      run Vector.append<ProviderEntry>(&mut providers, ProviderEntry {
+        key: Requirement {capability: move capability, roleType: move roleType, access: entries[entryAt].key.access},
+        provider: move provider,
+      })
+      entryAt = entryAt + usize.ONE
+    }
+    let mut runtime = run Application.runtime(&application)
     let listed = Vector.asSlice<ProviderEntry>(&providers)
     if listed.length > usize.ZERO {
       run RuntimeEncoding.word(&mut runtime, 4)
@@ -154,18 +188,21 @@ impl InstanceKey {
     }
   }
   /// The drop glue of `ty`, or absence when the type mentions no declaration that could own cleanup.
-  pub effect fn dropGlue(ty: &Shared<Type>) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
-    let owner = match move run Type.glueOwner(ty) {
+  /// The glue's type numbers its caller regions canonically, like a function application.
+  pub effect fn dropGlue(actual: &Shared<Type>) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
+    let owner = match move run Type.glueOwner(actual) {
       Option<DeclarationId>.Some {value} => value
       Option<DeclarationId>.None => { return Option.none<InstanceKey>() }
     }
-    let encoded = run Type.runtimeEncoding(ty, &owner)
+    let mut numbering = Numbering.make()
+    let ty = run Type.numberRegions(actual, &owner, &mut numbering)
+    let encoded = run Type.runtimeEncoding(&ty, &owner)
     let mut runtime = Bytes.make()
     // Tag 2 keeps glue identities disjoint from named (0) and operation (1) applications.
     run RuntimeEncoding.word(&mut runtime, 2)
     run RuntimeEncoding.field(&mut runtime, Bytes.asSlice(&encoded))
     return Option.some<InstanceKey>(InstanceKey.DropGlue {
-      ty: Shared.clone<Type>(ty), owner: run Shared.make<DeclarationId>(move owner), runtime: run Shared.make<Bytes>(move runtime),
+      ty: move ty, owner: run Shared.make<DeclarationId>(move owner), runtime: run Shared.make<Bytes>(move runtime),
     })
   }
   /// Constructs the application of a declaration with no generic arguments.
@@ -189,6 +226,7 @@ impl InstanceKey {
         Shared.clone<Application>(&application),
       )
       InstanceKey.Entry {..} => Option.none<Shared<Application>>()
+      InstanceKey.Export {..} => Option.none<Shared<Application>>()
       InstanceKey.DropGlue {..} => Option.none<Shared<Application>>()
     }
   }
@@ -201,6 +239,9 @@ impl InstanceKey {
         providers: Shared.clone<Vector<ProviderEntry>>(&providers),
       }
       InstanceKey.Entry {main} => InstanceKey.Entry {main: Shared.clone<DeclarationId>(&main)}
+      InstanceKey.Export {function, symbol} => InstanceKey.Export {
+        function: Shared.clone<DeclarationId>(&function), symbol: Shared.clone<Bytes>(&symbol),
+      }
       InstanceKey.DropGlue {ty, owner, runtime} => InstanceKey.DropGlue {
         ty: Shared.clone<Type>(&ty), owner: Shared.clone<DeclarationId>(&owner), runtime: Shared.clone<Bytes>(&runtime),
       }
@@ -210,6 +251,7 @@ impl InstanceKey {
     return match & self.* {
       InstanceKey.Function {identity, ..} => Shared.clone<DeclarationId>(&identity)
       InstanceKey.Entry {main} => Shared.clone<DeclarationId>(&main)
+      InstanceKey.Export {function, ..} => Shared.clone<DeclarationId>(&function)
       InstanceKey.DropGlue {owner, ..} => Shared.clone<DeclarationId>(&owner)
     }
   }
@@ -217,6 +259,21 @@ impl InstanceKey {
     return match & self.* {
       InstanceKey.Entry {main: _} => true
       _ => false
+    }
+  }
+  /// Whether this definition has a fixed C linkage name rather than a content-derived symbol.
+  pub fn fixedLinkage(self: &Self) -> bool {
+    return match & self.* {
+      InstanceKey.Entry {..} => true
+      InstanceKey.Export {..} => true
+      _ => false
+    }
+  }
+  /// The exact linkage name of a C export shim; every other key derives its symbol from content.
+  pub fn exportSymbol(self: &Self) -> Option<Shared<Bytes>> {
+    return match & self.* {
+      InstanceKey.Export {symbol, ..} => Option.some<Shared<Bytes>>(Shared.clone<Bytes>(&symbol))
+      _ => Option.none<Shared<Bytes>>()
     }
   }
   /// The cleaned type of a drop glue instance.
@@ -257,6 +314,10 @@ impl InstanceKey {
         InstanceKey.Entry {main: compared} => same(&main, &compared)
         _ => false
       }
+      InstanceKey.Export {function, symbol} => match & other.* {
+        InstanceKey.Export {function: compared, symbol: name} => same(&function, &compared) && sameRuntime(&symbol, &name)
+        _ => false
+      }
       InstanceKey.DropGlue {runtime, ..} => match & other.* {
         InstanceKey.DropGlue {runtime: compared, ..} => sameRuntime(&runtime, &compared)
         _ => false
@@ -269,6 +330,7 @@ impl InstanceKey {
         Shared.clone<Bytes>(&runtime),
       )
       InstanceKey.Entry {..} => Option.none<Shared<Bytes>>()
+      InstanceKey.Export {..} => Option.none<Shared<Bytes>>()
       InstanceKey.DropGlue {runtime, ..} => Option.some<Shared<Bytes>>(Shared.clone<Bytes>(&runtime))
     }
   }
@@ -281,21 +343,21 @@ impl InstanceKey {
       run RuntimeEncoding.declaration(&mut encoded, &declaration)
       return move encoded
     }
+    if let InstanceKey.Export {function, symbol} = &self.* {
+      // Tag 5 keeps export shims disjoint from named (0), operation (1), glue (2) and entry (3)
+      // families and from the provider marker (4).
+      let declaration = run DeclarationId.copyShared(&function)
+      let mut encoded = Bytes.make()
+      run RuntimeEncoding.word(&mut encoded, 5)
+      run RuntimeEncoding.declaration(&mut encoded, &declaration)
+      run appendShared(&mut encoded, &symbol)
+      return move encoded
+    }
     let runtime = match move InstanceKey.runtimeBytes(self) {
       Option<Shared<Bytes>>.Some {value} => move value
       Option<Shared<Bytes>>.None => { return absurd<Bytes>() }
     }
-    let count = Shared.with<Bytes, usize>(&runtime,
-      fn(bytes: &Bytes) -> usize { return Bytes.asSlice(bytes).length })
-    let mut copied = run Bytes.zeroed(count)
-    let target = Bytes.asMutSlice(&mut copied)
-    let mut at = usize.ZERO
-    while at < count {
-      target[at] = Shared.with<Bytes, u8>(&runtime,
-        fn(bytes: &Bytes) -> u8 { return Bytes.asSlice(bytes)[at] })
-      at = at + usize.ONE
-    }
-    return move copied
+    return run copyShared(&runtime)
   }
   /// Linkage content retains exact application evidence. It contains no selected body or callee body.
   pub effect fn encoding(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
@@ -364,6 +426,12 @@ impl InstanceKey {
         let declaration = run DeclarationId.copyShared(&main)
         run RuntimeEncoding.declaration(&mut output, &declaration)
       }
+      InstanceKey.Export {function, symbol} => {
+        run RuntimeEncoding.word(&mut output, 3)
+        let declaration = run DeclarationId.copyShared(&function)
+        run RuntimeEncoding.declaration(&mut output, &declaration)
+        run appendShared(&mut output, &symbol)
+      }
       InstanceKey.DropGlue {ty, owner, ..} => {
         run RuntimeEncoding.word(&mut output, 2)
         let declaration = run DeclarationId.copyShared(&owner)
@@ -378,6 +446,9 @@ impl InstanceKey {
     if InstanceKey.isEntry(self) {
       return run Bytes.copy(b"main")
     }
+    if let Option<Shared<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
+      return run copyShared(&value)
+    }
     let identity = run InstanceKey.encoding(self)
     return run InstanceKey.contentName(Bytes.asSlice(&identity))
   }
@@ -385,6 +456,9 @@ impl InstanceKey {
   pub effect fn runtimeName(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
     if InstanceKey.isEntry(self) {
       return run Bytes.copy(b"main")
+    }
+    if let Option<Shared<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
+      return run copyShared(&value)
     }
     let runtime = run InstanceKey.runtimeEncoding(self)
     return run InstanceKey.contentName(Bytes.asSlice(&runtime))
@@ -402,6 +476,26 @@ impl InstanceKey {
 
 fn familyHash(runtime: &Bytes) -> u64 {
   return InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), Bytes.asSlice(runtime))
+}
+
+// Copies shared bytes without letting a borrow escape the handle.
+effect fn copyShared(value: &Shared<Bytes>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared.with<Bytes, usize>(value,
+    fn(bytes: &Bytes) -> usize { return Bytes.asSlice(bytes).length })
+  let mut copied = run Bytes.zeroed(count)
+  let target = Bytes.asMutSlice(&mut copied)
+  let mut at = usize.ZERO
+  while at < count {
+    target[at] = Shared.with<Bytes, u8>(value,
+      fn(bytes: &Bytes) -> u8 { return Bytes.asSlice(bytes)[at] })
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn appendShared(output: &mut Bytes, value: &Shared<Bytes>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let copied = run copyShared(value)
+  return run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&copied))
 }
 
 fn sameRuntime(left: &Shared<Bytes>, right: &Shared<Bytes>) -> bool {
