@@ -57,7 +57,8 @@ import semantic.ReturnFlow
 import semantic.CallableSchema {CallableSchema as SectionSchema}
 import semantic.CaptureAvailability {Failure as CaptureFailure, FailureKind as CaptureFailureKind}
 import semantic.Intrinsic as CheckedIntrinsic {Member as IntrinsicMember, ValueKind as IntrinsicValueKind}
-import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember}
+import semantic.ScalarOperation {Code as ScalarCode, Scalar, ScalarOperation}
+import semantic.Lifetime {Intersection, Lifetime, Member as LifetimeMember, Numbering}
 import semantic.RuntimeEncoding
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Query {Cycle}
@@ -142,6 +143,7 @@ import semantic.TypedBody {
   UnionMember as BodyUnionMember,
 }
 import backend.Mir {SwitchCase as MirSwitchCase, FailureEdge as MirFailureEdge, Diagnostics as MirDiagnostics, ContextText as MirContextText}
+import backend.Mir {ScalarBinary as MirScalarBinary, ScalarUnary as MirScalarUnary}
 import semantic.SourceRevision {Observation, Revision}
 import semantic.StaticValue
 import semantic.StaticConstant
@@ -17082,7 +17084,7 @@ test effect fn staticIntrinsicContractsRejectUnknownMembersAndMismatches() -> ()
   let text = """static fn unknown() -> u32 { return Intrinsic.missing() }
 static fn wrongArgument() -> usize { return Intrinsic.staticTextByteLength(1) }
 static fn wrongResult() -> usize { return Intrinsic.targetPointerBits() }
-pub fn main() -> i32 { return Intrinsic.i32RotateLeft(40, 2) }
+pub fn main() -> i32 { return Intrinsic.assembly(40, 2) }
 fn unknownRuntime() -> i32 { return Intrinsic.i32AddMissing<i32>(40, 2) }
 """
   let source = run present(text) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -17105,7 +17107,7 @@ fn unknownRuntime() -> i32 { return Intrinsic.i32AddMissing<i32>(40, 2) }
     "sealed intrinsic selection reports unknown members and typed contract mismatches at source spans",
   )
   run Testing.expect(
-    rejectsSpan(&runtime, RejectionCode.IntrinsicUnavailable, text, "i32RotateLeft", 0) &&
+    rejectsSpan(&runtime, RejectionCode.IntrinsicUnavailable, text, "assembly", 0) &&
       rejectsSpan(&unknownRuntime, RejectionCode.UnknownMember, text, "i32AddMissing", 0),
     "a catalog-defined runtime primitive defers while a misspelled generic member stays an error",
   )
@@ -17118,7 +17120,7 @@ fn unknownRuntime() -> i32 { return Intrinsic.i32AddMissing<i32>(40, 2) }
       if entries.length == usize.ONE {
         namedGap = Shared.with<BackendGap, bool>(&entries[usize.ZERO], fn(gap: &BackendGap) -> bool {
           return gap.code == GapCode.IntrinsicMember &&
-            BackendGap.span(gap).start == offsetOf(text, "i32RotateLeft", 0) && BackendGap.span(gap).end == BackendGap.span(gap).start + 13
+            BackendGap.span(gap).start == offsetOf(text, "assembly", 0) && BackendGap.span(gap).end == BackendGap.span(gap).start + 8
         })
       }
     }
@@ -17147,19 +17149,8 @@ fn mirFormsPointerAddresses(function: &MirFunction) -> bool {
   return sliceData && offset
 }
 
-// Whether lowered MIR branches to a trap block.
-fn mirTraps(function: &MirFunction) -> bool {
-  let blocks = Vector.asSlice<MirBlock>(&function.blocks)
-  let mut at = usize.ZERO
-  while at < blocks.length {
-    if let MirTerminator.Trap {..} = &blocks[at].terminator { return true }
-    at = at + usize.ONE
-  }
-  return false
-}
-
 test effect fn pointerPrimitivesSelectNativeAddresses() -> ()
-! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | BackendGap | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let entry = run module("pointer-intrinsics.silk") |> Effect.provideMut<Allocator>(&mut allocator)
   let text = """fn second(values: &[u8]) -> u8 {
@@ -17214,10 +17205,17 @@ fn addNullability(pointer: [*]mut u8) -> u8 { return sink(pointer) }
       addresses = mirFormsPointerAddresses(function)
     }
   }
+  // The conversion stays one checked MIR form; its native lowering guards the sign and traps.
   let selectedWiden = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&widened, selectedMirIndex)
   if let Option<usize>.Some {value: widenIndex} = move selectedWiden {
     if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, widenIndex) {
-      trapped = mirTraps(function)
+      let machine = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
+      let layouts = run scalarControlLayouts(function, &machine) |> Effect.provideMut<Allocator>(&mut allocator)
+      let foreign = Vector.make<CAbi.Signature>()
+      let llvm = run emitClosedMir(function, &machine, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign))
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      let ir = Bytes.asSlice(&llvm)
+      trapped = scalarForms(function).converts && containsIr(ir, b" = icmp slt i64 ") && containsIr(ir, b"call void @llvm.trap()")
     }
   }
   run Testing.expect(addresses && trapped,
@@ -20881,14 +20879,15 @@ pub fn main() -> i32 { let lasting = Guard<'static> {} let local: i32 = 0 let sh
 
 // These closed actor graphs avoid reparsing a source program for graph-algorithm claims.
 // Each label comes from production MIR encoding; no test-authored expected identity bytes exist.
-effect fn recipeControlKey(id: &ModuleId, name: &[u8], region: usize) -> InstanceKey
+// A `'static` and a caller-local region select distinct canonical instances of one function.
+effect fn recipeControlKey(id: &ModuleId, name: &[u8], lasting: bool) -> InstanceKey
 ! OutOfMemoryError ? &mut Allocator {
   let mut owners = Vector.make<OwnerStep>()
   run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: OwnerKind.Function,
     name: Option.some<Bytes>(run Bytes.copy(name)), occurrence: usize.ZERO})
   let declaration = DeclarationId.fromParts(run ModuleId.copy(id), move owners)
-  let lifetime = run Shared.make<Lifetime>(Lifetime.Local {
-    declaration: run DeclarationId.copy(&declaration), ordinal: region})
+  let mut lifetime = run Shared.make<Lifetime>(Lifetime.Local {declaration: run DeclarationId.copy(&declaration), ordinal: usize.ZERO})
+  if lasting { lifetime = run Shared.make<Lifetime>(Lifetime.Static) }
   let mut arguments = Vector.make<Argument>()
   run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move lifetime})
   return run InstanceKey.function(run specializationWithArguments(&declaration, move arguments))
@@ -20971,6 +20970,235 @@ effect fn recipePlansAgree(left: &EmissionPlan, right: &EmissionPlan, key: &Inst
     && sameBytes(Bytes.asSlice(&a.symbol), Bytes.asSlice(&b.symbol))
 }
 
+// A selected instance observes only `'static` and region sharing among its inputs, so instance
+// keys number caller regions by first appearance and keep both facts exact.
+test effect fn instanceKeysNumberCallerRegionsByFirstAppearance() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run callerRegionNumberingClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn numberingDeclaration(id: &ModuleId, name: &[u8]) -> DeclarationId ! OutOfMemoryError ? &mut Allocator {
+  let mut owners = Vector.make<OwnerStep>()
+  run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: OwnerKind.Function,
+    name: Option.some<Bytes>(run Bytes.copy(name)), occurrence: usize.ZERO})
+  return DeclarationId.fromParts(run ModuleId.copy(id), move owners)
+}
+
+// A borrow region of `caller`, or `'static` when `lasting`.
+effect fn numberingRegion(caller: &DeclarationId, ordinal: usize, lasting: bool) -> Shared<Lifetime>
+! OutOfMemoryError ? &mut Allocator {
+  if lasting { return run Shared.make<Lifetime>(Lifetime.Static) }
+  return run Shared.make<Lifetime>(Lifetime.Local {declaration: run DeclarationId.copy(caller), ordinal: ordinal})
+}
+
+effect fn numberingPair(callee: &DeclarationId, first: Shared<Lifetime>, second: Shared<Lifetime>) -> InstanceKey
+! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move first})
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move second})
+  return run InstanceKey.function(run specializationWithArguments(callee, move arguments))
+}
+
+// `wrap<'r, &'t u8>`: one direct region argument and one region nested in a type argument.
+effect fn numberingNested(callee: &DeclarationId, direct: Shared<Lifetime>, nested: Shared<Lifetime>) -> InstanceKey
+! OutOfMemoryError ? &mut Allocator {
+  let referent = run specializationPrimitive(b"u8")
+  let mut arguments = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move direct})
+  run Vector.append<Argument>(&mut arguments, Argument.Type {value: run Shared.make<Type>(
+    Type.Reference {referent: move referent, access: Access.Shared, lifetime: move nested})})
+  return run InstanceKey.function(run specializationWithArguments(callee, move arguments))
+}
+
+// `serve<'a>` whose `Sink` requirement is served by a provider of type `&'p Console`.
+effect fn numberingServed(callee: &DeclarationId, sink: &DeclarationId, console: &DeclarationId, argument: Shared<Lifetime>,
+  lent: Shared<Lifetime>) -> InstanceKey
+! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move argument})
+  let capability = run specializationNominal(sink, Vector.make<Argument>())
+  let referent = run specializationNominal(console, Vector.make<Argument>())
+  let provider = run Shared.make<Type>(Type.Reference {referent: move referent, access: Access.Shared, lifetime: move lent})
+  let mut served = Vector.make<ProviderEntry>()
+  run Vector.append<ProviderEntry>(&mut served, ProviderEntry {
+    key: Requirement {capability: move capability, roleType: Option.none<Shared<Type>>(), access: Access.Shared},
+    provider: move provider,
+  })
+  return run InstanceKey.withProviders(run specializationWithArguments(callee, move arguments), move served)
+}
+
+fn suppliedAt(value: &Lifetime, position: usize) -> bool {
+  return match &value.* { Lifetime.Supplied {ordinal} => ordinal == position _ => false }
+}
+
+effect fn numberedArgumentsAre(key: &InstanceKey, first: usize, second: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let application = run InstanceKey.selected(key)
+  let arguments = Vector.asSlice<Argument>(&application.arguments)
+  if arguments.length != 2 { return false }
+  let leading = match &arguments[usize.ZERO] {
+    Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value, fn(region: &Lifetime) -> bool { return suppliedAt(region, first) })
+    _ => false
+  }
+  let trailing = match &arguments[usize.ONE] {
+    Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value, fn(region: &Lifetime) -> bool { return suppliedAt(region, second) })
+    _ => false
+  }
+  return leading && trailing
+}
+
+effect fn callerRegionNumberingClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("caller-region-numbering.silk")
+  let caller = run numberingDeclaration(&id, b"caller")
+  let pair = run numberingDeclaration(&id, b"pair")
+  let distinct = run numberingPair(&pair, run numberingRegion(&caller, 9, false), run numberingRegion(&caller, 3, false))
+  let renamed = run numberingPair(&pair, run numberingRegion(&caller, 4, false), run numberingRegion(&caller, 12, false))
+  let shared = run numberingPair(&pair, run numberingRegion(&caller, 3, false), run numberingRegion(&caller, 3, false))
+  let sharedElsewhere = run numberingPair(&pair, run numberingRegion(&caller, 5, false), run numberingRegion(&caller, 5, false))
+  let lasting = run numberingPair(&pair, run numberingRegion(&caller, 9, false), run numberingRegion(&caller, 3, true))
+  let renamedEqual = run InstanceKey.sameApplication(&distinct, &renamed)
+  let sharedEqual = run InstanceKey.sameApplication(&shared, &sharedElsewhere)
+  let distinctNumbered = run numberedArgumentsAre(&distinct, usize.ZERO, usize.ONE)
+  let sharedNumbered = run numberedArgumentsAre(&shared, usize.ZERO, usize.ZERO)
+  run Testing.expect(renamedEqual && sharedEqual && distinctNumbered && sharedNumbered,
+    "renamed caller regions share one instance whose regions are numbered by first appearance")
+  let sharingKept = run InstanceKey.sameApplication(&distinct, &shared)
+  let lastingKept = run InstanceKey.sameApplication(&distinct, &lasting)
+  run Testing.expect(!sharingKept && !lastingKept && InstanceKey.sameRuntimeBase(&distinct, &shared)
+    && InstanceKey.sameRuntimeBase(&distinct, &lasting),
+    "region sharing and 'static remain exact instance evidence inside one erased runtime family")
+  let wrap = run numberingDeclaration(&id, b"wrap")
+  let together = run numberingNested(&wrap, run numberingRegion(&caller, 3, false), run numberingRegion(&caller, 3, false))
+  let movedTogether = run numberingNested(&wrap, run numberingRegion(&caller, 8, false), run numberingRegion(&caller, 8, false))
+  let apart = run numberingNested(&wrap, run numberingRegion(&caller, 3, false), run numberingRegion(&caller, 8, false))
+  let nestedEqual = run InstanceKey.sameApplication(&together, &movedTogether)
+  let nestedApart = run InstanceKey.sameApplication(&together, &apart)
+  run Testing.expect(nestedEqual && !nestedApart,
+    "a region nested in a type argument is numbered with the direct region arguments")
+  let guard = run numberingDeclaration(&id, b"Guard")
+  let mut firstGuard = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut firstGuard, Argument.Lifetime {value: run numberingRegion(&caller, 3, false)})
+  let mut secondGuard = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut secondGuard, Argument.Lifetime {value: run numberingRegion(&caller, 8, false)})
+  let mut staticGuard = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut staticGuard, Argument.Lifetime {value: run numberingRegion(&caller, 8, true)})
+  let firstType = run specializationNominal(&guard, move firstGuard)
+  let secondType = run specializationNominal(&guard, move secondGuard)
+  let staticType = run specializationNominal(&guard, move staticGuard)
+  let firstGlue = run InstanceKey.dropGlue(&firstType)
+  let secondGlue = run InstanceKey.dropGlue(&secondType)
+  let staticGlue = run InstanceKey.dropGlue(&staticType)
+  let mut glue = false
+  if let Option<InstanceKey>.Some {value: first} = &firstGlue {
+    if let Option<InstanceKey>.Some {value: second} = &secondGlue {
+      if let Option<InstanceKey>.Some {value: permanent} = &staticGlue {
+        let glueShared = run InstanceKey.sameApplication(&first, &second)
+        let glueLasting = run InstanceKey.sameApplication(&first, &permanent)
+        glue = glueShared && !glueLasting
+      }
+    }
+  }
+  run Testing.expect(glue, "drop glue numbers caller regions of its type and keeps 'static cleanup selection distinct")
+  let serve = run numberingDeclaration(&id, b"serve")
+  let sink = run numberingDeclaration(&id, b"Sink")
+  let console = run numberingDeclaration(&id, b"Console")
+  let servedTogether = run numberingServed(&serve, &sink, &console, run numberingRegion(&caller, 3, false), run numberingRegion(&caller, 3, false))
+  let servedMoved = run numberingServed(&serve, &sink, &console, run numberingRegion(&caller, 8, false), run numberingRegion(&caller, 8, false))
+  let servedApart = run numberingServed(&serve, &sink, &console, run numberingRegion(&caller, 3, false), run numberingRegion(&caller, 8, false))
+  let providerShared = run InstanceKey.sameApplication(&servedTogether, &servedMoved)
+  let providerApart = run InstanceKey.sameApplication(&servedTogether, &servedApart)
+  run Testing.expect(providerShared && !providerApart,
+    "one numbering covers an application and its providers, so argument-provider region sharing stays exact")
+  let site = run numberingDeclaration(&id, b"site")
+  let declared = run Shared.make<Lifetime>(Lifetime.Parameter {declaration: run DeclarationId.copy(&site), ordinal: usize.ZERO})
+  let parameter = run numberingPair(&pair, move declared, run numberingRegion(&caller, 3, false))
+  let application = run InstanceKey.selected(&parameter)
+  let arguments = Vector.asSlice<Argument>(&application.arguments)
+  let mut kept = false
+  if arguments.length == 2 {
+    kept = match &arguments[usize.ZERO] {
+      Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value, fn(region: &Lifetime) -> bool {
+        return match &region.* { Lifetime.Parameter {..} => true _ => false }
+      })
+      _ => false
+    }
+  }
+  run Testing.expect(kept, "a declaration-owned parameter region is not a caller region and keeps its identity")
+  return ()
+}
+
+// Main lends two distinct locals; both calls reach one canonical instance and one MIR answer.
+test effect fn callSitesLendingDistinctLocalsShareOneInstance() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sharedCallerRegionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Every reference a lowered function makes to instances of `callee`, in reference order.
+effect fn calleeReferences(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, callee: &[u8]) -> Vector<InstanceKey>
+! OutOfMemoryError ? &mut Allocator {
+  let mut keys = Vector.make<InstanceKey>()
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: at} = move index {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, at) {
+      let references = Vector.asSlice<MirReference>(&function.references)
+      let mut reference = usize.ZERO
+      while reference < references.length {
+        let identity = InstanceKey.identity(&references[reference].key)
+        if Shared.with<DeclarationId, bool>(&identity, fn(found: &DeclarationId) -> bool { return DeclarationId.named(found, callee) }) {
+          run Vector.append<InstanceKey>(&mut keys, InstanceKey.copy(&references[reference].key))
+        }
+        reference = reference + usize.ONE
+      }
+    }
+  }
+  return move keys
+}
+
+effect fn sharedCallerRegionClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("caller-region-instances.silk")
+  let text = """
+fn accepts(input: &i32) -> bool { return true }
+pub fn main() -> i32 {
+  let first: i32 = 1
+  let second: i32 = 2
+  let left = accepts(&first)
+  let right = accepts(&second)
+  if left && right { return 42 }
+  return 0
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let entry = run Semantic.demandMir(&mut store, &mut request, &id, b"main")
+  let keys = run calleeReferences(&store, &entry, b"accepts")
+  let listed = Vector.asSlice<InstanceKey>(&keys)
+  let mut shared = succeeded(&entry) && listed.length == 2
+  if shared {
+    shared = run InstanceKey.sameApplication(&listed[usize.ZERO], &listed[usize.ONE])
+    let application = run InstanceKey.selected(&listed[usize.ZERO])
+    let arguments = Vector.asSlice<Argument>(&application.arguments)
+    if arguments.length == usize.ONE {
+      shared = shared && match &arguments[usize.ZERO] {
+        Argument.Lifetime {value} => Shared.with<Lifetime, bool>(&value, fn(region: &Lifetime) -> bool { return suppliedAt(region, usize.ZERO) })
+        _ => false
+      }
+    } else { shared = false }
+    let firstMir = run Semantic.demandInstanceMir(&mut store, &mut request, &listed[usize.ZERO], false)
+    let secondMir = run Semantic.demandInstanceMir(&mut store, &mut request, &listed[usize.ONE], false)
+    let firstIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&firstMir, selectedMirIndex)
+    let secondIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&secondMir, selectedMirIndex)
+    shared = shared && match &firstIndex {
+      Option<usize>.Some {value: one} => match &secondIndex { Option<usize>.Some {value: two} => one == two _ => false }
+      _ => false
+    }
+  }
+  run Testing.expect(shared, "two calls lending distinct caller locals reach one canonical instance and one lowered MIR")
+  return ()
+}
+
 test effect fn genericRecipeCyclesKeepExactLifetimesAndSafety() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -20980,9 +21208,9 @@ test effect fn genericRecipeCyclesKeepExactLifetimesAndSafety() -> ()
 effect fn recipeCycleSharingClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("recipe-cycle-sharing.silk")
-  let first = run recipeControlKey(&id, b"cycle", usize.ZERO)
-  let second = run recipeControlKey(&id, b"cycle", usize.ONE)
-  let unrelated = run recipeControlKey(&id, b"unrelated", usize.ZERO)
+  let first = run recipeControlKey(&id, b"cycle", false)
+  let second = run recipeControlKey(&id, b"cycle", true)
+  let unrelated = run recipeControlKey(&id, b"unrelated", false)
   let selfEdge = [InstanceKey.copy(&first)]
   let firstEdge = [InstanceKey.copy(&second)]
   let secondEdge = [InstanceKey.copy(&first)]
@@ -21031,9 +21259,9 @@ test effect fn genericRecipeMutualCyclesIgnoreLeafBodies() -> ()
 effect fn recipeTransitiveCycleClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("recipe-cycle-stability.silk")
-  let outer = run recipeControlKey(&id, b"outer", usize.ZERO)
-  let inner = run recipeControlKey(&id, b"inner", usize.ZERO)
-  let leaf = run recipeControlKey(&id, b"leaf", usize.ZERO)
+  let outer = run recipeControlKey(&id, b"outer", false)
+  let inner = run recipeControlKey(&id, b"inner", false)
+  let leaf = run recipeControlKey(&id, b"leaf", false)
   let outerEdges = [InstanceKey.copy(&inner)]
   let innerEdges = [InstanceKey.copy(&outer), InstanceKey.copy(&leaf)]
   let empty = Vector.make<InstanceKey>()
@@ -21503,7 +21731,7 @@ test effect fn genericRecipeMissingIdentityIsLoudGap() -> ()
 effect fn recipeMissingIdentityClaims() -> ()
 ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("recipe-missing.silk")
-  let absent = run recipeControlKey(&id, b"absent", usize.ZERO)
+  let absent = run recipeControlKey(&id, b"absent", false)
   let plan = EmissionPlan.empty()
   let result = run Effect.result(EmissionPlan.symbol(&plan, &absent))
   let rejected = match &result {
@@ -26749,6 +26977,48 @@ fn invalidIndex(values: [i32; 2], index: i32) -> i32 { return values[index] }
   return ()
 }
 
+fn checkedDirectCalls(answer: &Result<Answer, NoRejection>) -> usize {
+  if let Option<Shared<TypedBody>>.Some {value} = move checkedBody(answer) {
+    return Shared.with<TypedBody, usize>(&value, directCalls)
+  }
+  return usize.MAX
+}
+
+// Typing reads call targets only from the body's discovered call table, so a call nested in an
+// array element, a field initializer's array or a compileError message must be discovered too.
+test effect fn nestedExpressionCallsResolveTheirTargets() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("nested-calls.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+struct Pair { values: [i32; 2] }
+fn twice(value: i32) -> i32 { return value * 2 }
+fn elements() -> i32 {
+  let values = [twice(20), 2]
+  return values[0] + values[1]
+}
+fn nested() -> i32 {
+  let pair = Pair { values: [twice(10), 1] }
+  let grid = [[twice(1)], [twice(2)]]
+  return pair.values[0] + grid[1][0]
+}
+static fn label() -> string<'static> { return "computed failure" }
+static fn computed(value: u32) -> u32 { compileError(label()) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let elements = run Semantic.demandBody(&mut store, &mut request, &id, b"elements") |> Effect.provideMut<Allocator>(&mut allocator)
+  let nested = run Semantic.demandBody(&mut store, &mut request, &id, b"nested") |> Effect.provideMut<Allocator>(&mut allocator)
+  let computed = run Semantic.demandBody(&mut store, &mut request, &id, b"computed") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, usize>(&elements, checkedDirectCalls) == usize.ONE
+    && Shared.with<Result<Answer, NoRejection>, usize>(&nested, checkedDirectCalls) == 3,
+    "array elements, nested arrays and arrays in field initializers keep their resolved calls")
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, usize>(&computed, checkedDirectCalls) != usize.MAX,
+    "a static body checks once its compileError message call resolves")
+  return ()
+}
+
 test effect fn sliceConversionsRetainRegionAccessAndDiagnostics() -> ()
 ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -27001,7 +27271,7 @@ fn buildsStaticDescriptor(function: &MirFunction, bytes: &[u8]) -> bool {
   return false
 }
 
-effect fn unsignedWidenControl(key: &InstanceKey, value: MirOperand, target: &Shared<Type>, parameters: Vector<Shared<Type>>) -> MirFunction
+effect fn conversionControl(key: &InstanceKey, value: MirOperand, target: &Shared<Type>, parameters: Vector<Shared<Type>>) -> MirFunction
 ! OutOfMemoryError ? &mut Allocator {
   let empty = Vector.make<InstanceKey>()
   let mut function = run recipeControlMir(key, Vector.asSlice<InstanceKey>(&empty), Option.none<bool>(), true)
@@ -27020,14 +27290,14 @@ effect fn unsignedWidenControl(key: &InstanceKey, value: MirOperand, target: &Sh
   let mut statements = Vector.make<MirStatement>()
   run Vector.append<MirStatement>(&mut statements, MirStatement.Assign {
     destination: MirPlace {local: usize.ZERO, projections: Vector.make<MirProjection>()},
-    value: MirRvalue.UnsignedWiden {value: move value, ty: Shared.clone<Type>(target)}, origin: origin})
+    value: MirRvalue.Convert {value: move value, ty: Shared.clone<Type>(target)}, origin: origin})
   function.blocks = Vector.make<MirBlock>()
   run Vector.append<MirBlock>(&mut function.blocks, MirBlock {statements: move statements, terminator: MirTerminator.Return {origin: origin}})
   return move function
 }
 
 // Only the referenced ByteBox is non-scalar in these constructed MIR controls.
-effect fn unsignedWidenLayout(ty: &Shared<Type>, target: &MachineTarget) -> Option<BackendLayout>
+effect fn scalarControlLayout(ty: &Shared<Type>, target: &MachineTarget) -> Option<BackendLayout>
 ! OutOfMemoryError ? &mut Allocator {
   let scalar = BackendLayout.scalar(ty, target)
   if let Option<BackendLayout>.Some {value} = move scalar {
@@ -27039,14 +27309,14 @@ effect fn unsignedWidenLayout(ty: &Shared<Type>, target: &MachineTarget) -> Opti
   return run BackendLayout.record(Vector.asSlice<LayoutFieldInput>(&fields))
 }
 
-effect fn unsignedWidenLayouts(function: &MirFunction, target: &MachineTarget) -> Vector<TypeLayout>
+effect fn scalarControlLayouts(function: &MirFunction, target: &MachineTarget) -> Vector<TypeLayout>
 ! OutOfMemoryError ? &mut Allocator {
   let demands = run mirLayoutDemands(function)
   let needed = Vector.asSlice<LayoutDemand>(&demands)
   let mut layouts = Vector.make<TypeLayout>()
   let mut at = usize.ZERO
   while at < needed.length {
-    let facts = run unsignedWidenLayout(&needed[at].ty, target)
+    let facts = run scalarControlLayout(&needed[at].ty, target)
     if let Option<BackendLayout>.Some {value} = move facts {
       run Vector.append<TypeLayout>(&mut layouts, TypeLayout {ty: Shared.clone<Type>(&needed[at].ty), layout: run Shared.make<BackendLayout>(move value)})
     }
@@ -27055,16 +27325,16 @@ effect fn unsignedWidenLayouts(function: &MirFunction, target: &MachineTarget) -
   return move layouts
 }
 
-effect fn unsignedWidenInteger(spelling: &[u8], digits: &[u8]) -> MirOperand
+effect fn typedInteger(spelling: &[u8], digits: &[u8]) -> MirOperand
 ! OutOfMemoryError ? &mut Allocator {
   return MirOperand.Integer {decimal: run Bytes.copy(digits), negative: false, ty: run specializationPrimitive(spelling)}
 }
 
-effect fn unsignedWidenRejects(key: &InstanceKey, source: MirOperand, target: &Shared<Type>) -> bool
+effect fn conversionRejects(key: &InstanceKey, source: MirOperand, target: &Shared<Type>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  let function = run unsignedWidenControl(key, move source, target, Vector.make<Shared<Type>>())
+  let function = run conversionControl(key, move source, target, Vector.make<Shared<Type>>())
   let machine = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
-  let layouts = run unsignedWidenLayouts(&function, &machine)
+  let layouts = run scalarControlLayouts(&function, &machine)
   let foreign = Vector.make<CAbi.Signature>()
   let result = run Effect.result(emitClosedMir(&function, &machine, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign)))
   return match &result {
@@ -27079,72 +27349,90 @@ effect fn unsignedWidenRejects(key: &InstanceKey, source: MirOperand, target: &S
   }
 }
 
-test effect fn unsignedIntegerWideningValidatesPrimitiveCategoriesAndWidths() -> ()
+test effect fn numericConversionValidatesCategoriesAndRanges() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run unsignedIntegerWideningClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  return run numericConversionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn unsignedIntegerWideningClaims() -> ()
+effect fn numericConversionClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
-  let id = run module("unsigned-integer-widening.silk")
-  let key = run recipeControlKey(&id, b"widen", usize.ZERO)
+  let id = run module("numeric-conversion.silk")
+  let key = run recipeControlKey(&id, b"convert", false)
   let machine = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let integer = run specializationPrimitive(b"i32")
   let unsigned = run specializationPrimitive(b"u32")
   let byte = run specializationPrimitive(b"u8")
-  let function = run unsignedWidenControl(&key, run unsignedWidenInteger(b"u8", b"255"), &integer, Vector.make<Shared<Type>>())
-  let other = run unsignedWidenControl(&key, run unsignedWidenInteger(b"u8", b"255"), &unsigned, Vector.make<Shared<Type>>())
-  let lower = run unsignedWidenControl(&key, run unsignedWidenInteger(b"u8", b"5"), &integer, Vector.make<Shared<Type>>())
+  let function = run conversionControl(&key, run typedInteger(b"u8", b"255"), &integer, Vector.make<Shared<Type>>())
+  let other = run conversionControl(&key, run typedInteger(b"u8", b"255"), &unsigned, Vector.make<Shared<Type>>())
+  let lower = run conversionControl(&key, run typedInteger(b"u8", b"5"), &integer, Vector.make<Shared<Type>>())
   let firstRecipe = run InstanceRecipe.make(&function)
   let otherRecipe = run InstanceRecipe.make(&other)
   let lowerRecipe = run InstanceRecipe.make(&lower)
   run Testing.expect(!sameBytes(Bytes.asSlice(&firstRecipe.shape), Bytes.asSlice(&otherRecipe.shape))
     && !sameBytes(Bytes.asSlice(&firstRecipe.shape), Bytes.asSlice(&lowerRecipe.shape)),
-    "unsigned widening recipes retain both the operand identity and the destination type")
-  let layouts = run unsignedWidenLayouts(&function, &machine)
+    "conversion recipes retain both the operand identity and the destination type")
   let foreign = Vector.make<CAbi.Signature>()
-  let llvm = run emitClosedMir(&function, &machine, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign))
-  run Testing.expect(containsIr(Bytes.asSlice(&llvm), b" = zext i8 255 to i32\n") && !containsIr(Bytes.asSlice(&llvm), b"nneg"),
-    "plain zero extension preserves the byte's high bit and represents 255 as integer 255")
-  run Testing.expect(run unsignedWidenRejects(&key, run unsignedWidenInteger(b"i8", b"1"), &integer),
-    "signed i8 is rejected even for a strictly wider i32 destination and a nonnegative input")
-  let equalRejected = run unsignedWidenRejects(&key, run unsignedWidenInteger(b"u8", b"1"), &byte)
-  let narrowerRejected = run unsignedWidenRejects(&key, run unsignedWidenInteger(b"u16", b"1"), &byte)
-  run Testing.expect(equalRejected && narrowerRejected,
-    "equal-width and narrowing integer operations cannot use unsigned widening")
+  let mut cases = Vector.make<MirOperand>()
+  let mut targets = Vector.make<Shared<Type>>()
+  let mut expected = Vector.make<Bytes>()
+  run Vector.append<MirOperand>(&mut cases, run typedInteger(b"u8", b"255"))
+  run Vector.append<Shared<Type>>(&mut targets, Shared.clone<Type>(&integer))
+  run Vector.append<Bytes>(&mut expected, run Bytes.copy(b" = zext i8 255 to i32\n"))
+  run Vector.append<MirOperand>(&mut cases, run typedInteger(b"i8", b"1"))
+  run Vector.append<Shared<Type>>(&mut targets, Shared.clone<Type>(&integer))
+  run Vector.append<Bytes>(&mut expected, run Bytes.copy(b" = sext i8 1 to i32\n"))
+  run Vector.append<MirOperand>(&mut cases, run typedInteger(b"u16", b"300"))
+  run Vector.append<Shared<Type>>(&mut targets, Shared.clone<Type>(&byte))
+  run Vector.append<Bytes>(&mut expected, run Bytes.copy(b" = icmp ugt i16 300, 255\n"))
+  run Vector.append<MirOperand>(&mut cases, run typedInteger(b"i32", b"7"))
+  run Vector.append<Shared<Type>>(&mut targets, Shared.clone<Type>(&unsigned))
+  run Vector.append<Bytes>(&mut expected, run Bytes.copy(b" = icmp slt i32 7, 0\n"))
+  // 2.5 as f64; the low bound is -(2^31 + 1) and the high bound 2^31, both exact.
+  run Vector.append<MirOperand>(&mut cases, MirOperand.Float {bits: 4612811918334230528, ty: run specializationPrimitive(b"f64")})
+  run Vector.append<Shared<Type>>(&mut targets, Shared.clone<Type>(&integer))
+  run Vector.append<Bytes>(&mut expected, run Bytes.copy(b" = fcmp ule double 0x4004000000000000, 0xC1E0000000200000\n"))
+  let destinations = Vector.asSlice<Shared<Type>>(&targets)
+  let fragments = Vector.asSlice<Bytes>(&expected)
+  let mut at = usize.ZERO
+  while Vector.length<MirOperand>(&cases) != usize.ZERO {
+    let selected = Vector.remove<MirOperand>(&mut cases, usize.ZERO)
+    let control = run conversionControl(&key, move selected, &destinations[at], Vector.make<Shared<Type>>())
+    let layouts = run scalarControlLayouts(&control, &machine)
+    let llvm = run emitClosedMir(&control, &machine, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign))
+    let ir = Bytes.asSlice(&llvm)
+    let guarded = containsIr(ir, b"call void @llvm.trap()")
+    run Testing.expect(containsIr(ir, Bytes.asSlice(&fragments[at])) && guarded == (at >= 2) && !containsIr(ir, b"nneg"),
+      "exact widenings extend without a range check; narrowing, sign-changing and floating sources trap outside the destination range")
+    at = at + usize.ONE
+  }
   let mut invalid = Vector.make<MirOperand>()
   run Vector.append<MirOperand>(&mut invalid, MirOperand.Boolean {value: true})
-  run Vector.append<MirOperand>(&mut invalid, run unsignedWidenInteger(b"char", b"65"))
-  run Vector.append<MirOperand>(&mut invalid, MirOperand.Float {bits: 0, ty: run specializationPrimitive(b"f32")})
   let pointer = run Shared.make<Type>(Type.Pointer {pointee: Shared.clone<Type>(&byte), access: Access.Shared,
     nullable: true, multiplicity: Multiplicity.Many, alignment: Option.none<u64>()})
   run Vector.append<MirOperand>(&mut invalid, MirOperand.Null {ty: Shared.clone<Type>(&pointer)})
   run Vector.append<MirOperand>(&mut invalid, MirOperand.Unit)
-  let mut at = usize.ZERO
-  while at < Vector.length<MirOperand>(&invalid) {
+  while Vector.length<MirOperand>(&invalid) != usize.ZERO {
     let selected = Vector.remove<MirOperand>(&mut invalid, usize.ZERO)
-    run Testing.expect(run unsignedWidenRejects(&key, move selected, &integer),
-      "bool, char, floating, pointer and unit source categories reject with the structured typed-form gap")
+    run Testing.expect(run conversionRejects(&key, move selected, &integer),
+      "bool, pointer and unit source categories reject with the structured typed-form gap")
   }
   let mut invalidTargets = Vector.make<Shared<Type>>()
   run Vector.append<Shared<Type>>(&mut invalidTargets, run specializationPrimitive(b"bool"))
-  run Vector.append<Shared<Type>>(&mut invalidTargets, run specializationPrimitive(b"char"))
-  run Vector.append<Shared<Type>>(&mut invalidTargets, run specializationPrimitive(b"f32"))
   run Vector.append<Shared<Type>>(&mut invalidTargets, move pointer)
   run Vector.append<Shared<Type>>(&mut invalidTargets, run Shared.make<Type>(Type.Unit))
-  let destinations = Vector.asSlice<Shared<Type>>(&invalidTargets)
+  let rejected = Vector.asSlice<Shared<Type>>(&invalidTargets)
   at = usize.ZERO
-  while at < destinations.length {
-    run Testing.expect(run unsignedWidenRejects(&key, run unsignedWidenInteger(b"u8", b"1"), &destinations[at]),
-      "unsigned widening also rejects non-integer destinations")
+  while at < rejected.length {
+    run Testing.expect(run conversionRejects(&key, run typedInteger(b"u8", b"1"), &rejected[at]),
+      "numeric conversion also rejects non-numeric destinations")
     at = at + usize.ONE
   }
   return ()
 }
 
 // A referenced record demands its own layout before loading the unsigned field.
-effect fn unsignedProjectedWidenControl(key: &InstanceKey, record: &Shared<Type>, moves: bool, projected: bool) -> MirFunction
+effect fn projectedConversionControl(key: &InstanceKey, record: &Shared<Type>, moves: bool, projected: bool) -> MirFunction
 ! OutOfMemoryError ? &mut Allocator {
   let reference = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(record), access: Access.Shared,
     lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
@@ -27159,19 +27447,19 @@ effect fn unsignedProjectedWidenControl(key: &InstanceKey, record: &Shared<Type>
   }
   let operand = runtimeSliceOperand(move place, moves)
   let integer = run specializationPrimitive(b"i32")
-  return run unsignedWidenControl(key, move operand, &integer, move parameters)
+  return run conversionControl(key, move operand, &integer, move parameters)
 }
 
-test effect fn unsignedIntegerWideningRetainsProjectedLayoutsAndOperands() -> ()
+test effect fn numericConversionRetainsProjectedLayoutsAndOperands() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run unsignedProjectedWidenClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  return run projectedConversionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn unsignedProjectedWidenClaims() -> ()
+effect fn projectedConversionClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("unsigned-projected-widening.silk")
-  let key = run recipeControlKey(&id, b"widen", usize.ZERO)
+  let key = run recipeControlKey(&id, b"widen", false)
   let mut owners = Vector.make<OwnerStep>()
   run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: OwnerKind.Struct,
     name: Option.some<Bytes>(run Bytes.copy(b"ByteBox")), occurrence: usize.ZERO})
@@ -27180,8 +27468,8 @@ effect fn unsignedProjectedWidenClaims() -> ()
   let machine = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let mut mode = usize.ZERO
   while mode < 2 {
-    let function = run unsignedProjectedWidenControl(&key, &record, mode == usize.ONE, true)
-    let ordinary = run unsignedProjectedWidenControl(&key, &record, mode == usize.ONE, false)
+    let function = run projectedConversionControl(&key, &record, mode == usize.ONE, true)
+    let ordinary = run projectedConversionControl(&key, &record, mode == usize.ONE, false)
     let recipe = run InstanceRecipe.make(&function)
     let unprojected = run InstanceRecipe.make(&ordinary)
     run Testing.expect(!sameBytes(Bytes.asSlice(&recipe.shape), Bytes.asSlice(&unprojected.shape)),
@@ -27194,12 +27482,12 @@ effect fn unsignedProjectedWidenClaims() -> ()
         return match &value.* { Type.Nominal {declaration: nominalId, ..} => DeclarationId.named(&nominalId, b"ByteBox") _ => false }
       })
     }
-    run Testing.expect(projected, "unsigned widening demands the referenced record's layout through its projected operand")
-    let layouts = run unsignedWidenLayouts(&function, &machine)
+    run Testing.expect(projected, "a conversion demands the referenced record's layout through its projected operand")
+    let layouts = run scalarControlLayouts(&function, &machine)
     let foreign = Vector.make<CAbi.Signature>()
     let llvm = run emitClosedMir(&function, &machine, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign))
-    run Testing.expect(unsignedWidenUsesProjectedLoad(Bytes.asSlice(&llvm)),
-      "the exact byte loaded from the referenced record feeds unsigned widening with complete demanded layout facts")
+    run Testing.expect(conversionUsesProjectedLoad(Bytes.asSlice(&llvm)),
+      "the exact byte loaded from the referenced record feeds the conversion with complete demanded layout facts")
     mode = mode + usize.ONE
   }
   return ()
@@ -27291,7 +27579,7 @@ test effect fn runtimeSliceCountOperandsKeepProjectedDemandsAndRecipes() -> ()
 effect fn runtimeSliceCountClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("runtime-slice-count.silk")
-  let key = run recipeControlKey(&id, b"descriptor", usize.ZERO)
+  let key = run recipeControlKey(&id, b"descriptor", false)
   let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let mut mode = usize.ZERO
   while mode < 4 {
@@ -27652,9 +27940,10 @@ fn witnessMirReferenceRegion(value: &Type) -> Option<Shared<Lifetime>> {
   }
 }
 
+// Main's loan reaches each nested instance as its first canonical caller region.
 fn witnessMirCallerRegion(value: &Lifetime) -> bool {
   return match &value.* {
-    Lifetime.Local {declaration, ..} => DeclarationId.named(&declaration, b"main")
+    Lifetime.Supplied {ordinal} => ordinal == usize.ZERO
     _ => false
   }
 }
@@ -27883,10 +28172,19 @@ fn caller() -> i32 { return Read.read(Maker {}, first(), second()) }
   if let Option<InstanceKey>.Some {value} = move selected {
     let application = run InstanceKey.selected(&value)
     let signature = run Semantic.specializeSignature(&mut store, &mut request, &application, &id, Span.make(usize.ZERO, usize.ZERO))
-    signatureMatches = run witnessMirLendingSignature(&signature, Vector.asSlice<Shared<Type>>(&loanTypes))
+    // The canonical witness instance numbers the three distinct caller loans in written order.
+    let mut numbering = Numbering.make()
+    let mut numbered = Vector.make<Shared<Type>>()
+    let lent = Vector.asSlice<Shared<Type>>(&loanTypes)
+    let mut lentAt = usize.ZERO
+    while lentAt < lent.length {
+      run Vector.append<Shared<Type>>(&mut numbered, run Type.numberRegions(&lent[lentAt], &caller, &mut numbering))
+      lentAt = lentAt + usize.ONE
+    }
+    signatureMatches = run witnessMirLendingSignature(&signature, Vector.asSlice<Shared<Type>>(&numbered))
   }
   run Testing.expect(order && operands && signatureMatches && starts(Semantic.eventLog(&store), Family.Body) == usize.ONE,
-    "validated shared and exclusive witness loans capture each owned rvalue once in written order with actual caller regions and matching parameter ABI")
+    "validated shared and exclusive witness loans capture each owned rvalue once in written order with actual caller regions, numbered in the witness instance's matching parameter ABI")
   return ()
 }
 
@@ -35977,8 +36275,8 @@ effect fn emitWithCallee(caller: &MirFunction, callee: &MirFunction, target: &Ma
 }
 
 
-// Trace the loaded byte SSA name into the widening operand, independent of temporary numbering.
-fn unsignedWidenUsesProjectedLoad(ir: &[u8]) -> bool {
+// Trace the loaded byte SSA name into the zero-extending conversion, independent of temporary numbering.
+fn conversionUsesProjectedLoad(ir: &[u8]) -> bool {
   let mut start = usize.ZERO
   while start < ir.length {
     let mut end = start
@@ -36010,6 +36308,16 @@ fn unsignedWidenUsesProjectedLoad(ir: &[u8]) -> bool {
   return false
 }
 
+fn sameIntrinsic(left: IntrinsicMember, right: IntrinsicMember) -> bool {
+  return match left {
+    IntrinsicMember.Primitive {primitive} => CheckedIntrinsic.isPrimitive(right, primitive)
+    IntrinsicMember.Scalar {operation} => match right {
+      IntrinsicMember.Scalar {operation: other} => operation.actor == other.actor && operation.code == other.code && operation.target == other.target
+      IntrinsicMember.Primitive {..} => false
+    }
+  }
+}
+
 fn bodySelectsIntrinsic(answer: &Result<Answer, NoRejection>, selected: IntrinsicMember) -> bool {
   if let Result<Answer, NoRejection>.Success {value} = &answer.* {
     if let Outcome.Success {value: Value.Body {body, ..}} = &value.outcome {
@@ -36018,7 +36326,7 @@ fn bodySelectsIntrinsic(answer: &Result<Answer, NoRejection>, selected: Intrinsi
         let mut at = usize.ZERO
         while at < nodes.length {
           if let BodyNodeKind.Expression {form: BodyExpression.IntrinsicCall {member, ..}, ..} = &nodes[at].kind {
-            if member == selected { return true }
+            if sameIntrinsic(member, selected) { return true }
           }
           at = at + usize.ONE
         }
@@ -36029,14 +36337,21 @@ fn bodySelectsIntrinsic(answer: &Result<Answer, NoRejection>, selected: Intrinsi
   return false
 }
 
-fn mirWidensByte(function: &MirFunction) -> bool {
+fn kindIsScalar(kind: IntrinsicValueKind, scalar: Scalar) -> bool {
+  return match kind {
+    IntrinsicValueKind.Scalar {scalar: selected} => selected == scalar
+    _ => false
+  }
+}
+
+fn mirConvertsByte(function: &MirFunction) -> bool {
   let blocks = Vector.asSlice<MirBlock>(&function.blocks)
   let mut blockAt = usize.ZERO
   while blockAt < blocks.length {
     let statements = Vector.asSlice<MirStatement>(&blocks[blockAt].statements)
     let mut at = usize.ZERO
     while at < statements.length {
-      if let MirStatement.Assign {value: MirRvalue.UnsignedWiden {value: operand, ty}, ..} = &statements[at] {
+      if let MirStatement.Assign {value: MirRvalue.Convert {value: operand, ty}, ..} = &statements[at] {
         let integer = Shared.with<Type, bool>(&ty, fn(resolved: &Type) -> bool { return witnessPrimitive(resolved, b"i32") })
         if let MirOperand.Copy {place} = &operand {
           let locals = Vector.asSlice<MirLocal>(&function.locals)
@@ -36051,7 +36366,7 @@ fn mirWidensByte(function: &MirFunction) -> bool {
   return false
 }
 
-test effect fn sealedU8ToI32RetainsExactContractAndUnsignedWidening() -> ()
+test effect fn sealedU8ToI32RetainsExactContractAndNumericConversion() -> ()
 ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   return run sealedByteWideningClaims() |> Effect.provideMut<Allocator>(&mut allocator)
@@ -36059,14 +36374,16 @@ test effect fn sealedU8ToI32RetainsExactContractAndUnsignedWidening() -> ()
 
 effect fn sealedByteWideningClaims() -> ()
 ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
-  let selected = IntrinsicMember.U8ToI32
-  let lookup = match move CheckedIntrinsic.lookup(b"u8ToI32") { Option<IntrinsicMember>.Some {value} => value == selected _ => false }
-  let parameter = match move CheckedIntrinsic.parameterKind(selected, usize.ZERO) { Option<IntrinsicValueKind>.Some {value} => value == IntrinsicValueKind.U8 _ => false }
-  let result = match move CheckedIntrinsic.resultKind(selected) { Option<IntrinsicValueKind>.Some {value} => value == IntrinsicValueKind.I32 _ => false }
+  let operation = ScalarOperation {actor: Scalar.U8, code: ScalarCode.Convert, target: Scalar.I32}
+  let selected = IntrinsicMember.Scalar {operation: operation}
+  let lookup = match move CheckedIntrinsic.lookup(b"u8ToI32") { Option<IntrinsicMember>.Some {value} => sameIntrinsic(value, selected) _ => false }
+  let parameter = match move CheckedIntrinsic.parameterKind(selected, usize.ZERO) { Option<IntrinsicValueKind>.Some {value} => kindIsScalar(value, Scalar.U8) _ => false }
+  let result = match move CheckedIntrinsic.resultKind(selected) { Option<IntrinsicValueKind>.Some {value} => kindIsScalar(value, Scalar.I32) _ => false }
   let absent = match move CheckedIntrinsic.parameterKind(selected, usize.ONE) { Option<IntrinsicValueKind>.None => true _ => false }
-  run Testing.expect(lookup && parameter && result && absent && CheckedIntrinsic.isRuntime(selected) && !CheckedIntrinsic.borrowsOperands(selected)
+  let spelled = run ScalarOperation.spelling(operation)
+  run Testing.expect(lookup && parameter && result && absent && CheckedIntrinsic.isRuntime(selected) && !ScalarOperation.borrows(operation)
     && CheckedIntrinsic.arity(selected) == usize.ONE && CheckedIntrinsic.typeArity(selected) == usize.ZERO
-    && sameBytes(CheckedIntrinsic.spelling(selected), b"u8ToI32"),
+    && sameBytes(Bytes.asSlice(&spelled), b"u8ToI32"),
     "u8ToI32 has one by-value byte parameter, i32 result, exact spelling and runtime-only sealed identity")
   let mut arguments = Vector.make<Shared<Type>>()
   run Vector.append<Shared<Type>>(&mut arguments, run specializationPrimitive(b"u8"))
@@ -36096,8 +36413,8 @@ pub fn main() -> i32 {
   let mut request = Request.make()
   let checked = run Semantic.demandBody(&mut store, &mut request, &id, b"convert")
   let ordinary = run Semantic.demandBody(&mut store, &mut request, &id, b"ordinary")
-  let member = Shared.with<Result<Answer, NoRejection>, bool>(&checked, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, IntrinsicMember.U8ToI32) })
-  let unrelated = Shared.with<Result<Answer, NoRejection>, bool>(&ordinary, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, IntrinsicMember.U8ToI32) })
+  let member = Shared.with<Result<Answer, NoRejection>, bool>(&checked, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, selected) })
+  let unrelated = Shared.with<Result<Answer, NoRejection>, bool>(&ordinary, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, selected) })
   run Testing.expect(member && !unrelated && Shared.with<Result<Answer, NoRejection>, AnswerView>(&ordinary, inspect).success,
     "only the authenticated Intrinsic namespace selects the member; an ordinary same-spelled function remains an ordinary call")
   let argument = run Semantic.demandBody(&mut store, &mut request, &id, b"wrongArgument")
@@ -36113,13 +36430,13 @@ pub fn main() -> i32 {
   let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&lowered, selectedMirIndex)
   let mut widened = false
   if let Option<usize>.Some {value: ordinal} = move index {
-    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, ordinal) { widened = mirWidensByte(function) }
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, ordinal) { widened = mirConvertsByte(function) }
   }
-  run Testing.expect(widened, "the sealed member lowers to the completed ordinary unsigned-widening operation")
+  run Testing.expect(widened, "the sealed member lowers to the ordinary numeric conversion")
   let built = run Semantic.buildMain(&mut store, &mut request, &id, staticClosureNodes)
   let mut emitted = false
   if let BackendBuild.Module {text: llvm, ..} = &built {
-    emitted = unsignedWidenUsesProjectedLoad(Bytes.asSlice(&llvm)) && !containsIr(Bytes.asSlice(&llvm), b"nneg")
+    emitted = conversionUsesProjectedLoad(Bytes.asSlice(&llvm)) && !containsIr(Bytes.asSlice(&llvm), b"nneg")
   }
   run Testing.expect(emitted, "both 5 and high-bit 255 flow through a plain byte-to-i32 zero extension")
   return ()
@@ -36136,7 +36453,7 @@ test effect fn executableTrapTerminatorsRetainTrapCallAndUnreachable() -> ()
 effect fn executableTrapTerminatorClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("explicit-trap-terminator.silk")
-  let key = run recipeControlKey(&id, b"control", usize.ZERO)
+  let key = run recipeControlKey(&id, b"control", false)
   let empty = Vector.make<InstanceKey>()
   let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let origin = BodyOrigin {syntax: HirId {index: usize.ZERO}, span: Span.make(usize.ZERO, usize.ONE)}
@@ -36150,7 +36467,7 @@ effect fn executableTrapTerminatorClaims() -> ()
     let mut terminator = MirTerminator.Unreachable {origin: origin}
     if mode == usize.ZERO { terminator = MirTerminator.Trap {origin: origin} }
     run Vector.append<MirBlock>(&mut function.blocks, MirBlock {statements: Vector.make<MirStatement>(), terminator: move terminator})
-    let layouts = run unsignedWidenLayouts(&function, &target)
+    let layouts = run scalarControlLayouts(&function, &target)
     let foreign = Vector.make<CAbi.Signature>()
     let llvm = run emitClosedMir(&function, &target, Vector.asSlice<TypeLayout>(&layouts), Vector.asSlice<CAbi.Signature>(&foreign))
     let ir = Bytes.asSlice(&llvm)
@@ -36202,16 +36519,18 @@ test effect fn sealedU32BitAndRetainsByValueUnsignedBits() -> ()
 
 effect fn sealedU32BitAndClaims() -> ()
 ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
-  let selected = IntrinsicMember.U32BitAnd
-  let lookup = match move CheckedIntrinsic.lookup(b"u32BitAnd") { Option<IntrinsicMember>.Some {value} => value == selected _ => false }
-  let first = match move CheckedIntrinsic.parameterKind(selected, usize.ZERO) { Option<IntrinsicValueKind>.Some {value} => value == IntrinsicValueKind.U32 _ => false }
-  let second = match move CheckedIntrinsic.parameterKind(selected, usize.ONE) { Option<IntrinsicValueKind>.Some {value} => value == IntrinsicValueKind.U32 _ => false }
-  let result = match move CheckedIntrinsic.resultKind(selected) { Option<IntrinsicValueKind>.Some {value} => value == IntrinsicValueKind.U32 _ => false }
+  let operation = ScalarOperation {actor: Scalar.U32, code: ScalarCode.BitAnd, target: Scalar.U32}
+  let selected = IntrinsicMember.Scalar {operation: operation}
+  let lookup = match move CheckedIntrinsic.lookup(b"u32BitAnd") { Option<IntrinsicMember>.Some {value} => sameIntrinsic(value, selected) _ => false }
+  let first = match move CheckedIntrinsic.parameterKind(selected, usize.ZERO) { Option<IntrinsicValueKind>.Some {value} => kindIsScalar(value, Scalar.U32) _ => false }
+  let second = match move CheckedIntrinsic.parameterKind(selected, usize.ONE) { Option<IntrinsicValueKind>.Some {value} => kindIsScalar(value, Scalar.U32) _ => false }
+  let result = match move CheckedIntrinsic.resultKind(selected) { Option<IntrinsicValueKind>.Some {value} => kindIsScalar(value, Scalar.U32) _ => false }
   let absent = match move CheckedIntrinsic.parameterKind(selected, 2) { Option<IntrinsicValueKind>.None => true _ => false }
-  let binary = match move CheckedIntrinsic.binary(selected) { Option<InfixOperator>.Some {value} => value == InfixOperator.BitAnd _ => false }
+  let binary = match move ScalarOperation.infix(operation) { Option<InfixOperator>.Some {value} => value == InfixOperator.BitAnd _ => false }
+  let spelled = run ScalarOperation.spelling(operation)
   run Testing.expect(lookup && first && second && result && absent && binary && CheckedIntrinsic.isRuntime(selected)
-    && !CheckedIntrinsic.borrowsOperands(selected) && CheckedIntrinsic.arity(selected) == 2 && CheckedIntrinsic.typeArity(selected) == usize.ZERO
-    && sameBytes(CheckedIntrinsic.spelling(selected), b"u32BitAnd"),
+    && !ScalarOperation.borrows(operation) && CheckedIntrinsic.arity(selected) == 2 && CheckedIntrinsic.typeArity(selected) == usize.ZERO
+    && sameBytes(Bytes.asSlice(&spelled), b"u32BitAnd"),
     "u32BitAnd has two by-value u32 parameters/result and reuses ordinary BitAnd without borrowed i32 operands")
   let mut arguments = Vector.make<Shared<Type>>()
   run Vector.append<Shared<Type>>(&mut arguments, run specializationPrimitive(b"u32"))
@@ -36243,8 +36562,8 @@ pub fn main() -> i32 {
   let mut request = Request.make()
   let checked = run Semantic.demandBody(&mut store, &mut request, &id, b"combine")
   let ordinary = run Semantic.demandBody(&mut store, &mut request, &id, b"ordinary")
-  let authenticated = Shared.with<Result<Answer, NoRejection>, bool>(&checked, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, IntrinsicMember.U32BitAnd) })
-  let unrelated = Shared.with<Result<Answer, NoRejection>, bool>(&ordinary, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, IntrinsicMember.U32BitAnd) })
+  let authenticated = Shared.with<Result<Answer, NoRejection>, bool>(&checked, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, selected) })
+  let unrelated = Shared.with<Result<Answer, NoRejection>, bool>(&ordinary, fn(answer: &Result<Answer, NoRejection>) -> bool { return bodySelectsIntrinsic(answer, selected) })
   run Testing.expect(authenticated && !unrelated && Shared.with<Result<Answer, NoRejection>, AnswerView>(&ordinary, inspect).success,
     "an ordinary same-spelled function does not acquire sealed intrinsic identity")
   let left = run Semantic.demandBody(&mut store, &mut request, &id, b"wrongLeft")
@@ -36271,6 +36590,246 @@ pub fn main() -> i32 {
     emitted = containsIr(Bytes.asSlice(&llvm), b" = and i32 ") && !containsIr(Bytes.asSlice(&llvm), b"call { i32, i1 } @llvm.uadd.with.overflow.i32")
   }
   run Testing.expect(emitted, "full unsigned bit patterns use the existing same-width LLVM and opcode")
+  return ()
+}
+
+test effect fn scalarCatalogSelectsEveryCategoryByExactSpelling() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run scalarCatalogClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn catalogRoundTrips(name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match move ScalarOperation.lookup(name) {
+    Option<ScalarOperation>.Some {value} => {
+      let written = run ScalarOperation.spelling(value)
+      return sameBytes(Bytes.asSlice(&written), name)
+    }
+    Option<ScalarOperation>.None => false
+  }
+}
+
+fn catalogOmits(name: &[u8]) -> bool {
+  return match move ScalarOperation.lookup(name) {
+    Option<ScalarOperation>.None => true
+    _ => false
+  }
+}
+
+effect fn scalarCatalogClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut selected = true
+  if !run catalogRoundTrips(b"u32ShiftLeft") { selected = false }
+  if !run catalogRoundTrips(b"usizeToI32") { selected = false }
+  if !run catalogRoundTrips(b"i8WrappingNegate") { selected = false }
+  if !run catalogRoundTrips(b"f64IsNaN") { selected = false }
+  if !run catalogRoundTrips(b"f32FromBits") { selected = false }
+  if !run catalogRoundTrips(b"charFromU32") { selected = false }
+  if !run catalogRoundTrips(b"charToU32") { selected = false }
+  if !run catalogRoundTrips(b"boolNot") { selected = false }
+  if !run catalogRoundTrips(b"u64CheckedToU8") { selected = false }
+  if !run catalogRoundTrips(b"isizeSaturatingNegate") { selected = false }
+  if !run catalogRoundTrips(b"f64TotalOrder") { selected = false }
+  if !run catalogRoundTrips(b"u8RotateRight") { selected = false }
+  if !run catalogRoundTrips(b"i16ToF64") { selected = false }
+  if !run catalogRoundTrips(b"f32ToU64") { selected = false }
+  if !run catalogRoundTrips(b"u16CheckedRemainder") { selected = false }
+  if !run catalogRoundTrips(b"charLessThan") { selected = false }
+  run Testing.expect(selected, "every catalog member selects one operation whose canonical spelling is exactly its name")
+  let mut omitted = true
+  if !catalogOmits(b"u32Negate") { omitted = false }
+  if !catalogOmits(b"u32WrappingNegate") { omitted = false }
+  if !catalogOmits(b"boolAdd") { omitted = false }
+  if !catalogOmits(b"charAdd") { omitted = false }
+  if !catalogOmits(b"f64BitAnd") { omitted = false }
+  if !catalogOmits(b"f64ShiftLeft") { omitted = false }
+  if !catalogOmits(b"u32ToChar") { omitted = false }
+  if !catalogOmits(b"u32CheckedToChar") { omitted = false }
+  if !catalogOmits(b"u8CheckedToF32") { omitted = false }
+  if !catalogOmits(b"f32CheckedToI32") { omitted = false }
+  if !catalogOmits(b"u32ToBool") { omitted = false }
+  if !catalogOmits(b"u32IsNaN") { omitted = false }
+  if !catalogOmits(b"u32Shiftleft") { omitted = false }
+  if !catalogOmits(b"u32") { omitted = false }
+  if !catalogOmits(b"i8ToI3") { omitted = false }
+  if !catalogOmits(b"charToU8") { omitted = false }
+  if !catalogOmits(b"boolToU8") { omitted = false }
+  if !catalogOmits(b"u128Add") { omitted = false }
+  run Testing.expect(omitted, "operations outside a scalar category and malformed spellings select nothing")
+  let less = ScalarOperation {actor: Scalar.U64, code: ScalarCode.LessThan, target: Scalar.U64}
+  let bits = ScalarOperation {actor: Scalar.F32, code: ScalarCode.FromBits, target: Scalar.F32}
+  let classify = ScalarOperation {actor: Scalar.F64, code: ScalarCode.IsNaN, target: Scalar.F64}
+  let character = ScalarOperation {actor: Scalar.U32, code: ScalarCode.CheckedConvert, target: Scalar.Char}
+  let product = ScalarOperation {actor: Scalar.U64, code: ScalarCode.CheckedMultiply, target: Scalar.U64}
+  run Testing.expect(ScalarOperation.borrows(less) && ScalarOperation.result(less) == Scalar.Bool && ScalarOperation.arity(less) == 2
+    && ScalarOperation.operand(bits) == Scalar.U32 && ScalarOperation.result(bits) == Scalar.F32 && !ScalarOperation.borrows(bits)
+    && ScalarOperation.arity(classify) == usize.ONE && ScalarOperation.result(classify) == Scalar.Bool
+    && ScalarOperation.checked(character) && ScalarOperation.operand(character) == Scalar.U32 && ScalarOperation.result(character) == Scalar.Char
+    && ScalarOperation.checked(product) && ScalarOperation.arity(product) == 2 && !ScalarOperation.checked(classify),
+    "contracts derive borrowed comparisons, bit reinterpretation, classification and checked carriers from the catalog")
+  let member = IntrinsicMember.Scalar {operation: product}
+  run Testing.expect(CheckedIntrinsic.arity(member) == 4 && CheckedIntrinsic.typeArity(member) == usize.ONE
+    && match move CheckedIntrinsic.resultKind(member) { Option<IntrinsicValueKind>.None => true _ => false },
+    "a checked operation adds its present and absent carriers and the carrier result type argument")
+  return ()
+}
+
+// Which scalar MIR forms one lowered instance contains.
+struct ScalarForms {
+  shifts: bool
+  rotates: bool
+  converts: bool
+  classifies: bool
+  saturates: bool
+  compares: bool
+  stores: bool
+  views: bool
+  traps: bool
+  overflows: bool
+  nullTests: bool
+  calls: usize
+}
+
+fn scalarForms(function: &MirFunction) -> ScalarForms {
+  let mut forms = ScalarForms {shifts: false, rotates: false, converts: false, classifies: false, saturates: false,
+    compares: false, stores: false, views: false, traps: false, overflows: false, nullTests: false, calls: usize.ZERO}
+  let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+  let mut blockAt = usize.ZERO
+  while blockAt < blocks.length {
+    if let MirTerminator.Trap {..} = &blocks[blockAt].terminator { forms.traps = true }
+    if let MirTerminator.Call {..} = &blocks[blockAt].terminator { forms.calls = forms.calls + usize.ONE }
+    let statements = Vector.asSlice<MirStatement>(&blocks[blockAt].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      if let MirStatement.Assign {destination, value, ..} = &statements[at] {
+        let projections = Vector.asSlice<MirProjection>(&destination.projections)
+        if projections.length == usize.ONE && mirProjectionIsDeref(&projections[usize.ZERO]) { forms.stores = true }
+        match &value {
+          MirRvalue.ScalarBinary {operation, ..} => {
+            if operation == MirScalarBinary.ShiftLeft { forms.shifts = true }
+            if operation == MirScalarBinary.RotateRight { forms.rotates = true }
+            if operation == MirScalarBinary.SaturatingMultiply { forms.saturates = true }
+            if operation == MirScalarBinary.AddOverflows { forms.overflows = true }
+          }
+          MirRvalue.ScalarUnary {operation, ..} => { if operation == MirScalarUnary.IsNaN { forms.classifies = true } }
+          MirRvalue.Convert {..} => { forms.converts = true }
+          MirRvalue.Binary {operation, right, ..} => {
+            if operation == InfixOperator.LessThan { forms.compares = true }
+            if let MirOperand.Null {..} = &right { if operation == InfixOperator.Equals { forms.nullTests = true } }
+          }
+          MirRvalue.Slice {..} => { forms.views = true }
+          _ => ()
+        }
+      }
+      at = at + usize.ONE
+    }
+    blockAt = blockAt + usize.ONE
+  }
+  return move forms
+}
+
+effect fn loweredScalarForms(store: &mut Semantic, request: &mut Request, id: &ModuleId, name: &[u8]) -> Option<ScalarForms>
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let lowered = run Semantic.demandMir(&mut store.*, &mut request.*, id, name)
+  let index = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&lowered, selectedMirIndex)
+  if let Option<usize>.Some {value: ordinal} = move index {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store.*, ordinal) {
+      return Option.some<ScalarForms>(scalarForms(function))
+    }
+  }
+  return Option.none<ScalarForms>()
+}
+
+test effect fn sealedScalarAndPointerFamiliesTypeAndLowerFromTheCatalog() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sealedScalarFamilyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sealedScalarFamilyClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("sealed-scalar-family.silk")
+  let text = """
+fn shift(value: u32, count: u32) -> u32 { return Intrinsic.u32ShiftLeft(value, count) }
+fn rotate(value: u32, count: u32) -> u32 { return Intrinsic.u32RotateRight(value, count) }
+fn narrow(value: usize) -> i32 { return Intrinsic.usizeToI32(value) }
+fn nan(value: f64) -> bool { return Intrinsic.f64IsNaN(value) }
+fn clamp(left: i8, right: i8) -> i8 { return Intrinsic.i8SaturatingMultiply(left, right) }
+fn below(left: u64, right: u64) -> bool { return Intrinsic.u64LessThan(&left, &right) }
+fn put(target: *mut u16, value: u16) -> () { unsafe { return Intrinsic.pointerWrite<u16>(target, value) } }
+fn part(values: &[u8], from: usize, count: usize) -> &[u8] { return Intrinsic.sliceView<u8>(values, from, count) }
+fn vacant(target: ?*const u16) -> bool { return Intrinsic.pointerIsNull<?*const u16>(target) }
+fn unsignedNegate(value: u32) -> u32 { return Intrinsic.u32Negate(value) }
+fn kept(value: u32) -> u32 { return value }
+fn lost() -> u32 { return 0 }
+fn carried(left: u32, right: u32) -> u32 { return Intrinsic.u32CheckedAdd<u32>(left, right, kept, lost) }
+fn wrongCount(value: u32, small: u8) -> u32 { return Intrinsic.u32ShiftLeft(value, small) }
+fn unacknowledged(target: *mut u16) -> () { return Intrinsic.pointerWrite<u16>(target, 1) }
+fn wrongView(values: &mut [u8]) -> usize { return Intrinsic.sliceView<u8>(values, 0, 1).length }
+pub fn main() -> i32 {
+  let mut slot: u16 = 0
+  put(Intrinsic.pointerFromMutRef<u16>(&mut slot), 7)
+  if shift(1, 4) == 16 && rotate(1, 1) == 2147483648 && narrow(5) == 5 && !nan(1.5) && clamp(100, 2) == 127
+    && below(1, 2) && slot == 7 { return 0 }
+  return 1
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let negated = run Semantic.demandBody(&mut store, &mut request, &id, b"unsignedNegate")
+  let carried = run Semantic.demandBody(&mut store, &mut request, &id, b"carried")
+  let count = run Semantic.demandBody(&mut store, &mut request, &id, b"wrongCount")
+  let unsafeWrite = run Semantic.demandBody(&mut store, &mut request, &id, b"unacknowledged")
+  let exclusive = run Semantic.demandBody(&mut store, &mut request, &id, b"wrongView")
+  run Testing.expect(rejectsSpan(&negated, RejectionCode.UnknownMember, text, "u32Negate", usize.ZERO)
+    && rejectsSpan(&count, RejectionCode.TypeMismatch, text, "small", usize.ONE)
+    && rejectsSpan(&unsafeWrite, RejectionCode.UnsafeAcknowledgement, text, "Intrinsic.pointerWrite<u16>(target, 1)", usize.ZERO)
+    && rejectsSpan(&exclusive, RejectionCode.TypeMismatch, text, "Intrinsic.sliceView<u8>(values, 0, 1)", usize.ZERO),
+    "absent members, operand types, unsafe acknowledgement and view access keep exact codes and spans")
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, AnswerView>(&carried, inspect).success,
+    "a checked operation accepts named functions as its present and absent carriers")
+  let shift = run loweredScalarForms(&mut store, &mut request, &id, b"shift")
+  let rotate = run loweredScalarForms(&mut store, &mut request, &id, b"rotate")
+  let narrow = run loweredScalarForms(&mut store, &mut request, &id, b"narrow")
+  let nan = run loweredScalarForms(&mut store, &mut request, &id, b"nan")
+  let clamp = run loweredScalarForms(&mut store, &mut request, &id, b"clamp")
+  let below = run loweredScalarForms(&mut store, &mut request, &id, b"below")
+  let put = run loweredScalarForms(&mut store, &mut request, &id, b"put")
+  let part = run loweredScalarForms(&mut store, &mut request, &id, b"part")
+  let checked = run loweredScalarForms(&mut store, &mut request, &id, b"carried")
+  let vacant = run loweredScalarForms(&mut store, &mut request, &id, b"vacant")
+  let nullTest = match move vacant { Option<ScalarForms>.Some {value} => value.nullTests _ => false }
+  run Testing.expect(nullTest, "a null test compares its operand with a null of the argument's pointer type")
+  let mut invoked = false
+  if let Option<ScalarForms>.Some {value: forms} = move checked { invoked = forms.overflows && forms.calls == 2 && !forms.traps }
+  run Testing.expect(invoked, "a checked sum tests overflow and invokes exactly one carrier on each path")
+  let mut lowered = false
+  if let Option<ScalarForms>.Some {value: shifted} = move shift {
+    if let Option<ScalarForms>.Some {value: rotated} = move rotate {
+      if let Option<ScalarForms>.Some {value: converted} = move narrow {
+        if let Option<ScalarForms>.Some {value: classified} = move nan {
+          if let Option<ScalarForms>.Some {value: clamped} = move clamp {
+            if let Option<ScalarForms>.Some {value: compared} = move below {
+              if let Option<ScalarForms>.Some {value: written} = move put {
+                if let Option<ScalarForms>.Some {value: viewed} = move part {
+                  lowered = shifted.shifts && !shifted.rotates && rotated.rotates && converted.converts && classified.classifies
+                    && clamped.saturates && compared.compares && written.stores && viewed.views && viewed.traps && !converted.traps
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  run Testing.expect(lowered, "each member lowers to its scalar MIR form; a view checks its bounds with explicit traps")
+  let built = run Semantic.buildMain(&mut store, &mut request, &id, staticClosureNodes)
+  let mut emitted = false
+  if let BackendBuild.Module {text: llvm, ..} = &built {
+    let ir = Bytes.asSlice(&llvm)
+    emitted = containsIr(ir, b" = icmp uge i32 ") && containsIr(ir, b" = shl i32 ") && containsIr(ir, b" @llvm.fshr.i32(i32 ")
+      && containsIr(ir, b" = icmp ugt i64 ") && containsIr(ir, b" = trunc i64 ") && containsIr(ir, b" = bitcast double ")
+      && containsIr(ir, b" @llvm.smul.with.overflow.i8(") && containsIr(ir, b" = icmp ult i64 ") && containsIr(ir, b"store i16 ")
+  }
+  run Testing.expect(emitted, "shifts guard their count, rotations use funnel shifts, narrowing checks its range and classification reads the bits")
   return ()
 }
 
@@ -36374,7 +36933,7 @@ test effect fn addressIntegerConversionsRetainNativeWidthAndRecipeIdentity() -> 
 effect fn addressIntegerConversionClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("address-integer-conversion.silk")
-  let key = run recipeControlKey(&id, b"roundtrip", usize.ZERO)
+  let key = run recipeControlKey(&id, b"roundtrip", false)
   let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let word = run specializationPrimitive(b"usize")
   let pointer = run addressControlPointer(true, Access.Shared, Multiplicity.Single, Option.none<u64>())
@@ -36386,7 +36945,7 @@ effect fn addressIntegerConversionClaims() -> ()
     && containsIrLine(Bytes.asSlice(&llvm), b" = inttoptr i64 %", b" to ptr") && !containsIr(Bytes.asSlice(&llvm), b" = bitcast "),
     "native address roundtrip uses distinct exact-width pointer/integer conversion operations")
   let toWord = run addressConversionControl(&key, MirOperand.Null {ty: Shared.clone<Type>(&pointer)}, &word, &word, Vector.make<Shared<Type>>())
-  let toPointer = run addressConversionControl(&key, run unsignedWidenInteger(b"usize", b"0"), &pointer, &pointer, Vector.make<Shared<Type>>())
+  let toPointer = run addressConversionControl(&key, run typedInteger(b"usize", b"0"), &pointer, &pointer, Vector.make<Shared<Type>>())
   let wordRecipe = run InstanceRecipe.make(&toWord)
   let pointerRecipe = run InstanceRecipe.make(&toPointer)
   run Testing.expect(!sameBytes(Bytes.asSlice(&wordRecipe.shape), Bytes.asSlice(&pointerRecipe.shape)),
@@ -36402,7 +36961,7 @@ effect fn addressIntegerConversionClaims() -> ()
     else if qualifierAt == 2 { multiplicity = Multiplicity.Many }
     else { alignment = Option.some<u64>(16) }
     let qualified = run addressControlPointer(nullable, access, multiplicity, move alignment)
-    let otherPointer = run addressConversionControl(&key, run unsignedWidenInteger(b"usize", b"0"), &qualified, &pointer, Vector.make<Shared<Type>>())
+    let otherPointer = run addressConversionControl(&key, run typedInteger(b"usize", b"0"), &qualified, &pointer, Vector.make<Shared<Type>>())
     let qualifierRecipe = run InstanceRecipe.make(&otherPointer)
     run Testing.expect(!sameBytes(Bytes.asSlice(&pointerRecipe.shape), Bytes.asSlice(&qualifierRecipe.shape)),
       "each destination pointer qualifier changes the recipe independently of the unchanged return frame")
@@ -36426,7 +36985,7 @@ effect fn addressIntegerConversionClaims() -> ()
     run Testing.expect(rejected, "non-usize integer widths/categories never enter inttoptr")
     at = at + usize.ONE
   }
-  let intToInt = run addressConversionRejects(&key, run unsignedWidenInteger(b"usize", b"7"), &word, Vector.make<Shared<Type>>(), &target)
+  let intToInt = run addressConversionRejects(&key, run typedInteger(b"usize", b"7"), &word, Vector.make<Shared<Type>>(), &target)
   let ptrToPtr = run addressConversionRejects(&key, MirOperand.Null {ty: Shared.clone<Type>(&pointer)}, &pointer, Vector.make<Shared<Type>>(), &target)
   let narrow = run specializationPrimitive(b"u32")
   let ptrToNarrow = run addressConversionRejects(&key, MirOperand.Null {ty: Shared.clone<Type>(&pointer)}, &narrow, Vector.make<Shared<Type>>(), &target)
@@ -36532,7 +37091,7 @@ test effect fn addressIntegerConversionsRetainProjectedLayoutsAndOperands() -> (
 effect fn addressProjectedConversionClaims() -> ()
 ! InvalidModulePath | BackendGap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let id = run module("projected-address-conversion.silk")
-  let key = run recipeControlKey(&id, b"convert", usize.ZERO)
+  let key = run recipeControlKey(&id, b"convert", false)
   let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
   let pointer = run addressControlPointer(true, Access.Shared, Multiplicity.Single, Option.none<u64>())
   let word = run specializationPrimitive(b"usize")
