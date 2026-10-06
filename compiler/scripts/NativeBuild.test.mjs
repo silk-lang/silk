@@ -164,7 +164,7 @@ chmod +x "$4"
 N1
 chmod +x "$4"`
 
-it.layer(NodeServices.layer)((it) => {
+it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
   it.effect(
     'binds a canonical clang symlink and overrides conflicting ambient linker for every child',
     () =>
@@ -363,6 +363,139 @@ it.layer(NodeServices.layer)((it) => {
           SourceSnapshot.hash(readFileSync(join(options.outputDirectory, 'smoke/main.silk'))),
           result.smoke.sourceSha256,
         )
+      }),
+  )
+
+  it.effect('persists exact partial native bytes on deadline without N1 or smoke fallback', () =>
+    fixture(function* ({ options }) {
+      executable(
+        options.seed,
+        `printf '\\377out'
+printf '\\376err' >&2
+sleep 60`,
+      )
+      const result = yield* fixtureBuild({ ...options, timeoutMs: 250 })
+      assert.strictEqual(result.status, 'failed')
+      assert.strictEqual(result.failure.stage, 'native-build')
+      assert.strictEqual(result.stages.length, 1)
+      const stage = result.stages[0]
+      assert.match(stage.error, /deadline exceeded/)
+      assert.strictEqual(stage.signal, 'SIGKILL')
+      assert.strictEqual(result.output.sha256, null)
+      assert.strictEqual(existsSync(result.output.path), false)
+      assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
+      assert.deepStrictEqual(stage.command, [
+        options.seed,
+        'build',
+        join(options.snapshot, 'compiler/src/main.silk'),
+        '-o',
+        result.output.path,
+        '--stdlib',
+        join(options.snapshot, 'packages/compiler/stdlib'),
+        '--optimization',
+        'speed',
+        '--debug',
+        'false',
+      ])
+      assert.deepStrictEqual(
+        [...readFileSync(join(options.outputDirectory, 'native-build-stdout.bin'))],
+        [255, 111, 117, 116],
+      )
+      assert.deepStrictEqual(
+        [...readFileSync(join(options.outputDirectory, 'native-build-stderr.bin'))],
+        [254, 101, 114, 114],
+      )
+      const sidecar = JSON.parse(
+        readFileSync(join(options.outputDirectory, 'native-build-process-evidence.json'), 'utf8'),
+      )
+      assert.deepStrictEqual(sidecar.deadline, { timeoutMs: 250, expired: true })
+      assert.strictEqual(sidecar.resources.present, false)
+      assert.notStrictEqual(sidecar.resources.error, null)
+      assert.deepStrictEqual(
+        JSON.parse(readFileSync(join(options.outputDirectory, 'build-receipt.json'), 'utf8')),
+        result,
+      )
+    }),
+  )
+
+  it.effect('forwards per-child deadlines to preflight and postflight clang checks', () =>
+    Effect.gen(function* () {
+      for (const point of ['linker-preflight', 'native-build']) {
+        yield* fixture(function* ({ root, options }) {
+          const marker = join(root, 'block-version')
+          chmodSync(options.clang, 0o755)
+          executable(
+            options.clang,
+            `if test -f '${marker}'; then sleep 60; fi\nprintf 'fixture clang version 22\\n'`,
+          )
+          if (point === 'linker-preflight') writeFileSync(marker, 'block')
+          executable(options.seed, producer() + `\nprintf block > '${marker}'`)
+          const result = yield* fixtureBuild({ ...options, timeoutMs: 150 })
+          assert.strictEqual(result.status, 'failed')
+          assert.strictEqual(result.failure.stage, point)
+          assert.strictEqual(result.stages.length, point === 'linker-preflight' ? 0 : 1)
+          assert.match(result.failure.message, /cannot read verified clang version/)
+          assert.strictEqual(result.output.sha256, null)
+          assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
+        })
+      }
+    }),
+  )
+
+  it.effect('retains actual stage facts when completed evidence cannot be written', () =>
+    fixture(function* ({ options }) {
+      executable(
+        options.seed,
+        `mkdir '${join(options.outputDirectory, 'native-build-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
+      )
+      const result = yield* fixtureBuild(options)
+      assert.strictEqual(result.status, 'failed')
+      assert.strictEqual(result.failure.stage, 'native-build')
+      assert.strictEqual(result.stages.length, 1)
+      assert.strictEqual(result.stages[0].exitCode, 2)
+      assert.strictEqual(result.stages[0].stdout, 'actual')
+      assert.strictEqual(result.stages[0].stderr, 'refused')
+      assert.match(result.failure.message, /EISDIR|directory|AlreadyExists/)
+      assert.strictEqual(
+        existsSync(join(options.outputDirectory, 'native-build-process-evidence.json')),
+        false,
+      )
+      assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
+      assert.deepStrictEqual(
+        JSON.parse(readFileSync(join(options.outputDirectory, 'build-receipt.json'), 'utf8')),
+        result,
+      )
+    }),
+  )
+
+  it.effect(
+    'retains unexpired deadlines and completed evidence for all three successful stages',
+    () =>
+      fixture(function* ({ options }) {
+        executable(options.seed, producer())
+        const result = yield* fixtureBuild({ ...options, timeoutMs: 300 })
+        assert.strictEqual(result.status, 'passed')
+        for (const stage of result.stages) {
+          const sidecar = JSON.parse(
+            readFileSync(
+              join(options.outputDirectory, `${stage.name}-process-evidence.json`),
+              'utf8',
+            ),
+          )
+          assert.deepStrictEqual(sidecar.deadline, { timeoutMs: 300, expired: false })
+          assert.strictEqual(sidecar.resources.present, true)
+          assert.strictEqual(sidecar.resources.error, null)
+          assert.deepStrictEqual(
+            readFileSync(join(options.outputDirectory, `${stage.name}-stdout.bin`)),
+            Buffer.from(stage.stdout),
+          )
+          assert.deepStrictEqual(
+            readFileSync(join(options.outputDirectory, `${stage.name}-stderr.bin`)),
+            Buffer.from(stage.stderr),
+          )
+          assert.strictEqual('deadline' in stage, false)
+          assert.strictEqual('raw' in stage, false)
+        }
       }),
   )
 
