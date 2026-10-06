@@ -5,6 +5,7 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Option from 'effect/Option'
 import * as Path from 'effect/Path'
 import * as Result from 'effect/Result'
+import * as Schema from 'effect/Schema'
 import * as Analysis from '@silklang/compiler/Analysis'
 import * as Instances from '@silklang/compiler/Instances'
 import * as SourceFile from '@silklang/compiler/SourceFile'
@@ -12,7 +13,7 @@ import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import * as Layer from 'effect/Layer'
 import * as Tir from '@silklang/compiler/Tir'
 import * as Stdlib from '@silklang/compiler/Stdlib'
-import * as ToolchainIntegrity from '@silklang/compiler/ToolchainIntegrity'
+import { createHash } from 'node:crypto'
 import { unreachable } from '../../packages/compiler/test/support/raise.js'
 import * as Inventory from './BootstrapClosureInventory.js'
 
@@ -59,18 +60,26 @@ it.effect(
           value.bytes,
         ]),
       ])
-      const hash = ToolchainIntegrity.contentDigest
-      const files = [...bytes]
-        .map(([path, value]) => ({ path, mode: '100644', sha256: hash(value) }))
-        .sort((a, b) => {
-          if (a.path < b.path) return -1
-          if (a.path > b.path) return 1
-          return 0
-        })
+      const hash = Effect.fnUntraced(function* (value: string | Uint8Array) {
+        return yield* Effect.try(() => createHash('sha256').update(value).digest('hex'))
+      })
+      const hashed = yield* Effect.forEach(
+        [...bytes],
+        Effect.fnUntraced(function* ([path, value]) {
+          return { path, mode: '100644', sha256: yield* hash(value) }
+        }),
+      )
+      const files = hashed.sort((a, b) => {
+        if (a.path < b.path) return -1
+        if (a.path > b.path) return 1
+        return 0
+      })
       const fileDigest = (values: typeof files) =>
         hash(values.map(({ path, mode, sha256 }) => `${path}\0${mode}\0${sha256}\n`).join(''))
-      const compilerDigest = fileDigest(files.filter((file) => file.path.startsWith('compiler/')))
-      const stdlibDigest = fileDigest(
+      const compilerDigest = yield* fileDigest(
+        files.filter((file) => file.path.startsWith('compiler/')),
+      )
+      const stdlibDigest = yield* fileDigest(
         files.filter((file) => file.path.startsWith('packages/compiler/stdlib/')),
       )
       bytes.set('authored-inputs.tar', ascii('archive-control'))
@@ -82,17 +91,17 @@ it.effect(
           sourceCommit: 'a'.repeat(40),
           roots: ['compiler', 'packages/compiler/stdlib'],
           files,
-          normalizedDigest: fileDigest(files),
+          normalizedDigest: yield* fileDigest(files),
           compilerDigest,
           stdlibDigest,
           archive: 'authored-inputs.tar',
-          archiveSha256: hash('archive-control'),
+          archiveSha256: yield* hash('archive-control'),
         },
         bootstrap: {
           commit: 'b'.repeat(40),
           runId: '1',
           file: '/snapshot/bootstrap.mjs',
-          sha256: hash('bootstrap-control'),
+          sha256: yield* hash('bootstrap-control'),
           stdlibDigest,
         },
         profile: {
@@ -110,7 +119,7 @@ it.effect(
           return value === undefined ? yield* fallback.readFile(file) : value
         }),
         stat: Effect.fnUntraced(function* (file: string): Effect.fn.Return<FileSystem.File.Info> {
-          return yield* Effect.succeed({
+          return yield* Effect.succeed<FileSystem.File.Info>({
             type: 'File',
             mtime: Option.none(),
             atime: Option.none(),
@@ -152,10 +161,13 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const source = `pub fn identity<T>(value: T) -> T { return move value }
+fn selected(static value: i64) -> i32 { return 42 }
 fn unused() -> i32 { return 99 }
+fn completion() -> () { while true {} return }
 pub fn main() -> i32 {
-  let first = identity<i32>(42)
+  let first = identity<i32>(selected(9007199254740993))
   let second = identity<u8>(1)
+  completion()
   return first
 }`
       // A retained object fixture isolates exporter claims; analyze() always uses the real seed plan.
@@ -182,6 +194,15 @@ pub fn main() -> i32 {
       }
       assert.deepEqual(captured.missingProvenance, [])
       assert.strictEqual(captured.status, 'Complete')
+      const staticInstance =
+        captured.instances.find((value) => value.key.declaration.name === 'selected') ??
+        unreachable('expected static specialization')
+      assert.include(
+        staticInstance.key.staticArguments.at(0) ?? unreachable('expected encoded integer'),
+        '9007199254740993',
+      )
+      const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(captured)
+      assert.include(encoded, '9007199254740993')
       const missingIndex = yield* Inventory.capture({
         ...snapshot,
         index: {
@@ -210,9 +231,18 @@ pub fn main() -> i32 {
       const sites = captured.instances.flatMap((value) => value.residualBodySites)
       assert.isAbove(sites.length, 0)
       assert.isTrue(sites.every((value) => value.evidence === 'PRESENT_IN_SELECTED_RESIDUAL_BODY'))
-      // Published synthetic completion can survive after the return. It is never execution evidence.
+      // The synthetic completion after an infinite loop is residual presence, never execution evidence.
       const synthetic = sites.filter((value) => value.origin._tag === 'Synthetic')
       assert.isAbove(synthetic.length, 0)
+      const completion =
+        captured.instances.find((value) => value.key.declaration.name === 'completion') ??
+        unreachable('expected completion control')
+      assert.isTrue(completion.residualBodySites.some((site) => site.tag === 'While'))
+      assert.isTrue(
+        completion.residualBodySites.some(
+          (site) => site.tag === 'UnitLiteral' && site.origin._tag === 'Synthetic',
+        ),
+      )
       assert.deepEqual(
         captured.reachedExecutionEdges.map((edge) => [
           edge.kind,
