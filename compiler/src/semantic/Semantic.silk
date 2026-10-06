@@ -19283,27 +19283,6 @@ fn answerLayoutUnsupported(answer: &Result<Answer, NoRejection>) -> bool {
   }
 }
 
-// Written type and row binders: elided lifetimes and implicit callable representations are not
-// generics a function value would need applied from its use site.
-fn signatureWrittenGenerics(answer: &Result<Answer, NoRejection>) -> usize {
-  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
-      let listed = Vector.asSlice<Shared<Type>>(&signature.typeParameters)
-      let mut count = Vector.length<RowParameter>(&signature.rowParameters)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        let ordinal = Shared.with<Type, usize>(&listed[at], fn(parameter: &Type) -> usize {
-          return match &parameter.* { Type.Parameter {ordinal, ..} => ordinal _ => usize.MAX }
-        })
-        if ordinal < signature.callableParameterStart { count = count + usize.ONE }
-        at = at + usize.ONE
-      }
-      return count
-    }
-  }
-  return usize.ZERO
-}
-
 fn signatureBinderCount(answer: &Result<Answer, NoRejection>) -> usize {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
@@ -32839,8 +32818,9 @@ effect fn proveCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
   parameter: &Shared<Type>, contract: &Shared<Type>, span: Span,
 ) -> Option<Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let determined = Option.none<DeclarationId>()
   let source = match move run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-    declared, parameter, contract, span) {
+    declared, parameter, contract, &determined, span) {
     Result<Option<Shared<Type>>, Shared<Rejection>>.Success {value} => move value
     Result<Option<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
   }
@@ -33012,13 +32992,25 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
   -> Option<Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let actual = run Type.applyBindings(parameter, Vector.asSlice<Binding>(&inferred.*), true)
   let promised = run Type.applyBindings(contract, Vector.asSlice<Binding>(&inferred.*), true)
+  let mut pending = Option.none<DeclarationId>()
   if Shared.with<Type, bool>(&actual, genericSectionType) && run sectionContextUndetermined(&promised, fresh) {
-    return Option.none<Shared<Rejection>>()
+    // A generic function value has no exact contract until its use selects one. The positions
+    // this call already determined, such as the parameters, may select it; its instantiated
+    // result is then evidence for the still-open positions. Otherwise it stays deferred.
+    pending = Option.some<DeclarationId>(run DeclarationId.copy(fresh))
   }
-  let source = match move run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-    declared, &actual, &promised, span) {
+  let selected = run contextualCallableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+    declared, &actual, &promised, &pending, span)
+  let deferred = match &pending { Option<DeclarationId>.Some {..} => true _ => false }
+  let source = match move selected {
     Result<Option<Shared<Type>>, Shared<Rejection>>.Success {value} => move value
-    Result<Option<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
+    Result<Option<Shared<Type>>, Shared<Rejection>>.Failure {error} => {
+      if deferred {
+        drop error
+        return Option.none<Shared<Rejection>>()
+      }
+      return Option.some<Shared<Rejection>>(move error)
+    }
   }
   let sourceType = match move source {
     Option<Shared<Type>>.Some {value} => move value
@@ -33062,9 +33054,16 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Word, An
       }
       let pattern = run Type.openInvocation(&wanted.result, &rigid)
       let evidence = run Type.openInvocation(&offered.result, &rigid)
-      let compared = run Type.unify(&pattern, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut trial,
-      )
-      drop compared
+      // A delayed Effect result is covariant in its run access, so its channels and environment
+      // are the evidence; the comparison later proves the access.
+      let delayed = run effectBound(&evidence, &pattern)
+      if let Option<EffectBound>.Some {value: effects} = move delayed {
+        run inferEffectBound(fresh, &mut trial, &effects)
+      } else {
+        let compared = run Type.unify(&pattern, &evidence, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut trial,
+        )
+        drop compared
+      }
       let added = Vector.asSlice<Binding>(&trial)
       let mut checkAt = mark
       while checkAt < added.length {
@@ -34132,12 +34131,6 @@ effect fn checkInvocation<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.ForeignFunctionNotFirstClass, span)
   }
   let effectTarget = Shared.with<Result<Answer, NoRejection>, bool>(&target.signature, signatureIsEffect)
-  // A generic `effect fn` value needs its application inferred from the use site's callable
-  // contract (for example a handler passed to `Effect.catchAll`); that stays a named gap.
-  if effectTarget && valueConstruction && Vector.length<Argument>(&target.explicit) == usize.ZERO &&
-    Shared.with<Result<Answer, NoRejection>, usize>(&target.signature, signatureWrittenGenerics) != usize.ZERO {
-    return run bodyRejection(&resolver.*, module, RejectionCode.EffectFormUnavailable, span)
-  }
   let unsafeCall = foreignCall || Shared.with<Result<Answer, NoRejection>, bool>(
     &target.signature,
     signatureUnsafe,
@@ -34333,13 +34326,21 @@ effect fn checkInvocation<'scope>(
   }
   // An `effect<'env> fn` environment that no parameter mentions is inferred from what the call
   // captures (lifetimes reference): the region a borrowed argument retains, else 'static. A
-  // deferred section has not captured its remaining operands yet, so it keeps the binder open.
+  // section, including a whole generic `effect fn` used as a value, has not captured its remaining
+  // operands yet: a binder they mention stays open for the invocation, and any other environment
+  // binder is fixed by the supplied suffix the same way.
   let mut environmentAt = usize.ZERO
-  if parameterOffset != usize.ZERO { environmentAt = binderCount }
+  let mut pendingTypes = Vector.make<usize>()
+  let mut pendingLifetimes = Vector.make<usize>()
+  let mut pendingRows = Vector.make<usize>()
+  if parameterOffset != usize.ZERO && !run sectionEvidence(&inference, &freshOwner, Vector.asSlice<Binding>(&inferred),
+    parameterOffset, &mut pendingTypes, &mut pendingLifetimes, &mut pendingRows) {
+    environmentAt = binderCount
+  }
   while environmentAt < binderCount {
     let open = match move bindingArgumentAt(Vector.asSlice<Binding>(&inferred), environmentAt) {
       Option<Argument>.Some {..} => false
-      Option<Argument>.None => Shared.with<Result<Answer, NoRejection>, bool>(&inference,
+      Option<Argument>.None => !containsOrdinal(&pendingLifetimes, environmentAt) && Shared.with<Result<Answer, NoRejection>, bool>(&inference,
         fn(answer: &Result<Answer, NoRejection>) -> bool { return signatureEnvironmentBinder(answer, environmentAt) })
     }
     if open {
@@ -53667,9 +53668,11 @@ effect fn sectionInferenceOwner(resolver: &mut Resolver, target: &DeclarationId)
 
 // Admission specializes a comparison contract, never the immutable value or its runtime key.
 // Target binders are opened before the context is introduced, including recursive owner uses.
+// With a pending call owner, positions mentioning its still-open variables are not evidence, and
+// a contract those positions leave undetermined is absent rather than rejected.
 effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, declared: &[Constraint], actual: &Shared<Type>,
-  promised: &Shared<Type>, span: Span) -> Result<Option<Shared<Type>>, Shared<Rejection>>
+  promised: &Shared<Type>, pending: &Option<DeclarationId>, span: Span) -> Result<Option<Shared<Type>>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let schema = match move Shared.with<Type, Option<Shared<SectionSchema>>>(actual, sectionSchemaOf) {
     Option<Shared<SectionSchema>>.Some {value} => move value
@@ -53710,16 +53713,31 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
       Option<Shared<Type>>.Some {value} => move value
       _ => { fail RevisionMismatch {} }
     }
-    run inferSectionCallableShape(&pattern, &parameters[at], Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+    if !run mentionsPending(&parameters[at], pending) {
+      run inferSectionCallableShape(&pattern, &parameters[at], Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+    }
     at = at + usize.ONE
   }
-  run inferSectionCallableShape(&facts.result, &wanted.result, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+  // Invoking an `effect fn` target constructs its Effect, whose channels carry the written result.
+  let mut wantedResult = Shared.clone<Type>(&wanted.result)
+  if facts.isEffect {
+    if let Option<EffectChannels>.Some {value: channels} = move Shared.with<Type, Option<EffectChannels>>(&wanted.result, effectChannels) {
+      if !run mentionsPending(&channels.failure, pending) {
+        run inferSectionCallableShape(&facts.failure, &channels.failure, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+      }
+      wantedResult = move channels.success
+    }
+  }
+  if !run mentionsPending(&wantedResult, pending) {
+    run inferSectionCallableShape(&facts.result, &wantedResult, Vector.asSlice<Shared<DeclarationId>>(&variables), &mut inferred)
+  }
   let freshIdentity = run Shared.make<DeclarationId>(run DeclarationId.copy(&fresh))
   let inferenceFailure = run inferFromProviderBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
     &opened, &freshIdentity, declared, &mut inferred, span)
   if let Option<Shared<Rejection>>.Some {value} = move inferenceFailure {
     return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move value)
   }
+  let undetermined = match &pending.* { Option<DeclarationId>.Some {..} => true _ => false }
   let mut bounds = Vector.make<Constraint>()
   at = usize.ZERO
   while at < facts.constraints {
@@ -53728,6 +53746,7 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
     if let Option<Constraint>.Some {value} = move bound {
       let applied = run bindConstraint(&value, Vector.asSlice<Binding>(&inferred))
       if run constraintMentionsOwner(&applied, &fresh) {
+        if undetermined { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
         return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.IncompatibleCallableSignature, span))
       }
       run Vector.append<Constraint>(&mut bounds, move applied)
@@ -53738,11 +53757,32 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
   let failed = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &premises,
     Vector.asSlice<Constraint>(&bounds), module, span)
   if let Option<Shared<Rejection>>.Some {value} = move failed { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move value) }
-  let contract = run sectionInstantiatedContract(&opened, &copied.contract, Vector.asSlice<Binding>(&inferred))
+  let assigned = Vector.asSlice<Binding>(&inferred)
+  let mut result = run Type.applyBindings(&facts.result, assigned, true)
+  if facts.isEffect {
+    let constructed = match move run effectValueResult(&mut resolver.*, &mut owner.*, &mut dependencies.*, &opened, assigned,
+      Shared.clone<Type>(&result), run Type.applyBindings(&facts.failure, assigned, true),
+      run Row.applyBindings(&facts.requirements, assigned, true), declared, span) {
+      Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(move error) }
+    }
+    result = move constructed
+  }
+  let contract = run sectionInstantiatedContract(&opened, &copied.contract, assigned, move result)
   if run typeMentionsOwner(&contract, &fresh) {
+    if undetermined { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
     return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.IncompatibleCallableSignature, span))
   }
   return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.some<Shared<Type>>(move contract))
+}
+
+// Whether a contextual position still mentions the calling inference's open variables.
+effect fn mentionsPending(value: &Shared<Type>, pending: &Option<DeclarationId>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  return match &pending.* {
+    Option<DeclarationId>.Some {value: caller} => run typeMentionsOwner(value, &caller)
+    Option<DeclarationId>.None => false
+  }
 }
 
 // Learn referent variables even when reference access or validity differs. This is inference
@@ -53768,7 +53808,10 @@ effect fn inferSectionCallableShape(pattern: &Shared<Type>, actual: &Shared<Type
   }
 }
 
-effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoRejection>>, visible: &Shared<Type>, bindings: &[Binding]) -> Shared<Type>
+// The section's invocation contract under one use's bindings. The use supplies the instantiated
+// result; like the blueprint's, it retains the regions the section captured.
+effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoRejection>>, visible: &Shared<Type>, bindings: &[Binding],
+  result: Shared<Type>) -> Shared<Type>
 ! OutOfMemoryError ? &mut Allocator {
   let facts = match move Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(signature, signatureFacts) {
     Option<SignatureFacts>.Some {value} => move value _ => { return absurd<Shared<Type>>() }
@@ -53786,9 +53829,10 @@ effect fn sectionInstantiatedContract(signature: &Shared<Result<Answer, NoReject
     run Vector.append<Shared<Type>>(&mut parameters, run Type.applyBindings(&parameter, bindings, true))
     at = at + usize.ONE
   }
+  let regions = run callableEnvironmentRegions(&shape.environment)
   return run Shared.make<Type>(Type.Callable {mode: shape.mode, isUnsafe: shape.isUnsafe, environment: move shape.environment,
     invocationBinders: shape.invocationBinders, invocationBounds: move shape.invocationBounds,
-    parameters: move parameters, result: run Type.applyBindings(&facts.result, bindings, true)})
+    parameters: move parameters, result: run capturedEffectResult(move result, Vector.asSlice<Shared<Lifetime>>(&regions))})
 }
 
 union NamedSectionTarget {
@@ -53891,6 +53935,47 @@ struct SectionSelection {
   deferred: Vector<usize>
 }
 
+// Collects the binders a section's still-unsupplied leading parameters mention, including the
+// invocation contracts of representation parameters they name. Only these are evidence a later
+// invocation supplies; false when the signature lacks one of those parameters.
+effect fn sectionEvidence(inference: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId, inferred: &[Binding],
+  remaining: usize, types: &mut Vector<usize>, lifetimes: &mut Vector<usize>, rows: &mut Vector<usize>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < remaining {
+    let parameter = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) }) {
+      Option<Shared<Type>>.Some {value} => move value
+      _ => { return false }
+    }
+    let applied = run Type.applyBindings(&parameter, inferred, true)
+    run Type.collectOwned(&applied, fresh, &mut types.*, &mut lifetimes.*, &mut rows.*)
+    at = at + usize.ONE
+  }
+  // Both written callable parameters and authored F: fn bounds expose their invocation
+  // contract as part of the remaining parameter's source shape.
+  let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(inference, signatureConstraintCount)
+  let mut expanded = true
+  while expanded {
+    let before = Vector.length<usize>(&types.*) + Vector.length<usize>(&lifetimes.*) + Vector.length<usize>(&rows.*)
+    at = usize.ZERO
+    while at < boundCount {
+      let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
+        fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
+      if let Option<Constraint>.Some {value: Constraint.Represents {parameter, contract}} = move bound {
+        let applied = run Type.applyBindings(&parameter, inferred, true)
+        if run sectionEligibleRepresentation(&applied, fresh, &types.*) {
+          let shape = run Type.applyBindings(&contract, inferred, true)
+          run Type.collectOwned(&shape, fresh, &mut types.*, &mut lifetimes.*, &mut rows.*)
+        }
+      }
+      at = at + usize.ONE
+    }
+    expanded = before != Vector.length<usize>(&types.*) + Vector.length<usize>(&lifetimes.*) + Vector.length<usize>(&rows.*)
+  }
+  return true
+}
+
 // Construction and later staging share the same bound-versus-free binder selection rule.
 effect fn sectionSelection(resolver: &Resolver, module: &ModuleId, target: &DeclarationId,
   schema: &TargetSchema, inference: &Shared<Result<Answer, NoRejection>>,
@@ -53902,41 +53987,13 @@ effect fn sectionSelection(resolver: &Resolver, module: &ModuleId, target: &Decl
   let mut eligibleTypes = Vector.make<usize>()
   let mut eligibleLifetimes = Vector.make<usize>()
   let mut eligibleRows = Vector.make<usize>()
-  let mut at = usize.ZERO
-  while at < remaining {
-    let parameter = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference,
-      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) }) {
-      Option<Shared<Type>>.Some {value} => move value
-      _ => { return Result.failResult<SectionSelection, Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span)) }
-    }
-    let applied = run Type.applyBindings(&parameter, inferred, true)
-    run Type.collectOwned(&applied, fresh, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows)
-    at = at + usize.ONE
+  if !run sectionEvidence(inference, fresh, inferred, remaining, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows) {
+    return Result.failResult<SectionSelection, Shared<Rejection>>(run reject(resolver, module, RejectionCode.Unsupported, span))
   }
-  // Both written callable parameters and authored F: fn bounds expose their invocation
-  // contract as part of the remaining parameter's source shape.
   let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(inference, signatureConstraintCount)
-  let mut expanded = true
-  while expanded {
-    let before = Vector.length<usize>(&eligibleTypes) + Vector.length<usize>(&eligibleLifetimes) + Vector.length<usize>(&eligibleRows)
-    at = usize.ZERO
-    while at < boundCount {
-      let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
-        fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
-      if let Option<Constraint>.Some {value: Constraint.Represents {parameter, contract}} = move bound {
-        let applied = run Type.applyBindings(&parameter, inferred, true)
-        if run sectionEligibleRepresentation(&applied, fresh, &eligibleTypes) {
-          let shape = run Type.applyBindings(&contract, inferred, true)
-          run Type.collectOwned(&shape, fresh, &mut eligibleTypes, &mut eligibleLifetimes, &mut eligibleRows)
-        }
-      }
-      at = at + usize.ONE
-    }
-    expanded = before != Vector.length<usize>(&eligibleTypes) + Vector.length<usize>(&eligibleLifetimes) + Vector.length<usize>(&eligibleRows)
-  }
   // A provision selector inferred from the deferred operand's row is not implemented, so such a
   // section is a named deferral. A written selector is proved once the invocation infers the row.
-  at = usize.ZERO
+  let mut at = usize.ZERO
   while at < boundCount {
     let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(inference,
       fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
