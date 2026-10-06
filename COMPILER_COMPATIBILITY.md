@@ -214,9 +214,8 @@ Each entry records:
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
-  guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
-  borrowing match result gap, which current typing cannot reach because it borrows only places and
-  Drop-free array literals, and the deferred glue forms.
+  guard, loop and borrowing match result gaps. Not checked by a test: a partially moved owner moved
+  on only some paths, and the deferred glue forms.
 
 ### Selfhost keeps unavailable conditional sealed-property proofs explicit
 
