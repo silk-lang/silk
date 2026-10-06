@@ -756,8 +756,8 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
   pointer-sized ranges and other target selection; target constants; static parameters; and package
   parameters.
 - **M2.5, ownership, Effects, and remaining bodies:** borrow and capture safety, Effect bodies and
-  calls, `unsafe` calls, partial application, aggregate construction and member access, constant
-  reads such as `return limit`, and provision algebra such as `Without<R, K>`.
+  calls, `unsafe` calls, partial application, aggregate construction and member access, and
+  provision algebra such as `Without<R, K>`.
 - **M2.6, representation and reflection:** layout, offsets, and rejecting infinite by-value storage
   such as `struct Node { next: Node }`.
 - **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
