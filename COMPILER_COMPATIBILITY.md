@@ -1469,6 +1469,19 @@ repeated invocation and capture-only drop glue.
   higher-rank inference solver, integrated corpus success or native self-build success.
 - **Source migration:** none.
 
+### Public generic bounds under caller-local specialization
+
+- **Rule:** VIS-004 checks the authored public contract. A caller may instantiate its generic
+  parameters with private types without publishing those types.
+- **Compilers:** native callable and interface bounds use the same authored-contract visibility
+  policy as parameters and results. The unspecialized signature still rejects an explicitly
+  named private type; supplied own or enclosing arguments do not create a new public declaration.
+- **Evidence:** `rejectsPrivateExposureAndCollisions` covers a public inherent callback bound
+  specialized with a private enclosing type and retains exact authored-private-bound refusals.
+  Quantified admission exposed the previously masked `HashMap.withMut` bound check during N1.
+  This correction does not establish native self-build success.
+- **Source migration:** none.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
