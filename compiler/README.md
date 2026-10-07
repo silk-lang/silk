@@ -5,8 +5,15 @@ first demanded ordinary-body checks.
 The inspection modes read one Silk file and print its flat AST and syntax diagnostics, or its
 lowered module and declaration fingerprints in `hir` mode. The `build` mode demands semantic facts,
 MIR, scalar/address/aggregate Layout, and LLVM emission for a limited closed-body subset. Shared and mutable
-scalar references, dereference reads and stores, and receiver auto-borrows are supported. Raw-pointer
-dereference requires an explicit lexical `unsafe` boundary, including inside an `unsafe fn`.
+scalar references, dereference reads and stores, and receiver auto-borrows are supported. A borrow,
+auto-borrowed receiver or `match &` subject that names no existing storage (a call result, a
+literal, or a field of one) addresses a compiler temporary holding the evaluated value; that hidden
+owner follows the owned-rvalue temporary rules below, and a mutable loan of it needs no named
+mutable owner (BORROW-006). A borrowing binding, including a destructuring `let P = &e`, keeps its
+initializer's temporaries until its scope exits. A `match &mut`, `match place` or `let P = &mut e`
+subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`).
+Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
+`unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
 Internal aggregate calls copy parameters into callee storage and return through a caller-provided
 destination. Named tuple construction and ordinal places share record storage. Fixed arrays retain
