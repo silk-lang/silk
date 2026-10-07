@@ -79,6 +79,29 @@ Each entry records:
 
 ## Entries
 
+### Native integer C variadic imports
+
+- **Status:** implemented and locally verified on 2026-10-07; Linux integration remains pending.
+- **Rule:** a C import with at least one fixed parameter accepts closed integer tails. Signed and
+  unsigned 8/16-bit tails promote to signed i32; wider and target-sized integers retain their
+  widths and signs. Calls and declarations retain the true C variadic function type.
+- **Compilers:** the bootstrap already implements this subset. The native frontend now retains
+  authored variadic status in canonical signature identity and call evidence, including imported
+  revision invalidation. MIR retains independently validated integer promotion records; LLVM
+  emits the actual ellipsis and variadic call type, including a zero-tail call.
+- **Source migration:** use the ordinary C import and unsafe call syntax; no library spelling is
+  recognized by the compiler.
+- **Diagnostics and limits:** noninteger tails, zero-fixed imports, variadic exports and bodies,
+  ordinary variadic functions, first-class variadic values and GNU AArch64 remain refused. Fixed
+  C contract, unsafe, failure, provider, retention and callback boundaries still apply.
+- **Evidence:** four existing SemanticCases actors cover actual Body/MIR/LLVM facts, exact
+  negative outcomes, original signature identity and warm/fresh imported revisions. Local focused
+  execution passed all four actors plus the global semantic canary (5 PASS, 0 FAIL, 77 ms).
+  Actual optimized N0 integer calls linked to an independently compiled C receiver returned 42
+  with Clang O0 and O2 on Darwin; this does not claim Linux ABI execution or an N1 executable.
+- **Open questions:** remaining native compiler self-build refusals are measured separately.
+
+
 ### Shared-loan lifetime shortening in selfhost call inference
 
 - **Status:** implemented on 2026-10-04 on PR #787; verification is pending exact-head CI.
