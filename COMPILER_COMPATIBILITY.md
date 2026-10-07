@@ -482,7 +482,17 @@ Each entry records:
   generic-section layers; direct generic-schema staging retains the same immutable blueprint.
 - **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
   result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
-  independently; immutable construction evidence keeps its original binder ordinal.
+  independently; immutable construction evidence keeps its original binder ordinal. A named
+  function value passed to a callable parameter whose promised contract the earlier evidence
+  already closes, or to a checked scalar intrinsic's carrier parameter, takes its remaining type binders from that contract before any deferral, as the
+  bootstrap's function-item inference does; lifetime binders and borrowed type evidence still wait
+  for the invocation.
+- **Enclosing impl binders:** a section or function value whose target is an inherent member of a
+  generic `impl` selects every impl binder at construction, from written arguments, the supplied
+  suffix or the promised contract, and stores it as selected owner evidence beside the deferred
+  own binders (`&tokens |> Vector.get<Token>(index)`, `Option.some` passed as a carrier). A schema
+  cannot defer an impl binder, so such a value without that evidence keeps the generic
+  `Unsupported` gap.
 - **Compilers:** selfhost opens a generic section's target binders for each concrete callable
   promise, proves its target bounds, and preserves the shared blueprint. A later operand may first
   fix a consumer's type parameter. MIR selects the target from closed invocation operands rather
@@ -491,8 +501,8 @@ Each entry records:
   closed schema recipe before MIR, preserving the original target blueprint and exact capture
   record. Storage mode follows the actual base and newly stored fields; source promises still
   determine consuming transport. Ordinary named sections with deferred invocation lifetimes remain
-  required Step 8 work. Deferred requirement rows, unapplied enclosing owners and runtime static
-  evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
+  required Step 8 work. Deferred requirement rows, deferred enclosing impl binders and runtime
+  static evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
   [the generic specification](openspec/specs/bootstrap-type-generics/spec.md). Selfhost's deferred
@@ -509,6 +519,11 @@ Each entry records:
   signatures and a single transferred capture cleanup. `genericSectionsStageWithDeferredLeadingEvidence`,
   `genericSectionsSelectEvidenceSuppliedByAStage` and `genericSectionsStageOwnedCapturesWithOneCleanupOwner`
   cover staged blueprint selection, capture layout, argument appending and ownership.
+  `enclosingOwnerSectionsRetainTheirClosedParameterTypes` covers a piped deferred section over an
+  impl member and impl members used as carrier values; `providedCallPrefixesMapLifetimesSeparately`
+  covers a result-only binder taken from a closed promise and the open-promise result-inference
+  deferral. `sealedScalarAndPointerFamiliesTypeAndLowerFromTheCatalog` covers generic impl members as
+  checked scalar carriers.
 
 ### Effect joins in selfhost
 
