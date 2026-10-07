@@ -112,15 +112,37 @@ Each entry records:
   TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
-  `'static`, since the outcome retains no operand region through that binder. A binder nothing
-  mentions stays `UninferredParameter`. Sections and function values keep their existing
-  result-only binder gaps.
+  `'static`, since the outcome retains no operand region through that binder. A lifetime binder
+  nothing mentions, such as `fn advanceFinalStage<'head>(...)`, binds `'static` too, which the
+  bootstrap also accepts; only type and row binders stay `UninferredParameter`. Sections and
+  function values keep their existing result-only binder gaps.
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
   bootstrap infers the shorter region.
-- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
-  `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` and
+  `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in `compiler/src/semantic/SemanticCases.silk`.
+
+### Caller-local region relations and 'static binder shortening in selfhost
+
+- **Status:** implemented on 2026-10-07 on PR #1091.
+- **Rule:** a region the bootstrap infers by flow meets a declared region at the boundary that
+  fixes it (LIFE-002).
+- **Compilers:** the bootstrap solves every such region with the rest of the body. Selfhost keeps
+  its regions fixed at typing and instead retains a caller-local region meeting a declared region
+  as an open `RegionRelation` obligation at a loan through a descriptor (`&view[at]` over a
+  call-local view), at an operand of an already fixed type binder (`Option.some<&'a T>(&values[at])`),
+  and at a variant pattern that writes its regions, which admits the subject by covariant region
+  subtyping (a `'static` subject meets `Maybe<&'a i32>`, as in the bootstrap). An inferred lifetime binder that earlier `'static` evidence fixed
+  shortens to a later operand's caller-local region when every parameter stores the binder
+  covariantly and no bound or environment names it.
+- **Source migration:** none.
+- **Diagnostics and limits:** a fresh loan of body-owned storage still needs a declared premise,
+  a pattern region longer than the subject's stays `TypeMismatch`, and a
+  binder that a parameter stores invariantly keeps its first `'static` evidence and reports the
+  operand's `TypeMismatch` where the bootstrap infers the shorter region.
+- **Evidence:** `callerLocalRegionsRelateAtFixedBoundaries` and
+  `patternElisionInfersOmittedLifetimesFromTheSubject` in `compiler/src/semantic/SemanticCases.silk`.
 
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
