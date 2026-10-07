@@ -3645,12 +3645,44 @@ fn sameText(left: string, right: string) -> bool {
   }
   return true
 }
+fn comparesAs(left: string, right: string, expected: bool) -> bool {
+  return sameText(left, right) == expected
+    && (left == right) == expected && (left != right) != expected
+}
+fn firstText(order: &mut i32) -> string<'static> {
+  order.* = order.* * 10 + 1
+  return "ab"
+}
+fn secondText(order: &mut i32) -> string<'static> {
+  order.* = order.* * 10 + 2
+  return "ab"
+}
 pub fn main() -> i32 {
   if !sameText(escapedPattern, r"\\d+\\.\\d+") { return 1 }
   if !sameText(rawPattern, "\\\\d+\\\\.\\\\d+") { return 2 }
   if !sameText(rawPattern, escapedPattern) { return 3 }
   if usize.toI32(String.byteLength(rawPattern)) != 8 { return 4 }
   if usize.toI32(String.byteLength(windowsPath)) != 14 { return 5 }
+  if !comparesAs("", "", true) { return 6 }
+  if !comparesAs("", "a", false) || !comparesAs("a", "", false) { return 7 }
+  if !comparesAs("ab", "abc", false) || !comparesAs("abc", "ab", false) { return 8 }
+  if !comparesAs("ab", "xb", false) || !comparesAs("ab", "ax", false) { return 9 }
+  if !comparesAs("é😀", "é😀", true) || !comparesAs("é", "é", false) { return 10 }
+  let leftBytes: [u8; 3] = [97, 0, 98]
+  let equalBytes: [u8; 3] = [97, 0, 98]
+  let differentBytes: [u8; 3] = [97, 0, 99]
+  unsafe {
+    let left = String.fromUtf8Unchecked(&leftBytes)
+    let equal = String.fromUtf8Unchecked(&equalBytes)
+    let different = String.fromUtf8Unchecked(&differentBytes)
+    if !comparesAs(left, equal, true) || !comparesAs(left, different, false) { return 11 }
+  }
+  let mut order = 0
+  if firstText(&mut order) == secondText(&mut order) {} else { return 12 }
+  if order != 12 { return 13 }
+  order = 0
+  if firstText(&mut order) != secondText(&mut order) { return 14 }
+  if order != 12 { return 15 }
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
