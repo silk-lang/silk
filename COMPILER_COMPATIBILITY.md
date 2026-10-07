@@ -1513,6 +1513,25 @@ on caller-local region relations.
   `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
   and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
 
+### Native scalar enum consuming matches
+
+- **Status:** implemented; production check and five focused native controls pass on macOS/aarch64.
+- **Rule:** a scalar enum remains a sealed Copy value without cleanup. A bare match copies its
+  subject; `match move` records Consume access and the subject's owned local or projection, or no
+  place for a fresh value. It uses the same extraction proof as a record or union consuming match.
+  A Drop-hooked ancestor still prevents extraction of its enum field and reports
+  `ExtractionBoundary` at the complete match. Copy classification does not bypass that proof.
+- **Compilers:** the bootstrap already admits consuming scalar enum matches. Native now uses its
+  existing scalar switch/guard lowering rather than refusing the ownership mode. Shared and
+  mutable scalar enum matches retain their separate `Unsupported` boundary. Native ownership
+  checking remains the Step 14 follow-up; this change records consumption and preserves extraction
+  diagnostics without claiming a complete use-after-move check.
+- **Evidence:** `scalarEnumsLowerMembersValuesAndSwitches` asserts consumed parameter/field
+  coordinates, a fresh subject with no place, bare Copy access, guarded switch structure, no drop
+  statements/glue/flags and the Drop-ancestor rejection. The actor passes in 23 ms; all five
+  focused native controls pass in 104 ms. Linux and optimized N1 outcomes remain separate CI evidence.
+- **Source migration:** none.
+
 ### Native unconsumed Effect and callable arguments
 
 - **Status:** native gap; retires when native lowers a non-consuming by-value Effect argument.
