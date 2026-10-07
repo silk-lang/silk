@@ -886,6 +886,30 @@ The fixture now declares both functions in `impl Vector`, retaining its expected
 The bootstrap is frozen during backend development; retire this entry when it enforces the
 same owner lookup rule.
 
+### Borrowed operator operand inference in selfhost
+
+- **Status:** focused native verification passed on 2026-10-07; optimized N0, actual self-build
+  and integrated verification are pending.
+- **Rule:** OP-009 uses ordinary interface operation contracts after operand-only selection.
+  Written borrowed operands infer the operation's own lifetime parameters; fixed lifetimes,
+  caller parameters, reference access and interface/provider arguments remain rigid. Expected
+  results and operation obligations do not select between competing suppliers.
+- **Compilers:** the bootstrap instantiates operation references and checks their operand
+  contracts. Selfhost previously compared applied operation parameters by exact equality before
+  inferring operation-owned lifetimes, refusing both bounded and concrete borrowed operators.
+  Concrete discovery now distinguishes open runtime type/row shape from retained caller
+  validity lifetimes. The native source probes each complete operand list privately, publishes
+  canonical operation/ordinal bindings, applies them to the result and callable witness recipe, and proves
+  instantiated bounds using actual caller premises. Unsafe operations require a lexical unsafe
+  boundary. Generic type/row, static-argument and Effect operator applications remain explicit
+  gaps; an operation lifetime that no operand determines also remains an explicit gap.
+- **Evidence:** the existing-root actor `borrowedOperatorsInferOnlyTheirLifetimesAndProveBounds`
+  asserts target and binding identities, borrowed results, caller-proven and unproved bounds,
+  fixed static/access/unsafe boundaries and repeated-lifetime consistency. The new actor passed
+  in 23 ms with five related/global controls passing (46 ms total); the timing guard passed.
+- **Open questions:** reference operands do not yet contribute their referent's owner module to
+  concrete discovery. This separate provider-bucket limitation is unchanged by operand inference.
+
 ### Struct declaration fields use whitespace separators
 
 STRUCT-002 and GEN-002 show whitespace/newline-separated declaration fields. The TypeScript
