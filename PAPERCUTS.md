@@ -436,3 +436,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-07 · New cleanup source failed bootstrap on temporary nested slice projections and implicit mutable-view/metadata transfers · Bind stable aliases, clone projection snapshots before builder mutation, explicitly reborrow mutable views and mark scalar metadata Copy · silk
 2026-10-07 · A public opaque-specialization regression root exposed private marker types; root validation replaced the signature’s ExposedPrivateItem with Unsupported before closure admission · Make the fixture’s marker declarations public and trace the original signature rejection before altering the specialization oracle · Silk Stage1.
+
+2026-10-07 · New native Cases fixture failed bootstrap parsing on reserved effect binding and generic Shared.with directly in if-let RHS · Rename reserved binding and bind generic call result before matching with unique body names · silk
+2026-10-07 · bootstrap rejected a nested match borrow on a nodes slice already held by provenance checks (OWN0011) · use a named pure node-kind predicate with an explicit reborrow while retaining all source/initializer assertions · Silk Stage1 delayed callback Cases
+2026-10-07 · delayed metadata test oracle trapped by entering the same Type.Parameter Shared handle twice · compare handle addresses in completed loans and retain exact Parameter category plus structural owner/ordinal checks for distinct handles · Silk Stage1 delayed environment Cases
