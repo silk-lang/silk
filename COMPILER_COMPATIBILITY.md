@@ -1671,3 +1671,10 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `typed-form` gap) instead of a `TypeMismatch` at the operand.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
   `compiler/src/semantic/SemanticCases.silk`.
+
+### Selfhost preserves unchanged inexact capture-loop availability
+
+- **Status:** locally verified on 2026-10-07.
+- **Rule:** LOOP-001 requires preservation of the incoming ownership facts on repeating paths. A pre-existing may/must distinction does not imply that an unrelated loop changes those facts.
+- **Compilers:** selfhost compares active roots, separate may/must holes, uncertain roots and guard state after normal/continue arrivals. It preserves every may-hole and rejects acquisitions of maybe-missing storage. Conditions still run after copying the header; break and false-condition exits retain their actual post-condition state. Transfer history remains RHS/diagnostic evidence rather than a loop invariant.
+- **Evidence:** `anonymousCapturesKeepLoopAndIndexedProofs` retains changed-header/indexed negatives and adds unchanged-inexact, consume/refill/continue, later-acquisition, unknown-index and consuming-condition controls. The focused run passed four tests in 40 ms (maximum 28 ms), including these exact diagnostic controls and the retained guard actors; its timing gate passed. Original N1 buildFrom state and advancement remain unproved.
