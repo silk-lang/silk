@@ -100,6 +100,10 @@ index beside a moved element, a guard that changes an owner's state or
 consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
 report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
 created temporaries still report the `cleanup` gap.
+Anonymous-environment availability preserves unchanged loop headers even when a pre-loop branch
+may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
+state after each repeating edge; the missing field remains unavailable. Conditions are checked
+against the pre-condition header, and only normal/continue arrivals repeat.
 Effect fn bodies are typed against their declared success, failure and requirement channels.
 Calling an `effect fn` builds an exact Effect whose representation is the call's application and
 written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect
