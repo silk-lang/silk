@@ -315,18 +315,22 @@ Each entry records:
   instance payloads before selecting and building drop glue.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
-- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
-  reports the backend gap `cleanup` instead of lowering a partially moved owner whose holes differ
-  between joining paths or that is moved on only some paths, a write at a runtime index beside a
-  moved element, a loop iteration that leaves an owner in a different state than it found it, a
+- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. On 2026-10-07,
+  selfhost component cleanup was locally verified for conditional partial transfers, joins with
+  opposite authored move orders, receiving-owner cleanup and component refill. It retains canonical
+  projected components and independent edge-written flags rather than consuming-site hole lists.
+  Selfhost still reports the backend gap `cleanup` for a write at a runtime index beside a moved
+  element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
   drop glue for callable and Effect environments and unions without a canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
-  guard, loop and borrowing match result gaps. Not checked by a test: a partially moved owner moved
-  on only some paths, and the deferred glue forms.
+  guard, loop and borrowing match result gaps. The extended partial-move actor authenticates real
+  Move/Copy chains, exact source checkpoints, both conditional cleanup paths, receiving glue,
+  distinct component flags and literal refill. Seven focused tests passed in 247 ms (maximum 71 ms),
+  with the timing gate passing. Deferred glue forms and real N1 completion remain unproved.
 
 ### Selfhost keeps unavailable conditional sealed-property proofs explicit
 
