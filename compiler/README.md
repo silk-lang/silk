@@ -48,7 +48,11 @@ while physically equivalent types still share layouts. This is target-neutral an
 instances without encoding discovery ordinals or LLVM text. The build answer retains its emission
 plan for structural inspection alongside the emitted module.
 Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
-certify LLVM executability. Re-entering a generic function with different type arguments is
+certify LLVM executability. Callable continuation families distinguish the finite sets of original
+executable declarations retained in each original binder slot, including selected sections and
+their captures. Capture depth and generated region identities do not create new families;
+incomplete representation evidence retains the conservative same-body guard. Re-entering a
+generic function within one family with different type arguments is
 `ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
 the re-entry runs inside a Drop hook's cleanup and every type argument stays within the owned
 structure of the value whose cleanup selected the hook (GEN-006): `Vector<Bytes>` cleanup reaches
