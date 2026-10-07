@@ -50,7 +50,10 @@ plan for structural inspection alongside the emitted module.
 Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
 certify LLVM executability. Callable continuation families distinguish the finite sets of original
 executable declarations retained in each original binder slot, including selected sections and
-their captures. Capture depth and generated region identities do not create new families;
+their captures. An opaque representation retains its authenticated original executable producer
+and its selected free type evidence in those families; this does not unfold its public contract
+or enumerate every returned runner. Capture depth and generated region identities do not create new
+families;
 incomplete representation evidence retains the conservative same-body guard. Re-entering a
 generic function within one family with different type arguments is
 `ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
@@ -562,8 +565,9 @@ usual visibility and selective-import rules. Other intrinsic families and `impl 
 
 Body-sensitive representation-property proofs, row subtraction such as `Without<R, K>` (which
 belongs to the later provision and requirement-algebra work), requirements on type parameters,
-variadic functions, static parameters, and other nonstandard callable header modifiers currently
-return `Unsupported` rather than a provisional type. A `where` clause is different: the first
+static parameters, and other nonstandard callable header modifiers currently return `Unsupported`
+rather than a provisional type. Variadic function definitions are also rejected; admitted C
+imports use the integer-only boundary described below. A `where` clause is different: the first
 stable language has no `where` clauses, so a written one is rejected as invalid syntax, not a
 pending feature, even though the rejection currently uses the `Unsupported` code.
 
@@ -834,8 +838,16 @@ vocabulary is rejected as invalid, like a `where` clause, or returns `Unsupporte
   such as `struct Node { next: Node }`.
 - **M3, code generation:** MIR, LLVM, and reuse of lowered or emitted artifacts.
 
-Some `Unsupported` forms are later work that no wave owns yet: native-boundary declarations such as
-foreign `static` data and C variadic functions.
+Native C imports with a nonempty fixed parameter prefix admit integer-only variadic tails on
+AArch64 Darwin and x86_64 GNU Linux. Narrow signed/unsigned integers become signed i32 through
+sign/zero extension respectively; wider integers retain their type. TypedBody and MIR retain
+source and promoted tail types, and LLVM emission validates that evidence before emitting one
+true variadic declaration and call function type. Zero-tail and differently shaped calls share
+the same declaration; fixed/variadic status participates in canonical semantic signature identity
+and reached symbol conflicts, so changing an imported ellipsis invalidates dependent call admission.
+Fixed scalar/pointer C contracts and unsafe acknowledgement remain required. Floating, pointer,
+reference, aggregate, bool, char and callable tails, variadic definitions/function pointers,
+and other native targets remain outside this boundary.
 
 ## Inspect a source file
 

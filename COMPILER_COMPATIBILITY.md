@@ -79,6 +79,29 @@ Each entry records:
 
 ## Entries
 
+### Native integer C variadic imports
+
+- **Status:** implemented and locally verified on 2026-10-07; Linux integration remains pending.
+- **Rule:** a C import with at least one fixed parameter accepts closed integer tails. Signed and
+  unsigned 8/16-bit tails promote to signed i32; wider and target-sized integers retain their
+  widths and signs. Calls and declarations retain the true C variadic function type.
+- **Compilers:** the bootstrap already implements this subset. The native frontend now retains
+  authored variadic status in canonical signature identity and call evidence, including imported
+  revision invalidation. MIR retains independently validated integer promotion records; LLVM
+  emits the actual ellipsis and variadic call type, including a zero-tail call.
+- **Source migration:** use the ordinary C import and unsafe call syntax; no library spelling is
+  recognized by the compiler.
+- **Diagnostics and limits:** noninteger tails, zero-fixed imports, variadic exports and bodies,
+  ordinary variadic functions, first-class variadic values and GNU AArch64 remain refused. Fixed
+  C contract, unsafe, failure, provider, retention and callback boundaries still apply.
+- **Evidence:** four existing SemanticCases actors cover actual Body/MIR/LLVM facts, exact
+  negative outcomes, original signature identity and warm/fresh imported revisions. Local focused
+  execution passed all four actors plus the global semantic canary (5 PASS, 0 FAIL, 77 ms).
+  Actual optimized N0 integer calls linked to an independently compiled C receiver returned 42
+  with Clang O0 and O2 on Darwin; this does not claim Linux ABI execution or an N1 executable.
+- **Open questions:** remaining native compiler self-build refusals are measured separately.
+
+
 ### Shared-loan lifetime shortening in selfhost call inference
 
 - **Status:** implemented on 2026-10-04 on PR #787; verification is pending exact-head CI.
@@ -1073,6 +1096,11 @@ repeated invocation and capture-only drop glue.
   including unresolved staging, rebuilds its intersection after substitution to preserve concrete
   capture regions revealed by a binding. The original local restriction remains conservatively
   retained even for a scalar substitution; this lane does not prove escaping validity.
+  Applied generic contents obligations can also follow from an actual caller
+  `Contents(subject, longer)` premise when the complete subject is identical and the existing
+  lifetime proof establishes `longer` outlives the required region. Target obligations never
+  become caller premises. This implication is implemented and locally verified on 2026-10-07;
+  absent, reversed and different-subject premises retain their refusals.
   Native public callable promises and returned callable contracts report `Unsupported` at the
   value or invocation boundary when those contents remain unresolved, including callables inside
   stored aggregates. The direct public-promise bootstrap control instead reports `SEM0212` on its generic declaration for a
@@ -1082,6 +1110,11 @@ repeated invocation and capture-only drop glue.
   `NotChecked`.
 - **Evidence:** `genericOwnedCapturesRetainLocalContentsAndSubstitutedLoans` checks the exact
   parameter, once mode, local obligation and mixed known/unknown region retention;
+  `declaredPremisesProveNominalRegions` additionally checks actual selected generic applications,
+  caller-owned local loans and distinct declared-region implications, with strict missing/reversed/
+  wrong-subject/target-only controls. Its focused execution passed (2 tests, 0 failures, 30 ms);
+  the previous native generic-local reduction now emits LLVM IR, alongside unchanged exact and
+  concrete controls. This does not claim general borrow checking or an N1 executable.
   `abstractCallableStagesRetainNewlySubstitutedCaptureLoans` keeps the base abstract while revealing
   a capture loan. Direct and nested public promise controls assert native gap codes and spans.
   `genericOwnedCaptureTransfersCleanupToOriginalTarget` checks the ordinary direct target and
@@ -1534,12 +1567,14 @@ mismatching argument keep `TypeMismatch`.
 Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
 elides a lifetime checks its initializer without contextual expectation, so a context-typed
 initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
-exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit
-call-site generic arguments and qualified calls that elide a lifetime, and a constructor whose
-elided lifetime is reached only through an alias, keep the `body-lifetime-elision` gap: a call
-argument's elided lifetime needs a slot of the call's own inference that the expected result
-and every operand (including a static `String` and a caller-local loan) can shorten, which waits
-on caller-local region relations.
+exact region, so a later assignment with a different nonlocal lifetime is refused. Ordinary
+call-site generic arguments now infer omitted lifetimes in private invocation slots.
+The actual operands or expected result must close every omitted slot before the compiler publishes
+the selected application. Original target owners and sparse binder ordinals remain unchanged;
+private slots never become target arguments or receive default `'static` evidence. A result-only
+omission without evidence and an unresolved partial call retain `body-lifetime-elision`.
+Qualified owner applications, generic interface-operation prefixes, and a constructor whose
+elided lifetime is reached only through an alias remain separate unsupported lanes.
 
 ### Native typing retains unproven caller-local region relations
 
