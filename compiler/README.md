@@ -467,7 +467,11 @@ contract inside another quantified contract is rejected, including one quantifie
 omitted lifetime. An environment such as `Effect<'a & 'b; A>` is an order-independent
 intersection in which `'static` and repeats disappear, so `'b & 'static & 'a` is the same
 environment and `'a & 'a` is `'a`. A written `effect<'env> fn` or `effect<'a & 'b> fn` environment
-is recorded with the signature:
+is recorded with the signature. A declaration-owned lifetime argument can retain this complete
+finite meet, including in a reference, slice or `string` region; inference never chooses an
+arbitrary constituent or manufactures a static lifetime. Meet identity is associative, commutative
+and idempotent with static as identity, independently of any ambient outlives bounds. Written
+outlives premises and enclosing-body loan evidence prove validity through the meet rules:
 
 ```silk,ignore
 fn apply(transform: fn<'static>(&i32) -> &i32) -> i32 { return 0 }
@@ -527,8 +531,9 @@ successful answer proves no conformance. Member-owned type, lifetime, and row bi
 exact evidence from the substituted operation; an owned contract operand may be lent to an elided
 member borrow without letting that borrow escape. A fixed requirement beside one open member row
 is covered by the operation's fixed row before the open member row binds to its rigid parameters;
-the resolved member row must still be covered by the operation row. Ambiguous environment
-intersections and an environment covered only through a chain of bounds remain `Unsupported`.
+the resolved member row must still be covered by the operation row. A sole open environment
+member binds its complete residual meet; equations with several unconstrained open members
+remain `Unsupported`. Written transitive outlives premises retain their existing proof role.
 `demandCoherence` decides a conformance head before any applicability or bound proof. Every written
 parameter must occur in the interface application or provider (`UnconstrainedImplParameter`), and
 every bound must name a parameter inside the provider without repeating an open parameter or
@@ -1162,3 +1167,33 @@ The application retains enclosing generic scopes, including inputs used only by 
 use contract quantifies the anonymous parameters' invocation lifetimes. Runtime construction,
 invocation and capture glue use the exact environment type and original body instance, as
 recorded in the [Step 8 coverage receipt](docs/step8-callable-sweep.md).
+
+### Complete caller-region canonicalization
+
+Selected applications retain exact lifetime evidence. Canonicalization first collects the entire
+ordered application, enclosing scopes, static aggregate types, and provider inputs in their existing
+D2 order. Declaration parameters, invocation binders and static remain rigid. Caller Local and
+Supplied atoms receive one injective frozen map across all roots, so both sharing and incidence in
+unordered meets survive alpha renaming. Ordered incidence is a proved fast path; unordered structural
+correlations select the least complete exact record over all injective maps. Runtime encodings keep
+lifetime erasure and canonical set order unchanged. Pure renaming preserves authenticated erased
+callable caches and normalized requirement-row structure; actual substitutions continue through
+ordinary owning factories. Frozen candidate traversal charges the same structural budget as collection;
+it does not rerun semantic row normalization or quantified key comparison.
+
+One complete transaction permits 32768 structural/work units, 65536 attempted search states, and
+8388608 copied/produced/compared record bytes. Failed branches consume their budget. Cycles,
+exhaustion and atoms absent from collection fail canonicalization without publishing a key. The
+requesting semantic body or invocation anchors `Unsupported` at its authentic source origin;
+generated query caches retain a source-neutral refusal. Bare named declarations have an empty
+region domain and require no renaming search. Glue identity uses an original owning declaration;
+union children select the least declaration record under the same bounded transaction.
+
+Public `demandInstanceMir`/`demandInstanceText` requests provide an authentic source owner and span
+separately from the instance key. A root request with the zero-span sentinel resolves that owner's
+original authored header before publishing a canonical refusal. Reached call requests use the caller's
+actual call span; generated glue edges carry their originating cleanup request through child glue and
+hooks. These requesting coordinates never enter cached key identity or source-neutral failure facts.
+Nested application encoding charges owned declaration snapshots before allocating them, including
+failed copies after record-budget exhaustion. These source guarantees still require focused execution;
+this source change makes no N0/N1 completion claim.

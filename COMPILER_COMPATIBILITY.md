@@ -1667,3 +1667,20 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `typed-form` gap) instead of a `TypeMismatch` at the operand.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
   `compiler/src/semantic/SemanticCases.silk`.
+
+
+### Native canonical finite lifetime meets
+
+- **Rule:** LIFE-004's common validity is a canonical finite meet. Flatten nested meets, remove
+  static and duplicate atoms, retain the complete meet in lifetime arguments, and keep identity
+  independent of ambient bounds. Public substitution is simultaneous; inference follows only
+  explicitly permitted owners and refuses seeded cycles with complete rollback. Meet outlives
+  proof uses actual caller premises and the ordinary meet rules, never manufactured Contents or
+  a chosen constituent.
+- **Native source:** Lifetime, Type and Semantic now carry complete meets through environment
+  inference, scoped applications and validity proof. Whole-domain caller-region numbering replaces
+  the former streaming scalar representation. Canonical key construction is fallible under the
+  structural limits documented in `compiler/README.md`; refusals are source-neutral in generated
+  caches and become `Unsupported` at the genuine requesting origin. Runtime lifetime erasure and
+  provider order are unchanged. The authored regression actors and bootstrap/native checks still
+  need execution on this source head; this entry does not claim self-host completion.

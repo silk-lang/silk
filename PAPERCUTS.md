@@ -435,3 +435,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-07 · A canonical call result retained its authentic Local loan while contextual expression typing adapted the viewed result to a caller lifetime, and negative generic calls reported whole-call spans rather than operand spans · Authenticate the exact recorded RegionRelation and demanded caller result separately from the canonical application; calibrate exact negative spans with readonly diagnostic evidence · compiler call-prefix lifetime tests
 
 2026-10-07 · A public opaque-specialization regression root exposed private marker types; root validation replaced the signature’s ExposedPrivateItem with Unsupported before closure admission · Make the fixture’s marker declarations public and trace the original signature rejection before altering the specialization oracle · Silk Stage1.
+
+2026-10-07 · Ordinary-meet pinned compiler check failed before assertions with 106 syntax/API/ownership diagnostics · use owned scalar projections, owning Lifetime normalization, valid union/struct grammar and short loans; second production check passes, structured tests remain pending · Silk
