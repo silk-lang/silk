@@ -406,3 +406,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-07 · genericRecursiveResultKeepsCallerParameter expected the operand span after move admission moved to the completed expression, failing the semantic shard despite correct TypeMismatch · assert the full move argument span and rerun it with focused region controls · silk
 2026-10-07 · an unoptimized debug N0 exceeded the180-second self-build probe limit before reporting gaps, while the optimized baseline completed in26seconds, leaving the comparison inconclusive · use optimized N0 seeds for self-build/census measurements and retain debug builds for focused source-test iteration · silk
+
+2026-10-07 · A fix message queued to a completed native subagent did not start a new turn, delaying the focused-check rerun · Use followup_task to restart idle/completed native workers; send_message only delivers context · Silk Stage 1
+2026-10-07 · Copying an advisory value out of a borrowed Option match escaped its arm, and a block-tail constructor was ignored rather than returned · Use a named returning copy function and keep nested anonymous callbacks out of this compiler slice · Silk selfhost
+2026-10-07 · Raw native diagnostic decoding treated a u8 scalar enum plus padding as a full pointer word, falsely suggesting corruption · Inspect the actual comparison/load width and mask scalar enum bytes before interpreting aggregate memory · Silk Stage 1

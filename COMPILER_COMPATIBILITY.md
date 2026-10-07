@@ -502,13 +502,16 @@ Each entry records:
 
 - **Status:** direct invocation and closed contextual callable admission implemented in the Step 8
   generic-section layers; direct generic-schema staging retains the same immutable blueprint.
+  Named callback construction also uses determined parameter and result-channel evidence while
+  another consumer requirement row remains open; unresolved consumer positions are not evidence.
 - **Rule:** construction may defer target binders mentioned by remaining parameters. Unused or
   result-only unresolved binders report `SEM0052` at the construction call. Each invocation solves
   independently; immutable construction evidence keeps its original binder ordinal. A named
-  function value passed to a callable parameter whose promised contract the earlier evidence
-  already closes, or to a checked scalar intrinsic's carrier parameter, takes its remaining type binders from that contract before any deferral, as the
-  bootstrap's function-item inference does; lifetime binders and borrowed type evidence still wait
-  for the invocation.
+  function value passed to a callable parameter takes its remaining type binders from determined
+  positions in the promised contract before deferral, as does a checked scalar intrinsic's carrier
+  parameter. A still-open consumer type or row supplies no target evidence; the callback's actual
+  requirements determine an inferred consumer row. This follows the bootstrap's function-item
+  inference; lifetime binders and borrowed type evidence still wait for the invocation.
 - **Enclosing impl binders:** a section or function value whose target is an inherent member of a
   generic `impl` selects every impl binder at construction, from written arguments, the supplied
   suffix or the promised contract, and stores it as selected owner evidence beside the deferred
@@ -545,7 +548,11 @@ Each entry records:
   impl member and impl members used as carrier values; `providedCallPrefixesMapLifetimesSeparately`
   covers a result-only binder taken from a closed promise and the open-promise result-inference
   deferral. `sealedScalarAndPointerFamiliesTypeAndLowerFromTheCatalog` covers generic impl members as
-  checked scalar carriers.
+  checked scalar carriers. `namedEffectCallbacksUseKnownChannelsWhileConsumerRowsAreInferred`
+  follows two concrete wrapper/callback applications through MIR, proves empty and nonempty
+  consumer rows from actual callbacks, and retains unknown-success and excess-channel refusals.
+  The production compiler check and six focused native controls pass on macOS/aarch64; the new
+  actor takes 41 ms. Optimized N1 and Linux corpus outcomes remain separate CI evidence.
 
 ### Effect joins in selfhost
 
