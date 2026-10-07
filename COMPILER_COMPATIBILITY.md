@@ -1096,6 +1096,11 @@ repeated invocation and capture-only drop glue.
   including unresolved staging, rebuilds its intersection after substitution to preserve concrete
   capture regions revealed by a binding. The original local restriction remains conservatively
   retained even for a scalar substitution; this lane does not prove escaping validity.
+  Applied generic contents obligations can also follow from an actual caller
+  `Contents(subject, longer)` premise when the complete subject is identical and the existing
+  lifetime proof establishes `longer` outlives the required region. Target obligations never
+  become caller premises. This implication is implemented and locally verified on 2026-10-07;
+  absent, reversed and different-subject premises retain their refusals.
   Native public callable promises and returned callable contracts report `Unsupported` at the
   value or invocation boundary when those contents remain unresolved, including callables inside
   stored aggregates. The direct public-promise bootstrap control instead reports `SEM0212` on its generic declaration for a
@@ -1105,6 +1110,11 @@ repeated invocation and capture-only drop glue.
   `NotChecked`.
 - **Evidence:** `genericOwnedCapturesRetainLocalContentsAndSubstitutedLoans` checks the exact
   parameter, once mode, local obligation and mixed known/unknown region retention;
+  `declaredPremisesProveNominalRegions` additionally checks actual selected generic applications,
+  caller-owned local loans and distinct declared-region implications, with strict missing/reversed/
+  wrong-subject/target-only controls. Its focused execution passed (2 tests, 0 failures, 30 ms);
+  the previous native generic-local reduction now emits LLVM IR, alongside unchanged exact and
+  concrete controls. This does not claim general borrow checking or an N1 executable.
   `abstractCallableStagesRetainNewlySubstitutedCaptureLoans` keeps the base abstract while revealing
   a capture loan. Direct and nested public promise controls assert native gap codes and spans.
   `genericOwnedCaptureTransfersCleanupToOriginalTarget` checks the ordinary direct target and
