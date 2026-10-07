@@ -525,8 +525,9 @@ Each entry records:
   evidence supplied at that stage. Staging through an abstract callable parameter normalizes its
   closed schema recipe before MIR, preserving the original target blueprint and exact capture
   record. Storage mode follows the actual base and newly stored fields; source promises still
-  determine consuming transport. Ordinary named sections with deferred invocation lifetimes remain
-  required Step 8 work. Deferred requirement rows, deferred enclosing impl binders and runtime
+  determine consuming transport. Ordinary named sections defer invocation lifetimes through their
+  original recipe; quantified contextual admission is source-implemented with validation pending,
+  as detailed below. Deferred requirement rows, deferred enclosing impl binders and runtime
   static evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
@@ -1440,6 +1441,29 @@ repeated invocation and capture-only drop glue.
   Effect result sections. Bootstrap currently reports SEM0052 on the selected generic Effect
   section controls; native retains its Unsupported provider-recipe boundary until Step 9 supplies
   that recipe, rather than admitting a partially inferred Effect construction.
+- **Quantified contextual admission:** source implementation now opens outer promised invocation
+  parameters, result and lifetime premises under a separate rigid owner. Only offered target slots
+  infer; caller and promised premises must prove applied target obligations. A private comparison
+  view re-closes direct deferred lifetime bindings through their original target ordinals. Selected
+  evidence, actual schema and capture storage remain unchanged. Fixed lifetimes, mode, unsafe
+  authority, exclusive content and callable environments retain ordinary contract proof. Nested
+  invocation quantifiers and deferred type/row bindings embedding private rigids retain explicit
+  `Unsupported` boundaries; explicitly quantified public section contracts and Effect-valued
+  lifetime deferral remain separate gaps.
+- **Quantified verification pending:** `quantifiedNamedCallbacksRetainTheirInvocationRecipes` in
+  `CallableResultCases` demands concrete consumers and original callbacks, checks two independent
+  invocation loans, original lifetime slots 0 and 1, and staged capture inputs/projections.
+  Each original target call must use the distinct MIR local created at its corresponding source
+  Borrow origin, so duplicated first-loan wiring cannot satisfy the structural proof.
+  A mixed target contrasts selected type slot 0 with deferred lifetime slot 1 and promised
+  invocation ordinal 0; once transport retains shared actual storage through concrete MIR.
+  Its source-written negatives distinguish fixed Static, unproved/reversed bounds, exclusive
+  content and fixed inner-lifetime preservation, unsafe authority, once storage, retained environments,
+  alias-hidden nested quantifiers and embedded proof rigids. The named-result control in
+  `callableParameterKeepsInvocationRigidsAndBorrowedOwnersOutOfInference` preserves the outer
+  inferred-result escape boundary and a cheap unused nested-metadata quantifier barrier. Source
+  canonicalization still erases unused authored binders. These new assertions and their exact diagnostics have not yet
+  been executed; no integrated site-removal, corpus or self-build success is claimed.
 - **Source migration:** none.
 
 ## Explicit synchronous source startup
