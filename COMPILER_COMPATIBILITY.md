@@ -551,6 +551,8 @@ Each entry records:
   checked scalar carriers. `namedEffectCallbacksUseKnownChannelsWhileConsumerRowsAreInferred`
   follows two concrete wrapper/callback applications through MIR, proves empty and nonempty
   consumer rows from actual callbacks, and retains unknown-success and excess-channel refusals.
+  The production compiler check and six focused native controls pass on macOS/aarch64; the new
+  actor takes 41 ms. Optimized N1 and Linux corpus outcomes remain separate CI evidence.
 
 ### Effect joins in selfhost
 
