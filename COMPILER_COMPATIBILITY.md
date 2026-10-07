@@ -1557,12 +1557,14 @@ mismatching argument keep `TypeMismatch`.
 Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
 elides a lifetime checks its initializer without contextual expectation, so a context-typed
 initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
-exact region, so a later assignment with a different nonlocal lifetime is refused. Explicit
-call-site generic arguments and qualified calls that elide a lifetime, and a constructor whose
-elided lifetime is reached only through an alias, keep the `body-lifetime-elision` gap: a call
-argument's elided lifetime needs a slot of the call's own inference that the expected result
-and every operand (including a static `String` and a caller-local loan) can shorten, which waits
-on caller-local region relations.
+exact region, so a later assignment with a different nonlocal lifetime is refused. Ordinary
+call-site generic arguments now infer omitted lifetimes in private invocation slots.
+The actual operands or expected result must close every omitted slot before the compiler publishes
+the selected application. Original target owners and sparse binder ordinals remain unchanged;
+private slots never become target arguments or receive default `'static` evidence. A result-only
+omission without evidence and an unresolved partial call retain `body-lifetime-elision`.
+Qualified owner applications, generic interface-operation prefixes, and a constructor whose
+elided lifetime is reached only through an alias remain separate unsupported lanes.
 
 ### Native typing retains unproven caller-local region relations
 
