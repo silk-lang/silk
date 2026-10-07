@@ -78,8 +78,8 @@ unions without a canonical member order still report the `cleanup` gap. MIR lowe
 stack: bindings and by-value parameters that need cleanup are owners of their scope, consuming sites
 mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,
 innermost first and in reverse acquisition order. Replacement drops the displaced value first.
-Where paths reach a join with different ownership, the owner gets a `DropFlag` local written on
-each incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
+Where paths reach a join with different ownership, canonical projected cleanup components get
+independent `DropFlag` locals written on each actual incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
 tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
 rvalues used only as places are dropped at the end of their full expression unless a borrowing
 `let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
@@ -91,10 +91,12 @@ The bindings of a destructuring `let` belong to the enclosing block; those of a 
 arm end with the arm, innermost first. The subject drops only what no binding took, such as fields
 omitted with `..`: a `match` arm drops it when the arm ends, while `if let` and `let` drop it, or
 the whole unmatched `if let` subject, once a path is selected and before it runs (PATT-008). A
-static partial move leaves a hole in its owner: the owner is then dropped child by child, skipping
-moved children, and writing a moved child back makes it whole again. A hole beneath a type with a
-Drop hook is rejected as `OWN0002`. Holes that differ between joining paths, a maybe-moved partial
-owner, a write at a runtime index beside a moved element, a guard that changes an owner's state or
+static partial move marks the authenticated component moved: cleanup visits the remaining children
+in their canonical order. Joins normalize the incoming component partitions, including opposite
+authored move orders, and retain each child's independent liveness. Replacing a component drops
+its initialized old value before the store, then restores precisely that component; siblings keep
+their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. A write at a runtime
+index beside a moved element, a guard that changes an owner's state or
 consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
 report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
 created temporaries still report the `cleanup` gap.
