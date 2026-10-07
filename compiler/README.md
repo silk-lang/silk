@@ -453,6 +453,12 @@ interface Hash {}
 fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
 ```
 
+Delayed Effect results preserve their complete retained environments during callable and stored
+operand comparison. Structural compatibility returns scalar and environment validity obligations;
+the caller proves them from its declared bounds and authenticated invocation premises. A shorter
+result promise never authorizes a captured loan to escape, and selected target bounds remain
+independent obligations.
+
 A callable contract can quantify invocation lifetimes:
 `for<'call> fn<'env>(&'call i32) -> &'call i32` names them. An omitted lifetime in a callable
 parameter is a fresh invocation lifetime, so `fn<'env>(&i32) -> &i32` is the same contract; an
