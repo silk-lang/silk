@@ -20,9 +20,11 @@ destination. Named tuple construction and ordinal places share record storage. F
 one element layout, stride and logical length; indexing checks the logical bound before access or
 an indexed assignment's replacement expression, including for empty and zero-size storage.
 Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
-equality, and member or `_` match arms with guards lower to MIR switches. Unions of records store
-an unsigned tag (canonical member order) before the largest member; a generic body may inject into
-and match a union of generic record applications such as `Empty<T> | Full<T>`, and each closed
+equality, and member or `_` match arms with guards lower to MIR switches.
+`match move` of a scalar enum records its consuming place without introducing cleanup. Extracting
+an enum field through a Drop-hooked ancestor remains rejected even though the enum is Copy.
+Unions of records store an unsigned tag (canonical member order) before the largest member; a generic
+body may inject into and match a union of generic record applications such as `Empty<T> | Full<T>`, and each closed
 instance maps the authored member to its canonical tag. Nominal `union` declarations tag variants
 in declaration order and lay each variant out like a record.
 Record, structural-union and nominal-union matches bind fields as places and switch on the tag.

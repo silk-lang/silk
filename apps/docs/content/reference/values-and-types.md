@@ -1043,6 +1043,8 @@ the source value remains the enum's nominal type through storage, calls, equalit
 
 Every scalar enum is a compiler-sealed Copy value with no cleanup obligation. Reading or passing an
 enum copies its member value without consuming the original binding.
+An explicit `move` or `match move` still consumes its owned place. Consuming a field cannot leave
+a hole through an enclosing value with a `Drop` hook, including when that field is a Copy enum.
 
 ```silk
 enum Mode { Read, Write }
