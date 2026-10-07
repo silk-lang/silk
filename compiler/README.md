@@ -50,7 +50,10 @@ plan for structural inspection alongside the emitted module.
 Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
 certify LLVM executability. Callable continuation families distinguish the finite sets of original
 executable declarations retained in each original binder slot, including selected sections and
-their captures. Capture depth and generated region identities do not create new families;
+their captures. An opaque representation retains its authenticated original executable producer
+and its selected free type evidence in those families; this does not unfold its public contract
+or enumerate every returned runner. Capture depth and generated region identities do not create new
+families;
 incomplete representation evidence retains the conservative same-body guard. Re-entering a
 generic function within one family with different type arguments is
 `ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
