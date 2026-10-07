@@ -160,6 +160,8 @@ it.effect('derives affine local ownership through the ordinary Shared wrapper', 
       'shared-stdlib/facts',
       ascii(`import silk.shared { Shared }
 struct Holder<T> { value: Shared<T> }
+fn read(value: &i32) -> i32 { return value.* }
+fn inspectShared(value: &Shared<i32>) -> i32 { return Shared.with(value, read) }
 fn retain(value: Shared<i32>) -> i32 {
   let pending = effect { drop move value return 42 }
   drop pending
