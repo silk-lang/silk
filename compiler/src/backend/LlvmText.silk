@@ -2442,6 +2442,62 @@ fn foreignSignatureIndex(foreign: &[CAbi.Signature], declaration: &Shared<Declar
   return found
 }
 
+// Authenticate a tail's actual source before loading, then promote that one materialized value.
+effect fn emitVariadicArgument(writer: &mut Writer, function: &MirFunction, target: &Target,
+  layouts: &[TypeLayout], operand: &Operand, argument: &CAbi.VariadicArgument, span: Span) -> Value
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&function.key)
+  let mut address = Option.none<Address>()
+  if let Operand.Copy {place: source} = &operand.* {
+    address = Option.some<Address>(run emitPlace(&mut writer.*, function, target, layouts, &source))
+  }
+  if let Operand.Move {place: source} = &operand.* {
+    address = Option.some<Address>(run emitPlace(&mut writer.*, function, target, layouts, &source))
+  }
+  let mut input = Value {scalar: scalar(&argument.sourceType, target), text: Bytes.make()}
+  match move address {
+    Option<Address>.Some {value: sourceAddress} => {
+      if !(run CAbi.validVariadic(argument, &sourceAddress.ty)) { fail Gap.make(GapCode.CAbiVariadic, &owner, span) }
+      input = run loadAddress(&mut writer.*, &sourceAddress)
+    }
+    Option<Address>.None => {
+      if let Operand.Integer {ty: sourceType, ..} = &operand.* {
+        if !(run CAbi.validVariadic(argument, &sourceType)) { fail Gap.make(GapCode.CAbiVariadic, &owner, span) }
+      } else { fail Gap.make(GapCode.CAbiVariadic, &owner, span) }
+      input = run emitOperand(&mut writer.*, function, target, layouts, operand)
+    }
+  }
+  let source = scalar(&argument.sourceType, target)
+  let promoted = scalar(&argument.promotedType, target)
+  if input.scalar.aggregate || input.scalar.unit || input.scalar.pointer || input.scalar.floating
+    || input.scalar.bits != source.bits || input.scalar.signed != source.signed {
+    fail Gap.make(GapCode.CAbiVariadic, &owner, span)
+  }
+  if source.bits < promoted.bits {
+    if source.signed { return run emitCast(&mut writer.*, b"sext", &input, promoted) }
+    return run emitCast(&mut writer.*, b"zext", &input, promoted)
+  }
+  if source.bits != promoted.bits || source.signed != promoted.signed {
+    fail Gap.make(GapCode.CAbiVariadic, &owner, span)
+  }
+  return move input
+}
+
+// LLVM needs the actual variadic function type even when this invocation has no unnamed lanes.
+effect fn variadicFunctionType(writer: &mut Writer, signature: &CAbi.Signature, span: Span) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b" (")
+  let parameters = Vector.asSlice<CAbi.Lane>(&signature.parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if at > usize.ZERO { run append(&mut writer.*, b", ") }
+    run laneType(&mut writer.*, &parameters[at], &signature.declaration, span)
+    at = at + usize.ONE
+  }
+  run append(&mut writer.*, b", ...)")
+  return ()
+}
+
 effect fn emitCall(
   writer: &mut Writer,
   function: &MirFunction,
@@ -2459,15 +2515,42 @@ effect fn emitCall(
   span: Span,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let mut foreignIndex = usize.MAX
-  if let Callee.Extern {declaration} = &callee.* {
+  if let Callee.Extern {declaration, variadicArguments} = &callee.* {
     foreignIndex = foreignSignatureIndex(foreign, &declaration)
     if foreignIndex == usize.MAX {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.ForeignAbi, &owner, span)
+    }
+    let signature = &foreign[foreignIndex]
+    let fixed = Vector.length<CAbi.Lane>(&signature.parameters)
+    let actual = Vector.length<Operand>(arguments)
+    let tails = Vector.length<CAbi.VariadicArgument>(&variadicArguments)
+    if signature.global || actual < fixed || (!signature.variadic && actual != fixed)
+      || tails != actual - fixed || (signature.variadic && fixed == usize.ZERO) {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.CAbiVariadic, &owner, span)
+    }
+    if Vector.length<Operand>(providers) != usize.ZERO {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.ForeignAbi, &owner, span)
+    }
+    if let Option<Diagnostics>.Some {..} = &diagnostics.* {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.ForeignAbi, &owner, span)
+    }
+    if let Option<FailureEdge>.Some {..} = &failure.* {
       let owner = InstanceKey.identity(&function.key)
       fail Gap.make(GapCode.ForeignAbi, &owner, span)
     }
   }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
+  if foreignIndex != usize.MAX {
+    if kind.aggregate || !(run Type.equalsShared(&output.ty, &foreign[foreignIndex].result.ty)) {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.make(GapCode.ForeignAbi, &owner, span)
+    }
+  }
   // A fallible callee takes success and failure out-addresses after its arguments and returns a
   // status: 0 continues at `normal`, 1 at the failure edge (D3).
   let mut failed = Option.none<Address>()
@@ -2503,7 +2586,21 @@ effect fn emitCall(
   let mut evaluated = Vector.make<Value>()
   let mut index = usize.ZERO
   while index < values.length {
-    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index])
+    let mut tail = false
+    if foreignIndex != usize.MAX { tail = index >= Vector.length<CAbi.Lane>(&foreign[foreignIndex].parameters) }
+    let mut value = Value {scalar: pointerRepresentation(target), text: Bytes.make()}
+    if tail {
+      if let Callee.Extern {variadicArguments, ..} = &callee.* {
+        let supplied = Vector.asSlice<CAbi.VariadicArgument>(&variadicArguments)
+        let fixed = Vector.length<CAbi.Lane>(&foreign[foreignIndex].parameters)
+        value = run emitVariadicArgument(&mut writer.*, function, target, layouts, &values[index], &supplied[index - fixed], span)
+      } else {
+        let owner = InstanceKey.identity(&function.key)
+        fail Gap.make(GapCode.CAbiVariadic, &owner, span)
+      }
+    } else {
+      value = run emitArgument(&mut writer.*, function, target, layouts, &values[index])
+    }
     if value.scalar.unit {
       let owner = InstanceKey.identity(&function.key)
       fail Gap.make(GapCode.UnitParameter, &owner, span)
@@ -2521,6 +2618,7 @@ effect fn emitCall(
   if foreignIndex != usize.MAX {
     run extension(&mut writer.*, foreign[foreignIndex].result.extension)
     run laneType(&mut writer.*, &foreign[foreignIndex].result, &foreign[foreignIndex].declaration, span)
+    if foreign[foreignIndex].variadic { run variadicFunctionType(&mut writer.*, &foreign[foreignIndex], span) }
     run append(&mut writer.*, b" @")
     run quoted(&mut writer.*, Bytes.asSlice(&foreign[foreignIndex].symbol))
   } else if let Callee.Instance {key} = &callee.* {
@@ -2552,12 +2650,13 @@ effect fn emitCall(
     if foreignIndex != usize.MAX {
       let parameters = Vector.asSlice<CAbi.Lane>(&foreign[foreignIndex].parameters)
       if index >= parameters.length {
-        let owner = InstanceKey.identity(&function.key)
-        fail Gap.make(GapCode.CAbiVariadic, &owner, span)
+        run typeName(&mut writer.*, prepared[index].scalar)
+        run append(&mut writer.*, b" ")
+      } else {
+        run laneType(&mut writer.*, &parameters[index], &foreign[foreignIndex].declaration, span)
+        run append(&mut writer.*, b" ")
+        run extension(&mut writer.*, parameters[index].extension)
       }
-      run laneType(&mut writer.*, &parameters[index], &foreign[foreignIndex].declaration, span)
-      run append(&mut writer.*, b" ")
-      run extension(&mut writer.*, parameters[index].extension)
     } else {
       run typeName(&mut writer.*, prepared[index].scalar)
       run append(&mut writer.*, b" ")
@@ -3024,6 +3123,9 @@ pub effect fn foreignDeclarations(foreign: &[CAbi.Signature]) -> Vector<Declarat
   let mut at = usize.ZERO
   while at < foreign.length {
     let signature = &foreign[at]
+    if signature.variadic && (signature.global || Vector.length<CAbi.Lane>(&signature.parameters) == usize.ZERO) {
+      fail Gap.make(GapCode.CAbiVariadic, &signature.declaration, signature.span)
+    }
     let mut writer = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
     if signature.global {
       // A C object is an external global of its value lane, defined by the C side.
@@ -3056,6 +3158,7 @@ pub effect fn foreignDeclarations(foreign: &[CAbi.Signature]) -> Vector<Declarat
       run extension(&mut writer, parameters[parameter].extension)
       parameter = parameter + usize.ONE
     }
+    if signature.variadic { run append(&mut writer, b", ...") }
     run append(&mut writer, b")\n")
     run Vector.append<Declaration>(
       &mut output,
