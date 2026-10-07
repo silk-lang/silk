@@ -1075,6 +1075,13 @@ struct SelectedDeclaration {
   ordinal: usize
 }
 
+// Written slots retain their authentic owner when a member opens enclosing binders.
+union CallPrefixSlot {
+  Type {value: Shared<Type>},
+  Lifetime {value: Shared<Lifetime>},
+  Row {value: RowParameter},
+}
+
 struct CallTarget {
   foreign: bool
   variadic: bool
@@ -1082,17 +1089,21 @@ struct CallTarget {
   isPublic: bool
   signature: Shared<Result<Answer, NoRejection>>
   explicit: Vector<Argument>
-  // The binder ordinal each `explicit` argument fixes; unwritten leading lifetimes are inferred.
-  explicitOrdinals: Vector<usize>
+  // The authentic binder each argument fixes; unwritten leading lifetimes are inferred.
+  explicitSlots: Vector<CallPrefixSlot>
+  prefixOwner: Option<Shared<DeclarationId>>
+  prefixLifetimes: usize
   scopeArguments: Vector<Argument>
   inferOwner: bool
-explicitSyntax: bool
+  explicitSyntax: bool
 }
 
-// A written call prefix: its arguments and the binder ordinal each one fixes.
+// A written call prefix and its private templates for omitted body regions.
 struct CallPrefix {
   arguments: Vector<Argument>
-  ordinals: Vector<usize>
+  slots: Vector<CallPrefixSlot>
+  owner: Option<Shared<DeclarationId>>
+  lifetimes: usize
 }
 
 // Advisory positions for selecting a named callable, separate from a concrete expected type.
@@ -19800,9 +19811,18 @@ effect fn callInferenceSignature(
     at = at + usize.ONE
     ownAt = ownAt + usize.ONE
   }
-  let mapped = Vector.asSlice<Binding>(&remappedBindings)
+  return Result.succeed<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>(
+    run applyCallInferenceSignature(signature, &facts, move types, move lifetimes, move rows,
+      callableParameterStart, Vector.asSlice<Binding>(&remappedBindings)))
+}
+
+// Rebuild signature contents while retaining the binder lists and their dense coordinates.
+effect fn applyCallInferenceSignature(signature: &Shared<Result<Answer, NoRejection>>, facts: &SignatureFacts,
+  types: Vector<Shared<Type>>, lifetimes: Vector<Shared<Lifetime>>, rows: Vector<RowParameter>,
+  callableParameterStart: usize, mapped: &[Binding]) -> Shared<Result<Answer, NoRejection>>
+! OutOfMemoryError ? &mut Allocator {
   let mut parameters = Vector.make<Shared<Type>>()
-  at = usize.ZERO
+  let mut at = usize.ZERO
   while at < facts.parameters {
     let parameter = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(signature,
       fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, at) },
@@ -19870,9 +19890,42 @@ effect fn callInferenceSignature(
     },
     Vector.make<Dependency>(),
   )
-  return Result.succeed<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>(
-    run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(move applied)),
-  )
+  return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(move applied))
+}
+
+// Explicit types are fixed before operand inference, so their omitted regions are visible even
+// behind an ordinary type parameter. Extra binders are private to this call and follow every
+// original scope/own slot; they are never coordinates in a target application.
+effect fn callPrefixInferenceSignature(original: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
+  extra: usize, fixed: &[Binding]) -> Shared<Result<Answer, NoRejection>>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let facts = match move Shared.with<Result<Answer, NoRejection>, Option<SignatureFacts>>(original, signatureFacts) {
+    Option<SignatureFacts>.Some {value} => move value
+    _ => { fail RevisionMismatch {} }
+  }
+  let mut types = Vector.make<Shared<Type>>()
+  let mut lifetimes = Vector.make<Shared<Lifetime>>()
+  let mut rows = Vector.make<RowParameter>()
+  let mut at = usize.ZERO
+  while at < facts.binders {
+    let binder = Shared.with<Result<Answer, NoRejection>, Option<InferenceBinder>>(original,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<InferenceBinder> { return inferenceBinderAt(answer, at) })
+    match move binder {
+      Option<InferenceBinder>.Some {value: InferenceBinder.Type {value}} => { run Vector.append<Shared<Type>>(&mut types, move value) }
+      Option<InferenceBinder>.Some {value: InferenceBinder.Lifetime {value}} => { run Vector.append<Shared<Lifetime>>(&mut lifetimes, move value) }
+      Option<InferenceBinder>.Some {value: InferenceBinder.Row {value}} => { run Vector.append<RowParameter>(&mut rows, move value) }
+      _ => { fail RevisionMismatch {} }
+    }
+    at = at + usize.ONE
+  }
+  let mut generated = usize.ZERO
+  while generated < extra {
+    run Vector.append<Shared<Lifetime>>(&mut lifetimes, run Shared.make<Lifetime>(Lifetime.Parameter {
+      declaration: run DeclarationId.copy(fresh), ordinal: facts.binders + generated}))
+    generated = generated + usize.ONE
+  }
+  return run applyCallInferenceSignature(original, &facts, move types, move lifetimes, move rows,
+    facts.callableParameterStart, fixed)
 }
 
 effect fn typeMentionsOwner(value: &Shared<Type>, owner: &DeclarationId) -> bool
@@ -19944,6 +19997,36 @@ fn signatureConstraintCount(answer: &Result<Answer, NoRejection>) -> usize {
     }
     Result<Answer, NoRejection>.Failure {error: _} => usize.ZERO
   }
+}
+
+// Canonical signature evidence includes retained environments and bounds as well as result
+// types. None of those fields may retain a private prefix or invocation inference owner.
+effect fn signatureMentionsOwner(signature: &Signature, owner: &DeclarationId)
+  -> bool ! OutOfMemoryError ? &mut Allocator {
+  if run typeMentionsOwner(&signature.result, owner) { return true }
+  if run typeMentionsOwner(&signature.failure, owner) { return true }
+  if run argumentMentionsOwner(&Argument.Row {value: Shared.clone<Row>(&signature.requirements)}, owner) { return true }
+  let written = Vector.asSlice<Shared<Type>>(&signature.parameters)
+  let mut at = usize.ZERO
+  while at < written.length {
+    if run typeMentionsOwner(&written[at], owner) { return true }
+    at = at + usize.ONE
+  }
+  let bounds = Vector.asSlice<Constraint>(&signature.constraints)
+  at = usize.ZERO
+  while at < bounds.length {
+    if run constraintMentionsOwner(&bounds[at], owner) { return true }
+    at = at + usize.ONE
+  }
+  if let Option<Intersection>.Some {value: retained} = &signature.environment {
+    let members = Vector.asSlice<LifetimeMember>(&retained.members)
+    at = usize.ZERO
+    while at < members.length {
+      if run argumentMentionsOwner(&Argument.Lifetime {value: Shared.clone<Lifetime>(&members[at].region)}, owner) { return true }
+      at = at + usize.ONE
+    }
+  }
+  return false
 }
 
 // Whether a callee's binder at `ordinal` is one of its lifetime binders.
@@ -20074,6 +20157,132 @@ effect fn bindUseLifetimes(inference: &Shared<Result<Answer, NoRejection>>, fres
     at = at + usize.ONE
   }
   return ()
+}
+
+// Result context may solve new region holes only. The whole comparison must succeed, and a
+// transaction that also learns an unrelated original type, row or lifetime is not committed.
+effect fn bindCallPrefixResult(inference: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
+  originalCount: usize, totalCount: usize, expected: &Option<Shared<Type>>, effectTarget: bool,
+  inferred: &mut Vector<Binding>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if originalCount == totalCount || effectTarget { return () }
+  let wanted = match &expected.* {
+    Option<Shared<Type>>.Some {value} => Shared.clone<Type>(&value)
+    Option<Shared<Type>>.None => { return () }
+  }
+  let written = match move Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(inference, signatureResult) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return () }
+  }
+  let pattern = run Type.applyBindings(&written, Vector.asSlice<Binding>(&inferred.*), true)
+  let mut candidate = Vector.make<Binding>()
+  let mut variables = Vector.make<Shared<DeclarationId>>()
+  run Vector.append<Shared<DeclarationId>>(&mut variables, run Shared.make<DeclarationId>(run DeclarationId.copy(fresh)))
+  let matched = run Type.unify(&pattern, &wanted, Vector.asSlice<Shared<DeclarationId>>(&variables), Comparison.Exact, &mut candidate)
+  match move matched {
+    Unification.Unified => ()
+    Unification.Distinct => { return () }
+    Unification.Undetermined {..} => { return () }
+  }
+  let learned = Vector.asSlice<Binding>(&candidate)
+  let mut at = usize.ZERO
+  while at < learned.length {
+    if learned[at].ordinal < originalCount || learned[at].ordinal >= totalCount { return () }
+    if !Shared.with<DeclarationId, bool>(&learned[at].declaration,
+      fn(owner: &DeclarationId) -> bool { return DeclarationId.equals(owner, fresh) }) { return () }
+    let selected = match &learned[at].value {
+      Argument.Lifetime {value} => Shared.clone<Lifetime>(&value)
+      _ => { return () }
+    }
+    if run argumentMentionsOwner(&learned[at].value, fresh) { return () }
+    if let Option<Argument>.Some {value} = move bindingArgumentAt(Vector.asSlice<Binding>(&inferred.*), learned[at].ordinal) {
+      if let Argument.Lifetime {value: previous} = move value {
+        if !Lifetime.equalsShared(&previous, &selected) { return () }
+      } else { return () }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < learned.length {
+    if let Option<Argument>.None = move bindingArgumentAt(Vector.asSlice<Binding>(&inferred.*), learned[at].ordinal) {
+      run Vector.append<Binding>(&mut inferred.*, Binding {declaration: Shared.clone<DeclarationId>(&learned[at].declaration),
+        ordinal: learned[at].ordinal, value: copyArgument(&learned[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// A finite owner-local chain closes one inferred region. Cycles, absent evidence and a binding
+// of another kind are unresolved; no distinguished region is supplied to make them disappear.
+effect fn closedCallPrefixRegion(inferred: &[Binding], fresh: &DeclarationId, ordinal: usize,
+  totalCount: usize) -> Option<Shared<Lifetime>> ! OutOfMemoryError ? &mut Allocator {
+  let mut current = ordinal
+  let mut seen = Vector.make<usize>()
+  while current < totalCount {
+    if containsOrdinal(&seen, current) { return Option.none<Shared<Lifetime>>() }
+    run Vector.append<usize>(&mut seen, current)
+    let region = match move bindingArgumentAt(inferred, current) {
+      Option<Argument>.Some {value: Argument.Lifetime {value}} => move value
+      _ => { return Option.none<Shared<Lifetime>>() }
+    }
+    let next = ownedLifetimeOrdinal(&region, fresh)
+    if next == usize.MAX { return Option.some<Shared<Lifetime>>(move region) }
+    current = next
+  }
+  return Option.none<Shared<Lifetime>>()
+}
+
+// Close every extra slot first, then rewrite only original argument values. The returned vector
+// retains the original dense map for section selection; no extra coordinate can be published.
+effect fn closeCallPrefixBindings(inferred: &[Binding], fresh: &DeclarationId,
+  template: &Option<Shared<DeclarationId>>, originalCount: usize, totalCount: usize)
+  -> Option<Vector<Binding>> ! OutOfMemoryError ? &mut Allocator {
+  let owner = run Shared.make<DeclarationId>(run DeclarationId.copy(fresh))
+  let mut regions = Vector.make<Binding>()
+  let mut at = originalCount
+  while at < totalCount {
+    let value = match move run closedCallPrefixRegion(inferred, fresh, at, totalCount) {
+      Option<Shared<Lifetime>>.Some {value} => move value
+      _ => { return Option.none<Vector<Binding>>() }
+    }
+    let argument = Argument.Lifetime {value: move value}
+    if let Option<Shared<DeclarationId>>.Some {value: pending} = &template.* {
+      let declared = run DeclarationId.copyShared(&pending)
+      if run argumentMentionsOwner(&argument, &declared) { return Option.none<Vector<Binding>>() }
+    }
+    run Vector.append<Binding>(&mut regions, Binding {declaration: Shared.clone<DeclarationId>(&owner),
+      ordinal: at, value: move argument})
+    at = at + usize.ONE
+  }
+  let mut closed = Vector.make<Binding>()
+  at = usize.ZERO
+  while at < originalCount {
+    if let Option<Argument>.Some {value} = move bindingArgumentAt(inferred, at) {
+      let argument = run Argument.applyBindings(&value, Vector.asSlice<Binding>(&regions), true)
+      if let Option<Shared<DeclarationId>>.Some {value: pending} = &template.* {
+        let declared = run DeclarationId.copyShared(&pending)
+        if run argumentMentionsOwner(&argument, &declared) { return Option.none<Vector<Binding>>() }
+      }
+      // An original binder may still be deferred; extra holes may not occur in that evidence.
+      let mut types = Vector.make<usize>()
+      let mut lifetimes = Vector.make<usize>()
+      let mut rows = Vector.make<usize>()
+      match &argument {
+        Argument.Type {value} => { run Type.collectOwned(&value, fresh, &mut types, &mut lifetimes, &mut rows) }
+        Argument.Lifetime {value} => { run Type.collectOwnedLifetime(&value, fresh, &mut lifetimes) }
+        Argument.Row {value} => { run Type.collectOwnedRow(&value, fresh, &mut types, &mut lifetimes, &mut rows) }
+      }
+      let used = Vector.asSlice<usize>(&lifetimes)
+      let mut usedAt = usize.ZERO
+      while usedAt < used.length {
+        if used[usedAt] >= originalCount { return Option.none<Vector<Binding>>() }
+        usedAt = usedAt + usize.ONE
+      }
+      run Vector.append<Binding>(&mut closed, Binding {declaration: Shared.clone<DeclarationId>(&owner), ordinal: at, value: move argument})
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<Vector<Binding>>(move closed)
 }
 
 fn bindingArgumentAt(bindings: &[Binding], ordinal: usize) -> Option<Argument> {
@@ -22109,6 +22318,68 @@ effect fn appendRequirementsSuffix(
   return Option.none<Shared<Rejection>>()
 }
 
+fn callPrefixSlot(binder: &Binder) -> CallPrefixSlot {
+  return match &binder.* {
+    Binder.Type {value, ..} => CallPrefixSlot.Type {value: Shared.clone<Type>(&value)}
+    Binder.Lifetime {value, ..} => CallPrefixSlot.Lifetime {value: Shared.clone<Lifetime>(&value)}
+    Binder.Row {value, ..} => CallPrefixSlot.Row {value: RowParameter {
+      declaration: Shared.clone<DeclarationId>(&value.declaration), ordinal: value.ordinal}}
+  }
+}
+
+fn copyCallPrefixOwner(owner: &Option<Shared<DeclarationId>>) -> Option<Shared<DeclarationId>> {
+  return match &owner.* {
+    Option<Shared<DeclarationId>>.Some {value} => Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&value))
+    Option<Shared<DeclarationId>>.None => Option.none<Shared<DeclarationId>>()
+  }
+}
+
+effect fn copyCallPrefixSlots(slots: &[CallPrefixSlot]) -> Vector<CallPrefixSlot>
+! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector.make<CallPrefixSlot>()
+  let mut at = usize.ZERO
+  while at < slots.length {
+    let value = match &slots[at] {
+      CallPrefixSlot.Type {value} => CallPrefixSlot.Type {value: Shared.clone<Type>(&value)}
+      CallPrefixSlot.Lifetime {value} => CallPrefixSlot.Lifetime {value: Shared.clone<Lifetime>(&value)}
+      CallPrefixSlot.Row {value} => CallPrefixSlot.Row {value: RowParameter {
+        declaration: Shared.clone<DeclarationId>(&value.declaration), ordinal: value.ordinal}}
+    }
+    run Vector.append<CallPrefixSlot>(&mut copied, move value)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+fn callPrefixSlotOrdinal(slot: &CallPrefixSlot, owner: &DeclarationId) -> usize {
+  return match &slot.* {
+    CallPrefixSlot.Type {value} => Shared.with<Type, usize>(&value,
+      fn(parameter: &Type) -> usize { return Type.parameterOrdinalOf(parameter, owner) })
+    CallPrefixSlot.Lifetime {value} => ownedLifetimeOrdinal(&value, owner)
+    CallPrefixSlot.Row {value} => {
+      if Shared.with<DeclarationId, bool>(&value.declaration, fn(declaration: &DeclarationId) -> bool { return DeclarationId.equals(declaration, owner) }) { return value.ordinal }
+      return usize.MAX
+    }
+  }
+}
+
+effect fn callPrefixInferenceOrdinal(slot: &CallPrefixSlot, schema: &TargetSchema,
+  signature: &Shared<Result<Answer, NoRejection>>, opened: &Shared<Result<Answer, NoRejection>>)
+  -> usize ! OutOfMemoryError ? &mut Allocator {
+  let owner = run DeclarationId.copyShared(&schema.declaration)
+  let ordinal = callPrefixSlotOrdinal(slot, &owner)
+  if ordinal != usize.MAX { return sectionInferenceOrdinal(schema, opened, ordinal) }
+  let scopes = Vector.asSlice<ApplicationScope>(&schema.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    let owner = run DeclarationId.copyShared(&scopes[at].owner)
+    let ordinal = callPrefixSlotOrdinal(slot, &owner)
+    if ordinal != usize.MAX { return run sectionScopeInferenceOrdinal(schema, signature, &owner, ordinal) }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
 // A written call prefix fixes binders like an aggregate prefix: lifetime and ordinary arguments
 // are mapped in separate namespaces (`writtenBinderOrdinals`), and every unwritten binder is an
 // inference variable.
@@ -22128,9 +22399,9 @@ effect fn resolveCallPrefix(
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator {
   let mut explicit = Vector.make<Argument>()
-  let mut ordinals = Vector.make<usize>()
+  let mut slots = Vector.make<CallPrefixSlot>()
   if !written.present {
-    return Result.succeed<CallPrefix, Shared<Rejection>>(CallPrefix {arguments: move explicit, ordinals: move ordinals})
+    return Result.succeed<CallPrefix, Shared<Rejection>>(CallPrefix {arguments: move explicit, slots: move slots, owner: Option.none<Shared<DeclarationId>>(), lifetimes: usize.ZERO})
   }
   let source = run typeNode(&mut resolver.*, caller, written.id)
   let value = match move source {
@@ -22171,8 +22442,17 @@ effect fn resolveCallPrefix(
         run rejectKind(&resolver.*, caller, value.span, b"", GenericKind.Type, supplied),
       )
     }
+    let declared = match move run declarationAt(&mut resolver.*, target, ordinal) {
+      Option<DeclarationId>.Some {value} => move value
+      _ => { fail RevisionMismatch {} }
+    }
+    let mut prefixScope = Bytes.make()
+    run Bytes.append(&mut prefixScope, b"\0call-prefix-lifetimes")
+    run RuntimeEncoding.word(&mut prefixScope, usize.toU64(callerOrdinal))
+    run RuntimeEncoding.word(&mut prefixScope, usize.toU64(written.id.index))
+    let prefixOwner = run DeclarationId.inference(&declared, Bytes.asSlice(&prefixScope))
     let mut elision = LifetimeElision {
-      owner: Option.none<DeclarationId>(),
+      owner: Option.some<DeclarationId>(run DeclarationId.copy(&prefixOwner)),
       nextOrdinal: usize.ZERO,
       output: false,
       resultDefault: Option.none<Shared<Lifetime>>(),
@@ -22208,7 +22488,7 @@ effect fn resolveCallPrefix(
       if let Option<Shared<Rejection>>.Some {value: diagnostic} = move failure {
         return Result.failResult<CallPrefix, Shared<Rejection>>(move diagnostic)
       }
-      run Vector.append<usize>(&mut ordinals, formalAt)
+      run Vector.append<CallPrefixSlot>(&mut slots, callPrefixSlot(&formal[formalAt]))
       at = at + usize.ONE
     }
     if requirements.present {
@@ -22220,9 +22500,12 @@ effect fn resolveCallPrefix(
       if let Option<Shared<Rejection>>.Some {value: diagnostic} = move failure {
         return Result.failResult<CallPrefix, Shared<Rejection>>(move diagnostic)
       }
-      run Vector.append<usize>(&mut ordinals, suffixAt)
+      run Vector.append<CallPrefixSlot>(&mut slots, callPrefixSlot(&formal[suffixAt]))
     }
-    return Result.succeed<CallPrefix, Shared<Rejection>>(CallPrefix {arguments: move explicit, ordinals: move ordinals})
+    let mut pending = Option.none<Shared<DeclarationId>>()
+    if elision.nextOrdinal != usize.ZERO { pending = Option.some<Shared<DeclarationId>>(run Shared.make<DeclarationId>(move prefixOwner)) }
+    return Result.succeed<CallPrefix, Shared<Rejection>>(CallPrefix {arguments: move explicit, slots: move slots,
+      owner: move pending, lifetimes: elision.nextOrdinal})
   }
   return Result.failResult<CallPrefix, Shared<Rejection>>(
     run reject(&resolver.*, caller, RejectionCode.Unsupported, value.span),
@@ -22511,7 +22794,9 @@ effect fn inherentSelectedCallTarget(
     }
   }
   target.explicit = move written.arguments
-  target.explicitOrdinals = move written.ordinals
+  target.explicitSlots = move written.slots
+  target.prefixOwner = move written.owner
+  target.prefixLifetimes = written.lifetimes
   return Result.succeed<ResolvedTarget, Shared<Rejection>>(
     ResolvedTarget.Function {target: move target},
   )
@@ -22586,7 +22871,7 @@ effect fn serviceOperationTarget(
   }
   return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Function {target: CallTarget {
     foreign: false, variadic: false, declaration: move declaration, isPublic: true, signature: move signature,
-    explicit: move written.arguments, explicitOrdinals: move written.ordinals, scopeArguments: move scopeArguments,
+    explicit: move written.arguments, explicitSlots: move written.slots, prefixOwner: move written.owner, prefixLifetimes: written.lifetimes, scopeArguments: move scopeArguments,
     inferOwner: inferOwner, explicitSyntax: syntax.generics.present,
   }})
 }
@@ -23238,7 +23523,7 @@ effect fn callFunctionTarget(
           isPublic: isPublic,
           signature: move signature,
           explicit: move explicit.arguments,
-          explicitOrdinals: move explicit.ordinals,
+          explicitSlots: move explicit.slots, prefixOwner: move explicit.owner, prefixLifetimes: explicit.lifetimes,
           scopeArguments: Vector.make<Argument>(),
           inferOwner: false,
         explicitSyntax: syntax.generics.present,
@@ -23581,6 +23866,10 @@ effect fn resolveNamedRepresentation(
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
   }
+  if target.prefixLifetimes != usize.ZERO {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(
+      run reject(&resolver.*, module, RejectionCode.BodyLifetimeElisionUnavailable, span))
+  }
   let count = Shared.with<Result<Answer, NoRejection>, usize>(
     &target.signature,
     signatureBinderCount,
@@ -23770,7 +24059,8 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
       isPublic: target.isPublic,
       signature: Shared.clone<Result<Answer, NoRejection>>(&target.signature),
       explicit: run copyArguments(Vector.asSlice<Argument>(&target.explicit)),
-      explicitOrdinals: run copySlots(Vector.asSlice<usize>(&target.explicitOrdinals)),
+      explicitSlots: run copyCallPrefixSlots(Vector.asSlice<CallPrefixSlot>(&target.explicitSlots)),
+      prefixOwner: copyCallPrefixOwner(&target.prefixOwner), prefixLifetimes: target.prefixLifetimes,
       scopeArguments: run copyArguments(Vector.asSlice<Argument>(&target.scopeArguments)),
       inferOwner: target.inferOwner,
     explicitSyntax: target.explicitSyntax,
@@ -36514,7 +36804,7 @@ effect fn checkInvocation<'scope>(
     Option<TargetSchema>.Some {value} => move value
     Option<TargetSchema>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
   }
-  let inference = match move run callInferenceSignature(
+  let originalInference = match move run callInferenceSignature(
     &resolver.*,
     &target.signature,
     &schema,
@@ -36527,8 +36817,8 @@ effect fn checkInvocation<'scope>(
       return Result.failResult<BodyNodeId, Shared<Rejection>>(move error)
     }
   }
-  let binderCount = Shared.with<Result<Answer, NoRejection>, usize>(
-    &inference,
+  let originalBinderCount = Shared.with<Result<Answer, NoRejection>, usize>(
+    &originalInference,
     signatureBinderCount,
   )
   let callOwner = run Shared.make<DeclarationId>(run DeclarationId.copy(&freshOwner))
@@ -36538,24 +36828,45 @@ effect fn checkInvocation<'scope>(
     Shared.clone<DeclarationId>(&callOwner))
   let mut inferred = Vector.make<Binding>()
   let explicit = Vector.asSlice<Argument>(&target.explicit)
-  let explicitOrdinals = Vector.asSlice<usize>(&target.explicitOrdinals)
+  let writtenSlots = Vector.asSlice<CallPrefixSlot>(&target.explicitSlots)
+  if writtenSlots.length != explicit.length { fail RevisionMismatch {} }
+  let mut mappedExplicitOrdinals = Vector.make<usize>()
+  let mut templateBindings = Vector.make<Binding>()
+  if let Option<Shared<DeclarationId>>.Some {value: templateOwner} = &target.prefixOwner {
+    let mut at = usize.ZERO
+    while at < target.prefixLifetimes {
+      run Vector.append<Binding>(&mut templateBindings, Binding {
+        declaration: Shared.clone<DeclarationId>(&templateOwner), ordinal: at,
+        value: Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Parameter {
+          declaration: run DeclarationId.copy(&freshOwner), ordinal: originalBinderCount + at})}})
+      at = at + usize.ONE
+    }
+  } else if target.prefixLifetimes != usize.ZERO { fail RevisionMismatch {} }
   let mut binderAt = usize.ZERO
   while binderAt < explicit.length {
-    let value = match & explicit[binderAt] {
-      Argument.Type {value} => Argument.Type {value: Shared.clone<Type>(&value)}
-      Argument.Lifetime {value} => Argument.Lifetime {value: Shared.clone<Lifetime>(&value)}
-      Argument.Row {value} => Argument.Row {value: Shared.clone<Row>(&value)}
+    let ordinal = run callPrefixInferenceOrdinal(&writtenSlots[binderAt], &schema, &target.signature, &originalInference)
+    if ordinal == usize.MAX || ordinal >= originalBinderCount {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
     }
+    run Vector.append<usize>(&mut mappedExplicitOrdinals, ordinal)
+    let value = run Argument.applyBindings(&explicit[binderAt], Vector.asSlice<Binding>(&templateBindings), true)
     run Vector.append<Binding>(
       &mut inferred,
       Binding {
         declaration: Shared.clone<DeclarationId>(&callOwner),
-        ordinal: explicitOrdinals[binderAt],
+        ordinal: ordinal,
         value: move value,
       },
     )
     binderAt = binderAt + usize.ONE
   }
+  let explicitOrdinals = Vector.asSlice<usize>(&mappedExplicitOrdinals)
+  let inference = if target.prefixLifetimes == usize.ZERO {
+    Shared.clone<Result<Answer, NoRejection>>(&originalInference)
+  } else {
+    run callPrefixInferenceSignature(&originalInference, &freshOwner, target.prefixLifetimes, Vector.asSlice<Binding>(&inferred))
+  }
+  let binderCount = originalBinderCount + target.prefixLifetimes
   let mut typedArguments = Vector.make<BodyNodeId>()
   let parameterOffset = parameterCount - CallArguments.length(arguments)
   // A callee's static parameters take the values this body's selection pass evaluated for this
@@ -36691,9 +37002,9 @@ effect fn checkInvocation<'scope>(
   let mut pendingRows = Vector.make<usize>()
   if parameterOffset != usize.ZERO && !run sectionEvidence(&inference, &freshOwner, Vector.asSlice<Binding>(&inferred),
     parameterOffset, &mut pendingTypes, &mut pendingLifetimes, &mut pendingRows) {
-    environmentAt = binderCount
+    environmentAt = originalBinderCount
   }
-  while environmentAt < binderCount {
+  while environmentAt < originalBinderCount {
     let open = match move bindingArgumentAt(Vector.asSlice<Binding>(&inferred), environmentAt) {
       Option<Argument>.Some {..} => false
       Option<Argument>.None => !containsOrdinal(&pendingLifetimes, environmentAt) && Shared.with<Result<Answer, NoRejection>, bool>(&inference,
@@ -36712,16 +37023,42 @@ effect fn checkInvocation<'scope>(
     environmentAt = environmentAt + usize.ONE
   }
   if parameterOffset == usize.ZERO && !valueConstruction {
-    run bindUseLifetimes(&inference, &freshOwner, &callOwner, binderCount, expected, effectTarget, &mut inferred)
+    run bindUseLifetimes(&inference, &freshOwner, &callOwner, originalBinderCount, expected, effectTarget, &mut inferred)
+  }
+  if target.prefixLifetimes != usize.ZERO {
+    run bindCallPrefixResult(&inference, &freshOwner, originalBinderCount, binderCount, expected, effectTarget, &mut inferred)
+    inferred = match move run closeCallPrefixBindings(Vector.asSlice<Binding>(&inferred), &freshOwner,
+      &target.prefixOwner, originalBinderCount, binderCount) {
+      Option<Vector<Binding>>.Some {value} => move value
+      Option<Vector<Binding>>.None => {
+        return run bodyRejection(&resolver.*, module, RejectionCode.BodyLifetimeElisionUnavailable, span)
+      }
+    }
+  }
+  if target.prefixLifetimes != usize.ZERO {
+    let scoped = Vector.asSlice<Argument>(&target.scopeArguments)
+    let mut scopeAt = usize.ZERO
+    while scopeAt < scoped.length {
+      if run argumentMentionsOwner(&scoped[scopeAt], &freshOwner) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
+      }
+      if let Option<Shared<DeclarationId>>.Some {value: template} = &target.prefixOwner {
+        let pending = run DeclarationId.copyShared(&template)
+        if run argumentMentionsOwner(&scoped[scopeAt], &pending) {
+          return run bodyRejection(&resolver.*, module, RejectionCode.BodyLifetimeElisionUnavailable, span)
+        }
+      }
+      scopeAt = scopeAt + usize.ONE
+    }
   }
   let mut unresolvedAt = usize.ZERO
-  while unresolvedAt < binderCount {
+  while unresolvedAt < originalBinderCount {
     let evidence = bindingArgumentAt(Vector.asSlice<Binding>(&inferred), unresolvedAt)
     if let Option<Argument>.None = move evidence {
       if parameterOffset != usize.ZERO {
         return run finishDeferredNamedSection(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
           module, caller, &mut nodes.*, expression, span, &target.declaration, &target.signature,
-          &inference, &freshOwner, Vector.asSlice<Binding>(&inferred), parameterOffset,
+          &originalInference, &freshOwner, Vector.asSlice<Binding>(&inferred), parameterOffset,
           move typedArguments, constraints, expected, contractBody, sectionContext(expected, valueConstruction))
       }
       return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
@@ -36730,19 +37067,18 @@ effect fn checkInvocation<'scope>(
   }
   // Only rigid caller evidence crosses into canonical signature resolution and publication.
   let canonicalOwner = run Shared.make<DeclarationId>(run DeclarationId.copy(&target.declaration))
-  let completed = Vector.asMutSlice<Binding>(&mut inferred)
+  let completed = Vector.asSlice<Binding>(&inferred)
   let mut completedAt = usize.ZERO
   while completedAt < completed.length {
     if run argumentMentionsOwner(&completed[completedAt].value, &freshOwner) {
       return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
     }
-    completed[completedAt].declaration = Shared.clone<DeclarationId>(&canonicalOwner)
     completedAt = completedAt + usize.ONE
   }
   // Written arguments are already bindings; skipped lifetimes were inferred beside them.
   let mut specialized = Vector.make<Argument>()
   let mut specializeAt = usize.ZERO
-  while specializeAt < binderCount {
+  while specializeAt < originalBinderCount {
     let evidence = bindingArgumentAt(Vector.asSlice<Binding>(&inferred), specializeAt)
     match move evidence {
       Option<Argument>.Some {value} => run Vector.append<Argument>(&mut specialized, move value)
@@ -36768,7 +37104,7 @@ effect fn checkInvocation<'scope>(
   let mut requirementRow = run signatureRequirements(&inference)
   let mut directApplication = Option.none<Application>()
   let mut appliedBounds = Vector.make<Constraint>()
-  if binderCount == usize.ZERO {
+  if originalBinderCount == usize.ZERO {
     let boundCount = Shared.with<Result<Answer, NoRejection>, usize>(
       &target.signature,
       signatureConstraintCount,
@@ -36787,7 +37123,7 @@ effect fn checkInvocation<'scope>(
       boundAt = boundAt + usize.ONE
     }
   }
-  if binderCount > usize.ZERO {
+  if originalBinderCount > usize.ZERO {
     let selected = run checkedDirectApplication(
       &mut resolver.*,
       &mut owner.*,
@@ -36843,6 +37179,17 @@ effect fn checkInvocation<'scope>(
     }
     match & applied.outcome {
       Outcome.Success {value: Value.Signature {signature}} => {
+        if target.prefixLifetimes != usize.ZERO {
+          if run signatureMentionsOwner(&signature, &freshOwner) {
+            return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
+          }
+          if let Option<Shared<DeclarationId>>.Some {value: template} = &target.prefixOwner {
+            let pending = run DeclarationId.copyShared(&template)
+            if run signatureMentionsOwner(&signature, &pending) {
+              return run bodyRejection(&resolver.*, module, RejectionCode.BodyLifetimeElisionUnavailable, span)
+            }
+          }
+        }
         appliedBounds = run copyConstraints(Vector.asSlice<Constraint>(&signature.constraints))
         result = Option.some<Shared<Type>>(Shared.clone<Type>(&signature.result))
         failureType = Shared.clone<Type>(&signature.failure)
@@ -50792,7 +51139,7 @@ effect fn selectInherentReceiverCall(
                 isPublic: published,
                 signature: move signature,
                 explicit: Vector.make<Argument>(),
-                explicitOrdinals: Vector.make<usize>(),
+                explicitSlots: Vector.make<CallPrefixSlot>(), prefixOwner: Option.none<Shared<DeclarationId>>(), prefixLifetimes: usize.ZERO,
                 scopeArguments: move scopeArguments,
                 inferOwner: inferOwner,
                 explicitSyntax: false,
