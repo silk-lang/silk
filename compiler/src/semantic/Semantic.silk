@@ -106,7 +106,7 @@ import semantic.DeclarationId {DeclarationId, OwnerStep}
 import semantic.FinalProfile {FinalProfile}
 import semantic.InitialProfile {InitialProfile}
 import semantic.IntrinsicCatalog {runtimeMember as intrinsicRuntimeMember, typeFamily as intrinsicTypeFamily}
-import semantic.Intrinsic
+import semantic.Intrinsic as CheckedIntrinsic
 import semantic.Intrinsic {
   Member as IntrinsicMember,
   Primitive as IntrinsicPrimitive,
@@ -9018,7 +9018,7 @@ effect fn resolveTypeDescriptor(
       let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, argument, binders, &mut elision.*)
       return match move resolved {
         Result<Shared<Type>, Shared<Rejection>>.Success {value: described} => {
-          if sequence { return Result.succeed<Shared<Type>, Shared<Rejection>>(run Intrinsic.staticSequenceType(&described)) }
+          if sequence { return Result.succeed<Shared<Type>, Shared<Rejection>>(run CheckedIntrinsic.staticSequenceType(&described)) }
           return Result.succeed<Shared<Type>, Shared<Rejection>>(run Shared.make<Type>(Type.TypeDescriptor {owner: move described}))
         }
         Result<Shared<Type>, Shared<Rejection>>.Failure {error} => Result.failResult<Shared<Type>, Shared<Rejection>>(move error)
@@ -18703,13 +18703,13 @@ effect fn parameterSpanOr(
 // dependencies. The enclosing scope is always resolved as written; `supplied` then binds its
 // binders in order, `Self` last, by re-resolving the header under those arguments rather than
 // substituting types. The declaration's own binders stay its rigid parameters either way.
-fn signatureMentionsPhaseOnly(parameters: &[Shared<Type>], result: &Shared<Type>) -> bool {
+fn signatureMentionsPhaseOnly(parameters: &[Shared<Type>], staticSlots: &[usize], result: &Shared<Type>, channels: &Channels) -> bool {
   let mut at = usize.ZERO
   while at < parameters.length {
-    if Type.mentionsPhaseOnly(&parameters[at]) { return true }
+    if !isStaticIndex(staticSlots, at) && Type.mentionsPhaseOnly(&parameters[at]) { return true }
     at = at + usize.ONE
   }
-  return Type.mentionsPhaseOnly(result)
+  return Type.mentionsPhaseOnly(result) || Type.mentionsPhaseOnly(&channels.failure) || Row.mentionsPhaseOnly(&channels.requirements)
 }
 
 // The validated inherent head owns its domain premises. Rebind them through the current Self
@@ -19177,7 +19177,7 @@ effect fn resolveSignatureUnder(
   // nothing to retain. An `effect fn` success type gets no such default. Otherwise the
   // established elision applies.
   let closed = !value.isEffect && !hasUnknown && Vector.length<Shared<Lifetime>>(&retained) == usize.ZERO
-  if let Option<HirId>.Some {value: id} = move value.result {
+  if let Option<HirId>.Some {value: id} = &value.result {
     if closed {
       elision.staticEnvironment = run effectResult(
         &mut resolver.*,
@@ -19268,12 +19268,32 @@ effect fn resolveSignatureUnder(
     }
   }
   // Descriptors and sequences exist only during static evaluation; runtime contracts cannot
-  // carry either family at any depth in a parameter or result.
-  if !value.isStatic && signatureMentionsPhaseOnly(Vector.asSlice<Shared<Type>>(&parameters), &result,
+  // carry either family at any depth in inputs, results, failures or requirements.
+  if !value.isStatic && signatureMentionsPhaseOnly(Vector.asSlice<Shared<Type>>(&parameters), Vector.asSlice<usize>(&value.staticSlots), &result, &channels,
   ) {
     let mut phaseSpan = value.span
-    if Type.mentionsPhaseOnly(&result) && value.result.present {
-      let authored = run typeNode(&mut resolver.*, &module, value.result.id)
+    let declared = Vector.asSlice<Shared<Type>>(&parameters)
+    let mut phaseAt = usize.ZERO
+    while phaseAt < declared.length {
+      if !isStaticIndex(Vector.asSlice<usize>(&value.staticSlots), phaseAt) && Type.mentionsPhaseOnly(&declared[phaseAt]) {
+        let authored = run typeNode(&mut resolver.*, &module, entries[phaseAt])
+        if let Option<HeaderSyntax>.Some {value: syntax} = move authored { phaseSpan = syntax.span }
+        break
+      }
+      phaseAt = phaseAt + usize.ONE
+    }
+    if Type.mentionsPhaseOnly(&result) {
+      if let Option<HirId>.Some {value: phaseResult} = &value.result {
+        let authored = run typeNode(&mut resolver.*, &module, phaseResult)
+        if let Option<HeaderSyntax>.Some {value: syntax} = move authored { phaseSpan = syntax.span }
+      }
+    }
+    if Type.mentionsPhaseOnly(&channels.failure) && value.failures.present {
+      let authored = run typeNode(&mut resolver.*, &module, value.failures.id)
+      if let Option<HeaderSyntax>.Some {value: syntax} = move authored { phaseSpan = syntax.span }
+    }
+    if Row.mentionsPhaseOnly(&channels.requirements) && value.requirements.present {
+      let authored = run typeNode(&mut resolver.*, &module, value.requirements.id)
       if let Option<HeaderSyntax>.Some {value: syntax} = move authored { phaseSpan = syntax.span }
     }
     return memberRejected(run reject(&resolver.*, &module, RejectionCode.StaticPhaseViolation, phaseSpan), move dependencies)
@@ -29128,10 +29148,10 @@ fn memberUncovered(rows: &Vector<CoverageRow>, member: usize) -> bool {
 }
 
 // A pattern binder resolves to the binding place declared by its arm; every use is a fresh place node.
-effect fn patternBindingUse(nodes: &[BodyNode], binder: HirId) -> Option<PatternBindingUse> ! OutOfMemoryError ? &mut Allocator {
+effect fn patternBindingUse(resolver: &Resolver, nodes: &[BodyNode], binder: HirId) -> Option<PatternBindingUse> ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
   while at < nodes.length {
-    if nodes[at].origin.syntax.index == binder.index {
+    if nodes[at].origin.syntax.index == binder.index && !completedOccurrenceContains(resolver, at, false) {
       if let BodyNodeKind.Expression {ty, form: BodyExpression.PatternBinding {subject, path, access}} = &nodes[at].kind {
         return Option.some<PatternBindingUse>(PatternBindingUse {
           ty: Shared.clone<Type>(&ty),
@@ -32049,10 +32069,35 @@ effect fn anonymousEnvironmentType(identity: &DeclarationId, signature: &Shared<
   return run Type.callableSchema(move recipe, move fields, Vector.make<CallableFieldInput>())
 }
 
-fn bodyLocalIndex(locals: &[BodyLocal], syntax: usize) -> Option<usize> {
+// Original HIR binders are shared by generated iterations; a finished iteration's actual
+// local/node ranges have left lexical scope. Lookup retains the outer body's bindings and
+// the currently checked occurrence, which is recorded only after its body succeeds.
+fn completedOccurrenceContains(resolver: &Resolver, index: usize, local: bool) -> bool {
+  let frames = Vector.asSlice<BodyFrame>(&resolver.bodies)
+  if frames.length == usize.ZERO { return false }
+  let facts = Vector.asSlice<SelectedFact>(&frames[frames.length - usize.ONE].occurrences)
+  let mut at = usize.ZERO
+  while at < facts.length {
+    if let SelectedFact.Iteration {nodeStart, nodeEnd, localStart, localEnd, ..} = &facts[at] {
+      let mut start = nodeStart
+      let mut end = nodeEnd
+      if local {
+        start = localStart
+        end = localEnd
+      }
+      if start <= index && index < end { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn bodyLocalIndex(resolver: &Resolver, locals: &[BodyLocal], syntax: usize) -> Option<usize> {
   let mut at = usize.ZERO
   while at < locals.length {
-    if locals[at].origin.syntax.index == syntax { return Option.some<usize>(at) }
+    if locals[at].origin.syntax.index == syntax && !completedOccurrenceContains(resolver, at, true) {
+      return Option.some<usize>(at)
+    }
     at = at + usize.ONE
   }
   return Option.none<usize>()
@@ -32126,14 +32171,14 @@ effect fn checkedIdentifier(
       Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => Result.failResult<CheckedIdentifier, Shared<Rejection>>(move error)
     }
   }
-  if let Option<usize>.Some {value: at} = move bodyLocalIndex(locals, binder.index) {
+  if let Option<usize>.Some {value: at} = move bodyLocalIndex(&resolver.*, locals, binder.index) {
     return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
       ty: Shared.clone<Type>(&locals[at].ty),
       form: BodyExpression.Local {local: BodyLocalId {index: at}},
     })
   }
   if !staticBody {
-    let used = run patternBindingUse(nodes, binder)
+    let used = run patternBindingUse(&resolver.*, nodes, binder)
     if let Option<PatternBindingUse>.Some {value: use} = move used {
       return Result.succeed<CheckedIdentifier, Shared<Rejection>>(CheckedIdentifier {
         ty: move use.ty,
@@ -36629,7 +36674,7 @@ effect fn checkInvocation<'scope>(
       if staticBody == intrinsicIsRuntime(member) {
         return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span)
       }
-      if Intrinsic.sequencePending(member) { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
+      if CheckedIntrinsic.sequencePending(member) { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
       if CallArguments.length(arguments) != intrinsicArity(member) {
         return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
       }
@@ -40525,13 +40570,13 @@ effect fn bindingAnnotationType(
 }
 
 /// The mutable local an identifier assignment target is bound to, if any.
-fn mutableLocalOf(locals: &[BodyLocal], binding: HirRef) -> Option<BodyLocalId> {
+fn mutableLocalOf(resolver: &Resolver, locals: &[BodyLocal], binding: HirRef) -> Option<BodyLocalId> {
   if !binding.present {
     return Option.none<BodyLocalId>()
   }
   let mut localAt = usize.ZERO
   while localAt < locals.length {
-    if locals[localAt].origin.syntax.index == binding.id.index && locals[localAt].mutable {
+    if locals[localAt].origin.syntax.index == binding.id.index && locals[localAt].mutable && !completedOccurrenceContains(resolver, localAt, true) {
       return Option.some<BodyLocalId>(BodyLocalId {index: localAt})
     }
     localAt = localAt + usize.ONE
@@ -41142,7 +41187,7 @@ effect fn checkStatements(
           cursor,
           target,
         ) {
-          selected = mutableLocalOf(Vector.asSlice<BodyLocal>(&locals.*), binding)
+          selected = mutableLocalOf(&resolver.*, Vector.asSlice<BodyLocal>(&locals.*), binding)
         }
         let local = match move selected {
           Option<BodyLocalId>.Some {value: found} => found
@@ -49507,7 +49552,8 @@ effect fn selectionContextFacts(resolver: &mut Resolver, owner: &mut Query<Word,
     let mut iterations = Vector.make<IterationFacts>()
     let mut ordinal = usize.ZERO
     while ordinal < selectedIterations.length {
-      let nested = run selectionContextFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &selectedIterations[ordinal].selection)
+      let child = run MixedBody.copySharedBody(&selectedIterations[ordinal].selection)
+      let nested = run selectionContextFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &child)
       let calls = match move nested {
         Result<Vector<ResolvedCall>, Shared<Rejection>>.Success {value} => value
         Result<Vector<ResolvedCall>, Shared<Rejection>>.Failure {error} => { return Result.failResult<Vector<ResolvedCall>, Shared<Rejection>>(move error) }
