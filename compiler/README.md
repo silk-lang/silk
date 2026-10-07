@@ -36,6 +36,9 @@ computed under those applications; standard-library Option and Result use the sa
 as user declarations. Runtime text (`string<'static>`) and byte-string (`&'static [u8]`) literals
 store their decoded bytes in a private constant and build the same address-and-byte-length
 descriptor as a slice. Slice subranges and unions with string or f64 members remain follow-up work.
+Runtime string `==` and `!=` compare byte lengths and then exact UTF-8 bytes with a bounded MIR
+loop. Both operands are evaluated once, left to right; empty views and unequal lengths require no
+backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
 Semantic instances keep `'static` and region-sharing evidence but number caller-local regions by
 first appearance, so call sites that lend different locals share one instance; each semantic
 instance is validated separately. Complete selected MIR recipes
