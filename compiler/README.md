@@ -104,6 +104,11 @@ Anonymous-environment availability preserves unchanged loop headers even when a 
 may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
 state after each repeating edge; the missing field remains unavailable. Conditions are checked
 against the pre-condition header, and only normal/continue arrivals repeat.
+Runtime-index writes to fully initialized owned arrays preserve that availability. If the
+assignment's target root has a may-hole, including one created by the RHS, its indexed uncertainty
+remains explicit. The array-write/capture and exact RHS-transfer controls passed with the retained
+loop/guard controls (four focused tests, 54 ms; maximum 30 ms). Integrated corpus and N1 advancement
+remain unproved.
 Effect fn bodies are typed against their declared success, failure and requirement channels.
 Calling an `effect fn` builds an exact Effect whose representation is the call's application and
 written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect
