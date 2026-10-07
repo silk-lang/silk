@@ -10181,7 +10181,11 @@ effect fn conflictCase() -> i32 ! OutOfMemoryError {
   return Shared.${outer}<Counter, i32>(&first, nested(move alias))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
-pub fn main() -> i32 { return run Effect.catchAll(conflictCase(), recover) }`,
+pub fn main() -> i32 {
+  let observed = run Effect.catchAll(conflictCase(), recover)
+  drop observed
+  return 0
+}`,
         expected: { _tag: 'Trap' },
       }
     }),
