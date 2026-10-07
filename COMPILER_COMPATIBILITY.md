@@ -170,6 +170,27 @@ Each entry records:
   `compiler/src/semantic/SemanticCases.silk`, and the native corpus programs that use the storage
   core.
 
+### Generic record union members and cleanup re-entry in selfhost
+
+- **Status:** implemented on 2026-10-06 on PR #1089 (Stage 1 self-build, the `union-form` gap in
+  `silk/vector.silk`).
+- **Rule:** a nominal application is a structural-union member even while its arguments are open,
+  so a generic body injects into and matches `Empty<T> | Full<T>`; each closed instance maps the
+  authored member to its canonical tag. Instance discovery admits a re-entry with changed type
+  arguments while it runs inside a Drop hook's cleanup and every type argument stays within the
+  owned structure of the value whose cleanup selected the hook (GEN-006).
+- **Compilers:** both compilers admit nominal union members and follow cleanup re-entry under an
+  immutable root. The bootstrap tracks the root together with the selected hook's own type
+  arguments as a frame; selfhost keeps the single root the reference names and requires every
+  later type argument, including a nested hook's, to lie within that root's structural parts and
+  nominal fields, unfolding a declaration again only at a strictly smaller instantiation.
+- **Source migration:** none.
+- **Diagnostics and limits:** growth outside the root's owned structure, including a hook that
+  drops a larger value of its own type, keeps `ExpandingSpecialization`. A closed instance whose
+  members collapse to one runtime identity keeps the `union-form` gap.
+- **Evidence:** `genericRecordUnionsInjectAndMatchInGenericBodies` and
+  `cleanupReentryStaysWithinItsOwnedRoot` in `compiler/src/semantic/SemanticCases.silk`.
+
 ### Static aggregate reflection subset in selfhost
 
 - **Status:** implemented on 2026-10-02 on PR #664 (B12 c39, decision D2); verification is pending
@@ -259,9 +280,8 @@ Each entry records:
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
-  guard and loop gaps. Not checked by a test: a partially moved owner moved on only some paths, the
-  borrowing match result gap, which current typing cannot reach because it borrows only places and
-  Drop-free array literals, and the deferred glue forms.
+  guard, loop and borrowing match result gaps. Not checked by a test: a partially moved owner moved
+  on only some paths, and the deferred glue forms.
 
 ### Selfhost keeps unavailable conditional sealed-property proofs explicit
 

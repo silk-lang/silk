@@ -5,17 +5,26 @@ first demanded ordinary-body checks.
 The inspection modes read one Silk file and print its flat AST and syntax diagnostics, or its
 lowered module and declaration fingerprints in `hir` mode. The `build` mode demands semantic facts,
 MIR, scalar/address/aggregate Layout, and LLVM emission for a limited closed-body subset. Shared and mutable
-scalar references, dereference reads and stores, and receiver auto-borrows are supported. Raw-pointer
-dereference requires an explicit lexical `unsafe` boundary, including inside an `unsafe fn`.
+scalar references, dereference reads and stores, and receiver auto-borrows are supported. A borrow,
+auto-borrowed receiver or `match &` subject that names no existing storage (a call result, a
+literal, or a field of one) addresses a compiler temporary holding the evaluated value; that hidden
+owner follows the owned-rvalue temporary rules below, and a mutable loan of it needs no named
+mutable owner (BORROW-006). A borrowing binding, including a destructuring `let P = &e`, keeps its
+initializer's temporaries until its scope exits. A `match &mut`, `match place` or `let P = &mut e`
+subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`).
+Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
+`unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
 Internal aggregate calls copy parameters into callee storage and return through a caller-provided
 destination. Named tuple construction and ordinal places share record storage. Fixed arrays retain
 one element layout, stride and logical length; indexing checks the logical bound before access or
 an indexed assignment's replacement expression, including for empty and zero-size storage.
 Scalar enums take their representation's layout and keep nominal identity; members, `Enum.value`,
-equality, and member or `_` match arms with guards lower to MIR switches. Unions of argument-free
-records store an unsigned tag (canonical member order) before the largest member; nominal
-`union` declarations tag variants in declaration order and lay each variant out like a record.
+equality, and member or `_` match arms with guards lower to MIR switches. Unions of records store
+an unsigned tag (canonical member order) before the largest member; a generic body may inject into
+and match a union of generic record applications such as `Empty<T> | Full<T>`, and each closed
+instance maps the authored member to its canonical tag. Nominal `union` declarations tag variants
+in declaration order and lay each variant out like a record.
 Record, structural-union and nominal-union matches bind fields as places and switch on the tag.
 A tuple or `.{ ... }` literal constructs its immediately expected named tuple or struct; otherwise
 it creates an occurrence-nominal anonymous aggregate laid out as an ordinary record of its members.
@@ -34,8 +43,13 @@ while physically equivalent types still share layouts. This is target-neutral an
 instances without encoding discovery ordinals or LLVM text. The build answer retains its emission
 plan for structural inspection alongside the emitted module.
 Finite-specialization certificates prove that the lowered reachable-key graph closes; they do not
-certify LLVM executability. MIR, layouts and foreign signatures are validated before closure
-planning, while backend-only emission restrictions remain loud gaps on the completed build.
+certify LLVM executability. Re-entering a generic function with different type arguments is
+`ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
+the re-entry runs inside a Drop hook's cleanup and every type argument stays within the owned
+structure of the value whose cleanup selected the hook (GEN-006): `Vector<Bytes>` cleanup reaches
+`Vector<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
+MIR, layouts and foreign signatures are validated before closure planning, while backend-only
+emission restrictions remain loud gaps on the completed build.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
 by-value receiver of an affine place. The place is a local or match subject plus static field,
 element and union steps; an owned rvalue records none. A runtime index, a reference boundary or a
