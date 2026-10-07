@@ -1459,11 +1459,15 @@ repeated invocation and capture-only drop glue.
   invocation ordinal 0; once transport retains shared actual storage through concrete MIR.
   Its source-written negatives distinguish fixed Static, unproved/reversed bounds, exclusive
   content and fixed inner-lifetime preservation, unsafe authority, once storage, retained environments,
-  alias-hidden nested quantifiers and embedded proof rigids. The named-result control in
+  and embedded proof rigids. Missing or reversed invocation premises retain the existing
+  `Unsupported` result from bound proof; these cases are not admitted. The named-result control in
   `callableParameterKeepsInvocationRigidsAndBorrowedOwnersOutOfInference` preserves the outer
   inferred-result escape boundary and a cheap unused nested-metadata quantifier barrier. Source
-  canonicalization still erases unused authored binders. These new assertions and their exact diagnostics have not yet
-  been executed; no integrated site-removal, corpus or self-build success is claimed.
+  canonicalization still erases unused authored binders. Existing authored nested-quantifier
+  rejection remains in `invalidWrittenSignatureContracts`; it passed on the integrated base,
+  and its resolving path is unchanged here. Production checking and the focused native safety
+  controls pass; the corrected callback actor still awaits its complete native rerun. No
+  integrated site-removal, corpus or self-build success is claimed.
 - **Source migration:** none.
 
 ## Explicit synchronous source startup
