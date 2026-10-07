@@ -526,8 +526,8 @@ Each entry records:
   closed schema recipe before MIR, preserving the original target blueprint and exact capture
   record. Storage mode follows the actual base and newly stored fields; source promises still
   determine consuming transport. Ordinary named sections defer invocation lifetimes through their
-  original recipe; quantified contextual admission is source-implemented with validation pending,
-  as detailed below. Deferred requirement rows, deferred enclosing impl binders and runtime
+  original recipe; quantified contextual admission uses a proved private comparison contract, as
+  detailed below. Deferred requirement rows, deferred enclosing impl binders and runtime
   static evidence retain their separate selection boundaries; selected enclosing evidence is preserved. Bootstrap rejects some closed contextual forwarding of a stored generic
   section with `SEM0052`/`SEM0122`: its callable comparison does not open the offered section's
   type binders. This is a bootstrap limitation against the confirmed closed-static-chain rule in
@@ -1450,7 +1450,7 @@ repeated invocation and capture-only drop glue.
   invocation quantifiers and deferred type/row bindings embedding private rigids retain explicit
   `Unsupported` boundaries; explicitly quantified public section contracts and Effect-valued
   lifetime deferral remain separate gaps.
-- **Quantified verification pending:** `quantifiedNamedCallbacksRetainTheirInvocationRecipes` in
+- **Quantified structural controls:** `quantifiedNamedCallbacksRetainTheirInvocationRecipes` in
   `CallableResultCases` demands concrete consumers and original callbacks, checks two independent
   invocation loans, original lifetime slots 0 and 1, and staged capture inputs/projections.
   Each original target call must use the distinct MIR local created at its corresponding source
@@ -1464,10 +1464,9 @@ repeated invocation and capture-only drop glue.
   `callableParameterKeepsInvocationRigidsAndBorrowedOwnersOutOfInference` preserves the outer
   inferred-result escape boundary and a cheap unused nested-metadata quantifier barrier. Source
   canonicalization still erases unused authored binders. Existing authored nested-quantifier
-  rejection remains in `invalidWrittenSignatureContracts`; it passed on the integrated base,
-  and its resolving path is unchanged here. Production checking and the focused native safety
-  controls pass; the corrected callback actor still awaits its complete native rerun. No
-  integrated site-removal, corpus or self-build success is claimed.
+  rejection remains in `invalidWrittenSignatureContracts`; quantified comparison additionally
+  refuses independently bound nested metadata. These controls do not establish a complete
+  higher-rank inference solver, integrated corpus success or native self-build success.
 - **Source migration:** none.
 
 ## Explicit synchronous source startup
