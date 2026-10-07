@@ -398,3 +398,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 - 2026-10-07 · Native test runner prints FAIL without the AssertionError message, obscuring which invariant control failed · Reuse the existing test executable with a validated per-test plan and absolute plan/result paths; break in testFailed under LLDB and read the retained assertion message instead of rebuilding · selfhost stage1
 - 2026-10-07 · Authored struct Slot in a variance fixture resolved to the reserved silk/core Slot, whose unavailable member shape was treated as empty covariance evidence · Use InvariantBox for source-field controls and a separate core Slot control; require known member shapes before admitting nominal covariance · selfhost stage1
+
+2026-10-07 · genericRecursiveResultKeepsCallerParameter expected the operand span after move admission moved to the completed expression, failing the semantic shard despite correct TypeMismatch · assert the full move argument span and rerun it with focused region controls · silk
