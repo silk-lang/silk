@@ -315,18 +315,22 @@ Each entry records:
   instance payloads before selecting and building drop glue.
 - **Rule:** an owned value whose type carries `impl Drop` in its owned structure is cleaned when it
   leaves scope without being moved.
-- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. Selfhost still
-  reports the backend gap `cleanup` instead of lowering a partially moved owner whose holes differ
-  between joining paths or that is moved on only some paths, a write at a runtime index beside a
-  moved element, a loop iteration that leaves an owner in a different state than it found it, a
+- **Compilers:** both lower drops, replacement drops, drop flags and partial moves. On 2026-10-07,
+  selfhost component cleanup was locally verified for conditional partial transfers, joins with
+  opposite authored move orders, receiving-owner cleanup and component refill. It retains canonical
+  projected components and independent edge-written flags rather than consuming-site hole lists.
+  Selfhost still reports the backend gap `cleanup` for a write at a runtime index beside a moved
+  element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
   drop glue for callable and Effect environments and unions without a canonical member order.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
   `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
-  guard, loop and borrowing match result gaps. Not checked by a test: a partially moved owner moved
-  on only some paths, and the deferred glue forms.
+  guard, loop and borrowing match result gaps. The extended partial-move actor authenticates real
+  Move/Copy chains, exact source checkpoints, both conditional cleanup paths, receiving glue,
+  distinct component flags and literal refill. Seven focused tests passed in 247 ms (maximum 71 ms),
+  with the timing gate passing. Deferred glue forms and real N1 completion remain unproved.
 
 ### Selfhost keeps unavailable conditional sealed-property proofs explicit
 
@@ -1675,3 +1679,10 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Native subset:** source implementation written, verification pending. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or stored member types.
 - **Remaining native boundaries:** concat/length/at keep explicit Unsupported; reflected collections, nested static-for, generated closures/Effects, authored return/fail/break/continue inside iterations and newly generated loans remain unsupported. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
 - **Evidence:** the pre-repair optimized native reduction rejected the whole static-for as typed-form; the no-loop phase control rejected the sealed sequence type as core-type. Permanent existing-actor structured evaluation/selection/MIR and refusal controls are authored but have not run. This entry claims no optimized N0, SHA2 lowering, gap removal, N1 artifact or smoke success.
+
+### Selfhost preserves unchanged inexact capture-loop availability
+
+- **Status:** locally verified on 2026-10-07.
+- **Rule:** LOOP-001 requires preservation of the incoming ownership facts on repeating paths. A pre-existing may/must distinction does not imply that an unrelated loop changes those facts.
+- **Compilers:** selfhost compares active roots, separate may/must holes, uncertain roots and guard state after normal/continue arrivals. It preserves every may-hole and rejects acquisitions of maybe-missing storage. Conditions still run after copying the header; break and false-condition exits retain their actual post-condition state. Transfer history remains RHS/diagnostic evidence rather than a loop invariant.
+- **Evidence:** `anonymousCapturesKeepLoopAndIndexedProofs` retains changed-header/indexed negatives and adds unchanged-inexact, consume/refill/continue, later-acquisition, unknown-index and consuming-condition controls. The focused run passed four tests in 40 ms (maximum 28 ms), including these exact diagnostic controls and the retained guard actors; its timing gate passed. Original N1 buildFrom state and advancement remain unproved.

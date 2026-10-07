@@ -78,8 +78,8 @@ unions without a canonical member order still report the `cleanup` gap. MIR lowe
 stack: bindings and by-value parameters that need cleanup are owners of their scope, consuming sites
 mark them moved, and fallthrough, `return`, `break` and `continue` drop every scope they leave,
 innermost first and in reverse acquisition order. Replacement drops the displaced value first.
-Where paths reach a join with different ownership, the owner gets a `DropFlag` local written on
-each incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
+Where paths reach a join with different ownership, canonical projected cleanup components get
+independent `DropFlag` locals written on each actual incoming edge; elsewhere no flag exists. An owner that may be moved when a loop starts is
 tracked by its flag across iterations, and once a flag exists every state change writes it. Owned
 rvalues used only as places are dropped at the end of their full expression unless a borrowing
 `let` keeps them; one created by a short-circuit operand, a match arm or a guard ends with that
@@ -91,13 +91,19 @@ The bindings of a destructuring `let` belong to the enclosing block; those of a 
 arm end with the arm, innermost first. The subject drops only what no binding took, such as fields
 omitted with `..`: a `match` arm drops it when the arm ends, while `if let` and `let` drop it, or
 the whole unmatched `if let` subject, once a path is selected and before it runs (PATT-008). A
-static partial move leaves a hole in its owner: the owner is then dropped child by child, skipping
-moved children, and writing a moved child back makes it whole again. A hole beneath a type with a
-Drop hook is rejected as `OWN0002`. Holes that differ between joining paths, a maybe-moved partial
-owner, a write at a runtime index beside a moved element, a guard that changes an owner's state or
+static partial move marks the authenticated component moved: cleanup visits the remaining children
+in their canonical order. Joins normalize the incoming component partitions, including opposite
+authored move orders, and retain each child's independent liveness. Replacing a component drops
+its initialized old value before the store, then restores precisely that component; siblings keep
+their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. A write at a runtime
+index beside a moved element, a guard that changes an owner's state or
 consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
 report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
 created temporaries still report the `cleanup` gap.
+Anonymous-environment availability preserves unchanged loop headers even when a pre-loop branch
+may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
+state after each repeating edge; the missing field remains unavailable. Conditions are checked
+against the pre-condition header, and only normal/continue arrivals repeat.
 Effect fn bodies are typed against their declared success, failure and requirement channels.
 Calling an `effect fn` builds an exact Effect whose representation is the call's application and
 written arguments; `run f(a)` of such a construction is a direct call of `f`'s instance (Effect
@@ -455,6 +461,12 @@ effect fn second() -> i32 ! Offline | Missing ? &mut Clock at Primary { return 0
 interface Hash {}
 fn copy<'data, T: Hash + 'data>(value: &'data T) -> i32 { return 0 }
 ```
+
+Delayed Effect results preserve their complete retained environments during callable and stored
+operand comparison. Structural compatibility returns scalar and environment validity obligations;
+the caller proves them from its declared bounds and authenticated invocation premises. A shorter
+result promise never authorizes a captured loan to escape, and selected target bounds remain
+independent obligations.
 
 A callable contract can quantify invocation lifetimes:
 `for<'call> fn<'env>(&'call i32) -> &'call i32` names them. An omitted lifetime in a callable
