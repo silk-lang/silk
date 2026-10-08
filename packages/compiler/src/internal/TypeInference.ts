@@ -1841,6 +1841,37 @@ export const substitution = (
 ): Substitution | undefined =>
   declared.length !== arguments_.length ? undefined : prefixSubstitution(declared, arguments_)
 
+/** Replays a complete original declaration tuple without reordering its source slots. */
+export const orderedSubstitution = (
+  declared: ReadonlyArray<Parameter>,
+  arguments_: ReadonlyArray<GenericArgument>,
+): Substitution | undefined => {
+  if (
+    declared.length !== arguments_.length ||
+    declared.some((parameter, ordinal) => {
+      const argument = arguments_.at(ordinal)
+      if (argument === undefined) return true
+      switch (parameter.kind) {
+        case 'Lifetime':
+          return !Lifetime.isLifetime(argument)
+        case 'Value':
+          return !isTypeArgument(argument)
+        case 'RequirementRow':
+          return !isRequirementRowArgument(argument)
+        case 'CallableRepresentation':
+        case 'EffectRepresentation':
+          return (
+            !isRepresentationArgument(argument) ||
+            representationArgumentKind(argument) !== parameter.kind
+          )
+      }
+    })
+  )
+    return undefined
+  // Prefix admission still checks the exact representation contracts and static properties.
+  return bindPrefix(declared, arguments_)
+}
+
 /** Exact semantic arguments and the selected call's proven representation lifetime relations. */
 export interface SelectedSubstitution {
   readonly substitution: Substitution

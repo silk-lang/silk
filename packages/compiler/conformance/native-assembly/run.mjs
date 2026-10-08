@@ -37,7 +37,10 @@ const program = Effect.gen(function* () {
   const directory = dirname(fileURLToPath(import.meta.url))
   const supplies = yield* Schema.decodeEffect(Supplies)(
     yield* fs.readFileString(
-      join(directory, '../../../../openspec/changes/native-assembly-entry-contracts/supplies.json'),
+      join(
+        directory,
+        '../../../../openspec/changes/archive/2026-09-10-native-assembly-entry-contracts/supplies.json',
+      ),
     ),
   )
   const uapi = yield* Schema.decodeEffect(
@@ -52,7 +55,7 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(
       join(
         directory,
-        '../../../../openspec/changes/native-assembly-entry-contracts/assembly-supplies.json',
+        '../../../../openspec/changes/archive/2026-09-10-native-assembly-entry-contracts/assembly-supplies.json',
       ),
     ),
   )

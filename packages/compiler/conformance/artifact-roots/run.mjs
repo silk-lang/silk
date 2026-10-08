@@ -37,7 +37,10 @@ const program = Effect.gen(function* () {
   const directory = dirname(fileURLToPath(import.meta.url))
   const supplies = yield* Schema.decodeEffect(Supplies)(
     yield* fs.readFileString(
-      join(directory, '../../../../openspec/changes/explicit-artifact-roots/supplies.json'),
+      join(
+        directory,
+        '../../../../openspec/changes/archive/2026-09-10-explicit-artifact-roots/supplies.json',
+      ),
     ),
   )
   const output = resolve(directory, '../../../../.scratch/artifact-roots')

@@ -67,7 +67,7 @@ const invocationUseText = (
 ): string =>
   usage === undefined
     ? ''
-    : ` invocation=${usage.kind.toLowerCase()}:${AuthoredIdentity.anchorKey(usage.origin)} binder=${Lifetime.key(usage.binder)} region=${Lifetime.key(usage.lifetime)} inputs=${usage.inputs.map((input) => `p${input.parameter}:${localText(input.argument)}${input.capture === undefined ? '' : `.#${input.capture}`}${input.capturePath === undefined ? '' : ` via=${input.capturePath.map((step) => `${step._tag.toLowerCase()}@${Tir.executableSiteLabel(step.site)}${step._tag === 'Capture' ? `.#${step.ordinal}` : ''}`).join('/')}`}${input.header === undefined ? '' : ` header=p${input.header.parameter}@${AuthoredIdentity.anchorKey(input.header.source)}`}:${SilkType.encode(input.type)}`).join(',')} result=${localText(usage.result)}`
+    : ` invocation=${usage.kind.toLowerCase()}:${AuthoredIdentity.anchorKey(usage.origin)} binder=${Lifetime.key(usage.binder)} region=${Lifetime.key(usage.lifetime)} inputs=${usage.inputs.map((input) => `p${input.parameter}:${localText(input.argument)}${input.capture === undefined ? '' : `.#${input.capture}`}${input.capturePath === undefined ? '' : ` via=${input.capturePath.map((step) => `${step._tag.toLowerCase()}@${Tir.executableSiteLabel(step.site)}${step._tag === 'Capture' ? `.#${step.ordinal}` : ''}`).join('/')}`}${input.producer === undefined ? '' : ` producer=${Tir.nodeRefKey(input.producer)}`}${input.header === undefined ? '' : ` header=p${input.header.parameter}@${AuthoredIdentity.anchorKey(input.header.source)}`}:${SilkType.encode(input.type)}`).join(',')} result=${localText(usage.result)}`
 
 const operationText = (operation: Operation): string => {
   switch (operation._tag) {
@@ -531,6 +531,10 @@ export const encode = (self: Module): string => {
       ...(fn.sourceParameters ?? []).map(
         (parameter) =>
           `  source-parameter #${parameter.parameter} local=${localText(parameter.local)} origin=${JSON.stringify(AuthoredIdentity.anchorKey(parameter.source))} contract=${SilkType.encode(parameter.contract)} type=${SilkType.encode(parameter.type)}`,
+      ),
+      ...(fn.sourceCallableCaptures ?? []).map(
+        (capture) =>
+          `  source-callable-capture local=${localText(capture.local)} producer=${Tir.nodeRefKey(capture.producer)}`,
       ),
       ...suspensionLines(fn),
       ...topologicalRegions(fn).flatMap(regionLines),

@@ -33,6 +33,18 @@ export interface SourceCallView {
   readonly invocationContract: Type.Effect
 }
 
+/** A selected exclusive/owned provider may lend a shared receiver for this operation. */
+export const serves = (
+  provider: ProvidedRequirement,
+  access: Type.Requirement['access'],
+): boolean => {
+  const admits = (required: Type.Requirement['access']): boolean =>
+    required === 'Shared' ||
+    provider.access === 'Take' ||
+    (required === 'Exclusive' && provider.access === 'Exclusive')
+  return admits(provider.requirementAccess) && admits(access)
+}
+
 /** Completion may retain separate fact objects for the same original source declaration. */
 const sameOperation = (
   self: DeclarationFacts.ServiceOperationFact,
@@ -208,7 +220,7 @@ export const service = (
     }) ||
     provider.witness._tag !== 'SourceConformanceWitness' ||
     provider.role !== subject.role ||
-    provider.requirementAccess !== subject.access
+    !serves(provider, subject.access)
   )
     return undefined
   const capability = fn.semantic(subject.service)
@@ -267,7 +279,7 @@ export const service = (
   const sourceSubstitution =
     sourceService === undefined || sourceOperation === undefined
       ? undefined
-      : TypeInference.substitution(
+      : TypeInference.orderedSubstitution(
           [...sourceService.typeParameters, ...sourceOperation.typeParameters].map(
             (parameter) => parameter.type,
           ),
@@ -321,7 +333,7 @@ export const service = (
   const invocation =
     implementation === undefined
       ? undefined
-      : TypeInference.substitution(
+      : TypeInference.orderedSubstitution(
           implementation.function.declaration.typeParameters.map((parameter) => parameter.type),
           call.target.typeArguments.filter(
             (argument) => !Type.isHiddenExecutableArgument(argument),
@@ -350,7 +362,13 @@ export const service = (
     invocationContract === undefined ||
     !Type.isEffect(invocationContract) ||
     context === undefined ||
-    !Type.isEffect(publicContract)
+    !Type.isEffect(publicContract) ||
+    !Type.requirementMembers(publicContract).some(
+      (requirement) =>
+        requirement.role === subject.role &&
+        requirement.access === subject.access &&
+        Type.equals(requirement.capability, capability),
+    )
   )
     return undefined
   const implementationParameters = originalContract.parameters.map((parameter) =>
@@ -400,7 +418,9 @@ export const service = (
         failureRow: invocationContract.failureRow,
       },
       invocationContract,
-      [provider],
+      // This original operation's exact row is served by the witnessed receiver loan.
+      // The enclosing caller may retain a stronger requirement for its other operations.
+      [{ ...provider, requirementAccess: subject.access }],
     )
   )
     return undefined
