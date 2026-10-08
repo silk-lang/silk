@@ -302,7 +302,7 @@ It is not added before then, as the Effect note §5 requires. The entry-shim ent
 
 ## 6. Tests and corpus
 
-All structured and cheap, in `SemanticCases.silk`, one shared source per test:
+All structured and cheap, in `SemanticCallableCases.silk`, one shared source per test:
 
 - **Typing.** `observeDiagnostics` accepts the exact composite and rejects a fallible body (the
   bootstrap's SEM0012) and a callback of the wrong shape (SEM0012), asserted by code and span.

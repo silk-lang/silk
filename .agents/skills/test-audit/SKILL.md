@@ -130,7 +130,7 @@ repository root, select an existing root and, when useful, a test-name filter:
 
 ```sh
 node packages/cli/dist/bin.js check --manifest-path compiler/silk.toml
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCases.silk --filter '<test-name>' --no-cache > /tmp/selfhost-tests.log
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --filter '<test-name>' --no-cache > /tmp/selfhost-tests.log
 cat /tmp/selfhost-tests.log
 node .github/scripts/check-selfhost-test-times.mjs /tmp/selfhost-tests.log
 ```
