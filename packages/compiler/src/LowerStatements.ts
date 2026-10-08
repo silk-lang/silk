@@ -64,7 +64,7 @@ import * as MovePath from './MovePath.js'
 import * as Ownership from './Ownership.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
-import { effectValueForCall, instanceText } from './ValueType.js'
+import { callableValueType, effectValueForCall, instanceText } from './ValueType.js'
 
 export interface LoweredPatternSelection {
   readonly result: Mir.LocalId
@@ -498,7 +498,8 @@ const lowerStatement = (
     if (
       staticCallable !== undefined &&
       callableSchema !== undefined &&
-      (callableSchema.constraints.length > 0 || callableSchema.evidence.length > 0)
+      (callableSchema.constraints.length > 0 || callableSchema.evidence.length > 0) &&
+      callableValueType(fn, staticCallable) === undefined
     ) {
       fn.callableRecipes.set(statement.binding.ordinal, statement.initializer)
       const following = fn.reserve()

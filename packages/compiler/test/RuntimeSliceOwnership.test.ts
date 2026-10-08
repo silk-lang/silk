@@ -12,6 +12,7 @@ import * as Analysis from '../src/Analysis.js'
 import * as ConformanceProof from '../src/ConformanceProof.js'
 import * as ExecutableProperty from '../src/ExecutableProperty.js'
 import * as Lifetime from '../src/Lifetime.js'
+import * as Instances from '../src/Instances.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as ModuleSurface from '../src/ModuleSurface.js'
 import * as SemanticContext from '../src/SemanticContext.js'
@@ -19,6 +20,8 @@ import * as NominalVariance from '../src/NominalVariance.js'
 import * as OwnershipEncoding from '../src/OwnershipEncoding.js'
 import * as Type from '../src/Type.js'
 import * as TypeCompatibility from '../src/TypeCompatibility.js'
+import * as SourceCallView from '../src/SourceCallView.js'
+import * as Tir from '../src/Tir.js'
 import { unreachable } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
@@ -79,6 +82,158 @@ pub fn main() -> i32 {
     const self = yield* snapshot(source)
     assert.deepEqual(Analysis.diagnostics(self), [])
     assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(self)), [])
+    const discovery = Analysis.instancesOf(self)
+    const caller = discovery.instances.find((instance) => instance.key.declaration.name === 'read')
+    if (caller === undefined) return unreachable('missing provided service caller')
+    const subject = caller.function.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .find(
+        (node): node is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+          node._tag === 'ServiceEffectConstruct',
+      )
+    if (subject === undefined) return unreachable('missing held service invocation')
+    const call = discovery.calls.find(
+      (candidate) =>
+        Instances.keyText(candidate.owner) === Instances.keyText(caller.key) &&
+        candidate.node?.ordinal === subject.id?.ordinal,
+    )
+    if (call === undefined) return unreachable('missing source-owned service call')
+    const implementation = discovery.instances.find(
+      (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
+    )
+    const receiver = implementation?.specialization.parameters.at(0)
+    const physical = implementation?.specialization.result
+    if (
+      implementation === undefined ||
+      receiver === undefined ||
+      !Type.isReference(receiver) ||
+      !Type.isNominal(receiver.target) ||
+      physical === undefined ||
+      !Type.isEffect(physical)
+    )
+      return unreachable('missing original implementation contract')
+    const service = Type.substitute(subject.service, caller.substitution)
+    if (!Type.isNominal(service)) return unreachable('missing original service capability')
+    const witness = ConformanceProof.witness(
+      Analysis.declarationIndex(self),
+      receiver.target,
+      service,
+    )
+    if (witness?._tag !== 'SourceConformanceWitness') return unreachable('missing source witness')
+    const provider = {
+      capability: service,
+      providerType: receiver.target,
+      witness,
+      role: subject.role,
+      access: subject.access,
+      requirementAccess: subject.access,
+    }
+    const held = {
+      owner: caller,
+      index: Analysis.declarationIndex(self),
+      instances: discovery.instances,
+      calls: discovery.calls,
+      layout: Analysis.loweredMir(self).layout,
+      semantic: (type: Type.Type) => Type.substitute(type, caller.substitution),
+    }
+    assert.isDefined(SourceCallView.service(held, subject, call, provider, physical))
+    const alteredCall = (changed: Instances.CallInstance) => ({
+      ...held,
+      calls: discovery.calls.map((candidate) => (candidate === call ? changed : candidate)),
+    })
+    const wrongNode = { ...call, node: { _tag: 'TirNode' as const, ordinal: -1 } }
+    assert.isUndefined(
+      SourceCallView.service(alteredCall(wrongNode), subject, wrongNode, provider, physical),
+    )
+    const wrongTarget = { ...call, target: caller.key }
+    assert.isUndefined(
+      SourceCallView.service(alteredCall(wrongTarget), subject, wrongTarget, provider, physical),
+    )
+    const missingOriginalArgument = {
+      ...call,
+      target: { ...call.target, typeArguments: call.target.typeArguments.slice(1) },
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        alteredCall(missingOriginalArgument),
+        subject,
+        missingOriginalArgument,
+        provider,
+        physical,
+      ),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, { ...subject, arguments: [] }, call, provider, physical),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, subject, call, { ...provider, role: 'foreign' }, physical),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, subject, call, { ...provider, providerType: service }, physical),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, subject, call, provider, { ...physical, success: 'bool' }),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, subject, call, provider, {
+        ...physical,
+        failureRow: Type.effect('i32', ['bool'], physical).failureRow,
+      }),
+    )
+    assert.isUndefined(
+      SourceCallView.service(held, subject, call, provider, {
+        ...physical,
+        requirementRow: subject.type.requirementRow,
+      }),
+    )
+    const copiedAccess = { ...physical, access: 'Take' as const }
+    const copiedLayout = {
+      ...held.layout,
+      effectEnvironments: held.layout.effectEnvironments.map((environment) =>
+        Instances.keyText(environment.instance) === Instances.keyText(call.target)
+          ? {
+              ...environment,
+              effect: copiedAccess,
+              ...('fields' in environment
+                ? {
+                    fields: environment.fields.map((field) => ({
+                      ...field,
+                      access: 'Take' as const,
+                    })),
+                  }
+                : {}),
+            }
+          : environment,
+      ),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, layout: copiedLayout },
+        subject,
+        call,
+        provider,
+        copiedAccess,
+      ),
+    )
+    const foreignLayout = {
+      ...held.layout,
+      effectEnvironments: held.layout.effectEnvironments.map((environment) =>
+        Instances.keyText(environment.instance) === Instances.keyText(call.target)
+          ? {
+              ...environment,
+              site: Tir.effectRootSite(
+                caller.view.artifact,
+                caller.function.declaration.id.ordinal,
+                caller.key.declaration,
+              ),
+            }
+          : environment,
+      ),
+    }
+    assert.isUndefined(
+      SourceCallView.service({ ...held, layout: foreignLayout }, subject, call, provider, physical),
+    )
     const invalid = yield* analyze(
       source
         .replace('  let result = run pending', '  drop provider\n  let result = run pending')

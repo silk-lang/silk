@@ -4790,6 +4790,7 @@ import {
   analyzeCallTypeArguments,
   appliedOwnerTypeArgumentNodes,
   analyzeFunctionItem,
+  contextualInvocationSection,
   boundOperationReference,
   builtinSignature,
   instantiateBuiltinSignature,
@@ -4809,6 +4810,7 @@ import {
   instantiateSourceParameters,
   isSectionArity,
   ownedProviderCaptureAccess,
+  recoveryInvocationRecipe,
   serviceOperation,
   sourceCallable,
 } from './CallResolution.js'
@@ -5778,15 +5780,28 @@ export const finishIntrinsicContractCall = (
       handlerType !== undefined && Type.isCallable(handlerType) && Type.isEffect(handlerType.result)
         ? handlerType.result
         : undefined
+    // The real failure storage exists only on the selected recovery execution branch.
+    const recoveryInvocation =
+      wanted === undefined
+        ? undefined
+        : recoveryInvocationRecipe(
+            operation.rule.contract,
+            substitution,
+            Type.failureType(wanted.selected),
+            call.anchor,
+            resolution.bodyLifetimes,
+          )
     const catchAvailable =
       type._tag === 'Available' &&
       protected_ !== undefined &&
       handler !== undefined &&
       wanted !== undefined &&
+      recoveryInvocation !== undefined &&
       proved
     return {
       fact: {
         _tag: 'EffectCatch',
+        ...(recoveryInvocation === undefined ? {} : { recoveryInvocation }),
         reference: intrinsicReference(context, call),
         protected: protected_?.expression ?? unavailable,
         handler: handler?.expression ?? unavailable,
@@ -8701,10 +8716,15 @@ export const analyzePipelineExpression = (
     target === undefined
       ? undefined
       : analyzeExpression(context, target, declarations, declaration, scope, resolution)
+  const pipelineContract =
+    callable?.type !== undefined && Type.isCallable(callable.type) ? callable.type : undefined
+  // A pipeline supplies one trailing operand. Marked staging compares its parameter only after
+  // genuine capture formation is known, rather than using the future invocation region here.
   const expectedInput =
-    callable?.type !== undefined && Type.isCallable(callable.type)
-      ? callable.type.parameters.at(0)
-      : undefined
+    pipelineContract === undefined ||
+    (pipelineContract.parameters.length > 1 && pipelineContract.invocationUse !== undefined)
+      ? undefined
+      : pipelineContract.parameters.at(pipelineContract.parameters.length - 1)
   const input =
     inputNode === undefined
       ? undefined
@@ -9341,6 +9361,7 @@ const analyzeAnonymousCallable = (
   declaration: DeclarationFact,
   scope: Scope,
   resolution: ResolutionContext,
+  expected?: SemanticType,
 ): ExpressionResult => {
   if ((resolution.anonymousDepth ?? 0) > 0) {
     const diagnostic = Diagnostic.nestedAnonymousCallable(Location.at(node.anchor))
@@ -9486,8 +9507,63 @@ const analyzeAnonymousCallable = (
     resolution.index.modules,
   )
   typeDiagnostics.push(...failureRow.diagnostics, ...requirementRow.diagnostics)
+  const expectedInvocation =
+    expected !== undefined && Type.isCallable(expected) && expected.invocationUse !== undefined
+      ? expected
+      : undefined
+  const expectedInputs =
+    expectedInvocation === undefined ? [] : Type.invocationInputBounds(expectedInvocation)
+  if (expectedInputs === undefined)
+    typeDiagnostics.push(
+      Diagnostic.invalidLifetimeBinder(
+        'Malformed expected invocation-use contract',
+        Location.at(node.anchor),
+      ),
+    )
+  const implicitBinders = (collected.fact.lifetimeElaboration?.implicit ?? []).map((binder) =>
+    Lifetime.bound(binder.parameter.owner, binder.parameter.ordinal, binder.parameter.name),
+  )
+  const invocationBinder =
+    expectedInvocation === undefined || expectedInputs === undefined
+      ? undefined
+      : Lifetime.bound(
+          canonical,
+          Math.max(
+            -1,
+            ...collected.fact.typeParameters.map((parameter) => parameter.type.ordinal),
+            ...implicitBinders.map((binder) => binder.ordinal),
+          ) + 1,
+          'call',
+        )
+  const invocationParameterTypes = authoredParameters.flatMap((parameter) =>
+    parameter.declaredType._tag === 'Resolved' ? [parameter.declaredType.type] : [],
+  )
+  // This is a conditional body envelope, not the offered callable or a formation premise.
+  const invocationExpected =
+    invocationBinder === undefined || invocationParameterTypes.length !== authoredParameters.length
+      ? undefined
+      : Type.callable(invocationParameterTypes, 'never', {
+          environment: Lifetime.staticLifetime,
+          lifetimeBinders: [invocationBinder],
+          invocationUse: {
+            lifetime: invocationBinder,
+            parameters: authoredParameters.map((_, ordinal) => ordinal),
+          },
+        })
   const preliminaryDeclaration: DeclarationFact = {
     ...collected.fact,
+    ...(invocationBinder === undefined || collected.fact.lifetimeElaboration === undefined
+      ? {}
+      : {
+          lifetimeElaboration: {
+            ...collected.fact.lifetimeElaboration,
+            explicitEnvironment: invocationBinder,
+            invocationUse: {
+              lifetime: invocationBinder,
+              parameters: authoredParameters.map((_, ordinal) => ordinal),
+            },
+          },
+        }),
     parameters: authoredParameters,
     parameterCount: authoredParameters.length,
     returnType: returnType.fact,
@@ -9512,6 +9588,7 @@ const analyzeAnonymousCallable = (
     {
       ...preliminaryResolution,
       builder: anonymousBuilder(preliminaryDeclaration.owner),
+      ...(invocationExpected === undefined ? {} : { invocationExpected }),
       anonymousDepth: 1,
     },
     undefined,
@@ -9590,14 +9667,23 @@ const analyzeAnonymousCallable = (
             // All retained inputs are known after capture discovery. Their common validity is a
             // meet, while executableLifetimes continues to carry generic content obligations.
             explicitEnvironment:
-              preliminaryDeclaration.lifetimeElaboration.explicitEnvironment ??
+              (invocationBinder === undefined
+                ? preliminaryDeclaration.lifetimeElaboration.explicitEnvironment
+                : undefined) ??
               Lifetime.intersection([
                 lifetimes.environment,
-                ...authoredParameters.flatMap((parameter) =>
-                  parameter.declaredType._tag === 'Resolved'
-                    ? Type.storageLifetimes(parameter.declaredType.type)
-                    : [],
-                ),
+                ...(invocationBinder === undefined ? [] : [invocationBinder]),
+                // A marked body's exact input antecedents already require those contents
+                // through its invocation. Only independent capture formation bounds the
+                // returned computation alongside that use; ordinary anonymous inputs keep
+                // their existing inferred environment.
+                ...(invocationBinder === undefined
+                  ? authoredParameters.flatMap((parameter) =>
+                      parameter.declaredType._tag === 'Resolved'
+                        ? Type.storageLifetimes(parameter.declaredType.type)
+                        : [],
+                    )
+                  : []),
               ]),
           },
         }),
@@ -9609,6 +9695,7 @@ const analyzeAnonymousCallable = (
     {
       ...preliminaryResolution,
       builder: anonymousBuilder(hiddenDeclaration.owner),
+      ...(invocationExpected === undefined ? {} : { invocationExpected }),
       anonymousDepth: 1,
     },
     undefined,
@@ -9630,7 +9717,7 @@ const analyzeAnonymousCallable = (
     result = Type.effectWithRows(
       result,
       hiddenDeclaration.failureRow.row,
-      { ...DeclarationFacts.executableLifetimes(hiddenDeclaration), lifetimeBinders: [] },
+      DeclarationFacts.effectLifetimes(hiddenDeclaration),
       strongestEffectAccess(
         ...effectCaptures.flatMap((capture) => (capture.access === 'Copy' ? [] : [capture.access])),
       ),
@@ -9641,6 +9728,15 @@ const analyzeAnonymousCallable = (
     parameter.declaredType._tag === 'Resolved' ? [parameter.declaredType.type] : [],
   )
   const complete = result !== undefined && parameterTypes.length === authoredParameters.length
+  // The hidden declaration owns the complete input/capture recipe. Lexical captures stay in
+  // that source contract's suffix, while only authored parameters are future invocation inputs.
+  const originalContract = DeclarationFacts.callableContract(hiddenDeclaration)
+  const substitution = new Map(
+    declaration.typeParameters.map((parameter) => [
+      Type.key(parameter.type),
+      Type.parameterArgument(parameter.type),
+    ]),
+  )
   const callable =
     complete && result !== undefined && lifetimes !== undefined
       ? Type.callable(
@@ -9650,15 +9746,34 @@ const analyzeAnonymousCallable = (
             ...lifetimes,
             // Authored anonymous parameters quantify their own elided lifetimes. Captured outer
             // lifetimes remain free and continue to constrain the stored environment.
-            lifetimeBinders: (collected.fact.lifetimeElaboration?.implicit ?? []).map((binder) =>
-              Lifetime.bound(
-                binder.parameter.owner,
-                binder.parameter.ordinal,
-                binder.parameter.name,
-              ),
-            ),
+            lifetimeBinders: [
+              ...implicitBinders,
+              ...(invocationBinder === undefined ? [] : [invocationBinder]),
+            ],
+            ...(invocationBinder === undefined
+              ? {}
+              : {
+                  invocationUse: {
+                    lifetime: invocationBinder,
+                    parameters: parameterTypes.map((_, ordinal) => ordinal),
+                  },
+                }),
           },
           mode,
+          {
+            source: canonical,
+            contract: originalContract,
+            binders: originalContract.binders,
+            constraints: originalContract.constraints,
+            evidence: [],
+            substitution,
+            contractKey: CallableContract.key(originalContract),
+            constraintKeys: originalContract.constraints.map(Constraint.key),
+            evidenceKeys: [],
+            origins: hiddenDeclaration.constraints.map((constraint) =>
+              Location.at(constraint.anchor),
+            ),
+          },
         )
       : undefined
   const token = node._tag === 'CallableExpression' ? node : undefined
@@ -9728,6 +9843,11 @@ const analyzeAnonymousCallable = (
               memberAnchor: token.anchor,
             },
       remainingParameters: authoredParameters.map((_, ordinal) => ordinal),
+      ...(invocationBinder === undefined
+        ? {}
+        : {
+            invocationParameters: authoredParameters.map((_, ordinal) => ordinal),
+          }),
       captures: captures.map((capture, ordinal) => {
         const captured = enclosingCapture(capture)
         const capturedType = constructionExpressionType(captured)
@@ -9756,12 +9876,7 @@ const analyzeAnonymousCallable = (
       ...(environmentOwner === undefined ? {} : { environmentOwner }),
       // Reify inherited parameters in their argument namespace so the owner instance can
       // specialize captured lifetimes and representation binders like any other call site.
-      substitution: new Map(
-        declaration.typeParameters.map((parameter) => [
-          Type.key(parameter.type),
-          Type.parameterArgument(parameter.type),
-        ]),
-      ),
+      substitution,
       mode,
       type: callable === undefined ? unavailableExpressionType : availableExpressionType(callable),
       anchor: node.anchor,
@@ -9827,7 +9942,15 @@ function analyzeExpressionDecision(
   )
     resolution = { ...resolution, deferStaticCalls: true }
   if (node._tag === 'CallableExpression')
-    return analyzeAnonymousCallable(context, node, declarations, declaration, scope, resolution)
+    return analyzeAnonymousCallable(
+      context,
+      node,
+      declarations,
+      declaration,
+      scope,
+      resolution,
+      expected,
+    )
   if (node._tag === 'UnsafeExpression') {
     const call = node.operand
     if (call._tag !== 'CallExpression') return undefined
@@ -11024,7 +11147,7 @@ export function analyzeExpression(
   resolution: ResolutionContext,
   expected?: SemanticType,
 ): ExpressionResult | undefined {
-  const result = analyzeExpressionDecision(
+  const analyzed = analyzeExpressionDecision(
     context,
     node,
     declarations,
@@ -11033,7 +11156,8 @@ export function analyzeExpression(
     resolution,
     expected,
   )
-  if (result === undefined) return result
+  if (analyzed === undefined) return analyzed
+  const result = contextualInvocationSection(context, analyzed, expected, declaration, resolution)
   resolution.publishExpressionDecision?.(result.fact)
   if (resolution.builder === undefined) return result
   const lowered = BodyBuilder.tirExpression(result.fact, {
@@ -11189,8 +11313,7 @@ export const finishDeclarationCall = (
               success,
               Type.substituteFailureRow(callable.failureRow.row, substitution),
               {
-                ...DeclarationFacts.executableLifetimes(callable),
-                lifetimeBinders: [],
+                ...DeclarationFacts.effectLifetimes(callable),
                 environment: Type.substituteLifetime(
                   DeclarationFacts.executableLifetimes(callable).environment,
                   substitution,
@@ -11469,6 +11592,12 @@ export interface ResolutionContext {
   /** The private publisher for the body currently being checked. */
   readonly builder?: BodyBuilder.BodyBuilder
   readonly bodyLifetimes?: BodyLifetime.BodyLifetime
+  /** Contextual marked inputs for this hidden body, separate from declaration assumptions. */
+  readonly invocationExpected?: Type.Callable
+  /** Original outer call slots available only while checking its contextual argument. */
+  readonly invocationConsumer?: TypeInference.InvocationConsumer & {
+    readonly caller: DeclarationId
+  }
   readonly lifetimeCompatibility?: TypeCompatibility.Context
   /** The current eager execution boundary and its lexical loop destinations. */
   readonly execution?: {

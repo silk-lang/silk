@@ -2,8 +2,13 @@ import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import * as ConformanceProof from '../src/ConformanceProof.js'
+import * as Instances from '../src/Instances.js'
 import * as RowAlgebra from '../src/RowAlgebra.js'
+import * as SourceCallView from '../src/SourceCallView.js'
+import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
+import { unreachable } from './support/raise.js'
 
 const encoder = new TextEncoder()
 
@@ -29,6 +34,132 @@ pub effect fn main() -> () ! LogError {
       'x86_64-unknown-linux-gnu',
     )
     assert.deepEqual(Analysis.diagnostics(self), [])
+    const discovery = Analysis.instancesOf(self)
+    const caller =
+      discovery.instances.find((instance) => instance.key.declaration.name === 'Effect.log') ??
+      unreachable('missing original logging caller')
+    const subject = caller.function.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .find(
+        (node): node is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+          node._tag === 'ServiceEffectConstruct',
+      )
+    if (subject === undefined) return unreachable('missing held logging operation')
+    const call = discovery.calls.find(
+      (candidate) =>
+        Instances.keyText(candidate.owner) === Instances.keyText(caller.key) &&
+        candidate.node?.ordinal === subject.id?.ordinal,
+    )
+    if (call === undefined) return unreachable('missing original logging call')
+    const implementation = discovery.instances.find(
+      (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
+    )
+    if (implementation === undefined) return unreachable('missing selected logger implementation')
+    assert.deepEqual(
+      implementation.function.declaration.parameters.map((parameter) => parameter.phase),
+      ['Runtime', 'Runtime', 'Static', 'Runtime'],
+    )
+    assert.strictEqual(Instances.runtimeParameterOrdinal(implementation.function, 2), undefined)
+    assert.strictEqual(Instances.runtimeParameterOrdinal(implementation.function, 3), 2)
+    const layout = Analysis.loweredMir(self).layout
+    const environment = layout.effectEnvironments.find(
+      (candidate) =>
+        candidate._tag === 'EffectEnvironment' &&
+        Instances.keyText(candidate.instance) === Instances.keyText(call.target) &&
+        Instances.effectIdentity(candidate.instance, candidate.site) === call.resultEffect,
+    )
+    if (environment?._tag !== 'EffectEnvironment')
+      return unreachable('missing actual logger capture environment')
+    assert.deepEqual(
+      environment.fields.map((field) => field.ordinal),
+      [0, 1, 3],
+    )
+    const receiver = implementation.specialization.parameters.at(0)
+    if (receiver === undefined || !Type.isReference(receiver) || !Type.isNominal(receiver.target))
+      return unreachable('missing original logger receiver')
+    const capability = Type.substitute(subject.service, caller.substitution)
+    if (!Type.isNominal(capability)) return unreachable('missing original logger capability')
+    const witness = ConformanceProof.witness(
+      Analysis.declarationIndex(self),
+      receiver.target,
+      capability,
+    )
+    if (witness?._tag !== 'SourceConformanceWitness')
+      return unreachable('missing original logger witness')
+    const provider = {
+      capability,
+      providerType: receiver.target,
+      witness,
+      role: subject.role,
+      access: subject.access,
+      requirementAccess: subject.access,
+    }
+    const held = {
+      owner: caller,
+      index: Analysis.declarationIndex(self),
+      instances: discovery.instances,
+      calls: discovery.calls,
+      layout,
+      semantic: (type: Type.Type) => Type.substitute(type, caller.substitution),
+    }
+    assert.isDefined(SourceCallView.service(held, subject, call, provider, environment.effect))
+    const staticCapture = {
+      ...layout,
+      effectEnvironments: layout.effectEnvironments.map((candidate) =>
+        candidate === environment
+          ? {
+              ...environment,
+              fields: environment.fields.map((field) =>
+                field.ordinal === 3 ? { ...field, ordinal: 2 } : field,
+              ),
+            }
+          : candidate,
+      ),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, layout: staticCapture },
+        subject,
+        call,
+        provider,
+        environment.effect,
+      ),
+    )
+    // Re-label every physical identity consistently: an unchanged original call still cannot
+    // authorize another static template, even when copied physical metadata agrees with itself.
+    const changedKey = {
+      ...call.target,
+      staticArguments: [{ _tag: 'TextValue' as const, bytes: [120] }],
+    }
+    const changedCall = {
+      ...call,
+      target: changedKey,
+      resultEffect: Instances.effectIdentity(changedKey, environment.site),
+    }
+    const changedImplementation = { ...implementation, key: changedKey }
+    const changedLayout = {
+      ...layout,
+      effectEnvironments: layout.effectEnvironments.map((candidate) =>
+        candidate === environment ? { ...environment, instance: changedKey } : candidate,
+      ),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        {
+          ...held,
+          instances: discovery.instances.map((candidate) =>
+            candidate === implementation ? changedImplementation : candidate,
+          ),
+          calls: discovery.calls.map((candidate) => (candidate === call ? changedCall : candidate)),
+          layout: changedLayout,
+        },
+        subject,
+        changedCall,
+        provider,
+        environment.effect,
+      ),
+    )
     yield* Analysis.codegen(self, { mode: 'release' })
   }),
 )

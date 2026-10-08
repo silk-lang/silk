@@ -1,4 +1,5 @@
 import type * as AuthoredHir from './AuthoredHir.js'
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Lifetime from './Lifetime.js'
@@ -28,6 +29,7 @@ interface Base {
 export type Local =
   | {
       readonly _tag: 'BindingFact'
+      readonly mutability: 'Immutable' | 'Mutable'
       readonly id: Tir.LocalId
       readonly name: Name
       readonly inferredType: ExpressionType
@@ -125,6 +127,9 @@ export type Formation =
 export interface Argument {
   readonly id: { readonly ordinal: number }
   readonly expression: Expression
+  /** The actual argument node, before loan-view conversion erases a union adapter. */
+  readonly anchor: AuthoredHir.Anchor
+  readonly ref: Tir.NodeRef
   readonly type: ExpressionType
 }
 
@@ -174,7 +179,10 @@ export type Expression =
     })
   | (Base & {
       readonly _tag: 'StructLiteral' | 'UnionVariant'
-      readonly initializers: ReadonlyArray<{ readonly expression: Expression }>
+      readonly initializers: ReadonlyArray<{
+        readonly field: DeclarationFacts.FieldId
+        readonly expression: Expression
+      }>
     })
   | (Base & {
       readonly _tag: 'ArrayLiteral'
@@ -213,16 +221,31 @@ export type Expression =
     })
   | (Base & {
       readonly _tag: 'CallableApply'
+      readonly invocationUse?: Tir.InvocationUseObligation
       readonly callee: Expression
       readonly arguments: ReadonlyArray<Argument>
       readonly mode: Type.CallableMode
-      readonly staged?: unknown
+      readonly staged?: {
+        readonly site: Tir.CallableSiteId
+        readonly captures: ReadonlyArray<{
+          readonly ordinal: number
+          readonly parameterOrdinal: number
+          readonly argument: import('./AuthoredIdentity.js').Anchor
+          readonly type: Type.Type
+          readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take'
+        }>
+      }
       readonly provenance: { readonly _tag: string }
     })
   | (Base & {
       readonly _tag: 'CallableSection'
+      readonly invocationParameters?: ReadonlyArray<number>
+      readonly site: Tir.CallableSiteId
+      readonly remainingParameters: ReadonlyArray<number>
       readonly captures: ReadonlyArray<{
         readonly ordinal: number
+        readonly parameterOrdinal: number
+        readonly argument: Argument
         readonly expression: Expression
         readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take'
       }>
@@ -262,6 +285,7 @@ export type Expression =
   | (Base & { readonly _tag: 'CompileError'; readonly message: Expression })
 
 export interface Binding {
+  readonly mutability: 'Immutable' | 'Mutable'
   readonly id: Tir.LocalId
   readonly initializer: Expression
   readonly inferredType: ExpressionType
@@ -440,10 +464,140 @@ export const visitExpressions = (
   }
 }
 
+/** Original stored input provenance in one actual callable value graph. */
+export interface InvocationRecipe {
+  readonly parameters: ReadonlyArray<number>
+  readonly captures: ReadonlyArray<{
+    readonly parameter: number
+    readonly capture: number
+    readonly argument: Argument
+    readonly leaf: Tir.CallableSiteId
+    readonly capturePath?: ReadonlyArray<Tir.InvocationCapturePathStep>
+  }>
+}
+
+const sameCapturePath = (
+  left: ReadonlyArray<Tir.InvocationCapturePathStep> | undefined,
+  right: ReadonlyArray<Tir.InvocationCapturePathStep> | undefined,
+): boolean =>
+  left === undefined
+    ? right === undefined
+    : right !== undefined &&
+      left.length === right.length &&
+      left.every((step, ordinal) => {
+        const other = right.at(ordinal)
+        return (
+          other !== undefined &&
+          step._tag === other._tag &&
+          TirModule.nodeRefEquals(step.site.node, other.site.node) &&
+          TirModule.sameExecutableSite(step.site, other.site) &&
+          (step._tag === 'Base' || (other._tag === 'Capture' && step.ordinal === other.ordinal))
+        )
+      })
+
+/** Authenticates exact checked operands; undefined means a required obligation is malformed. */
+export const invocationArguments = (
+  self: Extract<Expression, { readonly _tag: 'CallableApply' }>,
+  recipe?: InvocationRecipe,
+):
+  | ReadonlyArray<{
+      readonly input: Tir.InvocationUseObligation['inputs'][number]
+      readonly argument: Argument
+    }>
+  | undefined => {
+  let contract: Type.Callable | undefined
+  if (self.callee.type._tag === 'Available') {
+    if (Type.isCallable(self.callee.type.type)) contract = self.callee.type.type
+    else if (
+      Type.isRepresented(self.callee.type.type) &&
+      Type.isCallable(self.callee.type.type.contract)
+    )
+      contract = self.callee.type.type.contract
+  }
+  const usage = contract?.invocationUse
+  if (self.staged !== undefined) return self.invocationUse === undefined ? [] : undefined
+  if (usage === undefined) return self.invocationUse === undefined ? [] : undefined
+  const obligation = self.invocationUse
+  if (
+    obligation === undefined ||
+    contract === undefined ||
+    usage.lifetime._tag !== 'BoundLifetime' ||
+    !Lifetime.equals(usage.lifetime, obligation.binder) ||
+    !Type.invocationUseValid(usage, contract.parameters.length, contract.lifetimeBinders, {
+      state: Type.invocationUseState(contract),
+    }) ||
+    (contract.schema !== undefined &&
+      !Type.invocationAdapterValid(usage, contract.parameters.length, contract.schema)) ||
+    AuthoredIdentity.anchorKey(obligation.origin) !== AuthoredIdentity.anchorKey(self.anchor) ||
+    obligation.owner.module !== obligation.lifetime.owner.module ||
+    obligation.owner.name !== obligation.lifetime.owner.name ||
+    obligation.inputs.length !== self.arguments.length + (recipe?.captures.length ?? 0) ||
+    contract.parameters.length !== self.arguments.length
+  )
+    return undefined
+  const parameters = new Set<number>()
+  const arguments_ = new Set<string>()
+  const actual = new Map<string, Argument>()
+  for (const argument of self.arguments) {
+    const key = AuthoredIdentity.anchorKey(argument.anchor)
+    if (actual.has(key)) return undefined
+    actual.set(key, argument)
+  }
+  const selected: Array<{
+    readonly input: Tir.InvocationUseObligation['inputs'][number]
+    readonly argument: Argument
+  }> = []
+  for (const input of obligation.inputs) {
+    const key = AuthoredIdentity.anchorKey(input.argument)
+    const capture =
+      input.capture === undefined
+        ? undefined
+        : recipe?.captures.find((candidate) => candidate.parameter === input.parameter)
+    const argument = input.capture === undefined ? actual.get(key) : capture?.argument
+    if (
+      !Number.isSafeInteger(input.parameter) ||
+      input.parameter < 0 ||
+      parameters.has(input.parameter) ||
+      arguments_.has(key) ||
+      (input.capture === undefined && input.capturePath !== undefined) ||
+      (input.capture !== undefined &&
+        (!Number.isSafeInteger(input.capture) ||
+          input.capture < 0 ||
+          capture === undefined ||
+          capture.capture !== input.capture ||
+          !sameCapturePath(input.capturePath, capture.capturePath) ||
+          AuthoredIdentity.anchorKey(capture.argument.anchor) !== key)) ||
+      argument === undefined ||
+      argument.type._tag !== 'Available' ||
+      !Type.equals(argument.type.type, input.type)
+    )
+      return undefined
+    parameters.add(input.parameter)
+    arguments_.add(key)
+    selected.push({ input, argument })
+  }
+  return selected
+}
+
+/** A result retains a call's exact input authority only when its stored representation contains κ. */
+export const retainsInvocationInputs = (
+  self: Extract<Expression, { readonly _tag: 'CallableApply' }>,
+): boolean => {
+  const obligation = self.invocationUse
+  return (
+    obligation !== undefined &&
+    self.type._tag === 'Available' &&
+    Type.storageLifetimes(self.type.type).some((lifetime) =>
+      Lifetime.atoms(lifetime).some((atom) => Lifetime.equals(atom, obligation.lifetime)),
+    )
+  )
+}
+
 /** Arguments whose access capability, or owned payload, is retained by the selected result. */
 export const retainedResultArguments = (
   self: Expression,
   assumptions: Lifetime.Assumptions,
+  recipe?: InvocationRecipe,
 ): ReadonlyArray<Argument> => {
   if (
     (self._tag !== 'Call' && self._tag !== 'CallableApply' && self._tag !== 'Operator') ||
@@ -455,7 +609,13 @@ export const retainedResultArguments = (
       ? new Set(self.heldLoans.map((loan) => loan.ordinal))
       : undefined
   const result = self.type.type
+  const invoked =
+    self._tag === 'CallableApply' && retainsInvocationInputs(self)
+      ? invocationArguments(self, recipe)
+      : []
+  const exact = new Set((invoked ?? []).map(({ argument }) => argument))
   return self.arguments.filter((argument) => {
+    if (exact.has(argument)) return true
     // `heldLoans` is authoritative only for a direct borrow operand. A nested call or aggregate
     // can carry its own loans into this result and still needs the ordinary type relation below.
     if (held !== undefined && argument.expression._tag === 'Borrow')
@@ -533,6 +693,7 @@ export const ofTir = (
       if (statement._tag === 'Bind')
         bindings.set(statement.binding.ordinal, {
           _tag: 'BindingFact',
+          mutability: statement.mutability,
           id: statement.binding,
           name: name(statement.name),
           inferredType:
@@ -587,7 +748,9 @@ export const ofTir = (
       return {
         id: { ordinal: declared.at(position) ?? position },
         expression: made,
-        type: made.type,
+        anchor: node.origin.anchor,
+        ref: TirModule.nodeReference(artifact, node),
+        type: node._tag === 'Unavailable' ? { _tag: 'Unavailable' } : available(node.type),
       }
     })
   }
@@ -633,7 +796,12 @@ export const ofTir = (
       for (const statement of inner) {
         if (statement._tag === 'Bind') {
           const initializer = expression(statement.initializer)
-          found.push({ id: statement.binding, initializer, inferredType: initializer.type })
+          found.push({
+            id: statement.binding,
+            mutability: statement.mutability,
+            initializer,
+            inferredType: initializer.type,
+          })
         }
         if (statement._tag === 'Unsafe') inStatements(statement.statements)
         if (statement._tag === 'If' || statement._tag === 'IfLet') {
@@ -775,7 +943,10 @@ export const ofTir = (
         return {
           ...base,
           _tag: node._tag === 'Construct' ? 'StructLiteral' : 'UnionVariant',
-          initializers: node.fields.map((field) => ({ expression: expression(field.value) })),
+          initializers: node.fields.map((field) => ({
+            field: field.field,
+            expression: expression(field.value),
+          })),
         }
       case 'ArrayConstruct':
         return {
@@ -871,6 +1042,7 @@ export const ofTir = (
         return {
           ...base,
           _tag: 'CallableApply',
+          ...(node.invocationUse === undefined ? {} : { invocationUse: node.invocationUse }),
           callee: expression(node.callee),
           arguments: argumentsOf(node.arguments),
           mode: node.access,
@@ -886,8 +1058,24 @@ export const ofTir = (
         return {
           ...base,
           _tag: 'CallableSection',
+          ...(node.invocationParameters === undefined
+            ? {}
+            : { invocationParameters: node.invocationParameters }),
+          site: node.site,
+          remainingParameters: node.remainingParameters,
           captures: node.captures.map((capture) => ({
             ordinal: capture.ordinal,
+            parameterOrdinal: capture.parameterOrdinal,
+            argument: {
+              id: { ordinal: capture.parameterOrdinal },
+              expression: expression(capture.value),
+              anchor: capture.value.origin.anchor,
+              ref: TirModule.nodeReference(artifact, capture.value),
+              type:
+                capture.value._tag === 'Unavailable'
+                  ? { _tag: 'Unavailable' }
+                  : available(capture.value.type),
+            },
             expression: expression(capture.value),
             access: capture.access,
           })),
@@ -1002,7 +1190,12 @@ export const ofTir = (
           return [
             {
               _tag: 'BindStatement',
-              binding: { id: node.binding, initializer, inferredType: initializer.type },
+              binding: {
+                id: node.binding,
+                mutability: node.mutability,
+                initializer,
+                inferredType: initializer.type,
+              },
               region: node.region,
             },
           ]

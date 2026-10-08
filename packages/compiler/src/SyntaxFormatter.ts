@@ -1070,15 +1070,23 @@ const printNode = (
       const marker = directTokens(node).find(
         (token) => token.kind === 'Bang' || token.kind === 'Question',
       )
+      const use =
+        node.kind === 'LifetimeParameter'
+          ? directTokens(node).find((token) => token.kind === 'Identifier')
+          : undefined
       const colon = directTokens(node).find((token) => token.kind === 'Colon')
       const bounds = directNodes(node)
       const pluses = directTokens(node).filter((token) => token.kind === 'Plus')
+      let binderPrefix = FormatDocument.empty
+      if (use !== undefined) binderPrefix = FormatDocument.text(' ')
+      else if (marker === undefined) binderPrefix = prefix
       return FormatDocument.concat(
+        ...(use === undefined ? [] : [printToken(context, use, prefix, preserveBlank)]),
         ...(marker === undefined ? [] : [printToken(context, marker, prefix, preserveBlank)]),
         printToken(
           context,
           tokenOf(node, node.kind === 'LifetimeParameter' ? 'Lifetime' : 'Identifier'),
-          marker === undefined ? prefix : FormatDocument.empty,
+          binderPrefix,
           preserveBlank,
         ),
         ...(colon === undefined ? [] : [printToken(context, colon)]),

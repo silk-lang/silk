@@ -1,3 +1,6 @@
+import type * as CallableInputView from './CallableInputView.js'
+import type * as Lifetime from './Lifetime.js'
+import type * as AuthoredIdentity from './AuthoredIdentity.js'
 import type * as ExecutionStorageComponent from './ExecutionStorageComponent.js'
 import type * as MachineFunction from './MachineFunction.js'
 import type * as NativeAssembly from './NativeAssembly.js'
@@ -52,6 +55,62 @@ export const lower = Effect.fn('Mir.lower')(function* (
  * than graph edges; only a backend-private lowering may introduce a cyclic CFG.
  */
 
+/** Exact lowered operands of one invocation; checked by ownership and MIR verification. */
+export interface InvocationUse {
+  readonly kind: 'Source' | 'Recovery'
+  readonly owner: Lifetime.Owner
+  readonly origin: AuthoredIdentity.Anchor
+  readonly binder: Lifetime.Bound
+  readonly lifetime: Lifetime.Local
+  readonly inputs: ReadonlyArray<{
+    readonly parameter: number
+    /** When present, argument is the retained callable container and this is its original slot. */
+    readonly capture?: number
+    readonly capturePath?: ReadonlyArray<Tir.InvocationCapturePathStep>
+    /** Genuine incoming parameter authority, separate from original formation provenance. */
+    readonly header?: { readonly parameter: number; readonly source: AuthoredIdentity.Anchor }
+    readonly argument: LocalId
+    readonly type: SilkType.Type
+    readonly source?: AuthoredIdentity.Anchor
+  }>
+  readonly result: LocalId
+}
+
+/** External referents needed while one actual invocation-produced holder is parked. */
+export interface InvocationUseRetention {
+  readonly invocation: InvocationUse
+  readonly holder: LocalId
+  /** Formation captures retain η independently of original invocation inputs. */
+  readonly environment: ReadonlyArray<{
+    readonly argument: LocalId
+    readonly referents: InvocationUseRetention['dependencies'][number]['referents']
+    readonly contents: InvocationUseRetention['dependencies'][number]['contents']
+  }>
+  readonly dependencies: ReadonlyArray<{
+    readonly parameter: number
+    readonly capture?: number
+    readonly capturePath?: ReadonlyArray<Tir.InvocationCapturePathStep>
+    readonly argument: LocalId
+    readonly referents: ReadonlyArray<{
+      readonly root: LocalId
+      readonly loan: SuspensionBorrowIdentity
+    }>
+    /** Header-owned borrowed contents; these are never a second owner of the parameter cell. */
+    readonly contents: ReadonlyArray<{
+      readonly parameter: number
+      readonly path: ReadonlyArray<
+        | { readonly _tag: 'Field'; readonly field: DeclarationFacts.FieldId }
+        | { readonly _tag: 'Element'; readonly index: number }
+        | { readonly _tag: 'Variant'; readonly ordinal: number }
+        | { readonly _tag: 'Capture'; readonly ordinal: number }
+        | { readonly _tag: 'DeclaredContents'; readonly component: number }
+      >
+      readonly type: SilkType.Type
+      readonly region: Lifetime.Lifetime
+    }>
+  }>
+}
+
 export type ScalarType = {
   readonly [Spelling in SilkType.Builtin]: { readonly _tag: Spelling }
 }[SilkType.Builtin]
@@ -79,6 +138,8 @@ export type Type =
     }
   | {
       readonly _tag: 'EffectValue'
+      /** Source-checked parameter view; the physical environment remains the actual producer. */
+      readonly inputView?: ExecutableInputView
       readonly type: SilkType.Effect
       readonly site: Tir.EffectSiteId
       readonly environment: Extract<
@@ -102,6 +163,8 @@ export type Type =
     }
   | {
       readonly _tag: 'CallableValue'
+      /** Source-checked parameter view; no callable environment is reconstructed. */
+      readonly inputView?: ExecutableInputView
       readonly type: SilkType.Callable
       readonly target: Tir.CallableTarget
       readonly typeArguments?: ReadonlyArray<SilkType.GenericArgument>
@@ -202,6 +265,7 @@ export interface Provenance {
 }
 
 export type NormalizationRejection =
+  | 'InvocationUse'
   | 'ComplexConstructor'
   | 'DynamicTarget'
   | 'EffectEscapes'
@@ -974,6 +1038,7 @@ export type Operation =
     }
   | {
       readonly _tag: 'Call'
+      readonly invocationUse?: InvocationUse
       readonly destination: LocalId
       readonly target: DeclarationFacts.CanonicalId
       readonly typeArguments: ReadonlyArray<SilkType.GenericArgument>
@@ -984,6 +1049,8 @@ export type Operation =
     }
   | {
       readonly _tag: 'MakeEffect'
+      /** Exact call replaced by constructor folding; its invocation proof remains source-owned. */
+      readonly invocationSource?: Extract<Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>
       readonly destination: LocalId
       readonly runner: DeclarationFacts.CanonicalId
       readonly runnerTypeArguments: ReadonlyArray<SilkType.GenericArgument>
@@ -1008,6 +1075,7 @@ export type Operation =
         readonly ordinal: number
         readonly parameterOrdinal: number
         readonly source: LocalId
+        readonly sourceOrigin?: AuthoredIdentity.Anchor
         readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take'
       }>
       readonly type: Extract<Type, { readonly _tag: 'CallableValue' }>
@@ -1033,6 +1101,7 @@ export type Operation =
     }
   | {
       readonly _tag: 'ApplyCallable'
+      readonly invocationUse?: InvocationUse
       readonly destination: LocalId
       readonly callable?: LocalId
       readonly target?: Tir.CallableTarget
@@ -1041,6 +1110,7 @@ export type Operation =
         readonly ordinal: number
         readonly parameterOrdinal: number
         readonly source: LocalId
+        readonly sourceOrigin?: AuthoredIdentity.Anchor
         readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take'
       }>
       readonly arguments: ReadonlyArray<LocalId>
@@ -1103,7 +1173,7 @@ export type Operation =
       readonly staticArguments?: ReadonlyArray<StaticValue.Value>
       readonly arguments: ReadonlyArray<LocalId>
       readonly outcomeType: Extract<Type, { readonly _tag: 'EffectOutcome' }>
-      readonly propagationType: Extract<Type, { readonly _tag: 'EffectOutcome' }>
+      readonly propagationType?: Extract<Type, { readonly _tag: 'EffectOutcome' }>
       readonly tagMappings: ReadonlyArray<{
         readonly source: number
         readonly target: number
@@ -1398,6 +1468,8 @@ export interface Execution {
   readonly result?: LocalId
   /** Failure whose selected handler is being applied and executed in this region graph. */
   readonly recoveryOutcome?: LocalId
+  /** Checked primitive recipe before a concrete offered handler's designation is opened. */
+  readonly recoveryInvocation?: Tir.RecoveryInvocationRecipe
 }
 
 export interface MatchArm {
@@ -1557,6 +1629,7 @@ export interface CoroutineFrameState {
   readonly runner: SuspensionRunner
   readonly outcome: SilkType.Effect
   readonly slots: ReadonlyArray<CoroutineFrameSlot>
+  readonly invocationUses?: ReadonlyArray<InvocationUseRetention>
   /** Present exactly when cancellation must run an armed nonparking finalizer before cleanup. */
   readonly cancellationFinalizer?: CancellationFinalizer
   readonly success: CoroutineFramePathPlan & { readonly resume: ResumePointId }
@@ -1653,7 +1726,37 @@ export type RunSuspendableEffectRegion = Extract<
   { readonly _tag: 'RunSuspendableEffectRegion' }
 >
 
+/** A selected call-edge view, authenticated against the separate held source catalog. */
+export interface ExecutableInputView {
+  readonly owner: Instances.InstanceKey
+  readonly callNode: Tir.NodeId
+  readonly view: Tir.ExecutableInputView
+}
+
+/** Original source and selected instance records, retained independently of physical descriptors. */
+export interface ExecutableInputViewSource {
+  readonly caller: Instances.Instance
+  readonly callee: Instances.Instance
+  readonly call: Instances.CallInstance
+  readonly original: Tir.ExecutableInputView
+  readonly selected: Tir.ExecutableInputView
+}
+
 export interface MirFunction {
+  /** Original source lifetime owner, preserved for generated runners and callable bodies. */
+  readonly sourceOwner?: Lifetime.Owner
+  /** The original source callable role; generated Effect runners never acquire this role. */
+  readonly sourceInvocationUse?: SilkType.InvocationUse
+  /** Checked authored inputs mapped to their actual physical header slots. */
+  readonly sourceParameters?: ReadonlyArray<{
+    readonly local: LocalId
+    readonly parameter: number
+    readonly source: AuthoredIdentity.Anchor
+    /** Authored promise before selection of the concrete hidden representation. */
+    readonly contract: SilkType.Type
+    /** Complete selected semantic header, including the actual callable schema. */
+    readonly type: SilkType.Type
+  }>
   readonly machine?: MachineFunction.MachineFunction
   readonly initializationFlags?: ReadonlyArray<{
     readonly root: LocalId
@@ -1690,6 +1793,10 @@ export interface MirFunction {
 }
 
 export interface Module {
+  /** Held original producer/target bodies for non-generic physical sections. */
+  readonly callableInputSources?: ReadonlyArray<CallableInputView.Source>
+  /** Held checked call graph for semantic views whose physical layout is shared. */
+  readonly executableInputViews?: ReadonlyArray<ExecutableInputViewSource>
   /** Source component selected only for reachable private frame storage. */
   readonly executionStorage?: ExecutionStorageComponent.ExecutionStorageComponent
   /** Explicit artifact roots preserved through optimization without creating foreign exports. */

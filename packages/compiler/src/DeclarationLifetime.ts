@@ -34,6 +34,8 @@ export interface Context {
   readonly implicit: ReadonlyArray<ImplicitBinder>
   readonly diagnostics: ReadonlyArray<Diagnostic.Located>
   readonly explicitEnvironment?: Lifetime.Lifetime
+  /** The genuine hidden callable use binder and its authored inputs, before lexical captures. */
+  readonly invocationUse?: Type.InvocationUse & { readonly lifetime: Lifetime.Bound }
   /**
    * An ordinary named function's top-level `Effect` result whose omitted environment has no
    * borrowed-input default and elaborated as `'static`. Declaration completion rejects it when
@@ -485,6 +487,8 @@ const elaborate = (
     const binderPath = [callableOrdinal++]
     const scopeBindings = new Map(scope)
     const binders: Array<Lifetime.Bound> = []
+    let invocationUseLifetime: Lifetime.Bound | undefined
+    let invalidInvocationUse = quantified
     if (quantified && type.binders.length > 0)
       diagnostics.push(
         Diagnostic.invalidLifetimeBinder(
@@ -494,6 +498,7 @@ const elaborate = (
       )
     for (const parameter of type.binders) {
       if (parameter._tag !== 'LifetimeParameter') {
+        invalidInvocationUse = true
         diagnostics.push(
           Diagnostic.invalidLifetimeBinder(
             'A callable lifetime binder accepts only lifetime parameters',
@@ -508,6 +513,7 @@ const elaborate = (
         spelled === "'static" ||
         binders.some((binder) => Lifetime.display(binder) === spelled)
       ) {
+        invalidInvocationUse = true
         diagnostics.push(
           Diagnostic.invalidLifetimeBinder(
             'Lifetime binders must have distinct names other than static',
@@ -519,6 +525,19 @@ const elaborate = (
       const binder = Lifetime.bound(owner, binders.length, spelled, binderPath)
       binders.push(binder)
       scopeBindings.set(spelled, binder)
+      if (parameter.invocationUse === true) {
+        let invalid: string | undefined
+        if (type._tag === 'ForeignFunctionType')
+          invalid = 'A foreign callable cannot carry an invocation-use lifetime'
+        else if (parameter.bounds.length > 0)
+          invalid = 'An invocation-use lifetime cannot declare bounds'
+        else if (invocationUseLifetime !== undefined)
+          invalid = 'A callable accepts only one invocation-use lifetime'
+        if (invalid !== undefined) {
+          invalidInvocationUse = true
+          diagnostics.push(Diagnostic.invalidLifetimeBinder(invalid, Location.at(parameter.anchor)))
+        } else invocationUseLifetime = binder
+      }
     }
     const lifetimeBounds: Array<Lifetime.Outlives> = []
     for (const parameter of type.binders) {
@@ -559,6 +578,14 @@ const elaborate = (
         environment,
         lifetimeBinders: binders,
         lifetimeBounds: Lifetime.assumptions(lifetimeBounds).bounds,
+        ...(invocationUseLifetime === undefined || invalidInvocationUse
+          ? {}
+          : {
+              invocationUse: {
+                lifetime: invocationUseLifetime,
+                parameters: type.parameters.map((_, ordinal) => ordinal),
+              },
+            }),
       })
   }
 

@@ -2,6 +2,8 @@ import * as CleanupPlan from './CleanupPlan.js'
 import type * as DeclarationFacts from './DeclarationFacts.js'
 import * as Mir from './Mir.js'
 import * as ProvisionalMir from './ProvisionalMir.js'
+import * as Tir from './Tir.js'
+import * as Type from './Type.js'
 import * as FunctionIndex from './internal/FunctionIndex.js'
 
 /**
@@ -64,10 +66,79 @@ type ConstructorGuard = 'SingleRegion' | 'TrivialCleanup'
 const constructorGuardOf = (shape: ConstructorShape): ConstructorGuard =>
   shape.fn.regions.length === 1 ? 'SingleRegion' : 'TrivialCleanup'
 
+/** A captureless function item remains an exact target through its real callable value. */
+const itemTarget = (
+  owner: Mir.MirFunction | undefined,
+  operation: Extract<Mir.Operation, { readonly _tag: 'ApplyCallable' }>,
+): DeclarationFacts.CanonicalId | undefined => {
+  if (owner === undefined || operation.callable === undefined) return undefined
+  const type = owner.localTypes.at(operation.callable.ordinal)
+  if (
+    type?._tag !== 'CallableValue' ||
+    type.environment !== undefined ||
+    type.site !== undefined ||
+    type.inputView !== undefined ||
+    type.target._tag !== 'DeclarationCallableTarget'
+  )
+    return undefined
+  const definitions = owner.regions
+    .flatMap(Mir.operationsOf)
+    .flatMap(Mir.operationTree)
+    .filter(
+      (candidate) =>
+        candidate._tag === 'MakeCallable' &&
+        candidate.destination.ordinal === operation.callable?.ordinal,
+    )
+  const definition = definitions.at(0)
+  if (
+    definitions.length !== 1 ||
+    definition?._tag !== 'MakeCallable' ||
+    definition.base !== undefined ||
+    definition.captures.length !== 0 ||
+    definition.target._tag !== 'DeclarationCallableTarget' ||
+    definition.target.declaration.module !== type.target.declaration.module ||
+    definition.target.declaration.name !== type.target.declaration.name ||
+    !Type.equals(definition.type.type, type.type) ||
+    !Mir.runtimeArgumentsEqual(definition.typeArguments, operation.typeArguments)
+  )
+    return undefined
+  return type.target.declaration
+}
+
+const declarationOf = (
+  owner: Mir.MirFunction | undefined,
+  operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+): DeclarationFacts.CanonicalId | undefined => {
+  if (operation._tag === 'Call') return operation.target
+  return operation.target?._tag === 'DeclarationCallableTarget'
+    ? operation.target.declaration
+    : itemTarget(owner, operation)
+}
+
 const directTarget = (
   functions: FunctionIndex.FunctionIndex<Mir.MirFunction>,
   operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+  owner?: Mir.MirFunction,
 ): ConstructorShape | undefined => {
+  if (operation.invocationUse !== undefined) {
+    const declaration = declarationOf(owner, operation)
+    if (declaration === undefined) return undefined
+    const candidates = FunctionIndex.mirInstances(
+      functions,
+      declaration,
+      operation.typeArguments,
+      operation._tag === 'Call' ? operation.staticArguments : undefined,
+    ).filter((candidate) =>
+      Mir.matchesCall(
+        candidate,
+        declaration,
+        operation.typeArguments,
+        operation._tag === 'Call' ? operation.staticArguments : undefined,
+        operation.type,
+      ),
+    )
+    return candidates.length === 1 ? constructorShape(candidates.at(0)) : undefined
+  }
   if (operation._tag === 'Call') {
     return constructorShape(
       FunctionIndex.mirInstances(
@@ -96,13 +167,9 @@ const directTarget = (
 const hasConcreteTarget = (
   functions: FunctionIndex.FunctionIndex<Mir.MirFunction>,
   operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+  owner: Mir.MirFunction,
 ): boolean => {
-  let declaration: DeclarationFacts.CanonicalId | undefined
-  if (operation._tag === 'Call') {
-    declaration = operation.target
-  } else if (operation.target?._tag === 'DeclarationCallableTarget') {
-    declaration = operation.target.declaration
-  }
+  const declaration = declarationOf(owner, operation)
   return (
     declaration !== undefined &&
     FunctionIndex.mirInstances(functions, declaration, operation.typeArguments).length > 0
@@ -136,6 +203,13 @@ const foldConstructor = (
 ): Extract<Mir.Operation, { readonly _tag: 'MakeEffect' }> | undefined => {
   if (operation._tag !== 'Call' && operation._tag !== 'ApplyCallable') return undefined
   if (shape === undefined) return undefined
+  if (operation.invocationUse !== undefined && operation.type._tag !== 'EffectValue')
+    return undefined
+  if (
+    operation.invocationUse !== undefined &&
+    !Mir.realizesReturn(shape.construction.type, operation.type)
+  )
+    return undefined
   const parameters = parametersFor(operation, shape.fn.parameterCount)
   if (parameters === undefined) return undefined
   const captures = shape.construction.captures.map((capture) => {
@@ -145,6 +219,7 @@ const foldConstructor = (
   if (captures.some((capture) => capture === undefined)) return undefined
   return {
     _tag: 'MakeEffect',
+    ...(operation.invocationUse === undefined ? {} : { invocationSource: operation }),
     destination: operation.destination,
     runner: shape.construction.runner,
     runnerTypeArguments: shape.construction.runnerTypeArguments,
@@ -154,9 +229,63 @@ const foldConstructor = (
       ): capture is Extract<Mir.Operation, { readonly _tag: 'MakeEffect' }>['captures'][number] =>
         capture !== undefined,
     ),
-    type: shape.construction.type,
+    type:
+      operation.invocationUse !== undefined && operation.type._tag === 'EffectValue'
+        ? operation.type
+        : shape.construction.type,
     provenance: operation.provenance,
   }
+}
+
+/** Replays the actual constructor fold before consuming a preserved call-use certificate. */
+export const invocationConstructionValid = (
+  program: Pick<Mir.Module, 'functions'>,
+  construction: Extract<Mir.Operation, { readonly _tag: 'MakeEffect' }>,
+): boolean => {
+  const source = construction.invocationSource
+  if (source === undefined) return true
+  if (
+    source.invocationUse === undefined ||
+    source.destination.ordinal !== construction.destination.ordinal ||
+    source.invocationUse.result.ordinal !== construction.destination.ordinal
+  )
+    return false
+  const index = FunctionIndex.make(program.functions, (fn) => fn.id)
+  const owners = program.functions.filter((fn) =>
+    fn.regions
+      .flatMap(Mir.operationsOf)
+      .flatMap(Mir.operationTree)
+      .some(
+        (operation) => operation._tag === 'MakeEffect' && operation.invocationSource === source,
+      ),
+  )
+  if (owners.length !== 1) return false
+  const target = directTarget(index, source, owners.at(0))
+  const expected = foldConstructor(target, source)
+  if (
+    expected === undefined ||
+    expected.runner.module !== construction.runner.module ||
+    expected.runner.name !== construction.runner.name ||
+    expected.runnerTypeArguments.length !== construction.runnerTypeArguments.length ||
+    !expected.runnerTypeArguments.every((argument, ordinal) => {
+      const actual = construction.runnerTypeArguments.at(ordinal)
+      return actual !== undefined && Type.equalsGenericArgument(argument, actual)
+    }) ||
+    expected.captures.length !== construction.captures.length ||
+    !expected.captures.every((capture, ordinal) => {
+      const actual = construction.captures.at(ordinal)
+      return (
+        actual !== undefined &&
+        capture.source.ordinal === actual.source.ordinal &&
+        capture.access === actual.access
+      )
+    }) ||
+    !Type.equals(expected.type.type, construction.type.type) ||
+    expected.type.environment !== construction.type.environment ||
+    !Tir.sameExecutableSite(expected.type.site, construction.type.site)
+  )
+    return false
+  return true
 }
 
 interface LocalUse {
@@ -363,7 +492,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
       const operations = region.operations.map((operation) => {
         const target =
           operation._tag === 'Call' || operation._tag === 'ApplyCallable'
-            ? directTarget(functionIndex, operation)
+            ? directTarget(functionIndex, operation, fn)
             : undefined
         const targetSuspension =
           target === undefined
@@ -382,7 +511,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
               _tag: 'Rejected',
               reason:
                 targetSuspension ??
-                (hasConcreteTarget(functionIndex, operation)
+                (hasConcreteTarget(functionIndex, operation, fn)
                   ? 'ComplexConstructor'
                   : 'DynamicTarget'),
               function: fn.id,
@@ -445,7 +574,10 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
             : undefined
         let reason: Mir.NormalizationRejection | undefined = runSuspension
         if (reason === undefined) {
-          if (uses.length === 0) reason = 'EffectEscapes'
+          // DirectStaticRun removes the holder. Keep source-owned invocation proofs on their
+          // actual constructed holder so verification can discharge input validity and cleanup.
+          if (construction.invocationSource !== undefined) reason = 'InvocationUse'
+          else if (uses.length === 0) reason = 'EffectEscapes'
           else if (uses.length > 1) reason = 'EffectReused'
           else if (use === undefined || !sameRegion(use.region.id, region.id)) {
             reason = 'CrossRegionUse'

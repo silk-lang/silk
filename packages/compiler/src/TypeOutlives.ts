@@ -10,6 +10,8 @@ export interface Context {
   readonly assumptions: Lifetime.Assumptions
   readonly parameters: ReadonlyMap<string, DeclarationFacts.TypeParameterFact>
   readonly parameterBounds: ReadonlyMap<string, ReadonlyArray<Lifetime.Lifetime>>
+  /** Marked expected-input antecedents local to one hidden body/comparison scope. */
+  readonly invocationInputs: ReadonlyArray<Type.InvocationInputBound>
   readonly nominals: ReadonlyMap<string, ReadonlyArray<DeclarationFacts.TypeParameterFact>>
   readonly contractNominals: ReadonlySet<string>
   readonly work: {
@@ -227,6 +229,7 @@ export const context = (modules: ReadonlyArray<DeclarationFacts.ModuleHeaders>):
     assumptions: Lifetime.assumptions(bounds),
     parameters,
     parameterBounds,
+    invocationInputs: [],
     nominals,
     contractNominals,
     work: work,
@@ -242,6 +245,12 @@ export const check = (
   scope: Context,
   prove: Prove = (longer, shorter) => Lifetime.outlives(scope.assumptions, longer, shorter),
 ): boolean => {
+  if (
+    scope.invocationInputs.some(
+      (input) => Type.equals(input.type, self) && prove(input.lifetime, lifetime),
+    )
+  )
+    return true
   if (!Type.storageLifetimes(self).every((retained) => prove(retained, lifetime))) return false
   return Type.storageParameters(self).every((parameter) => {
     if (parameter.staticProperties.includes('Intrinsic.Detached')) return true
@@ -316,6 +325,27 @@ export const withInputs = (scope: Context, inputs: ReadonlyArray<Type.Type>): Co
     ...scope,
     assumptions: Lifetime.mergeAssumptions(scope.assumptions, Lifetime.assumptions(bounds)),
     parameterBounds,
+  }
+}
+
+/** Adds only explicitly marked expected-input conditions; this does not prove an actual call. */
+export const withInvocationInputs = (
+  scope: Context,
+  expected: Type.Callable,
+): Context | undefined => {
+  const inputs = Type.invocationInputBounds(expected)
+  if (inputs === undefined) return undefined
+  return {
+    ...scope,
+    invocationInputs: [...scope.invocationInputs, ...inputs],
+    assumptions: Lifetime.mergeAssumptions(
+      scope.assumptions,
+      Lifetime.assumptions(
+        inputs.flatMap((input) =>
+          Type.storageLifetimes(input.type).map((longer) => ({ longer, shorter: input.lifetime })),
+        ),
+      ),
+    ),
   }
 }
 

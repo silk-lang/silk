@@ -373,7 +373,11 @@ effect fn inspect() -> Result<i32, HttpError | OutOfMemoryError> {
 The outer `Result` remains one nominal union. Its `Failure` payload is the ordinary structural union
 `HttpError | OutOfMemoryError`; reification does not flatten either layer. The two constructor
 adapters are exact `once fn` values, so success and failure payloads may be move-only and are
-transferred exactly once. Traps are not typed failures and are not converted into `Failure`.
+transferred exactly once. Recovery uses an invocation-scoped callback: the caught error remains
+valid through the immediately executed returned Effect and its cleanup. This adds no `E: 'env`
+or `E: 'static` restriction to `Effect.result`; retained views in the resulting `Result` continue
+to carry their own ordinary lifetimes. Traps are not typed failures and are not converted into
+`Failure`.
 
 This behavior is not privileged. Another library can define a generic result-like nominal union and
 compose the same `map` followed by `catchAll` under any legal function name. The compiler recognizes

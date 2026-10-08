@@ -639,20 +639,44 @@ function decodeLifetime(value: unknown): Lifetime.Lifetime {
   throw new InvalidModuleSurfaceEncoding(`unknown lifetime tag ${tag}`)
 }
 
-const encodeExecutableLifetimes = (value: Type.ExecutableLifetimes): SerializedRecord => ({
-  environment: encodeLifetime(value.environment),
-  lifetimeBinders: value.lifetimeBinders.map(encodeLifetime),
-  lifetimeBounds: (value.lifetimeBounds ?? []).map((bound) => ({
-    longer: encodeLifetime(bound.longer),
-    shorter: encodeLifetime(bound.shorter),
-  })),
-  typeOutlives: (value.typeOutlives ?? []).map((bound) => ({
-    type: encodeTypeNode(bound.type),
-    lifetime: encodeLifetime(bound.lifetime),
-  })),
-})
+const encodeExecutableLifetimes = (
+  value: Type.ExecutableLifetimes,
+  parameterCount?: number,
+): SerializedRecord => {
+  if (
+    Type.invocationUseState(value) !== 'Closed' ||
+    (value.invocationUse !== undefined && parameterCount === undefined) ||
+    !Type.invocationUseValid(value.invocationUse, parameterCount ?? 0, value.lifetimeBinders, {
+      state: 'Closed',
+    })
+  )
+    throw new InvalidModuleSurfaceEncoding('invalid closed invocation-use metadata')
+  return {
+    environment: encodeLifetime(value.environment),
+    lifetimeBinders: value.lifetimeBinders.map(encodeLifetime),
+    lifetimeBounds: (value.lifetimeBounds ?? []).map((bound) => ({
+      longer: encodeLifetime(bound.longer),
+      shorter: encodeLifetime(bound.shorter),
+    })),
+    typeOutlives: (value.typeOutlives ?? []).map((bound) => ({
+      type: encodeTypeNode(bound.type),
+      lifetime: encodeLifetime(bound.lifetime),
+    })),
+    ...(value.invocationUse === undefined
+      ? {}
+      : {
+          invocationUse: {
+            lifetime: encodeLifetime(value.invocationUse.lifetime),
+            parameters: Array.from(value.invocationUse.parameters),
+          },
+        }),
+  }
+}
 
-const decodeExecutableLifetimes = (encoded: SerializedRecord): Type.ExecutableLifetimes => {
+const decodeExecutableLifetimes = (
+  encoded: SerializedRecord,
+  parameterCount?: number,
+): Type.ExecutableLifetimes => {
   const lifetimeBinders = serializedArray(encoded.lifetimeBinders, 'lifetime binders').map(
     (value) => {
       const lifetime = decodeLifetime(value)
@@ -663,9 +687,29 @@ const decodeExecutableLifetimes = (encoded: SerializedRecord): Type.ExecutableLi
   )
   if (new Set(lifetimeBinders.map(Lifetime.key)).size !== lifetimeBinders.length)
     throw new InvalidModuleSurfaceEncoding('executable lifetime binders must be distinct')
+  const invocationUse =
+    encoded.invocationUse === undefined
+      ? undefined
+      : (() => {
+          const usage = serializedRecord(encoded.invocationUse, 'invocation use')
+          return {
+            lifetime: decodeLifetime(usage.lifetime),
+            parameters: serializedArray(usage.parameters, 'invocation use parameters').map(
+              (parameter) => serializedNonNegativeInteger(parameter, 'invocation use parameter'),
+            ),
+          }
+        })()
+  if (
+    (invocationUse !== undefined && parameterCount === undefined) ||
+    !Type.invocationUseValid(invocationUse, parameterCount ?? 0, lifetimeBinders, {
+      state: 'Closed',
+    })
+  )
+    throw new InvalidModuleSurfaceEncoding('invalid closed invocation-use metadata')
   return {
     environment: decodeLifetime(encoded.environment),
     lifetimeBinders,
+    ...(invocationUse === undefined ? {} : { invocationUse }),
     lifetimeBounds: serializedArray(encoded.lifetimeBounds, 'lifetime bounds').map((value) => {
       const bound = serializedRecord(value, 'lifetime bound')
       return { longer: decodeLifetime(bound.longer), shorter: decodeLifetime(bound.shorter) }
@@ -938,10 +982,20 @@ function encodeTypeNode(value: Type.Type): unknown {
       addressSpace: value.addressSpace,
       pointee: encodeTypeNode(value.pointee),
     }
-  if (Type.isCallable(value))
+  if (Type.isCallable(value)) {
+    if (
+      value.schema !== undefined &&
+      (value.invocationUse !== undefined ||
+        value.schema.contract.invocationUse !== undefined ||
+        value.schema.invocationAdapter !== undefined) &&
+      !callableSchemaMatches(value, value.schema)
+    )
+      throw new InvalidModuleSurfaceEncoding(
+        'callable signature disagrees with its specialized schema contract',
+      )
     return {
       tag: 'Callable',
-      ...encodeExecutableLifetimes(value),
+      ...encodeExecutableLifetimes(value, value.parameters.length),
       unsafe: value.unsafe,
       mode: value.mode,
       parameters: value.parameters.map(encodeTypeNode),
@@ -953,6 +1007,19 @@ function encodeTypeNode(value: Type.Type): unknown {
               tag: 'CallableSchema',
               ...(value.schema.source === undefined ? {} : { source: value.schema.source }),
               contract: encodeCallableContract(value.schema.contract),
+              ...(value.schema.invocationAdapter === undefined
+                ? {}
+                : {
+                    invocationAdapter: {
+                      binder: encodeLifetime(value.schema.invocationAdapter.binder),
+                      originalInputs: Array.from(value.schema.invocationAdapter.originalInputs),
+                      parameters: Array.from(value.schema.invocationAdapter.parameters),
+                      lifetimes: value.schema.invocationAdapter.lifetimes.map((slot) => ({
+                        parameter: encodeParameter(slot.parameter),
+                        lifetime: encodeLifetime(slot.lifetime),
+                      })),
+                    },
+                  }),
               binders: value.schema.binders.map(encodeParameter),
               constraints: value.schema.constraints.map(encodeConstraintNode),
               evidence: value.schema.evidence.map(encodeConstraintEvidenceNode),
@@ -963,6 +1030,7 @@ function encodeTypeNode(value: Type.Type): unknown {
             },
           }),
     }
+  }
   if (Type.isForeignFunction(value))
     return {
       tag: 'ForeignFunction',
@@ -993,9 +1061,12 @@ function encodeTypeNode(value: Type.Type): unknown {
 }
 
 function encodeCallableContract(value: CallableContract.CallableContract): SerializedRecord {
+  const originalInputs = Type.callableInputOrdinals(value)
+  if (value.invocationUse !== undefined && originalInputs === undefined)
+    throw new InvalidModuleSurfaceEncoding('invalid marked callable capture suffix')
   return {
     tag: 'CallableContract',
-    ...encodeExecutableLifetimes(value),
+    ...encodeExecutableLifetimes(value, originalInputs?.length ?? value.parameters.length),
     functionKind: value.functionKind,
     unsafe: value.unsafe,
     binders: value.binders.map(encodeParameter),
@@ -1048,8 +1119,20 @@ function decodeCallableContract(value: unknown): CallableContract.CallableContra
       throw new InvalidModuleSurfaceEncoding('callable contract capture is out of bounds')
     return { parameter, capture: captured }
   })
+  let inputCount = parameters.length
+  if (encoded.invocationUse !== undefined) {
+    inputCount -= captures.length
+    if (
+      inputCount < 0 ||
+      !captures.every(
+        (capture, ordinal) =>
+          capture.capture === ordinal && capture.parameter === inputCount + ordinal,
+      )
+    )
+      throw new InvalidModuleSurfaceEncoding('invalid marked callable capture suffix')
+  }
   return CallableContract.make({
-    ...decodeExecutableLifetimes(encoded),
+    ...decodeExecutableLifetimes(encoded, inputCount),
     functionKind,
     unsafe: serializedBoolean(encoded.unsafe, 'callable contract unsafe qualifier'),
     binders: serializedArray(encoded.binders, 'callable contract binders').map(decodeParameter),
@@ -1072,14 +1155,66 @@ const sameTypes = (left: ReadonlyArray<Type.Type>, right: ReadonlyArray<Type.Typ
     return other !== undefined && Type.equals(type, other)
   })
 
-const callableSchemaMatches = (
-  parameters: ReadonlyArray<Type.Type>,
-  result: Type.Type,
-  schema: Type.CallableSchema,
-): boolean => {
+const callableSchemaMatches = (callable: Type.Callable, schema: Type.CallableSchema): boolean => {
+  const { parameters, result } = callable
   const contractParameters = schema.contract.parameters.map((parameter) =>
     Type.substitute(parameter.type, schema.substitution),
   )
+  const adapter = schema.invocationAdapter
+  if (adapter !== undefined) {
+    if (
+      adapter.binder._tag !== 'BoundLifetime' ||
+      !Type.invocationAdapterValid(callable.invocationUse, parameters.length, schema)
+    )
+      return false
+    const mapped = adapter.parameters.map((ordinal) => contractParameters.at(ordinal))
+    if (
+      !mapped.every((parameter, ordinal) => {
+        const visible = parameters.at(ordinal)
+        return parameter !== undefined && visible !== undefined && Type.equals(parameter, visible)
+      })
+    )
+      return false
+    // Original target obligations remain selected obligations, rather than becoming use premises.
+    const selectedBounds = schema.contract.lifetimeBounds.map((bound) => ({
+      longer: Type.substituteLifetime(bound.longer, schema.substitution),
+      shorter: Type.substituteLifetime(bound.shorter, schema.substitution),
+    }))
+    const selectedTypeBounds = schema.contract.typeOutlives.map((bound) => ({
+      type: Type.substitute(bound.type, schema.substitution),
+      lifetime: Type.substituteLifetime(bound.lifetime, schema.substitution),
+    }))
+    if (
+      !selectedBounds.every((bound) =>
+        callable.lifetimeBounds.some(
+          (retained) =>
+            Lifetime.equals(bound.longer, retained.longer) &&
+            Lifetime.equals(bound.shorter, retained.shorter),
+        ),
+      )
+    )
+      return false
+    if (
+      !selectedTypeBounds.every((bound) =>
+        callable.typeOutlives.some(
+          (retained) =>
+            Type.equals(bound.type, retained.type) &&
+            Lifetime.equals(bound.lifetime, retained.lifetime),
+        ),
+      )
+    )
+      return false
+    return Type.equals(result, Type.substitute(schema.contract.result, schema.substitution))
+  }
+  const usage = callable.invocationUse
+  const originalUsage = schema.contract.invocationUse
+  if (
+    (usage === undefined) !== (originalUsage === undefined) ||
+    (usage !== undefined &&
+      originalUsage !== undefined &&
+      !Lifetime.equals(usage.lifetime, originalUsage.lifetime))
+  )
+    return false
   const leading = contractParameters.at(0)
   const fullReference = sameTypes(parameters, contractParameters)
   const leadingSection =
@@ -1130,6 +1265,38 @@ function decodeCallableSchemaNode(value: unknown): Type.CallableSchema {
     contract.binders,
     'callable schema substitution',
   )
+  const invocationAdapter =
+    current.invocationAdapter === undefined
+      ? undefined
+      : (() => {
+          const adapter = serializedRecord(current.invocationAdapter, 'invocation adapter')
+          const binder = decodeLifetime(adapter.binder)
+          if (binder._tag !== 'BoundLifetime')
+            throw new InvalidModuleSurfaceEncoding(
+              'closed invocation adapter must retain its original binder',
+            )
+          return {
+            binder,
+            originalInputs: serializedArray(
+              adapter.originalInputs,
+              'original invocation inputs',
+            ).map((ordinal) => serializedNonNegativeInteger(ordinal, 'original invocation input')),
+            parameters: serializedArray(adapter.parameters, 'invocation adapter parameters').map(
+              (ordinal) => serializedNonNegativeInteger(ordinal, 'invocation adapter parameter'),
+            ),
+            lifetimes: serializedArray(adapter.lifetimes, 'invocation adapter lifetime slots').map(
+              (value) => {
+                const slot = serializedRecord(value, 'invocation adapter lifetime slot')
+                const parameter = decodeParameterOfKind(
+                  slot.parameter,
+                  'Lifetime',
+                  'invocation adapter slot',
+                )
+                return { parameter, lifetime: decodeLifetime(slot.lifetime) }
+              },
+            ),
+          }
+        })()
   const source =
     current.source === undefined ? undefined : serializedRecord(current.source, 'schema source')
   return {
@@ -1142,6 +1309,7 @@ function decodeCallableSchemaNode(value: unknown): Type.CallableSchema {
           },
         }),
     contract,
+    ...(invocationAdapter === undefined ? {} : { invocationAdapter }),
     binders,
     constraints,
     evidence,
@@ -1228,18 +1396,19 @@ function decodeTypeNode(value: unknown): Type.Type {
       const result = decodeTypeNode(encoded.result)
       const schema =
         encoded.schema === undefined ? undefined : decodeCallableSchemaNode(encoded.schema)
-      if (schema !== undefined && !callableSchemaMatches(parameters, result, schema))
-        throw new InvalidModuleSurfaceEncoding(
-          'callable signature disagrees with its specialized schema contract',
-        )
-      return Type.callable(
+      const callable = Type.callable(
         parameters,
         result,
-        decodeExecutableLifetimes(encoded),
+        decodeExecutableLifetimes(encoded, parameters.length),
         mode,
         schema,
         serializedBoolean(encoded.unsafe, 'callable unsafe qualifier'),
       )
+      if (schema !== undefined && !callableSchemaMatches(callable, schema))
+        throw new InvalidModuleSurfaceEncoding(
+          'callable signature disagrees with its specialized schema contract',
+        )
+      return callable
     }
     case 'ForeignFunction': {
       const parameters = serializedArray(encoded.parameters, 'foreign function parameters').map(
@@ -1729,6 +1898,7 @@ const executableLifetimeSignature = (value: Type.ExecutableLifetimes): string =>
     array(value.lifetimeBinders.map(Lifetime.key)),
     Lifetime.assumptions(value.lifetimeBounds ?? []).key,
     Type.typeOutlivesKey(value.typeOutlives ?? []),
+    ...(value.invocationUse === undefined ? [] : [Type.invocationUseKey(value)]),
   ])
 
 const declaredType = (value: DeclarationFacts.DeclaredTypeFact): string => {

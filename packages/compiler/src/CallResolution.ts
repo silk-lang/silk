@@ -96,9 +96,28 @@ export const analyzeArgumentNodes = (
   scope: Scope,
   resolution: ResolutionContext,
   expectedTypes: ReadonlyArray<SemanticType | undefined> = [],
+  consumer?: TypeInference.InvocationConsumer,
 ): ArgumentsResult => {
-  const inferred = new Map<string, Type.GenericArgument>()
-  const lifetimes = selectedCallLifetimes(site, [], resolution)
+  const inferred = new Map<string, Type.GenericArgument>(consumer?.substitution)
+  // A nested call establishes its own advisory domain; an enclosing argument context
+  // must not authorize foreign holes in that call or in an unrelated hidden body.
+  const { invocationConsumer: enclosingConsumer, ...argumentResolution } = resolution
+  void enclosingConsumer
+  const lifetimes = selectedCallLifetimes(
+    site,
+    [],
+    resolution,
+    consumer?.substitution,
+    undefined,
+    new Set(
+      (consumer?.binders ?? []).flatMap((parameter) => {
+        const argument = Type.parameterArgument(parameter)
+        return Lifetime.isLifetime(argument) && !inferred.has(Lifetime.key(argument))
+          ? [Lifetime.key(argument)]
+          : []
+      }),
+    ),
+  )
   // An operand recovery invented to fill an empty position is not an argument the author wrote.
   const written = nodes.filter(
     (element) =>
@@ -114,7 +133,16 @@ export const analyzeArgumentNodes = (
       declarations,
       declaration,
       scope,
-      resolution,
+      consumer === undefined
+        ? argumentResolution
+        : {
+            ...argumentResolution,
+            invocationConsumer: {
+              binders: consumer.binders,
+              substitution: new Map(inferred),
+              caller: declaration.id,
+            },
+          },
       expected,
     )
     if (pattern !== undefined && result?.type !== undefined) {
@@ -263,6 +291,10 @@ export function analyzeArguments(
     callTypeArguments?.explicit === true && explicitTypes !== undefined
       ? explicitArgumentSubstitution(declaredTypeParameters, callTypeArguments.facts)
       : undefined
+  const targetInvocation =
+    target === undefined
+      ? undefined
+      : DeclarationFacts.executableLifetimes(target).invocationUse?.lifetime
   const substitution =
     target === undefined
       ? explicitSubstitution
@@ -271,6 +303,15 @@ export function analyzeArguments(
           DeclarationFacts.executableLifetimes(target).lifetimeBinders,
           resolution,
           explicitSubstitution,
+          targetInvocation?._tag === 'BoundLifetime' ? targetInvocation : undefined,
+          inputInferredCallLifetimes(
+            DeclarationFacts.executableLifetimes(target).lifetimeBinders,
+            target.parameters.flatMap((parameter) =>
+              parameter.declaredType._tag === 'Resolved' ? [parameter.declaredType.type] : [],
+            ),
+            targetInvocation?._tag === 'BoundLifetime' ? targetInvocation : undefined,
+            declaredTypeParameters,
+          ),
         ).substitution
   let selectedParameters: ReadonlyArray<SemanticType | undefined>
   if (boundParameters.length > 0) selectedParameters = boundParameters
@@ -289,9 +330,7 @@ export function analyzeArguments(
     selectedParameters = (target?.parameters ?? [])
       .slice(offset)
       .map((parameter) =>
-        parameter.declaredType._tag === 'Resolved'
-          ? Type.substitute(parameter.declaredType.type, substitution ?? new Map())
-          : undefined,
+        parameter.declaredType._tag === 'Resolved' ? parameter.declaredType.type : undefined,
       )
   }
   const expectedTypes = selectedParameters
@@ -304,6 +343,12 @@ export function analyzeArguments(
     scope,
     resolution,
     expectedTypes,
+    target === undefined
+      ? undefined
+      : {
+          binders: declaredTypeParameters,
+          substitution: substitution ?? new Map(),
+        },
   )
 }
 
@@ -692,6 +737,34 @@ export const resolvedCallableContract = (
   )
 }
 
+/** Authenticates a future selected input against the primitive's original marked contract. */
+export const recoveryInvocationRecipe = (
+  contract: CallableContract.CallableContract,
+  substitution: Type.Substitution,
+  selected: Type.Type,
+  origin: AuthoredHir.Anchor,
+  body: BodyLifetime.BodyLifetime | undefined,
+): Tir.RecoveryInvocationRecipe | undefined => {
+  const parameter = contract.parameters.at(1)
+  const required =
+    parameter === undefined ? undefined : Type.substitute(parameter.type, substitution)
+  const binder =
+    required !== undefined && Type.isCallable(required)
+      ? required.invocationUse?.lifetime
+      : undefined
+  if (binder?._tag !== 'BoundLifetime' || body === undefined) return undefined
+  const lifetime = BodyLifetime.invocationRegion(body, origin, binder)
+  if (lifetime === undefined) return undefined
+  return {
+    owner: body.owner,
+    lifetime,
+    origin,
+    parameter: 0,
+    selected,
+    binder,
+  }
+}
+
 export const callArityDiagnostic = (
   reference: Extract<
     CallReferenceFact,
@@ -830,15 +903,60 @@ export const instantiateSourceParameters = (
   call: AuthoredHir.Expression,
   resolution: ResolutionContext,
 ): ReadonlyArray<SemanticType | undefined> => {
+  const declared = DeclarationFacts.executableLifetimes(declaration)
   const selected = selectedCallLifetimes(
     call,
-    DeclarationFacts.executableLifetimes(declaration).lifetimeBinders,
+    declared.lifetimeBinders,
     resolution,
+    new Map(),
+    declared.invocationUse?.lifetime._tag === 'BoundLifetime'
+      ? declared.invocationUse.lifetime
+      : undefined,
   )
   return declaration.parameters.map((parameter) =>
     parameter.declaredType._tag === 'Resolved'
       ? Type.substitute(parameter.declaredType.type, selected.substitution)
       : undefined,
+  )
+}
+
+/** Original data slots in a required invocation input remain open for caller input inference. */
+const inputInferredCallLifetimes = (
+  binders: ReadonlyArray<Lifetime.Bound>,
+  parameters: ReadonlyArray<Type.Type>,
+  invocation: Lifetime.Bound | undefined,
+  generic: ReadonlyArray<Type.Parameter>,
+): ReadonlySet<string> => {
+  const selectable = new Set(
+    generic.flatMap((parameter) => {
+      const argument = Type.parameterArgument(parameter)
+      return Lifetime.isLifetime(argument) ? [Lifetime.key(argument)] : []
+    }),
+  )
+  const inputs = new Set<string>()
+  for (const parameter of parameters)
+    Type.visit(parameter, (type) => {
+      if (
+        !Type.isCallable(type) ||
+        type.invocationUse === undefined ||
+        Type.invocationUseState(type) !== 'Closed' ||
+        !Type.invocationUseValid(type.invocationUse, type.parameters.length, type.lifetimeBinders, {
+          state: Type.invocationUseState(type),
+        })
+      )
+        return
+      for (const input of type.parameters)
+        for (const lifetime of Type.freeLifetimes(input)) inputs.add(Lifetime.key(lifetime))
+    })
+  return new Set(
+    binders
+      .filter(
+        (binder) =>
+          (invocation === undefined || !Lifetime.equals(binder, invocation)) &&
+          inputs.has(Lifetime.key(binder)) &&
+          selectable.has(Lifetime.key(binder)),
+      )
+      .map(Lifetime.key),
   )
 }
 
@@ -848,16 +966,26 @@ const selectedCallLifetimes = (
   binders: ReadonlyArray<Lifetime.Bound>,
   resolution: ResolutionContext | undefined,
   initial: Type.Substitution = new Map(),
+  invocation?: Lifetime.Bound,
+  deferred: ReadonlySet<string> = new Set(),
 ): SelectedCallLifetimes => {
   const substitution = new Map(initial)
   const body = resolution?.bodyLifetimes
   if (body !== undefined) {
-    for (const [ordinal, binder] of binders.entries()) {
-      if (substitution.has(Lifetime.key(binder))) continue
-      const region = BodyLifetime.region(body, call.anchor, 'Call', ordinal)
+    for (const binder of binders) {
+      if (substitution.has(Lifetime.key(binder)) || deferred.has(Lifetime.key(binder))) continue
+      const region =
+        invocation !== undefined && Lifetime.equals(binder, invocation)
+          ? BodyLifetime.invocationRegion(body, call.anchor, binder)
+          : BodyLifetime.region(body, call.anchor, 'Call', binder.ordinal)
       if (region !== undefined) substitution.set(Lifetime.key(binder), region)
     }
   }
+  // A deferred original slot may depend on the just-opened use binder. Resolve its stored
+  // expression under this exact opening before passing the original target its arguments.
+  const opening = new Map([...substitution].filter(([identity]) => !initial.has(identity)))
+  for (const [identity, argument] of initial)
+    substitution.set(identity, Type.substituteGenericArgument(argument, opening))
   const compatibility = resolution?.lifetimeCompatibility
   return {
     substitution,
@@ -867,6 +995,7 @@ const selectedCallLifetimes = (
       : {
           inference: {
             compatibility,
+            inferable: new Set([...deferred].filter((identity) => !initial.has(identity))),
             typeOutlives: (type, lifetime) =>
               TypeCompatibility.typeOutlives(compatibility, { type, lifetime }),
             accepts: (source: Lifetime.Lifetime, target: Lifetime.Lifetime, invariant: boolean) =>
@@ -910,6 +1039,102 @@ const selectedLifetimeBoundDiagnostics = (
       : [Diagnostic.unsatisfiedTypeOutlives(Type.display(type), Lifetime.display(lifetime), span)]
   }),
 ]
+
+/** Captures the original accepted call edge, rather than treating its expected type as authority. */
+const executableInputViews = (
+  reference: CallReferenceFact,
+  caller: DeclarationFact | undefined,
+  call: AuthoredHir.Expression,
+  arguments_: ReadonlyArray<ArgumentFact>,
+  substitution: Type.Substitution,
+  resolution: ResolutionContext | undefined,
+): ReadonlyArray<Tir.ExecutableInputView> => {
+  const body = resolution?.bodyLifetimes
+  const builder = resolution?.builder
+  const compatibility = resolution?.lifetimeCompatibility
+  if (
+    reference._tag !== 'Resolved' ||
+    reference.declaration.canonical._tag !== 'Canonical' ||
+    caller?.canonical._tag !== 'Canonical' ||
+    body === undefined ||
+    builder === undefined ||
+    compatibility === undefined
+  )
+    return []
+  const target = reference.declaration
+  const targetId = reference.declaration.canonical.id
+  const callerId = caller.canonical.id
+  return arguments_.flatMap((argument, ordinal) => {
+    const parameter = target.parameters.at(ordinal)
+    if (
+      parameter === undefined ||
+      parameter.phase !== 'Runtime' ||
+      parameter.declaredType._tag !== 'Resolved' ||
+      argument.type._tag !== 'Available'
+    )
+      return []
+    if (argument.expression._tag === 'Unavailable') return []
+    const supplied = argument.expression.type
+    const actual = Type.isRepresented(supplied) ? supplied.contract : supplied
+    const required = Type.substitute(parameter.declaredType.type, substitution)
+    const expected = Type.isRepresented(required) ? required.contract : required
+    if (
+      (!Type.isCallable(actual) || !Type.isCallable(expected)) &&
+      (!Type.isEffect(actual) || !Type.isEffect(expected))
+    )
+      return []
+    return [
+      {
+        caller: callerId,
+        call: call.anchor,
+        operand: Tir.nodeReference(builder.artifact, argument.expression),
+        operandOrigin: argument.anchor,
+        actual,
+        ...(argument.invocationSource === undefined
+          ? {}
+          : { invocationSource: argument.invocationSource }),
+        target: targetId,
+        parameter: { ordinal, source: parameter.anchor, declared: parameter.declaredType.type },
+        expected,
+        substitution: new Map(substitution),
+        premises: {
+          owner: body.owner,
+          bounds: compatibility.assumptions.bounds.map((bound) => ({ ...bound })),
+          obligations: [...body.constraints.values()].map((bound) => ({ ...bound })),
+          typeBounds: compatibility.typeBounds.map((bound) => ({ ...bound })),
+          invocationInputs: compatibility.invocationInputs.map((input) => ({ ...input })),
+          points: new Map(body.points),
+          anchors: new Map(body.anchors),
+          formations: [...body.formations.values()].map((formation) => ({
+            ...formation,
+            lifetimeBounds: formation.lifetimeBounds.map((bound) => ({ ...bound })),
+            typeOutlives: formation.typeOutlives.map((bound) => ({ ...bound })),
+          })),
+        },
+      },
+    ]
+  })
+}
+
+/** Retains the checked operand's exact executable representation for generic selection. */
+const specializationActual = (
+  context: SemanticContext.SemanticContext,
+  pattern: SemanticType,
+  actual: SemanticType,
+  expression: Tir.Expression,
+  builder?: BodyBuilder.BodyBuilder,
+): SemanticType | undefined => {
+  if (
+    !Type.isRepresented(pattern) ||
+    Type.isRepresented(actual) ||
+    (!Type.isCallable(actual) && !Type.isEffect(actual))
+  )
+    return actual
+  const representation = representationOfExpression(context, expression, builder)
+  return representation === undefined
+    ? undefined
+    : Type.represented(actual, pattern.representation.requiredBound, representation)
+}
 
 /**
  * Specializes a call from an explicit prefix of its type arguments plus its value arguments. The
@@ -992,7 +1217,14 @@ export const seededSpecialization = (
   let rowFailure: Type.InferenceFailure | undefined
   for (const site of sites) {
     const attempt = new Map(inferred)
-    if (TypeInference.infer(site.pattern, site.actual, attempt, lifetimes?.inference)) {
+    // Written and previously learned selections stay fixed while remaining holes learn
+    // from this argument. Their concrete reference regions use ordinary compatibility.
+    const pattern = Type.substitute(site.pattern, inferred)
+    const actual = specializationActual(context, pattern, site.actual, site.expression, builder)
+    if (
+      actual !== undefined &&
+      TypeInference.infer(pattern, actual, attempt, lifetimes?.inference)
+    ) {
       commitSpecialization(inferred, attempt)
       continue
     }
@@ -1698,7 +1930,23 @@ export const analyzeCallContract = (
       diagnostics: [diagnostic],
     }
   }
-  const callLifetimes = selectedCallLifetimes(call, contract.lifetimeBinders, resolution)
+  const callLifetimes = selectedCallLifetimes(
+    call,
+    contract.lifetimeBinders,
+    resolution,
+    new Map(),
+    contract.invocationUse?.lifetime._tag === 'BoundLifetime'
+      ? contract.invocationUse.lifetime
+      : undefined,
+    inputInferredCallLifetimes(
+      contract.lifetimeBinders,
+      contract.parameters.map((parameter) => parameter.type),
+      contract.invocationUse?.lifetime._tag === 'BoundLifetime'
+        ? contract.invocationUse.lifetime
+        : undefined,
+      contract.binders,
+    ),
+  )
   const declaredTypeParameters = contract.binders
   const constraintDeferred = new Set(
     contract.constraints.flatMap((constraint) =>
@@ -1794,21 +2042,13 @@ export const analyzeCallContract = (
           compatible = false
           break
         }
-        const representedSupplied =
-          Type.isRepresented(pattern) &&
-          !Type.isRepresented(supplied) &&
-          (Type.isCallable(supplied) || Type.isEffect(supplied))
-            ? (() => {
-                const representation = representationOfExpression(
-                  context,
-                  argument.expression,
-                  resolution?.builder,
-                )
-                return representation === undefined
-                  ? undefined
-                  : Type.represented(supplied, pattern.representation.requiredBound, representation)
-              })()
-            : supplied
+        const representedSupplied = specializationActual(
+          context,
+          pattern,
+          supplied,
+          argument.expression,
+          resolution?.builder,
+        )
         if (representedSupplied === undefined) {
           compatible = false
           const representationParameter =
@@ -2118,6 +2358,14 @@ export const analyzeCallContract = (
     mappings,
     fact: {
       _tag: 'Compatible',
+      inputViews: executableInputViews(
+        reference,
+        caller,
+        call,
+        argumentsList,
+        substitution,
+        resolution,
+      ),
       expectedCount,
       actualCount,
       typeArguments,
@@ -2328,7 +2576,7 @@ export const callableResultType = (declaration: SourceCallable): SemanticType | 
   return Type.effectWithRows(
     declaration.returnType.type,
     declaration.failureRow.row,
-    { ...DeclarationFacts.executableLifetimes(declaration), lifetimeBinders: [] },
+    DeclarationFacts.effectLifetimes(declaration),
     'Shared',
     declaration.requirementRow.row,
   )
@@ -2359,6 +2607,10 @@ export const callableTypeOfReference = (
     )
   const callable = sourceCallable(reference)
   if (callable === undefined) return undefined
+  // Hidden lexical capture lanes need genuine section formation operands. A bare
+  // function item cannot fabricate their environment by projecting the raw body.
+  if (callable.parameters.some((parameter) => parameter.captureAccess !== undefined))
+    return undefined
   const parameters = callable.parameters.flatMap((parameter) =>
     parameter.declaredType._tag === 'Resolved' ? [parameter.declaredType.type] : [],
   )
@@ -2454,7 +2706,15 @@ export const instantiateInterfaceReference = (
   resolution: ResolutionContext,
 ): typeof reference => {
   const declared = DeclarationFacts.executableLifetimes(reference.declaration)
-  const selected = selectedCallLifetimes(call, declared.lifetimeBinders, resolution)
+  const selected = selectedCallLifetimes(
+    call,
+    declared.lifetimeBinders,
+    resolution,
+    new Map(),
+    declared.invocationUse?.lifetime._tag === 'BoundLifetime'
+      ? declared.invocationUse.lifetime
+      : undefined,
+  )
   return {
     ...reference,
     parameters: reference.parameters.map((parameter) =>
@@ -2775,7 +3035,31 @@ export const analyzeFunctionItem = (
     expectedCallable?.lifetimeBinders.length === 0
       ? (unresolvedCallable?.lifetimeBinders ?? [])
       : []
-  const callLifetimes = selectedCallLifetimes(node, opened, resolution)
+  const callLifetimes = selectedCallLifetimes(
+    node,
+    opened,
+    resolution,
+    new Map(),
+    unresolvedCallable?.invocationUse?.lifetime._tag === 'BoundLifetime'
+      ? unresolvedCallable.invocationUse.lifetime
+      : undefined,
+  )
+  const invocationAdapter =
+    unresolvedCallable !== undefined &&
+    expectedCallable?.invocationUse !== undefined &&
+    contract !== undefined
+      ? TypeInference.adaptInvocationCallable(
+          unresolvedCallable,
+          expectedCallable,
+          contract.binders,
+          callLifetimes.substitution,
+          resolution.lifetimeCompatibility,
+          resolution.invocationConsumer?.caller.sourceId === caller.id.sourceId &&
+            resolution.invocationConsumer.caller.ordinal === caller.id.ordinal
+            ? resolution.invocationConsumer
+            : undefined,
+        )
+      : undefined
   // Here the inference pattern is the offered generic item, while the contextual type is the
   // required use. Argument inference has the opposite orientation; retain that distinction for
   // lifetime obligations while still inferring the item's own type parameters.
@@ -2787,7 +3071,9 @@ export const analyzeFunctionItem = (
           accepts: (source, target, invariant) =>
             callLifetimes.inference?.accepts(target, source, invariant) ?? false,
         }
-  const contextual = new Map<string, Type.GenericArgument>(callLifetimes.substitution)
+  const contextual = new Map<string, Type.GenericArgument>(
+    invocationAdapter?.substitution ?? callLifetimes.substitution,
+  )
   const pattern =
     unresolvedCallable === undefined || expectedCallable === undefined
       ? undefined
@@ -2813,9 +3099,10 @@ export const analyzeFunctionItem = (
       ? substitutedPattern
       : undefined
   let specialized =
-    contextualPattern !== undefined &&
-    expectedCallable !== undefined &&
-    TypeInference.infer(contextualPattern, expectedCallable, contextual, itemInference)
+    invocationAdapter !== undefined ||
+    (contextualPattern !== undefined &&
+      expectedCallable !== undefined &&
+      TypeInference.infer(contextualPattern, expectedCallable, contextual, itemInference))
   if (!specialized && contextualPattern !== undefined && expectedCallable !== undefined) {
     const partial = new Map<string, Type.GenericArgument>(callLifetimes.substitution)
     const attempt = (): boolean => {
@@ -2880,8 +3167,8 @@ export const analyzeFunctionItem = (
       specialized = true
     }
   }
-  let callable = unresolvedCallable
-  if (callable !== undefined && specialized) {
+  let callable = invocationAdapter?.callable ?? unresolvedCallable
+  if (callable !== undefined && specialized && invocationAdapter === undefined) {
     const instantiated = Type.callable(
       callable.parameters,
       callable.result,
@@ -2914,6 +3201,7 @@ export const analyzeFunctionItem = (
     typeArguments.length === contract?.binders.length &&
     typeArguments.every(Type.isRuntimeConcreteGenericArgument) &&
     callable?.schema !== undefined &&
+    invocationAdapter === undefined &&
     callable.schema.constraints.length > 0
       ? solveCallableConstraints(
           callable.schema.constraints,
@@ -3102,11 +3390,17 @@ export const analyzeSectionContract = (
       return parameter === undefined ? [] : Type.storageLifetimes(parameter.type).map(Lifetime.key)
     }),
   )
-  const capturedBinders = callable.lifetimeBinders.filter((binder) =>
-    capturedLifetimes.has(Lifetime.key(binder)),
+  const capturedBinders = callable.lifetimeBinders.filter(
+    (binder) =>
+      capturedLifetimes.has(Lifetime.key(binder)) &&
+      (callable.invocationUse === undefined ||
+        !Lifetime.equals(binder, callable.invocationUse.lifetime)),
   )
   const remainingBinders = callable.lifetimeBinders.filter(
-    (binder) => !capturedLifetimes.has(Lifetime.key(binder)),
+    (binder) =>
+      !capturedLifetimes.has(Lifetime.key(binder)) ||
+      (callable.invocationUse !== undefined &&
+        Lifetime.equals(binder, callable.invocationUse.lifetime)),
   )
   const remainingLifetimeKeys = new Set(remainingBinders.map(Lifetime.key))
   const callLifetimes = selectedCallLifetimes(call, capturedBinders, resolution)
@@ -3326,6 +3620,158 @@ export const exactCallableOf = (
   return undefined
 }
 
+type StoredInvocationInput = {
+  readonly parameter: number
+  readonly capture: number
+  readonly expression: Tir.Expression
+  readonly leaf: Tir.CallableSiteId
+  readonly capturePath?: NonNullable<Tir.InvocationUseObligation['inputs'][number]['capturePath']>
+}
+
+interface StoredInvocationRecipe {
+  readonly parameters: ReadonlyArray<number>
+  readonly captures: ReadonlyArray<StoredInvocationInput>
+}
+
+/** Reads original input coordinates only from the actual immutable staged value graph. */
+const storedInvocationRecipe = (
+  expression: Tir.Expression,
+  bindingOf: (ordinal: number) => import('./Elaboration.js').BindingDeclarationFact | undefined,
+  writtenBindings: ReadonlySet<number>,
+  seen: ReadonlySet<Tir.Expression> = new Set(),
+  allowUnmarked = false,
+): StoredInvocationRecipe | undefined => {
+  if (seen.has(expression) || expression._tag === 'Unavailable') return undefined
+  const next = new Set(seen).add(expression)
+  if (expression._tag === 'Move')
+    return storedInvocationRecipe(
+      expression.subject,
+      bindingOf,
+      writtenBindings,
+      next,
+      allowUnmarked,
+    )
+  if (expression._tag === 'BindingReference') {
+    const binding = bindingOf(expression.binding.ordinal)
+    return binding === undefined ||
+      binding.mutability !== 'Immutable' ||
+      writtenBindings.has(binding.id.ordinal)
+      ? undefined
+      : storedInvocationRecipe(binding.initializer, bindingOf, writtenBindings, next, allowUnmarked)
+  }
+  let type: Type.Callable | undefined
+  if (Type.isCallable(expression.type)) type = expression.type
+  else if (Type.isRepresented(expression.type) && Type.isCallable(expression.type.contract))
+    type = expression.type.contract
+  if (
+    type === undefined ||
+    (!allowUnmarked && type.invocationUse === undefined) ||
+    Type.invocationInputBounds(type) === undefined
+  )
+    return undefined
+  if (expression._tag === 'CallableSection') {
+    const original =
+      expression.invocationParameters ??
+      (allowUnmarked && type.schema !== undefined
+        ? Type.callableInputOrdinals(type.schema.contract)
+        : undefined)
+    if (
+      original === undefined ||
+      new Set(original).size !== original.length ||
+      !original.every((parameter) => Number.isSafeInteger(parameter) && parameter >= 0)
+    )
+      return undefined
+    const captures = expression.captures.filter((capture) =>
+      original.includes(capture.parameterOrdinal),
+    )
+    const covered = [
+      ...expression.remainingParameters,
+      ...captures.map((capture) => capture.parameterOrdinal),
+    ]
+    if (
+      covered.length !== original.length ||
+      new Set(covered).size !== original.length ||
+      !covered.every((parameter) => original.includes(parameter))
+    )
+      return undefined
+    return {
+      parameters: expression.remainingParameters,
+      captures: captures.map((capture) => ({
+        parameter: capture.parameterOrdinal,
+        capture: capture.ordinal,
+        expression: capture.value,
+        leaf: expression.site,
+      })),
+    }
+  }
+  if (expression._tag === 'CallableApply' && expression.staged !== undefined) {
+    const base = storedInvocationRecipe(
+      expression.callee,
+      bindingOf,
+      writtenBindings,
+      next,
+      allowUnmarked,
+    )
+    const stage = expression.staged
+    const count = expression.arguments.length
+    if (
+      base === undefined ||
+      count === 0 ||
+      count >= base.parameters.length ||
+      stage.captures.length !== count ||
+      type.parameters.length !== base.parameters.length - count
+    )
+      return undefined
+    const captures: Array<StoredInvocationInput> = base.captures.map((capture) => ({
+      ...capture,
+      capturePath: [
+        { _tag: 'Base', site: stage.site },
+        ...(capture.capturePath ?? [
+          { _tag: 'Capture', site: capture.leaf, ordinal: capture.capture },
+        ]),
+      ],
+    }))
+    for (const [ordinal, capture] of stage.captures.entries()) {
+      const argument = expression.arguments.at(ordinal)
+      const parameter = base.parameters.at(base.parameters.length - count + ordinal)
+      if (
+        argument === undefined ||
+        argument._tag === 'Unavailable' ||
+        parameter === undefined ||
+        capture.ordinal !== ordinal ||
+        capture.parameterOrdinal !== parameter ||
+        AuthoredIdentity.anchorKey(capture.argument) !==
+          AuthoredIdentity.anchorKey(argument.origin.anchor) ||
+        !Type.equals(capture.type, argument.type)
+      )
+        return undefined
+      captures.push({
+        parameter,
+        capture: capture.ordinal,
+        expression: argument,
+        leaf: stage.site,
+        capturePath: [{ _tag: 'Capture', site: stage.site, ordinal: capture.ordinal }],
+      })
+    }
+    if (new Set(captures.map((capture) => capture.parameter)).size !== captures.length)
+      return undefined
+    return { parameters: base.parameters.slice(0, base.parameters.length - count), captures }
+  }
+  if (expression._tag !== 'ParameterReference' && expression._tag !== 'FunctionItem')
+    return undefined
+  const adapter = type.schema?.invocationAdapter
+  if (
+    type.invocationUse !== undefined &&
+    type.schema !== undefined &&
+    !Type.invocationAdapterValid(type.invocationUse, type.parameters.length, type.schema)
+  )
+    return undefined
+  return {
+    parameters: adapter?.parameters ?? type.parameters.map((_, ordinal) => ordinal),
+    captures: [],
+  }
+}
+
 export const concreteCallableIdentity = (
   expression: ExpressionDecision,
   writtenBindings: ReadonlySet<number> = new Set(),
@@ -3386,6 +3832,14 @@ export const sectionCallableType = (
     Type.substitute(result, substitution),
     {
       ...lifetimes,
+      ...(contract.invocationUse === undefined
+        ? {}
+        : {
+            invocationUse: {
+              lifetime: contract.invocationUse.lifetime,
+              parameters: remaining.map((_, ordinal) => ordinal),
+            },
+          }),
       lifetimeBinders: contract.lifetimeBinders.filter(
         (binder) => !substitution.has(Lifetime.key(binder)),
       ),
@@ -3605,11 +4059,20 @@ export const finishCallableSection = (
       ? availableExpressionType(callable)
       : unavailableExpressionType
   const environmentOwner = executableSpecializationOwner(resolution)
+  const originalInvocationParameters =
+    callable?.invocationUse === undefined
+      ? undefined
+      : resolvedCallableContract(reference)?.parameters.map((_, ordinal) => ordinal)
   return {
     fact: {
       _tag: 'CallableSection',
       selectedConformances: constraints.proofs,
       site: executableSite('CallableSiteId', resolution, node),
+      ...(originalInvocationParameters === undefined
+        ? {}
+        : {
+            invocationParameters: originalInvocationParameters,
+          }),
       reference,
       path,
       remainingParameters: remainingOf(
@@ -3638,6 +4101,432 @@ export const finishCallableSection = (
     ],
     type: type._tag === 'Available' ? type.type : undefined,
   }
+}
+
+/** Admits an immutable stored value while preserving its evaluated producer and source type. */
+const contextualStoredInvocation = (
+  context: SemanticContext.SemanticContext,
+  result: ExpressionResult,
+  promised: Type.Callable,
+  caller: DeclarationFact,
+  resolution: ResolutionContext,
+): ExpressionResult => {
+  const fact = result.fact
+  const builder = resolution.builder
+  if (
+    (fact._tag !== 'Identifier' && fact._tag !== 'Move') ||
+    fact.type._tag !== 'Available' ||
+    result.diagnostics.length !== 0 ||
+    result.type === undefined ||
+    builder === undefined ||
+    !Type.isCallable(result.type) ||
+    !Type.equals(result.type, fact.type.type) ||
+    result.type.invocationUse !== undefined ||
+    promised.invocationUse === undefined
+  )
+    return result
+  const source = result.type
+  const schema = source.schema
+  const target = schema?.source
+  const declaration =
+    target === undefined
+      ? undefined
+      : DeclarationFacts.byCanonical(resolution.index, {
+          _tag: 'CanonicalDeclarationId',
+          ...target,
+        })
+  if (
+    schema === undefined ||
+    target === undefined ||
+    declaration?._tag !== 'FunctionDeclaration' ||
+    declaration.name._tag !== 'Present'
+  )
+    return result
+  const targetName = declaration.name
+  const contract = DeclarationFacts.callableContract(declaration)
+  const originalInputs = Type.callableInputOrdinals(contract)
+  if (
+    originalInputs === undefined ||
+    CallableContract.key(contract) !== schema.contractKey ||
+    CallableContract.key(schema.contract) !== CallableContract.key(contract) ||
+    schema.binders.length !== contract.binders.length ||
+    !schema.binders.every((binder, ordinal) => {
+      const original = contract.binders.at(ordinal)
+      return original !== undefined && Type.key(original) === Type.key(binder)
+    })
+  )
+    return result
+  const written = resolution.writtenCallableBindings ?? new Set<number>()
+  const knownBindings = resolution.execution?.context.bindings ?? []
+  const bindingOf = (ordinal: number) => {
+    const semantic = BodyBuilder.semanticOfLocal(builder, { _tag: 'TirLocal', ordinal })
+    if (
+      fact._tag === 'Identifier' &&
+      fact.reference._tag === 'ResolvedBinding' &&
+      fact.reference.binding === semantic
+    )
+      return fact.reference.binding
+    return knownBindings.find((binding) => binding === semantic)
+  }
+  const operand =
+    fact._tag === 'Move'
+      ? fact.subject
+      : (() => {
+          if (fact.reference._tag !== 'ResolvedBinding') return undefined
+          return fact.reference.binding.initializer
+        })()
+  if (operand === undefined) return result
+  const recipe = storedInvocationRecipe(operand, bindingOf, written, new Set(), true)
+  if (
+    recipe === undefined ||
+    recipe.parameters.length !== source.parameters.length ||
+    [...recipe.parameters, ...recipe.captures.map((capture) => capture.parameter)].length !==
+      originalInputs.length ||
+    new Set([...recipe.parameters, ...recipe.captures.map((capture) => capture.parameter)]).size !==
+      originalInputs.length ||
+    [...recipe.parameters, ...recipe.captures.map((capture) => capture.parameter)].some(
+      (ordinal) => !originalInputs.includes(ordinal),
+    ) ||
+    !recipe.parameters.every((original, ordinal) => {
+      const input = contract.parameters.at(original)
+      const actual = source.parameters.at(ordinal)
+      return (
+        input !== undefined &&
+        actual !== undefined &&
+        Type.equals(Type.substitute(input.type, schema.substitution), actual)
+      )
+    })
+  )
+    return result
+  const producers: Array<Tir.StoredInvocationSource['producers'][number]> = []
+  const seen = new Set<Tir.Expression>()
+  const walk = (expression: Tir.Expression): boolean => {
+    if (seen.has(expression) || expression._tag === 'Unavailable') return false
+    seen.add(expression)
+    if (expression._tag === 'Move') return walk(expression.subject)
+    const producer = (
+      kind: Tir.StoredInvocationSource['producers'][number]['kind'],
+      binding?: Tir.LocalId,
+    ) => {
+      if (expression.origin._tag !== 'Authored') return false
+      producers.push({
+        node: Tir.nodeReference(builder.artifact, expression),
+        origin: expression.origin.anchor,
+        kind,
+        ...(binding === undefined ? {} : { binding }),
+      })
+      return true
+    }
+    if (expression._tag === 'BindingReference') {
+      const binding = bindingOf(expression.binding.ordinal)
+      return (
+        binding !== undefined &&
+        binding.mutability === 'Immutable' &&
+        !written.has(binding.id.ordinal) &&
+        producer('Binding', expression.binding) &&
+        walk(binding.initializer)
+      )
+    }
+    if (expression._tag === 'CallableApply' && expression.staged !== undefined)
+      return producer('Stage') && walk(expression.callee)
+    if (expression._tag !== 'CallableSection' && expression._tag !== 'FunctionItem') return false
+    const leaf = expression.type.schema
+    return (
+      leaf?.source?.module === target.module &&
+      leaf.source.name === target.name &&
+      CallableContract.key(leaf.contract) === CallableContract.key(contract) &&
+      expression.target._tag === 'DeclarationCallableTarget' &&
+      expression.target.declaration.module === target.module &&
+      expression.target.declaration.name === target.name &&
+      producer(expression._tag === 'CallableSection' ? 'Section' : 'FunctionItem')
+    )
+  }
+  if (fact._tag === 'Identifier') {
+    if (
+      fact.reference._tag !== 'ResolvedBinding' ||
+      fact.reference.binding.mutability !== 'Immutable' ||
+      written.has(fact.reference.binding.id.ordinal)
+    )
+      return result
+    producers.push({
+      node: BodyBuilder.expressionReference(builder, fact.anchor),
+      origin: fact.anchor,
+      kind: 'Binding',
+      binding: BodyBuilder.localId(builder, fact.reference.binding.id),
+    })
+  }
+  if (!walk(operand)) return result
+  let compatibility = resolution.lifetimeCompatibility ?? TypeCompatibility.context()
+  if (source.environment._tag !== 'StaticLifetime') {
+    const formation = resolution.bodyLifetimes?.formations.get(Lifetime.key(source.environment))
+    if (
+      formation === undefined ||
+      !producers.some(
+        (producer) =>
+          AuthoredIdentity.anchorKey(producer.origin) ===
+          AuthoredIdentity.anchorKey(formation.origin),
+      ) ||
+      !Lifetime.equals(formation.environment, source.environment) ||
+      formation.lifetimeBounds.some(
+        (bound) => !Lifetime.equals(bound.shorter, source.environment),
+      ) ||
+      formation.typeOutlives.some((bound) => !Lifetime.equals(bound.lifetime, source.environment))
+    )
+      return result
+    compatibility = {
+      ...compatibility,
+      typeBounds: [...compatibility.typeBounds, ...formation.typeOutlives],
+      assumptions: Lifetime.mergeAssumptions(
+        compatibility.assumptions,
+        Lifetime.assumptions(formation.lifetimeBounds),
+      ),
+    }
+  }
+  const consumer = resolution.invocationConsumer
+  const selected = TypeCompatibility.commitWhen(
+    compatibility,
+    () => {
+      const adapted = TypeInference.adaptInvocationCallable(
+        source,
+        promised,
+        schema.binders,
+        schema.substitution,
+        compatibility,
+        consumer?.caller.sourceId === caller.id.sourceId &&
+          consumer.caller.ordinal === caller.id.ordinal
+          ? consumer
+          : undefined,
+        recipe.parameters,
+      )
+      if (
+        adapted === undefined ||
+        adapted.callable.schema === undefined ||
+        !Type.invocationAdapterValid(
+          adapted.callable.invocationUse,
+          source.parameters.length,
+          adapted.callable.schema,
+        )
+      )
+        return undefined
+      const constraints = interfaceConstraints(
+        context,
+        { _tag: 'Resolved', spelling: targetName.spelling, anchor: targetName.anchor, declaration },
+        adapted.callable.schema.substitution,
+        resolution.index,
+        caller,
+        Location.at(fact.anchor),
+      )
+      if (constraints.diagnostics.length !== 0) return undefined
+      const invocationSource: Tir.StoredInvocationSource = {
+        target: { _tag: 'CanonicalDeclarationId', ...target },
+        producers,
+        originalInputs,
+        parameters: recipe.parameters,
+        captures: recipe.captures.map((capture) => ({
+          parameter: capture.parameter,
+          capture: capture.capture,
+          expression: Tir.nodeReference(builder.artifact, capture.expression),
+          leaf: capture.leaf,
+          ...(capture.capturePath === undefined ? {} : { capturePath: capture.capturePath }),
+        })),
+        originalSubstitution: new Map(schema.substitution),
+        selected: adapted.callable,
+      }
+      return {
+        ...result,
+        fact: {
+          ...fact,
+          originalType: source,
+          invocationSource,
+          type: availableExpressionType(adapted.callable),
+        },
+        type: adapted.callable,
+      }
+    },
+    (selected) => selected !== undefined,
+  )
+  return selected ?? result
+}
+
+/** Admits one already formed named section under the actual contextual use contract. */
+export const contextualInvocationSection = (
+  context: SemanticContext.SemanticContext,
+  result: ExpressionResult,
+  expected: SemanticType | undefined,
+  caller: DeclarationFact,
+  resolution: ResolutionContext,
+): ExpressionResult => {
+  const fact = result.fact
+  const promised =
+    expected !== undefined && Type.isRepresented(expected) ? expected.contract : expected
+  if (
+    promised !== undefined &&
+    Type.isCallable(promised) &&
+    promised.invocationUse !== undefined &&
+    (fact._tag === 'Identifier' || fact._tag === 'Move')
+  )
+    return contextualStoredInvocation(context, result, promised, caller, resolution)
+  if (
+    fact._tag !== 'CallableSection' ||
+    fact.type._tag !== 'Available' ||
+    result.type === undefined ||
+    !Type.isCallable(fact.type.type) ||
+    !Type.equals(fact.type.type, result.type) ||
+    fact.type.type.invocationUse !== undefined ||
+    promised === undefined ||
+    !Type.isCallable(promised) ||
+    promised.invocationUse === undefined ||
+    result.diagnostics.length !== 0 ||
+    fact.reference._tag !== 'Resolved' ||
+    fact.reference.declaration.canonical._tag !== 'Canonical'
+  )
+    return result
+  const source = fact.type.type
+  const schema = source.schema
+  const contract = resolvedCallableContract(fact.reference)
+  const canonical = fact.reference.declaration.canonical.id
+  const provenance = schema?.source
+  const originalInputs = contract === undefined ? undefined : Type.callableInputOrdinals(contract)
+  if (
+    schema === undefined ||
+    contract === undefined ||
+    originalInputs === undefined ||
+    provenance === undefined ||
+    provenance.module !== canonical.module ||
+    provenance.name !== canonical.name ||
+    schema.contractKey !== CallableContract.key(contract) ||
+    CallableContract.key(schema.contract) !== CallableContract.key(contract) ||
+    schema.binders.length !== contract.binders.length ||
+    !schema.binders.every((binder, ordinal) => {
+      const original = contract.binders.at(ordinal)
+      return original !== undefined && Type.key(binder) === Type.key(original)
+    }) ||
+    schema.substitution.size !== fact.substitution.size ||
+    ![...fact.substitution].every(([identity, argument]) => {
+      const retained = schema.substitution.get(identity)
+      return retained !== undefined && Type.equalsGenericArgument(argument, retained)
+    }) ||
+    source.parameters.length !== fact.remainingParameters.length ||
+    fact.mode !== source.mode ||
+    fact.captures.some(
+      (capture, ordinal) =>
+        capture.ordinal !== ordinal ||
+        !originalInputs.includes(capture.parameterOrdinal) ||
+        constructionExpressionType(capture.expression)._tag !== 'Available',
+    )
+  )
+    return result
+  const partition = [
+    ...fact.remainingParameters,
+    ...fact.captures.map((capture) => capture.parameterOrdinal),
+  ]
+  if (
+    partition.length !== originalInputs.length ||
+    new Set(partition).size !== partition.length ||
+    partition.some((ordinal) => !originalInputs.includes(ordinal)) ||
+    !fact.remainingParameters.every((original, ordinal) => {
+      const parameter = contract.parameters.at(original)
+      const visible = source.parameters.at(ordinal)
+      return (
+        parameter !== undefined &&
+        visible !== undefined &&
+        Type.equals(Type.substitute(parameter.type, fact.substitution), visible)
+      )
+    })
+  )
+    return result
+  const base = resolution.lifetimeCompatibility ?? TypeCompatibility.context()
+  let compatibility = base
+  if (source.environment._tag !== 'StaticLifetime') {
+    const body = resolution.bodyLifetimes
+    const formation = body?.formations.get(Lifetime.key(source.environment))
+    if (
+      body === undefined ||
+      formation === undefined ||
+      AuthoredIdentity.anchorKey(formation.origin) !== AuthoredIdentity.anchorKey(fact.anchor) ||
+      !Lifetime.equals(formation.environment, source.environment) ||
+      formation.lifetimeBounds.some(
+        (bound) => !Lifetime.equals(bound.shorter, source.environment),
+      ) ||
+      formation.typeOutlives.some((bound) => !Lifetime.equals(bound.lifetime, source.environment))
+    )
+      return result
+    // Only this actual capture construction supplies Γ; original target bounds stay goals.
+    // Its registered obligations still pass the body's lifetime/ownership gates before MIR.
+    compatibility = {
+      ...base,
+      typeBounds: [...base.typeBounds, ...formation.typeOutlives],
+      assumptions: Lifetime.mergeAssumptions(
+        base.assumptions,
+        Lifetime.assumptions(formation.lifetimeBounds),
+      ),
+    }
+  }
+  const consumer = resolution.invocationConsumer
+  const selected = TypeCompatibility.commitWhen(
+    compatibility,
+    () => {
+      const adapted = TypeInference.adaptInvocationCallable(
+        source,
+        promised,
+        schema.binders,
+        fact.substitution,
+        compatibility,
+        consumer?.caller.sourceId === caller.id.sourceId &&
+          consumer.caller.ordinal === caller.id.ordinal
+          ? consumer
+          : undefined,
+        fact.remainingParameters,
+      )
+      if (adapted === undefined || adapted.callable.schema === undefined) return undefined
+      const substitution = adapted.callable.schema.substitution
+      const typeArguments: Array<Type.GenericArgument> = []
+      for (const binder of contract.binders) {
+        const argument = substitution.get(Type.key(binder))
+        if (argument === undefined) return undefined
+        typeArguments.push(argument)
+      }
+      if (
+        !Type.invocationAdapterValid(
+          adapted.callable.invocationUse,
+          source.parameters.length,
+          adapted.callable.schema,
+        )
+      )
+        return undefined
+      const constraints = interfaceConstraints(
+        context,
+        fact.reference,
+        substitution,
+        resolution.index,
+        caller,
+        Location.at(fact.anchor),
+      )
+      if (constraints.diagnostics.length > 0)
+        return {
+          accepted: false,
+          result: { ...result, diagnostics: [...result.diagnostics, ...constraints.diagnostics] },
+        }
+      const type = availableExpressionType(adapted.callable)
+      return {
+        accepted: true,
+        result: {
+          ...result,
+          fact: {
+            ...fact,
+            selectedConformances: constraints.proofs,
+            type,
+            substitution,
+            typeArguments,
+            invocationParameters: Array.from(originalInputs),
+          },
+          type: adapted.callable,
+        },
+      }
+    },
+    (selected) => selected?.accepted === true,
+  )
+  return selected?.result ?? result
 }
 
 export const finishCallableApplication = (
@@ -3755,6 +4644,27 @@ export const finishCallableApplication = (
   const exactCallable = exactCallableOf(callee.fact, writtenBindings)
   const section = exactCallable?._tag === 'CallableSection' ? exactCallable : undefined
   const directSection = callee.fact._tag === 'CallableSection' ? callee.fact : undefined
+  const recipeBindings = new Map(
+    (resolution?.execution?.context.bindings ?? []).map(
+      (binding) => [binding.id.ordinal, binding] as const,
+    ),
+  )
+  if (callee.fact._tag === 'Identifier' && callee.fact.reference._tag === 'ResolvedBinding')
+    recipeBindings.set(callee.fact.reference.binding.id.ordinal, callee.fact.reference.binding)
+  const storedRecipe =
+    callable?.invocationUse === undefined
+      ? undefined
+      : storedInvocationRecipe(
+          expressionNode(callee),
+          (ordinal) => {
+            const builder = resolution?.builder
+            if (builder === undefined) return undefined
+            const semantic = BodyBuilder.semanticOfLocal(builder, { _tag: 'TirLocal', ordinal })
+            // Semantic binding ordinals and unified TIR local ordinals are distinct namespaces.
+            return [...recipeBindings.values()].find((binding) => binding === semantic)
+          },
+          writtenBindings,
+        )
   const stagedSection =
     directSection !== undefined &&
     callable !== undefined &&
@@ -3775,21 +4685,84 @@ export const finishCallableApplication = (
     caller !== undefined
       ? {
           site: executableSite('CallableSiteId', resolution, node),
-          captures: argumentsResult.facts.map((argument, ordinal) => ({
-            _tag: 'CallableCapture' as const,
-            ordinal,
-            parameterOrdinal: callable.parameters.length - argumentsResult.facts.length + ordinal,
+          captures: argumentsResult.facts.flatMap((argument, ordinal) => {
+            const position = callable.parameters.length - argumentsResult.facts.length + ordinal
+            const parameterOrdinal =
+              callable.invocationUse === undefined
+                ? (callable.schema?.invocationAdapter?.parameters.at(position) ??
+                  section?.remainingParameters.at(position) ??
+                  position)
+                : storedRecipe?.parameters.at(position)
+            return parameterOrdinal === undefined
+              ? []
+              : [
+                  {
+                    _tag: 'CallableCapture' as const,
+                    ordinal,
+                    parameterOrdinal,
+                    expression: argument.expression,
+                    access: captureAccess(
+                      argument.expression,
+                      resolution.index,
+                      copyAssumptionsOf(caller),
+                    ),
+                  },
+                ]
+          }),
+        }
+      : undefined
+  const formationCaptures =
+    stagedSection !== undefined && resolution !== undefined && caller !== undefined
+      ? [
+          ...stagedSection.captures,
+          ...argumentsResult.facts.map((argument) => ({
             expression: argument.expression,
             access: captureAccess(argument.expression, resolution.index, copyAssumptionsOf(caller)),
           })),
-        }
-      : undefined
+        ]
+      : stagedValue?.captures
+  // This one actual formation environment is used only for stored-parameter checking and
+  // published as the section's environment. The future invocation binder stays unselected.
+  const stagedFormation =
+    formationCaptures === undefined || callable === undefined
+      ? undefined
+      : BodyLifetime.environment(
+          resolution?.bodyLifetimes,
+          node.anchor,
+          [
+            callable,
+            ...availableConstructionTypes(formationCaptures.map((capture) => capture.expression)),
+            ...(storedRecipe?.captures.flatMap((capture) =>
+              capture.expression._tag === 'Unavailable' ? [] : [capture.expression.type],
+            ) ?? []),
+          ],
+          formationCaptures
+            .filter((capture) => capture.access === 'Shared' || capture.access === 'Exclusive')
+            .map((capture) => constructionExpressionAnchor(capture.expression)),
+        )
   const schema = callable?.schema
+  const staged = stagedSection !== undefined || stagedValue !== undefined
+  const capturedLifetimeKeys = new Set(
+    staged
+      ? (callable?.parameters.slice(-argumentsResult.facts.length) ?? []).flatMap((parameter) =>
+          Type.storageLifetimes(parameter).map(Lifetime.key),
+        )
+      : [],
+  )
   const callLifetimes = selectedCallLifetimes(
     node,
-    callable?.lifetimeBinders ?? [],
+    (callable?.lifetimeBinders ?? []).filter(
+      (binder) =>
+        !staged ||
+        (capturedLifetimeKeys.has(Lifetime.key(binder)) &&
+          (callable?.invocationUse === undefined ||
+            !Lifetime.equals(binder, callable.invocationUse.lifetime))),
+    ),
     resolution,
     schema?.substitution ?? section?.substitution,
+    callable?.invocationUse?.lifetime._tag === 'BoundLifetime'
+      ? callable.invocationUse.lifetime
+      : undefined,
   )
   const inferred = new Map<string, Type.GenericArgument>(callLifetimes.substitution)
   let evidence: ReadonlyArray<Constraint.ConstraintEvidence> = []
@@ -3799,6 +4772,15 @@ export const finishCallableApplication = (
     (node._tag === 'PipelineExpression'
       ? AuthoredWalk.isAvailable(node)
       : hasAvailableCallSyntax(node))
+  if (callable?.invocationUse !== undefined && storedRecipe === undefined) {
+    diagnostics.push(
+      Diagnostic.invalidLifetimeBinder(
+        'Invocation-use callable has no authenticated stored input recipe',
+        Location.at(node.anchor),
+      ),
+    )
+    valid = false
+  }
   if (callable === undefined && callee.type !== undefined) {
     diagnostics.push(
       Diagnostic.nonCallableApplication(Type.encode(callee.type), Location.at(callee.fact.anchor)),
@@ -3877,8 +4859,25 @@ export const finishCallableApplication = (
         ? 0
         : callable.parameters.length - argumentsResult.facts.length
     for (const [ordinal, argument] of argumentsResult.facts.entries()) {
-      const expected = callable.parameters.at(parameterOffset + ordinal)
+      const original = callable.parameters.at(parameterOffset + ordinal)
+      let expected = original
+      if (callable.invocationUse !== undefined && formationCaptures !== undefined) {
+        if (stagedFormation === undefined) expected = undefined
+        else
+          expected = TypeInference.stagedInvocationParameter(
+            callable,
+            parameterOffset + ordinal,
+            stagedFormation,
+          )
+      }
       if (expected === undefined || argument.type._tag !== 'Available') {
+        if (callable.invocationUse !== undefined && formationCaptures !== undefined)
+          diagnostics.push(
+            Diagnostic.invalidLifetimeBinder(
+              'Staged invocation input has no valid formation environment',
+              Location.at(argument.anchor),
+            ),
+          )
         valid = false
         continue
       }
@@ -3949,12 +4948,25 @@ export const finishCallableApplication = (
     }
   }
   if (callable !== undefined) {
+    const deferred = new Set(
+      staged
+        ? callable.lifetimeBinders
+            .filter((binder) => !inferred.has(Lifetime.key(binder)))
+            .map(Lifetime.key)
+        : [],
+    )
+    const awaitsUse = (region: Lifetime.Lifetime): boolean =>
+      Lifetime.atoms(Type.substituteLifetime(region, inferred)).some((atom) =>
+        deferred.has(Lifetime.key(atom)),
+      )
     const lifetimeDiagnostics = selectedLifetimeBoundDiagnostics(
-      callable.lifetimeBounds,
+      callable.lifetimeBounds.filter(
+        (bound) => !awaitsUse(bound.longer) && !awaitsUse(bound.shorter),
+      ),
       inferred,
       callLifetimes.compatibility,
       Location.at(node.anchor),
-      callable.typeOutlives,
+      callable.typeOutlives.filter((bound) => !awaitsUse(bound.lifetime)),
     )
     diagnostics.push(...lifetimeDiagnostics)
     if (lifetimeDiagnostics.length !== 0) valid = false
@@ -4049,6 +5061,139 @@ export const finishCallableApplication = (
         )
   diagnostics.push(...selectedConformances.diagnostics)
   if (selectedConformances.diagnostics.length > 0) valid = false
+  let invocationUse: Tir.InvocationUseObligation | undefined
+  if (
+    valid &&
+    callable?.invocationUse !== undefined &&
+    stagedSection === undefined &&
+    stagedValue === undefined
+  ) {
+    const usage = callable.invocationUse
+    const body = resolution?.bodyLifetimes
+    const lifetime = inferred.get(Lifetime.key(usage.lifetime))
+    const binderOrdinal = callable.lifetimeBinders.findIndex((binder) =>
+      Lifetime.equals(binder, usage.lifetime),
+    )
+    const genuineRegion =
+      body === undefined || binderOrdinal < 0 || usage.lifetime._tag !== 'BoundLifetime'
+        ? undefined
+        : BodyLifetime.invocationRegion(body, node.anchor, usage.lifetime)
+    const originalParameters = storedRecipe?.parameters
+    const capturedInputs = (storedRecipe?.captures ?? []).flatMap((capture) => {
+      const actual = capture.expression
+      return actual._tag === 'Unavailable'
+        ? []
+        : [
+            {
+              parameter: capture.parameter,
+              capture: capture.capture,
+              ...(capture.capturePath === undefined ? {} : { capturePath: capture.capturePath }),
+              argument: actual.origin.anchor,
+              type: actual.type,
+            },
+          ]
+    })
+    const visibleInputs = argumentsResult.facts.flatMap((argument, ordinal) => {
+      const actual = constructionExpressionType(argument.expression)
+      const parameter = originalParameters?.at(ordinal)
+      return actual._tag !== 'Available' || parameter === undefined
+        ? []
+        : [
+            {
+              parameter,
+              argument: constructionExpressionAnchor(argument.expression),
+              type: actual.type,
+            },
+          ]
+    })
+    const inputs = [...capturedInputs, ...visibleInputs]
+    if (
+      Type.invocationInputBounds(callable) === undefined ||
+      usage.lifetime._tag !== 'BoundLifetime' ||
+      body === undefined ||
+      lifetime === undefined ||
+      !Lifetime.isLifetime(lifetime) ||
+      lifetime._tag !== 'LocalLifetime' ||
+      genuineRegion === undefined ||
+      !Lifetime.equals(lifetime, genuineRegion) ||
+      visibleInputs.length !== callable.parameters.length ||
+      capturedInputs.length !== (storedRecipe?.captures.length ?? 0) ||
+      new Set(inputs.map((input) => input.parameter)).size !== inputs.length
+    ) {
+      diagnostics.push(
+        Diagnostic.typeArgumentInference('invocation-use region', Location.at(node.anchor)),
+      )
+      valid = false
+    } else {
+      invocationUse = {
+        owner: body.owner,
+        origin: node.anchor,
+        binder: usage.lifetime,
+        lifetime,
+        inputs,
+      }
+    }
+  }
+  const stagedContract = (
+    mode: Type.CallableMode,
+    selectedSchema: Type.CallableSchema | undefined,
+  ): Type.Callable | undefined => {
+    if (callable === undefined || stagedFormation === undefined) return undefined
+    const remaining = callable.parameters.length - argumentsResult.facts.length
+    const adapter = callable.schema?.invocationAdapter
+    const schema =
+      selectedSchema === undefined
+        ? undefined
+        : {
+            ...selectedSchema,
+            substitution: new Map([...selectedSchema.substitution, ...inferred]),
+            ...(adapter === undefined
+              ? {}
+              : {
+                  invocationAdapter: {
+                    ...adapter,
+                    parameters: adapter.parameters.slice(0, remaining),
+                  },
+                }),
+          }
+    return Type.callable(
+      callable.parameters
+        .slice(0, remaining)
+        .map((parameter) => Type.substitute(parameter, inferred)),
+      Type.substitute(callable.result, inferred),
+      {
+        ...stagedFormation,
+        lifetimeBinders: callable.lifetimeBinders.filter(
+          (binder) => !inferred.has(Lifetime.key(binder)),
+        ),
+        lifetimeBounds: [
+          ...(stagedFormation.lifetimeBounds ?? []),
+          ...callable.lifetimeBounds.map((bound) => ({
+            longer: Type.substituteLifetime(bound.longer, inferred),
+            shorter: Type.substituteLifetime(bound.shorter, inferred),
+          })),
+        ],
+        typeOutlives: [
+          ...(stagedFormation.typeOutlives ?? []),
+          ...callable.typeOutlives.map((bound) => ({
+            type: Type.substitute(bound.type, inferred),
+            lifetime: Type.substituteLifetime(bound.lifetime, inferred),
+          })),
+        ],
+        ...(callable.invocationUse === undefined
+          ? {}
+          : {
+              invocationUse: {
+                lifetime: callable.invocationUse.lifetime,
+                parameters: Array.from({ length: remaining }, (_, ordinal) => ordinal),
+              },
+            }),
+      },
+      mode,
+      schema,
+      callable.unsafe,
+    )
+  }
   const type = (() => {
     if (!valid || callable === undefined) return unavailableExpressionType
     if (stagedSection !== undefined && stagedCaptures !== undefined) {
@@ -4065,45 +5210,26 @@ export const finishCallableApplication = (
         inferred,
         callableMode(stagedCaptures),
         stagedCaptures.map((capture) => capture.parameterOrdinal),
-        BodyLifetime.environment(
-          resolution?.bodyLifetimes,
-          node.anchor,
-          availableConstructionTypes(stagedCaptures.map((capture) => capture.expression)),
-          stagedCaptures
-            .filter((capture) => capture.access === 'Shared' || capture.access === 'Exclusive')
-            .map((capture) => constructionExpressionAnchor(capture.expression)),
-        ),
+        stagedFormation,
       )
-      return sectionType === undefined
-        ? unavailableExpressionType
-        : availableExpressionType(sectionType)
+      let retained: typeof sectionType
+      if (sectionType !== undefined) {
+        if (callable.invocationUse === undefined) retained = sectionType
+        else
+          retained = stagedContract(
+            strongestEffectAccess(callable.mode, callableMode(stagedCaptures)),
+            sectionType.schema,
+          )
+      }
+      return retained === undefined ? unavailableExpressionType : availableExpressionType(retained)
     }
     const result = Type.substitute(callable.result, inferred)
     if (stagedValue !== undefined) {
-      const lifetimes = BodyLifetime.environment(
-        resolution?.bodyLifetimes,
-        node.anchor,
-        [
-          callable,
-          ...availableConstructionTypes(stagedValue.captures.map((capture) => capture.expression)),
-        ],
-        stagedValue.captures
-          .filter((capture) => capture.access === 'Shared' || capture.access === 'Exclusive')
-          .map((capture) => constructionExpressionAnchor(capture.expression)),
+      const retained = stagedContract(
+        strongestEffectAccess(callable.mode, callableMode(stagedValue.captures)),
+        callable.schema,
       )
-      if (lifetimes === undefined) return unavailableExpressionType
-      return availableExpressionType(
-        Type.callable(
-          callable.parameters
-            .slice(0, callable.parameters.length - argumentsResult.facts.length)
-            .map((parameter) => Type.substitute(parameter, inferred)),
-          result,
-          lifetimes,
-          strongestEffectAccess(callable.mode, callableMode(stagedValue.captures)),
-          callable.schema,
-          callable.unsafe,
-        ),
-      )
+      return retained === undefined ? unavailableExpressionType : availableExpressionType(retained)
     }
     return availableExpressionType(
       Type.isEffect(result)
@@ -4139,6 +5265,11 @@ export const finishCallableApplication = (
         selectedConformances: selectedConformances.proofs,
         site: executableSite('CallableSiteId', resolution, node),
         reference: stagedSection.reference,
+        ...(stagedSection.invocationParameters === undefined
+          ? {}
+          : {
+              invocationParameters: stagedSection.invocationParameters,
+            }),
         path: stagedSection.path,
         remainingParameters: stagedSection.remainingParameters.slice(0, remainingCount),
         captures: stagedCaptures,
@@ -4192,15 +5323,27 @@ export const finishCallableApplication = (
         Type.isEffect(handlerType.result)
           ? handlerType.result
           : undefined
+      const recoveryInvocation =
+        wanted === undefined
+          ? undefined
+          : recoveryInvocationRecipe(
+              section.reference.contract,
+              inferred,
+              Type.failureType(wanted.selected),
+              node.anchor,
+              resolution?.bodyLifetimes,
+            )
       const catchAvailable =
         type._tag === 'Available' &&
         protected_ !== undefined &&
         handler !== undefined &&
         wanted !== undefined &&
+        recoveryInvocation !== undefined &&
         proved
       return {
         fact: {
           _tag: 'EffectCatch',
+          ...(recoveryInvocation === undefined ? {} : { recoveryInvocation }),
           reference: sectionIntrinsicReference(section),
           protected: protected_?.expression ?? unavailableNode(context, node.anchor, resolution),
           handler: handler ?? unavailableNode(context, node.anchor, resolution),
@@ -4259,6 +5402,7 @@ export const finishCallableApplication = (
       arguments: argumentsResult.facts,
       mode,
       ...(callable === undefined ? {} : { contract: callable }),
+      ...(invocationUse === undefined || type._tag !== 'Available' ? {} : { invocationUse }),
       substitution: inferred,
       inferredProviderSelectors,
       ...(stagedValue === undefined ? {} : { staged: stagedValue }),

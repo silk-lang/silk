@@ -1407,7 +1407,13 @@ const residualExpression = (
       )
       if (value._tag !== 'Unavailable') return value
     }
-    return tirReference(fact.reference, fact.type, fact.anchor, options.context, options.builder)
+    return tirReference(
+      fact.reference,
+      fact.originalType === undefined ? fact.type : { _tag: 'Available', type: fact.originalType },
+      fact.anchor,
+      options.context,
+      options.builder,
+    )
   }
   if (fact._tag === 'Move') {
     const subject = tirExpression(fact.subject, options)
@@ -1423,7 +1429,7 @@ const residualExpression = (
         subject._tag === 'Project' || subject._tag === 'IndexPlace'
           ? { ...subject, access: 'ConsumeRequested' as const }
           : subject,
-      type: fact.type.type,
+      type: fact.originalType ?? fact.type.type,
       span: options.context.spanOf(fact.anchor),
       origin: Tir.authored(fact.anchor),
     }
@@ -1522,6 +1528,9 @@ const residualExpression = (
       }
     return {
       _tag: 'EffectCatch',
+      ...(fact.recoveryInvocation === undefined
+        ? {}
+        : { recoveryInvocation: fact.recoveryInvocation }),
       intrinsic: fact.reference.operation.id,
       protected: protected_,
       handler,
@@ -2138,6 +2147,9 @@ const residualExpression = (
         : fact.typeArguments
     return {
       _tag: 'CallableSection',
+      ...(fact.invocationParameters === undefined
+        ? {}
+        : { invocationParameters: fact.invocationParameters }),
       site: fact.site,
       target,
       remainingParameters: fact.remainingParameters,
@@ -2235,6 +2247,7 @@ const residualExpression = (
           }))
     return {
       _tag: 'CallableApply',
+      ...(fact.invocationUse === undefined ? {} : { invocationUse: fact.invocationUse }),
       callee: tirExpression(fact.callee, options),
       arguments: fact.arguments.map((argument, ordinal) =>
         tirExpression(argument.expression, options, argumentBorrowId(argument, ordinal, self)),
@@ -2258,10 +2271,18 @@ const residualExpression = (
         : {
             staged: {
               site: fact.staged.site,
-              captures: fact.staged.captures.map((capture) => ({
-                ordinal: capture.ordinal,
-                access: capture.access,
-              })),
+              captures: fact.staged.captures.map((capture) => {
+                const type = constructionExpressionType(capture.expression)
+                if (type._tag !== 'Available')
+                  throw new RangeError('Checked staged capture lost its source type')
+                return {
+                  ordinal: capture.ordinal,
+                  parameterOrdinal: capture.parameterOrdinal,
+                  argument: constructionExpressionAnchor(capture.expression),
+                  type: type.type,
+                  access: capture.access,
+                }
+              }),
             },
           }),
       access: fact.mode,
@@ -2539,7 +2560,12 @@ const residualExpression = (
     const staticArgumentOrigins = (fact._tag === 'Call' ? (fact.staticArguments ?? []) : []).map(
       (argument) => argument.textOrigin,
     )
+    const inputViews = fact.contract.inputViews
     const call = {
+      ...(fact.contract.inputViews === undefined ? {} : { inputViews: fact.contract.inputViews }),
+      ...(fact.contract.invocationUse === undefined
+        ? {}
+        : { invocationUse: fact.contract.invocationUse }),
       target: fact.reference.declaration.canonical.id,
       typeArguments: fact.contract.typeArguments,
       evidence: publishedEvidence(
@@ -2559,6 +2585,18 @@ const residualExpression = (
         if (parameter?.phase === 'Static') return []
         const borrowId = argumentBorrowId(argument, ordinal, self)
         const argumentType = constructionExpressionType(argument.expression)
+        const invocationView = inputViews?.find(
+          (view) =>
+            view.parameter.ordinal === ordinal &&
+            view.invocationSource !== undefined &&
+            view.invocationSource === argument.invocationSource &&
+            argumentType._tag === 'Available' &&
+            Type.equals(view.actual, argumentType.type) &&
+            parameter?.declaredType._tag === 'Resolved' &&
+            Type.equals(view.expected, Type.substitute(parameter.declaredType.type, substitution)),
+        )
+        if (invocationView !== undefined)
+          return [tirExpression(argument.expression, options, borrowId)]
         const genericForwarding =
           parameter?.declaredType._tag === 'Resolved' &&
           argumentType._tag === 'Available' &&

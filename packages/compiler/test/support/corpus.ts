@@ -3645,12 +3645,44 @@ fn sameText(left: string, right: string) -> bool {
   }
   return true
 }
+fn comparesAs(left: string, right: string, expected: bool) -> bool {
+  return sameText(left, right) == expected
+    && (left == right) == expected && (left != right) != expected
+}
+fn firstText(order: &mut i32) -> string<'static> {
+  order.* = order.* * 10 + 1
+  return "ab"
+}
+fn secondText(order: &mut i32) -> string<'static> {
+  order.* = order.* * 10 + 2
+  return "ab"
+}
 pub fn main() -> i32 {
   if !sameText(escapedPattern, r"\\d+\\.\\d+") { return 1 }
   if !sameText(rawPattern, "\\\\d+\\\\.\\\\d+") { return 2 }
   if !sameText(rawPattern, escapedPattern) { return 3 }
   if usize.toI32(String.byteLength(rawPattern)) != 8 { return 4 }
   if usize.toI32(String.byteLength(windowsPath)) != 14 { return 5 }
+  if !comparesAs("", "", true) { return 6 }
+  if !comparesAs("", "a", false) || !comparesAs("a", "", false) { return 7 }
+  if !comparesAs("ab", "abc", false) || !comparesAs("abc", "ab", false) { return 8 }
+  if !comparesAs("ab", "xb", false) || !comparesAs("ab", "ax", false) { return 9 }
+  if !comparesAs("é😀", "é😀", true) || !comparesAs("é", "é", false) { return 10 }
+  let leftBytes: [u8; 3] = [97, 0, 98]
+  let equalBytes: [u8; 3] = [97, 0, 98]
+  let differentBytes: [u8; 3] = [97, 0, 99]
+  unsafe {
+    let left = String.fromUtf8Unchecked(&leftBytes)
+    let equal = String.fromUtf8Unchecked(&equalBytes)
+    let different = String.fromUtf8Unchecked(&differentBytes)
+    if !comparesAs(left, equal, true) || !comparesAs(left, different, false) { return 11 }
+  }
+  let mut order = 0
+  if firstText(&mut order) == secondText(&mut order) {} else { return 12 }
+  if order != 12 { return 13 }
+  order = 0
+  if firstText(&mut order) != secondText(&mut order) { return 14 }
+  if order != 12 { return 15 }
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
@@ -6096,6 +6128,209 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // The selected borrowed payload and owned handler capture survive execution; bypass drops
+    // only the unused capture. This proves synchronous cleanup ordering, not parking/cancellation.
+    name: 'effect-borrowed-recovery-owned-cleanup',
+    source: `import silk.effect { Effect }
+unsafe extern "C" fn silk_recovery_event(id: i32) -> ()
+unsafe extern "C" fn silk_recovery_verify() -> i32
+struct Owner { value: i32 }
+struct Guard { id: i32 offset: i32 }
+impl Drop for Owner {
+  fn drop(self: &mut Owner) -> () {
+    self.value = 100
+    unsafe { silk_recovery_event(1) }
+    return ()
+  }
+}
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    let id = self.id
+    self.offset = 100
+    unsafe { silk_recovery_event(id) }
+    return ()
+  }
+}
+effect<'data> fn failed<'data>(owner: &'data Owner) -> never ! &'data Owner { fail owner }
+effect<'data> fn succeeded<'data>(owner: &'data Owner) -> i32 ! &'data Owner {
+  return owner.value + 2
+}
+effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
+  unsafe { silk_recovery_event(7) }
+  return owner.value + guard.offset
+}
+pub fn main() -> i32 {
+  let owner = Owner { value: 40 }
+  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), recovered(Guard { id: 2, offset: 2 }))
+  if selected != 42 { return 1 }
+  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), recovered(Guard { id: 3, offset: 2 }))
+  if bypassed != 42 { return 2 }
+  drop owner
+  unsafe { return silk_recovery_verify() }
+}`,
+    nativeCSources: {
+      recovery_events: `#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+static char events[16];
+static unsigned count;
+void silk_recovery_event(int32_t id) {
+  putchar('0' + id);
+  if (count < sizeof(events) - 1) events[count++] = (char)('0' + id);
+}
+int32_t silk_recovery_verify(void) {
+  puts("");
+  return strcmp(events, "7231") == 0 ? 42 : 0;
+}
+`,
+    },
+    nativeStdout: '7231\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    // One scoped recovery survives resumption; another is cancelled while its inputs stay live.
+    name: 'effect-borrowed-recovery-park-resume-cancel',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution }
+unsafe extern "C" fn silk_scoped_event(id: i32) -> ()
+unsafe extern "C" fn silk_scoped_verify() -> i32
+struct Owner { value: i32 }
+struct Guard { offset: i32 resume: bool }
+struct Held<'data> { owner: &'data Owner guard: Guard }
+impl Drop for Owner {
+  fn drop(self: &mut Owner) -> () {
+    self.value = 100
+    unsafe { silk_scoped_event(1) }
+    return ()
+  }
+}
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    self.offset = 100
+    unsafe { silk_scoped_event(2) }
+    return ()
+  }
+}
+impl<'data> Drop for Held<'data> {
+  fn drop(self: &mut Held<'data>) -> () {
+    if self.owner.value != 40 || self.guard.offset != 2 {
+      unsafe { silk_scoped_event(9) }
+    } else {
+      unsafe { silk_scoped_event(4) }
+    }
+    return ()
+  }
+}
+struct ReadyGuard {}
+struct DormantGuard { wake: Intrinsic.Wake }
+impl Drop for ReadyGuard {
+  fn drop(self: &mut ReadyGuard) -> () {
+    unsafe { silk_scoped_event(5) }
+    return ()
+  }
+}
+impl Drop for DormantGuard {
+  fn drop(self: &mut DormantGuard) -> () {
+    unsafe { silk_scoped_event(5) }
+    return ()
+  }
+}
+fn registerReady(wake: Intrinsic.Wake) -> ReadyGuard {
+  Intrinsic.wake(move wake)
+  return ReadyGuard {}
+}
+fn registerDormant(wake: Intrinsic.Wake) -> DormantGuard {
+  return DormantGuard { wake: move wake }
+}
+effect<'data> fn failed<'data>(owner: &'data Owner) -> never ! &'data Owner { fail owner }
+effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
+  unsafe { silk_scoped_event(7) }
+  let held = Held<'data> { owner: owner, guard: move guard }
+  if held.guard.resume {
+    run Execution.park(registerReady)
+  } else {
+    run Execution.park(registerDormant)
+  }
+  unsafe { silk_scoped_event(8) }
+  return held.owner.value + held.guard.offset
+}
+effect fn body(resume: bool) -> i32 {
+  let owner = Owner { value: 40 }
+  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    recovered(Guard { offset: 2, resume: resume }),
+  )
+  drop owner
+  return result
+}
+struct Empty {}
+struct Stored { execution: Intrinsic.Execution<i32> }
+struct Driver { slot: Empty | Stored result: i32 }
+fn ready(state: &()) -> () { return () }
+fn completed(driver: &mut Driver, result: i32) -> () {
+  driver.result = result
+  return ()
+}
+fn suspended(driver: &mut Driver, execution: Intrinsic.Execution<i32>) -> () {
+  let previous = Intrinsic.replace(driver.slot, Stored { execution: move execution })
+  drop previous
+  return ()
+}
+effect fn drive(execution: Intrinsic.Execution<i32>, driver: &mut Driver) -> () {
+  return run Execution.drive(move execution, move driver, completed, suspended)
+}
+effect fn scenario(resume: bool) -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let initialExecution = run Execution.make<i32>(body(resume), (), ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut driver = Driver { slot: Empty {}, result: 0 }
+  run drive(move initialExecution, &mut driver)
+  if driver.result != 0 { return -1 }
+  let selected = Intrinsic.replace(driver.slot, Empty {})
+  match move selected {
+    Empty {} => { return -2 }
+    Stored { execution } => {
+      if resume {
+        run drive(move execution, &mut driver)
+      } else {
+        drop execution
+      }
+    }
+  }
+  return driver.result
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let resumed = run scenario(true)
+  if resumed != 42 { return 0 }
+  let cancelled = run scenario(false)
+  if cancelled != 0 { return 0 }
+  unsafe { return silk_scoped_verify() }
+}
+effect fn allocationFailed(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 {
+  return run Effect.catchAll<i32, i32, OutOfMemoryError, never>(program(), allocationFailed)
+}`,
+    nativeCSources: {
+      scoped_events: `#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+static char events[32];
+static unsigned count;
+void silk_scoped_event(int32_t id) {
+  putchar('0' + id);
+  if (count < sizeof(events) - 1) events[count++] = (char)('0' + id);
+}
+int32_t silk_scoped_verify(void) {
+  puts("");
+  return strcmp(events, "75842175421") == 0 ? 42 : 0;
+}
+`,
+    },
+    nativeStdout: '75842175421\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'effect-heterogeneous-failure-payload',
     source: heterogeneousFailurePayload,
     expected: { _tag: 'Completes', result: 42 },
@@ -7184,6 +7419,71 @@ pub effect fn main() -> i32 ! StartupProblem | HostInputError ? &mut HostInput {
   let count = run HostInput.argumentCount()
   fail StartupProblem {}
 }`
+
+// Reuse the authored lifetime-sensitive event oracles while varying ordinary handler storage.
+const borrowedRecoveryVariants = (
+  name: string,
+  substitutions: ReadonlyArray<{
+    readonly inline: string
+    readonly stored: string
+    readonly staged: string
+  }>,
+): ReadonlyArray<CorpusProgram> => {
+  const original = corpus.find((program) => program.name === name)
+  if (original === undefined) throw new Error(`missing canonical borrowed recovery case ${name}`)
+  return (['stored-handler', 'staged-handler'] as const).map((variant) => {
+    let source = original.source
+    for (const substitution of substitutions) {
+      if (!source.includes(substitution.inline))
+        throw new Error(`missing canonical recovery call in ${name}`)
+      source = source.replace(
+        substitution.inline,
+        variant === 'stored-handler' ? substitution.stored : substitution.staged,
+      )
+    }
+    return { ...original, name: `${name}-${variant}`, source }
+  })
+}
+
+const borrowedRecoveryStorageCorpus: ReadonlyArray<CorpusProgram> = [
+  ...borrowedRecoveryVariants('effect-borrowed-recovery-owned-cleanup', [
+    {
+      inline:
+        '  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), recovered(Guard { id: 2, offset: 2 }))',
+      stored:
+        '  let selectedHandler = recovered(Guard { id: 2, offset: 2 })\n  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), move selectedHandler)',
+      staged:
+        '  let selectedBase = recovered\n  let selectedHandler = selectedBase(Guard { id: 2, offset: 2 })\n  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), move selectedHandler)',
+    },
+    {
+      inline:
+        '  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), recovered(Guard { id: 3, offset: 2 }))',
+      stored:
+        '  let bypassedHandler = recovered(Guard { id: 3, offset: 2 })\n  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), move bypassedHandler)',
+      staged:
+        '  let bypassedBase = recovered\n  let bypassedHandler = bypassedBase(Guard { id: 3, offset: 2 })\n  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), move bypassedHandler)',
+    },
+  ]),
+  ...borrowedRecoveryVariants('effect-borrowed-recovery-park-resume-cancel', [
+    {
+      inline: `  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    recovered(Guard { offset: 2, resume: resume }),
+  )`,
+      stored: `  let handler = recovered(Guard { offset: 2, resume: resume })
+  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    move handler,
+  )`,
+      staged: `  let base = recovered
+  let handler = base(Guard { offset: 2, resume: resume })
+  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    move handler,
+  )`,
+    },
+  ]),
+]
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
@@ -9617,6 +9917,7 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   ...corpus,
+  ...borrowedRecoveryStorageCorpus,
   ...algorithmExamples,
   algorithmicCompilerFold,
   ...pressurePrograms,
@@ -10149,7 +10450,11 @@ effect fn conflictCase() -> i32 ! OutOfMemoryError {
   return Shared.${outer}<Counter, i32>(&first, nested(move alias))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
-pub fn main() -> i32 { return run Effect.catchAll(conflictCase(), recover) }`,
+pub fn main() -> i32 {
+  let observed = run Effect.catchAll(conflictCase(), recover)
+  drop observed
+  return 0
+}`,
         expected: { _tag: 'Trap' },
       }
     }),
