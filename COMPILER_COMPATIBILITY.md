@@ -1596,9 +1596,11 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   or a region an earlier operand fixed for the same binder, including a `'static` Effect
   environment such as `Effect.provideMut(program(), &mut allocator)`), native admits the value at the
   expected region and the body keeps a `RegionRelation` safety obligation with the origin and both
-  regions. Native fixes an inferred binder by its first evidence, while the bootstrap solves for the
-  shortest region, so a binder an earlier operand fixed to `'static` also relates a later loan of a
-  declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
+  regions. Native fixes an inferred binder by its first evidence and shortens it when a later
+  operand offers another region for a binder every parameter stores covariantly: to that region
+  over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
+  `pair<'a>(&'a i32, &'a i32)`. The bootstrap solves for the shortest region directly, so a binder
+  an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
   proves its representation bound once. Such bodies are `ContractTyped` and counted by the
