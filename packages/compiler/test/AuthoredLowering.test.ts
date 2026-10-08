@@ -521,3 +521,33 @@ it.effect('matches the structural golden for a representative module', () =>
     )
   }),
 )
+
+it.effect(
+  'owns invocation-use role in authored identity while retaining lifetime alpha equivalence',
+  () =>
+    Effect.gen(function* () {
+      const fixture = (marker: string, name: string) =>
+        lower(
+          `invocation-role-${marker}-${name}`,
+          `fn pick() -> i32 { let callback: for<${marker}'${name}> fn<'static>(i32) -> i32 = target return 1 }`,
+        )
+      const marked = yield* fixture('use ', 'call')
+      const renamed = yield* fixture('use ', 'other')
+      const ordinary = yield* fixture('', 'call')
+      const binder =
+        tagged(marked.module, 'LifetimeParameter').at(0) ?? unreachable('expected marked binder')
+      assert.strictEqual(binder.invocationUse, true)
+      assert.strictEqual(
+        tagged(ordinary.module, 'LifetimeParameter').at(0)?.invocationUse,
+        undefined,
+      )
+      const key = (value: AuthoredLowering.Lowered) =>
+        AuthoredLowering.canonicalBody(value, declarationNamed(value.module, 'pick'))
+      assert.strictEqual(key(marked), key(renamed))
+      assert.notStrictEqual(key(marked), key(ordinary))
+      assert.notDeepEqual(
+        yield* bodyBytes(marked.module, 'pick'),
+        yield* bodyBytes(ordinary.module, 'pick'),
+      )
+    }),
+)

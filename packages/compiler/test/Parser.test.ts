@@ -249,6 +249,36 @@ fn refine(value: Choice, place: i32) -> i32 {
   assert.strictEqual(SyntaxTree.directNode(call, 'LifetimeType')?.kind, 'LifetimeType')
 })
 
+it('retains a contextual invocation-use marker without reserving declaration identifier use', () => {
+  const source = `fn invoke(callback: for<'data, use 'call> fn<'static>(&'data i32, i32) -> i32) {}
+fn ordinary<use, 'a>(value: use, callback: for<'a> fn<'static>(&'a i32) -> i32) {}`
+  const syntax = parseText('invocation-use-syntax', source)
+  assert.deepEqual(syntax.lexicalDiagnostics, [])
+  assert.deepEqual(syntax.parserDiagnostics, [])
+  assert.deepEqual(reconstructedBytes(syntax), ascii(source))
+  const nodes = descendants(syntax.root).filter(SyntaxTree.isNode)
+  assert.deepEqual(
+    nodes
+      .filter((node) => node.kind === 'LifetimeParameter')
+      .map((node) => [
+        directTokenText(syntax, node, 'Identifier'),
+        directTokenText(syntax, node, 'Lifetime'),
+      ]),
+    [
+      [undefined, "'data"],
+      ['use', "'call"],
+      [undefined, "'a"],
+      [undefined, "'a"],
+    ],
+  )
+  assert.isTrue(
+    nodes.some(
+      (node) =>
+        node.kind === 'TypeParameter' && directTokenText(syntax, node, 'Identifier') === 'use',
+    ),
+  )
+})
+
 it('recovers malformed lifetime types and rejects lifetime annotations on value borrows', () => {
   for (const declaration of [
     "fn damaged<'a>(value: &'a, next: i32) -> () {}",

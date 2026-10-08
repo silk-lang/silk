@@ -16,6 +16,7 @@ import * as BodyView from './BodyView.js'
 import * as Location from './Location.js'
 import * as Provenance from './Provenance.js'
 import type * as LifetimeFlow from './LifetimeFlow.js'
+import type * as BodyLifetime from './BodyLifetime.js'
 import * as ExecutableOrigin from './ExecutableOrigin.js'
 import * as Tir from './Tir.js'
 import * as FunctionIndex from './internal/FunctionIndex.js'
@@ -66,6 +67,8 @@ export interface Instance {
   readonly substitution: Type.Substitution
   readonly specialization: ConcreteSpecialization
   readonly ownership: Ownership.FunctionOwnership
+  /** Checked source construction premises under this exact instance's substitution. */
+  readonly formations?: ReadonlyArray<BodyLifetime.Formation>
   readonly resultCallable?: Type.CallableIdentityArgument
   readonly resultEffect?: string
   /** Exact residual application whose compile-time dependency attribution produced this body. */
@@ -166,6 +169,7 @@ export interface CallProvider {
 /** One monomorphic ordinary/effect constructor call with hidden Effect identities resolved. */
 export interface CallInstance {
   readonly _tag: 'CallInstance'
+  readonly inputViews?: ReadonlyArray<Tir.ExecutableInputView>
   readonly owner: InstanceKey
   /** Published TIR node that selected this target inside the owning instance. */
   readonly node?: Tir.NodeId
@@ -3204,6 +3208,38 @@ export const discover = (
         )
       return {
         ...instance,
+        ...(lifetimes?.solution._tag !== 'Solved' ||
+        lifetimes.solution.violations.length !== 0 ||
+        lifetimes.diagnostics.length !== 0 ||
+        checked.diagnostics.length !== 0
+          ? {}
+          : {
+              formations: (lifetimes.formations ?? []).flatMap((formation) => {
+                const environment = Type.substituteLifetime(
+                  formation.environment,
+                  instance.substitution,
+                )
+                if (environment._tag !== 'LocalLifetime') return []
+                return [
+                  {
+                    origin: formation.origin,
+                    environment,
+                    lifetimeBounds: formation.lifetimeBounds.map((bound) => ({
+                      longer: Type.substituteLifetime(bound.longer, instance.substitution),
+                      shorter: Type.substituteLifetime(bound.shorter, instance.substitution),
+                    })),
+                    typeOutlives: formation.typeOutlives.map((bound) => ({
+                      type: Type.substitute(
+                        bound.type,
+                        instance.substitution,
+                        instance.specialization.compatibility,
+                      ),
+                      lifetime: Type.substituteLifetime(bound.lifetime, instance.substitution),
+                    })),
+                  },
+                ]
+              }),
+            }),
         effectSuccesses: trace('Instances.resolveEffectSuccesses', () =>
           effectSuccesses(
             instance.function,

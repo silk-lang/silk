@@ -4,6 +4,7 @@ import * as RowAlgebra from '../RowAlgebra.js'
 import type {
   Callable,
   Effect,
+  ExecutableLifetimes,
   FailureRow,
   GenericArgument,
   Parameter,
@@ -13,6 +14,7 @@ import type {
   RequirementsRow,
   RowInferenceFailure,
   InferenceFailure,
+  InvocationInputBound,
   SealedStaticProperty,
   Substitution,
   TypeOutlives,
@@ -20,14 +22,19 @@ import type {
 } from '../Type.js'
 import {
   callable,
+  callableInputOrdinals,
   compareAccess,
   effectWithRows,
   executableFormationRequirements,
+  invocationInputBounds,
+  invocationUseState,
   lifetimes,
   encode,
   equals,
   failureMemberParameters,
   failureMembers,
+  failureType,
+  freeLifetimes,
   failureRowPolicy,
   genericArgumentKey,
   isCallable,
@@ -60,9 +67,11 @@ import {
   requirementSatisfies,
   someSubterm,
   string,
+  storageLifetimes,
   satisfiesOutlives,
   substitute,
   substituteFailureRow,
+  substituteGenericArgument,
   substituteLifetime,
   substituteRequirementsRow,
   union,
@@ -74,6 +83,17 @@ const representationArgumentContract = (
   self._tag === 'RepresentationParameterArgument'
     ? self.parameter.representationBound
     : self.contract
+
+// These concrete retention edges are conditional on the same expected exact input judgment.
+// Executable outcomes/requirements are not stored input contents.
+const lifetimesOfInput = (
+  input: InvocationInputBound,
+  substitution: Substitution,
+): ReadonlyArray<Lifetime.Outlives> =>
+  storageLifetimes(substitute(input.type, substitution)).map((longer) => ({
+    longer,
+    shorter: substituteLifetime(input.lifetime, substitution),
+  }))
 
 export interface GenericArgumentConflict {
   readonly parameter: Parameter
@@ -656,6 +676,11 @@ const inferQuantifiedExecutable = (
   inferred: Map<string, GenericArgument>,
   context: InferenceContext,
 ): boolean => {
+  if (isCallable(pattern) && isCallable(actual)) {
+    if (invocationInputBounds(pattern) === undefined || invocationInputBounds(actual) === undefined)
+      return false
+    if (actual.invocationUse !== undefined && pattern.invocationUse === undefined) return false
+  }
   if (
     isCallable(pattern) &&
     isCallable(actual) &&
@@ -668,7 +693,16 @@ const inferQuantifiedExecutable = (
       : undefined
     return instantiated !== undefined && inferType(pattern, instantiated, inferred, context)
   }
-  if (pattern.lifetimeBinders.length !== actual.lifetimeBinders.length) return false
+  if (
+    pattern.lifetimeBinders.length !== actual.lifetimeBinders.length &&
+    !(
+      isCallable(pattern) &&
+      isCallable(actual) &&
+      pattern.invocationUse !== undefined &&
+      actual.lifetimeBinders.length === 0
+    )
+  )
+    return false
   const nested = (type: Type): boolean =>
     someSubterm(
       type,
@@ -683,17 +717,40 @@ const inferQuantifiedExecutable = (
   const patternSubstitution = new Map<string, GenericArgument>()
   const actualSubstitution = new Map<string, GenericArgument>()
   const universe = `inference:${key(pattern)}:${key(actual)}`
+  const actualData = actual.lifetimeBinders.filter(
+    (binder) =>
+      actual.invocationUse === undefined || !Lifetime.equals(binder, actual.invocationUse.lifetime),
+  )
+  const actualUse = actual.invocationUse?.lifetime
+  let dataOrdinal = 0
   for (const [ordinal, binder] of pattern.lifetimeBinders.entries()) {
-    const supplied = actual.lifetimeBinders.at(ordinal)
-    if (supplied === undefined) return false
+    let supplied: Lifetime.Bound | undefined
+    if (actual.invocationUse === undefined) supplied = actual.lifetimeBinders.at(ordinal)
+    else if (
+      pattern.invocationUse !== undefined &&
+      Lifetime.equals(binder, pattern.invocationUse.lifetime)
+    )
+      supplied = actual.lifetimeBinders.find(
+        (entry) => actualUse !== undefined && Lifetime.equals(entry, actualUse),
+      )
+    else supplied = actualData.at(dataOrdinal++)
+    if (supplied === undefined && actual.lifetimeBinders.length !== 0) return false
     const rigid = Lifetime.placeholder(binder, universe)
     patternSubstitution.set(Lifetime.key(binder), rigid)
-    actualSubstitution.set(Lifetime.key(supplied), rigid)
+    if (supplied !== undefined) actualSubstitution.set(Lifetime.key(supplied), rigid)
   }
   const open = (self: Callable | Effect, substitution: Substitution): Callable | Effect => {
     const metadata = {
       environment: self.environment,
       lifetimeBinders: [],
+      ...(self.invocationUse === undefined
+        ? {}
+        : {
+            invocationUse: {
+              ...self.invocationUse,
+              lifetime: substituteLifetime(self.invocationUse.lifetime, substitution),
+            },
+          }),
       typeOutlives: self.typeOutlives.map((bound) => ({
         type: substitute(bound.type, substitution),
         lifetime: substituteLifetime(bound.lifetime, substitution),
@@ -711,6 +768,7 @@ const inferQuantifiedExecutable = (
           self.mode,
           self.schema,
           self.unsafe,
+          'Opened',
         )
       : effectWithRows(
           substitute(self.success, substitution),
@@ -725,6 +783,8 @@ const inferQuantifiedExecutable = (
   // Only the rigid comparison uses these assumptions; the escape check below still prevents
   // an invocation binder from entering the caller's specialization.
   const openedPattern = open(pattern, patternSubstitution)
+  const expectedInputs = isCallable(openedPattern) ? invocationInputBounds(openedPattern) : []
+  if (expectedInputs === undefined) return false
   // Captured data already establishes formation facts. Preserve those while checking the
   // returned Effect, without assuming any precondition that mentions an invocation binder.
   const formation = executableFormationRequirements(actual)
@@ -732,7 +792,11 @@ const inferQuantifiedExecutable = (
     if (
       Lifetime.outlives(
         Lifetime.assumptions(
-          [...openedPattern.lifetimeBounds, ...formation.lifetimeBounds].map((bound) => ({
+          [
+            ...openedPattern.lifetimeBounds,
+            ...expectedInputs.flatMap((input) => lifetimesOfInput(input, trial)),
+            ...formation.lifetimeBounds,
+          ].map((bound) => ({
             longer: substituteLifetime(bound.longer, trial),
             shorter: substituteLifetime(bound.shorter, trial),
           })),
@@ -757,6 +821,11 @@ const inferQuantifiedExecutable = (
       accepts: (longer, shorter, invariant) =>
         proves(longer, shorter) && (!invariant || proves(shorter, longer)),
       typeOutlives: (type, lifetime) =>
+        expectedInputs.some(
+          (input) =>
+            equals(substitute(input.type, trial), type) &&
+            proves(substituteLifetime(input.lifetime, trial), lifetime),
+        ) ||
         satisfiesOutlives(
           type,
           lifetime,
@@ -794,6 +863,9 @@ export const instantiateOfferedCallable = (
   target: Callable,
   compatibility: TypeCompatibility.Context = TypeCompatibility.context(),
 ): Callable | undefined => {
+  const expectedInputs = invocationInputBounds(target)
+  if (expectedInputs === undefined || invocationInputBounds(source) === undefined) return undefined
+  if (source.invocationUse !== undefined && target.invocationUse === undefined) return undefined
   const nested = (type: Type): boolean =>
     someSubterm(
       type,
@@ -825,6 +897,8 @@ export const instantiateOfferedCallable = (
           )),
     },
   }
+  if (source.invocationUse !== undefined && target.invocationUse !== undefined)
+    inferred.set(Lifetime.key(source.invocationUse.lifetime), target.invocationUse.lifetime)
   const sites = [...source.parameters, source.result]
   const expectedSites = [...target.parameters, target.result]
   for (const [ordinal, site] of sites.entries()) {
@@ -842,10 +916,12 @@ export const instantiateOfferedCallable = (
   const formation = executableFormationRequirements(source)
   const boundsContext = {
     ...compatibility,
+    invocationInputs: [...compatibility.invocationInputs, ...expectedInputs],
     typeBounds: [...compatibility.typeBounds, ...target.typeOutlives, ...formation.typeOutlives],
     assumptions: Lifetime.assumptions([
       ...compatibility.assumptions.bounds,
       ...target.lifetimeBounds,
+      ...expectedInputs.flatMap((input) => lifetimesOfInput(input, new Map())),
       ...formation.lifetimeBounds,
     ]),
   }
@@ -870,13 +946,549 @@ export const instantiateOfferedCallable = (
   const opened = callable(
     source.parameters,
     source.result,
+    {
+      ...source,
+      lifetimeBinders: [],
+      ...(source.invocationUse === undefined
+        ? {}
+        : {
+            invocationUse: {
+              ...source.invocationUse,
+              lifetime: substituteLifetime(source.invocationUse.lifetime, substitution),
+            },
+          }),
+    },
+    source.mode,
+    source.schema,
+    source.unsafe,
+    'Opened',
+  )
+  const instantiated = substitute(opened, substitution)
+  return isCallable(instantiated) ? instantiated : undefined
+}
+
+/** A named item's original slots closed over an explicitly marked, deferred invocation domain. */
+export interface InvocationCallableAdapter {
+  readonly callable: Callable
+  readonly substitution: Substitution
+}
+
+/**
+ * Opens a checked callable at one authentic finite use. Only original lifetime binders are
+ * selected here; input ownership and cleanup remain obligations of the actual invocation.
+ * The returned substitution also opens the semantic result of its unchanged physical value.
+ */
+export const openInvocationCallable = (
+  source: Callable,
+  inputs: ReadonlyArray<Type>,
+  use: Lifetime.Local,
+  compatibility: TypeCompatibility.Context = TypeCompatibility.context(),
+): InvocationCallableAdapter | undefined => {
+  const conditions = invocationInputBounds(source)
+  const usage = source.invocationUse
+  if (
+    conditions === undefined ||
+    invocationUseState(source) !== 'Closed' ||
+    source.parameters.length !== inputs.length ||
+    (usage !== undefined && usage.lifetime._tag !== 'BoundLifetime')
+  )
+    return undefined
+  return TypeCompatibility.commitWhen(
+    compatibility,
+    () => {
+      const selected = new Map<string, GenericArgument>()
+      if (usage !== undefined) selected.set(Lifetime.key(usage.lifetime), use)
+      const inferable = new Set(
+        source.lifetimeBinders
+          .filter((binder) => usage === undefined || !Lifetime.equals(binder, usage.lifetime))
+          .map(Lifetime.key),
+      )
+      // Retained source selections are evidence only for the exact original data slot.
+      // An identity selection is still unresolved, not permission to default it to κ.
+      for (const binder of source.lifetimeBinders) {
+        if (!inferable.has(Lifetime.key(binder))) continue
+        const retained = source.schema?.substitution.get(Lifetime.key(binder))
+        if (
+          retained !== undefined &&
+          Lifetime.isLifetime(retained) &&
+          !Lifetime.atoms(retained).some((atom) => inferable.has(Lifetime.key(atom)))
+        )
+          selected.set(Lifetime.key(binder), retained)
+      }
+      const inference: InferenceContext = {
+        allowOpenGenericArguments: false,
+        inferableGenericArguments: new Set<string>(),
+        lifetimes: {
+          compatibility,
+          inferable,
+          accepts: (longer, shorter, invariant) =>
+            TypeCompatibility.isCompatible(
+              TypeCompatibility.check(string(longer), string(shorter), compatibility),
+            ) &&
+            (!invariant ||
+              TypeCompatibility.isCompatible(
+                TypeCompatibility.check(string(shorter), string(longer), compatibility),
+              )),
+          typeOutlives: (type, lifetime) =>
+            TypeCompatibility.typeOutlives(compatibility, { type, lifetime }),
+        },
+      }
+      for (const [ordinal, parameter_] of source.parameters.entries()) {
+        const input = inputs.at(ordinal)
+        if (input === undefined || !inferType(parameter_, input, selected, inference))
+          return undefined
+      }
+      const opened = callable(
+        source.parameters,
+        source.result,
+        {
+          ...source,
+          lifetimeBinders: [],
+          ...(usage === undefined
+            ? {}
+            : {
+                invocationUse: {
+                  ...usage,
+                  lifetime: use,
+                },
+              }),
+        },
+        source.mode,
+        source.schema,
+        source.unsafe,
+        'Opened',
+      )
+      // Check the whole opened semantic record, including retained schema selections.
+      // An unused data binder can disappear, but a result-only dependency cannot acquire
+      // a scope from output context or from the designated use by default.
+      const needed = new Set(freeLifetimes(opened).map(Lifetime.key))
+      if (
+        source.lifetimeBinders.some((binder) => {
+          if (!needed.has(Lifetime.key(binder))) return false
+          const value = selected.get(Lifetime.key(binder))
+          return (
+            value === undefined ||
+            !Lifetime.isLifetime(value) ||
+            Lifetime.atoms(value).some((atom) => inferable.has(Lifetime.key(atom)))
+          )
+        })
+      )
+        return undefined
+      if (
+        !conditions.every((condition) => {
+          const input = inputs.at(condition.parameter)
+          return (
+            input !== undefined &&
+            TypeCompatibility.typeOutlives(compatibility, {
+              type: input,
+              lifetime: substituteLifetime(condition.lifetime, selected),
+            })
+          )
+        }) ||
+        !source.lifetimeBounds.every((bound) =>
+          TypeCompatibility.isCompatible(
+            TypeCompatibility.check(
+              string(substituteLifetime(bound.longer, selected)),
+              string(substituteLifetime(bound.shorter, selected)),
+              compatibility,
+            ),
+          ),
+        ) ||
+        !source.typeOutlives.every((bound) =>
+          TypeCompatibility.typeOutlives(compatibility, {
+            type: substitute(bound.type, selected),
+            lifetime: substituteLifetime(bound.lifetime, selected),
+          }),
+        )
+      )
+        return undefined
+      const instantiated = substitute(opened, selected, compatibility)
+      const original = new Set(source.lifetimeBinders.map(Lifetime.key))
+      if (
+        !isCallable(instantiated) ||
+        freeLifetimes(instantiated).some((region) => original.has(Lifetime.key(region))) ||
+        !instantiated.parameters.every((parameter_, ordinal) => {
+          const input = inputs.at(ordinal)
+          return (
+            input !== undefined &&
+            TypeCompatibility.isCompatible(
+              TypeCompatibility.check(input, parameter_, compatibility),
+            )
+          )
+        })
+      )
+        return undefined
+      return { callable: instantiated, substitution: selected }
+    },
+    (result) => result !== undefined,
+  )
+}
+
+/** Genuine outer call binders and selections, supplied only by its argument-checking context. */
+export interface InvocationConsumer {
+  readonly binders: ReadonlyArray<Parameter>
+  readonly substitution: Substitution
+}
+
+/**
+ * Proves a generic item's conditional signature without publishing the private comparison region.
+ * Original declaration bindings remain in the schema; the expected binder closes their dependency
+ * until a real invocation supplies its finite input-use region.
+ */
+export const adaptInvocationCallable = (
+  source: Callable,
+  expected: Callable,
+  binders: ReadonlyArray<Parameter>,
+  initial: Substitution,
+  compatibility: TypeCompatibility.Context = TypeCompatibility.context(),
+  consumer?: InvocationConsumer,
+  originalVisibleOrdinals?: ReadonlyArray<number>,
+): InvocationCallableAdapter | undefined => {
+  const usage = expected.invocationUse
+  const sourceInputs =
+    source.schema === undefined ? undefined : callableInputOrdinals(source.schema.contract)
+  const visible = originalVisibleOrdinals ?? source.parameters.map((_, ordinal) => ordinal)
+  if (
+    visible.length !== source.parameters.length ||
+    new Set(visible).size !== visible.length ||
+    visible.some(
+      (ordinal) =>
+        !Number.isSafeInteger(ordinal) ||
+        ordinal < 0 ||
+        (sourceInputs !== undefined && !sourceInputs.includes(ordinal)),
+    ) ||
+    (originalVisibleOrdinals !== undefined && sourceInputs === undefined)
+  )
+    return undefined
+  if (
+    usage === undefined ||
+    source.invocationUse !== undefined ||
+    usage.lifetime._tag !== 'BoundLifetime' ||
+    invocationInputBounds(expected) === undefined ||
+    invocationInputBounds(source) === undefined ||
+    source.parameters.length !== expected.parameters.length ||
+    source.lifetimeBinders.some(
+      (binder) =>
+        !binders.some(
+          (parameter_) =>
+            parameter_.kind === 'Lifetime' && key(parameter_) === Lifetime.key(binder),
+        ),
+    )
+  )
+    return undefined
+  const nested = (type: Type): boolean =>
+    someSubterm(
+      type,
+      (part) => (isCallable(part) || isEffect(part)) && part.lifetimeBinders.length > 0,
+    )
+  if ([...source.parameters, source.result, ...expected.parameters, expected.result].some(nested))
+    return undefined
+  const universe = `invocation-adapter:${key(source)}:${key(expected)}`
+  const opening = new Map<string, GenericArgument>()
+  const closing = new Map<string, GenericArgument>()
+  for (const binder of expected.lifetimeBinders) {
+    const rigid = Lifetime.placeholder(binder, universe)
+    opening.set(Lifetime.key(binder), rigid)
+    closing.set(Lifetime.key(rigid), binder)
+  }
+  const promised = callable(
+    expected.parameters.map((parameter_) => substitute(parameter_, opening)),
+    substitute(expected.result, opening),
+    {
+      environment: expected.environment,
+      lifetimeBinders: [],
+      invocationUse: {
+        ...usage,
+        lifetime: substituteLifetime(usage.lifetime, opening),
+      },
+      lifetimeBounds: expected.lifetimeBounds.map((bound) => ({
+        longer: substituteLifetime(bound.longer, opening),
+        shorter: substituteLifetime(bound.shorter, opening),
+      })),
+      typeOutlives: expected.typeOutlives.map((bound) => ({
+        type: substitute(bound.type, opening),
+        lifetime: substituteLifetime(bound.lifetime, opening),
+      })),
+    },
+    expected.mode,
+    expected.schema,
+    expected.unsafe,
+    'Opened',
+  )
+  const inputs = invocationInputBounds(promised)
+  if (inputs === undefined) return undefined
+  const sourcePattern = callable(
+    source.parameters,
+    source.result,
     { ...source, lifetimeBinders: [] },
     source.mode,
     source.schema,
     source.unsafe,
   )
-  const instantiated = substitute(opened, substitution)
-  return isCallable(instantiated) ? instantiated : undefined
+  const scoped: TypeCompatibility.Context = {
+    ...compatibility,
+    invocationInputs: [...compatibility.invocationInputs, ...inputs],
+    typeBounds: [...compatibility.typeBounds, ...promised.typeOutlives],
+    assumptions: Lifetime.mergeAssumptions(
+      compatibility.assumptions,
+      Lifetime.assumptions([
+        ...promised.lifetimeBounds,
+        ...inputs.flatMap((input) => lifetimesOfInput(input, new Map())),
+      ]),
+    ),
+  }
+  return TypeCompatibility.commitWhen(
+    scoped,
+    () => {
+      const trial = new Map(initial)
+      const own = new Set(binders.map(key))
+      // Only unsolved original outer output binders are advisory holes. A caller-owned
+      // rigid parameter, an explicit selection and an offered binder remain fixed.
+      const pending = new Set(
+        (consumer?.binders ?? [])
+          .filter(
+            (binder) =>
+              (binder.kind === 'Value' || binder.kind === 'RequirementRow') &&
+              !consumer?.substitution.has(key(binder)),
+          )
+          .map(key),
+      )
+      if ([...pending].some((identity) => own.has(identity))) return undefined
+      const mentionsPending = (site: Type): boolean =>
+        parameters(site).some((binder) => pending.has(key(binder)))
+      const mentionsPendingRequirements = (site: Effect): boolean =>
+        requirementRowParameters(site).some((binder) => pending.has(key(binder))) ||
+        requirementMembers(site).some((requirement) => mentionsPending(requirement.capability))
+      const inference: InferenceContext = {
+        allowOpenGenericArguments: false,
+        inferableGenericArguments: own,
+        lifetimes: {
+          compatibility: scoped,
+          inferable: new Set(
+            binders
+              .filter((binder) => binder.kind === 'Lifetime')
+              .map((binder) => genericArgumentKey(parameterArgument(binder))),
+          ),
+          accepts: (longer, shorter, invariant) =>
+            TypeCompatibility.isCompatible(
+              TypeCompatibility.check(string(shorter), string(longer), scoped),
+            ) &&
+            (!invariant ||
+              TypeCompatibility.isCompatible(
+                TypeCompatibility.check(string(longer), string(shorter), scoped),
+              )),
+          typeOutlives: (type, lifetime) =>
+            TypeCompatibility.typeOutlives(scoped, { type, lifetime }),
+        },
+      }
+      for (const [ordinal, site] of source.parameters.entries()) {
+        const wanted = promised.parameters.at(ordinal)
+        if (wanted === undefined || !inferType(site, wanted, trial, inference)) return undefined
+      }
+      // Infer the offered declaration's own demanded result holes without asking a
+      // selected offered value to become an unsolved outer consumer parameter.
+      // Directional access and fixed output compatibility belong to the full proof below.
+      const learnFixedOutput = (site: Type, wanted: Type): boolean => {
+        if (mentionsPending(wanted)) return true
+        const attempt = new Map(trial)
+        if (inferType(site, wanted, attempt, inference)) {
+          commitInference(trial, attempt)
+          return true
+        }
+        return !parameters(substitute(site, trial)).some(
+          (binder) => own.has(key(binder)) && !trial.has(key(binder)),
+        )
+      }
+      if (isEffect(source.result) && isEffect(promised.result)) {
+        if (
+          !inferEnvironment(
+            source.result.environment,
+            promised.result.environment,
+            trial,
+            inference,
+          ) ||
+          !learnFixedOutput(source.result.success, promised.result.success) ||
+          !learnFixedOutput(failureType(source.result), failureType(promised.result))
+        )
+          return undefined
+        if (!mentionsPendingRequirements(promised.result)) {
+          const requirementTrial = new Map(trial)
+          if (inferRequirementRows(source.result, promised.result, requirementTrial, inference))
+            commitInference(trial, requirementTrial)
+        }
+      } else if (!learnFixedOutput(source.result, promised.result)) return undefined
+      if (binders.some((binder) => !trial.has(key(binder)))) return undefined
+      const selected = substitute(sourcePattern, trial)
+      if (!isCallable(selected)) return undefined
+      // These equations are private comparison evidence, not published consumer
+      // selections. The ordinary outer argument pass infers from the retained actual
+      // result and independently checks the complete applied contract afterwards.
+      const consumerTrial = new Map(consumer?.substitution)
+      const outputInference: InferenceContext = {
+        ...inference,
+        inferableGenericArguments: pending,
+        lifetimes:
+          inference.lifetimes === undefined
+            ? undefined
+            : {
+                ...inference.lifetimes,
+                inferable: new Set<string>(),
+              },
+      }
+      if (isEffect(promised.result) && isEffect(selected.result)) {
+        if (
+          mentionsPending(promised.result.success) &&
+          !inferType(
+            promised.result.success,
+            selected.result.success,
+            consumerTrial,
+            outputInference,
+          )
+        )
+          return undefined
+        if (
+          mentionsPending(failureType(promised.result)) &&
+          !inferFailureRows(promised.result, selected.result, consumerTrial, outputInference)
+        )
+          return undefined
+        if (
+          mentionsPendingRequirements(promised.result) &&
+          !inferRequirementRows(promised.result, selected.result, consumerTrial, outputInference)
+        )
+          return undefined
+      } else if (
+        mentionsPending(promised.result) &&
+        !inferType(promised.result, selected.result, consumerTrial, outputInference)
+      )
+        return undefined
+      const projected = substitute(promised, consumerTrial)
+      if (!isCallable(projected)) return undefined
+      // Callable comparison accepts already-proven independent formation facts. A named
+      // adapter must establish those facts here, before comparison can assume them.
+      const independent = executableFormationRequirements(selected)
+      if (
+        !independent.typeOutlives.every((bound) => TypeCompatibility.typeOutlives(scoped, bound)) ||
+        !independent.lifetimeBounds.every((bound) =>
+          TypeCompatibility.isCompatible(
+            TypeCompatibility.check(string(bound.longer), string(bound.shorter), scoped),
+          ),
+        )
+      )
+        return undefined
+      // The expected conditional domain, not the offered obligations, supplies the premise.
+      const offered = callable(
+        selected.parameters,
+        selected.result,
+        {
+          ...selected,
+          lifetimeBinders: [],
+          ...(promised.invocationUse === undefined
+            ? {}
+            : { invocationUse: promised.invocationUse }),
+        },
+        selected.mode,
+        selected.schema,
+        selected.unsafe,
+        'Opened',
+      )
+      if (!TypeCompatibility.isCompatible(TypeCompatibility.check(offered, projected, scoped)))
+        return undefined
+      const reclosed = new Map<string, GenericArgument>()
+      for (const [identity, argument] of trial) {
+        if (!own.has(identity)) {
+          if (!initial.has(identity)) return undefined
+          reclosed.set(identity, argument)
+          continue
+        }
+        const closed = substituteGenericArgument(argument, closing)
+        if (
+          argumentLifetimes(closed).some(
+            (region) => region._tag === 'PlaceholderLifetime' && region.universe === universe,
+          )
+        )
+          return undefined
+        reclosed.set(identity, closed)
+      }
+      const closedSource = substitute(sourcePattern, reclosed)
+      if (!isCallable(closedSource)) return undefined
+      const originalInputs =
+        closedSource.schema === undefined
+          ? undefined
+          : callableInputOrdinals(closedSource.schema.contract)
+      if (closedSource.schema !== undefined && originalInputs === undefined) return undefined
+      const adaptedSchema =
+        closedSource.schema === undefined || originalInputs === undefined
+          ? undefined
+          : {
+              ...closedSource.schema,
+              substitution: new Map([...closedSource.schema.substitution, ...reclosed]),
+              invocationAdapter: {
+                binder: usage.lifetime,
+                originalInputs,
+                parameters: Array.from(visible),
+                lifetimes: binders.flatMap((parameter_) => {
+                  const selectedLifetime = reclosed.get(key(parameter_))
+                  return parameter_.kind === 'Lifetime' &&
+                    selectedLifetime !== undefined &&
+                    Lifetime.isLifetime(selectedLifetime) &&
+                    Lifetime.atoms(selectedLifetime).some((atom) =>
+                      Lifetime.equals(atom, usage.lifetime),
+                    )
+                    ? [{ parameter: parameter_, lifetime: selectedLifetime }]
+                    : []
+                }),
+              },
+            }
+      const adapted = callable(
+        closedSource.parameters,
+        closedSource.result,
+        {
+          ...closedSource,
+          lifetimeBinders: expected.lifetimeBinders,
+          invocationUse: usage,
+        },
+        closedSource.mode,
+        adaptedSchema,
+        closedSource.unsafe,
+        'Closed',
+      )
+      return { callable: adapted, substitution: reclosed }
+    },
+    (result) => result !== undefined,
+  )
+}
+
+/**
+ * Checks a stored suffix against its authentic formation environment without selecting the
+ * future use binder. The caller owns that environment's real capture/loan provenance.
+ */
+export const stagedInvocationParameter = (
+  self: Callable,
+  ordinal: number,
+  formation: ExecutableLifetimes,
+): Type | undefined => {
+  if (
+    !Number.isSafeInteger(ordinal) ||
+    ordinal < 0 ||
+    invocationInputBounds(self) === undefined ||
+    invocationUseState(self) !== 'Closed'
+  )
+    return undefined
+  const parameter_ = self.parameters.at(ordinal)
+  const usage = self.invocationUse
+  if (parameter_ === undefined || usage === undefined) return parameter_
+  if (
+    usage.lifetime._tag !== 'BoundLifetime' ||
+    formation.lifetimeBinders.length !== 0 ||
+    formation.invocationUse !== undefined ||
+    Lifetime.atoms(formation.environment).some(
+      (atom) => atom._tag === 'PlaceholderLifetime' || Lifetime.equals(atom, usage.lifetime),
+    )
+  )
+    return undefined
+  // This is only a parameter checking view. Neither the original callable nor the caller's
+  // inference substitution receives κ→η; the result and pending target bounds stay original.
+  return substitute(parameter_, new Map([[Lifetime.key(usage.lifetime), formation.environment]]))
 }
 
 /** Invocation preconditions need implication; independent formation facts travel with the value. */
@@ -886,9 +1498,26 @@ const inferExecutableBounds = (
   inferred: Substitution,
   context: InferenceContext,
 ): boolean => {
+  const expectedInputs = isCallable(pattern) ? invocationInputBounds(pattern) : []
+  const actualInputs = isCallable(actual) ? invocationInputBounds(actual) : []
+  if (expectedInputs === undefined || actualInputs === undefined) return false
+  if (isCallable(pattern) && isCallable(actual) && actual.invocationUse !== undefined) {
+    if (
+      pattern.invocationUse === undefined ||
+      !Lifetime.equals(
+        substituteLifetime(pattern.invocationUse.lifetime, inferred),
+        substituteLifetime(actual.invocationUse.lifetime, inferred),
+      )
+    )
+      return false
+  }
   const formation = executableFormationRequirements(actual)
   const expected = Lifetime.assumptions(
-    [...pattern.lifetimeBounds, ...formation.lifetimeBounds].map((bound) => ({
+    [
+      ...pattern.lifetimeBounds,
+      ...expectedInputs.flatMap((input) => lifetimesOfInput(input, inferred)),
+      ...formation.lifetimeBounds,
+    ].map((bound) => ({
       longer: substituteLifetime(bound.longer, inferred),
       shorter: substituteLifetime(bound.shorter, inferred),
     })),
@@ -905,6 +1534,11 @@ const inferExecutableBounds = (
       const type = substitute(bound.type, inferred)
       const lifetime = substituteLifetime(bound.lifetime, inferred)
       return (
+        expectedInputs.some(
+          (input) =>
+            equals(substitute(input.type, inferred), type) &&
+            proves(substituteLifetime(input.lifetime, inferred), lifetime),
+        ) ||
         satisfiesOutlives(type, lifetime, expectedTypes, proves) ||
         (context.lifetimes?.typeOutlives?.(type, lifetime) ?? false)
       )

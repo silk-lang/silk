@@ -972,6 +972,19 @@ export const executableLifetimes = (
   return cached
 }
 
+/** The stored Effect result retains regions and bounds, without a callable invocation role. */
+export const effectLifetimes = (
+  declaration: DeclarationFact | ServiceOperationFact,
+): Type.ExecutableLifetimes => {
+  const lifetimes = executableLifetimes(declaration)
+  return {
+    environment: lifetimes.environment,
+    lifetimeBinders: [],
+    ...(lifetimes.lifetimeBounds === undefined ? {} : { lifetimeBounds: lifetimes.lifetimeBounds }),
+    ...(lifetimes.typeOutlives === undefined ? {} : { typeOutlives: lifetimes.typeOutlives }),
+  }
+}
+
 const computeExecutableLifetimes = (
   declaration: DeclarationFact | ServiceOperationFact,
 ): Type.ExecutableLifetimes => {
@@ -1005,6 +1018,12 @@ const computeExecutableLifetimes = (
       ? [Lifetime.bound(parameter.type.owner, parameter.type.ordinal, parameter.type.name)]
       : [],
   )
+  const invocationUse = declaration.lifetimeElaboration?.invocationUse
+  if (
+    invocationUse !== undefined &&
+    !lifetimeBinders.some((binder) => Lifetime.equals(binder, invocationUse.lifetime))
+  )
+    lifetimeBinders.push(invocationUse.lifetime)
   const lifetimeBounds: Array<Lifetime.Outlives> = []
   const typeOutlives: Array<Type.TypeOutlives> = []
   for (const parameter of declaration.typeParameters)
@@ -1043,6 +1062,7 @@ const computeExecutableLifetimes = (
   return {
     environment,
     lifetimeBinders: lifetimeBinders,
+    ...(invocationUse === undefined ? {} : { invocationUse }),
     lifetimeBounds: Lifetime.assumptions(lifetimeBounds).bounds,
     typeOutlives: Type.normalizeTypeOutlives(typeOutlives),
   }
@@ -1093,7 +1113,7 @@ export const callableContract = (
       ? Type.effectWithRows(
           success,
           declaration.failureRow.row,
-          { ...executableLifetimes(declaration), lifetimeBinders: [] },
+          effectLifetimes(declaration),
           'Shared',
           declaration.requirementRow.row,
         )
@@ -1116,6 +1136,12 @@ export const callableContract = (
         : [],
     ),
     result,
+    // Hidden lexical captures are actual source producer parameters, separate from
+    // the authored invocation input set. Their retained order is the capture ordinal
+    // assigned by anonymous body formation, not a runtime field or packet guess.
+    captures: declaration.parameters
+      .filter((parameter) => parameter.captureAccess !== undefined)
+      .map((parameter, capture) => ({ parameter: parameter.id.ordinal, capture })),
     constraints: declaration.constraintContracts,
   })
 }

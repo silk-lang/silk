@@ -66,6 +66,7 @@ export interface Plan {
   readonly span: SourceSpan.SourceSpan
   readonly frame: 'StatefulRelay'
   readonly slots: ReadonlyArray<Slot>
+  readonly invocationUses: ReadonlyArray<Mir.InvocationUseRetention>
   readonly success: ResumePlan
   readonly failure: ResumePlan
 }
@@ -572,7 +573,7 @@ const planFor = (
   live: ReadonlySet<number>,
   control: ProvisionalMir.RunControl,
   opaqueRealizations: OpaqueRealization.Catalog,
-): Plan => {
+): Plan | undefined => {
   const definitions = definitionMap(fn)
   const operationDefined = operationDefinitions(operation)
   const parkGuard = operation._tag === 'ExecutionPark' ? operation.guard.ordinal : undefined
@@ -596,6 +597,17 @@ const planFor = (
     }
   }
   const retained = new Set([...live, ...(parkGuard === undefined ? [] : [parkGuard])])
+  const holders = [
+    ...MirVerification.operationLocals(operation).filter(
+      (local) => !operationDefined.has(local.ordinal),
+    ),
+    ...[...live].map((ordinal): Mir.LocalId => ({ _tag: 'Local', ordinal })),
+  ]
+  const invocationUses = MirVerification.invocationRetentions(fn, program, holders).retentions
+  for (const retention of invocationUses)
+    for (const dependency of [...retention.dependencies, ...retention.environment])
+      for (const referent of dependency.referents) retained.add(referent.root.ordinal)
+
   if ('cancellationFinalizer' in operation && operation.cancellationFinalizer !== undefined) {
     if (operation.cancellationFinalizer._tag === 'EffectCancellationFinalizer')
       retained.add(operation.cancellationFinalizer.effect.ordinal)
@@ -717,7 +729,11 @@ const planFor = (
       initialization: slot.initialization,
       ordinal: slot.local.ordinal,
     }))
-  const releaseOrder = [...releases, ...Ownership.inReleaseOrder(affineReleases)]
+  // The returned child/holder owns transferred payloads. Only external referents get extra slots.
+  // Its cleanup precedes those owners, including cancellation before the child has completed.
+  const unorderedReleases = [...releases, ...Ownership.inReleaseOrder(affineReleases)]
+  const releaseOrder = MirVerification.invocationReleaseOrder(invocationUses, unorderedReleases)
+  if (releaseOrder === undefined) return undefined
   const loanEnds = Ownership.inReleaseOrder(borrowed).map((slot) => slot.access.loan)
   return {
     _tag: 'SuspensionOwnershipPlan',
@@ -730,6 +746,7 @@ const planFor = (
     // final `run` may adapt the child's represented Effect outcome to the caller's result shape.
     frame: 'StatefulRelay',
     slots,
+    invocationUses,
     success: {
       restores: slots
         .filter((slot) => slot.local.ordinal !== parkGuard)
@@ -794,6 +811,30 @@ export const plan = (
           continue
         }
         live ??= liveness(fn)
+        const retainedInputs = MirVerification.invocationRetentions(fn, program, [
+          ...MirVerification.operationLocals(operation).filter(
+            (local) => !operationDefinitions(operation).has(local.ordinal),
+          ),
+          ...[...(live.get(operation) ?? [])].map((ordinal): Mir.LocalId => ({
+            _tag: 'Local',
+            ordinal,
+          })),
+        ])
+        const invocationIssues = [
+          ...MirVerification.invocationUseIssues(fn, program),
+          ...retainedInputs.issues,
+        ]
+        if (invocationIssues.length > 0) {
+          violations.push(
+            ...invocationIssues.map((issue): Violation => ({
+              _tag: 'SuspensionOwnershipViolation',
+              function: fn.instance,
+              span: issue.operation.provenance.span,
+              detail: issue.detail,
+            })),
+          )
+          continue
+        }
         const planned = planFor(
           program,
           index,
@@ -804,6 +845,15 @@ export const plan = (
           control,
           opaqueRealizations,
         )
+        if (planned === undefined) {
+          violations.push({
+            _tag: 'SuspensionOwnershipViolation',
+            function: fn.instance,
+            span: operation.provenance.span,
+            detail: 'invocation input cleanup dependencies are cyclic or duplicate',
+          })
+          continue
+        }
         const assignedFlags = MirVerification.initializationOf(fn, program.layout).flagsBefore.get(
           operation,
         )

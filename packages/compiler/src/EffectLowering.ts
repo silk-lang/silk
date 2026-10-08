@@ -11,10 +11,12 @@ import {
   propagationReleases,
 } from './CleanupEmission.js'
 import * as ConformanceProof from './ConformanceProof.js'
+import * as DeclarationFacts from './DeclarationFacts.js'
 import type {} from './EntryAssembly.js'
 import type {} from './Forwarding.js'
 import { inlineForwardedRequirement } from './Forwarding.js'
 import type { FunctionLowering } from './FunctionLowering.js'
+import { invocationCompatibility, invocationFormationContext } from './FunctionLowering.js'
 import * as Tir from './Tir.js'
 import * as Instances from './Instances.js'
 import * as Layout from './Layout.js'
@@ -22,13 +24,19 @@ import * as Lifetime from './Lifetime.js'
 import type { ProvidedRequirement } from './Lower.js'
 import { borrowKey, patternKey, specializeProvider } from './Lower.js'
 import type {} from './LowerExpression.js'
-import { lowerCallOperand, lowerExpression, lowerExecution } from './LowerExpression.js'
+import {
+  lowerCallOperand,
+  lowerExpression,
+  lowerExecution,
+  lowerRecoveryInvocationInputs,
+} from './LowerExpression.js'
 import * as Match from './Match.js'
 import * as Ownership from './Ownership.js'
 import * as Mir from './Mir.js'
 import * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
+import * as TypeInference from './internal/TypeInference.js'
 import {
   baseRunnerKey,
   effectValueByIdentity,
@@ -38,6 +46,7 @@ import {
   providerBindings,
   requirementsFor,
   runtimeRequirementArguments,
+  sameArguments,
 } from './ValueType.js'
 
 export const lowerCatchEffectValue = (
@@ -659,7 +668,64 @@ export const callableEffectValue = (
   const result = fn.effectResults.get(
     instanceText(callable.target.declaration, callableTargetArguments(callable)),
   )
-  return result?._tag === 'EffectValue' ? result : undefined
+  if (result?._tag !== 'EffectValue') return undefined
+  const schema = callable.type.schema
+  if (schema === undefined) return result
+  const source = schema.source
+  if (
+    source === undefined ||
+    source.module !== callable.target.declaration.module ||
+    source.name !== callable.target.declaration.name
+  )
+    return undefined
+  // Machine sharing erases lifetime arguments. The actual operand retains the original source
+  // selection, so its proof header must not inherit another invocation's finite regions.
+  const selected = Type.substitute(schema.contract.result, schema.substitution)
+  if (!Type.isEffect(selected)) return undefined
+  const fields = result.environment.fields.map((field) => {
+    if (field.source !== 'Parameter') return field
+    const parameter = schema.contract.parameters.at(field.ordinal)
+    return parameter === undefined
+      ? undefined
+      : { ...field, type: Type.substitute(parameter.type, schema.substitution) }
+  })
+  if (fields.some((field) => field === undefined)) return undefined
+  const selectedResult = { ...selected, access: result.type.access }
+  return {
+    ...result,
+    type: selectedResult,
+    environment: {
+      ...result.environment,
+      effect: selectedResult,
+      fields: fields.flatMap((field) => (field === undefined ? [] : [field])),
+    },
+  }
+}
+
+/** The offered designation belongs to the actual producer, independently of its required view. */
+const callableInvocationBinder = (
+  fn: FunctionLowering,
+  callable: Extract<Mir.Type, { readonly _tag: 'CallableValue' }>,
+): { readonly binder?: Lifetime.Bound } | undefined => {
+  let usage: Type.InvocationUse | undefined
+  if (callable.environment !== undefined) {
+    usage = callable.environment.callable.type.invocationUse
+  } else {
+    const target = callable.target
+    if (target._tag !== 'DeclarationCallableTarget') return undefined
+    const arguments_ = callableTargetArguments(callable)
+    const producers = fn.instances.filter(
+      (instance) =>
+        instance.key.declaration.module === target.declaration.module &&
+        instance.key.declaration.name === target.declaration.name &&
+        sameArguments(instance.key.typeArguments, arguments_),
+    )
+    const producer = producers.length === 1 ? producers.at(0) : undefined
+    if (producer === undefined) return undefined
+    usage = DeclarationFacts.executableLifetimes(producer.function.declaration).invocationUse
+  }
+  if (usage === undefined) return {}
+  return usage.lifetime._tag === 'BoundLifetime' ? { binder: usage.lifetime } : undefined
 }
 
 const resourceCancellationFinalizerOf = (
@@ -1031,12 +1097,12 @@ export const lowerEffectCatch = (
   const handlerType =
     captured?.handlerType ??
     (handler === undefined ? undefined : fn.localTypes.at(handler.result.ordinal))
-  const handlerEffectType =
+  const physicalHandlerEffectType =
     handlerType?._tag === 'CallableValue' ? callableEffectValue(fn, handlerType) : undefined
   if (
     handler === undefined ||
     handlerType?._tag !== 'CallableValue' ||
-    handlerEffectType === undefined
+    physicalHandlerEffectType === undefined
   )
     return undefined
   const unusedHandlerDrop = (): ReadonlyArray<Mir.DropOperation> => {
@@ -1058,6 +1124,96 @@ export const lowerEffectCatch = (
   }
 
   const selected = fn.semantic(expression.selected)
+  const recipe = expression.recoveryInvocation
+  if (recipe === undefined || !Type.equals(fn.semantic(recipe.selected), selected)) return undefined
+  const offered = callableInvocationBinder(fn, handlerType)
+  if (offered === undefined) return undefined
+  const closedBinder = offered.binder ?? handlerType.type.invocationUse?.lifetime ?? recipe.binder
+  if (closedBinder._tag !== 'BoundLifetime') return undefined
+  const baseCompatibility = invocationFormationContext(
+    fn,
+    handlerType,
+    closedBinder,
+    invocationCompatibility(fn),
+  )
+  if (baseCompatibility === undefined) return undefined
+  // This is the checked recipe's exact conditional input, not formation captures or a new
+  // declaration bound. Actual failure storage and cleanup are discharged by invocation retention.
+  const compatibility: TypeCompatibility.Context = {
+    ...baseCompatibility,
+    invocationInputs: [
+      ...baseCompatibility.invocationInputs,
+      { parameter: recipe.parameter, type: selected, lifetime: recipe.lifetime },
+    ],
+    assumptions: Lifetime.mergeAssumptions(
+      baseCompatibility.assumptions,
+      Lifetime.assumptions(
+        Type.retention(selected).regions.map((longer) => ({
+          longer,
+          shorter: recipe.lifetime,
+        })),
+      ),
+    ),
+  }
+  const opened = TypeInference.openInvocationCallable(
+    handlerType.type,
+    [selected],
+    recipe.lifetime,
+    compatibility,
+  )
+  if (opened === undefined) return undefined
+  const resultSubstitution = new Map(opened.substitution)
+  if (offered.binder !== undefined)
+    resultSubstitution.set(Lifetime.key(offered.binder), recipe.lifetime)
+  const handlerResult = Type.substitute(
+    physicalHandlerEffectType.type,
+    resultSubstitution,
+    compatibility,
+  )
+  const declaredHandlerResult = opened.callable.result
+  if (!Type.isEffect(handlerResult) || !Type.isEffect(declaredHandlerResult)) return undefined
+  // Invoking an Effect function captures its actual inputs. An owned input strengthens the
+  // constructed computation's access even when the declaration's bare return contract is shared.
+  // Read those captures from this exact source producer, independently of the result descriptor.
+  const captureAccesses = physicalHandlerEffectType.environment.fields.map((field) => field.access)
+  let invocationAccess: Type.CaptureAccess = 'Shared'
+  if (declaredHandlerResult.access === 'Take' || captureAccesses.includes('Take'))
+    invocationAccess = 'Take'
+  else if (declaredHandlerResult.access === 'Exclusive' || captureAccesses.includes('Exclusive'))
+    invocationAccess = 'Exclusive'
+  const invokedHandlerResult: Type.Effect = { ...declaredHandlerResult, access: invocationAccess }
+  if (
+    !TypeCompatibility.isCompatible(
+      TypeCompatibility.check(handlerResult, invokedHandlerResult, compatibility),
+    )
+  )
+    return undefined
+  const handlerEffectType = { ...physicalHandlerEffectType, type: handlerResult }
+  const sourceBinder = offered.binder
+  const recoveryInvocation = (
+    argument: Mir.LocalId,
+    result: Mir.LocalId,
+  ): Mir.InvocationUse | undefined => {
+    const actual = fn.localTypes.at(argument.ordinal)
+    if (actual === undefined || !Type.equals(Mir.semanticType(actual), selected)) return undefined
+    const retained = lowerRecoveryInvocationInputs(
+      fn,
+      handler.result,
+      argument,
+      selected,
+      sourceBinder ?? recipe.binder,
+    )
+    if (retained === undefined) return undefined
+    return {
+      kind: 'Recovery',
+      owner: recipe.owner,
+      origin: recipe.origin,
+      binder: retained.binder,
+      lifetime: recipe.lifetime,
+      inputs: retained.inputs,
+      result,
+    }
+  }
   const protectedEffect = fn.semantic(expression.protected.type)
   const resultEffect = fn.semantic(expression.type)
   if (!Type.isEffect(protectedEffect) || !Type.isEffect(resultEffect)) return undefined
@@ -1164,14 +1320,17 @@ export const lowerEffectCatch = (
       return undefined
     const otherwise = lowerExecution(fn, expression.span, () => {
       const applied = fn.alloc(handlerEffectType)
+      const invocationUse = recoveryInvocation(caught.failure, applied)
+      if (invocationUse === undefined) return undefined
       fn.emit({
         _tag: 'ApplyCallable' as const,
+        invocationUse,
         destination: applied,
         callable: handler.result,
         typeArguments: callableTargetArguments(handlerType),
         captures: [],
         arguments: [caught.failure],
-        callableType: handlerType.type,
+        callableType: opened.callable,
         access: handlerType.type.mode,
         evaluation: 'CalleeThenArguments' as const,
         realization: 'Environment' as const,
@@ -1187,7 +1346,11 @@ export const lowerEffectCatch = (
       destination,
       condition: caught.valid,
       taken,
-      otherwise: { ...otherwise, recoveryOutcome: caught.outcome },
+      otherwise: {
+        ...otherwise,
+        recoveryOutcome: caught.outcome,
+        recoveryInvocation: { ...recipe, selected },
+      },
       type: successType,
       resultShape: successShape,
       provenance: generated(expression.span),
@@ -1267,14 +1430,17 @@ export const lowerEffectCatch = (
           })
         }
         const applied = fn.alloc(handlerEffectType)
+        const invocationUse = recoveryInvocation(handlerArgument, applied)
+        if (invocationUse === undefined) return undefined
         fn.emit({
           _tag: 'ApplyCallable' as const,
+          invocationUse,
           destination: applied,
           callable: handler.result,
           typeArguments: callableTargetArguments(handlerType),
           captures: [],
           arguments: [handlerArgument],
-          callableType: handlerType.type,
+          callableType: opened.callable,
           access: handlerType.type.mode,
           evaluation: 'CalleeThenArguments' as const,
           realization: 'Environment' as const,
@@ -1340,7 +1506,11 @@ export const lowerEffectCatch = (
       selected: {
         access: 'Move' as const,
         execution: selectedMembers.some((candidate) => Type.equals(candidate, member))
-          ? { ...selectedExecution, recoveryOutcome: caught.outcome }
+          ? {
+              ...selectedExecution,
+              recoveryOutcome: caught.outcome,
+              recoveryInvocation: { ...recipe, selected },
+            }
           : selectedExecution,
         cleanup: [],
         endBorrow: false,

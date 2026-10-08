@@ -2,6 +2,7 @@ import * as Effect from 'effect/Effect'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as ConformanceProof from './ConformanceProof.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Diagnostic from './Diagnostic.js'
 import * as ExecutionPackage from './ExecutionPackage.js'
@@ -9,6 +10,7 @@ import * as FieldRealization from './FieldRealization.js'
 import * as Tir from './Tir.js'
 import * as InstanceDiagnostics from './InstanceDiagnostics.js'
 import * as Instances from './Instances.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import { alignUp } from './internal/Align.js'
 import type {
   AddressScalar,
@@ -326,6 +328,12 @@ export interface EffectEnvironmentField extends PlacedField {
   readonly effectIdentity?: string
   /** Canonical environment selected when `effectIdentity` was a representation-site alias. */
   readonly resolvedEffectIdentity?: string
+  /** Original checked caller edge selecting the source parameter view of this payload. */
+  readonly inputView?: {
+    readonly owner: Instances.InstanceKey
+    readonly callNode: Tir.NodeId
+    readonly view: Tir.ExecutableInputView
+  }
   readonly callableIdentity?: Type.CallableIdentityArgument
   readonly providedRequirement?: NonNullable<
     FieldRealization.EffectEnvironmentSlot['providedRequirement']
@@ -2155,7 +2163,7 @@ const addFunctionTypes = Effect.fnUntraced(function* (
       const outcome = Type.effect(
         type,
         failures,
-        { ...DeclarationFacts.executableLifetimes(fn.declaration), lifetimeBinders: [] },
+        DeclarationFacts.effectLifetimes(fn.declaration),
         'Shared',
         requirements,
       )
@@ -3254,7 +3262,58 @@ const planEffectCapture = Effect.fn('Layout.planEffectCapture')(function* (
     capturedCallableIdentity === undefined
       ? undefined
       : environmentMatching(callablePlans, capturedCallableIdentity)
+  const parameterType = Type.isRepresented(specialized) ? specialized.contract : specialized
+  const parameter = instance.function.declaration.parameters
+    .filter((entry) => entry.phase === 'Runtime')
+    .at(ordinal)
+  const inputView =
+    source !== 'Parameter' ||
+    !Type.isEffect(parameterType) ||
+    capturedEffectEnvironment === undefined ||
+    parameter === undefined
+      ? undefined
+      : state.discovery.calls
+          .flatMap((call) => {
+            if (
+              call.node === undefined ||
+              Instances.keyText(call.target) !== Instances.keyText(instance.key)
+            )
+              return []
+            const caller = Instances.instanceByKey(state.discovery.instances, call.owner)
+            if (caller?.ownership.verdict._tag !== 'Satisfied') return []
+            const callNode = call.node
+            return (call.inputViews ?? []).flatMap((view) => {
+              if (
+                view.parameter.ordinal !== ordinal ||
+                AuthoredIdentity.anchorKey(view.parameter.source) !==
+                  AuthoredIdentity.anchorKey(parameter.anchor) ||
+                !Type.isEffect(view.actual) ||
+                !Type.isEffect(view.expected) ||
+                !Type.equals(view.expected, parameterType) ||
+                !Type.equals(
+                  { ...view.actual, access: capturedEffectEnvironment.effect.access },
+                  capturedEffectEnvironment.effect,
+                )
+              )
+                return []
+              const proof = { owner: call.owner, callNode, view }
+              return ExecutableInputView.authority(
+                state.discovery.instances,
+                state.discovery.calls,
+                proof,
+              ) === undefined
+                ? []
+                : [proof]
+            })
+          })
+          .at(0)
   const fieldType =
+    (inputView === undefined || !Type.isEffect(inputView.view.expected)
+      ? undefined
+      : {
+          ...inputView.view.expected,
+          access: capturedEffectEnvironment?.effect.access ?? inputView.view.expected.access,
+        }) ??
     capturedEffectEnvironment?.effect ??
     (capturedCompositeRepresentation === undefined
       ? undefined
@@ -3313,6 +3372,7 @@ const planEffectCapture = Effect.fn('Layout.planEffectCapture')(function* (
         type: fieldType,
         representation,
         ...(capturedEffectIdentity === undefined ? {} : { effectIdentity: capturedEffectIdentity }),
+        ...(inputView === undefined ? {} : { inputView }),
         ...(capturedEffectEnvironment === undefined
           ? {}
           : {

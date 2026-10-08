@@ -17,12 +17,140 @@ import type * as Ownership from './Ownership.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as StaticValue from './StaticValue.js'
 import * as Type from './Type.js'
+import * as TypeCompatibility from './TypeCompatibility.js'
+import * as NominalVariance from './NominalVariance.js'
+import * as Lifetime from './Lifetime.js'
 import type { GeneratedEffectRunner, SpecializedWitnessEffectTarget } from './ValueType.js'
 import {
   representedValueType,
   storedCallableValueType,
   storedEffectValueType,
 } from './ValueType.js'
+
+/** Restores the checked nominal catalog at the actual-use lowering boundary. */
+export const invocationCompatibility = (fn: FunctionLowering): TypeCompatibility.Context => {
+  const base = fn.owner.specialization.compatibility ?? TypeCompatibility.context()
+  return {
+    ...base,
+    nominalVariance: new Map([
+      ...NominalVariance.derive(fn.index).summaries,
+      ...base.nominalVariance,
+    ]),
+  }
+}
+
+/** Uses only capture premises from the exact admitted source construction. */
+export const invocationFormationContext = (
+  fn: FunctionLowering,
+  actual: Extract<Mir.Type, { readonly _tag: 'CallableValue' }>,
+  binder: Lifetime.Bound,
+  base: TypeCompatibility.Context,
+): TypeCompatibility.Context | undefined => {
+  const environment = actual.type.environment
+  if (environment._tag === 'StaticLifetime') return base
+  // A selected capture-free function identity may retain a required semantic view in its
+  // parameter header. Its empty physical closure has no formation premises to import.
+  if (
+    actual.environment === undefined &&
+    actual.storage === undefined &&
+    actual.target._tag === 'DeclarationCallableTarget'
+  ) {
+    const target = actual.target.declaration
+    const arguments_ = actual.typeArguments ?? []
+    const selected = fn.instances.filter(
+      (instance) =>
+        instance.key.declaration.module === target.module &&
+        instance.key.declaration.name === target.name &&
+        instance.key.typeArguments.length === arguments_.length &&
+        instance.key.typeArguments.every((argument, ordinal) => {
+          const supplied = arguments_.at(ordinal)
+          return supplied !== undefined && Type.equalsGenericArgument(argument, supplied)
+        }),
+    )
+    if (selected.length === 1 && selected.at(0)?.ownership.verdict._tag === 'Satisfied') return base
+    return undefined
+  }
+  const producerKey = actual.environment?.callable.owner
+  if (producerKey === undefined) return undefined
+  const producers = fn.instances.filter(
+    (instance) =>
+      Instances.keyText(instance.key) === Instances.keyText(producerKey) &&
+      instance.key.typeArguments.length === producerKey.typeArguments.length &&
+      instance.key.typeArguments.every((argument, ordinal) => {
+        const selected = producerKey.typeArguments.at(ordinal)
+        return selected !== undefined && Type.equalsGenericArgument(argument, selected)
+      }),
+  )
+  const producer = producers.at(0)
+  if (
+    producers.length !== 1 ||
+    producer === undefined ||
+    producer.formations === undefined ||
+    producer.ownership.verdict._tag !== 'Satisfied'
+  )
+    return undefined
+  const lifetimeBounds: Array<Lifetime.Outlives> = []
+  const typeOutlives: Array<Type.TypeOutlives> = []
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const mentionsUse = (region: Lifetime.Lifetime): boolean =>
+    Lifetime.atoms(region).some((atom) => Lifetime.equals(atom, binder))
+  const visit = (region: Lifetime.Lifetime): boolean => {
+    const identity = Lifetime.key(region)
+    if (visited.has(identity)) return true
+    if (visiting.has(identity) || mentionsUse(region)) return false
+    const candidates =
+      producer.formations?.filter((formation) => Lifetime.equals(formation.environment, region)) ??
+      []
+    const formation = candidates.at(0)
+    if (
+      candidates.length !== 1 ||
+      formation === undefined ||
+      formation.origin.owner.module !== producer.key.declaration.module
+    )
+      return false
+    visiting.add(identity)
+    for (const bound of formation.lifetimeBounds) {
+      if (
+        mentionsUse(bound.longer) ||
+        mentionsUse(bound.shorter) ||
+        !Lifetime.equals(bound.shorter, formation.environment)
+      )
+        return false
+      const parent =
+        producer.formations?.some((candidate) =>
+          Lifetime.equals(candidate.environment, bound.longer),
+        ) ?? false
+      if (parent && !visit(bound.longer)) return false
+      // An Environment dependency must have its own genuine construction record.
+      if (
+        !parent &&
+        bound.longer._tag === 'LocalLifetime' &&
+        bound.longer.context.startsWith('Environment:')
+      )
+        return false
+      lifetimeBounds.push(bound)
+    }
+    for (const bound of formation.typeOutlives) {
+      if (
+        mentionsUse(bound.lifetime) ||
+        Type.freeLifetimes(bound.type).some(mentionsUse) ||
+        !Lifetime.equals(bound.lifetime, formation.environment)
+      )
+        return false
+      typeOutlives.push(bound)
+    }
+    visiting.delete(identity)
+    visited.add(identity)
+    return true
+  }
+  if (!visit(environment)) return undefined
+  return {
+    ...base,
+    typeBounds: [...base.typeBounds, ...typeOutlives],
+    assumptions: Lifetime.mergeAssumptions(base.assumptions, Lifetime.assumptions(lifetimeBounds)),
+  }
+}
 
 /** Selects one admitted runtime call edge in its lexical provider context. */
 export const selectCall = (

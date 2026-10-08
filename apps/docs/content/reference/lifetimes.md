@@ -140,6 +140,30 @@ fn apply<'data>(
 }
 ```
 
+A callable may instead mark one outer binder with `for<use 'call>`. This binder names the extent
+of that particular invocation, including use of its returned computation, suspension, cancellation,
+and cleanup. Every supplied input must remain valid for that whole extent. The marker does not
+require generic input contents to outlive the callable's stored capture environment or `'static`.
+It applies to ordinary callable contracts; no library declaration name changes its meaning.
+
+The stored capture environment remains independent. A returned computation that retains both an
+input and a capture has the intersection of their invocation and capture environments, such as
+`Effect<'call & 'env; B>`. Its holder, aliases, stored fields, and cleanup remain within those
+loans. A callback may return independent data. It may not conceal retained input dependencies in a
+result type, return a borrowed view of a consumed parameter's former binding cell, or let a
+computation retaining those inputs escape their use extent.
+
+An unmarked `for<'data>` still quantifies an independent data lifetime. The marked binder keeps its
+original position alongside such binders and cannot be chosen by an explicit call-prefix argument.
+Only one outer binder may be marked, and it has no authored colon bounds. Partial application
+retains each supplied original input's obligation until actual invocation; storing an input does
+not turn that obligation into a premise about every value of the same generic type.
+
+Anonymous recovery callbacks receive the marked input conditions while checking their body.
+Their own captures must satisfy formation independently. A named generic callback must prove its
+actual parameter, result, access, failure, and requirement contracts under those conditions; a
+contextual expected result cannot replace its real implementation signature.
+
 An effect-function declaration may name its retained environment with
 `effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32`. The environment resolves against the
 complete declaration binder list. Naming it retains every obligation of captured contents; it

@@ -126,6 +126,20 @@ export type CallableMode = 'Shared' | 'Exclusive' | 'Take'
 /** Access carried by a stored environment lane; copy adds no ownership dependency. */
 export type CaptureAccess = 'Copy' | CallableMode
 
+/** Original declaration coordinates retained by a proven invocation-use adapter. */
+export interface InvocationAdapter {
+  readonly binder: Lifetime.Lifetime
+  /** Complete original invocation inputs, including stored inputs and excluding lexical captures. */
+  readonly originalInputs: ReadonlyArray<number>
+  /** Visible input ordinal maps to its original target input ordinal. */
+  readonly parameters: ReadonlyArray<number>
+  /** Only original lifetime slots whose selected value depends on the invocation binder. */
+  readonly lifetimes: ReadonlyArray<{
+    readonly parameter: Parameter
+    readonly lifetime: Lifetime.Lifetime
+  }>
+}
+
 /**
  * Compile-time-only obligations retained by a partially applied generic callable.
  *
@@ -138,6 +152,7 @@ export interface CallableSchema {
   /** Already selected source declaration retained through generic value substitution. */
   readonly source?: { readonly module: string; readonly name: string }
   readonly contract: CallableContract.CallableContract
+  readonly invocationAdapter?: InvocationAdapter
   readonly binders: ReadonlyArray<Parameter>
   readonly constraints: ReadonlyArray<Constraint.Constraint>
   readonly evidence: ReadonlyArray<Constraint.ConstraintEvidence>
@@ -165,13 +180,194 @@ export interface TypeOutlives {
   readonly lifetime: Lifetime.Lifetime
 }
 
-/** One canonical structural callable contract independent of its hidden concrete environment. */
+/** One explicitly marked invocation-use binder and all of its positional inputs. */
+export interface InvocationUse {
+  readonly lifetime: Lifetime.Lifetime
+  readonly parameters: ReadonlyArray<number>
+}
+
+export type InvocationUseState = 'Closed' | 'Opened'
+
+// Only owning factories may mark a private opened view. This is not serialized metadata.
+const openedInvocationUse: unique symbol = Symbol('Type.openedInvocationUse')
+
 export interface ExecutableLifetimes {
   readonly environment: Lifetime.Lifetime
   readonly lifetimeBinders: ReadonlyArray<Lifetime.Bound>
   readonly lifetimeBounds?: ReadonlyArray<Lifetime.Outlives>
   readonly typeOutlives?: ReadonlyArray<TypeOutlives>
+  readonly invocationUse?: InvocationUse
+  readonly [openedInvocationUse]?: true
 }
+
+/** The exact input subject of one conditional invocation-validity antecedent. */
+export interface InvocationInputBound extends TypeOutlives {
+  readonly parameter: number
+}
+
+/** Validates designation and complete positional inputs in one explicit owning view. */
+export const invocationUseValid = (
+  usage: InvocationUse | undefined,
+  parameterCount: number,
+  binders: ReadonlyArray<Lifetime.Bound>,
+  view: { readonly state: InvocationUseState },
+): boolean => {
+  if (usage === undefined) return true
+  if (
+    !Number.isSafeInteger(parameterCount) ||
+    parameterCount < 0 ||
+    usage.parameters.length !== parameterCount ||
+    !Array.from(usage.parameters).every((parameter, ordinal) => parameter === ordinal)
+  )
+    return false
+  if (view.state === 'Closed')
+    return (
+      usage.lifetime._tag === 'BoundLifetime' &&
+      binders.some((binder) => Lifetime.equals(binder, usage.lifetime))
+    )
+  return (
+    binders.length === 0 &&
+    (usage.lifetime._tag === 'PlaceholderLifetime' || usage.lifetime._tag === 'LocalLifetime')
+  )
+}
+
+/** Reads provenance retained by an explicitly opened owning constructor. */
+export const invocationUseState = (self: ExecutableLifetimes): InvocationUseState =>
+  self[openedInvocationUse] === true ? 'Opened' : 'Closed'
+
+/** Copies a validated role; malformed internal factory input is a compiler invariant defect. */
+export const invocationUseMetadata = (
+  self: ExecutableLifetimes,
+  parameterCount: number,
+  state: InvocationUseState = invocationUseState(self),
+): Pick<ExecutableLifetimes, 'invocationUse' | typeof openedInvocationUse> => {
+  if (!invocationUseValid(self.invocationUse, parameterCount, self.lifetimeBinders, { state }))
+    throw new RangeError('invalid invocation-use metadata')
+  if (self.invocationUse === undefined) return {}
+  return {
+    invocationUse: {
+      lifetime: self.invocationUse.lifetime,
+      parameters: Array.from(self.invocationUse.parameters),
+    },
+    ...(state === 'Opened' ? { [openedInvocationUse]: true as const } : {}),
+  }
+}
+
+/** Produces conditional expected-input bounds; this never proves an actual operand valid. */
+export const invocationInputBounds = (
+  self: ExecutableLifetimes & { readonly parameters: ReadonlyArray<Type> },
+): ReadonlyArray<InvocationInputBound> | undefined => {
+  if (
+    !invocationUseValid(self.invocationUse, self.parameters.length, self.lifetimeBinders, {
+      state: invocationUseState(self),
+    })
+  )
+    return undefined
+  const usage = self.invocationUse
+  if (usage === undefined) return []
+  return self.parameters.map((type, parameter) => ({ type, parameter, lifetime: usage.lifetime }))
+}
+
+/** Canonical identity of original adapter coordinates and complete selected regions. */
+export const invocationAdapterKey = (self: InvocationAdapter): string =>
+  Canonical.record('InvocationAdapter', [
+    Lifetime.key(self.binder),
+    Canonical.array(self.originalInputs.map(String)),
+    Canonical.array(self.parameters.map(String)),
+    Canonical.array(
+      self.lifetimes
+        .map((slot) =>
+          Canonical.record('LifetimeSlot', [key(slot.parameter), Lifetime.key(slot.lifetime)]),
+        )
+        .sort(compareText),
+    ),
+  ])
+
+/** Original authored inputs before the authenticated hidden lexical-capture suffix. */
+export const callableInputOrdinals = (
+  contract: CallableContract.CallableContract,
+): ReadonlyArray<number> | undefined => {
+  const count = contract.parameters.length - contract.captures.length
+  if (
+    count < 0 ||
+    !contract.captures.every(
+      (capture, ordinal) => capture.capture === ordinal && capture.parameter === count + ordinal,
+    )
+  )
+    return undefined
+  const inputs = Array.from({ length: count }, (_, ordinal) => ordinal)
+  const usage = contract.invocationUse
+  if (
+    usage !== undefined &&
+    (usage.parameters.length !== inputs.length ||
+      !usage.parameters.every((parameter, ordinal) => parameter === inputs.at(ordinal)))
+  )
+    return undefined
+  return inputs
+}
+
+/** Checks the recipe's original coordinates against the retained target substitution. */
+export const invocationAdapterValid = (
+  usage: InvocationUse | undefined,
+  parameterCount: number,
+  schema: CallableSchema,
+): boolean => {
+  const adapter = schema.invocationAdapter
+  if (adapter === undefined) return true
+  const originalInputs = callableInputOrdinals(schema.contract)
+  if (
+    originalInputs === undefined ||
+    adapter.originalInputs.length !== originalInputs.length ||
+    !adapter.originalInputs.every((ordinal, index) => ordinal === originalInputs.at(index)) ||
+    usage === undefined ||
+    !Lifetime.equals(adapter.binder, usage.lifetime) ||
+    adapter.parameters.length !== parameterCount ||
+    new Set(adapter.parameters).size !== parameterCount ||
+    !Array.from(adapter.parameters).every(
+      (ordinal) => Number.isSafeInteger(ordinal) && originalInputs.includes(ordinal),
+    )
+  )
+    return false
+  const original = new Set(
+    schema.contract.binders.filter((binder) => binder.kind === 'Lifetime').map(key),
+  )
+  const selected = new Set(adapter.lifetimes.map((slot) => key(slot.parameter)))
+  if (selected.size !== adapter.lifetimes.length) return false
+  return (
+    adapter.lifetimes.every((slot) => {
+      const identity = key(slot.parameter)
+      const value = schema.substitution.get(identity)
+      return (
+        slot.parameter.kind === 'Lifetime' &&
+        original.has(identity) &&
+        value !== undefined &&
+        Lifetime.isLifetime(value) &&
+        Lifetime.equals(value, slot.lifetime) &&
+        Lifetime.atoms(slot.lifetime).some((region) => Lifetime.equals(region, adapter.binder))
+      )
+    }) &&
+    schema.contract.binders
+      .filter((binder) => binder.kind === 'Lifetime')
+      .every((binder) => {
+        const value = schema.substitution.get(key(binder))
+        return (
+          value === undefined ||
+          !Lifetime.isLifetime(value) ||
+          !Lifetime.atoms(value).some((region) => Lifetime.equals(region, adapter.binder)) ||
+          selected.has(key(binder))
+        )
+      })
+  )
+}
+
+/** Semantic identity of the role, independent of its private owning-view provenance. */
+export const invocationUseKey = (self: ExecutableLifetimes): string =>
+  self.invocationUse === undefined
+    ? ''
+    : Canonical.record('InvocationUse', [
+        Lifetime.key(self.invocationUse.lifetime),
+        Canonical.array(self.invocationUse.parameters.map(String)),
+      ])
 
 export interface Callable extends ExecutableLifetimes {
   readonly lifetimeBounds: ReadonlyArray<Lifetime.Outlives>
@@ -964,8 +1160,10 @@ export const callable = (
   mode: CallableMode = 'Shared',
   schema?: CallableSchema,
   unsafe = false,
+  useState: InvocationUseState = invocationUseState(lifetimes),
 ): Callable => ({
   _tag: 'CallableType',
+  ...invocationUseMetadata(lifetimes, parameters_.length, useState),
   environment: lifetimes.environment,
   lifetimeBinders: [...lifetimes.lifetimeBinders],
   lifetimeBounds: Lifetime.assumptions(lifetimes.lifetimeBounds ?? []).bounds,
@@ -1002,6 +1200,16 @@ export const callable = (
           constraintKeys: Array.from(schema.constraintKeys),
           evidenceKeys: Array.from(schema.evidenceKeys),
           origins: Array.from(schema.origins),
+          ...(schema.invocationAdapter === undefined
+            ? {}
+            : {
+                invocationAdapter: {
+                  binder: schema.invocationAdapter.binder,
+                  originalInputs: Array.from(schema.invocationAdapter.originalInputs),
+                  parameters: Array.from(schema.invocationAdapter.parameters),
+                  lifetimes: schema.invocationAdapter.lifetimes.map((slot) => ({ ...slot })),
+                },
+              }),
         },
       }),
 })
@@ -1012,18 +1220,22 @@ export const foreignFunction = (
   result: Type,
   contract: ForeignContract.ForeignContract = ForeignContract.conservative,
   lifetimes: ExecutableLifetimes = { environment: Lifetime.staticLifetime, lifetimeBinders: [] },
-): ForeignFunction => ({
-  _tag: 'ForeignFunctionType',
-  environment: lifetimes.environment,
-  lifetimeBinders: [...lifetimes.lifetimeBinders],
-  lifetimeBounds: Lifetime.assumptions(lifetimes.lifetimeBounds ?? []).bounds,
-  typeOutlives: normalizeTypeOutlives(lifetimes.typeOutlives ?? []),
-  nullable: false,
-  contract,
-  abi: 'C',
-  parameters: Array.from(parameters_),
-  result,
-})
+): ForeignFunction => {
+  if (lifetimes.invocationUse !== undefined)
+    throw new RangeError('foreign function cannot have invocation-use metadata')
+  return {
+    _tag: 'ForeignFunctionType',
+    environment: lifetimes.environment,
+    lifetimeBinders: [...lifetimes.lifetimeBinders],
+    lifetimeBounds: Lifetime.assumptions(lifetimes.lifetimeBounds ?? []).bounds,
+    typeOutlives: normalizeTypeOutlives(lifetimes.typeOutlives ?? []),
+    nullable: false,
+    contract,
+    abi: 'C',
+    parameters: Array.from(parameters_),
+    result,
+  }
+}
 
 const implicitRowOrigin: SourceSpan.SourceSpan = (() => {
   const span = SourceSpan.fromOffsets('$implicit-row', 0, 0)
@@ -1050,6 +1262,8 @@ export const effect = (
   requirements: ReadonlyArray<Requirement> = [],
   requirementParameters: ReadonlyArray<Parameter> = [],
 ): Effect => {
+  if (lifetimes.invocationUse !== undefined)
+    throw new RangeError('Effect cannot have direct invocation-use metadata')
   const leaves = failures.flatMap(failureLeaves)
   const concreteFailures = leaves.filter(
     (failure) => !(isParameter(failure) && failure.kind === 'Value'),
@@ -2194,6 +2408,8 @@ export const conformanceKey = (capability: Nominal, provider: Type): string =>
   `${key(capability)}\u0000${key(provider)}`
 
 const computeKey = (self: Type): string => {
+  if ((isForeignFunction(self) || isEffect(self)) && self.invocationUse !== undefined)
+    throw new RangeError('non-callable executable cannot have invocation-use metadata')
   if (isString(self)) return `string<${Lifetime.key(self.lifetime)}>`
   if (isBuiltin(self)) return `builtin:${self}`
   if (isNever(self)) return 'union:'
@@ -2210,7 +2426,18 @@ const computeKey = (self: Type): string => {
     return `reference:${self.access}<${Lifetime.key(self.lifetime)};${key(self.target)}>`
   if (isPointer(self)) return `pointer:${pointerQualifierKey(self)}<${key(self.pointee)}>`
   if (isCallable(self)) {
+    if (
+      !invocationUseValid(self.invocationUse, self.parameters.length, self.lifetimeBinders, {
+        state: invocationUseState(self),
+      })
+    )
+      throw new RangeError('invalid invocation-use metadata')
     const schema = self.schema
+    if (
+      schema !== undefined &&
+      !invocationAdapterValid(self.invocationUse, self.parameters.length, schema)
+    )
+      throw new RangeError('invalid invocation adapter coordinates')
     const schemaKey =
       schema === undefined
         ? ''
@@ -2219,6 +2446,9 @@ const computeKey = (self: Type): string => {
               ? ''
               : Canonical.array([schema.source.module, schema.source.name]),
             schema.contractKey,
+            ...(schema.invocationAdapter === undefined
+              ? []
+              : [invocationAdapterKey(schema.invocationAdapter)]),
             Canonical.array(schema.constraintKeys),
             Canonical.array(schema.evidenceKeys),
             Canonical.array(
@@ -2773,7 +3003,12 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
     }
   }
   const visitContract = (contract: CallableContract.CallableContract): void => {
+    for (const binder of contract.lifetimeBinders)
+      binderScope.set(Lifetime.key(binder), (binderScope.get(Lifetime.key(binder)) ?? 0) + 1)
+    // A raw source blueprint owns its declaration binders, including a use role that is
+    // not a generic argument slot. Its environment differs from the stored value's eta.
     visitArgument(contract.environment)
+    if (contract.invocationUse !== undefined) visitArgument(contract.invocationUse.lifetime)
     for (const binder of contract.lifetimeBinders) visitArgument(binder)
     for (const bound of contract.lifetimeBounds) {
       visitArgument(bound.longer)
@@ -2790,6 +3025,11 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
     for (const parameter_ of contract.parameters) visitType(parameter_.type)
     visitType(contract.result)
     for (const constraint of contract.constraints) visitConstraint(constraint)
+    for (const binder of contract.lifetimeBinders) {
+      const count = binderScope.get(Lifetime.key(binder)) ?? 0
+      if (count <= 1) binderScope.delete(Lifetime.key(binder))
+      else binderScope.set(Lifetime.key(binder), count - 1)
+    }
   }
   const visitType = (type: Type): void => {
     append(visitor.type?.(type, inBinderScope))
@@ -2827,6 +3067,7 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
       for (const binder of type.lifetimeBinders)
         binderScope.set(Lifetime.key(binder), (binderScope.get(Lifetime.key(binder)) ?? 0) + 1)
       for (const binder of type.lifetimeBinders) visitArgument(binder)
+      if (type.invocationUse !== undefined) visitArgument(type.invocationUse.lifetime)
       for (const bound of type.lifetimeBounds) {
         visitArgument(bound.longer)
         visitArgument(bound.shorter)
@@ -2839,6 +3080,13 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
       visitType(type.result)
       if (type.schema !== undefined) {
         visitContract(type.schema.contract)
+        if (type.schema.invocationAdapter !== undefined) {
+          visitArgument(type.schema.invocationAdapter.binder)
+          for (const slot of type.schema.invocationAdapter.lifetimes) {
+            visitType(slot.parameter)
+            visitArgument(slot.lifetime)
+          }
+        }
         for (const binder of type.schema.binders) {
           visitType(binder)
           if (binder.representationBound !== undefined) visitType(binder.representationBound)
@@ -2946,17 +3194,20 @@ export const encode = (self: Type): string => {
     return `${self.nullable ? '?' : ''}${self.extent === 'Many' ? '[*]' : '*'}${self.mutable ? 'mut' : 'const'} ${self.alignment === 'Natural' ? '' : `align(${self.alignment}) `}${encode(self.pointee)}`
   if (isCallable(self)) {
     const mode = executableAccessPrefix(self.mode)
-    const quantified =
-      self.lifetimeBinders.length === 0
-        ? ''
-        : `for<${self.lifetimeBinders
-            .map((binder) => {
-              const bounds = self.lifetimeBounds
-                .filter((bound) => Lifetime.equals(bound.longer, binder))
-                .map((bound) => Lifetime.display(bound.shorter))
-              return `${Lifetime.display(binder)}${bounds.length === 0 ? '' : `: ${bounds.join(' + ')}`}`
-            })
-            .join(', ')}> `
+    let quantified: string
+    if (self.lifetimeBinders.length === 0) {
+      if (self.invocationUse === undefined) quantified = ''
+      else quantified = `for<use ${Lifetime.display(self.invocationUse.lifetime)}> `
+    } else {
+      quantified = `for<${self.lifetimeBinders
+        .map((binder) => {
+          const bounds = self.lifetimeBounds
+            .filter((bound) => Lifetime.equals(bound.longer, binder))
+            .map((bound) => Lifetime.display(bound.shorter))
+          return `${self.invocationUse !== undefined && Lifetime.equals(self.invocationUse.lifetime, binder) ? 'use ' : ''}${Lifetime.display(binder)}${bounds.length === 0 ? '' : `: ${bounds.join(' + ')}`}`
+        })
+        .join(', ')}> `
+    }
     return `${quantified}${self.unsafe ? 'unsafe ' : ''}${mode}fn<${Lifetime.display(self.environment)}>(${self.parameters.map(encode).join(', ')}) -> ${encode(self.result)}`
   }
   if (isForeignFunction(self))
@@ -3556,6 +3807,18 @@ export const substitute = (
         ? undefined
         : {
             ...self.schema,
+            ...(self.schema.invocationAdapter === undefined
+              ? {}
+              : {
+                  invocationAdapter: {
+                    ...self.schema.invocationAdapter,
+                    binder: substituteLifetime(self.schema.invocationAdapter.binder, substitution),
+                    lifetimes: self.schema.invocationAdapter.lifetimes.map((slot) => ({
+                      parameter: slot.parameter,
+                      lifetime: substituteLifetime(slot.lifetime, substitution),
+                    })),
+                  },
+                }),
             substitution: new Map([
               ...[...self.schema.substitution.entries()].map(
                 ([parameter_, argument]) =>
@@ -3917,6 +4180,7 @@ export const executableFormationRequirements = (
 } => {
   const invocation = new Set([
     ...self.lifetimeBinders.map(Lifetime.key),
+    ...(self.invocationUse === undefined ? [] : [Lifetime.key(self.invocationUse.lifetime)]),
     ...(isCallable(self) ? (self.schema?.binders.map(key) ?? []) : []),
   ])
   // Inference opens invocation binders to rigid placeholders before comparing contracts. Those
@@ -4145,6 +4409,7 @@ const executableLifetimeKey = (self: ExecutableLifetimes): string =>
     Canonical.array(self.lifetimeBinders.map(Lifetime.key)),
     Lifetime.assumptions(self.lifetimeBounds ?? []).key,
     typeOutlivesKey(self.typeOutlives ?? []),
+    ...(self.invocationUse === undefined ? [] : [invocationUseKey(self)]),
   ])
 
 const substituteExecutableLifetimes = (
@@ -4152,6 +4417,15 @@ const substituteExecutableLifetimes = (
   substitution: Substitution,
   compatibility?: TypeCompatibility.Context,
 ): ExecutableLifetimes => ({
+  ...(self[openedInvocationUse] === true ? { [openedInvocationUse]: true as const } : {}),
+  ...(self.invocationUse === undefined
+    ? {}
+    : {
+        invocationUse: {
+          lifetime: substituteLifetime(self.invocationUse.lifetime, substitution),
+          parameters: Array.from(self.invocationUse.parameters),
+        },
+      }),
   environment: substituteLifetime(self.environment, substitution),
   lifetimeBinders: self.lifetimeBinders,
   typeOutlives: (self.typeOutlives ?? []).map((bound) => ({

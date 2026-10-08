@@ -6,6 +6,7 @@ import type {} from './Forwarding.js'
 import type { FunctionLowering } from './FunctionLowering.js'
 import * as Tir from './Tir.js'
 import * as Instances from './Instances.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import type * as Intrinsic from './Intrinsic.js'
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import * as Layout from './Layout.js'
@@ -275,6 +276,26 @@ export const effectValueType = (
     site: block.site,
     environment,
   }
+}
+
+/** The checked ordinary return view of a block, with its actual construction storage. */
+export const returnedEffectValueType = (
+  layout: Layout.Plan,
+  instance: Instances.Instance,
+  block: Extract<Tir.Expression, { readonly _tag: 'EffectBlock' }>,
+): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
+  const contract = instance.function.contract
+  // Body return admission and the solved instance establish this view. Construction itself
+  // keeps block.type; the descriptor still selects the same actual instance, site and fields.
+  const requested =
+    contract._tag === 'Contract' &&
+    contract.functionKind !== 'Effect' &&
+    Type.isEffect(instance.specialization.result)
+      ? instance.specialization.result
+      : Type.substitute(block.type, instance.substitution, instance.specialization.compatibility)
+  return Type.isEffect(requested)
+    ? effectValueType(layout, instance.key, block, requested)
+    : undefined
 }
 
 export const effectValueAtSite = (
@@ -672,6 +693,29 @@ export const ensureEffectRunner = (
   type: Extract<Mir.Type, { readonly _tag: 'EffectValue' }>,
   requirements: ReadonlyArray<ProvidedRequirement>,
 ): DeclarationFacts.CanonicalId | undefined => {
+  const sourceView =
+    type.inputView === undefined
+      ? undefined
+      : ExecutableInputView.authority(fn.instances, fn.calls, type.inputView)
+  const physicalView =
+    sourceView !== undefined &&
+    Instances.keyText(sourceView.callee.key) === Instances.keyText(fn.owner.key) &&
+    Type.isEffect(sourceView.selected.actual) &&
+    Type.isEffect(sourceView.selected.expected) &&
+    Type.equals(
+      { ...sourceView.selected.actual, access: type.environment.effect.access },
+      type.environment.effect,
+    ) &&
+    Type.equals(
+      { ...sourceView.selected.expected, access: type.environment.effect.access },
+      type.type,
+    ) &&
+    Type.runtimeKey(sourceView.selected.actual) ===
+      Type.runtimeKey({
+        ...sourceView.selected.expected,
+        access: sourceView.selected.actual.access,
+      })
+  if (type.inputView !== undefined && !physicalView) return undefined
   const key =
     requirements.length === 0 ? effectRunnerKey(type) : providedRunnerKey(type, requirements)
   const existing = generatedRunner(fn.generatedRunners, key)
@@ -681,7 +725,7 @@ export const ensureEffectRunner = (
   // registration order. Provider wrappers still require a concrete base recipe below.
   if (
     requirements.length === 0 &&
-    EffectExecutionContract.equals(type.environment.effect, type.type)
+    (physicalView || EffectExecutionContract.equals(type.environment.effect, type.type))
   )
     return (
       type.storage?.realization.runner ??

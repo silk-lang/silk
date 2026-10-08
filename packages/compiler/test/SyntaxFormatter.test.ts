@@ -1557,3 +1557,20 @@ for (const [name, source, expected] of [
     }),
   )
 }
+
+it.effect(
+  'preserves invocation-use designation when formatting and reparsing callable binders',
+  () =>
+    Effect.gen(function* () {
+      const source =
+        "fn invoke(callback:for < 'data , use 'call > once fn < 'static > (&'data i32,i32)->i32){}"
+      const original = parse('invocation-use-format', source)
+      assert.deepEqual(original.parserDiagnostics, [])
+      const text = formattedText(yield* SyntaxFormatter.format(original))
+      assert.include(text, "for<'data, use 'call> once fn<'static>")
+      const reparsed = parse('invocation-use-format', text)
+      assert.deepEqual(reparsed.parserDiagnostics, [])
+      assert.deepEqual(normalized(reparsed, reparsed.root), normalized(original, original.root))
+      assert.strictEqual(formattedText(yield* SyntaxFormatter.format(reparsed)), text)
+    }),
+)

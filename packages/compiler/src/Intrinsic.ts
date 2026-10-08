@@ -843,6 +843,11 @@ const catchSelectedRow = RowAlgebra.singleton(
 const catchJoinedSuccess = Type.union([catchSuccess, catchHandlerSuccess])
 if (catchJoinedSuccess._tag !== 'Normalized')
   throw new RangeError('catch success parameters must form an ordinary union')
+const catchInvocation = Lifetime.bound(
+  { module: 'Intrinsic', name: 'catchFailure.handler' },
+  0,
+  'call',
+)
 const catchContract = CallableContract.make({
   environment: contractLifetime('catchContract'),
   lifetimeBinders: [],
@@ -865,11 +870,21 @@ const catchContract = CallableContract.make({
         Type.effectWithRows(
           catchHandlerSuccess,
           catchHandlerFailureRow,
-          { environment: contractLifetime('catchContract'), lifetimeBinders: [] },
+          {
+            environment: Lifetime.intersection([
+              catchInvocation,
+              contractLifetime('catchContract'),
+            ]),
+            lifetimeBinders: [],
+          },
           'Take',
           catchHandlerRequirementRow,
         ),
-        { environment: contractLifetime('catchContract'), lifetimeBinders: [] },
+        {
+          environment: contractLifetime('catchContract'),
+          lifetimeBinders: [catchInvocation],
+          invocationUse: { lifetime: catchInvocation, parameters: [0] },
+        },
         'Take',
       ),
       mode: 'Take' as const,
@@ -2470,7 +2485,10 @@ const intrinsicOperations = [
     typeParameters: ['S', 'A', 'B', 'E', 'F', '?R', '?Q'],
     parameters: [
       valueParameter('protected', 'once Effect<A ! E ? R>'),
-      valueParameter('handler', 'once fn(S) -> once Effect<B ! F ? Q>'),
+      valueParameter(
+        'handler',
+        "for<use 'call> once fn<'env>(S) -> once Effect<'call & 'env; B ! F ? Q>",
+      ),
     ],
     result: 'Effect<A | B ! Without<E, S> | F ? R | Q>',
     contract: catchContract,

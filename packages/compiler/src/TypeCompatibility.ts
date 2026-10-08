@@ -87,6 +87,8 @@ export interface Context {
   readonly outlives?: (longer: Lifetime.Lifetime, shorter: Lifetime.Lifetime) => boolean
   readonly commitOutlives?: (longer: Lifetime.Lifetime, shorter: Lifetime.Lifetime) => void
   readonly typeBounds: ReadonlyArray<Type.TypeOutlives>
+  /** Expected marked-contract antecedents, never an actual-operand ownership certificate. */
+  readonly invocationInputs: ReadonlyArray<Type.InvocationInputBound>
   readonly typeOutlives?: (type: Type.Type, lifetime: Lifetime.Lifetime) => boolean
   readonly commitTypeOutlives?: (type: Type.Type, lifetime: Lifetime.Lifetime) => void
   readonly work: Work
@@ -138,6 +140,7 @@ export const context = (
     readonly outlives?: Context['outlives']
     readonly commitOutlives?: Context['commitOutlives']
     readonly typeBounds?: ReadonlyArray<Type.TypeOutlives>
+    readonly invocationInputs?: ReadonlyArray<Type.InvocationInputBound>
     readonly typeOutlives?: Context['typeOutlives']
     readonly commitTypeOutlives?: Context['commitTypeOutlives']
   } = {},
@@ -145,6 +148,7 @@ export const context = (
   assumptions: options.assumptions ?? Lifetime.assumptions([]),
   nominalVariance: new Map(options.nominalVariance ?? []),
   typeBounds: Type.normalizeTypeOutlives(options.typeBounds ?? []),
+  invocationInputs: Array.from(options.invocationInputs ?? []),
   ...(options.typeOutlives === undefined ? {} : { typeOutlives: options.typeOutlives }),
   ...(options.outlives === undefined ? {} : { outlives: options.outlives }),
   ...(options.commitOutlives === undefined ? {} : { commitOutlives: options.commitOutlives }),
@@ -193,6 +197,14 @@ const outlives = (
 
 /** Proves one selected structural data-validity obligation in the current comparison scope. */
 export const typeOutlives = (self: Context, bound: Type.TypeOutlives): boolean => {
+  if (
+    self.invocationInputs.some(
+      (input) =>
+        Type.equals(input.type, bound.type) &&
+        Lifetime.outlives(self.assumptions, input.lifetime, bound.lifetime),
+    )
+  )
+    return true
   if (
     Type.satisfiesOutlives(bound.type, bound.lifetime, self.typeBounds, (longer, shorter) =>
       Lifetime.outlives(self.assumptions, longer, shorter),
@@ -249,6 +261,11 @@ const callableCompatible = (
   target: Type.Callable,
   self: Context,
 ): boolean => {
+  const sourceInputs = Type.invocationInputBounds(source)
+  const targetInputs = Type.invocationInputBounds(target)
+  if (sourceInputs === undefined || targetInputs === undefined) return false
+  // A bounded-use callable cannot be advertised as an unrestricted data quantifier.
+  if (source.invocationUse !== undefined && target.invocationUse === undefined) return false
   if (source.lifetimeBinders.length > 0 && target.lifetimeBinders.length === 0) {
     const instantiated = TypeInference.instantiateOfferedCallable(source, target, self)
     return instantiated !== undefined && callableCompatible(instantiated, target, self)
@@ -279,11 +296,26 @@ const callableCompatible = (
     Type.key(target),
     self.assumptions.key,
   ])
+  const sourceData = source.lifetimeBinders.filter(
+    (binder) =>
+      source.invocationUse === undefined || !Lifetime.equals(binder, source.invocationUse.lifetime),
+  )
+  const sourceUse = source.invocationUse?.lifetime
+  let dataOrdinal = 0
   for (const [ordinal, binder] of target.lifetimeBinders.entries()) {
     const rigid = Lifetime.placeholder(binder, universe)
     self.work.rigidBinders += 1
     targetSubstitution.set(Lifetime.key(binder), rigid)
-    const offered = source.lifetimeBinders.at(ordinal)
+    let offered: Lifetime.Bound | undefined
+    if (source.invocationUse === undefined) offered = source.lifetimeBinders.at(ordinal)
+    else if (
+      target.invocationUse !== undefined &&
+      Lifetime.equals(binder, target.invocationUse.lifetime)
+    )
+      offered = source.lifetimeBinders.find(
+        (entry) => sourceUse !== undefined && Lifetime.equals(entry, sourceUse),
+      )
+    else offered = sourceData.at(dataOrdinal++)
     if (offered !== undefined) sourceSubstitution.set(Lifetime.key(offered), rigid)
   }
   const substitutedBounds = (
@@ -303,8 +335,25 @@ const callableCompatible = (
       lifetime: Lifetime.substitute(bound.lifetime, substitution),
     }))
   const formation = Type.executableFormationRequirements(source)
+  if (
+    source.invocationUse !== undefined &&
+    target.invocationUse !== undefined &&
+    !Lifetime.equals(
+      Lifetime.substitute(source.invocationUse.lifetime, sourceSubstitution),
+      Lifetime.substitute(target.invocationUse.lifetime, targetSubstitution),
+    )
+  )
+    return false
   const scoped = {
     ...self,
+    invocationInputs: [
+      ...self.invocationInputs,
+      ...targetInputs.map((bound) => ({
+        parameter: bound.parameter,
+        type: Type.substituteLifetimes(bound.type, targetSubstitution),
+        lifetime: Lifetime.substitute(bound.lifetime, targetSubstitution),
+      })),
+    ],
     typeBounds: [
       ...self.typeBounds,
       ...substituteTypeBounds(target.typeOutlives, targetSubstitution),
@@ -314,6 +363,14 @@ const callableCompatible = (
       self.assumptions,
       Lifetime.assumptions([
         ...substitutedBounds(target.lifetimeBounds, targetSubstitution),
+        ...targetInputs.flatMap((input) =>
+          Type.storageLifetimes(Type.substituteLifetimes(input.type, targetSubstitution)).map(
+            (longer) => ({
+              longer,
+              shorter: Lifetime.substitute(input.lifetime, targetSubstitution),
+            }),
+          ),
+        ),
         ...formation.lifetimeBounds,
       ]),
     ),

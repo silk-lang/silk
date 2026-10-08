@@ -2785,3 +2785,350 @@ it('reuses canonical lifetime bounds while snapshotting caller-owned input', () 
   assert.isFalse(Lifetime.outlives(before, b, a))
   assert.isTrue(Lifetime.outlives(after, b, a))
 })
+
+it('retains invocation-use designation through semantic identity and owning views', () => {
+  const owner = { module: 'invocation-use', name: 'callback' }
+  const data = Lifetime.bound(owner, 0, 'data')
+  const use = Lifetime.bound(owner, 1, 'call')
+  const inputs: ReadonlyArray<Type.Type> = ['i32', Type.reference('Shared', 'i32', data)]
+  const metadata: Type.ExecutableLifetimes = {
+    environment: Lifetime.staticLifetime,
+    lifetimeBinders: [data, use],
+    invocationUse: { lifetime: use, parameters: [0, 1] },
+  }
+  const marked = Type.callable(inputs, 'i32', metadata)
+  const ordinary = Type.callable(inputs, 'i32', {
+    environment: metadata.environment,
+    lifetimeBinders: metadata.lifetimeBinders,
+  })
+  assert.notStrictEqual(Type.key(marked), Type.key(ordinary))
+  assert.strictEqual(Type.runtimeKey(marked), Type.runtimeKey(ordinary))
+  assert.include(Type.encode(marked), "for<'data, use 'call>")
+  assert.deepStrictEqual(Type.invocationInputBounds(marked), [
+    { parameter: 0, type: 'i32', lifetime: use },
+    { parameter: 1, type: inputs.at(1) ?? unreachable('expected second input'), lifetime: use },
+  ])
+  assert.deepStrictEqual(Type.executableFormationRequirements(marked), {
+    lifetimeBounds: [],
+    typeOutlives: [],
+  })
+  assert.isFalse(Type.freeLifetimes(marked).some((region) => Lifetime.equals(region, use)))
+
+  const pure = Type.callable(['i32'], 'i32', {
+    environment: Lifetime.staticLifetime,
+    lifetimeBinders: [use],
+    invocationUse: { lifetime: use, parameters: [0] },
+  })
+  assert.deepStrictEqual(pure.lifetimeBinders, [use])
+  const placeholder = Lifetime.placeholder(use, 'actual-call')
+  const opened = Type.callable(
+    ['i32'],
+    'i32',
+    {
+      environment: Lifetime.staticLifetime,
+      lifetimeBinders: [],
+      invocationUse: { lifetime: placeholder, parameters: [0] },
+    },
+    'Shared',
+    undefined,
+    false,
+    'Opened',
+  )
+  assert.strictEqual(Type.invocationUseState(opened), 'Opened')
+  assert.include(Type.encode(opened), "for<use 'call>")
+  assert.isTrue(Type.freeLifetimes(opened).some((region) => Lifetime.equals(region, placeholder)))
+  const local = Lifetime.local({ module: 'invocation-use', name: 'caller' }, 'call', 3)
+  const substituted = Type.substitute(opened, new Map([[Lifetime.key(placeholder), local]]))
+  assert.isTrue(Type.isCallable(substituted))
+  if (!Type.isCallable(substituted)) return assert.fail('expected a callable')
+  assert.deepStrictEqual(substituted.invocationUse, { lifetime: local, parameters: [0] })
+  assert.strictEqual(Type.invocationUseState(substituted), 'Opened')
+  assert.deepStrictEqual(Type.invocationInputBounds(substituted), [
+    { parameter: 0, type: 'i32', lifetime: local },
+  ])
+  const closedSubstitution = Type.substitute(pure, new Map([[Lifetime.key(use), local]]))
+  assert.isTrue(Type.isCallable(closedSubstitution))
+  if (!Type.isCallable(closedSubstitution)) return assert.fail('expected closed callable')
+  assert.deepStrictEqual(closedSubstitution.invocationUse, pure.invocationUse)
+
+  const contract = CallableContract.make({
+    ...metadata,
+    functionKind: 'Function',
+    parameters: inputs.map((type): CallableContract.Parameter => ({ type, mode: 'Value' })),
+    result: 'i32',
+  })
+  const schema: Type.CallableSchema = {
+    source: owner,
+    contract,
+    binders: [],
+    constraints: [],
+    evidence: [],
+    substitution: new Map(),
+    contractKey: CallableContract.key(contract),
+    constraintKeys: [],
+    evidenceKeys: [],
+    origins: [],
+  }
+  const selected = Type.specializeExecutableOwner(
+    Type.callable(inputs, 'i32', metadata, 'Shared', schema),
+    { declaration: owner, typeArguments: [], staticArgumentKeys: [] },
+    Constraint.specializeCallableSchemaExecutableOwner,
+  )
+  assert.isTrue(Type.isCallable(selected))
+  if (!Type.isCallable(selected)) return assert.fail('expected selected callable')
+  const selectedSchema = selected.schema ?? unreachable('expected selected schema')
+  assert.deepStrictEqual(selectedSchema.contract.invocationUse, metadata.invocationUse)
+  assert.strictEqual(selectedSchema.contractKey, CallableContract.key(selectedSchema.contract))
+})
+
+it('scopes raw callable blueprint environments while retaining actual capture dependencies', () => {
+  const owner = { module: 'invocation-blueprint', name: 'hidden' }
+  const use = Lifetime.bound(owner, 1, 'call')
+  const actualUse = Lifetime.local({ module: owner.module, name: 'caller' }, 'Call', 3)
+  const contract = CallableContract.make({
+    functionKind: 'Effect',
+    environment: use,
+    lifetimeBinders: [use],
+    invocationUse: { lifetime: use, parameters: [0] },
+    parameters: [{ type: 'i32', mode: 'Value' }],
+    result: Type.effect('i32', [], { environment: use, lifetimeBinders: [] }),
+  })
+  const schema: Type.CallableSchema = {
+    source: owner,
+    contract,
+    binders: [],
+    constraints: [],
+    evidence: [],
+    substitution: new Map(),
+    contractKey: CallableContract.key(contract),
+    constraintKeys: [],
+    evidenceKeys: [],
+    origins: [],
+  }
+  const source = Type.callable(
+    ['i32'],
+    Type.effect('i32', [], { environment: use, lifetimeBinders: [] }),
+    {
+      environment: Lifetime.staticLifetime,
+      lifetimeBinders: [use],
+      invocationUse: { lifetime: use, parameters: [0] },
+    },
+    'Take',
+    schema,
+  )
+  const opened = TypeInference.openInvocationCallable(source, ['i32'], actualUse)
+  assert.isDefined(opened)
+  if (opened === undefined) return assert.fail('expected authenticated invocation opening')
+  assert.deepStrictEqual(opened.callable.schema?.contract, contract)
+  assert.includeMembers(Type.freeLifetimes(opened.callable).map(Lifetime.key), [
+    Lifetime.key(actualUse),
+  ])
+  assert.notInclude(Type.freeLifetimes(opened.callable).map(Lifetime.key), Lifetime.key(use))
+
+  const retainedCapture = Type.callable(
+    source.parameters,
+    source.result,
+    { ...source, environment: use },
+    source.mode,
+    schema,
+  )
+  assert.include(Type.freeLifetimes(retainedCapture).map(Lifetime.key), Lifetime.key(use))
+})
+
+it('opens actual invocation lifetimes without defaulting independent data or generic inputs', () => {
+  const owner = { module: 'invocation-opening', name: 'offered' }
+  const caller = { module: 'invocation-opening', name: 'caller' }
+  const data = Lifetime.bound(owner, 0, 'data')
+  const use = Lifetime.bound(owner, 1, 'call')
+  const actualData = Lifetime.bound(caller, 0, 'input')
+  const environment = Lifetime.bound(caller, 1, 'env')
+  const actualUse = Lifetime.local(caller, 'recovery', 2)
+  const error = Type.parameter(caller, 2, 'E')
+  const helper = { module: 'invocation-opening', name: 'helper' }
+  const originalError = Type.parameter(helper, 0, 'E')
+  const originalData = Type.parameter(helper, 1, 'data', 'Lifetime')
+  const originalEnv = Type.parameter(helper, 2, 'env', 'Lifetime')
+  const sourceData = Lifetime.bound(helper, 1, 'data')
+  const sourceEnv = Lifetime.bound(helper, 2, 'env')
+  const contract = CallableContract.make({
+    ...detached,
+    functionKind: 'Function',
+    binders: [originalError, originalData, originalEnv],
+    parameters: [
+      { type: Type.reference('Shared', 'i32', sourceData), mode: 'Value' },
+      { type: originalError, mode: 'Value' },
+    ],
+    result: Type.effect(
+      Type.reference('Shared', 'i32', sourceData),
+      [],
+      {
+        environment: sourceEnv,
+        lifetimeBinders: [],
+      },
+      'Take',
+    ),
+  })
+  const selectedEnvironment = Lifetime.intersection([use, environment])
+  const schema: Type.CallableSchema = {
+    contract,
+    binders: contract.binders,
+    constraints: [],
+    evidence: [],
+    substitution: new Map<string, Type.GenericArgument>([
+      [Type.key(originalError), error],
+      [Type.key(originalData), data],
+      [Type.key(originalEnv), selectedEnvironment],
+    ]),
+    contractKey: CallableContract.key(contract),
+    constraintKeys: [],
+    evidenceKeys: [],
+    origins: [],
+    invocationAdapter: {
+      binder: use,
+      originalInputs: [0, 1],
+      parameters: [0, 1],
+      lifetimes: [{ parameter: originalEnv, lifetime: selectedEnvironment }],
+    },
+  }
+  const marked = Type.callable(
+    [Type.reference('Shared', 'i32', data), error],
+    Type.effect(
+      Type.reference('Shared', 'i32', data),
+      [],
+      {
+        environment: selectedEnvironment,
+        lifetimeBinders: [],
+      },
+      'Take',
+    ),
+    {
+      environment,
+      lifetimeBinders: [data, use],
+      invocationUse: { lifetime: use, parameters: [0, 1] },
+    },
+    'Take',
+    schema,
+  )
+  const inputs: ReadonlyArray<Type.Type> = [Type.reference('Shared', 'i32', actualData), error]
+  const scope = TypeCompatibility.context({
+    invocationInputs: inputs.map((type, parameter) => ({ parameter, type, lifetime: actualUse })),
+  })
+  const opened =
+    TypeInference.openInvocationCallable(marked, inputs, actualUse, scope) ??
+    unreachable('expected actual lifetime application')
+  assert.strictEqual(Type.invocationUseState(opened.callable), 'Opened')
+  assert.deepStrictEqual(opened.callable.lifetimeBinders, [])
+  assert.deepStrictEqual(opened.callable.parameters, inputs)
+  assert.deepStrictEqual(opened.substitution.get(Lifetime.key(use)), actualUse)
+  assert.deepStrictEqual(opened.substitution.get(Lifetime.key(data)), actualData)
+  assert.isFalse(Lifetime.equals(actualData, actualUse))
+  const result = opened.callable.result
+  assert.isTrue(Type.isEffect(result))
+  if (!Type.isEffect(result)) return assert.fail('expected actual Effect result')
+  assert.deepStrictEqual(result.success, inputs[0])
+  assert.deepStrictEqual(result.environment, Lifetime.intersection([actualUse, environment]))
+  const applied = opened.callable.schema ?? unreachable('expected original helper schema')
+  assert.strictEqual(applied.contract, schema.contract)
+  assert.deepStrictEqual(applied.invocationAdapter?.originalInputs, [0, 1])
+  assert.deepStrictEqual(applied.substitution.get(Type.key(originalError)), error)
+  assert.deepStrictEqual(applied.substitution.get(Type.key(originalData)), actualData)
+  assert.deepStrictEqual(applied.substitution.get(Type.key(originalEnv)), result.environment)
+  assert.isTrue(Type.invocationAdapterValid(opened.callable.invocationUse, 2, applied))
+  assert.strictEqual(
+    Type.key(marked),
+    Type.key(Type.callable(marked.parameters, marked.result, marked, marked.mode, schema)),
+  )
+  assert.isUndefined(TypeInference.openInvocationCallable(marked, inputs, actualUse))
+  const closedBinderInput = [Type.reference('Shared', 'i32', use), error]
+  assert.isUndefined(
+    TypeInference.openInvocationCallable(
+      marked,
+      closedBinderInput,
+      actualUse,
+      TypeCompatibility.context({
+        invocationInputs: closedBinderInput.map((type, parameter) => ({
+          parameter,
+          type,
+          lifetime: actualUse,
+        })),
+      }),
+    ),
+  )
+  assert.isUndefined(
+    TypeInference.openInvocationCallable(marked, [inputs[0] ?? 'never', 'i32'], actualUse, scope),
+  )
+  const resultOnly = Type.callable(['i32'], Type.reference('Shared', 'i32', data), {
+    environment,
+    lifetimeBinders: [data, use],
+    invocationUse: { lifetime: use, parameters: [0] },
+  })
+  assert.isUndefined(
+    TypeInference.openInvocationCallable(
+      resultOnly,
+      ['i32'],
+      actualUse,
+      TypeCompatibility.context({
+        invocationInputs: [{ parameter: 0, type: 'i32', lifetime: actualUse }],
+      }),
+    ),
+  )
+  const unusedData = Type.callable(['i32'], 'i32', {
+    environment,
+    lifetimeBinders: [data, use],
+    invocationUse: { lifetime: use, parameters: [0] },
+  })
+  const unusedOpening =
+    TypeInference.openInvocationCallable(unusedData, ['i32'], actualUse) ??
+    unreachable('expected unused ordinary binder elimination')
+  assert.deepStrictEqual(unusedOpening.callable.lifetimeBinders, [])
+  assert.isFalse(unusedOpening.substitution.has(Lifetime.key(data)))
+  const requiresStatic = Type.callable(
+    marked.parameters,
+    marked.result,
+    {
+      ...marked,
+      typeOutlives: [{ type: error, lifetime: Lifetime.staticLifetime }],
+    },
+    marked.mode,
+    schema,
+  )
+  assert.isUndefined(TypeInference.openInvocationCallable(requiresStatic, inputs, actualUse, scope))
+})
+
+it('refuses malformed or non-callable invocation-use metadata', () => {
+  const owner = { module: 'invocation-use', name: 'callback' }
+  const use = Lifetime.bound(owner, 0, 'call')
+  const other = Lifetime.bound({ ...owner, name: 'other' }, 0, 'call')
+  const valid = Type.callable(['i32', 'bool'], 'i32', {
+    environment: Lifetime.staticLifetime,
+    lifetimeBinders: [use],
+    invocationUse: { lifetime: use, parameters: [0, 1] },
+  })
+  for (const usage of [
+    { lifetime: use, parameters: [0] },
+    { lifetime: use, parameters: [0, 0] },
+    { lifetime: use, parameters: [1, 0] },
+    { lifetime: other, parameters: [0, 1] },
+    { lifetime: Lifetime.staticLifetime, parameters: [0, 1] },
+  ]) {
+    const malformed = { ...valid, invocationUse: usage }
+    assert.strictEqual(Type.invocationInputBounds(malformed), undefined)
+    assert.strictEqual(Type.fromUnknown(malformed), undefined)
+    assert.throws(() => Type.callable(valid.parameters, valid.result, malformed), RangeError)
+  }
+  const placeholder = Lifetime.placeholder(use, 'call')
+  const openedMetadata = {
+    environment: Lifetime.staticLifetime,
+    lifetimeBinders: [],
+    invocationUse: { lifetime: placeholder, parameters: [0] },
+  }
+  assert.throws(() => Type.callable(['i32'], 'i32', openedMetadata), RangeError)
+  assert.isFalse(
+    Type.invocationUseValid({ lifetime: use, parameters: [0] }, 1, [], { state: 'Opened' }),
+  )
+  assert.isFalse(
+    Type.invocationUseValid(openedMetadata.invocationUse, 1, [use], { state: 'Opened' }),
+  )
+  assert.throws(() => Type.effect('i32', [], valid), RangeError)
+  assert.throws(() => Type.foreignFunction(['i32'], 'i32', undefined, valid), RangeError)
+})

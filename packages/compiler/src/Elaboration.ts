@@ -913,6 +913,8 @@ export interface AnonymousCaptureFact {
 /** One hidden concrete section construction awaiting an ordered leading parameter prefix. */
 export interface CallableSectionExpressionDecision {
   readonly _tag: 'CallableSection'
+  /** Original explicit marked input positions, preserved when a section is flattened. */
+  readonly invocationParameters?: ReadonlyArray<number>
   readonly selectedConformances?: ReadonlyArray<ConformanceGoal.Proof>
   readonly site: Tir.CallableSiteId
   readonly reference: CallReferenceFact
@@ -950,6 +952,7 @@ export interface CallableApplyExpressionDecision {
   /** Exact source identity, when semantic application can discharge its generic obligations. */
   readonly sourceTarget?: Extract<CallReferenceFact, { readonly _tag: 'Resolved' }>
   readonly selectedConformances?: ReadonlyArray<ConformanceGoal.Proof>
+  readonly invocationUse?: Tir.InvocationUseObligation
   readonly callee: Tir.Expression
   readonly arguments: ReadonlyArray<ArgumentFact>
   readonly mode: Type.CallableMode
@@ -1122,6 +1125,7 @@ export type ExpressionDecision =
        * residual is carried explicitly because it has no source-level type to recover it from.
        */
       readonly _tag: 'EffectCatch'
+      readonly recoveryInvocation?: Tir.RecoveryInvocationRecipe
       readonly reference: IntrinsicReferenceFact
       readonly protected: Tir.Expression
       readonly handler: Tir.Expression
@@ -1195,8 +1199,29 @@ export const retainedResultArguments = (
   )
     return []
   const result = self.type.type
+  let invocationUse: Tir.InvocationUseObligation | undefined
+  if (self._tag === 'CallableApply') invocationUse = self.invocationUse
+  else if (self._tag === 'Call' && self.contract._tag === 'Compatible')
+    invocationUse = self.contract.invocationUse
+  const retainsInvocation =
+    invocationUse !== undefined &&
+    Type.storageLifetimes(result).some((lifetime) =>
+      Lifetime.atoms(lifetime).some((member) => Lifetime.equals(member, invocationUse.lifetime)),
+    )
   return self.arguments.filter((argument) => {
     if (argument.type._tag !== 'Available') return false
+    if (
+      retainsInvocation &&
+      invocationUse?.inputs.some(
+        (input) =>
+          input.capture === undefined &&
+          AuthoredIdentity.anchorKey(input.argument) ===
+            AuthoredIdentity.anchorKey(constructionExpressionAnchor(argument.expression)) &&
+          argument.type._tag === 'Available' &&
+          Type.equals(input.type, argument.type.type),
+      )
+    )
+      return true
     const source = argument.type.type
     // Extracting T from &mut Owner<T> transfers T's external dependencies, not the access
     // capability to Owner's storage. Only the outer borrow can retain that storage loan.
@@ -1265,6 +1290,8 @@ export type UnavailableCallContractReason =
 export type CallContractFact =
   | {
       readonly _tag: 'Compatible'
+      readonly inputViews?: ReadonlyArray<Tir.ExecutableInputView>
+      readonly invocationUse?: Tir.InvocationUseObligation
       readonly expectedCount: number
       readonly actualCount: number
       readonly typeArguments: ReadonlyArray<Type.GenericArgument>
@@ -2582,7 +2609,7 @@ const runtimeTirFunction = (
     const type = Type.effectWithRows(
       fact.declaration.returnType.type,
       fact.declaration.failureRow.row,
-      { ...DeclarationFacts.executableLifetimes(fact.declaration), lifetimeBinders: [] },
+      DeclarationFacts.effectLifetimes(fact.declaration),
       access,
       fact.declaration.requirementRow.row,
     )

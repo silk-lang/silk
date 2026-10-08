@@ -2593,6 +2593,18 @@ export const make = (operations: Operations) => {
         {
           call: {
             _tag: 'CallInstance',
+            ...((expression._tag === 'Call' || expression._tag === 'EffectConstruct') &&
+            expression.inputViews !== undefined
+              ? {
+                  inputViews: expression.inputViews.map((view) =>
+                    Tir.substituteExecutableInputView(
+                      view,
+                      substitution,
+                      selectedCompatibility(fn, owner),
+                    ),
+                  ),
+                }
+              : {}),
             owner,
             ...(expression.id === undefined ? {} : { node: expression.id }),
             span,

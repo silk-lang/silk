@@ -1,6 +1,7 @@
 import type * as Diagnostic from './Diagnostic.js'
 import type * as Elaboration from './Elaboration.js'
 import type * as Location from './Location.js'
+import type * as LifetimeFlow from './LifetimeFlow.js'
 import * as Tir from './Tir.js'
 
 /** The read-only semantic input shared by evaluation and every post-construction consumer. */
@@ -9,6 +10,8 @@ export interface BodyView {
   readonly function: Tir.TirFunction
   readonly evidence: ReadonlyArray<Tir.SelectedEvidence>
   readonly causes: ReadonlyArray<Diagnostic.Identity<Location.Location>>
+  /** Held source region proof, independent of per-call copied view metadata. */
+  readonly lifetimes?: LifetimeFlow.LifetimeFlow
 }
 
 export const make = (
@@ -18,6 +21,7 @@ export const make = (
   function: body.function,
   evidence: body.results.evidence,
   causes: body.results.causes,
+  ...(body.results.lifetimes === undefined ? {} : { lifetimes: body.results.lifetimes }),
 })
 
 export const node = (

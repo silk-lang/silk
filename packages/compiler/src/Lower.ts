@@ -7,6 +7,7 @@ import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as ExecutionPackage from './ExecutionPackage.js'
 import * as ExecutionTransition from './ExecutionTransition.js'
 import * as Tir from './Tir.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import * as Instances from './Instances.js'
 import * as Layout from './Layout.js'
 import * as LocalSharedControlBlock from './LocalSharedControlBlock.js'
@@ -266,7 +267,7 @@ import {
 } from './EntryAssembly.js'
 import type {} from './Forwarding.js'
 import type { GeneratedEffectRunner, SpecializedWitnessEffectTarget } from './ValueType.js'
-import { baseRunnerKey, effectValueType, instanceText } from './ValueType.js'
+import { baseRunnerKey, returnedEffectValueType, instanceText } from './ValueType.js'
 
 /**
  * Re-proves source witness effects while their concrete instance context is still authoritative.
@@ -392,18 +393,8 @@ export const lowerProgram = (
     }
     for (const instance of runtimeInstances.values()) {
       const block = returnedEffectBlock(instance.function)
-      const blockType =
-        block === undefined
-          ? undefined
-          : Type.substitute(
-              block.type,
-              instance.substitution,
-              instance.specialization.compatibility,
-            )
       const type =
-        block === undefined || blockType === undefined || !Type.isEffect(blockType)
-          ? undefined
-          : effectValueType(layout, instance.key, block, blockType)
+        block === undefined ? undefined : returnedEffectValueType(layout, instance, block)
       if (type !== undefined && block !== undefined) {
         publishEffectResult(instance, type)
         generatedRunners.push({
@@ -739,6 +730,7 @@ export const lowerProgram = (
         left.declarationSpan.start - right.declarationSpan.start ||
         left.declarationSpan.end - right.declarationSpan.end,
     )
+  const executableInputViews = ExecutableInputView.catalog(discovery.instances, discovery.calls)
   const program: Mir.Module = {
     _tag: 'MirModule',
     module: discovery.rootModule,
@@ -746,6 +738,7 @@ export const lowerProgram = (
     foreignCalls: discovery.foreignCalls,
     foreignExports: discovery.foreignExports,
     retainedRoots: discovery.retention,
+    ...(executableInputViews.length === 0 ? {} : { executableInputViews }),
     foreignStatics,
     layout: finalizedLayout,
     staticData,

@@ -1,3 +1,4 @@
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as ConcreteCleanup from './ConcreteCleanup.js'
 import {
   authored,
@@ -53,10 +54,13 @@ import {
   restoreDelayedEffectState,
 } from './Forwarding.js'
 import type { FunctionLowering } from './FunctionLowering.js'
+import { invocationCompatibility, invocationFormationContext } from './FunctionLowering.js'
 import * as Tir from './Tir.js'
 import * as BodyView from './BodyView.js'
 import * as Instances from './Instances.js'
 import * as Layout from './Layout.js'
+import * as Lifetime from './Lifetime.js'
+import * as TypeInference from './internal/TypeInference.js'
 import type { DelayedEffectState, ProvidedRequirement } from './Lower.js'
 import {
   bool,
@@ -909,6 +913,7 @@ function lowerCallableSectionExpression(
     readonly ordinal: number
     readonly parameterOrdinal: number
     readonly source: Mir.LocalId
+    readonly sourceOrigin?: AuthoredIdentity.Anchor
     readonly access: Type.CaptureAccess
   }> = []
   for (const capture of expression.captures) {
@@ -922,6 +927,7 @@ function lowerCallableSectionExpression(
       ordinal: capture.ordinal,
       parameterOrdinal: capture.parameterOrdinal,
       source: lowered.result,
+      sourceOrigin: capture.value.origin.anchor,
       access: capture.access,
     })
   }
@@ -992,15 +998,18 @@ function lowerStagedCallableApply(
     readonly ordinal: number
     readonly parameterOrdinal: number
     readonly source: Mir.LocalId
+    readonly sourceOrigin?: AuthoredIdentity.Anchor
     readonly access: Type.CaptureAccess
   }> = []
   for (const [ordinal, source] of sources.entries()) {
     const field = environment.fields.find((candidate) => candidate.ordinal === baseCount + ordinal)
-    if (field === undefined) return undefined
+    const argument = expression.arguments.at(ordinal)
+    if (field === undefined || argument === undefined) return undefined
     captures.push({
       ordinal: field.ordinal,
       parameterOrdinal: field.parameterOrdinal,
       source,
+      sourceOrigin: argument.origin.anchor,
       access: field.access,
     })
   }
@@ -1017,6 +1026,279 @@ function lowerStagedCallableApply(
   })
   return { result: destination }
 }
+
+/** Completes original invocation inputs only from an authenticated incoming callable header. */
+const completeInvocationInputs = (
+  fn: FunctionLowering,
+  callable: Mir.LocalId | undefined,
+  inputs: Array<Mir.InvocationUse['inputs'][number]>,
+): boolean => {
+  const actual = callable === undefined ? undefined : fn.localTypes.at(callable.ordinal)
+  const schema = actual?._tag === 'CallableValue' ? actual.type.schema : undefined
+  const originalInputs =
+    schema?.invocationAdapter?.originalInputs ??
+    (schema === undefined ? undefined : Type.callableInputOrdinals(schema.contract))
+  if (originalInputs === undefined) return true
+  const headers = fn.owner.function.declaration.parameters.filter(
+    (parameter) =>
+      parameter.phase === 'Runtime' &&
+      parameter.captureAccess === undefined &&
+      fn.parameterLocals.get(parameter.id.ordinal)?.ordinal === callable?.ordinal,
+  )
+  const header = headers.at(0)
+  if (headers.length > 1) return false
+  for (const parameter of originalInputs) {
+    if (inputs.some((input) => input.parameter === parameter)) continue
+    // Locally formed sections must retain their checked construction recipe. A
+    // caller's source header is the authority for captures opaque to this body.
+    if (header === undefined || callable === undefined || actual?._tag !== 'CallableValue')
+      return false
+    const fields =
+      actual.environment?.fields.filter((field) => field.parameterOrdinal === parameter) ?? []
+    const field = fields.at(0)
+    if (fields.length !== 1 || field === undefined) return false
+    inputs.push({
+      parameter,
+      capture: field.ordinal,
+      argument: callable,
+      type: field.type,
+      source: header.anchor,
+      header: { parameter: header.id.ordinal, source: header.anchor },
+    })
+  }
+  return (
+    inputs.length === originalInputs.length &&
+    new Set(inputs.map((input) => input.parameter)).size === inputs.length &&
+    inputs.every((input) => originalInputs.includes(input.parameter))
+  )
+}
+
+/** Uses the selected failure operand and the original callable's complete input coordinates. */
+export const lowerRecoveryInvocationInputs = (
+  fn: FunctionLowering,
+  callable: Mir.LocalId,
+  argument: Mir.LocalId,
+  selected: Type.Type,
+  binder: Lifetime.Bound,
+): Pick<Mir.InvocationUse, 'binder' | 'inputs'> | undefined => {
+  const actual = fn.localTypes.at(callable.ordinal)
+  const operand = fn.localTypes.at(argument.ordinal)
+  if (
+    actual?._tag !== 'CallableValue' ||
+    operand === undefined ||
+    !Type.equals(Mir.semanticType(operand), selected)
+  )
+    return undefined
+  const schema = actual.type.schema
+  if (schema === undefined) {
+    // A bare named item has no lexical packet. Its complete original input header is
+    // nevertheless held by the exact checked target instance, independently of the
+    // contextual callable promise selected by the consumer.
+    if (
+      actual.target._tag !== 'DeclarationCallableTarget' ||
+      actual.environment !== undefined ||
+      actual.storage !== undefined ||
+      actual.site !== undefined
+    )
+      return undefined
+    const target = actual.target.declaration
+    const arguments_ = actual.typeArguments ?? []
+    const sources = fn.instances.filter(
+      (instance) =>
+        instance.key.declaration.module === target.module &&
+        instance.key.declaration.name === target.name &&
+        instance.key.typeArguments.length === arguments_.length &&
+        instance.key.typeArguments.every((argument, ordinal) => {
+          const selected = arguments_.at(ordinal)
+          return (
+            selected !== undefined &&
+            Type.genericArgumentKey(argument) === Type.genericArgumentKey(selected)
+          )
+        }),
+    )
+    const source = sources.at(0)
+    if (
+      sources.length !== 1 ||
+      source === undefined ||
+      source.ownership.verdict._tag !== 'Satisfied' ||
+      source.view.causes.length !== 0 ||
+      source.view.lifetimes?.diagnostics.length !== 0
+    )
+      return undefined
+    const contract = DeclarationFacts.callableContract(source.function.declaration)
+    const originalInputs = Type.callableInputOrdinals(contract)
+    const parameters = source.function.declaration.parameters.filter(
+      (parameter) => parameter.phase === 'Runtime',
+    )
+    const parameter = parameters.at(0)
+    const selectedParameter = source.specialization.parameters.at(0)
+    if (
+      originalInputs?.length !== 1 ||
+      originalInputs.at(0) !== 0 ||
+      contract.captures.length !== 0 ||
+      parameters.length !== 1 ||
+      parameter === undefined ||
+      parameter.captureAccess !== undefined ||
+      selectedParameter === undefined ||
+      actual.type.parameters.length !== 1 ||
+      !Type.equals(selectedParameter, selected) ||
+      !Type.equals(actual.type.parameters[0] ?? 'never', selected)
+    )
+      return undefined
+    const offered = contract.invocationUse?.lifetime
+    return {
+      binder: offered?._tag === 'BoundLifetime' ? offered : binder,
+      inputs: [{ parameter: parameter.id.ordinal, argument, type: selected }],
+    }
+  }
+  if (!Type.invocationAdapterValid(actual.type.invocationUse, 1, schema)) return undefined
+  const parameter = schema.invocationAdapter?.parameters.at(0) ?? 0
+  const inputs: Array<Mir.InvocationUse['inputs'][number]> = [
+    { parameter, argument, type: selected },
+  ]
+  if (!completeInvocationInputs(fn, callable, inputs)) return undefined
+  const offered = schema.contract.invocationUse?.lifetime ?? actual.type.invocationUse?.lifetime
+  const sourceBinder = offered?._tag === 'BoundLifetime' ? offered : binder
+  return { binder: sourceBinder, inputs }
+}
+
+/** Maps checked source operands after evaluation/capture, retaining original parameter coordinates. */
+const lowerInvocationInputs = (
+  fn: FunctionLowering,
+  obligation: Tir.InvocationUseObligation,
+  arguments_: ReadonlyArray<Tir.Expression>,
+  locals: ReadonlyArray<Mir.LocalId>,
+  captures: ReadonlyArray<{
+    readonly ordinal: number
+    readonly parameterOrdinal: number
+    readonly source: Mir.LocalId
+  }> = [],
+  callable?: Mir.LocalId,
+): Pick<Mir.InvocationUse, 'binder' | 'inputs'> | undefined => {
+  if (arguments_.length !== locals.length) return undefined
+  const inputs: Array<Mir.InvocationUse['inputs'][number]> = []
+  const selected = new Set<number>()
+  const actualCallable = callable === undefined ? undefined : fn.localTypes.at(callable.ordinal)
+  const contract = actualCallable?._tag === 'CallableValue' ? actualCallable.type : undefined
+  const schema = contract?.schema
+  const adapter = schema?.invocationAdapter
+  if (
+    contract !== undefined &&
+    schema !== undefined &&
+    adapter !== undefined &&
+    !Type.invocationAdapterValid(contract.invocationUse, locals.length, schema)
+  )
+    return undefined
+  const headerCandidates =
+    callable === undefined
+      ? []
+      : fn.owner.function.declaration.parameters.filter(
+          (parameter) =>
+            parameter.phase === 'Runtime' &&
+            parameter.captureAccess === undefined &&
+            fn.parameterLocals.get(parameter.id.ordinal)?.ordinal === callable.ordinal,
+        )
+  if (headerCandidates.length > 1) return undefined
+  const header = headerCandidates.at(0)
+  for (const input of obligation.inputs) {
+    if (input.capture !== undefined) {
+      const matches = captures.filter(
+        (capture) =>
+          capture.ordinal === input.capture && capture.parameterOrdinal === input.parameter,
+      )
+      const direct = matches.at(0)
+      const type = fn.semantic(input.type)
+      if (matches.length > 1) return undefined
+      if (direct !== undefined) {
+        const actual = fn.localTypes.at(direct.source.ordinal)
+        if (actual === undefined || !Type.equals(Mir.semanticType(actual), type)) return undefined
+        inputs.push({
+          parameter: input.parameter,
+          argument: direct.source,
+          type,
+          source: input.argument,
+        })
+      } else {
+        const actual = callable === undefined ? undefined : fn.localTypes.at(callable.ordinal)
+        if (callable === undefined || actual?._tag !== 'CallableValue') return undefined
+        const fields =
+          actual.environment?.fields.filter(
+            (field) => field.parameterOrdinal === input.parameter,
+          ) ?? []
+        const field = fields.at(0)
+        if (fields.length !== 1 || field === undefined || !Type.equals(field.type, type))
+          return undefined
+        inputs.push({
+          parameter: input.parameter,
+          capture: field.ordinal,
+          ...(input.capturePath === undefined ? {} : { capturePath: input.capturePath }),
+          ...(header === undefined
+            ? {}
+            : {
+                header: { parameter: header.id.ordinal, source: header.anchor },
+              }),
+          argument: callable,
+          type,
+          source: input.argument,
+        })
+      }
+      continue
+    }
+    const positions = arguments_.flatMap((argument, ordinal) =>
+      AuthoredIdentity.anchorKey(argument.origin.anchor) ===
+      AuthoredIdentity.anchorKey(input.argument)
+        ? [ordinal]
+        : [],
+    )
+    const ordinal = positions.at(0)
+    const argument = ordinal === undefined ? undefined : locals.at(ordinal)
+    if (
+      positions.length !== 1 ||
+      ordinal === undefined ||
+      argument === undefined ||
+      selected.has(ordinal)
+    )
+      return undefined
+    const actual = fn.localTypes.at(argument.ordinal)
+    const type = fn.semantic(input.type)
+    if (actual === undefined || !Type.equals(Mir.semanticType(actual), type)) return undefined
+    selected.add(ordinal)
+    const original = adapter?.parameters.at(ordinal) ?? input.parameter
+    inputs.push({ parameter: original, argument, type, source: input.argument })
+  }
+  if (!completeInvocationInputs(fn, callable, inputs)) return undefined
+  if (
+    new Set(inputs.map((input) => input.parameter)).size !== inputs.length ||
+    selected.size !== locals.length
+  )
+    return undefined
+  const offered = schema?.contract.invocationUse?.lifetime
+  const binder =
+    offered?._tag === 'BoundLifetime'
+      ? offered
+      : (contract?.invocationUse?.lifetime ?? obligation.binder)
+  if (binder._tag !== 'BoundLifetime') return undefined
+  return { binder, inputs }
+}
+
+export const lowerInvocationUse = (
+  fn: FunctionLowering,
+  obligation: Tir.InvocationUseObligation,
+  arguments_: ReadonlyArray<Tir.Expression>,
+  locals: ReadonlyArray<Mir.LocalId>,
+  result: Mir.LocalId,
+  captures: ReadonlyArray<{
+    readonly ordinal: number
+    readonly parameterOrdinal: number
+    readonly source: Mir.LocalId
+  }> = [],
+  callable?: Mir.LocalId,
+): Mir.InvocationUse | undefined => {
+  const lowered = lowerInvocationInputs(fn, obligation, arguments_, locals, captures, callable)
+  return lowered === undefined ? undefined : { ...obligation, ...lowered, kind: 'Source', result }
+}
+
+/** Uses only the checked construction graph belonging to this exact physical producer. */
 
 function lowerCallableApplyExpression(
   fn: FunctionLowering,
@@ -1042,6 +1324,7 @@ function lowerCallableApplyExpression(
     readonly ordinal: number
     readonly parameterOrdinal: number
     readonly source: Mir.LocalId
+    readonly sourceOrigin?: AuthoredIdentity.Anchor
     readonly access: Type.CaptureAccess
   }> = []
   let callable: Mir.LocalId | undefined
@@ -1084,6 +1367,7 @@ function lowerCallableApplyExpression(
             ordinal: capture.ordinal,
             parameterOrdinal: capture.parameterOrdinal,
             source: lowered.result,
+            sourceOrigin: capture.value.origin.anchor,
             access: capture.access,
           })
         }
@@ -1142,7 +1426,7 @@ function lowerCallableApplyExpression(
     return undefined
   })()
   const semanticType = fn.semantic(expression.type)
-  const type =
+  let type =
     (call === undefined || !Type.isEffect(semanticType)
       ? undefined
       : effectValueForCall(
@@ -1230,9 +1514,102 @@ function lowerCallableApplyExpression(
     })
     return { result: destination }
   }
+  const invocationInputs =
+    expression.invocationUse === undefined
+      ? undefined
+      : lowerInvocationInputs(
+          fn,
+          expression.invocationUse,
+          expression.arguments,
+          arguments_,
+          captures,
+          callable,
+        )
+  if (expression.invocationUse !== undefined && invocationInputs === undefined) return undefined
+  if (
+    expression.invocationUse !== undefined &&
+    invocationInputs !== undefined &&
+    callable !== undefined
+  ) {
+    const obligation = expression.invocationUse
+    const actual = fn.localTypes.at(callable.ordinal)
+    if (actual?._tag !== 'CallableValue' || actual.type.invocationUse === undefined)
+      return undefined
+    const visible = arguments_.map((argument) => fn.localTypes.at(argument.ordinal))
+    if (visible.some((argument) => argument === undefined)) return undefined
+    const ownerContext = invocationCompatibility(fn)
+    const base = invocationFormationContext(fn, actual, invocationInputs.binder, ownerContext)
+    if (base === undefined) return undefined
+    // These are exact actual-use obligations, not declaration premises or η validity.
+    // Their concrete input/holder/cleanup discharge remains mandatory in MIR verification.
+    const compatibility: TypeCompatibility.Context = {
+      ...base,
+      invocationInputs: [
+        ...base.invocationInputs,
+        ...invocationInputs.inputs.map((input) => ({
+          parameter: input.parameter,
+          type: input.type,
+          lifetime: obligation.lifetime,
+        })),
+      ],
+      assumptions: Lifetime.mergeAssumptions(
+        base.assumptions,
+        Lifetime.assumptions(
+          invocationInputs.inputs.flatMap((input) =>
+            Type.retention(input.type).regions.map((longer) => ({
+              longer,
+              shorter: obligation.lifetime,
+            })),
+          ),
+        ),
+      ),
+    }
+    const opened = TypeInference.openInvocationCallable(
+      actual.type,
+      visible.flatMap((argument) => (argument === undefined ? [] : [Mir.semanticType(argument)])),
+      obligation.lifetime,
+      compatibility,
+    )
+    if (
+      opened === undefined ||
+      !TypeCompatibility.isCompatible(
+        TypeCompatibility.check(opened.callable.result, semanticType, compatibility),
+      )
+    )
+      return undefined
+    const physicalResult = Type.substitute(
+      Mir.semanticType(type),
+      opened.substitution,
+      compatibility,
+    )
+    if (
+      !TypeCompatibility.isCompatible(
+        TypeCompatibility.check(physicalResult, semanticType, compatibility),
+      )
+    )
+      return undefined
+    if (type._tag === 'EffectValue') {
+      if (!Type.isEffect(physicalResult)) return undefined
+      type = { ...type, type: physicalResult }
+    } else if (!Type.equals(physicalResult, Mir.semanticType(type))) return undefined
+    callableType = opened.callable
+    typeArguments = typeArguments.map((argument) =>
+      Type.substituteGenericArgument(argument, opened.substitution, compatibility),
+    )
+  }
   const destination = fn.alloc(type)
+  const invocationUse =
+    expression.invocationUse === undefined || invocationInputs === undefined
+      ? undefined
+      : {
+          ...expression.invocationUse,
+          ...invocationInputs,
+          kind: 'Source' as const,
+          result: destination,
+        }
   fn.emit({
     _tag: 'ApplyCallable',
+    ...(invocationUse === undefined ? {} : { invocationUse }),
     destination,
     ...(callable === undefined ? {} : { callable }),
     ...(target === undefined ? {} : { target }),
@@ -1346,6 +1723,7 @@ function lowerEffectBlockExpression(
   if (type === undefined) return undefined
   const captures: Array<{
     readonly source: Mir.LocalId
+    readonly sourceOrigin?: AuthoredIdentity.Anchor
     readonly access: Type.CaptureAccess
   }> = []
   for (const [ordinal, capture] of expression.captures.entries()) {
@@ -2860,8 +3238,20 @@ function lowerCallExpression(
       )
     if (type === undefined) return undefined
     destination = fn.alloc(type)
+    const invocationUse =
+      expression.invocationUse === undefined
+        ? undefined
+        : lowerInvocationUse(
+            fn,
+            expression.invocationUse,
+            expression.arguments,
+            argumentLocals,
+            destination,
+          )
+    if (expression.invocationUse !== undefined && invocationUse === undefined) return undefined
     fn.emit({
       _tag: 'Call',
+      ...(invocationUse === undefined ? {} : { invocationUse }),
       destination,
       target: expression.target,
       typeArguments,

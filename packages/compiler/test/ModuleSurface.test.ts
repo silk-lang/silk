@@ -1689,3 +1689,290 @@ export "C" static silk_abi_version: u32 = 2`)
     assert.strictEqual(ModuleSurface.equals(original, changed), false)
   }),
 )
+
+it.effect('round-trips closed invocation-use contracts and refuses malformed designations', () =>
+  Effect.gen(function* () {
+    const owner = { module: 'surface/Invocation', name: 'callback' }
+    const data = Lifetime.bound(owner, 0, 'data')
+    const use = Lifetime.bound(owner, 1, 'call')
+    const inputs: ReadonlyArray<Type.Type> = ['i32', Type.reference('Shared', 'i32', data)]
+    const lifetimes: Type.ExecutableLifetimes = {
+      environment: Lifetime.staticLifetime,
+      lifetimeBinders: [data, use],
+      invocationUse: { lifetime: use, parameters: [0, 1] },
+    }
+    const contract = CallableContract.make({
+      ...lifetimes,
+      functionKind: 'Function',
+      parameters: inputs.map((type): CallableContract.Parameter => ({ type, mode: 'Value' })),
+      result: 'i32',
+    })
+    const schema: Type.CallableSchema = {
+      source: owner,
+      contract,
+      binders: [],
+      constraints: [],
+      evidence: [],
+      substitution: new Map(),
+      contractKey: CallableContract.key(contract),
+      constraintKeys: [],
+      evidenceKeys: [],
+      origins: [],
+    }
+    const callable = Type.callable(inputs, 'i32', lifetimes, 'Shared', schema)
+    const encoded = ModuleSurface.encodeSemanticType(callable)
+    const decoded = yield* ModuleSurface.decodeSemanticType(encoded)
+    assert.isTrue(Type.isCallable(decoded))
+    if (!Type.isCallable(decoded)) return assert.fail('expected decoded callable')
+    assert.deepStrictEqual(decoded.invocationUse, { lifetime: use, parameters: [0, 1] })
+    assert.strictEqual(Type.key(decoded), Type.key(callable))
+    assert.deepStrictEqual(decoded.schema?.contract.invocationUse, {
+      lifetime: use,
+      parameters: [0, 1],
+    })
+    assert.strictEqual(ModuleSurface.encodeSemanticType(decoded), encoded)
+    const record = decodeJson(encoded)
+    const usage = recordField(record, 'invocationUse')
+    const serializedUse = recordField(usage, 'lifetime')
+    const otherOwner = replaceRecordField(serializedUse, 'owner', {
+      module: owner.module,
+      name: 'foreign-callback',
+    })
+    for (const malformed of [
+      replaceRecordField(usage, 'parameters', [0]),
+      replaceRecordField(usage, 'parameters', [0, 0]),
+      replaceRecordField(usage, 'parameters', [1, 0]),
+      replaceRecordField(usage, 'lifetime', { tag: 'StaticLifetime' }),
+      replaceRecordField(usage, 'lifetime', otherOwner),
+    ]) {
+      const failure = yield* Effect.flip(
+        ModuleSurface.decodeSemanticType(
+          encodeJson(replaceRecordField(record, 'invocationUse', malformed)),
+        ),
+      )
+      assert.instanceOf(failure, ModuleSurface.ModuleSurfaceDecodeError)
+      assert.strictEqual(failure.reason._tag, 'InvalidEncoding')
+    }
+    const placeholder = Lifetime.placeholder(use, 'private-call')
+    const opened = Type.callable(
+      ['i32'],
+      'i32',
+      {
+        environment: Lifetime.staticLifetime,
+        lifetimeBinders: [],
+        invocationUse: { lifetime: placeholder, parameters: [0] },
+      },
+      'Shared',
+      undefined,
+      false,
+      'Opened',
+    )
+    assert.throws(() => ModuleSurface.encodeSemanticType(opened))
+    const foreign = decodeJson(
+      ModuleSurface.encodeSemanticType(Type.foreignFunction(['i32'], 'i32')),
+    )
+    const foreignForged = { ...serializedRecordForInvocation(foreign), invocationUse: usage }
+    const effect = decodeJson(
+      ModuleSurface.encodeSemanticType(
+        Type.effect('i32', [], {
+          environment: Lifetime.staticLifetime,
+          lifetimeBinders: [],
+        }),
+      ),
+    )
+    const effectForged = { ...serializedRecordForInvocation(effect), invocationUse: usage }
+    for (const nonCallable of [foreignForged, effectForged]) {
+      const failure = yield* Effect.flip(ModuleSurface.decodeSemanticType(encodeJson(nonCallable)))
+      assert.instanceOf(failure, ModuleSurface.ModuleSurfaceDecodeError)
+      assert.strictEqual(failure.reason._tag, 'InvalidEncoding')
+    }
+  }),
+)
+
+const serializedRecordForInvocation = (value: unknown): Readonly<Record<string, unknown>> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    return unreachable('expected an encoded executable record')
+  return Object.fromEntries(Object.entries(value))
+}
+
+it.effect('authenticates invocation adapters against original target lifetime slots', () =>
+  Effect.gen(function* () {
+    const target = { module: 'surface/Invocation', name: 'completed' }
+    const success = Type.parameter(target, 0, 'A')
+    const failure = Type.parameter(target, 1, 'E')
+    const environment = Type.parameter(target, 2, 'env', 'Lifetime')
+    const originalRegion = Lifetime.bound(target, 2, 'env')
+    const use = Lifetime.bound({ module: 'surface/Caller', name: 'recover' }, 0, 'call')
+    const capture = Lifetime.bound({ module: 'surface/Caller', name: 'capture' }, 0, 'env')
+    const selectedRegion = Lifetime.intersection([use, capture])
+    const contract = CallableContract.make({
+      functionKind: 'Function',
+      environment: Lifetime.staticLifetime,
+      lifetimeBinders: [],
+      binders: [success, failure, environment],
+      parameters: [
+        { type: failure, mode: 'Value' },
+        { type: success, mode: 'Value' },
+        { type: 'u8', mode: 'Value' },
+      ],
+      captures: [{ parameter: 2, capture: 0 }],
+      result: Type.effect(
+        success,
+        [failure],
+        { environment: originalRegion, lifetimeBinders: [] },
+        'Take',
+      ),
+    })
+    const schema: Type.CallableSchema = {
+      source: target,
+      contract,
+      binders: contract.binders,
+      constraints: [],
+      evidence: [],
+      origins: [],
+      constraintKeys: [],
+      evidenceKeys: [],
+      contractKey: CallableContract.key(contract),
+      substitution: new Map<string, Type.GenericArgument>([
+        [Type.key(success), 'i32'],
+        [Type.key(failure), 'bool'],
+        [Type.key(environment), selectedRegion],
+      ]),
+      invocationAdapter: {
+        binder: use,
+        originalInputs: [0, 1],
+        parameters: [0],
+        lifetimes: [{ parameter: environment, lifetime: selectedRegion }],
+      },
+    }
+    const adapted = Type.callable(
+      ['bool'],
+      Type.effect(
+        'i32',
+        ['bool'],
+        {
+          environment: selectedRegion,
+          lifetimeBinders: [],
+        },
+        'Take',
+      ),
+      {
+        environment: capture,
+        lifetimeBinders: [use],
+        invocationUse: { lifetime: use, parameters: [0] },
+      },
+      'Shared',
+      schema,
+    )
+    const encoded = ModuleSurface.encodeSemanticType(adapted)
+    const decoded = yield* ModuleSurface.decodeSemanticType(encoded)
+    assert.strictEqual(Type.key(decoded), Type.key(adapted))
+    if (!Type.isCallable(decoded)) return assert.fail('expected an adapter')
+    const decodedSchema = decoded.schema ?? unreachable('expected original schema')
+    assert.strictEqual(decodedSchema.contract.invocationUse, undefined)
+    assert.strictEqual(CallableContract.key(decodedSchema.contract), CallableContract.key(contract))
+    assert.deepStrictEqual(decodedSchema.invocationAdapter, schema.invocationAdapter)
+    assert.deepStrictEqual(Type.callableInputOrdinals(decodedSchema.contract), [0, 1])
+    assert.deepStrictEqual(decodedSchema.invocationAdapter?.originalInputs, [0, 1])
+    assert.deepStrictEqual(decodedSchema.invocationAdapter?.parameters, [0])
+    const record = decodeJson(encoded)
+    const encodedSchema = recordField(record, 'schema')
+    const recipe = recordField(encodedSchema, 'invocationAdapter')
+    const slots = recordField(recipe, 'lifetimes')
+    if (!Array.isArray(slots)) return assert.fail('expected encoded lifetime slots')
+    const slot = slots.at(0) ?? unreachable('expected env2 slot')
+    const parameter = recordField(slot, 'parameter')
+    for (const malformed of [
+      replaceRecordField(recipe, 'parameters', [1]),
+      replaceRecordField(recipe, 'parameters', [2]),
+      replaceRecordField(recipe, 'originalInputs', [0]),
+      replaceRecordField(recipe, 'originalInputs', [0, 0]),
+      replaceRecordField(recipe, 'originalInputs', [0, 1, 2]),
+      replaceRecordField(recipe, 'originalInputs', [1, 0]),
+      replaceRecordField(recipe, 'originalInputs', undefined),
+      replaceRecordField(recipe, 'lifetimes', []),
+      replaceRecordField(recipe, 'lifetimes', [
+        replaceRecordField(slot, 'parameter', replaceRecordField(parameter, 'ordinal', 1)),
+      ]),
+      replaceRecordField(recipe, 'lifetimes', [
+        replaceRecordField(slot, 'lifetime', { tag: 'StaticLifetime' }),
+      ]),
+    ]) {
+      const forged = encodeJson(
+        replaceRecordField(
+          record,
+          'schema',
+          replaceRecordField(encodedSchema, 'invocationAdapter', malformed),
+        ),
+      )
+      const error = yield* Effect.flip(ModuleSurface.decodeSemanticType(forged))
+      assert.instanceOf(error, ModuleSurface.ModuleSurfaceDecodeError)
+      assert.strictEqual(error.reason._tag, 'InvalidEncoding')
+    }
+    const markedContract = CallableContract.make({
+      functionKind: 'Function',
+      environment: Lifetime.staticLifetime,
+      lifetimeBinders: [use],
+      invocationUse: { lifetime: use, parameters: [0] },
+      parameters: [
+        { type: 'i32', mode: 'Value' },
+        { type: 'u8', mode: 'Value' },
+      ],
+      captures: [{ parameter: 1, capture: 0 }],
+      result: 'i32',
+    })
+    const markedSchema: Type.CallableSchema = {
+      contract: markedContract,
+      binders: [],
+      constraints: [],
+      evidence: [],
+      origins: [],
+      constraintKeys: [],
+      evidenceKeys: [],
+      substitution: new Map(),
+      contractKey: CallableContract.key(markedContract),
+      invocationAdapter: { binder: use, originalInputs: [0], parameters: [0], lifetimes: [] },
+    }
+    const marked = Type.callable(
+      ['i32'],
+      'i32',
+      {
+        environment: Lifetime.staticLifetime,
+        lifetimeBinders: [use],
+        invocationUse: { lifetime: use, parameters: [0] },
+      },
+      'Shared',
+      markedSchema,
+    )
+    const encodedMarked = ModuleSurface.encodeSemanticType(marked)
+    const decodedMarked = yield* ModuleSurface.decodeSemanticType(encodedMarked)
+    assert.strictEqual(Type.key(decodedMarked), Type.key(marked))
+    const markedRecord = decodeJson(encodedMarked)
+    const markedSchemaRecord = recordField(markedRecord, 'schema')
+    const markedContractRecord = recordField(markedSchemaRecord, 'contract')
+    const forgedCapture = encodeJson(
+      replaceRecordField(
+        markedRecord,
+        'schema',
+        replaceRecordField(
+          markedSchemaRecord,
+          'contract',
+          replaceRecordField(markedContractRecord, 'captures', [
+            { tag: 'CaptureRelationship', parameter: 0, capture: 0 },
+          ]),
+        ),
+      ),
+    )
+    const captureFailure = yield* Effect.flip(ModuleSurface.decodeSemanticType(forgedCapture))
+    assert.strictEqual(captureFailure.reason._tag, 'InvalidEncoding')
+    const removed = encodeJson(
+      replaceRecordField(
+        record,
+        'schema',
+        replaceRecordField(encodedSchema, 'invocationAdapter', undefined),
+      ),
+    )
+    const missingRecipe = yield* Effect.flip(ModuleSurface.decodeSemanticType(removed))
+    assert.strictEqual(missingRecipe.reason._tag, 'InvalidEncoding')
+  }),
+)

@@ -6,6 +6,8 @@ import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Result from 'effect/Result'
 import * as Analysis from '../src/Analysis.js'
+import * as AuthoredIdentity from '../src/AuthoredIdentity.js'
+import * as Lifetime from '../src/Lifetime.js'
 import * as SemanticContext from '../src/SemanticContext.js'
 import * as Tir from '../src/Tir.js'
 import * as Lexer from '../src/Lexer.js'
@@ -2501,3 +2503,316 @@ pub fn main() -> i32 {
     }),
   )
 }
+
+it.effect(
+  'authenticates invocation-use payload owners and retains real loans through scoped holder aliases',
+  () =>
+    Effect.gen(function* () {
+      const source = `struct Holder<'scope> { work: once Effect<'scope; i32> }
+fn owned<T>(callback: for<use 'call> once fn<'static>(T, T) -> once Effect<'call; i32>, first: T, second: T) -> i32 {
+  let waiting = callback(move first, move second)
+  drop waiting
+  return 0
+}
+fn staged<T>(callback: for<use 'call> once fn<'static>(T, T, T) -> once Effect<'call; i32>, first: T, second: T, third: T) -> i32 {
+  let firstStage = callback(move third)
+  let alias = move firstStage
+  let secondStage = alias(move second)
+  let waiting = secondStage(move first)
+  drop waiting
+  return 0
+}
+fn blocked(callback: for<use 'call> once fn<'static>(&'call mut [i32]) -> once Effect<'call; i32>) -> i32 {
+  let mut values = [1]
+  let waiting = callback(&mut values)
+  let holder = Holder { work: move waiting }
+  values[0] = 2
+  drop holder
+  return 0
+}
+fn released(callback: for<use 'call> once fn<'static>(&'call mut [i32]) -> once Effect<'call; i32>) -> i32 {
+  let mut values = [1]
+  let waiting = callback(&mut values)
+  let holder = Holder { work: move waiting }
+  drop holder
+  values[0] = 2
+  return values[0]
+}`
+      const snapshot = yield* Analysis.ofSourceRealized('ownership/invocation-use', ascii(source))
+      const result =
+        snapshot.results.get(snapshot.closure.rootModule) ?? unreachable('expected checked source')
+      const plan = Ownership.localSharedAccessBoundaryPlan(snapshot.results)
+      const context = SemanticContext.make(result.authored)
+      const selected = (name: string): Ownership.CheckInput => {
+        const body =
+          result.bodies.find(
+            (candidate) =>
+              candidate.declaration.name._tag === 'Present' &&
+              candidate.declaration.name.spelling === name,
+          ) ?? unreachable(`expected ${name}`)
+        return Ownership.input(
+          body.function,
+          body.artifact,
+          body.results.lifetimes,
+          snapshot.index,
+          plan,
+          context,
+          body.results.causes,
+        )
+      }
+      const ownedInput = selected('owned')
+      const owned = Ownership.check(ownedInput)
+      assert.deepEqual(owned.diagnostics, [])
+      assert.strictEqual(owned.ownership.verdict._tag, 'Satisfied')
+      assert.strictEqual(owned.ownership.invocations.length, 1)
+      const invocation =
+        owned.ownership.invocations.at(0) ?? unreachable('expected exact invocation')
+      assert.deepEqual(
+        invocation.inputs.map((input) => input.parameter),
+        [0, 1],
+      )
+      assert.deepEqual(
+        invocation.inputs.map((input) => input.source?.root),
+        [
+          { _tag: 'Parameter', parameter: { _tag: 'TirLocal', ordinal: 1 } },
+          { _tag: 'Parameter', parameter: { _tag: 'TirLocal', ordinal: 2 } },
+        ],
+      )
+      assert.deepEqual(
+        invocation.inputs.map((input) => input.transfer),
+        ['Move', 'Move'],
+      )
+      assert.deepEqual(
+        invocation.inputs.map((input) => input.conditionalContents),
+        [true, true],
+      )
+      assert.deepEqual(
+        invocation.inputs.map((input) => input.referents),
+        [[], []],
+      )
+      assert.deepEqual(owned.ownership.loans, [])
+      const firstInput = invocation.inputs.at(0) ?? unreachable('expected first input provenance')
+      const secondInput = invocation.inputs.at(1) ?? unreachable('expected second input provenance')
+      assert.strictEqual(Type.key(firstInput.type), Type.key(secondInput.type))
+      assert.isFalse(Tir.nodeRefEquals(firstInput.argument, secondInput.argument))
+      assert.strictEqual(invocation.retained, true)
+      const flow = ownedInput.lifetimes ?? unreachable('expected real caller lifetime domain')
+      assert.isTrue(
+        flow.input.regions.some((entry) =>
+          Lifetime.equals(entry.lifetime, invocation.obligation.lifetime),
+        ),
+      )
+      const origin =
+        flow.anchors.get(invocation.obligation.lifetime.ordinal) ??
+        unreachable('expected call origin')
+      assert.strictEqual(
+        AuthoredIdentity.anchorKey(origin),
+        AuthoredIdentity.anchorKey(invocation.obligation.origin),
+      )
+      const drop = source.indexOf('drop waiting')
+      assert.isAtLeast(invocation.end.span.start, drop)
+      assert.isAtMost(invocation.end.span.end, drop + 'drop waiting'.length)
+
+      const stagedInput = selected('staged')
+      const staged = Ownership.check(stagedInput)
+      assert.deepEqual(staged.diagnostics, [])
+      assert.strictEqual(staged.ownership.verdict._tag, 'Satisfied')
+      assert.strictEqual(staged.ownership.invocations.length, 1)
+      const stagedUse =
+        staged.ownership.invocations.at(0) ?? unreachable('expected final staged invocation')
+      assert.deepEqual(
+        stagedUse.inputs.map((input) => input.parameter),
+        [2, 1, 0],
+      )
+      assert.deepEqual(
+        stagedUse.inputs.map((input) => input.transfer),
+        ['Capture', 'Capture', 'Move'],
+      )
+      assert.deepEqual(
+        stagedUse.inputs.map((input) => input.source?.root),
+        [
+          { _tag: 'Parameter', parameter: { _tag: 'TirLocal', ordinal: 3 } },
+          { _tag: 'Parameter', parameter: { _tag: 'TirLocal', ordinal: 2 } },
+          { _tag: 'Parameter', parameter: { _tag: 'TirLocal', ordinal: 1 } },
+        ],
+      )
+      const prior = stagedUse.inputs.at(0) ?? unreachable('expected retained base frame')
+      const current = stagedUse.inputs.at(1) ?? unreachable('expected current stored input')
+      assert.deepEqual(
+        prior.capture?.path?.map((step) => step._tag),
+        ['Base', 'Capture'],
+      )
+      assert.deepEqual(
+        current.capture?.path?.map((step) => step._tag),
+        ['Capture'],
+      )
+      assert.strictEqual(prior.capture?.ordinal, 0)
+      assert.strictEqual(current.capture?.ordinal, 0)
+      assert.isFalse(Tir.nodeRefEquals(prior.argument, current.argument))
+      const firstStage = stagedInput.function.statements.find(
+        (statement) => statement._tag === 'Bind' && statement.name === 'firstStage',
+      )
+      const secondStage = stagedInput.function.statements.find(
+        (statement) => statement._tag === 'Bind' && statement.name === 'secondStage',
+      )
+      if (
+        firstStage?._tag !== 'Bind' ||
+        firstStage.initializer._tag !== 'CallableApply' ||
+        secondStage?._tag !== 'Bind' ||
+        secondStage.initializer._tag !== 'CallableApply'
+      )
+        return unreachable('expected original source stage producers')
+      const firstFrame = firstStage.initializer.staged ?? unreachable('expected first stored frame')
+      const secondFrame =
+        secondStage.initializer.staged ?? unreachable('expected second stored frame')
+      const baseStep = prior.capture?.path?.at(0) ?? unreachable('expected authenticated base step')
+      const leafStep =
+        prior.capture?.path?.at(1) ?? unreachable('expected authenticated stored leaf')
+      const ownStep =
+        current.capture?.path?.at(0) ?? unreachable('expected authenticated own capture')
+      assert.isTrue(Tir.nodeRefEquals(baseStep.site.node, secondFrame.site.node))
+      assert.isTrue(Tir.nodeRefEquals(leafStep.site.node, firstFrame.site.node))
+      assert.isTrue(Tir.nodeRefEquals(ownStep.site.node, secondFrame.site.node))
+      assert.deepEqual(
+        stagedUse.inputs.map((input) => input.conditionalContents),
+        [true, true, true],
+      )
+      assert.deepEqual(
+        stagedUse.inputs.map((input) => input.referents),
+        [[], [], []],
+      )
+      assert.deepEqual(staged.ownership.loans, [])
+
+      const stagedBinding = stagedInput.function.statements.find(
+        (statement) => statement._tag === 'Bind' && statement.name === 'waiting',
+      )
+      if (stagedBinding?._tag !== 'Bind' || stagedBinding.initializer._tag !== 'CallableApply')
+        return unreachable('expected genuine final staged call')
+      const stagedCall = stagedBinding.initializer
+      const stagedObligation =
+        stagedCall.invocationUse ?? unreachable('expected complete staged input obligation')
+      const firstStored = stagedObligation.inputs.at(0) ?? unreachable('expected base stored input')
+      const wrongStagedObligation: Tir.InvocationUseObligation = {
+        ...stagedObligation,
+        inputs: [
+          {
+            ...firstStored,
+            capturePath: [{ _tag: 'Capture', site: secondFrame.site, ordinal: 0 }],
+          },
+          ...stagedObligation.inputs.slice(1),
+        ],
+      }
+      const wrongFrame = Ownership.check({
+        ...stagedInput,
+        function: {
+          ...stagedInput.function,
+          statements: stagedInput.function.statements.map((statement) =>
+            statement === stagedBinding
+              ? {
+                  ...stagedBinding,
+                  initializer: { ...stagedCall, invocationUse: wrongStagedObligation },
+                }
+              : statement,
+          ),
+        },
+      })
+      assert.strictEqual(wrongFrame.ownership.verdict._tag, 'Violation')
+      assert.isTrue(
+        wrongFrame.diagnostics.some(
+          (diagnostic) =>
+            diagnostic.code === 'SEM0211' &&
+            diagnostic.span.start === stagedCall.span.start &&
+            diagnostic.span.end === stagedCall.span.end,
+        ),
+      )
+
+      const blocked = Ownership.check(selected('blocked'))
+      assert.strictEqual(blocked.ownership.verdict._tag, 'Violation')
+      const write = source.indexOf('values[0] = 2', source.indexOf('fn blocked'))
+      assert.isTrue(
+        blocked.diagnostics.some(
+          (diagnostic) =>
+            diagnostic.code === 'OWN0011' &&
+            diagnostic.span.start === write &&
+            diagnostic.span.end === write + 'values[0]'.length,
+        ),
+      )
+      const released = Ownership.check(selected('released'))
+      assert.deepEqual(released.diagnostics, [])
+      assert.strictEqual(released.ownership.verdict._tag, 'Satisfied')
+      const retained =
+        released.ownership.invocations.at(0) ?? unreachable('expected borrowed invocation')
+      const input = retained.inputs.at(0) ?? unreachable('expected actual borrowed operand')
+      assert.strictEqual(input.transfer, 'Borrow')
+      assert.strictEqual(input.conditionalContents, false)
+      assert.deepEqual(
+        input.referents.map((referent) => referent.root),
+        [{ _tag: 'Let', binding: { _tag: 'TirLocal', ordinal: 1 } }],
+      )
+      const release = source.indexOf('drop holder', source.indexOf('fn released'))
+      const loan =
+        released.ownership.loans.find((candidate) => candidate.origin === 'ReturnedView') ??
+        unreachable('expected retained actual input loan')
+      assert.isAtLeast(loan.endSpan.start, release)
+      assert.isAtMost(loan.endSpan.end, release + 'drop holder'.length)
+      assert.deepEqual(
+        loan.referents.map((referent) => referent.root),
+        input.referents.map((referent) => referent.root),
+      )
+
+      // Corrupt only obligation metadata on the genuine checked call: equal T cannot hide a swap.
+      const binding =
+        ownedInput.function.statements.find((statement) => statement._tag === 'Bind') ??
+        unreachable('expected waiting binding')
+      if (binding._tag !== 'Bind' || binding.initializer._tag !== 'CallableApply')
+        return unreachable('expected actual callback application')
+      const call = binding.initializer
+      const obligation = call.invocationUse ?? unreachable('expected required input obligation')
+      const first = obligation.inputs.at(0) ?? unreachable('expected first actual input')
+      const second = obligation.inputs.at(1) ?? unreachable('expected second actual input')
+      const firstArgument = call.arguments.at(0) ?? unreachable('expected real first operand')
+      const secondArgument = call.arguments.at(1) ?? unreachable('expected real second operand')
+      assert.strictEqual(
+        AuthoredIdentity.anchorKey(first.argument),
+        AuthoredIdentity.anchorKey(firstArgument.origin.anchor),
+      )
+      assert.strictEqual(
+        AuthoredIdentity.anchorKey(second.argument),
+        AuthoredIdentity.anchorKey(secondArgument.origin.anchor),
+      )
+      const checkCall = (changed: Extract<Tir.Expression, { readonly _tag: 'CallableApply' }>) =>
+        Ownership.check({
+          ...ownedInput,
+          function: {
+            ...ownedInput.function,
+            statements: ownedInput.function.statements.map((statement) =>
+              statement === binding ? { ...binding, initializer: changed } : statement,
+            ),
+          },
+        })
+      const swapped = checkCall({
+        ...call,
+        invocationUse: {
+          ...obligation,
+          inputs: [
+            { ...first, argument: second.argument },
+            { ...second, argument: first.argument },
+          ],
+        },
+      })
+      const { invocationUse: required, ...missing } = call
+      assert.strictEqual(required, obligation)
+      const absent = checkCall(missing)
+      for (const rejected of [swapped, absent]) {
+        assert.strictEqual(rejected.ownership.verdict._tag, 'Violation')
+        assert.isTrue(
+          rejected.diagnostics.some(
+            (diagnostic) =>
+              diagnostic.code === 'SEM0211' &&
+              diagnostic.span.start === call.span.start &&
+              diagnostic.span.end === call.span.end,
+          ),
+        )
+      }
+    }),
+)

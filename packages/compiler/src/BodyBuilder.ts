@@ -1522,6 +1522,9 @@ const residualExpression = (
       }
     return {
       _tag: 'EffectCatch',
+      ...(fact.recoveryInvocation === undefined
+        ? {}
+        : { recoveryInvocation: fact.recoveryInvocation }),
       intrinsic: fact.reference.operation.id,
       protected: protected_,
       handler,
@@ -2138,6 +2141,9 @@ const residualExpression = (
         : fact.typeArguments
     return {
       _tag: 'CallableSection',
+      ...(fact.invocationParameters === undefined
+        ? {}
+        : { invocationParameters: fact.invocationParameters }),
       site: fact.site,
       target,
       remainingParameters: fact.remainingParameters,
@@ -2235,6 +2241,7 @@ const residualExpression = (
           }))
     return {
       _tag: 'CallableApply',
+      ...(fact.invocationUse === undefined ? {} : { invocationUse: fact.invocationUse }),
       callee: tirExpression(fact.callee, options),
       arguments: fact.arguments.map((argument, ordinal) =>
         tirExpression(argument.expression, options, argumentBorrowId(argument, ordinal, self)),
@@ -2258,10 +2265,18 @@ const residualExpression = (
         : {
             staged: {
               site: fact.staged.site,
-              captures: fact.staged.captures.map((capture) => ({
-                ordinal: capture.ordinal,
-                access: capture.access,
-              })),
+              captures: fact.staged.captures.map((capture) => {
+                const type = constructionExpressionType(capture.expression)
+                if (type._tag !== 'Available')
+                  throw new RangeError('Checked staged capture lost its source type')
+                return {
+                  ordinal: capture.ordinal,
+                  parameterOrdinal: capture.parameterOrdinal,
+                  argument: constructionExpressionAnchor(capture.expression),
+                  type: type.type,
+                  access: capture.access,
+                }
+              }),
             },
           }),
       access: fact.mode,
@@ -2540,6 +2555,10 @@ const residualExpression = (
       (argument) => argument.textOrigin,
     )
     const call = {
+      ...(fact.contract.inputViews === undefined ? {} : { inputViews: fact.contract.inputViews }),
+      ...(fact.contract.invocationUse === undefined
+        ? {}
+        : { invocationUse: fact.contract.invocationUse }),
       target: fact.reference.declaration.canonical.id,
       typeArguments: fact.contract.typeArguments,
       evidence: publishedEvidence(

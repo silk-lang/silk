@@ -26,6 +26,120 @@ import * as TypeCompatibility from './TypeCompatibility.js'
  * states and never masquerade as typed operations.
  */
 
+/** Authenticated path through actual staged callable storage, outermost frame first. */
+export type InvocationCapturePathStep =
+  | { readonly _tag: 'Base'; readonly site: CallableSiteId }
+  | { readonly _tag: 'Capture'; readonly site: CallableSiteId; readonly ordinal: number }
+
+/** One source-checked executable argument at its original declaration parameter boundary. */
+export interface ExecutableInputView {
+  readonly caller: DeclarationFacts.CanonicalId
+  readonly call: AuthoredIdentity.Anchor
+  readonly operand: NodeRef
+  readonly operandOrigin: AuthoredIdentity.Anchor
+  readonly actual: Type.Callable | Type.Effect
+  readonly target: DeclarationFacts.CanonicalId
+  readonly parameter: {
+    readonly ordinal: number
+    readonly source: AuthoredIdentity.Anchor
+    readonly declared: Type.Type
+  }
+  readonly expected: Type.Callable | Type.Effect
+  readonly substitution: Type.Substitution
+  /** Original checked caller domain; every committed obligation still requires its ownership gate. */
+  readonly premises: {
+    readonly owner: Lifetime.Owner
+    readonly bounds: ReadonlyArray<Lifetime.Outlives>
+    readonly obligations: ReadonlyArray<Lifetime.Outlives>
+    readonly typeBounds: ReadonlyArray<Type.TypeOutlives>
+    readonly invocationInputs: ReadonlyArray<Type.InvocationInputBound>
+    readonly points: ReadonlyMap<string, number>
+    readonly anchors: ReadonlyMap<string, AuthoredIdentity.Anchor>
+    readonly formations: ReadonlyArray<{
+      readonly origin: AuthoredIdentity.Anchor
+      readonly environment: Lifetime.Local
+      readonly lifetimeBounds: ReadonlyArray<Lifetime.Outlives>
+      readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
+    }>
+  }
+}
+
+/** Selects a checked source argument view in its caller's concrete specialization. */
+export const substituteExecutableInputView = (
+  view: ExecutableInputView,
+  substitution: Type.Substitution,
+  compatibility?: TypeCompatibility.Context,
+): ExecutableInputView => {
+  const actual = Type.substitute(view.actual, substitution, compatibility)
+  const expected = Type.substitute(view.expected, substitution, compatibility)
+  if (
+    (!Type.isCallable(actual) && !Type.isEffect(actual)) ||
+    (!Type.isCallable(expected) && !Type.isEffect(expected))
+  )
+    throw new RangeError('executable argument view lost its original source kind')
+  const bound = (entry: Lifetime.Outlives): Lifetime.Outlives => ({
+    longer: Type.substituteLifetime(entry.longer, substitution),
+    shorter: Type.substituteLifetime(entry.shorter, substitution),
+  })
+  const typeBound = (entry: Type.TypeOutlives): Type.TypeOutlives => ({
+    type: Type.substitute(entry.type, substitution, compatibility),
+    lifetime: Type.substituteLifetime(entry.lifetime, substitution),
+  })
+  return {
+    ...view,
+    actual,
+    expected,
+    substitution: new Map(
+      [...view.substitution].map(([key, argument]) => [
+        key,
+        Type.substituteGenericArgument(argument, substitution, compatibility),
+      ]),
+    ),
+    premises: {
+      ...view.premises,
+      bounds: view.premises.bounds.map(bound),
+      obligations: view.premises.obligations.map(bound),
+      typeBounds: view.premises.typeBounds.map(typeBound),
+      invocationInputs: view.premises.invocationInputs.map((input) => ({
+        ...input,
+        type: Type.substitute(input.type, substitution, compatibility),
+        lifetime: Type.substituteLifetime(input.lifetime, substitution),
+      })),
+      formations: view.premises.formations.map((formation) => ({
+        ...formation,
+        lifetimeBounds: formation.lifetimeBounds.map(bound),
+        typeOutlives: formation.typeOutlives.map(typeBound),
+      })),
+    },
+  }
+}
+
+/** One call-owned input obligation; ownership and cleanup analysis must discharge it. */
+export interface InvocationUseObligation {
+  readonly owner: Lifetime.Owner
+  readonly origin: AuthoredIdentity.Anchor
+  readonly binder: Lifetime.Bound
+  readonly lifetime: Lifetime.Local
+  readonly inputs: ReadonlyArray<{
+    readonly parameter: number
+    /** A previously stored section input; its original transfer belongs to the callee. */
+    readonly capture?: number
+    readonly capturePath?: ReadonlyArray<InvocationCapturePathStep>
+    readonly argument: AuthoredIdentity.Anchor
+    readonly type: Type.Type
+  }>
+}
+
+/** A future recovery input, authenticated only on the selected runtime failure branch. */
+export interface RecoveryInvocationRecipe {
+  readonly owner: Lifetime.Owner
+  readonly lifetime: Lifetime.Local
+  readonly origin: AuthoredIdentity.Anchor
+  readonly parameter: 0
+  readonly selected: Type.Type
+  readonly binder: Lifetime.Bound
+}
+
 /** A normalized function contract: ordered parameter types and the result type. */
 export interface Contract {
   readonly _tag: 'Contract'
@@ -1021,7 +1135,9 @@ type ExpressionNode =
     }
   | {
       readonly _tag: 'Call'
+      readonly invocationUse?: InvocationUseObligation
       readonly target: DeclarationFacts.CanonicalId
+      readonly inputViews?: ReadonlyArray<ExecutableInputView>
       readonly typeArguments: ReadonlyArray<Type.GenericArgument>
       readonly evidence: EvidenceRef
       /** Symbolic source identities to be checked against the later concrete proof selection. */
@@ -1056,6 +1172,8 @@ type ExpressionNode =
     }
   | {
       readonly _tag: 'CallableSection'
+      /** Original explicit marked inputs; independently formed lexical captures are excluded. */
+      readonly invocationParameters?: ReadonlyArray<number>
       readonly site: CallableSiteId
       readonly target: CallableTarget
       readonly remainingParameters: ReadonlyArray<number>
@@ -1086,6 +1204,7 @@ type ExpressionNode =
     }
   | {
       readonly _tag: 'CallableApply'
+      readonly invocationUse?: InvocationUseObligation
       readonly callee: Expression
       readonly arguments: ReadonlyArray<Expression>
       readonly loanEnds: ReadonlyArray<BorrowId>
@@ -1103,6 +1222,9 @@ type ExpressionNode =
         readonly site: CallableSiteId
         readonly captures: ReadonlyArray<{
           readonly ordinal: number
+          readonly parameterOrdinal: number
+          readonly argument: AuthoredIdentity.Anchor
+          readonly type: Type.Type
           readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take'
         }>
       }
@@ -1113,6 +1235,7 @@ type ExpressionNode =
   | {
       readonly _tag: 'EffectConstruct'
       readonly target: DeclarationFacts.CanonicalId
+      readonly inputViews?: ReadonlyArray<ExecutableInputView>
       readonly typeArguments: ReadonlyArray<Type.GenericArgument>
       readonly evidence: EvidenceRef
       readonly symbolicConformances: ReadonlyArray<ConformanceProof.SymbolicConformanceSelection>
@@ -1173,6 +1296,7 @@ type ExpressionNode =
        * because no source-level type can spell it.
        */
       readonly _tag: 'EffectCatch'
+      readonly recoveryInvocation?: RecoveryInvocationRecipe
       readonly intrinsic: Intrinsic.OperationId
       readonly protected: Expression
       readonly handler: Expression
