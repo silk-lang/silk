@@ -3,6 +3,7 @@ import { alignUp } from './internal/Align.js'
 import * as Layout from './Layout.js'
 import * as ValueStorage from './ValueStorage.js'
 import * as Mir from './Mir.js'
+import * as MirVerification from './MirVerification.js'
 import * as StaticValue from './StaticValue.js'
 import * as SilkType from './Type.js'
 
@@ -219,7 +220,19 @@ export const cleanupReleases = (
     const field = byLocal.get(release.local.ordinal)
     return field === undefined ? [] : [field]
   })
-  if (ordered.length !== fields.length)
+  const dependencyOrder = MirVerification.invocationReleaseOrder(
+    state.invocationUses ?? [],
+    state.failure.releases,
+  )
+  if (
+    new Set(ordered.map((field) => field.local.ordinal)).size !== fields.length ||
+    dependencyOrder === undefined ||
+    dependencyOrder.some(
+      (release, ordinal) =>
+        release.local.ordinal !== state.failure.releases.at(ordinal)?.local.ordinal,
+    ) ||
+    ordered.length !== fields.length
+  )
     throw new RangeError('coroutine cleanup diverged from its canonical release plan')
   return ordered
 }

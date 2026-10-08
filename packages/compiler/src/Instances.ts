@@ -16,6 +16,7 @@ import * as BodyView from './BodyView.js'
 import * as Location from './Location.js'
 import * as Provenance from './Provenance.js'
 import type * as LifetimeFlow from './LifetimeFlow.js'
+import type * as BodyLifetime from './BodyLifetime.js'
 import * as ExecutableOrigin from './ExecutableOrigin.js'
 import * as Tir from './Tir.js'
 import * as FunctionIndex from './internal/FunctionIndex.js'
@@ -66,6 +67,8 @@ export interface Instance {
   readonly substitution: Type.Substitution
   readonly specialization: ConcreteSpecialization
   readonly ownership: Ownership.FunctionOwnership
+  /** Checked source construction premises under this exact instance's substitution. */
+  readonly formations?: ReadonlyArray<BodyLifetime.Formation>
   readonly resultCallable?: Type.CallableIdentityArgument
   readonly resultEffect?: string
   /** Exact residual application whose compile-time dependency attribution produced this body. */
@@ -166,6 +169,7 @@ export interface CallProvider {
 /** One monomorphic ordinary/effect constructor call with hidden Effect identities resolved. */
 export interface CallInstance {
   readonly _tag: 'CallInstance'
+  readonly inputViews?: ReadonlyArray<Tir.ExecutableInputView>
   readonly owner: InstanceKey
   /** Published TIR node that selected this target inside the owning instance. */
   readonly node?: Tir.NodeId
@@ -914,6 +918,27 @@ const effectParameterOrdinals = (
   fn: Tir.TirFunction,
   substitution: Type.Substitution,
 ): ReadonlyArray<number> => executableParameters(fn, substitution).effects
+
+/** Maps an original declaration input to the contract's dense runtime parameter tuple. */
+export const runtimeParameterOrdinal = (
+  fn: Tir.TirFunction,
+  originalOrdinal: number,
+): number | undefined => {
+  const parameters = fn.declaration.parameters
+  if (
+    fn.contract._tag !== 'Contract' ||
+    !Number.isInteger(originalOrdinal) ||
+    originalOrdinal < 0 ||
+    originalOrdinal >= parameters.length ||
+    parameters.some((parameter, ordinal) => parameter.id.ordinal !== ordinal) ||
+    parameters.filter((parameter) => parameter.phase === 'Runtime').length !==
+      fn.contract.parameters.length ||
+    parameters.at(originalOrdinal)?.phase !== 'Runtime'
+  )
+    return undefined
+  return parameters.slice(0, originalOrdinal).filter((parameter) => parameter.phase === 'Runtime')
+    .length
+}
 
 export const parameterEffectRepresentationArgument = (
   fn: Tir.TirFunction,
@@ -3045,10 +3070,11 @@ export const discover = (
             ? undefined
             : resultEffectIdentity(target, provided.target, results, index)
         providerCalls.set(
-          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${keyText(provided.target)}`,
+          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${provided.node?.ordinal ?? -1}\u0005${keyText(provided.target)}`,
           {
             _tag: 'CallInstance',
             owner: provided.owner,
+            ...(provided.node === undefined ? {} : { node: provided.node }),
             span: provided.span,
             target: provided.target,
             ...(provided.providers === undefined ? {} : { providers: provided.providers }),
@@ -3204,6 +3230,38 @@ export const discover = (
         )
       return {
         ...instance,
+        ...(lifetimes?.solution._tag !== 'Solved' ||
+        lifetimes.solution.violations.length !== 0 ||
+        lifetimes.diagnostics.length !== 0 ||
+        checked.diagnostics.length !== 0
+          ? {}
+          : {
+              formations: (lifetimes.formations ?? []).flatMap((formation) => {
+                const environment = Type.substituteLifetime(
+                  formation.environment,
+                  instance.substitution,
+                )
+                if (environment._tag !== 'LocalLifetime') return []
+                return [
+                  {
+                    origin: formation.origin,
+                    environment,
+                    lifetimeBounds: formation.lifetimeBounds.map((bound) => ({
+                      longer: Type.substituteLifetime(bound.longer, instance.substitution),
+                      shorter: Type.substituteLifetime(bound.shorter, instance.substitution),
+                    })),
+                    typeOutlives: formation.typeOutlives.map((bound) => ({
+                      type: Type.substitute(
+                        bound.type,
+                        instance.substitution,
+                        instance.specialization.compatibility,
+                      ),
+                      lifetime: Type.substituteLifetime(bound.lifetime, instance.substitution),
+                    })),
+                  },
+                ]
+              }),
+            }),
         effectSuccesses: trace('Instances.resolveEffectSuccesses', () =>
           effectSuccesses(
             instance.function,

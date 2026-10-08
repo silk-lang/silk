@@ -1,3 +1,5 @@
+import * as Lifetime from './Lifetime.js'
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as NativeAssembly from './NativeAssembly.js'
 import * as Instances from './Instances.js'
 import * as CAbi from './CAbi.js'
@@ -59,6 +61,13 @@ const selectorText = (selectors: ReadonlyArray<PlaceSelector>): string =>
       return `[${index}/${selector.length}]`
     })
     .join('')
+
+const invocationUseText = (
+  usage: Extract<Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>['invocationUse'],
+): string =>
+  usage === undefined
+    ? ''
+    : ` invocation=${usage.kind.toLowerCase()}:${AuthoredIdentity.anchorKey(usage.origin)} binder=${Lifetime.key(usage.binder)} region=${Lifetime.key(usage.lifetime)} inputs=${usage.inputs.map((input) => `p${input.parameter}:${localText(input.argument)}${input.capture === undefined ? '' : `.#${input.capture}`}${input.capturePath === undefined ? '' : ` via=${input.capturePath.map((step) => `${step._tag.toLowerCase()}@${Tir.executableSiteLabel(step.site)}${step._tag === 'Capture' ? `.#${step.ordinal}` : ''}`).join('/')}`}${input.header === undefined ? '' : ` header=p${input.header.parameter}@${AuthoredIdentity.anchorKey(input.header.source)}`}:${SilkType.encode(input.type)}`).join(',')} result=${localText(usage.result)}`
 
 const operationText = (operation: Operation): string => {
   switch (operation._tag) {
@@ -195,16 +204,16 @@ const operationText = (operation: Operation): string => {
         operation.typeArguments.length === 0
           ? ''
           : `<${operation.typeArguments.map(SilkType.encodeGenericArgument).join(', ')}>`
-      }(${operation.arguments.map(localText).join(', ')}) : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
+      }(${operation.arguments.map(localText).join(', ')}) : ${typeText(operation.type)} ${provenanceText(operation.provenance)}${invocationUseText(operation.invocationUse)}`
     case 'MakeEffect':
-      return `${localText(operation.destination)} = make-effect ${targetText(operation.runner)} captures=${operation.captures.map((capture) => `${localText(capture.source)}:${capture.access.toLowerCase()}`).join(',') || 'none'} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
+      return `${localText(operation.destination)} = make-effect ${targetText(operation.runner)} captures=${operation.captures.map((capture) => `${localText(capture.source)}:${capture.access.toLowerCase()}`).join(',') || 'none'} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}${invocationUseText(operation.invocationSource?.invocationUse)}`
     case 'MakeCallable':
       return `${localText(operation.destination)} = make-callable ${callableTargetText(operation.target)}${operation.base === undefined ? '' : ` base=${localText(operation.base)}`} captures=${operation.captures.map((capture) => `#${capture.ordinal}->p${capture.parameterOrdinal}:${localText(capture.source)}:${capture.access.toLowerCase()}`).join(',') || 'none'} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
     case 'ApplyCallable': {
       let target = '?'
       if (operation.callable !== undefined) target = localText(operation.callable)
       else if (operation.target !== undefined) target = callableTargetText(operation.target)
-      return `${localText(operation.destination)} = apply-callable ${target}(${operation.arguments.map(localText).join(', ')}) captures=${operation.captures.map((capture) => `#${capture.ordinal}:${localText(capture.source)}`).join(',') || 'none'} access=${operation.access.toLowerCase()} evaluation=${operation.evaluation} realization=${operation.realization} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
+      return `${localText(operation.destination)} = apply-callable ${target}(${operation.arguments.map(localText).join(', ')}) captures=${operation.captures.map((capture) => `#${capture.ordinal}:${localText(capture.source)}`).join(',') || 'none'} access=${operation.access.toLowerCase()} evaluation=${operation.evaluation} realization=${operation.realization} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}${invocationUseText(operation.invocationUse)}`
     }
     case 'PackEffectOutcome':
       return `${localText(operation.destination)} = effect-outcome tag=${operation.tag} ${localText(operation.source)} : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
@@ -255,7 +264,13 @@ const fieldPathText = (path: ReadonlyArray<DeclarationFacts.FieldId>): string =>
   path.length === 0 ? 'payload' : path.map((field) => `#${field.ordinal}`).join('.')
 
 const recoveryText = (execution: Execution): string =>
-  execution.recoveryOutcome === undefined ? '' : ` recovery=${localText(execution.recoveryOutcome)}`
+  execution.recoveryOutcome === undefined
+    ? ''
+    : ` recovery=${localText(execution.recoveryOutcome)}${
+        execution.recoveryInvocation === undefined
+          ? ''
+          : ` recipe=${AuthoredIdentity.anchorKey(execution.recoveryInvocation.origin)} binder=${Lifetime.key(execution.recoveryInvocation.binder)} region=${Lifetime.key(execution.recoveryInvocation.lifetime)} selected=${SilkType.encode(execution.recoveryInvocation.selected)}`
+      }`
 
 const operationLines = (operation: Operation, indent: string): ReadonlyArray<string> => {
   if (operation._tag === 'DiagnosticScope') {
@@ -503,6 +518,20 @@ export const encode = (self: Module): string => {
           ? ''
           : `<${fn.instance.typeArguments.map(SilkType.encodeGenericArgument).join(', ')}>`
       } params=${fn.parameterCount} locals=${fn.localTypes.length} -> ${typeText(fn.result)} entry=${regionText(fn.entry)}${fn.machine === undefined ? '' : ' machine=naked,noreturn'}`,
+      ...(fn.sourceOwner === undefined
+        ? []
+        : [
+            `  source-owner ${JSON.stringify(fn.sourceOwner.module)}:${JSON.stringify(fn.sourceOwner.name)}`,
+          ]),
+      ...(fn.sourceInvocationUse === undefined
+        ? []
+        : [
+            `  source-invocation lifetime=${Lifetime.key(fn.sourceInvocationUse.lifetime)} parameters=${fn.sourceInvocationUse.parameters.join(',')}`,
+          ]),
+      ...(fn.sourceParameters ?? []).map(
+        (parameter) =>
+          `  source-parameter #${parameter.parameter} local=${localText(parameter.local)} origin=${JSON.stringify(AuthoredIdentity.anchorKey(parameter.source))} contract=${SilkType.encode(parameter.contract)} type=${SilkType.encode(parameter.type)}`,
+      ),
       ...suspensionLines(fn),
       ...topologicalRegions(fn).flatMap(regionLines),
     ]),

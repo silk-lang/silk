@@ -1,6 +1,7 @@
 import type * as AuthoredHir from './AuthoredHir.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as BodyQuery from './BodyQuery.js'
+import * as BodyLifetime from './BodyLifetime.js'
 import * as Result from 'effect/Result'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as ConformanceProof from './ConformanceProof.js'
@@ -287,6 +288,37 @@ export interface Work {
   readonly cleanupPlanQueries: number
 }
 
+/** Exact call-input ownership retained conditionally by the function's final verdict. */
+export interface InvocationOwnership {
+  readonly obligation: Tir.InvocationUseObligation
+  readonly call: Tir.NodeRef
+  readonly result: Tir.NodeRef
+  readonly inputs: ReadonlyArray<{
+    readonly parameter: number
+    readonly argument: Tir.NodeRef
+    readonly type: Type.Type
+    readonly transfer: 'Move' | 'Copy' | 'Borrow' | 'Capture'
+    /** A stored input stays owned by this actual retained callee, not its old source cell. */
+    readonly capture?: {
+      readonly ordinal: number
+      readonly callee: Tir.NodeRef
+      readonly path?: ReadonlyArray<Tir.InvocationCapturePathStep>
+    }
+    /** The source value's storage, never authority to borrow its consumed binding cell. */
+    readonly source?: LoanReferent
+    /** Actual retained payload loans, separate from the source value's storage. */
+    readonly referents: ReadonlyArray<LoanReferent>
+    /** Generic contents require the same exact-input obligation at realization. */
+    readonly conditionalContents: boolean
+  }>
+  readonly retained: boolean
+  readonly end: {
+    readonly region: Tir.RegionId
+    readonly span: SourceSpan.SourceSpan
+    readonly cleanupOnly: boolean
+  }
+}
+
 /** One function's ownership facts and its target-neutral cleanup plan. */
 export interface FunctionOwnership {
   readonly _tag: 'FunctionOwnership'
@@ -317,6 +349,7 @@ export interface FunctionOwnership {
   readonly matches: ReadonlyArray<MatchOwnership>
   readonly callables: ReadonlyArray<CallableEnvironmentFact>
   readonly loans: ReadonlyArray<LoanFact>
+  readonly invocations: ReadonlyArray<InvocationOwnership>
   readonly replacements: ReadonlyArray<ReplacementFact>
   readonly transitions: ReadonlyArray<PlaceTransition>
   readonly verdict: Verdict
@@ -1742,6 +1775,7 @@ const cleanupPlan = (state: CheckState, type: Type.Type): CleanupPlan.CleanupPla
 }
 
 interface LoanAnalysis {
+  readonly invocations: ReadonlyArray<InvocationOwnership>
   readonly loanAccessChecks: number
   readonly loans: ReadonlyArray<LoanFact>
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
@@ -1783,6 +1817,7 @@ const analyzeLoans = (
 ): LoanAnalysis => {
   let loanAccessChecks = 0
   const loans: Array<LoanFact> = []
+  const invocations: Array<InvocationOwnership> = []
   const diagnostics: Array<Diagnostic.Diagnostic> = []
 
   const directSite = (
@@ -2079,7 +2114,8 @@ const analyzeLoans = (
           scanRunEnds(statement.expression, statement.region)
           break
         case 'DropStatement': {
-          scanRunEnds(statement.expression, statement.region)
+          // The consuming boundary owns the retained loan's end, including the authored drop.
+          scanRunEnds(statement.expression, statement.region, statement.anchor)
           const site = directSite(statement.expression)?.site
           if (site?._tag === 'Let') {
             callableEnds.set(site.binding.ordinal, endpointAt(statement.anchor, statement.region))
@@ -2122,6 +2158,143 @@ const analyzeLoans = (
   const bindingInitializers = new Map(
     bindings.map((binding) => [binding.id.ordinal, binding.initializer] as const),
   )
+  const invocationSection = (
+    expression: LoanView.Expression,
+    seen: ReadonlySet<number> = new Set(),
+  ): Extract<LoanView.Expression, { readonly _tag: 'CallableSection' }> | undefined => {
+    if (expression._tag === 'Move') return invocationSection(expression.subject, seen)
+    if (expression._tag === 'CallableSection') return expression
+    const site = directSite(expression)?.site
+    if (site?._tag !== 'Let' || seen.has(site.binding.ordinal)) return undefined
+    const initializer = bindingInitializers.get(site.binding.ordinal)
+    return expression._tag !== 'Identifier' ||
+      expression.reference._tag !== 'ResolvedBinding' ||
+      expression.reference.binding.mutability !== 'Immutable' ||
+      initializer === undefined
+      ? undefined
+      : invocationSection(initializer, new Set(seen).add(site.binding.ordinal))
+  }
+  const invocationRecipe = (
+    expression: LoanView.Expression,
+    seen: ReadonlySet<LoanView.Expression> = new Set(),
+  ): LoanView.InvocationRecipe | undefined => {
+    if (seen.has(expression)) return undefined
+    const next = new Set(seen).add(expression)
+    if (expression._tag === 'Move') return invocationRecipe(expression.subject, next)
+    if (expression._tag === 'Identifier' && expression.reference._tag === 'ResolvedBinding') {
+      const binding = expression.reference.binding
+      const initializer = bindingInitializers.get(binding.id.ordinal)
+      return binding.mutability !== 'Immutable' || initializer === undefined
+        ? undefined
+        : invocationRecipe(initializer, next)
+    }
+    let type: Type.Callable | undefined
+    if (expression.type._tag === 'Available') {
+      if (Type.isCallable(expression.type.type)) type = expression.type.type
+      else if (
+        Type.isRepresented(expression.type.type) &&
+        Type.isCallable(expression.type.type.contract)
+      )
+        type = expression.type.type.contract
+    }
+    if (type?.invocationUse === undefined || Type.invocationInputBounds(type) === undefined)
+      return undefined
+    if (expression._tag === 'CallableSection') {
+      const original = expression.invocationParameters
+      if (
+        original === undefined ||
+        new Set(original).size !== original.length ||
+        !original.every((parameter) => Number.isSafeInteger(parameter) && parameter >= 0)
+      )
+        return undefined
+      const captures = expression.captures.filter((capture) =>
+        original.includes(capture.parameterOrdinal),
+      )
+      const covered = [
+        ...expression.remainingParameters,
+        ...captures.map((capture) => capture.parameterOrdinal),
+      ]
+      if (
+        covered.length !== original.length ||
+        new Set(covered).size !== original.length ||
+        !covered.every((parameter) => original.includes(parameter))
+      )
+        return undefined
+      return {
+        parameters: expression.remainingParameters,
+        captures: captures.map((capture) => ({
+          parameter: capture.parameterOrdinal,
+          capture: capture.ordinal,
+          argument: capture.argument,
+          leaf: expression.site,
+        })),
+      }
+    }
+    if (expression._tag === 'CallableApply' && expression.staged !== undefined) {
+      const base = invocationRecipe(expression.callee, next)
+      const stage = expression.staged
+      const count = expression.arguments.length
+      if (
+        base === undefined ||
+        count === 0 ||
+        count >= base.parameters.length ||
+        stage.captures.length !== count ||
+        type.parameters.length !== base.parameters.length - count
+      )
+        return undefined
+      const captures: Array<LoanView.InvocationRecipe['captures'][number]> = base.captures.map(
+        (capture) => ({
+          ...capture,
+          capturePath: [
+            { _tag: 'Base', site: stage.site },
+            ...(capture.capturePath ?? [
+              { _tag: 'Capture', site: capture.leaf, ordinal: capture.capture },
+            ]),
+          ],
+        }),
+      )
+      for (const [ordinal, capture] of stage.captures.entries()) {
+        const argument = expression.arguments.at(ordinal)
+        const parameter = base.parameters.at(base.parameters.length - count + ordinal)
+        if (
+          argument === undefined ||
+          argument.type._tag !== 'Available' ||
+          parameter === undefined ||
+          capture.ordinal !== ordinal ||
+          capture.parameterOrdinal !== parameter ||
+          AuthoredIdentity.anchorKey(capture.argument) !==
+            AuthoredIdentity.anchorKey(argument.anchor) ||
+          !Type.equals(capture.type, argument.type.type)
+        )
+          return undefined
+        captures.push({
+          parameter,
+          capture: capture.ordinal,
+          argument,
+          leaf: stage.site,
+          capturePath: [{ _tag: 'Capture', site: stage.site, ordinal: capture.ordinal }],
+        })
+      }
+      if (new Set(captures.map((capture) => capture.parameter)).size !== captures.length)
+        return undefined
+      return { parameters: base.parameters.slice(0, base.parameters.length - count), captures }
+    }
+    if (
+      expression._tag !== 'FunctionItem' &&
+      !(expression._tag === 'Identifier' && expression.reference._tag === 'Resolved')
+    )
+      return undefined
+    if (
+      type.schema !== undefined &&
+      !Type.invocationAdapterValid(type.invocationUse, type.parameters.length, type.schema)
+    )
+      return undefined
+    return {
+      parameters:
+        type.schema?.invocationAdapter?.parameters ?? type.parameters.map((_, ordinal) => ordinal),
+      captures: [],
+    }
+  }
   const returnedCallable = (
     expression: LoanView.Expression,
     seen: ReadonlySet<number> = new Set(),
@@ -2243,19 +2416,31 @@ const analyzeLoans = (
   const assumptions = Lifetime.assumptions(fn.lifetimeFlow?.input.constraints ?? [])
   const returnedArgumentOrdinals = (expression: LoanView.Expression): ReadonlySet<number> =>
     new Set(
-      LoanView.retainedResultArguments(expression, assumptions).map(
-        (argument) => argument.id.ordinal,
-      ),
+      LoanView.retainedResultArguments(
+        expression,
+        assumptions,
+        expression._tag === 'CallableApply' ? invocationRecipe(expression.callee) : undefined,
+      ).map((argument) => argument.id.ordinal),
     )
   const returnedSources = (expression: LoanView.Expression): ReadonlyArray<LoanView.Expression> => {
-    const arguments_ = LoanView.retainedResultArguments(expression, assumptions).map(
-      (argument) => argument.expression,
-    )
+    if (expression._tag === 'Move')
+      return [expression.subject, ...returnedSources(expression.subject)]
+    if (expression._tag === 'StructLiteral' || expression._tag === 'UnionVariant')
+      return expression.initializers.map((initializer) => initializer.expression)
+    if (expression._tag === 'ArrayLiteral')
+      return expression.elements.map((element) => element.expression)
+    const arguments_ = LoanView.retainedResultArguments(
+      expression,
+      assumptions,
+      expression._tag === 'CallableApply' ? invocationRecipe(expression.callee) : undefined,
+    ).map((argument) => argument.expression)
     if (
       expression._tag === 'CallableApply' &&
       expression.callee.type._tag === 'Available' &&
       expression.type._tag === 'Available' &&
-      LoanView.retainsLifetimes(expression.callee.type.type, expression.type.type, assumptions)
+      (LoanView.retainsLifetimes(expression.callee.type.type, expression.type.type, assumptions) ||
+        (LoanView.retainsInvocationInputs(expression) &&
+          (expression.invocationUse?.inputs.some((input) => input.capture !== undefined) ?? false)))
     )
       return [...arguments_, expression.callee]
     return arguments_
@@ -2353,6 +2538,22 @@ const analyzeLoans = (
         ? rootsOf(root, formation.root.path)
         : [{ root, path: formation.root.path }]
     }
+    if (expression._tag === 'CallableApply' && LoanView.retainsInvocationInputs(expression)) {
+      const inputs = LoanView.invocationArguments(expression, invocationRecipe(expression.callee))
+      return inputs === undefined
+        ? []
+        : inputs.flatMap(({ argument }) => payloadReferents(argument.expression))
+    }
+    if (expression._tag === 'Move') return sourceReferents(expression.subject)
+    if (expression._tag === 'StructLiteral' || expression._tag === 'UnionVariant')
+      return expression.initializers.flatMap((initializer) =>
+        sourceReferents(initializer.expression),
+      )
+    if (expression._tag === 'ArrayLiteral')
+      return expression.elements.flatMap((element) => sourceReferents(element.expression))
+    const exact = physicalPlace(expression)
+    if (exact?.root._tag === 'Let' && viewRoots.has(exact.root.binding.ordinal))
+      return rootsOf(exact.root, exact.path)
     if (fn.lifetimeFlow !== undefined && expression.type._tag === 'Available') {
       const origins = LifetimeFlow.sources(fn.lifetimeFlow, expression.type.type).flatMap(
         (origin) =>
@@ -2374,6 +2575,81 @@ const analyzeLoans = (
     const direct = physicalPlace(expression)
     return direct === undefined ? [] : rootsOf(direct.root, direct.path)
   }
+  // An invocation transfers an exact value. Its retained payload can depend on external loans;
+  // its old owned cell is not one of those loans, even for an unknown generic payload.
+  const payloadReferents = (
+    expression: LoanView.Expression,
+    seen: ReadonlySet<number> = new Set(),
+    path: ReadonlyArray<ReferentSelector> = [],
+  ): ReadonlyArray<LoanReferent> => {
+    if (expression._tag === 'Move') return payloadReferents(expression.subject, seen, path)
+    if (expression._tag === 'FieldProjection' && expression.state._tag === 'Resolved')
+      return payloadReferents(expression.subject, seen, [
+        {
+          _tag: 'Field',
+          field: expression.state.field.id,
+          span: context.spanOf(expression.anchor),
+        },
+        ...path,
+      ])
+    if (
+      expression._tag === 'IndexProjection' &&
+      expression.array !== undefined &&
+      (expression.bounds._tag === 'Proven' || expression.bounds._tag === 'Runtime')
+    )
+      return payloadReferents(expression.subject, seen, [
+        {
+          _tag: 'Index',
+          index: expression.index,
+          array: expression.array,
+          bounds: expression.bounds,
+          span: context.spanOf(expression.anchor),
+        },
+        ...path,
+      ])
+    if (expression._tag === 'Borrow') return sourceReferents(expression)
+    if (expression._tag === 'StructLiteral' || expression._tag === 'UnionVariant') {
+      const first = path.at(0)
+      return expression.initializers.flatMap((initializer) => {
+        if (first === undefined) return payloadReferents(initializer.expression, seen)
+        if (first._tag === 'Field' && DeclarationFacts.sameFieldId(first.field, initializer.field))
+          return payloadReferents(initializer.expression, seen, path.slice(1))
+        return []
+      })
+    }
+    if (expression._tag === 'ArrayLiteral') {
+      const first = path.at(0)
+      return expression.elements.flatMap((element, ordinal) => {
+        if (first === undefined) return payloadReferents(element.expression, seen)
+        if (
+          first._tag === 'Index' &&
+          (first.bounds._tag === 'Runtime' || first.bounds.index === ordinal)
+        )
+          return payloadReferents(element.expression, seen, path.slice(1))
+        return []
+      })
+    }
+    const site = directSite(expression)?.site
+    if (site?._tag === 'Let') {
+      if (seen.has(site.binding.ordinal)) return []
+      const initializer = bindingInitializers.get(site.binding.ordinal)
+      if (initializer !== undefined)
+        return payloadReferents(initializer, new Set(seen).add(site.binding.ordinal), path)
+      const known = viewRoots.get(site.binding.ordinal)
+      if (known !== undefined)
+        return known.map((referent) => ({ root: referent.root, path: [...referent.path, ...path] }))
+    }
+    if (expression._tag === 'CallableApply')
+      return returnedSources(expression).flatMap((source) => payloadReferents(source, seen, path))
+    if (expression.type._tag !== 'Available') return []
+    if (Type.isReference(expression.type.type) || Type.isSlice(expression.type.type)) {
+      const place = physicalPlace(expression)
+      return place === undefined ? [] : rootsOf(place.root, [...place.path, ...path])
+    }
+    // A stored nominal parameter's internal borrows remain a conditional input obligation.
+    // No type-keyed origin or guessed physical-cell loan completes it here.
+    return []
+  }
   for (const binding of bindings) {
     if (
       binding.inferredType._tag !== 'Available' ||
@@ -2392,21 +2668,24 @@ const analyzeLoans = (
     if (
       binding.initializer._tag === 'CallableApply' &&
       binding.initializer.callee.type._tag === 'Available' &&
-      LoanView.retainsLifetimes(
+      (LoanView.retainsLifetimes(
         binding.initializer.callee.type.type,
         binding.inferredType.type,
         assumptions,
-      )
+      ) ||
+        LoanView.retainsInvocationInputs(binding.initializer))
     ) {
-      if (binding.initializer.callee._tag === 'CallableSection')
-        for (const capture of binding.initializer.callee.captures) {
+      const section = invocationSection(binding.initializer.callee)
+      if (section !== undefined)
+        for (const capture of section.captures) {
           if (
             capture.expression.type._tag === 'Available' &&
-            LoanView.retainsLifetimes(
+            (LoanView.retainsLifetimes(
               capture.expression.type.type,
               binding.inferredType.type,
               assumptions,
-            )
+            ) ||
+              LoanView.retainsInvocationInputs(binding.initializer))
           )
             returnedCallableCaptures.add(captureKey(capture.expression.anchor, capture.ordinal))
         }
@@ -2600,6 +2879,26 @@ const analyzeLoans = (
               ]
             : []),
         ]
+      }
+      case 'CallableApply': {
+        if (!LoanView.retainsInvocationInputs(expression)) return []
+        const inputs = LoanView.invocationArguments(expression, invocationRecipe(expression.callee))
+        return (inputs ?? []).flatMap(({ argument }) =>
+          payloadReferents(argument.expression).some((referent) => escapingRoot(referent.root))
+            ? [
+                {
+                  spelling: directSite(argument.expression)?.spelling ?? '?',
+                  access:
+                    argument.type._tag === 'Available' &&
+                    (Type.isReference(argument.type.type) || Type.isSlice(argument.type.type))
+                      ? argument.type.type.access
+                      : ('Shared' as const),
+                  span: context.spanOf(argument.anchor),
+                  anchor: argument.anchor,
+                },
+              ]
+            : [],
+        )
       }
       case 'Call': {
         if (expression.type._tag !== 'Available' || !Type.isEffect(expression.type.type)) return []
@@ -2902,7 +3201,8 @@ const analyzeLoans = (
         for (const capture of expression.captures) {
           const candidate = capture.expression
           if (capture.access !== 'Shared' && capture.access !== 'Exclusive') {
-            inspect(candidate, region, captureActive, naturalAccess(candidate))
+            // The stored payload can itself retain loans; it does not borrow its old cell.
+            inspect(candidate, region, captureActive, naturalAccess(candidate), delayedEnd)
             continue
           }
           const directRoot =
@@ -2955,6 +3255,91 @@ const analyzeLoans = (
         return
       }
       case 'CallableApply': {
+        const obligation = expression.invocationUse
+        const inputs = LoanView.invocationArguments(expression, invocationRecipe(expression.callee))
+        const expected = invocationRecipe(expression.callee)?.parameters
+        const owner = fn.declaration.lifetimeElaboration?.owner
+        const origin =
+          obligation === undefined
+            ? undefined
+            : fn.lifetimeFlow?.anchors.get(obligation.lifetime.ordinal)
+        const valid =
+          inputs !== undefined &&
+          (obligation === undefined ||
+            (owner !== undefined &&
+              owner.module === obligation.owner.module &&
+              owner.name === obligation.owner.name &&
+              fn.lifetimeFlow !== undefined &&
+              fn.lifetimeFlow.input.regions.some((entry) =>
+                Lifetime.equals(entry.lifetime, obligation.lifetime),
+              ) &&
+              obligation.lifetime.context === BodyLifetime.invocationContext(obligation.binder) &&
+              origin !== undefined &&
+              AuthoredIdentity.anchorKey(origin) ===
+                AuthoredIdentity.anchorKey(obligation.origin) &&
+              expected !== undefined &&
+              expected.length ===
+                inputs.filter(({ input }) => input.capture === undefined).length &&
+              inputs
+                .filter(({ input }) => input.capture === undefined)
+                .every(
+                  ({ input, argument }, position) =>
+                    input.parameter === expected.at(position) &&
+                    argument === expression.arguments.at(position),
+                )))
+        if (!valid) {
+          diagnostics.push(
+            Diagnostic.invalidLifetimeBinder(
+              'Invocation-use obligation does not authenticate the actual callable inputs',
+              context.spanOf(expression.anchor),
+            ),
+          )
+        } else if (obligation !== undefined && inputs !== undefined) {
+          const end = LoanView.retainsInvocationInputs(expression)
+            ? (delayedEnd ?? endpointAt(expression.anchor, region))
+            : endpointAt(expression.anchor, region)
+          invocations.push({
+            obligation,
+            call: expression.ref,
+            result: expression.ref,
+            inputs: inputs.map(({ input, argument }) => {
+              const candidate = argument.expression
+              const source = physicalPlace(candidate)
+              const referents = payloadReferents(candidate)
+              return {
+                parameter: input.parameter,
+                argument: argument.ref,
+                type: input.type,
+                ...(input.capture === undefined
+                  ? {}
+                  : {
+                      capture: {
+                        ordinal: input.capture,
+                        callee: expression.callee.ref,
+                        ...(input.capturePath === undefined ? {} : { path: input.capturePath }),
+                      },
+                    }),
+                transfer: (() => {
+                  if (input.capture !== undefined) return 'Capture' as const
+                  if (candidate._tag === 'Borrow') return 'Borrow' as const
+                  if (
+                    candidate._tag === 'Move' ||
+                    categoryOf(index, input.type, copyAssumptions)._tag === 'MoveOnly'
+                  )
+                    return 'Move' as const
+                  return 'Copy' as const
+                })(),
+                ...(source === undefined ? {} : { source }),
+                referents,
+                conditionalContents:
+                  Type.storageParameters(input.type).length > 0 ||
+                  (Type.storageLifetimes(input.type).length > 0 && referents.length === 0),
+              }
+            }),
+            retained: LoanView.retainsInvocationInputs(expression),
+            end: { region: end.region, span: end.span, cleanupOnly: end.cleanupOnly ?? false },
+          })
+        }
         const callActive: Array<LoanFact> = [
           ...active,
           ...delayedLoansAt(context.spanOf(expression.anchor)),
@@ -3258,9 +3643,13 @@ const analyzeLoans = (
           let bindingEnd: LoanEndpoint | undefined
           if (initializerType._tag === 'Available' && Type.isEffect(initializerType.type))
             bindingEnd =
-              runEnds.get(statement.binding.id.ordinal) ??
-              callableEnds.get(statement.binding.id.ordinal) ??
-              fallbackEnd
+              laterExecutableEnd(
+                laterExecutableEnd(
+                  runEnds.get(statement.binding.id.ordinal),
+                  callableEnds.get(statement.binding.id.ordinal),
+                ),
+                viewEnds.get(statement.binding.id.ordinal),
+              ) ?? fallbackEnd
           // A binding that stores an executable holds its captured borrows for as long as it
           // holds that environment, whether it is the binding's own value or sits in a field
           // of the aggregate it names.
@@ -3271,8 +3660,11 @@ const analyzeLoans = (
           )
             bindingEnd =
               laterExecutableEnd(
-                runEnds.get(statement.binding.id.ordinal),
-                callableEnds.get(statement.binding.id.ordinal),
+                laterExecutableEnd(
+                  runEnds.get(statement.binding.id.ordinal),
+                  callableEnds.get(statement.binding.id.ordinal),
+                ),
+                viewEnds.get(statement.binding.id.ordinal),
               ) ?? fallbackEnd
           else if (initializerType._tag === 'Available' && Type.isSlot(initializerType.type))
             bindingEnd = slotEnds.get(statement.binding.id.ordinal) ?? fallbackEnd
@@ -3358,6 +3750,7 @@ const analyzeLoans = (
   statements(fn.statements)
   return {
     loanAccessChecks,
+    invocations,
     loans: loans,
     diagnostics: diagnostics,
   }
@@ -4632,12 +5025,28 @@ const checkFunction = (
   // publishes beside it, extended by the cleanup this pass just planned.
   const loanLifetimes =
     lifetimes === undefined ? undefined : LifetimeFlow.withCleanupUses(lifetimes, cleanupExits)
+  const missingInvocationDomain: Array<Diagnostic.Diagnostic> = []
+  if (loanLifetimes === undefined)
+    LoanView.visitExpressions(LoanView.ofTir(fn, index, artifact).statements, (expression) => {
+      if (
+        expression._tag === 'CallableApply' &&
+        (expression.invocationUse !== undefined ||
+          LoanView.invocationArguments(expression) === undefined)
+      )
+        missingInvocationDomain.push(
+          Diagnostic.invalidLifetimeBinder(
+            'Invocation-use obligation has no caller lifetime domain',
+            context.spanOf(expression.anchor),
+          ),
+        )
+    })
   const loanAnalysis =
     loanLifetimes === undefined
       ? {
           loanAccessChecks: 0,
+          invocations: [],
           loans: [],
-          diagnostics: [],
+          diagnostics: missingInvocationDomain,
         }
       : analyzeLoans(
           { ...LoanView.ofTir(fn, index, artifact), lifetimeFlow: loanLifetimes },
@@ -4740,6 +5149,7 @@ const checkFunction = (
       matches: state.matches,
       callables: state.callables,
       loans: loanAnalysis.loans,
+      invocations: loanAnalysis.invocations,
       replacements: state.replacements,
       transitions: state.transitions,
       verdict,

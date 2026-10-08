@@ -528,6 +528,7 @@ export const specializeCallableSchemaExecutableOwner: Type.CallableSchemaOwnerSp
         Canonical.record('Capture', [`${capture.parameter}`, `${capture.capture}`]),
       ),
     ),
+    ...(contract.invocationUse === undefined ? [] : [Type.invocationUseKey(contract)]),
   ])
   return {
     ...schema,

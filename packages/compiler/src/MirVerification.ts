@@ -1,3 +1,8 @@
+import * as CallableInputView from './CallableInputView.js'
+import * as AuthoredIdentity from './AuthoredIdentity.js'
+import * as Mir from './Mir.js'
+import * as MirNormalization from './MirNormalization.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as CompilerTrace from './CompilerTrace.js'
@@ -687,7 +692,11 @@ const runnerOutcomeMatches = (fn: MirFunction, effect: SilkType.Effect): boolean
   fn.result._tag === 'EffectOutcome' &&
   EffectExecutionContract.matches(fn.result.type, effect, fn.effectRunner?.providers ?? [])
 
-const suspensionViolations = (fn: MirFunction, layout: Layout.Plan): ReadonlyArray<Violation> => {
+const suspensionViolations = (
+  fn: MirFunction,
+  program: InvocationProgram,
+): ReadonlyArray<Violation> => {
+  const layout = program.layout
   const violations: Array<Violation> = []
   const projectedProviderValid = (
     provider: SuspensionProviderArgument & { readonly argument: LocalId },
@@ -898,6 +907,76 @@ const suspensionViolations = (fn: MirFunction, layout: Layout.Plan): ReadonlyArr
     )
       invalid('InvalidCoroutineFrame', 'continuation runner or typed outcome is stale')
     const slots = descriptor.slots
+    const holders = [
+      ...operationLocals(region.operation).filter((local) => {
+        if (
+          'destination' in region.operation &&
+          local.ordinal === region.operation.destination.ordinal
+        )
+          return false
+        if ('outcome' in region.operation && local.ordinal === region.operation.outcome.ordinal)
+          return false
+        if (
+          region.operation._tag === 'CatchEffect' &&
+          (local.ordinal === region.operation.successValue.ordinal ||
+            local.ordinal === region.operation.failureValue.ordinal)
+        )
+          return false
+        return true
+      }),
+      ...slots.map((slot) => slot.local),
+    ]
+    const inputRetention = invocationRetentions(fn, program, holders)
+    if (inputRetention.issues.length > 0)
+      invalid('InvalidCoroutineFrame', 'continuation invocation borrowed contents remain unproved')
+    if (
+      inputRetention.retentions.map(invocationRetentionText).sort().join('\n') !==
+      (descriptor.invocationUses ?? []).map(invocationRetentionText).sort().join('\n')
+    )
+      invalid(
+        'InvalidCoroutineFrame',
+        'continuation loses or fabricates an exact invocation holder dependency',
+      )
+    const canonicalStates =
+      suspension.frame?.states.filter((state) => sameSuspensionPoint(state.point, region.point)) ??
+      []
+    const canonicalState = canonicalStates.length === 1 ? canonicalStates.at(0) : undefined
+    if (
+      canonicalState === undefined ||
+      inputRetention.retentions.map(invocationRetentionText).sort().join('\n') !==
+        (canonicalState.invocationUses ?? []).map(invocationRetentionText).sort().join('\n')
+    )
+      invalid(
+        'InvalidCoroutineFrame',
+        'canonical frame loses or fabricates an exact invocation holder dependency',
+      )
+    for (const retention of inputRetention.retentions)
+      for (const dependency of [...retention.dependencies, ...retention.environment])
+        for (const referent of dependency.referents)
+          if (
+            !slots.some((slot) => slot.local.ordinal === referent.root.ordinal) ||
+            initializationOf(fn, layout).before.get(region.operation)?.get(referent.root.ordinal)
+              ?.initialization === 'Missing'
+          )
+            invalid(
+              'InvalidCoroutineFrame',
+              'continuation loses an initialized invocation input external referent owner',
+            )
+    const orderedReleases = invocationReleaseOrder(
+      inputRetention.retentions,
+      descriptor.failure.releases,
+    )
+    if (
+      orderedReleases === undefined ||
+      orderedReleases.some(
+        (release, ordinal) =>
+          release.local.ordinal !== descriptor.failure.releases.at(ordinal)?.local.ordinal,
+      )
+    )
+      invalid(
+        'InvalidCoroutineFrame',
+        'cancellation releases an invocation referent before its owned holder',
+      )
     const slotOrdinals = slots.map((slot) => slot.ordinal)
     const localOrdinals = slots.map((slot) => slot.local.ordinal)
     const expectedOrdinals = slots.map((_slot, ordinal) => ordinal)
@@ -1013,6 +1092,1766 @@ const suspensionViolations = (fn: MirFunction, layout: Layout.Plan): ReadonlyArr
   }
   return violations
 }
+
+/** A conditional input remains unresolved until its concrete producer is available. */
+export interface InvocationUseIssue {
+  readonly _tag: 'InvalidInvocationUse' | 'ConditionalInvocationInput'
+  readonly operation: Operation
+  readonly detail: string
+}
+
+const invocationDefinitions = (fn: MirFunction): ReadonlyMap<number, ReadonlyArray<Operation>> => {
+  const definitions = new Map<number, Array<Operation>>()
+  const add = (local: LocalId, operation: Operation): void => {
+    const current = definitions.get(local.ordinal) ?? []
+    if (!current.includes(operation)) current.push(operation)
+    definitions.set(local.ordinal, current)
+  }
+  for (const operation of operations(fn)) {
+    if ('destination' in operation && operation.destination !== undefined)
+      add(operation.destination, operation)
+    if (operation._tag === 'CatchEffect') {
+      add(operation.outcome, operation)
+      add(operation.successValue, operation)
+      add(operation.failureValue, operation)
+    } else if (
+      operation._tag === 'RunEffect' ||
+      operation._tag === 'RunEffectValue' ||
+      operation._tag === 'RunStaticEffect' ||
+      operation._tag === 'RunEffectComposite'
+    )
+      add(operation.outcome, operation)
+    if (operation._tag === 'Match')
+      for (const arm of operation.arms)
+        for (const binding of arm.bindings) add(binding.destination, operation)
+  }
+  return definitions
+}
+
+const relatedAuthoredOwners = (
+  left: AuthoredIdentity.Identity,
+  right: AuthoredIdentity.Identity,
+): boolean =>
+  left.module === right.module &&
+  left.namespace === right.namespace &&
+  (left.path.length <= right.path.length
+    ? AuthoredIdentity.key(left) ===
+      AuthoredIdentity.key({ ...right, path: right.path.slice(0, left.path.length) })
+    : AuthoredIdentity.key(right) ===
+      AuthoredIdentity.key({ ...left, path: left.path.slice(0, right.path.length) }))
+
+interface RecoveryScope {
+  readonly outcome: LocalId
+  readonly recipe?: Tir.RecoveryInvocationRecipe
+}
+const recoveryScopes = (fn: MirFunction): ReadonlyMap<Operation, RecoveryScope> => {
+  const scopes = new Map<Operation, RecoveryScope>()
+  const visit = (
+    execution: Pick<Mir.Execution, 'regions' | 'recoveryOutcome' | 'recoveryInvocation'>,
+    inherited?: RecoveryScope,
+  ): void => {
+    const scope =
+      execution.recoveryOutcome === undefined
+        ? inherited
+        : {
+            outcome: execution.recoveryOutcome,
+            ...(execution.recoveryInvocation === undefined
+              ? {}
+              : { recipe: execution.recoveryInvocation }),
+          }
+    for (const region of regionsTree(execution.regions))
+      for (const operation of operationsOf(region)) {
+        if (scope !== undefined) scopes.set(operation, scope)
+        if (operation._tag === 'DiagnosticScope') visit(operation.body, scope)
+        else if (operation._tag === 'Conditional') {
+          visit(operation.taken, scope)
+          visit(operation.otherwise, scope)
+        } else if (operation._tag === 'ShortCircuit') visit(operation.right, scope)
+        else if (operation._tag === 'Match')
+          for (const arm of operation.arms) {
+            if (arm.guard !== undefined) visit(arm.guard.execution, scope)
+            visit(arm.selected.execution, scope)
+          }
+      }
+  }
+  visit(fn)
+  return scopes
+}
+
+const invocationCapturedSource = (
+  definitions: ReadonlyMap<number, ReadonlyArray<Operation>>,
+  container: LocalId,
+  ordinal: number,
+  parameter: number,
+  source?: AuthoredIdentity.Anchor,
+  path?: ReadonlyArray<Tir.InvocationCapturePathStep>,
+  seen: ReadonlySet<number> = new Set(),
+): LocalId | undefined => {
+  if (seen.has(container.ordinal)) return undefined
+  const next = new Set([...seen, container.ordinal])
+  const candidates = definitions.get(container.ordinal) ?? []
+  if (candidates.length !== 1) return undefined
+  const definition = candidates.at(0)
+  if (definition?._tag === 'Move')
+    return invocationCapturedSource(
+      definitions,
+      definition.source,
+      ordinal,
+      parameter,
+      source,
+      path,
+      next,
+    )
+  if (definition?._tag !== 'MakeCallable') return undefined
+  const step = path?.at(0)
+  if (step !== undefined) {
+    if (
+      definition.type.site === undefined ||
+      Tir.executableSiteKey(step.site) !== Tir.executableSiteKey(definition.type.site)
+    )
+      return undefined
+    if (step._tag === 'Base')
+      return definition.base === undefined
+        ? undefined
+        : invocationCapturedSource(
+            definitions,
+            definition.base,
+            ordinal,
+            parameter,
+            source,
+            path?.slice(1),
+            next,
+          )
+    const capture = definition.captures.find((capture) => capture.ordinal === step.ordinal)
+    if (capture === undefined) return undefined
+    if ((path?.length ?? 0) > 1)
+      return invocationCapturedSource(
+        definitions,
+        capture.source,
+        ordinal,
+        parameter,
+        source,
+        path?.slice(1),
+        next,
+      )
+    return capture.parameterOrdinal === parameter &&
+      source !== undefined &&
+      capture.sourceOrigin !== undefined &&
+      AuthoredIdentity.anchorKey(source) === AuthoredIdentity.anchorKey(capture.sourceOrigin)
+      ? capture.source
+      : undefined
+  }
+  const matches = definition.captures.filter(
+    (capture) => capture.ordinal === ordinal && capture.parameterOrdinal === parameter,
+  )
+  const capture = matches.at(0)
+  if (matches.length === 1 && capture !== undefined)
+    return source !== undefined &&
+      capture.sourceOrigin !== undefined &&
+      AuthoredIdentity.anchorKey(source) === AuthoredIdentity.anchorKey(capture.sourceOrigin)
+      ? capture.source
+      : undefined
+  return definition.base === undefined
+    ? undefined
+    : invocationCapturedSource(definitions, definition.base, ordinal, parameter, source, path, next)
+}
+
+/** Checked incoming section storage is authority only at its actual authored parameter boundary. */
+const invocationHeaderCapture = (
+  fn: MirFunction,
+  input: Mir.InvocationUse['inputs'][number],
+  program: InvocationProgram,
+):
+  | {
+      readonly contents: ReadonlyArray<
+        Mir.InvocationUseRetention['dependencies'][number]['contents'][number]
+      >
+      readonly conditional: boolean
+    }
+  | undefined => {
+  if (input.capture === undefined || input.header === undefined || fn.sourceOwner === undefined)
+    return undefined
+  const definitions = invocationDefinitions(fn)
+  const actualContainer = fn.localTypes.at(input.argument.ordinal)
+  if (actualContainer?._tag !== 'CallableValue') return undefined
+  let declared = input.argument
+  const seen = new Set<number>()
+  for (;;) {
+    if (seen.has(declared.ordinal)) return undefined
+    seen.add(declared.ordinal)
+    const candidates = definitions.get(declared.ordinal) ?? []
+    if (candidates.length === 0) break
+    const producer = candidates.length === 1 ? candidates.at(0) : undefined
+    if (producer?._tag !== 'Move') return undefined
+    const previous = fn.localTypes.at(producer.source.ordinal)
+    if (previous?._tag !== 'CallableValue' || !SilkType.equals(previous.type, actualContainer.type))
+      return undefined
+    declared = producer.source
+  }
+  if (declared.ordinal >= fn.parameterCount) return undefined
+  const capture = input.capture
+  const declaredHeaders = fn.sourceParameters ?? []
+  if (
+    new Set(declaredHeaders.map((parameter) => parameter.local.ordinal)).size !==
+      declaredHeaders.length ||
+    new Set(declaredHeaders.map((parameter) => parameter.parameter)).size !== declaredHeaders.length
+  )
+    return undefined
+  const headers = declaredHeaders.filter(
+    (parameter) =>
+      parameter.local.ordinal === declared.ordinal &&
+      parameter.parameter === input.header?.parameter &&
+      AuthoredIdentity.anchorKey(parameter.source) ===
+        AuthoredIdentity.anchorKey(input.header.source),
+  )
+  const header = headers.length === 1 ? headers.at(0) : undefined
+  const container = fn.localTypes.at(declared.ordinal)
+  if (
+    header === undefined ||
+    container?._tag !== 'CallableValue' ||
+    !SilkType.isCallable(header.type) ||
+    !SilkType.equals(header.type, container.type) ||
+    header.source.owner.module !== fn.sourceOwner.module ||
+    !Number.isSafeInteger(header.parameter) ||
+    header.parameter < 0
+  )
+    return undefined
+  const schema = header.type.schema
+  const field = container.environment?.fields.at(input.capture)
+  if (
+    field === undefined ||
+    field.ordinal !== input.capture ||
+    field.parameterOrdinal !== input.parameter ||
+    !SilkType.equals(field.type, input.type) ||
+    (schema !== undefined &&
+      !SilkType.invocationAdapterValid(
+        header.type.invocationUse,
+        header.type.parameters.length,
+        schema,
+      ))
+  )
+    return undefined
+  const sourceView =
+    schema === undefined ? CallableInputView.authenticate(program, container) : undefined
+  const originalInputs =
+    schema === undefined
+      ? sourceView?.inputs
+      : (schema.invocationAdapter?.originalInputs ??
+        SilkType.callableInputOrdinals(schema.contract))
+  const visible =
+    schema === undefined
+      ? sourceView?.visible
+      : (schema.invocationAdapter?.parameters ??
+        Array.from({ length: header.type.parameters.length }, (_, ordinal) => ordinal))
+  if (
+    originalInputs === undefined ||
+    !originalInputs.includes(input.parameter) ||
+    visible === undefined ||
+    visible.includes(input.parameter)
+  )
+    return undefined
+  // The incoming boundary's canonical flattened field is the path. An old formation path and
+  // anchor remain provenance; neither manufactures a captured local or a second cleanup owner.
+  const retained = SilkType.retention(input.type)
+  return {
+    conditional: retained.unknown.length !== 0,
+    contents: retained.regions.map((region) => ({
+      parameter: header.parameter,
+      path: [{ _tag: 'Capture', ordinal: capture }],
+      type: input.type,
+      region,
+    })),
+  }
+}
+
+/** Authenticates real call operands and selected recovery branches before any retention proof. */
+export const invocationUseIssues = (
+  fn: MirFunction,
+  program: InvocationProgram,
+): ReadonlyArray<InvocationUseIssue> => {
+  const issues: Array<InvocationUseIssue> = []
+  const definitions = invocationDefinitions(fn)
+  const recoveries = recoveryScopes(fn)
+  const sourceOfFailure = (
+    local: LocalId,
+    outcome: LocalId,
+    seen: ReadonlySet<number> = new Set(),
+  ): boolean => {
+    if (seen.has(local.ordinal)) return false
+    const candidates = definitions.get(local.ordinal) ?? []
+    if (candidates.length !== 1) return false
+    const definition = candidates.at(0)
+    if (definition?._tag === 'CatchEffect')
+      return (
+        definition.outcome.ordinal === outcome.ordinal &&
+        definition.failureValue.ordinal === local.ordinal
+      )
+    const next = new Set([...seen, local.ordinal])
+    if (definition?._tag === 'Move' || definition?._tag === 'ConvertUnion')
+      return sourceOfFailure(definition.source, outcome, next)
+    if (definition?._tag === 'Match')
+      return (
+        definition.arms.some((arm) =>
+          arm.bindings.some((binding) => binding.destination.ordinal === local.ordinal),
+        ) && sourceOfFailure(definition.scrutinee, outcome, next)
+      )
+    return false
+  }
+  for (const actualOperation of operations(fn)) {
+    if (
+      actualOperation._tag === 'MakeEffect' &&
+      actualOperation.invocationSource !== undefined &&
+      !MirNormalization.invocationConstructionValid(program, actualOperation)
+    ) {
+      issues.push({
+        _tag: 'InvalidInvocationUse',
+        operation: actualOperation,
+        detail: 'folded invocation loses its exact actual constructor proof',
+      })
+      continue
+    }
+    const operation =
+      actualOperation._tag === 'MakeEffect' ? actualOperation.invocationSource : actualOperation
+    if (operation === undefined) continue
+    if (operation._tag !== 'Call' && operation._tag !== 'ApplyCallable') continue
+    const invocation = operation.invocationUse
+    if (invocation === undefined) {
+      if (operation._tag === 'ApplyCallable' && operation.callableType.invocationUse !== undefined)
+        issues.push({
+          _tag: 'InvalidInvocationUse',
+          operation,
+          detail: 'marked callable application omits its actual invocation inputs',
+        })
+      continue
+    }
+    const invalid = (detail: string): void => {
+      issues.push({ _tag: 'InvalidInvocationUse', operation, detail })
+    }
+    if (operation._tag === 'Call') {
+      const targets = program.functions.filter((target) =>
+        matchesCall(
+          target,
+          operation.target,
+          operation.typeArguments,
+          operation.staticArguments,
+          operation.type,
+        ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      if (
+        target === undefined ||
+        target.parameterCount !== operation.arguments.length ||
+        !operation.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            callArgumentCompatible(actual, expected)
+          )
+        })
+      )
+        invalid(
+          'invocation original call loses its unique selected target or actual input contract',
+        )
+    } else {
+      if (
+        operation.access !== operation.callableType.mode ||
+        operation.arguments.length !== operation.callableType.parameters.length ||
+        !operation.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = operation.callableType.parameters.at(ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            acceptsRuntimeOperand(semanticType(actual), expected)
+          )
+        })
+      )
+        invalid(
+          'invocation original callable loses its actual mode or complete visible input contract',
+        )
+      if (operation.realization === 'DirectErasedSection') {
+        const targetId =
+          operation.target?._tag === 'DeclarationCallableTarget'
+            ? operation.target.declaration
+            : undefined
+        const targets =
+          targetId === undefined
+            ? []
+            : program.functions.filter((target) =>
+                matchesCall(target, targetId, operation.typeArguments, undefined, operation.type),
+              )
+        const target = targets.length === 1 ? targets.at(0) : undefined
+        const supplied = new Map<number, LocalId>()
+        const coordinates = operation.callableType.schema?.invocationAdapter?.parameters
+        for (const [ordinal, argument] of operation.arguments.entries())
+          supplied.set(coordinates?.at(ordinal) ?? ordinal, argument)
+        for (const capture of operation.captures) {
+          if (supplied.has(capture.parameterOrdinal))
+            invalid('invocation original target input is supplied twice')
+          supplied.set(capture.parameterOrdinal, capture.source)
+        }
+        if (
+          operation.callable !== undefined ||
+          target === undefined ||
+          supplied.size !== target.parameterCount ||
+          [...supplied].some(([ordinal, local]) => {
+            const actual = fn.localTypes.at(local.ordinal)
+            const expected = target?.localTypes.at(ordinal)
+            return (
+              actual === undefined ||
+              expected === undefined ||
+              !callArgumentCompatible(actual, expected)
+            )
+          })
+        )
+          invalid('invocation erased original target loses complete actual parameter wiring')
+      }
+    }
+    if (
+      fn.sourceOwner === undefined ||
+      invocation.owner.module !== fn.sourceOwner.module ||
+      invocation.owner.name !== fn.sourceOwner.name ||
+      invocation.lifetime._tag !== 'LocalLifetime' ||
+      invocation.lifetime.owner.module !== invocation.owner.module ||
+      invocation.lifetime.owner.name !== invocation.owner.name ||
+      invocation.origin.owner.module !== invocation.owner.module ||
+      invocation.binder._tag !== 'BoundLifetime' ||
+      invocation.result.ordinal !== operation.destination.ordinal
+    )
+      invalid('invocation identity, source owner, or actual returned local is stale')
+    if (operation._tag === 'ApplyCallable' && operation.callableType.invocationUse !== undefined) {
+      const actual =
+        operation.callable === undefined ? undefined : fn.localTypes.at(operation.callable.ordinal)
+      const actualTarget = actual?._tag === 'CallableValue' ? actual.target : operation.target
+      const targetId =
+        actualTarget?._tag === 'DeclarationCallableTarget' ? actualTarget.declaration : undefined
+      const targets =
+        targetId === undefined
+          ? []
+          : program.functions.filter((target) =>
+              matchesCall(
+                target,
+                targetId,
+                actual?._tag === 'CallableValue'
+                  ? (actual.typeArguments ?? [])
+                  : operation.typeArguments,
+                undefined,
+                operation.type,
+              ),
+            )
+      const selected = targets.length === 1 ? targets.at(0) : undefined
+      const inputSource =
+        actual?._tag === 'CallableValue' &&
+        actual.inputView !== undefined &&
+        ExecutableInputView.physicalCallable(program, actual) !== undefined
+          ? ExecutableInputView.authenticate(program.executableInputViews ?? [], actual.inputView)
+          : undefined
+      const viewedDesignation =
+        inputSource?.selected.invocationSource?.selected.invocationUse?.lifetime
+      // A parameter descriptor may carry the required callable view. Only a concrete
+      // environment or the uniquely selected source header supplies the offered designation.
+      const originalDesignation =
+        actual?._tag === 'CallableValue' && actual.environment !== undefined
+          ? (actual.environment.callable.type.invocationUse?.lifetime ?? viewedDesignation)
+          : (selected?.sourceInvocationUse?.lifetime ?? viewedDesignation)
+      if (
+        originalDesignation?._tag === 'BoundLifetime' &&
+        !Lifetime.equals(originalDesignation, invocation.binder)
+      )
+        invalid('invocation loses its authentic offered original use binder')
+      if (invocation.kind === 'Recovery' && originalDesignation === undefined) {
+        const requiredBinder = recoveries.get(actualOperation)?.recipe?.binder
+        if (requiredBinder === undefined || !Lifetime.equals(requiredBinder, invocation.binder))
+          invalid('recovery invocation loses its checked original required use binder')
+      }
+      if (invocation.kind === 'Source') {
+        const required = fn.sourceParameters?.find(
+          (parameter) => parameter.local.ordinal === operation.callable?.ordinal,
+        )?.contract
+        const requiredBinder =
+          (actual?._tag === 'CallableValue'
+            ? actual.type.schema?.invocationAdapter?.binder
+            : undefined) ??
+          (required !== undefined && SilkType.isCallable(required)
+            ? required.invocationUse?.lifetime
+            : undefined)
+        if (
+          requiredBinder?._tag === 'BoundLifetime' &&
+          originalDesignation === undefined &&
+          !Lifetime.equals(requiredBinder, invocation.binder)
+        )
+          invalid('invocation loses its checked original required use binder')
+      }
+      const usage = operation.callableType.invocationUse
+      if (
+        !SilkType.invocationUseValid(
+          usage,
+          operation.callableType.parameters.length,
+          operation.callableType.lifetimeBinders,
+          { state: SilkType.invocationUseState(operation.callableType) },
+        ) ||
+        !(
+          Lifetime.equals(usage.lifetime, invocation.binder) ||
+          Lifetime.equals(usage.lifetime, invocation.lifetime)
+        )
+      )
+        invalid('invocation selected lifetime does not open its actual callable designation')
+    }
+    if (
+      SilkType.freeLifetimes(semanticType(operation.type)).some((lifetime) =>
+        Lifetime.atoms(lifetime).some((atom) => Lifetime.equals(atom, invocation.binder)),
+      )
+    )
+      invalid('actual invocation result retains its unopened rigid designation')
+    if (
+      new Set(invocation.inputs.map((input) => input.parameter)).size !== invocation.inputs.length
+    )
+      invalid('invocation duplicates an original input coordinate')
+    const schema = operation._tag === 'ApplyCallable' ? operation.callableType.schema : undefined
+    let originalInputs: ReadonlyArray<number> | undefined
+    if (operation._tag !== 'ApplyCallable')
+      originalInputs = Array.from({ length: operation.arguments.length }, (_, ordinal) => ordinal)
+    else if (schema === undefined) {
+      const actual =
+        operation.callable === undefined ? undefined : fn.localTypes.at(operation.callable.ordinal)
+      const sourceView =
+        actual?._tag === 'CallableValue' && actual.environment !== undefined
+          ? CallableInputView.authenticate(program, actual)
+          : undefined
+      originalInputs =
+        actual?._tag === 'CallableValue' && actual.environment !== undefined
+          ? sourceView?.inputs
+          : (operation.callableType.invocationUse?.parameters ??
+            Array.from(
+              { length: operation.callableType.parameters.length },
+              (_, ordinal) => ordinal,
+            ))
+    } else
+      originalInputs =
+        schema.invocationAdapter?.originalInputs ?? SilkType.callableInputOrdinals(schema.contract)
+    if (
+      originalInputs === undefined ||
+      invocation.inputs.length !== originalInputs.length ||
+      originalInputs.some(
+        (ordinal) => !invocation.inputs.some((input) => input.parameter === ordinal),
+      ) ||
+      (schema !== undefined &&
+        !SilkType.invocationAdapterValid(
+          operation._tag === 'ApplyCallable' ? operation.callableType.invocationUse : undefined,
+          operation.arguments.length,
+          schema,
+        ))
+    )
+      invalid('invocation fails complete original target input coverage')
+    const callable =
+      operation._tag === 'ApplyCallable' && operation.callable !== undefined
+        ? fn.localTypes.at(operation.callable.ordinal)
+        : undefined
+    const coordinates =
+      operation._tag === 'ApplyCallable'
+        ? (operation.callableType.schema?.invocationAdapter?.parameters ??
+          (callable?._tag === 'CallableValue' &&
+          callable.type.schema === undefined &&
+          callable.environment !== undefined
+            ? CallableInputView.authenticate(program, callable)?.visible
+            : undefined))
+        : undefined
+    for (const [ordinal, argument] of operation.arguments.entries()) {
+      const original = coordinates?.at(ordinal) ?? ordinal
+      if (
+        !invocation.inputs.some(
+          (input) =>
+            input.capture === undefined &&
+            input.parameter === original &&
+            input.argument.ordinal === argument.ordinal,
+        )
+      )
+        invalid('invocation operand loses its exact original target parameter coordinate')
+    }
+    if (operation._tag === 'ApplyCallable') {
+      for (const capture of operation.captures.filter((capture) =>
+        originalInputs?.includes(capture.parameterOrdinal),
+      ))
+        if (
+          !invocation.inputs.some(
+            (input) =>
+              input.capture === undefined &&
+              input.parameter === capture.parameterOrdinal &&
+              input.argument.ordinal === capture.source.ordinal,
+          )
+        )
+          invalid('invocation omits a directly retained original captured input')
+    }
+    const visible = invocation.inputs.filter(
+      (input) =>
+        input.capture === undefined &&
+        operation.arguments.some((argument) => argument.ordinal === input.argument.ordinal),
+    )
+    if (
+      operation.arguments.some(
+        (argument) => !visible.some((input) => input.argument.ordinal === argument.ordinal),
+      )
+    )
+      invalid('invocation omits an actual supplied operand')
+    for (const input of invocation.inputs) {
+      if (
+        !Number.isSafeInteger(input.parameter) ||
+        input.parameter < 0 ||
+        (invocation.kind === 'Source' && input.source === undefined) ||
+        (input.capture === undefined &&
+          input.source !== undefined &&
+          !relatedAuthoredOwners(input.source.owner, invocation.origin.owner))
+      )
+        invalid('invocation input loses its original coordinate or authored source')
+      let actual = input.argument
+      if (input.capture !== undefined) {
+        const container = fn.localTypes.at(input.argument.ordinal)
+        const field =
+          container?._tag === 'CallableValue'
+            ? container.environment?.fields.at(input.capture)
+            : undefined
+        const captured = invocationCapturedSource(
+          definitions,
+          input.argument,
+          input.capture,
+          input.parameter,
+          input.source,
+          input.capturePath,
+        )
+        const incoming = invocationHeaderCapture(fn, input, program)
+        if (
+          operation._tag !== 'ApplyCallable' ||
+          operation.callable?.ordinal !== input.argument.ordinal ||
+          field === undefined ||
+          field.parameterOrdinal !== input.parameter ||
+          !SilkType.equals(field.type, input.type) ||
+          (captured === undefined && incoming === undefined)
+        ) {
+          invalid('invocation captured input lacks its exact retained callable slot producer')
+          continue
+        }
+        if (captured === undefined) {
+          if (incoming?.conditional)
+            issues.push({
+              _tag: 'ConditionalInvocationInput',
+              operation,
+              detail:
+                'incoming captured input retains an unresolved exact-header contents obligation',
+            })
+          continue
+        }
+        actual = captured
+      } else if (
+        !operation.arguments.some((argument) => argument.ordinal === input.argument.ordinal)
+      ) {
+        const capture =
+          operation._tag === 'ApplyCallable'
+            ? operation.captures.find(
+                (capture) =>
+                  capture.parameterOrdinal === input.parameter &&
+                  capture.source.ordinal === input.argument.ordinal,
+              )
+            : undefined
+        if (
+          capture === undefined ||
+          capture.sourceOrigin === undefined ||
+          input.source === undefined ||
+          AuthoredIdentity.anchorKey(capture.sourceOrigin) !==
+            AuthoredIdentity.anchorKey(input.source)
+        ) {
+          invalid('invocation input is not an authenticated direct stored original capture')
+          continue
+        }
+      }
+      const actualType = fn.localTypes.at(actual.ordinal)
+      if (actualType === undefined || !SilkType.equals(semanticType(actualType), input.type))
+        invalid('invocation input type disagrees with its actual MIR local')
+      if (
+        SilkType.retention(input.type).unknown.length > 0 &&
+        SilkType.retention(semanticType(operation.type)).regions.some((region) =>
+          Lifetime.equals(region, invocation.lifetime),
+        )
+      )
+        issues.push({
+          _tag: 'ConditionalInvocationInput',
+          operation,
+          detail: 'generic invocation contents retain an unresolved exact-input obligation',
+        })
+    }
+    if (invocation.kind === 'Recovery') {
+      const scope = recoveries.get(actualOperation)
+      const recipe = scope?.recipe
+      const input = invocation.inputs.find(
+        (input) => input.capture === undefined && input.parameter === 0,
+      )
+      if (
+        operation._tag !== 'ApplyCallable' ||
+        scope === undefined ||
+        recipe === undefined ||
+        input === undefined ||
+        !sourceOfFailure(input.argument, scope.outcome) ||
+        !Lifetime.equals(recipe.lifetime, invocation.lifetime) ||
+        recipe.owner.module !== invocation.owner.module ||
+        recipe.owner.name !== invocation.owner.name ||
+        AuthoredIdentity.anchorKey(recipe.origin) !==
+          AuthoredIdentity.anchorKey(invocation.origin) ||
+        !SilkType.equals(recipe.selected, input.type)
+      )
+        invalid('recovery invocation is not owned by the actual selected caught failure branch')
+    }
+  }
+  return issues
+}
+
+type InvocationDependency = Mir.InvocationUseRetention['dependencies'][number]
+type InvocationContents = InvocationDependency['contents'][number]
+
+/** Canonical source authority for a header parameter's external borrowed contents. */
+const invocationHeaderContents = (
+  fn: MirFunction,
+  program: InvocationProgram,
+  parameter: number,
+): ReadonlyArray<InvocationContents> | undefined => {
+  const layout = program.layout
+  const declared = fn.localTypes.at(parameter)
+  const sourceOwner = fn.sourceOwner
+  if (parameter >= fn.parameterCount || declared === undefined || sourceOwner === undefined)
+    return undefined
+  const contents: Array<InvocationContents> = []
+  const active = new Set<string>()
+  const visit = (type: SilkType.Type, path: InvocationContents['path']): boolean => {
+    const key = SilkType.key(type)
+    if (active.has(key)) return false
+    const retention = SilkType.retention(type)
+    if (retention.unknown.length > 0) return false
+    if (retention.regions.length === 0) return true
+    if (
+      SilkType.isReference(type) ||
+      SilkType.isSlice(type) ||
+      SilkType.isString(type) ||
+      SilkType.isCallable(type) ||
+      SilkType.isEffect(type) ||
+      SilkType.isRepresented(type)
+    ) {
+      // A checked header denotes an external referent, never a local cell allocated by this body.
+      if (
+        retention.regions.some((region) =>
+          operations(fn).some(
+            (operation) =>
+              ((operation._tag === 'Call' || operation._tag === 'ApplyCallable') &&
+                operation.invocationUse !== undefined &&
+                Lifetime.equals(region, operation.invocationUse.lifetime)) ||
+              (operation._tag === 'MakeEffect' &&
+                operation.invocationSource?.invocationUse !== undefined &&
+                Lifetime.equals(region, operation.invocationSource.invocationUse.lifetime)),
+          ),
+        )
+      )
+        return false
+      contents.push(...retention.regions.map((region) => ({ parameter, path, type, region })))
+      return true
+    }
+    active.add(key)
+    const entry = Layout.entry(layout, type)
+    const representation = entry?.representation
+    // Physical entries erase lifetime coordinates. They cannot supply a different instance's
+    // semantic field regions; the checked incoming contract is the authority for that domain.
+    if (
+      SilkType.isNominal(type) &&
+      entry !== undefined &&
+      (!SilkType.equals(entry.type, type) || representation?._tag === 'Reference')
+    ) {
+      contents.push(
+        ...retention.regions
+          .slice()
+          .sort((left, right) => Lifetime.key(left).localeCompare(Lifetime.key(right)))
+          .map((region, component) => ({
+            parameter,
+            path: [...path, { _tag: 'DeclaredContents' as const, component }],
+            type,
+            region,
+          })),
+      )
+      active.delete(key)
+      return true
+    }
+    const before = contents.length
+    let valid = false
+    if (representation?._tag === 'Aggregate')
+      valid = representation.fields.every((field) =>
+        visit(field.type, [...path, { _tag: 'Field', field: field.id }]),
+      )
+    else if (representation?._tag === 'Repeated' && SilkType.isFixedArray(type))
+      valid = Array.from({ length: representation.length }, (_, index) =>
+        visit(type.element, [...path, { _tag: 'Element', index }]),
+      ).every(Boolean)
+    else if (representation?._tag === 'Union' && SilkType.isUnion(type))
+      valid = representation.members.every((member) => {
+        const actual = type.members.filter(
+          (candidate) => SilkType.runtimeKey(candidate) === SilkType.runtimeKey(member.type),
+        )
+        const selected = actual.length === 1 ? actual.at(0) : undefined
+        return (
+          selected !== undefined &&
+          visit(selected, [...path, { _tag: 'Variant', ordinal: member.ordinal }])
+        )
+      })
+    else if (representation?._tag === 'NominalUnion')
+      valid = representation.variants.every((variant) =>
+        variant.fields.every((field) =>
+          visit(field.type, [
+            ...path,
+            { _tag: 'Variant', ordinal: variant.ordinal },
+            { _tag: 'Field', field: field.id },
+          ]),
+        ),
+      )
+    if (
+      valid &&
+      !retention.regions.every((region) =>
+        contents.slice(before).some((content) => Lifetime.equals(content.region, region)),
+      )
+    ) {
+      // Known nominal storage can hide retained contents behind its declared contract. Unknown
+      // generic contents were rejected above; a named region is not an empty-storage certificate.
+      if (SilkType.isNominal(type) && entry !== undefined) {
+        contents.push(
+          ...retention.regions
+            .filter(
+              (region) =>
+                !contents.slice(before).some((content) => Lifetime.equals(content.region, region)),
+            )
+            .sort((left, right) => Lifetime.key(left).localeCompare(Lifetime.key(right)))
+            .map((region, component) => ({
+              parameter,
+              path: [...path, { _tag: 'DeclaredContents' as const, component }],
+              type,
+              region,
+            })),
+        )
+      } else valid = false
+    }
+    active.delete(key)
+    return valid
+  }
+  if (declared._tag === 'EffectValue' && declared.inputView !== undefined) {
+    const physical = ExecutableInputView.physical(program, declared)
+    const headers =
+      fn.sourceParameters?.filter(
+        (header) =>
+          header.local.ordinal === parameter && SilkType.equals(header.type, declared.type),
+      ) ?? []
+    const header = headers.at(0)
+    if (
+      physical === undefined ||
+      headers.length !== 1 ||
+      header === undefined ||
+      header.source.owner.module !== sourceOwner.module ||
+      declared.inputView.view.target.module !== sourceOwner.module ||
+      declared.inputView.view.target.name !== sourceOwner.name ||
+      header.parameter !== declared.inputView.view.parameter.ordinal ||
+      AuthoredIdentity.anchorKey(header.source) !==
+        AuthoredIdentity.anchorKey(declared.inputView.view.parameter.source)
+    )
+      return undefined
+    // An incoming closure's authenticated original fields denote external borrowed
+    // contents. The contextual success/failure channels cannot manufacture them.
+    return physical.environment.fields.every((field) =>
+      visit(field.type, [{ _tag: 'Capture', ordinal: field.ordinal }]),
+    )
+      ? contents
+      : undefined
+  }
+  return visit(semanticType(declared), []) ? contents : undefined
+}
+
+export interface InvocationRetentionAnalysis {
+  readonly retentions: ReadonlyArray<Mir.InvocationUseRetention>
+  readonly issues: ReadonlyArray<InvocationUseIssue>
+}
+
+type InvocationProgram = Pick<
+  Mir.Module,
+  'layout' | 'functions' | 'executableInputViews' | 'callableInputSources'
+>
+
+type InvocationChannel = 'Value' | 'Success' | 'Failure'
+
+/** Real returned producer edges, expressed in the selected body's incoming parameter coordinates. */
+const invocationReturnedParameters = (
+  program: InvocationProgram,
+  fn: MirFunction,
+  channel: InvocationChannel,
+  active: ReadonlySet<MirFunction> = new Set(),
+): ReadonlySet<number> | undefined => {
+  if (active.has(fn) || fn.sourceOwner === undefined) return undefined
+  const nextFunctions = new Set([...active, fn])
+  const definitions = invocationDefinitions(fn)
+  const parameters = new Set<number>()
+  const walk = (
+    local: LocalId,
+    selected: InvocationChannel,
+    seen: ReadonlySet<number>,
+  ): boolean => {
+    if (seen.has(local.ordinal)) return false
+    const type = fn.localTypes.at(local.ordinal)
+    if (type === undefined) return false
+    if (
+      type._tag !== 'EffectOutcome' &&
+      SilkType.retention(semanticType(type)).regions.length === 0 &&
+      SilkType.retention(semanticType(type)).unknown.length === 0
+    )
+      return true
+    const candidates = definitions.get(local.ordinal) ?? []
+    if (local.ordinal < fn.parameterCount && candidates.length === 0) {
+      parameters.add(local.ordinal)
+      return true
+    }
+    if (candidates.length !== 1) return false
+    const definition = candidates.at(0)
+    const next = new Set([...seen, local.ordinal])
+    const descend = (value: LocalId, kind: InvocationChannel = 'Value'): boolean =>
+      walk(value, kind, next)
+    if (definition?._tag === 'PackEffectOutcome')
+      return (
+        (selected === 'Failure' && definition.tag === 0) ||
+        (selected === 'Success' && definition.tag !== 0) ||
+        descend(definition.source)
+      )
+    if (definition?._tag === 'PackEffectFailureUnion')
+      return selected === 'Success' || descend(definition.source)
+    if (
+      definition?._tag === 'Move' ||
+      definition?._tag === 'ConvertUnion' ||
+      definition?._tag === 'Project' ||
+      definition?._tag === 'PackEffectComposite' ||
+      definition?._tag === 'UnpackEffectComposite'
+    )
+      return descend(definition.source, selected)
+    if (definition?._tag === 'UnpackEffectSuccess') return descend(definition.source, 'Success')
+    if (definition?._tag === 'BeginLoan') {
+      const root = fn.localTypes.at(definition.root.ordinal)
+      // A returned loan of this body's own storage cannot become a caller header authority.
+      return (
+        !borrowsDescriptor(definition) &&
+        (root?._tag === 'Reference' ||
+          root?._tag === 'Slice' ||
+          root?._tag === 'EnvironmentBorrow') &&
+        descend(definition.root)
+      )
+    }
+    if (definition?._tag === 'Construct' || definition?._tag === 'ConstructUnionVariant')
+      return definition.fields.every((field) => descend(field.value))
+    if (definition?._tag === 'ConstructArray')
+      return definition.elements.every((element) => descend(element))
+    if (definition?._tag === 'MakeEffect' || definition?._tag === 'MakeCallable')
+      return (
+        (definition._tag !== 'MakeCallable' ||
+          definition.base === undefined ||
+          descend(definition.base)) &&
+        definition.captures.every((capture) => descend(capture.source))
+      )
+    if (definition?._tag === 'Match') {
+      const arms = definition.arms.filter((arm) =>
+        selectableMatchArms(definition).has(arm.id.ordinal),
+      )
+      if (
+        arms.some((arm) =>
+          arm.bindings.some((binding) => binding.destination.ordinal === local.ordinal),
+        )
+      )
+        return descend(definition.scrutinee)
+      return (
+        definition.destination?.ordinal === local.ordinal &&
+        arms.every(
+          (arm) =>
+            arm.selected.execution.result !== undefined &&
+            descend(arm.selected.execution.result, selected),
+        )
+      )
+    }
+    if (definition?._tag === 'Call') {
+      const targets = program.functions.filter((target) =>
+        matchesCall(
+          target,
+          definition.target,
+          definition.typeArguments,
+          definition.staticArguments,
+          definition.type,
+        ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      if (
+        target === undefined ||
+        target.parameterCount !== definition.arguments.length ||
+        !definition.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            callArgumentCompatible(actual, expected)
+          )
+        })
+      )
+        return false
+      const returned = invocationReturnedParameters(program, target, selected, nextFunctions)
+      return (
+        returned !== undefined &&
+        [...returned].every((ordinal) => {
+          const argument = definition.arguments.at(ordinal)
+          return argument !== undefined && descend(argument)
+        })
+      )
+    }
+    if (definition?._tag === 'RunEffect' || definition?._tag === 'RunStaticEffect') {
+      const inputs =
+        definition._tag === 'RunEffect'
+          ? definition.arguments
+          : [...definition.captures.map((capture) => capture.source), ...definition.arguments]
+      const targets = program.functions.filter((target) =>
+        matchesEffectInstance(
+          target,
+          definition._tag === 'RunEffect' ? definition.target : definition.runner,
+          definition._tag === 'RunEffect'
+            ? definition.typeArguments
+            : definition.runnerTypeArguments,
+          definition._tag === 'RunEffect'
+            ? definition.staticArguments
+            : definition.runnerStaticArguments,
+          definition.outcomeType.type,
+        ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      if (
+        target === undefined ||
+        target.parameterCount !== inputs.length ||
+        !inputs.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            executionArgumentCompatible(actual, expected)
+          )
+        })
+      )
+        return false
+      const returned = invocationReturnedParameters(
+        program,
+        target,
+        local.ordinal === definition.destination.ordinal ? 'Success' : selected,
+        nextFunctions,
+      )
+      return (
+        returned !== undefined &&
+        [...returned].every((ordinal) => {
+          const argument = inputs.at(ordinal)
+          return argument !== undefined && descend(argument)
+        })
+      )
+    }
+    if (definition?._tag === 'RunEffectValue' || definition?._tag === 'CatchEffect') {
+      const effect = fn.localTypes.at(definition.effect.ordinal)
+      const fields = effect?._tag === 'EffectValue' ? effect.environment.fields : undefined
+      const physicalOutcome = ExecutableInputView.outcome(
+        program,
+        effect,
+        definition.outcomeType.type,
+      )
+      const targets = program.functions.filter(
+        (target) =>
+          physicalOutcome !== undefined &&
+          matchesEffectInstance(
+            target,
+            definition.runner,
+            definition.runnerTypeArguments,
+            definition.runnerStaticArguments,
+            physicalOutcome,
+            definition._tag === 'RunEffectValue' ? definition.providers : undefined,
+          ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      if (
+        target === undefined ||
+        fields === undefined ||
+        target.parameterCount !== fields.length + definition.arguments.length ||
+        !fields.every((field, ordinal) => {
+          const expected = target.localTypes.at(ordinal)
+          return expected !== undefined && acceptsRuntimeOperand(field.type, semanticType(expected))
+        }) ||
+        !definition.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(fields.length + ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            callArgumentCompatible(actual, expected)
+          )
+        })
+      )
+        return false
+      let kind = selected
+      if (definition._tag === 'CatchEffect') {
+        if (local.ordinal === definition.failureValue.ordinal) kind = 'Failure'
+        else if (local.ordinal === definition.successValue.ordinal) kind = 'Success'
+      } else if (local.ordinal === definition.destination.ordinal) kind = 'Success'
+      const returned = invocationReturnedParameters(program, target, kind, nextFunctions)
+      return (
+        returned !== undefined &&
+        [...returned].every((ordinal) => {
+          if (ordinal >= fields.length) {
+            const argument = definition.arguments.at(ordinal - fields.length)
+            return argument !== undefined && descend(argument)
+          }
+          const capture = invocationEffectCapture(fn, definition.effect, ordinal)
+          if (capture !== undefined) return descend(capture.source)
+          // An incoming checked Effect is external declared contents authority. This denotes its
+          // environment storage, not a proof fabricated from its success or failure channel type.
+          return (
+            definition.effect.ordinal < fn.parameterCount &&
+            (definitions.get(definition.effect.ordinal) ?? []).length === 0 &&
+            descend(definition.effect)
+          )
+        })
+      )
+    }
+    return false
+  }
+  const roots = outcomes(fn).filter(
+    (outcome): outcome is Extract<Outcome, { readonly _tag: 'Return' }> =>
+      outcome._tag === 'Return',
+  )
+  if (roots.length === 0 || !roots.every((outcome) => walk(outcome.value, channel, new Set())))
+    return undefined
+  if (
+    channel === 'Failure' &&
+    !operations(fn)
+      .filter((operation) => operation._tag === 'PropagateEffectFailure')
+      .every((operation) => walk(operation.source, 'Value', new Set()))
+  )
+    return undefined
+  return parameters
+}
+
+/** Resolves one physical environment field only through an actual selected Effect producer. */
+const invocationEffectCapture = (
+  fn: MirFunction,
+  effect: LocalId,
+  ordinal: number,
+  seen: ReadonlySet<number> = new Set(),
+): { readonly source: LocalId; readonly access: SilkType.CaptureAccess } | undefined => {
+  if (seen.has(effect.ordinal)) return undefined
+  const definitions = invocationDefinitions(fn).get(effect.ordinal) ?? []
+  const definition = definitions.length === 1 ? definitions.at(0) : undefined
+  if (definition?._tag === 'MakeEffect') return definition.captures.at(ordinal)
+  if (definition?._tag === 'Move')
+    return invocationEffectCapture(
+      fn,
+      definition.source,
+      ordinal,
+      new Set([...seen, effect.ordinal]),
+    )
+  return undefined
+}
+
+/** Traces an incoming Effect through actual descriptor-preserving affine transfers. */
+const invocationIncomingEffect = (fn: MirFunction, effect: LocalId): LocalId | undefined => {
+  const definitions = invocationDefinitions(fn)
+  let local = effect
+  const seen = new Set<number>()
+  for (;;) {
+    if (seen.has(local.ordinal)) return undefined
+    seen.add(local.ordinal)
+    const candidates = definitions.get(local.ordinal) ?? []
+    if (candidates.length === 0) return local.ordinal < fn.parameterCount ? local : undefined
+    const move = candidates.length === 1 ? candidates.at(0) : undefined
+    if (move?._tag !== 'Move') return undefined
+    const actual = fn.localTypes.at(local.ordinal)
+    const previous = fn.localTypes.at(move.source.ordinal)
+    if (
+      actual?._tag !== 'EffectValue' ||
+      previous?._tag !== 'EffectValue' ||
+      !SilkType.equals(actual.type, previous.type) ||
+      !Tir.sameExecutableSite(actual.site, previous.site) ||
+      Instances.keyText(actual.environment.instance) !==
+        Instances.keyText(previous.environment.instance)
+    )
+      return undefined
+    local = move.source
+  }
+}
+
+/** Follows real holder and input producers; type regions never manufacture a local loan root. */
+export const invocationRetentions = (
+  fn: MirFunction,
+  program: InvocationProgram,
+  holders: ReadonlyArray<LocalId>,
+): InvocationRetentionAnalysis => {
+  const definitions = invocationDefinitions(fn)
+  const retentions: Array<Mir.InvocationUseRetention> = []
+  const issues: Array<InvocationUseIssue> = []
+  const collect = (
+    local: LocalId,
+    referents: Array<InvocationDependency['referents'][number]>,
+    contents: Array<InvocationContents>,
+    seen: ReadonlySet<number>,
+    operation: Operation,
+  ): void => {
+    if (seen.has(local.ordinal)) {
+      issues.push({
+        _tag: 'InvalidInvocationUse',
+        operation,
+        detail: 'invocation input producer cycle is unresolved',
+      })
+      return
+    }
+    const declared = fn.localTypes.at(local.ordinal)
+    if (declared === undefined) {
+      issues.push({
+        _tag: 'InvalidInvocationUse',
+        operation,
+        detail: 'invocation input has no declared storage type',
+      })
+      return
+    }
+    const retention = SilkType.retention(semanticType(declared))
+    if (retention.unknown.length > 0) {
+      issues.push({
+        _tag: 'ConditionalInvocationInput',
+        operation,
+        detail: 'invocation input borrowed contents need concrete realization',
+      })
+      return
+    }
+    if (retention.regions.length === 0) return
+    const next = new Set([...seen, local.ordinal])
+    const candidates = definitions.get(local.ordinal) ?? []
+    if (local.ordinal < fn.parameterCount && candidates.length === 0) {
+      const header = invocationHeaderContents(fn, program, local.ordinal)
+      if (header === undefined)
+        issues.push({
+          _tag: 'InvalidInvocationUse',
+          operation,
+          detail: 'invocation input lacks canonical external header contents authority',
+        })
+      else contents.push(...header)
+      return
+    }
+    if (candidates.length !== 1) {
+      issues.push({
+        _tag: 'InvalidInvocationUse',
+        operation,
+        detail: 'invocation input has ambiguous stored producers',
+      })
+      return
+    }
+    const definition = candidates.at(0)
+    if (definition?._tag === 'BeginLoan') {
+      const rootType = fn.localTypes.at(definition.root.ordinal)
+      if (
+        !borrowsDescriptor(definition) &&
+        (rootType?._tag === 'Reference' ||
+          rootType?._tag === 'Slice' ||
+          rootType?._tag === 'EnvironmentBorrow')
+      )
+        collect(definition.root, referents, contents, next, operation)
+      else
+        referents.push({
+          root: definition.root,
+          loan: { _tag: 'MirLoan', borrow: definition.borrow },
+        })
+      return
+    }
+    if (
+      definition?._tag === 'Move' ||
+      definition?._tag === 'ConvertUnion' ||
+      definition?._tag === 'Project' ||
+      definition?._tag === 'PackEffectComposite' ||
+      definition?._tag === 'UnpackEffectComposite' ||
+      definition?._tag === 'UnpackEffectSuccess'
+    ) {
+      collect(definition.source, referents, contents, next, operation)
+      return
+    }
+    if (definition?._tag === 'Construct' || definition?._tag === 'ConstructUnionVariant') {
+      for (const field of definition.fields)
+        collect(field.value, referents, contents, next, operation)
+      return
+    }
+    if (definition?._tag === 'ConstructArray') {
+      for (const element of definition.elements)
+        collect(element, referents, contents, next, operation)
+      return
+    }
+    if (definition?._tag === 'MakeEffect' || definition?._tag === 'MakeCallable') {
+      if (definition._tag === 'MakeCallable' && definition.base !== undefined)
+        collect(definition.base, referents, contents, next, operation)
+      for (const capture of definition.captures) {
+        if (capture.access === 'Shared' || capture.access === 'Exclusive')
+          referents.push({
+            root: capture.source,
+            loan: { _tag: 'BorrowedLocal', local: capture.source },
+          })
+        collect(capture.source, referents, contents, next, operation)
+      }
+      return
+    }
+    if (definition?._tag === 'Match') {
+      const selected = selectableMatchArms(definition)
+      if (
+        definition.arms.some(
+          (arm) =>
+            selected.has(arm.id.ordinal) &&
+            arm.bindings.some((binding) => binding.destination.ordinal === local.ordinal),
+        )
+      ) {
+        collect(definition.scrutinee, referents, contents, next, operation)
+        return
+      }
+    }
+    if (definition?._tag === 'Call') {
+      const targets = program.functions.filter((target) =>
+        matchesCall(
+          target,
+          definition.target,
+          definition.typeArguments,
+          definition.staticArguments,
+          definition.type,
+        ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      const returned =
+        target === undefined ? undefined : invocationReturnedParameters(program, target, 'Value')
+      if (
+        target !== undefined &&
+        target.parameterCount === definition.arguments.length &&
+        returned !== undefined &&
+        definition.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            callArgumentCompatible(actual, expected)
+          )
+        })
+      ) {
+        for (const ordinal of returned) {
+          const argument = definition.arguments.at(ordinal)
+          if (argument !== undefined) collect(argument, referents, contents, next, operation)
+        }
+        return
+      }
+    }
+    if (definition?._tag === 'CatchEffect' && definition.failureValue.ordinal === local.ordinal) {
+      const effect = fn.localTypes.at(definition.effect.ordinal)
+      const physicalOutcome = ExecutableInputView.outcome(
+        program,
+        effect,
+        definition.outcomeType.type,
+      )
+      const targets = program.functions.filter(
+        (target) =>
+          physicalOutcome !== undefined &&
+          matchesEffectInstance(
+            target,
+            definition.runner,
+            definition.runnerTypeArguments,
+            definition.runnerStaticArguments,
+            physicalOutcome,
+          ),
+      )
+      const target = targets.length === 1 ? targets.at(0) : undefined
+      const returned =
+        target === undefined ? undefined : invocationReturnedParameters(program, target, 'Failure')
+      const fields = effect?._tag === 'EffectValue' ? effect.environment.fields : undefined
+      if (
+        target !== undefined &&
+        fields !== undefined &&
+        returned !== undefined &&
+        target.parameterCount === fields.length + definition.arguments.length &&
+        fields.every((field, ordinal) => {
+          const expected = target.localTypes.at(ordinal)
+          return expected !== undefined && acceptsRuntimeOperand(field.type, semanticType(expected))
+        }) &&
+        definition.arguments.every((argument, ordinal) => {
+          const actual = fn.localTypes.at(argument.ordinal)
+          const expected = target.localTypes.at(fields.length + ordinal)
+          return (
+            actual !== undefined &&
+            expected !== undefined &&
+            callArgumentCompatible(actual, expected)
+          )
+        })
+      ) {
+        for (const ordinal of returned) {
+          if (ordinal < fields.length) {
+            const capture = invocationEffectCapture(fn, definition.effect, ordinal)
+            if (capture === undefined) {
+              const incoming = invocationIncomingEffect(fn, definition.effect)
+              const physical =
+                effect?._tag === 'EffectValue'
+                  ? ExecutableInputView.physical(program, effect)
+                  : undefined
+              const incomingContents =
+                incoming === undefined
+                  ? undefined
+                  : invocationHeaderContents(fn, program, incoming.ordinal)
+              const field = physical?.environment.fields.at(ordinal)
+              if (
+                physical !== undefined &&
+                field !== undefined &&
+                incomingContents !== undefined &&
+                field.ordinal === ordinal &&
+                physicalOutcome !== undefined &&
+                sameEffectChannels(physicalOutcome, physical.environment.effect)
+              ) {
+                const selectedContents = incomingContents.filter((content) => {
+                  const path = content.path.at(0)
+                  return path?._tag === 'Capture' && path.ordinal === ordinal
+                })
+                if (
+                  SilkType.retention(field.type).regions.every((region) =>
+                    selectedContents.some((content) => Lifetime.equals(content.region, region)),
+                  )
+                ) {
+                  contents.push(...selectedContents)
+                  continue
+                }
+              }
+              const external = incoming !== undefined
+              const declaredRegions =
+                effect === undefined ? [] : SilkType.retention(semanticType(effect)).regions
+              if (
+                external &&
+                retention.regions.every((region) =>
+                  declaredRegions.some((declared) => Lifetime.equals(region, declared)),
+                )
+              ) {
+                // The selected runner's returned producer reaches this genuine incoming Effect
+                // field. Its checked external environment supplies contents, never its channel.
+                collect(incoming ?? definition.effect, referents, contents, next, operation)
+                continue
+              }
+              issues.push({
+                _tag: 'InvalidInvocationUse',
+                operation,
+                detail:
+                  'caught failure retained contents have no unique original Effect field producer',
+              })
+              continue
+            }
+            if (capture.access === 'Shared' || capture.access === 'Exclusive')
+              referents.push({
+                root: capture.source,
+                loan: { _tag: 'BorrowedLocal', local: capture.source },
+              })
+            collect(capture.source, referents, contents, next, operation)
+          } else {
+            const argument = definition.arguments.at(ordinal - fields.length)
+            if (argument !== undefined) collect(argument, referents, contents, next, operation)
+          }
+        }
+        return
+      }
+    }
+    issues.push({
+      _tag: 'InvalidInvocationUse',
+      operation,
+      detail: 'invocation input borrowed contents have no authenticated concrete producer',
+    })
+  }
+  const visited = new Set<string>()
+  const visit = (holder: LocalId, local: LocalId, seen: ReadonlySet<number>): void => {
+    const key = `${holder.ordinal}:${local.ordinal}`
+    if (visited.has(key)) return
+    visited.add(key)
+    if (seen.has(local.ordinal)) return
+    const next = new Set([...seen, local.ordinal])
+    const candidates = definitions.get(local.ordinal) ?? []
+    if (candidates.length !== 1) return
+    const actualDefinition = candidates.at(0)
+    if (
+      actualDefinition?._tag === 'MakeEffect' &&
+      actualDefinition.invocationSource !== undefined &&
+      !MirNormalization.invocationConstructionValid(program, actualDefinition)
+    ) {
+      issues.push({
+        _tag: 'InvalidInvocationUse',
+        operation: actualDefinition,
+        detail: 'folded holder has no authentic invocation constructor proof',
+      })
+      return
+    }
+    const definition =
+      actualDefinition?._tag === 'MakeEffect' && actualDefinition.invocationSource !== undefined
+        ? actualDefinition.invocationSource
+        : actualDefinition
+    if (
+      (definition?._tag === 'Call' || definition?._tag === 'ApplyCallable') &&
+      definition.invocationUse !== undefined
+    ) {
+      const invocation = definition.invocationUse
+      const resultType = fn.localTypes.at(invocation.result.ordinal)
+      const retained =
+        resultType === undefined ? undefined : SilkType.retention(semanticType(resultType))
+      if (
+        retained === undefined ||
+        !retained.regions.some(
+          (region) =>
+            Lifetime.equals(region, invocation.lifetime) ||
+            invocation.inputs.some((input) =>
+              SilkType.retention(input.type).regions.some((member) =>
+                Lifetime.equals(region, member),
+              ),
+            ),
+        )
+      )
+        return
+      const dependencies = invocation.inputs.map((input): InvocationDependency => {
+        const referents: Array<InvocationDependency['referents'][number]> = []
+        const contents: Array<InvocationContents> = []
+        const actual =
+          input.capture === undefined
+            ? input.argument
+            : invocationCapturedSource(
+                definitions,
+                input.argument,
+                input.capture,
+                input.parameter,
+                input.source,
+                input.capturePath,
+              )
+        if (actual === undefined) {
+          const incoming = invocationHeaderCapture(fn, input, program)
+          if (incoming === undefined)
+            issues.push({
+              _tag: 'InvalidInvocationUse',
+              operation: definition,
+              detail: 'invocation capture source is not uniquely authenticated',
+            })
+          else {
+            contents.push(...incoming.contents)
+            if (incoming.conditional)
+              issues.push({
+                _tag: 'ConditionalInvocationInput',
+                operation: definition,
+                detail:
+                  'incoming captured input retains an unresolved exact-header contents obligation',
+              })
+          }
+        } else collect(actual, referents, contents, new Set(), definition)
+        return {
+          parameter: input.parameter,
+          ...(input.capture === undefined ? {} : { capture: input.capture }),
+          argument: input.argument,
+          ...(input.capturePath === undefined ? {} : { capturePath: input.capturePath }),
+          referents,
+          contents,
+        }
+      })
+      const environment: Array<Mir.InvocationUseRetention['environment'][number]> = []
+      if (definition._tag === 'ApplyCallable') {
+        const sources = [
+          ...(definition.callable === undefined ? [] : [definition.callable]),
+          ...definition.captures.map((capture) => capture.source),
+        ]
+        for (const argument of sources) {
+          const referents: Array<InvocationDependency['referents'][number]> = []
+          const contents: Array<InvocationContents> = []
+          collect(argument, referents, contents, new Set(), definition)
+          if (referents.length > 0 || contents.length > 0)
+            environment.push({ argument, referents, contents })
+        }
+      }
+      retentions.push({ invocation, holder, dependencies, environment })
+      return
+    }
+    if (
+      definition?._tag === 'Move' ||
+      definition?._tag === 'ConvertUnion' ||
+      definition?._tag === 'Project' ||
+      definition?._tag === 'PackEffectComposite' ||
+      definition?._tag === 'UnpackEffectComposite' ||
+      definition?._tag === 'UnpackEffectSuccess'
+    )
+      visit(holder, definition.source, next)
+    else if (definition?._tag === 'MakeEffect' || definition?._tag === 'MakeCallable') {
+      if (definition._tag === 'MakeCallable' && definition.base !== undefined)
+        visit(holder, definition.base, next)
+      for (const capture of definition.captures) visit(holder, capture.source, next)
+    } else if (definition?._tag === 'Construct' || definition?._tag === 'ConstructUnionVariant')
+      for (const field of definition.fields) visit(holder, field.value, next)
+    else if (definition?._tag === 'ConstructArray')
+      for (const element of definition.elements) visit(holder, element, next)
+    else if (definition?._tag === 'Call' || definition?._tag === 'ApplyCallable') {
+      // Actual operand edges preserve a nested holder through an ordinary checked forwarding call.
+      for (const argument of definition.arguments) visit(holder, argument, next)
+      if (definition._tag === 'ApplyCallable') {
+        if (definition.callable !== undefined) visit(holder, definition.callable, next)
+        for (const capture of definition.captures) visit(holder, capture.source, next)
+      }
+    } else if (definition?._tag === 'Match') {
+      const selected = selectableMatchArms(definition)
+      for (const arm of definition.arms)
+        if (selected.has(arm.id.ordinal)) {
+          if (
+            definition.destination?.ordinal === local.ordinal &&
+            arm.selected.execution.result !== undefined
+          )
+            visit(holder, arm.selected.execution.result, next)
+          if (arm.bindings.some((binding) => binding.destination.ordinal === local.ordinal))
+            visit(holder, definition.scrutinee, next)
+        }
+    }
+  }
+  for (const holder of holders) visit(holder, holder, new Set())
+  return { retentions, issues }
+}
+
+/** Function-owned invocation scopes cannot leave through a public return or failure boundary. */
+export const invocationEscapeIssues = (
+  fn: MirFunction,
+  program: InvocationProgram,
+): ReadonlyArray<InvocationUseIssue> => {
+  const issues: Array<InvocationUseIssue> = []
+  for (const region of regionsTree(fn.regions)) {
+    if (region._tag !== 'OperationRegion' && region._tag !== 'CleanupRegion') continue
+    const values = region.outcome._tag === 'Return' ? [region.outcome.value] : []
+    for (const operation of operationsOf(region))
+      if (operation._tag === 'PropagateEffectFailure') values.push(operation.source)
+    for (const value of values) {
+      const type = fn.localTypes.at(value.ordinal)
+      if (type === undefined) continue
+      const regions = SilkType.retention(semanticType(type)).regions
+      for (const retention of invocationRetentions(fn, program, [value]).retentions) {
+        const invocation = retention.invocation
+        if (
+          fn.sourceOwner !== undefined &&
+          invocation.owner.module === fn.sourceOwner.module &&
+          invocation.owner.name === fn.sourceOwner.name &&
+          regions.some((region) => Lifetime.equals(region, invocation.lifetime))
+        ) {
+          const actual = operations(fn).find(
+            (operation) =>
+              ((operation._tag === 'Call' || operation._tag === 'ApplyCallable') &&
+                operation.invocationUse === invocation) ||
+              (operation._tag === 'MakeEffect' &&
+                operation.invocationSource?.invocationUse === invocation &&
+                MirNormalization.invocationConstructionValid(program, operation)),
+          )
+          if (actual !== undefined)
+            issues.push({
+              _tag: 'InvalidInvocationUse',
+              operation: actual,
+              detail:
+                'function-owned invocation computation escapes its source use and cleanup scope',
+            })
+        }
+      }
+    }
+  }
+  return issues
+}
+
+/** Orders owned holder cleanup before owners of its external referents; cycles refuse. */
+export const invocationReleaseOrder = <Release extends { readonly local: LocalId }>(
+  retentions: ReadonlyArray<Mir.InvocationUseRetention>,
+  releases: ReadonlyArray<Release>,
+): ReadonlyArray<Release> | undefined => {
+  const pending = Array.from(releases)
+  if (new Set(pending.map((release) => release.local.ordinal)).size !== pending.length)
+    return undefined
+  const follows = new Map<number, Set<number>>()
+  for (const retention of retentions)
+    for (const dependency of [...retention.dependencies, ...retention.environment])
+      for (const referent of dependency.referents) {
+        if (retention.holder.ordinal === referent.root.ordinal) return undefined
+        const predecessors = follows.get(referent.root.ordinal) ?? new Set<number>()
+        predecessors.add(retention.holder.ordinal)
+        follows.set(referent.root.ordinal, predecessors)
+      }
+  const ordered: Array<Release> = []
+  while (pending.length > 0) {
+    const index = pending.findIndex(
+      (release) =>
+        !pending.some((other) => follows.get(release.local.ordinal)?.has(other.local.ordinal)),
+    )
+    if (index < 0) return undefined
+    const release = pending.splice(index, 1).at(0)
+    if (release !== undefined) ordered.push(release)
+  }
+  return ordered
+}
+
+const invocationContentsPartKey = (part: InvocationContents['path'][number]) => {
+  if (part._tag === 'Field') return [part._tag, DeclarationFacts.fieldIdKey(part.field)]
+  if (part._tag === 'Element') return [part._tag, part.index]
+  if (part._tag === 'DeclaredContents') return [part._tag, part.component]
+  return [part._tag, part.ordinal]
+}
+
+const invocationRetentionText = (retention: Mir.InvocationUseRetention): string =>
+  JSON.stringify([
+    retention.holder.ordinal,
+    retention.invocation.kind,
+    retention.invocation.owner,
+    AuthoredIdentity.anchorKey(retention.invocation.origin),
+    Lifetime.key(retention.invocation.binder),
+    Lifetime.key(retention.invocation.lifetime),
+    retention.invocation.result.ordinal,
+    retention.invocation.inputs.map((input) => [
+      input.parameter,
+      input.capture ?? null,
+      input.header === undefined
+        ? null
+        : [input.header.parameter, AuthoredIdentity.anchorKey(input.header.source)],
+      input.capturePath?.map((step) => [
+        step._tag,
+        Tir.executableSiteKey(step.site),
+        step._tag === 'Capture' ? step.ordinal : null,
+      ]) ?? null,
+      input.argument.ordinal,
+      SilkType.key(input.type),
+      input.source === undefined ? null : AuthoredIdentity.anchorKey(input.source),
+    ]),
+    retention.environment.map((environment) => [
+      environment.argument.ordinal,
+      environment.referents.map((referent) => [
+        referent.root.ordinal,
+        suspensionBorrowText(referent.loan),
+      ]),
+      environment.contents.map((content) => [
+        content.parameter,
+        content.path.map(invocationContentsPartKey),
+        SilkType.key(content.type),
+        Lifetime.key(content.region),
+      ]),
+    ]),
+    retention.dependencies.map((dependency) => [
+      dependency.parameter,
+      dependency.capture ?? null,
+      dependency.capturePath?.map((step) => [
+        step._tag,
+        Tir.executableSiteKey(step.site),
+        step._tag === 'Capture' ? step.ordinal : null,
+      ]) ?? null,
+      dependency.argument.ordinal,
+      dependency.referents.map((referent) => [
+        referent.root.ordinal,
+        suspensionBorrowText(referent.loan),
+      ]),
+      dependency.contents.map((content) => [
+        content.parameter,
+        content.path.map(invocationContentsPartKey),
+        SilkType.key(content.type),
+        Lifetime.key(content.region),
+      ]),
+    ]),
+  ])
 
 /** Source-stable operations across canonical topological region order. */
 export const operations = (self: MirFunction): ReadonlyArray<Operation> =>
@@ -1194,7 +3033,13 @@ export const operationLocals = (operation: Operation): ReadonlyArray<LocalId> =>
     case 'Call':
       return [operation.destination, ...operation.arguments]
     case 'MakeEffect':
-      return [operation.destination, ...operation.captures.map((capture) => capture.source)]
+      return [
+        operation.destination,
+        ...operation.captures.map((capture) => capture.source),
+        ...(operation.invocationSource === undefined
+          ? []
+          : operationLocals(operation.invocationSource)),
+      ]
     case 'MakeCallable':
       return [
         operation.destination,
@@ -2282,6 +4127,9 @@ const operationTypes = (operation: Operation): ReadonlyArray<DeclarationFacts.Se
       return [
         semanticType(operation.type),
         ...operation.runnerTypeArguments.filter(SilkType.isTypeArgument),
+        ...(operation.invocationSource === undefined
+          ? []
+          : operationTypes(operation.invocationSource)),
       ]
     case 'MakeCallable':
       // A construction's environment identity is checked as that identity; its ordinary arguments
@@ -2555,7 +4403,14 @@ const accessedOwnerLocals = (operation: Operation): ReadonlyArray<LocalId> => {
     case 'Call':
       return operation.arguments
     case 'MakeEffect':
-      return operation.captures.map((capture) => capture.source)
+      return [
+        ...operation.captures.map((capture) => capture.source),
+        ...(operation.invocationSource === undefined
+          ? []
+          : operationLocals(operation.invocationSource).filter(
+              (local) => local.ordinal !== operation.destination.ordinal,
+            )),
+      ]
     case 'MakeCallable':
       return [
         ...(operation.base === undefined ? [] : [operation.base]),
@@ -3319,6 +5174,28 @@ const computeVerify = Effect.fnUntraced(function* (
     'MirVerification.verifyModule',
     () => {
       for (const fn of self.functions) {
+        for (const local of fn.localTypes) {
+          if (
+            (local._tag !== 'EffectValue' && local._tag !== 'CallableValue') ||
+            local.inputView === undefined
+          )
+            continue
+          const valid =
+            local._tag === 'EffectValue'
+              ? ExecutableInputView.physical(self, local) !== undefined
+              : ExecutableInputView.physicalCallable(self, local) !== undefined
+          if (!valid)
+            violations.push({
+              _tag: 'Violation',
+              rule:
+                local._tag === 'EffectValue'
+                  ? 'InvalidEffectOperation'
+                  : 'InvalidCallableOperation',
+              function: fn.id,
+              detail:
+                'executable input view lacks its original checked call edge or physical producer',
+            })
+        }
         const operations = fn.regions.flatMap(operationsOf).flatMap(operationTree)
         for (const operation of operations) {
           if (operation._tag !== 'NativeAssembly') continue
@@ -3719,7 +5596,18 @@ const computeVerify = Effect.fnUntraced(function* (
       if (region._tag === 'ConditionalRegion') controlLocals.add(region.condition.ordinal)
       if (region._tag === 'LoopRegion') controlLocals.add(region.conditionValue.ordinal)
     }
-    violations.push(...suspensionViolations(fn, self.layout))
+    violations.push(
+      ...[...invocationUseIssues(fn, self), ...invocationEscapeIssues(fn, self)].map(
+        (issue): Violation => ({
+          _tag: 'Violation',
+          rule: 'InvalidCoroutineFrame',
+          function: fn.id,
+          provenance: issue.operation.provenance,
+          detail: issue.detail,
+        }),
+      ),
+    )
+    violations.push(...suspensionViolations(fn, self))
     const currentInstance = instanceText(fn.instance)
     const concreteTypes = [
       ...fn.instance.typeArguments.filter(SilkType.isTypeArgument),
@@ -3750,7 +5638,13 @@ const computeVerify = Effect.fnUntraced(function* (
     const missingTypes = new Set(
       [...fn.localTypes, fn.result]
         .filter((type) => type._tag !== 'CallableValue')
-        .map(semanticType)
+        .map((type) =>
+          semanticType(
+            type._tag === 'EffectValue' && type.inputView !== undefined
+              ? (ExecutableInputView.physical(self, type) ?? type)
+              : type,
+          ),
+        )
         .filter(
           (type) =>
             Layout.entry(self.layout, type) === undefined &&
@@ -6934,17 +8828,24 @@ const computeVerify = Effect.fnUntraced(function* (
         }
         if (operation._tag === 'RunEffectValue') {
           const effect = fn.localTypes.at(operation.effect.ordinal)
+          const physicalOutcome = ExecutableInputView.outcome(
+            self,
+            effect,
+            operation.outcomeType.type,
+          )
           const outcome = fn.localTypes.at(operation.outcome.ordinal)
           const destination = fn.localTypes.at(operation.destination.ordinal)
-          const runner = self.functions.find((candidate) =>
-            matchesEffectInstance(
-              candidate,
-              operation.runner,
-              operation.runnerTypeArguments,
-              operation.runnerStaticArguments,
-              operation.outcomeType.type,
-              operation.providers,
-            ),
+          const runner = self.functions.find(
+            (candidate) =>
+              physicalOutcome !== undefined &&
+              matchesEffectInstance(
+                candidate,
+                operation.runner,
+                operation.runnerTypeArguments,
+                operation.runnerStaticArguments,
+                physicalOutcome,
+                operation.providers,
+              ),
           )
           const suspensionRegion = fn.suspension?.regions.find(
             (candidate) =>
@@ -7101,12 +9002,15 @@ const computeVerify = Effect.fnUntraced(function* (
                 })()
           const valid =
             effectValue !== undefined &&
+            physicalOutcome !== undefined &&
             outcome?._tag === 'EffectOutcome' &&
             destination !== undefined &&
             SilkType.equals(effectValue.type, operation.outcomeType.type) &&
             SilkType.equals(outcome.type, operation.outcomeType.type) &&
             SilkType.equals(semanticType(destination), semanticType(operation.type)) &&
-            ((runner !== undefined && runnerOutcomeMatches(runner, operation.outcomeType.type)) ||
+            ((runner !== undefined &&
+              physicalOutcome !== undefined &&
+              runnerOutcomeMatches(runner, physicalOutcome)) ||
               (suspensionRunner !== undefined &&
                 SilkType.equals(suspensionRunner.outcome, operation.outcomeType.type))) &&
             storedContractValid &&
@@ -7283,17 +9187,24 @@ const computeVerify = Effect.fnUntraced(function* (
             })
         }
         if (operation._tag === 'CatchEffect') {
-          const runner = self.functions.find((candidate) =>
-            matchesEffectInstance(
-              candidate,
-              operation.runner,
-              operation.runnerTypeArguments,
-              operation.runnerStaticArguments,
-              operation.outcomeType.type,
-            ),
+          const effect = fn.localTypes.at(operation.effect.ordinal)
+          const physicalOutcome = ExecutableInputView.outcome(
+            self,
+            effect,
+            operation.outcomeType.type,
+          )
+          const runner = self.functions.find(
+            (candidate) =>
+              physicalOutcome !== undefined &&
+              matchesEffectInstance(
+                candidate,
+                operation.runner,
+                operation.runnerTypeArguments,
+                operation.runnerStaticArguments,
+                physicalOutcome,
+              ),
           )
           const destination = fn.localTypes.at(operation.destination.ordinal)
-          const effect = fn.localTypes.at(operation.effect.ordinal)
           const outcome = fn.localTypes.at(operation.outcome.ordinal)
           const success = fn.localTypes.at(operation.successValue.ordinal)
           const failure = fn.localTypes.at(operation.failureValue.ordinal)
@@ -7301,7 +9212,9 @@ const computeVerify = Effect.fnUntraced(function* (
             SilkType.failureMembers(operation.outcomeType.type),
           )
           const disagreements = [
-            runner !== undefined && runnerOutcomeMatches(runner, operation.outcomeType.type)
+            runner !== undefined &&
+            physicalOutcome !== undefined &&
+            runnerOutcomeMatches(runner, physicalOutcome)
               ? undefined
               : `runner(${runner?.result._tag === 'EffectOutcome' ? SilkType.encode(runner.result.type) : (runner?.result._tag ?? 'missing')} != ${SilkType.encode(operation.outcomeType.type)})`,
             effect?._tag === 'EffectValue' &&

@@ -2593,6 +2593,18 @@ export const make = (operations: Operations) => {
         {
           call: {
             _tag: 'CallInstance',
+            ...((expression._tag === 'Call' || expression._tag === 'EffectConstruct') &&
+            expression.inputViews !== undefined
+              ? {
+                  inputViews: expression.inputViews.map((view) =>
+                    Tir.substituteExecutableInputView(
+                      view,
+                      substitution,
+                      selectedCompatibility(fn, owner),
+                    ),
+                  ),
+                }
+              : {}),
             owner,
             ...(expression.id === undefined ? {} : { node: expression.id }),
             span,
@@ -3748,16 +3760,17 @@ export const make = (operations: Operations) => {
       if (!instancesByKey.has(identity)) instancesByKey.set(identity, instance)
     }
     const executionNodeForKey = (key: InstanceKey): string => executionNodeIn(instancesByKey, key)
+    // Static expansion retains one authored span for distinct nodes in the owner's body artifact.
     const serviceCallNode = (
       owner: InstanceKey,
       expression: Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }>,
     ): string =>
-      `service\0${keyText(owner)}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
+      `service\0${keyText(owner)}\0${expression.id?.ordinal ?? -1}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
     const providerBindingNode = (
       owner: InstanceKey,
       expression: Extract<Tir.Expression, { readonly _tag: 'EffectBindRequirement' }>,
     ): string =>
-      `provider\0${keyText(owner)}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
+      `provider\0${keyText(owner)}\0${expression.id?.ordinal ?? -1}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
     const scannedInstances: Array<ScannedInstance> = []
     for (const instance of instances) {
       edges = []
@@ -3777,7 +3790,7 @@ export const make = (operations: Operations) => {
       const deferredCallNode = (
         expression: Extract<Tir.Expression, { readonly _tag: 'Call' | 'EffectConstruct' }>,
       ): string => {
-        const node = `call\0${keyText(instance.key)}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
+        const node = `call\0${keyText(instance.key)}\0${expression.id?.ordinal ?? -1}\0${expression.span.sourceId}:${expression.span.start}:${expression.span.end}`
         deferredCalls.set(node, { expression, context })
         return node
       }
@@ -4172,11 +4185,16 @@ export const make = (operations: Operations) => {
             if (target === undefined) continue
             const span = service.expression.span
             providedTargets.set(
-              `${keyText(instance.key)}\0${keyText(target)}\0${span.sourceId}:${span.start}:${span.end}`,
+              `${keyText(instance.key)}\0${expression.id?.ordinal ?? -1}\0${keyText(target)}\0${keyText(service.context.owner)}\0${service.expression.id?.ordinal ?? -1}\0${span.sourceId}:${span.start}:${span.end}`,
               {
                 owner: instance.key,
                 target,
                 span,
+                ...(service.expression.id !== undefined &&
+                keyText(service.context.owner) === keyText(instance.key) &&
+                Tir.nodeOf(instance.function, service.expression.id) === service.expression
+                  ? { node: service.expression.id }
+                  : {}),
                 ...(service.expression.staticArgumentOrigins === undefined
                   ? {}
                   : { staticArgumentOrigins: service.expression.staticArgumentOrigins }),
@@ -4215,11 +4233,16 @@ export const make = (operations: Operations) => {
             if (target === undefined) continue
             const span = service.expression.span
             providedTargets.set(
-              `${keyText(instance.key)}\0${keyText(target)}\0${span.sourceId}:${span.start}:${span.end}`,
+              `${keyText(instance.key)}\0${expression.id?.ordinal ?? -1}\0${keyText(target)}\0${keyText(service.context.owner)}\0${service.expression.id?.ordinal ?? -1}\0${span.sourceId}:${span.start}:${span.end}`,
               {
                 owner: instance.key,
                 target,
                 span,
+                ...(service.expression.id !== undefined &&
+                keyText(service.context.owner) === keyText(instance.key) &&
+                Tir.nodeOf(instance.function, service.expression.id) === service.expression
+                  ? { node: service.expression.id }
+                  : {}),
                 ...(service.expression.staticArgumentOrigins === undefined
                   ? {}
                   : { staticArgumentOrigins: service.expression.staticArgumentOrigins }),
@@ -4326,14 +4349,21 @@ export const make = (operations: Operations) => {
               name: handler.target.name,
             }
             const target = targetFunction(results, declaration)
-            const targetKey =
+            // Quantified named items omit only their original invocation lifetime slots.
+            // Keep those source-owned binders in discovery, as ordinary callable application
+            // does; the checked invocation supplies its concrete semantic selection later.
+            const arguments_ =
               target === undefined
+                ? undefined
+                : callableTargetArguments(target, handler.typeArguments)
+            const targetKey =
+              target === undefined || arguments_ === undefined
                 ? undefined
                 : keyOf(
                     declaration,
                     target.contract,
                     target.declaration.typeParameters.map((parameter) => parameter.type),
-                    handler.typeArguments,
+                    arguments_,
                   )
             const handlerEffect =
               target === undefined || targetKey === undefined
@@ -4657,10 +4687,13 @@ export const make = (operations: Operations) => {
         if (target !== undefined) {
           const span = deferredCall.expression.span
           providedTargets.set(
-            `${keyText(context.owner)}\0${keyText(target)}\0${span.sourceId}:${span.start}:${span.end}`,
+            `${keyText(context.owner)}\0${keyText(target)}\0${deferredCall.expression.id?.ordinal ?? -1}\0${span.sourceId}:${span.start}:${span.end}`,
             {
               owner: context.owner,
               target,
+              ...(deferredCall.expression.id === undefined
+                ? {}
+                : { node: deferredCall.expression.id }),
               span,
               ...(deferredCall.expression.staticArgumentOrigins === undefined
                 ? {}
@@ -4698,10 +4731,13 @@ export const make = (operations: Operations) => {
           )
           if (target !== undefined) {
             providedTargets.set(
-              `${keyText(serviceCall.context.owner)}\0${keyText(target)}\0${serviceCall.expression.span.sourceId}:${serviceCall.expression.span.start}:${serviceCall.expression.span.end}`,
+              `${keyText(serviceCall.context.owner)}\0${keyText(target)}\0${serviceCall.expression.id?.ordinal ?? -1}\0${serviceCall.expression.span.sourceId}:${serviceCall.expression.span.start}:${serviceCall.expression.span.end}`,
               {
                 owner: serviceCall.context.owner,
                 target,
+                ...(serviceCall.expression.id === undefined
+                  ? {}
+                  : { node: serviceCall.expression.id }),
                 span: serviceCall.expression.span,
                 providers: [
                   {

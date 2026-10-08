@@ -325,7 +325,7 @@ Mapping runs inside selected recovery, preserving the original failure as its di
 ### Associated function `Effect.flatMap`
 
 ```silk
-pub effect<'env> fn flatMap<'env, A, B, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, onSuccess: once fn<'env>(A) -> Effect<'env; B ! F ? S>) -> B ! E | F ? R | S
+pub effect<'env> fn flatMap<'env, A, B, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, onSuccess: for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; B ! F ? S>) -> B ! E | F ? R | S
 ```
 
 Runs `self`, then continues its success with an effectful callback.
@@ -335,6 +335,8 @@ Runs `self`, then continues its success with an effectful callback.
 The callback is not invoked when `self` fails. Its failure and requirement rows join those of
 `self`, and its success becomes the overall success. This is the general sequencing combinator;
 use direct `run` statements when named intermediate values are clearer.
+The success input remains valid through the returned Effect's execution and cleanup, including suspension and cancellation.
+The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
 <a id="declaration-73696c6b2f6566666563743a3a4566666563742e666c617474656e"></a>
 
@@ -388,7 +390,7 @@ successful values are needed together; it does not run them concurrently.
 ### Associated function `Effect.tap`
 
 ```silk
-pub effect<'env> fn tap<'env, A, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, callback: once fn<'env>(A) -> Effect<'env; A ! F ? S>) -> A ! E | F ? R | S
+pub effect<'env> fn tap<'env, A, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, callback: for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; A ! F ? S>) -> A ! E | F ? R | S
 ```
 
 Continues success with a callback that returns the value to expose as the overall success.
@@ -399,13 +401,15 @@ The callback receives and consumes the original `A`, then must produce an `A` of
 useful for effectful observation followed by returning the observed value, but it does not
 automatically preserve the original value. A failure from either step propagates, and the
 callback is skipped when `self` fails.
+The success input remains valid through the returned Effect's execution and cleanup, including suspension and cancellation.
+The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
 <a id="declaration-73696c6b2f6566666563743a3a4566666563742e6361746368416c6c"></a>
 
 ### Associated function `Effect.catchAll`
 
 ```silk
-pub effect<'env> fn catchAll<'env, A, B, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, onFailure: once fn<'env>(E) -> once Effect<'env; B ! F ? S>) -> A | B ! F ? R | S
+pub effect<'env> fn catchAll<'env, A, B, E, F, ?R, ?S>(self: once Effect<'env; A ! E ? R>, onFailure: for<use 'call> once fn<'env>(E) -> once Effect<'call & 'env; B ! F ? S>) -> A | B ! F ? R | S
 ```
 
 Recovers every typed failure in the protected row with another Effect.
@@ -416,14 +420,16 @@ The handler receives the complete failure value and runs only on typed failure. 
 failure row is removed in full; only the handler's own `F` can fail afterwards. Success bypasses
 the handler, requirements from both paths remain, and traps are not recovered. Use [`catch`](#declaration-73696c6b2f6566666563743a3a4566666563742e6361746368) to
 handle one selected member while leaving the other failures in the row.
-The handler's returned Effect runs once and may consume captured values.
+The handler's returned Effect runs once and can consume captured values.
+The failure input remains valid through execution, suspension, cancellation, and cleanup.
+The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
 <a id="declaration-73696c6b2f6566666563743a3a4566666563742e6361746368"></a>
 
 ### Associated function `Effect.catch`
 
 ```silk
-pub effect<'env> fn catch<'env, S, A, B, E, F, ?R, ?Q>(self: once Effect<'env; A ! E ? R>, onFailure: once fn<'env>(S) -> once Effect<'env; B ! F ? Q>) -> A | B ! Without<E, S> | F ? R | Q where S in E
+pub effect<'env> fn catch<'env, S, A, B, E, F, ?R, ?Q>(self: once Effect<'env; A ! E ? R>, onFailure: for<use 'call> once fn<'env>(S) -> once Effect<'call & 'env; B ! F ? Q>) -> A | B ! Without<E, S> | F ? R | Q where S in E
 ```
 
 Recovers one selected typed failure.
@@ -438,6 +444,8 @@ A success bypasses the handler. A matching `S` invokes it once; nonmatching type
 propagate in `Without<E, S>`, and the handler's failures join as `F`. Requirements from either
 path remain. Traps are not selected or recovered. Use [`catchAll`](#declaration-73696c6b2f6566666563743a3a4566666563742e6361746368416c6c) when the handler should receive
 the entire failure value regardless of its union member.
+The selected failure input remains valid through execution, suspension, cancellation, and cleanup.
+The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
 <a id="declaration-73696c6b2f6566666563743a3a4566666563742e656e737572696e67"></a>
 

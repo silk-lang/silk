@@ -2040,7 +2040,7 @@ export const analyzeFunctionBody = (
     .map((statement) => semantic.spanOf(statement.anchor))
   const nextBindingOrdinal = { value: 0 }
   const declaredOutlives = TypeOutlives.context(resolution.index.modules)
-  const outlivesScope =
+  const inputScope =
     resolution.anonymousDepth === 1
       ? TypeOutlives.withInputs(
           declaredOutlives,
@@ -2049,7 +2049,14 @@ export const analyzeFunctionBody = (
           ),
         )
       : declaredOutlives
-  const bodyLifetimes = BodyLifetime.make(
+  const conditionalScope =
+    resolution.invocationExpected === undefined
+      ? inputScope
+      : TypeOutlives.withInvocationInputs(inputScope, resolution.invocationExpected)
+  if (conditionalScope === undefined)
+    throw new RangeError('Hidden invocation-use context lost its checked contract')
+  const outlivesScope = conditionalScope
+  const ordinaryBodyLifetimes = BodyLifetime.make(
     declaration.canonical._tag === 'Canonical'
       ? declaration.canonical.id
       : {
@@ -2059,6 +2066,13 @@ export const analyzeFunctionBody = (
     AuthoredWalk.anchors(blockNode),
     outlivesScope.parameterBounds,
   )
+  const conditionalBodyLifetimes =
+    resolution.invocationExpected === undefined
+      ? ordinaryBodyLifetimes
+      : BodyLifetime.withInvocationInputs(ordinaryBodyLifetimes, resolution.invocationExpected)
+  if (conditionalBodyLifetimes === undefined)
+    throw new RangeError('Hidden invocation-use body lost its checked input coordinates')
+  const bodyLifetimes = conditionalBodyLifetimes
   const authoredDeclaration = AuthoredWalk.declarationOf(semantic.module, declaration.owner)
   // Occurrences and hints serve only editors, so a build session never collects them.
   const tooling = resolution.semantic.tooling

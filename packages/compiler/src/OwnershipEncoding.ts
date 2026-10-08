@@ -1,3 +1,5 @@
+import * as Lifetime from './Lifetime.js'
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import type * as CleanupPlan from './CleanupPlan.js'
 import type * as DeclarationFacts from './DeclarationFacts.js'
 import * as ExecutionAffinity from './ExecutionAffinity.js'
@@ -140,6 +142,10 @@ export const encode = (self: ModuleOwnership): string =>
         } else if (loan.origin === 'ReturnedView') origin = 'returned-view'
         return `  loan l${loan.id.ordinal} ${loan.access.toLowerCase()} ${siteText(loan.root)} referents=${loan.referents.map(referentKey).join(',')} ${origin} region=${loan.startRegion.ordinal}->${loan.endRegion.ordinal} ${spanText(loan.startSpan)}..${spanText(loan.endSpan)}`
       }),
+      ...fn.invocations.map(
+        (invocation) =>
+          `  invocation ${AuthoredIdentity.anchorKey(invocation.obligation.origin)} binder=${Lifetime.key(invocation.obligation.binder)} region=${Lifetime.key(invocation.obligation.lifetime)} result=${Tir.nodeRefKey(invocation.result)} retained=${invocation.retained} inputs=${invocation.inputs.map((input) => `p${input.parameter}:${Tir.nodeRefKey(input.argument)}:${input.transfer.toLowerCase()}${input.capture === undefined ? '' : ` capture=#${input.capture.ordinal}:${Tir.nodeRefKey(input.capture.callee)}${input.capture.path === undefined ? '' : ` via=${input.capture.path.map((step) => `${step._tag.toLowerCase()}@${Tir.executableSiteLabel(step.site)}${step._tag === 'Capture' ? `.#${step.ordinal}` : ''}`).join('/')}`}`}:${Type.encode(input.type)}:${input.conditionalContents ? 'conditional' : 'concrete'}:referents=${input.referents.map(referentKey).join(',') || 'none'}`).join(';')} end=${invocation.end.region.ordinal}:${spanText(invocation.end.span)} cleanup=${invocation.end.cleanupOnly}`,
+      ),
       ...fn.replacements.map(
         (replacement) =>
           `  replace region=${replacement.region.ordinal} type=${Type.encode(replacement.type)} cleanup=${cleanupText(replacement.cleanup)} ${spanText(replacement.span)}`,

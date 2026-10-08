@@ -206,6 +206,7 @@ export const parseTypeArgumentList = (
 export const parseTypeParameterList = (
   initial: State,
   following: ReadonlyArray<Token.TokenKind>,
+  invocationBinders = false,
 ): NodeResult => {
   const parameterStarts: ReadonlyArray<Token.TokenKind> = ['Lifetime', 'Identifier', 'Question']
   const left = expect(initial, 'Less', [...parameterStarts, 'Greater', ...following])
@@ -221,18 +222,22 @@ export const parseTypeParameterList = (
     nextSignificantKind(state) !== 'EndOfFile' &&
     (!following.includes(nextSignificantKind(state) ?? 'EndOfFile') || nullablePointerStarts(state))
   ) {
-    const markerKind = nextSignificantKind(state)
+    // `use` is contextual only in a callable's outer `for` list, never a declaration generic.
+    const invocationUse = invocationBinders && hasContextualSpelling(state, 'use')
+    const use = invocationUse
+      ? expect(state, 'Identifier', ['Lifetime', 'Comma', 'Greater', ...following])
+      : undefined
+    const markerKind = nextSignificantKind(use?.state ?? state)
     const marker =
-      markerKind === 'Question'
+      !invocationUse && markerKind === 'Question'
         ? expect(state, markerKind, ['Identifier', 'Comma', 'Greater', ...following])
         : undefined
-    const lifetimeParameter = markerKind === 'Lifetime'
-    const name = expect(marker?.state ?? state, lifetimeParameter ? 'Lifetime' : 'Identifier', [
-      'Colon',
-      'Comma',
-      'Greater',
-      ...following,
-    ])
+    const lifetimeParameter = invocationUse || markerKind === 'Lifetime'
+    const name = expect(
+      marker?.state ?? use?.state ?? state,
+      lifetimeParameter ? 'Lifetime' : 'Identifier',
+      ['Colon', 'Comma', 'Greater', ...following],
+    )
     const colon =
       marker === undefined && nextSignificantKind(name.state) === 'Colon'
         ? expect(name.state, 'Colon', [...argumentStarts, 'Comma', 'Greater', ...following])
@@ -262,6 +267,7 @@ export const parseTypeParameterList = (
     children = [
       ...children,
       syntaxNode(completedState, lifetimeParameter ? 'LifetimeParameter' : 'TypeParameter', [
+        ...(use?.elements ?? []),
         ...(marker?.elements ?? []),
         ...name.elements,
         ...(colon?.elements ?? []),
@@ -359,14 +365,11 @@ export const parseTypePrimary = (
 ): NodeResult => {
   if (nextSignificantKind(initial) === 'ForKeyword') {
     const keyword = expect(initial, 'ForKeyword', ['Less', ...typeStarts, ...following])
-    const parameters = parseTypeParameterList(keyword.state, [
-      'FnKeyword',
-      'MutKeyword',
-      'OnceKeyword',
-      'UnsafeKeyword',
-      'ExternKeyword',
-      ...following,
-    ])
+    const parameters = parseTypeParameterList(
+      keyword.state,
+      ['FnKeyword', 'MutKeyword', 'OnceKeyword', 'UnsafeKeyword', 'ExternKeyword', ...following],
+      true,
+    )
     const binders = syntaxNode(parameters.state, 'LifetimeBinderList', parameters.node.children)
     const callable = parseTypePrimary(parameters.state, following, preserveFieldStart)
     const state =

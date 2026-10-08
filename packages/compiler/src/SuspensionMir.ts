@@ -209,6 +209,7 @@ const descriptorOf = (
   runner,
   outcome: runner.outcome,
   slots: plan.slots,
+  ...(plan.invocationUses.length === 0 ? {} : { invocationUses: plan.invocationUses }),
   ...('cancellationFinalizer' in plan.operation &&
   plan.operation.cancellationFinalizer !== undefined
     ? { cancellationFinalizer: plan.operation.cancellationFinalizer }

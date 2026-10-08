@@ -10,6 +10,7 @@ import * as CleanupPlan from './CleanupPlan.js'
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import type * as Layout from './Layout.js'
 import * as Mir from './Mir.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import type { LinearOperation } from './MirLinearization.js'
 import * as NativeAggregate from './NativeAggregate.js'
 import * as NativeArith from './NativeArith.js'
@@ -852,6 +853,14 @@ export const emit = (context: Context, operation: Operation) => {
     }
     case 'RunEffectValue':
     case 'RunStaticEffect': {
+      const physicalOutcome =
+        operation._tag === 'RunStaticEffect'
+          ? operation.outcomeType.type
+          : ExecutableInputView.outcome(
+              context.program,
+              nativeStorage.fn.localTypes.at(operation.effect.ordinal),
+              operation.outcomeType.type,
+            )
       const logicalInputs =
         operation._tag === 'RunStaticEffect'
           ? [...operation.captures.map((capture) => capture.source), ...operation.arguments]
@@ -863,12 +872,13 @@ export const emit = (context: Context, operation: Operation) => {
         operation.runnerStaticArguments,
       ).find(
         (candidate) =>
+          physicalOutcome !== undefined &&
           Mir.matchesEffectInstance(
             candidate.fn,
             operation.runner,
             operation.runnerTypeArguments,
             operation.runnerStaticArguments,
-            operation.outcomeType.type,
+            physicalOutcome,
             operation._tag === 'RunEffectValue' ? operation.providers : undefined,
           ) &&
           (operation._tag !== 'RunStaticEffect' ||
@@ -1047,19 +1057,26 @@ export const emit = (context: Context, operation: Operation) => {
       break
     }
     case 'CatchEffect': {
+      const physicalOutcome = ExecutableInputView.outcome(
+        context.program,
+        nativeStorage.fn.localTypes.at(operation.effect.ordinal),
+        operation.outcomeType.type,
+      )
       const target = FunctionIndex.nativeInstances(
         declared,
         operation.runner,
         operation.runnerTypeArguments,
         operation.runnerStaticArguments,
-      ).find((candidate) =>
-        Mir.matchesEffectInstance(
-          candidate.fn,
-          operation.runner,
-          operation.runnerTypeArguments,
-          operation.runnerStaticArguments,
-          operation.outcomeType.type,
-        ),
+      ).find(
+        (candidate) =>
+          physicalOutcome !== undefined &&
+          Mir.matchesEffectInstance(
+            candidate.fn,
+            operation.runner,
+            operation.runnerTypeArguments,
+            operation.runnerStaticArguments,
+            physicalOutcome,
+          ),
       )
       if (target === undefined) throw new RangeError('Backend cannot resolve Effect result runner')
       const reifyArguments = NativeArgument.captures(

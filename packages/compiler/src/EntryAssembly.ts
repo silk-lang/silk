@@ -17,12 +17,13 @@ import { i32, local, mirType, patternKey } from './Lower.js'
 import type {} from './LowerExpression.js'
 import { lowerExpressionInner } from './LowerExpression.js'
 import { lowerSequence } from './LowerStatements.js'
-import type * as Mir from './Mir.js'
+import * as Mir from './Mir.js'
 import type * as OpaqueRealization from './OpaqueRealization.js'
 import type * as Ownership from './Ownership.js'
 import * as RowAlgebra from './RowAlgebra.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
+
 import type {
   GeneratedBlockEffectRunner,
   GeneratedBuiltinEffectRunner,
@@ -35,6 +36,7 @@ import {
   resultCallableValueType,
   effectValueByIdentity,
   effectValueType,
+  returnedEffectValueType,
   instanceText,
   providedContractEntry,
   representedValueType,
@@ -47,6 +49,43 @@ import {
   sourceWitnessArguments,
   witnessEffectContract,
 } from './WitnessLowering.js'
+
+/** Preserves only genuine authored input headers, including inputs captured by a real runner. */
+const sourceParametersOf = (
+  lowering: FunctionLowering,
+): NonNullable<Mir.MirFunction['sourceParameters']> =>
+  lowering.owner.function.declaration.parameters
+    .filter((parameter) => parameter.phase === 'Runtime')
+    .flatMap((parameter, runtimeOrdinal) => {
+      const physical = lowering.parameterLocals.get(parameter.id.ordinal)
+      const selected = lowering.owner.specialization.parameters.at(runtimeOrdinal)
+      if (physical === undefined || selected === undefined || parameter.captureAccess !== undefined)
+        return []
+      const descriptor = lowering.localTypes.at(physical.ordinal)
+      if (descriptor === undefined) return []
+      // The existing hidden-identity realization selected this complete actual header.
+      // Its authored promise alone cannot certify original stored callable inputs.
+      const contract = Type.isRepresented(selected) ? selected.contract : selected
+      return [
+        {
+          local: physical,
+          parameter: parameter.id.ordinal,
+          source: parameter.anchor,
+          contract,
+          type: Mir.semanticType(descriptor),
+        },
+      ]
+    })
+
+/** An authored callable has source identity even when its signature needs no lifetime annotation. */
+const sourceOwnerOf = (lowering: FunctionLowering): Pick<Mir.MirFunction, 'sourceOwner'> => {
+  const declaration = lowering.owner.function.declaration
+  const canonical = declaration.canonical
+  const owner =
+    declaration.lifetimeElaboration?.owner ??
+    (canonical._tag === 'Canonical' ? canonical.id : undefined)
+  return owner === undefined ? {} : { sourceOwner: owner }
+}
 
 const publishRunnerSuccess = (
   fn: FunctionLowering,
@@ -338,11 +377,7 @@ export const lowerInstance = (
           Type.isEffect(capture.type) &&
           captures.every((field) => Type.equals(field.type, capture.type))
         ) {
-          const captured = effectValueByIdentity(
-            layout,
-            capture.resolvedEffectIdentity ?? capture.effectIdentity ?? '',
-            capture.type,
-          )
+          const captured = effectCaptureValue(capture, layout)
           if (captured !== undefined) return [captured]
         }
         if (Type.isEffect(specialized)) return []
@@ -384,8 +419,7 @@ export const lowerInstance = (
           instance.specialization.result,
           instance.specialization.failureRow ?? RowAlgebra.concrete(Type.failureRowPolicy(), []),
           {
-            ...DeclarationFacts.executableLifetimes(fn.declaration),
-            lifetimeBinders: [],
+            ...DeclarationFacts.effectLifetimes(fn.declaration),
             environment: Type.substituteLifetime(
               DeclarationFacts.executableLifetimes(fn.declaration).environment,
               instance.substitution,
@@ -402,10 +436,12 @@ export const lowerInstance = (
       ? instance.specialization.result
       : undefined)
   const returnedBlock = contract._tag === 'Contract' ? returnedEffectBlock(fn) : undefined
-  const hiddenEffectValue =
-    returnedBlock === undefined || resultEffectType === undefined
-      ? undefined
-      : effectValueType(layout, instance.key, returnedBlock, resultEffectType)
+  let hiddenEffectValue: Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined
+  if (returnedBlock !== undefined && resultEffectType !== undefined) {
+    if (contract._tag === 'Contract' && contract.functionKind !== 'Effect')
+      hiddenEffectValue = returnedEffectValueType(layout, instance, returnedBlock)
+    else hiddenEffectValue = effectValueType(layout, instance.key, returnedBlock, resultEffectType)
+  }
   const hiddenCompositeResult = returnedValueType(
     layout,
     opaqueRealizations,
@@ -485,6 +521,13 @@ export const lowerInstance = (
 
   return {
     _tag: 'MirFunction',
+    ...(fn.declaration.lifetimeElaboration?.invocationUse === undefined
+      ? {}
+      : {
+          sourceInvocationUse: DeclarationFacts.executableLifetimes(fn.declaration).invocationUse,
+        }),
+    sourceParameters: sourceParametersOf(lowering),
+    ...sourceOwnerOf(lowering),
     id: instance.key.declaration,
     instance: instance.key,
     ...(fn.declaration.machine === undefined ? {} : { machine: fn.declaration.machine }),
@@ -497,6 +540,30 @@ export const lowerInstance = (
   }
 }
 
+const effectCaptureValue = (
+  field: Layout.EffectEnvironmentField,
+  layout: Layout.Plan,
+): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
+  const identity = field.resolvedEffectIdentity ?? field.effectIdentity
+  if (identity === undefined) return undefined
+  const ordinary = effectValueByIdentity(
+    layout,
+    identity,
+    EffectExecutionContract.fromType(field.type),
+  )
+  const inputView = field.inputView
+  if (inputView === undefined) return ordinary
+  if (
+    !Type.isEffect(field.type) ||
+    !Type.isEffect(inputView.view.actual) ||
+    !Type.isEffect(inputView.view.expected) ||
+    !Type.equals({ ...inputView.view.expected, access: field.type.access }, field.type)
+  )
+    return undefined
+  const actual = effectValueByIdentity(layout, identity, inputView.view.actual)
+  return actual === undefined ? undefined : { ...actual, type: field.type, inputView }
+}
+
 const effectCaptureParameterTypes = (
   fields: ReadonlyArray<Layout.EffectEnvironmentField>,
   layout: Layout.Plan,
@@ -504,6 +571,8 @@ const effectCaptureParameterTypes = (
 ): ReadonlyArray<Mir.Type> =>
   fields.flatMap((field) => {
     if (field.effectIdentity !== undefined) {
+      const checked = effectCaptureValue(field, layout)
+      if (checked !== undefined) return [checked]
       const resolvedEffectValue =
         field.resolvedEffectIdentity === undefined
           ? undefined
@@ -523,7 +592,11 @@ const effectCaptureParameterTypes = (
     }
     if (field.callableIdentity !== undefined && Type.isCallable(field.type)) {
       const callable = callableValueByIdentity(layout, field.callableIdentity, field.type)
-      return callable === undefined ? [] : [callable]
+      if (callable === undefined) return []
+      if (field.inputView === undefined) return [callable]
+      const selected = field.inputView.view.invocationSource?.selected
+      if (selected === undefined || !Type.equals(selected, field.type)) return []
+      return [{ ...callable, type: selected, inputView: field.inputView }]
     }
     if (Type.isRepresented(field.type)) {
       const represented = representedValueType(layout, opaqueRealizations, field.type, new Map())
@@ -647,6 +720,8 @@ export const lowerEffectRunner = (
     _tag: 'LoweredGeneratedEffectRunner',
     runner: {
       _tag: 'MirFunction',
+      sourceParameters: sourceParametersOf(lowering),
+      ...sourceOwnerOf(lowering),
       id,
       instance,
       parameterCount: parameterTypes.length,
@@ -752,6 +827,8 @@ export const lowerCatchEffectRunner = (
   publishRunnerSuccess(lowering, region, operations, success, result, spec.expression.span)
   return {
     _tag: 'MirFunction',
+    sourceParameters: sourceParametersOf(lowering),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: parameterTypes.length,
@@ -874,6 +951,8 @@ export const lowerBuiltinEffectRunner = (
   publishRunnerSuccess(lowering, region, operations, success, result, spec.expression.span)
   return {
     _tag: 'MirFunction',
+    sourceParameters: sourceParametersOf(lowering),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: allParameters.length,
@@ -1098,6 +1177,8 @@ export const lowerWitnessEffectRunner = (
   })
   return {
     _tag: 'MirFunction',
+    sourceParameters: sourceParametersOf(lowering),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: allParameters.length,

@@ -10,6 +10,7 @@ import * as Mir from '../src/Mir.js'
 import * as MirEncoding from '../src/MirEncoding.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Target from '../src/Target.js'
+import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
 import * as MirSamples from './support/mirSamples.js'
 
@@ -441,10 +442,29 @@ pub fn main() -> i32 {
     }
     const fallible = effectReturn('fallible')
     const pending = effectReturn('pending')
+    const original = snapshot.instances.instances.find(
+      (instance) => instance.key.declaration.name === 'fallible',
+    )
+    const producer = original?.function.statements
+      .flatMap(Tir.statementExpressions)
+      .find((expression) => expression._tag === 'EffectBlock')
+    assert.isTrue(
+      producer?._tag === 'EffectBlock' &&
+        Type.isEffect(producer.type) &&
+        Type.isNever(producer.type.success),
+    )
+    // The checked declaration supplies the physical success carrier once, including the runner.
+    assert.strictEqual(fallible.returned.type.success, 'i32')
+    assert.strictEqual(fallible.returned.environment.effect.success, 'i32')
     assert.isTrue(Mir.realizesReturn(fallible.returned, fallible.result))
     assert.isTrue(Mir.realizesReturn(pending.returned, pending.result))
     // A declared `never` success does not accept a realized value.
-    assert.isFalse(Mir.realizesReturn(fallible.result, fallible.returned))
+    const bottomResult: Mir.Type = {
+      ...fallible.returned,
+      type: { ...fallible.returned.type, success: 'never' },
+    }
+    assert.isTrue(Mir.realizesReturn(bottomResult, fallible.result))
+    assert.isFalse(Mir.realizesReturn(fallible.result, bottomResult))
     // The site and environment instance each pin the realization.
     assert.isFalse(
       Mir.realizesReturn(fallible.returned, { ...fallible.result, site: pending.result.site }),
@@ -478,7 +498,7 @@ pub fn main() -> i32 {
         fn === fallible.fn
           ? {
               ...fn,
-              result: fallible.returned,
+              result: bottomResult,
               localTypes: fn.localTypes.map((type, ordinal) =>
                 ordinal === fallible.ordinal ? fallible.result : type,
               ),

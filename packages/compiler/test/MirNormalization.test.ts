@@ -487,3 +487,125 @@ it.effect('verifier rejects dangling normalization identities', () =>
     )
   }),
 )
+
+it.effect('retains checked invocation operands when folding an Effect constructor', () =>
+  Effect.gen(function* () {
+    const raw = yield* AnalysisFixture.retainingMain(
+      'test/mir-normalization-invocation-use',
+      encoder.encode(`effect fn construct(value: i32) -> i32 { return value }
+pub fn main() -> i32 {
+  return run Intrinsic.catchFailure(effect { fail 42 }, construct)
+}`),
+      'wasm32-unknown-unknown',
+      { normalizeMir: false },
+    )
+    assert.deepStrictEqual(Analysis.diagnostics(raw), [])
+    const program = Analysis.loweredMir(raw)
+    const main = program.functions.find((fn) => fn.id.name === 'main') ?? unreachable()
+    const invocation =
+      MirVerification.operations(main).find(
+        (operation) =>
+          (operation._tag === 'Call' || operation._tag === 'ApplyCallable') &&
+          operation.invocationUse !== undefined,
+      ) ?? unreachable('expected genuine marked invocation')
+    if (invocation._tag !== 'Call' && invocation._tag !== 'ApplyCallable')
+      return assert.fail('expected checked actual invocation')
+    if (invocation._tag !== 'ApplyCallable' || invocation.callable === undefined)
+      return assert.fail('expected actual recovery handler declaration and callable')
+    const descriptor = main.localTypes.at(invocation.callable.ordinal)
+    assert.strictEqual(descriptor?._tag, 'CallableValue')
+    if (
+      descriptor?._tag !== 'CallableValue' ||
+      descriptor.target._tag !== 'DeclarationCallableTarget'
+    )
+      return assert.fail('expected actual callable descriptor')
+    assert.isUndefined(invocation.target)
+    assert.strictEqual(
+      descriptor.target.declaration.module,
+      'test/mir-normalization-invocation-use',
+    )
+    assert.strictEqual(descriptor.target.declaration.name, 'construct')
+    const target = descriptor.target.declaration
+    const constructor =
+      program.functions.find(
+        (fn) => fn.id.module === target.module && fn.id.name === target.name,
+      ) ?? unreachable('expected actual source constructor body')
+    assert.strictEqual(constructor.parameterCount, 1)
+    assert.strictEqual(constructor.localTypes.at(0)?._tag, 'i32')
+    const original =
+      MirVerification.operations(constructor).find(
+        (operation) => operation._tag === 'MakeEffect',
+      ) ?? unreachable('expected actual constructor definition')
+    if (original._tag !== 'MakeEffect') return assert.fail('expected actual Effect construction')
+    const proof = invocation.invocationUse ?? unreachable('expected actual input-use record')
+    assert.strictEqual(proof.kind, 'Recovery')
+    assert.strictEqual(proof.inputs.at(0)?.parameter, 0)
+    assert.strictEqual(proof.inputs.at(0)?.argument.ordinal, invocation.arguments.at(0)?.ordinal)
+    assert.strictEqual(invocation.arguments.length, 1)
+    const actualInput = invocation.arguments.at(0) ?? unreachable('expected source operand')
+    assert.strictEqual(proof.result.ordinal, invocation.destination.ordinal)
+    const normalized = MirNormalization.normalize(program, provisionalOf(raw))
+    assert.isTrue(
+      (normalized.normalization ?? []).some(
+        (verdict) =>
+          verdict.function === main.id &&
+          verdict.local.ordinal === invocation.destination.ordinal &&
+          verdict._tag === 'Normalized' &&
+          verdict.kind === 'FoldedConstructor',
+      ),
+      'expected selected-source constructor fold',
+    )
+    const normalizedCaller =
+      normalized.functions.find((fn) => fn.id === main.id) ??
+      unreachable('expected normalized caller')
+    const folded =
+      MirVerification.operations(normalizedCaller).find(
+        (operation) => operation._tag === 'MakeEffect' && operation.invocationSource === invocation,
+      ) ?? unreachable('expected selected-source constructor fold')
+    if (folded._tag !== 'MakeEffect') return assert.fail('expected folded checked constructor')
+    assert.strictEqual(folded.invocationSource, invocation)
+    assert.strictEqual(folded.destination.ordinal, invocation.destination.ordinal)
+    assert.deepStrictEqual(folded.runner, original.runner)
+    assert.deepStrictEqual(folded.runnerTypeArguments, original.runnerTypeArguments)
+    assert.strictEqual(folded.captures.length, 1)
+    const capture = folded.captures.at(0) ?? unreachable('expected actual scalar capture')
+    assert.strictEqual(capture.source.ordinal, actualInput.ordinal)
+    assert.strictEqual(capture.access, 'Copy')
+    assert.isTrue(MirNormalization.invocationConstructionValid(normalized, folded))
+    assert.isTrue(
+      (normalized.normalization ?? []).some(
+        (verdict) =>
+          verdict.function === main.id &&
+          verdict.local.ordinal === folded.destination.ordinal &&
+          verdict._tag === 'Rejected' &&
+          verdict.reason === 'InvocationUse',
+      ),
+    )
+    assert.isFalse(
+      (normalized.normalization ?? []).some(
+        (verdict) =>
+          verdict.function === main.id &&
+          verdict.local.ordinal === folded.destination.ordinal &&
+          verdict._tag === 'Normalized' &&
+          verdict.kind === 'DirectStaticRun',
+      ),
+    )
+    // Select a different real caller local. The positive graph and every packet/identity
+    // stay untouched; only the original operand or its physical capture is altered.
+    const other = invocation.destination
+    assert.notStrictEqual(other.ordinal, actualInput.ordinal)
+    const wrongInvocation = { ...invocation, arguments: [other] }
+    assert.isFalse(
+      MirNormalization.invocationConstructionValid(normalized, {
+        ...folded,
+        invocationSource: wrongInvocation,
+      }),
+    )
+    assert.isFalse(
+      MirNormalization.invocationConstructionValid(normalized, {
+        ...folded,
+        captures: [{ ...capture, source: other }],
+      }),
+    )
+  }),
+)
