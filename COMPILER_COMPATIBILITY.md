@@ -58,9 +58,10 @@ actual Local regions of the same caller is admitted at the region the binder alr
 body retains a `RegionRelation` safety obligation for the later checked caller-region/outlives
 stage; this does not admit fixed Static, incompatible access/element, or foreign owner evidence.
 See "Native typing retains unproven caller-local region relations" below. Immediate raw
-pointer weakening removes mutation capability and adds nullability, preserving invariant
-pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
-covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
+pointer weakening removes mutation capability, adds nullability, and weakens alignment as the
+bootstrap does (any requirement to `align(1)`, a written alignment to a smaller written one),
+preserving invariant pointee/extent; it does not implement reverse access, nested pointee
+covariance, or other qualifier conversions. Ownership, lifetime, and cleanup
 checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
 complete language oracle.
 
