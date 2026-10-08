@@ -40,7 +40,10 @@ const program = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const directory = dirname(fileURLToPath(import.meta.url))
   const suppliesText = yield* fs.readFileString(
-    join(directory, '../../../../openspec/changes/add-native-pointer-boundary/supplies.json'),
+    join(
+      directory,
+      '../../../../openspec/changes/archive/2026-09-10-add-native-pointer-boundary/supplies.json',
+    ),
   )
   const supplies = yield* Schema.decodeEffect(Supplies)(suppliesText)
   const argument = process.argv.slice(2)

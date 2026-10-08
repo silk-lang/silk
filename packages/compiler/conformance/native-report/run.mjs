@@ -88,7 +88,7 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(
       path.join(
         directory,
-        '../../../../openspec/changes/complete-native-runtime-migration/report-supplies.json',
+        '../../../../openspec/changes/archive/2026-09-10-complete-native-runtime-migration/report-supplies.json',
       ),
     ),
   )

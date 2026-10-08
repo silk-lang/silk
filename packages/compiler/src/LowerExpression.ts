@@ -1,4 +1,5 @@
 import * as CallableInputView from './CallableInputView.js'
+import * as CallableDeclarationView from './CallableDeclarationView.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as ConcreteCleanup from './ConcreteCleanup.js'
 import {
@@ -1121,6 +1122,25 @@ export const lowerRecoveryInvocationInputs = (
       (actual.environment === undefined && actual.site !== undefined)
     )
       return undefined
+    if (actual.environment === undefined) {
+      const source = CallableDeclarationView.original(fn.index, actual)
+      const parameter = source?.declaration.parameters.at(0)
+      const originalInput = source?.inputs.at(0)
+      if (
+        source === undefined ||
+        source.inputs.length !== 1 ||
+        source.parameters.length !== 1 ||
+        parameter === undefined ||
+        originalInput !== parameter.id.ordinal ||
+        !Type.equals(source.parameters.at(0) ?? 'never', selected)
+      )
+        return undefined
+      const offered = source.contract.invocationUse?.lifetime
+      return {
+        binder: offered?._tag === 'BoundLifetime' ? offered : binder,
+        inputs: [{ parameter: originalInput, argument, type: selected }],
+      }
+    }
     const target = actual.target.declaration
     const environment = actual.environment
     const arguments_ =
@@ -1149,11 +1169,6 @@ export const lowerRecoveryInvocationInputs = (
       source.view.lifetimes?.diagnostics.length !== 0
     )
       return undefined
-    const contract = DeclarationFacts.callableContract(source.function.declaration)
-    const originalInputs = Type.callableInputOrdinals(contract)
-    const parameters = source.function.declaration.parameters.filter(
-      (parameter) => parameter.phase === 'Runtime',
-    )
     if (environment !== undefined) {
       const view = CallableInputView.authenticate(
         {
@@ -1181,8 +1196,22 @@ export const lowerRecoveryInvocationInputs = (
           fn.parameterLocals.get(parameter.id.ordinal)?.ordinal === callable.ordinal,
       )
       const header = headers.at(0)
+      const producer = fn.incomingCallables.get(callable.ordinal)
+      const incoming =
+        producer === undefined
+          ? undefined
+          : CallableInputView.catchInput(
+              {
+                layout: fn.layout,
+                callableInputSources: CallableInputView.catalog(fn.instances, fn.layout),
+              },
+              actual,
+              producer,
+            )
       if (
-        (definition === undefined && (headers.length !== 1 || header === undefined)) ||
+        (definition === undefined &&
+          (headers.length !== 1 || header === undefined) &&
+          incoming === undefined) ||
         (definition !== undefined &&
           (definition.base !== undefined ||
             definition.type.environment !== environment ||
@@ -1226,31 +1255,21 @@ export const lowerRecoveryInvocationInputs = (
             source: header.anchor,
             header: { parameter: header.id.ordinal, source: header.anchor },
           })
+        } else if (incoming !== undefined && producer !== undefined) {
+          inputs.push({
+            parameter: capture.parameterOrdinal,
+            capture: capture.ordinal,
+            argument: callable,
+            type: field.type,
+            source: capture.value.origin.anchor,
+            producer,
+          })
         }
       }
       const offered = view.contract.invocationUse?.lifetime
       return { binder: offered?._tag === 'BoundLifetime' ? offered : binder, inputs }
     }
-    const parameter = parameters.at(0)
-    const selectedParameter = source.specialization.parameters.at(0)
-    if (
-      originalInputs?.length !== 1 ||
-      originalInputs.at(0) !== 0 ||
-      contract.captures.length !== 0 ||
-      parameters.length !== 1 ||
-      parameter === undefined ||
-      parameter.captureAccess !== undefined ||
-      selectedParameter === undefined ||
-      actual.type.parameters.length !== 1 ||
-      !Type.equals(selectedParameter, selected) ||
-      !Type.equals(actual.type.parameters[0] ?? 'never', selected)
-    )
-      return undefined
-    const offered = contract.invocationUse?.lifetime
-    return {
-      binder: offered?._tag === 'BoundLifetime' ? offered : binder,
-      inputs: [{ parameter: parameter.id.ordinal, argument, type: selected }],
-    }
+    return undefined
   }
   if (!Type.invocationAdapterValid(actual.type.invocationUse, 1, schema)) return undefined
   const parameter = schema.invocationAdapter?.parameters.at(0) ?? 0

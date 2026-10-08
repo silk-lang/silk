@@ -88,7 +88,7 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(
       path.join(
         directory,
-        '../../../../openspec/changes/source-owned-native-entropy/supplies.json',
+        '../../../../openspec/changes/archive/2026-09-10-source-owned-native-entropy/supplies.json',
       ),
     ),
   )
