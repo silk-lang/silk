@@ -294,9 +294,9 @@ Each entry records:
   used by the condition or its helpers cannot be supplied by an interface that only the condition's
   own arm imports or declares: the condition resolves as if that interface were absent instead of
   reporting `Cycle`.
-- **Evidence:** in `compiler/src/semantic/SemanticStaticCases.silk`,
-  `moduleArmsSelectNativeDeclarations`, `conditionOrderSelectNativeAnswers` (both demand orders in
-  fresh stores) and `mixedConditionalNameSelectNativeBoundary`.
+- **Evidence:** `moduleArmsSelectNativeDeclarations` and `conditionOrderSelectNativeAnswers` (both
+  demand orders in fresh stores) in `compiler/src/semantic/SemanticSignatureCases.silk`, and
+  `mixedConditionalNameSelectNativeBoundary` in `compiler/src/semantic/SemanticStaticCases.silk`.
 - **Open questions:** expose arm availability through the static port so mixed-body routing can
   select arms, and decide whether the scan bound should instead report `Cycle` when a skipped
   interface would apply.
@@ -762,7 +762,7 @@ Each entry records:
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
     mismatch against this entry.
 - **Evidence:** the `callableAndEffectSignatureContracts` case in
-  `compiler/src/semantic/SemanticStaticCases.silk` asserts:
+  `compiler/src/semantic/SemanticSignatureCases.silk` asserts:
   - `closedEffect`, `inputEffect` and `heldEffect` equal `explicitStatic`;
   - `genericEffect`, `twoBorrowEffect` and `nestedStatic` reject as `AmbiguousLifetime`, and
     `heldOpenEffect` does so spanning its written `Effect<i32>` result;
@@ -1673,7 +1673,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
   `UnknownMember`, which it keeps for a function's own unbounded type parameter.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticStaticCases.silk`.
+  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 ### Native service operations with a `Self` operand
 
@@ -1684,7 +1684,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
   `typed-form` gap) instead of a `TypeMismatch` at the operand.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticStaticCases.silk`.
+  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 
 ### Finite scalar StaticSequence iteration in the native frontend

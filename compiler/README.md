@@ -1075,7 +1075,7 @@ them back to a local owner, as required by Silk's ownership rules.
 ## Verification
 
 Build this checkout's bootstrap CLI, then run the source-written cases. The M1 query root imports
-query and source-index cases. The semantic cases are split by topic into five roots that share
+query and source-index cases. The semantic cases are split by topic into six roots that share
 `semantic/SemanticCaseSupport.silk`; they, the callable-result cases and the frozen-target cases use
 their own roots to keep each native compilation within the CI time and heap limits. The HIR root
 runs the lowering, fingerprint, and parser cases without pulling the semantic engine into their
@@ -1088,6 +1088,7 @@ named `selfhost-*`; pushing one does not start a second CI run before its pull r
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticSignatureCases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticConformanceCases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticLoweringCases.silk --no-cache
 NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCaptureCases.silk --no-cache
