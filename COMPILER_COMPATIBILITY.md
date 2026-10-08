@@ -329,6 +329,9 @@ Each entry records:
   element, a loop iteration that leaves an owner in a different state than it found it, a
   guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
   drop glue for callable and Effect environments and unions without a canonical member order.
+  Since 2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as
+  `K: Copy` or a shared callable representation does; an unbounded abstract owner of a generic
+  named instance keeps the `cleanup` gap.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticLoweringCases.silk`, and `cleanupFollowsLoopsAndConditionalPaths`
