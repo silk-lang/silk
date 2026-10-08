@@ -17,12 +17,13 @@ import semantic.InternIndex {InternIndex}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target as ApplicationTarget}
 import semantic.RuntimeEncoding
+import semantic.StaticValue
 import semantic.RuntimeEncoding {Coordinates}
 import semantic.CallableSchema
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.CallableSchema {CallableSchema as SectionSchema}
-import semantic.Lifetime {Intersection, Lifetime, Member, Numbering}
+import semantic.Lifetime {CanonicalizationFailure, Intersection, Lifetime, Member, Numbering}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
@@ -1117,7 +1118,23 @@ effect fn sameArgumentRows(left: &Shared<Type>, right: &Shared<Type>, count: usi
 // Under a map, an assigned invocation binder on the left matches its image on the right, and an
 // unassigned one matches any right binder that is not yet an image.
 fn sameLifetime(left: &Shared<Lifetime>, right: &Shared<Lifetime>, map: &[usize]) -> bool {
-  if projectionMap(map) {
+  if projectionMap(map) { return true }
+  let atomCount = Lifetime.atomCount(left)
+  if atomCount > usize.ONE || Lifetime.atomCount(right) > usize.ONE {
+    if atomCount != Lifetime.atomCount(right) { return false }
+    let mut atomAt = usize.ZERO
+    while atomAt < atomCount {
+      let firstAtom = Lifetime.atomAt(left, atomAt)
+      let mut found = false
+      let mut comparedAt = usize.ZERO
+      while !found && comparedAt < atomCount {
+        let comparedAtom = Lifetime.atomAt(right, comparedAt)
+        found = sameLifetime(&firstAtom, &comparedAtom, map)
+        comparedAt = comparedAt + usize.ONE
+      }
+      if !found { return false }
+      atomAt = atomAt + usize.ONE
+    }
     return true
   }
   if map.length == usize.ZERO {
@@ -2302,7 +2319,7 @@ fn openType(value: &Shared<Type>, runtime: bool) -> bool {
       return comparedLifetimeAt(node, at)
     })
     if let Option<Shared<Lifetime>>.Some {value: region} = move found {
-      if Shared.with<Lifetime, bool>(&region, openLifetime) {
+      if Lifetime.anyAtom(&region, openLifetime) {
         return true
       }
     }
@@ -2415,10 +2432,15 @@ impl Type {
   }
 
 
-  /// The first nominal or anonymous-occurrence declaration a value type mentions, searching array
-  /// elements and union members in canonical order. Drop glue for the type is attributed to it; a
-  /// type that mentions none owns no aggregate that could need cleanup.
-  pub effect fn glueOwner(value: &Shared<Type>) -> Option<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  /// The original declaration anchoring cleanup identity. Union children select the least
+  /// declaration record, independent of region names and runtime member traversal order.
+  /// A bounded caller shares its complete record-production/comparison transaction here.
+  pub effect fn glueOwner(value: &Shared<Type>, coordinates: &mut Coordinates) -> Option<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+    if coordinates.exceeded { return Option.none<DeclarationId>() }
+    let affordable = Shared.with<Type, bool>(value, fn(node: &Type) -> bool {
+      return RuntimeEncoding.recordPayload(&mut coordinates.*, nodePayload(node))
+    })
+    if !affordable { return Option.none<DeclarationId>() }
     let node = run nodeCopy(value)
     return match &node {
       Type.Nominal {declaration, ..} => Option.some<DeclarationId>(run DeclarationId.copy(&declaration))
@@ -2426,37 +2448,60 @@ impl Type {
         let declaration = Shared.with<AnonymousOccurrence, Shared<DeclarationId>>(&occurrence, fn(site: &AnonymousOccurrence) -> Shared<DeclarationId> {
           return Shared.clone<DeclarationId>(&site.declaration)
         })
+        let affordableOwner = Shared.with<DeclarationId, bool>(&declaration,
+          fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+        if !affordableOwner { return Option.none<DeclarationId>() }
         return Option.some<DeclarationId>(run DeclarationId.copyShared(&declaration))
       }
       Type.CallableSchema {schema, ..} => {
         let target = Shared.with<SectionSchema, Shared<DeclarationId>>(&schema,
           fn(value: &SectionSchema) -> Shared<DeclarationId> { return Shared.clone<DeclarationId>(&value.target) })
+        let affordableOwner = Shared.with<DeclarationId, bool>(&target,
+          fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+        if !affordableOwner { return Option.none<DeclarationId>() }
         return Option.some<DeclarationId>(run DeclarationId.copyShared(&target))
       }
       Type.CallableValue {application, ..} => {
-        let target = run Application.copyShared(&application)
-        return Option.some<DeclarationId>(run DeclarationId.copy(Application.bodyDeclaration(&target)))
+        let affordableOwner = Shared.with<Application, bool>(&application,
+          fn(selected: &Application) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*,
+            RuntimeEncoding.declarationPayload(Application.bodyDeclaration(selected))) })
+        if !affordableOwner { return Option.none<DeclarationId>() }
+        let declaration = run Application.copyBodyDeclaration(&application)
+        return Option.some<DeclarationId>(move declaration)
       }
-      Type.CallableView {representation, ..} => run Type.glueOwner(&representation)
+      Type.CallableView {representation, ..} => run Type.glueOwner(&representation, &mut coordinates.*)
       // A composition's runtime identity is anchored by the Effect it protects.
       Type.EffectComposite {parts, ..} => {
         let stored = Vector.asSlice<Shared<Type>>(&parts)
-        return run Type.glueOwner(&stored[usize.ZERO])
+        return run Type.glueOwner(&stored[usize.ZERO], &mut coordinates.*)
       }
-      Type.Array {element, ..} => run Type.glueOwner(&element)
-      Type.Union {..} => {
-        let members = match move run Type.canonicalUnionMembers(value) {
-          Option<Vector<Shared<Type>>>.Some {value: ordered} => ordered
-          Option<Vector<Shared<Type>>>.None => { return Option.none<DeclarationId>() }
-        }
+      Type.Array {element, ..} => run Type.glueOwner(&element, &mut coordinates.*)
+      Type.Union {members} => {
         let listed = Vector.asSlice<Shared<Type>>(&members)
+        let mut best = Option.none<DeclarationId>()
+        let mut bestRecord = Bytes.make()
         let mut at = usize.ZERO
         while at < listed.length {
-          let candidate = run Type.glueOwner(&listed[at])
-          if let Option<DeclarationId>.Some {value: found} = move candidate { return Option.some<DeclarationId>(move found) }
+          let candidate = run Type.glueOwner(&listed[at], &mut coordinates.*)
+          if let Option<DeclarationId>.Some {value: found} = move candidate {
+            let mut record = Bytes.make()
+            run RuntimeEncoding.recordDeclaration(&mut record, &found, &mut coordinates.*)
+            if coordinates.exceeded { return Option.none<DeclarationId>() }
+            let mut choose = true
+            if let Option<DeclarationId>.Some {..} = &best {
+              let equal = RuntimeEncoding.recordEqual(Bytes.asSlice(&record), Bytes.asSlice(&bestRecord), &mut coordinates.*)
+              if coordinates.exceeded { return Option.none<DeclarationId>() }
+              if equal { choose = false } else {
+                choose = RuntimeEncoding.less(Bytes.asSlice(&record), Bytes.asSlice(&bestRecord))
+              }
+            }
+            if choose { best = Option.some<DeclarationId>(move found)
+              bestRecord = move record }
+          }
+          if coordinates.exceeded { return Option.none<DeclarationId>() }
           at = at + usize.ONE
         }
-        return Option.none<DeclarationId>()
+        return move best
       }
       _ => Option.none<DeclarationId>()
     }
@@ -2818,16 +2863,17 @@ impl Type {
     owner: &DeclarationId,
     lifetimes: &mut Vector<usize>,
   ) -> () ! OutOfMemoryError ? &mut Allocator {
-    let ordinal = Shared.with<Lifetime, usize>(
-      lifetime,
-      fn(region: &Lifetime) -> usize {
+    let count = Lifetime.atomCount(lifetime)
+    let mut atomAt = usize.ZERO
+    while atomAt < count {
+      let atom = Lifetime.atomAt(lifetime, atomAt)
+      let ordinal = Shared.with<Lifetime, usize>(&atom, fn(region: &Lifetime) -> usize {
         return ownedLifetimeOrdinal(region, owner)
-      },
-    )
-    if ordinal == usize.MAX {
-      return ()
+      })
+      if ordinal != usize.MAX { run appendOrdinal(&mut lifetimes.*, ordinal) }
+      atomAt = atomAt + usize.ONE
     }
-    return run appendOrdinal(&mut lifetimes.*, ordinal)
+    return ()
   }
   /// Appends the owned parameters a requirement row mentions through its capabilities and `?R`
   /// parameters.
@@ -2933,11 +2979,15 @@ impl Type {
   pub effect fn collectLifetime(lifetime: &Shared<Lifetime>, order: &mut Vector<usize>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-    let ordinal = Shared.with<Lifetime, usize>(lifetime, invocationOrdinal)
-    if ordinal == usize.MAX {
-      return ()
+    let count = Lifetime.atomCount(lifetime)
+    let mut atomAt = usize.ZERO
+    while atomAt < count {
+      let atom = Lifetime.atomAt(lifetime, atomAt)
+      let ordinal = Shared.with<Lifetime, usize>(&atom, invocationOrdinal)
+      if ordinal != usize.MAX { run appendOrdinal(&mut order.*, ordinal) }
+      atomAt = atomAt + usize.ONE
     }
-    return run appendOrdinal(&mut order.*, ordinal)
+    return ()
   }
   /// Appends the non-static regions a value of this type retains when an Effect captures it, and
   /// reports whether every retained region is known.
@@ -3206,7 +3256,10 @@ impl Type {
         let callable = Type.closedCallableStorage(&member)
         if !closed && !callable { return Option.none<Vector<Shared<Type>>>() }
         let mut anchor = Option.none<DeclarationId>()
-        if callable { anchor = run Type.glueOwner(&member) } else { anchor = run copyNodeDeclaration(&member) }
+        if callable {
+          let mut coordinates = RuntimeEncoding.coordinates()
+          anchor = run Type.glueOwner(&member, &mut coordinates)
+        } else { anchor = run copyNodeDeclaration(&member) }
         let own = match move anchor {
           Option<DeclarationId>.Some {value: declaration} => declaration
           Option<DeclarationId>.None => { return Option.none<Vector<Shared<Type>>>() }
@@ -4294,7 +4347,9 @@ fn resolvedLifetime(
   bindings: &[Binding],
 ) -> Shared<Lifetime> {
   let mut current = Shared.clone<Lifetime>(term)
-  while true {
+  let mut followed = usize.ZERO
+  while followed <= bindings.length {
+    followed = followed + usize.ONE
     let slot = Shared.with<Lifetime, UnifySlot>(
       &current,
       fn(value: &Lifetime) -> UnifySlot {
@@ -4317,6 +4372,58 @@ fn resolvedLifetime(
     current = move next
   }
   return move current
+}
+
+// Resolve only permitted inference owners, retaining the active original slot path. Seeded cycles
+// yield no evidence; general applyBindings remains simultaneous and never calls this resolver.
+effect fn resolvedLifetimeMeet(term: &Shared<Lifetime>, variables: &[Shared<DeclarationId>], bindings: &[Binding],
+  active: &mut Vector<UnifySlot>) -> Option<Shared<Lifetime>> ! OutOfMemoryError ? &mut Allocator {
+  let slot = Shared.with<Lifetime, UnifySlot>(term, fn(region: &Lifetime) -> UnifySlot {
+    return lifetimeSlot(region, variables)
+  })
+  if slot.owner != usize.MAX {
+    let supplied = bindingAt(bindings, variables, &slot)
+    if supplied != usize.MAX {
+      if hasSlot(Vector.asSlice<UnifySlot>(&active.*), &slot) { return Option.none<Shared<Lifetime>>() }
+      if let Argument.Lifetime {value: selected} = &bindings[supplied].value {
+        let mark = Vector.length<UnifySlot>(&active.*)
+        run Vector.append<UnifySlot>(&mut active.*, UnifySlot {owner: slot.owner, ordinal: slot.ordinal})
+        let result = run resolvedLifetimeMeet(&selected, variables, bindings, &mut active.*)
+        Vector.truncate<UnifySlot>(&mut active.*, mark)
+        return move result
+      }
+      return Option.none<Shared<Lifetime>>()
+    }
+  }
+  let count = Lifetime.atomCount(term)
+  if count == usize.ONE { return Option.some<Shared<Lifetime>>(Shared.clone<Lifetime>(term)) }
+  let mut normalized = Vector.make<Shared<Lifetime>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Lifetime.atomAt(term, at)
+    let resolved = run resolvedLifetimeMeet(&atom, variables, bindings, &mut active.*)
+    let closed = match move resolved {
+      Option<Shared<Lifetime>>.Some {value: resolvedAtom} => move resolvedAtom
+      _ => { return Option.none<Shared<Lifetime>>() }
+    }
+    run Vector.append<Shared<Lifetime>>(&mut normalized, move closed)
+    at = at + usize.ONE
+  }
+  return Option.some<Shared<Lifetime>>(run Lifetime.meet(Vector.asSlice<Shared<Lifetime>>(&normalized)))
+}
+
+fn lifetimeContainsSlot(term: &Shared<Lifetime>, slot: &UnifySlot, variables: &[Shared<DeclarationId>]) -> bool {
+  let count = Lifetime.atomCount(term)
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Lifetime.atomAt(term, at)
+    let here = Shared.with<Lifetime, UnifySlot>(&atom, fn(region: &Lifetime) -> UnifySlot {
+      return lifetimeSlot(region, variables)
+    })
+    if sameSlot(slot, &here) { return true }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 fn unionMember(value: &Shared<Type>, at: usize) -> Option<Shared<Type>> {
@@ -4431,6 +4538,30 @@ fn rowMentions(row: &Shared<Row>, slot: &UnifySlot, variables: &[Shared<Declarat
 
 // Whether a term still mentions an unbound variable once bindings are followed. Exact comparison
 // also counts variable lifetimes, which the projection never binds.
+// A seeded lifetime may resolve to a full meet. Inspect every actual atom without treating a
+// rigid foreign meet as an inference variable; seeded cycles remain conservatively open.
+fn lifetimeHasVariable(term: &Shared<Lifetime>, variables: &[Shared<DeclarationId>], bindings: &[Binding], remaining: usize) -> bool {
+  let slot = Shared.with<Lifetime, UnifySlot>(term,
+    fn(region: &Lifetime) -> UnifySlot { return lifetimeSlot(region, variables) })
+  if slot.owner != usize.MAX {
+    let supplied = bindingAt(bindings, variables, &slot)
+    if supplied == usize.MAX || remaining == usize.ZERO { return true }
+    if let Argument.Lifetime {value: selected} = &bindings[supplied].value {
+      return lifetimeHasVariable(&selected, variables, bindings, remaining - usize.ONE)
+    }
+    return true
+  }
+  let count = Lifetime.atomCount(term)
+  if count == usize.ONE { return false }
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Lifetime.atomAt(term, at)
+    if lifetimeHasVariable(&atom, variables, bindings, remaining) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 fn hasVariable(
   term: &Shared<Type>,
   variables: &[Shared<DeclarationId>],
@@ -4458,16 +4589,7 @@ fn hasVariable(
         },
       )
       if let Option<Shared<Lifetime>>.Some {value: lifetime} = move found {
-        let resolved = resolvedLifetime(&lifetime, variables, bindings)
-        let slot = Shared.with<Lifetime, UnifySlot>(
-          &resolved,
-          fn(value: &Lifetime) -> UnifySlot {
-            return lifetimeSlot(value, variables)
-          },
-        )
-        if slot.owner != usize.MAX {
-          return true
-        }
+        if lifetimeHasVariable(&lifetime, variables, bindings, bindings.length + usize.ONE) { return true }
       }
       region = region + usize.ONE
     }
@@ -4786,18 +4908,24 @@ effect fn resolvedEnvironment(
   environment: &Shared<Intersection>,
   variables: &[Shared<DeclarationId>],
   bindings: &[Binding],
-) -> Shared<Intersection> ! OutOfMemoryError ? &mut Allocator {
+) -> Option<Shared<Intersection>> ! OutOfMemoryError ? &mut Allocator {
   let mut regions = Vector.make<Shared<Lifetime>>()
+  let mut active = Vector.make<UnifySlot>()
   let count = environmentSize(environment)
   let mut at = usize.ZERO
   while at < count {
     let member = environmentMember(environment, at)
     if let Option<Shared<Lifetime>>.Some {value} = move member {
-      run Vector.append<Shared<Lifetime>>(&mut regions, resolvedLifetime(&value, variables, bindings))
+      let selected = run resolvedLifetimeMeet(&value, variables, bindings, &mut active)
+      let resolved = match move selected {
+        Option<Shared<Lifetime>>.Some {value: normalized} => move normalized
+        _ => { return Option.none<Shared<Intersection>>() }
+      }
+      run Vector.append<Shared<Lifetime>>(&mut regions, move resolved)
     }
     at = at + usize.ONE
   }
-  return run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions)))
+  return Option.some<Shared<Intersection>>(run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions))))
 }
 
 fn environmentContains(environment: &Shared<Intersection>, candidate: &Shared<Lifetime>) -> bool {
@@ -4910,57 +5038,65 @@ fn environmentWithoutSlotCovered(
   return true
 }
 
-fn unmatchedEnvironmentMember(
-  fixedSide: &Shared<Intersection>,
-  variableSide: &Shared<Intersection>,
-) -> Option<Shared<Lifetime>> {
+effect fn unmatchedEnvironmentMeet(fixedSide: &Shared<Intersection>, variableSide: &Shared<Intersection>)
+  -> Shared<Lifetime> ! OutOfMemoryError ? &mut Allocator {
+  let mut residual = Vector.make<Shared<Lifetime>>()
   let count = environmentSize(fixedSide)
-  let mut unmatched = Option.none<Shared<Lifetime>>()
   let mut at = usize.ZERO
   while at < count {
-    let member = environmentMember(fixedSide, at)
-    if let Option<Shared<Lifetime>>.Some {value} = move member {
-      if !environmentContains(variableSide, &value) {
-        if let Option<Shared<Lifetime>>.Some {value: _} = &unmatched { return Option.none<Shared<Lifetime>>() }
-        unmatched = Option.some<Shared<Lifetime>>(move value)
-      }
+    if let Option<Shared<Lifetime>>.Some {value: member} = move environmentMember(fixedSide, at) {
+      if !environmentContains(variableSide, &member) { run Vector.append<Shared<Lifetime>>(&mut residual, move member) }
     }
     at = at + usize.ONE
   }
-  return move unmatched
+  return run Lifetime.meet(Vector.asSlice<Shared<Lifetime>>(&residual))
 }
 
-effect fn unifyExecutableEnvironment(
-  first: &Shared<Type>,
-  second: &Shared<Type>,
-  variables: &[Shared<DeclarationId>],
-  bindings: &mut Vector<Binding>,
-) -> Unification ! OutOfMemoryError ? &mut Allocator {
+impl Type {
+  /// Solves an exact canonical environment equation transactionally. One permitted unknown may
+  /// acquire the entire unmatched meet; several unknown members never choose a partition.
+  pub effect fn unifyEnvironments(leftRaw: &Shared<Intersection>, rightRaw: &Shared<Intersection>,
+    at: &Shared<Type>, variables: &[Shared<DeclarationId>], bindings: &mut Vector<Binding>)
+    -> Unification ! OutOfMemoryError ? &mut Allocator {
+    let left = match move run resolvedEnvironment(leftRaw, variables, Vector.asSlice<Binding>(&bindings.*)) {
+      Option<Shared<Intersection>>.Some {value: normalizedLeft} => move normalizedLeft
+      _ => { return undetermined(at) }
+    }
+    let right = match move run resolvedEnvironment(rightRaw, variables, Vector.asSlice<Binding>(&bindings.*)) {
+      Option<Shared<Intersection>>.Some {value: normalizedRight} => move normalizedRight
+      _ => { return undetermined(at) }
+    }
+    if environmentEquals(&left, &right) { return Unification.Unified }
+    let slot = soleEnvironmentSlot(&left, &right, variables)
+    if slot.owner == usize.MAX { return undetermined(at) }
+    let leftHas = environmentHasSlot(&left, &slot, variables)
+    let variableSide = environmentOnSide(leftHas, &left, &right)
+    let fixedSide = environmentOnSide(!leftHas, &left, &right)
+    if !environmentWithoutSlotCovered(variableSide, fixedSide, &slot, variables) { return undetermined(at) }
+    let candidate = run unmatchedEnvironmentMeet(fixedSide, variableSide)
+    if lifetimeContainsSlot(&candidate, &slot, variables) { return undetermined(at) }
+    let mark = Vector.length<Binding>(&bindings.*)
+    run bindVariable(&slot, Argument.Lifetime {value: move candidate}, variables, &mut bindings.*)
+    let provedLeft = run resolvedEnvironment(leftRaw, variables, Vector.asSlice<Binding>(&bindings.*))
+    let provedRight = run resolvedEnvironment(rightRaw, variables, Vector.asSlice<Binding>(&bindings.*))
+    if let Option<Shared<Intersection>>.Some {value: completedLeft} = move provedLeft {
+      if let Option<Shared<Intersection>>.Some {value: completedRight} = move provedRight {
+        if environmentEquals(&completedLeft, &completedRight) { return Unification.Unified }
+      }
+    }
+    Vector.truncate<Binding>(&mut bindings.*, mark)
+    return undetermined(at)
+  }
+}
+
+effect fn unifyExecutableEnvironment(first: &Shared<Type>, second: &Shared<Type>,
+  variables: &[Shared<DeclarationId>], bindings: &mut Vector<Binding>) -> Unification
+! OutOfMemoryError ? &mut Allocator {
   let leftFound = Shared.with<Type, Option<Shared<Intersection>>>(first, executableEnvironment)
   let rightFound = Shared.with<Type, Option<Shared<Intersection>>>(second, executableEnvironment)
   if let Option<Shared<Intersection>>.Some {value: leftRaw} = move leftFound {
     if let Option<Shared<Intersection>>.Some {value: rightRaw} = move rightFound {
-      let left = run resolvedEnvironment(&leftRaw, variables, Vector.asSlice<Binding>(&bindings.*))
-      let right = run resolvedEnvironment(&rightRaw, variables, Vector.asSlice<Binding>(&bindings.*))
-      if environmentEquals(&left, &right) { return Unification.Unified }
-      let slot = soleEnvironmentSlot(&left, &right, variables)
-      if slot.owner == usize.MAX { return undetermined(first) }
-      let leftHas = environmentHasSlot(&left, &slot, variables)
-      let variableSide = environmentOnSide(leftHas, &left, &right)
-      let fixedSide = environmentOnSide(!leftHas, &left, &right)
-      if !environmentWithoutSlotCovered(variableSide, fixedSide, &slot, variables) { return undetermined(first) }
-      let missing = unmatchedEnvironmentMember(fixedSide, variableSide)
-      let candidate = match move missing {
-        Option<Shared<Lifetime>>.Some {value} => move value
-        Option<Shared<Lifetime>>.None => run Shared.make<Lifetime>(Lifetime.Static)
-      }
-      let mark = Vector.length<Binding>(&bindings.*)
-      run bindVariable(&slot, Argument.Lifetime {value: move candidate}, variables, &mut bindings.*)
-      let provedLeft = run resolvedEnvironment(&leftRaw, variables, Vector.asSlice<Binding>(&bindings.*))
-      let provedRight = run resolvedEnvironment(&rightRaw, variables, Vector.asSlice<Binding>(&bindings.*))
-      if environmentEquals(&provedLeft, &provedRight) { return Unification.Unified }
-      Vector.truncate<Binding>(&mut bindings.*, mark)
-      return undetermined(first)
+      return run Type.unifyEnvironments(&leftRaw, &rightRaw, first, variables, &mut bindings.*)
     }
   }
   return Unification.Distinct
@@ -5013,8 +5149,15 @@ effect fn unifyLifetimes(
   variables: &[Shared<DeclarationId>],
   bindings: &mut Vector<Binding>,
 ) -> Unification ! OutOfMemoryError ? &mut Allocator {
-  let first = resolvedLifetime(left, variables, Vector.asSlice<Binding>(&bindings.*))
-  let second = resolvedLifetime(right, variables, Vector.asSlice<Binding>(&bindings.*))
+  let mut active = Vector.make<UnifySlot>()
+  let first = match move run resolvedLifetimeMeet(left, variables, Vector.asSlice<Binding>(&bindings.*), &mut active) {
+    Option<Shared<Lifetime>>.Some {value: resolvedLeft} => move resolvedLeft
+    _ => { return undetermined(at) }
+  }
+  let second = match move run resolvedLifetimeMeet(right, variables, Vector.asSlice<Binding>(&bindings.*), &mut active) {
+    Option<Shared<Lifetime>>.Some {value: resolvedRight} => move resolvedRight
+    _ => { return undetermined(at) }
+  }
   let firstSlot = Shared.with<Lifetime, UnifySlot>(
     &first,
     fn(value: &Lifetime) -> UnifySlot {
@@ -5029,11 +5172,13 @@ effect fn unifyLifetimes(
   )
   if firstSlot.owner != usize.MAX {
     if !sameSlot(&firstSlot, &secondSlot) {
+      if lifetimeContainsSlot(&second, &firstSlot, variables) { return undetermined(at) }
       run bindVariable(&firstSlot, Argument.Lifetime {value: move second}, variables, &mut bindings.*)
     }
     return Unification.Unified
   }
   if secondSlot.owner != usize.MAX {
+    if lifetimeContainsSlot(&first, &secondSlot, variables) { return undetermined(at) }
     run bindVariable(&secondSlot, Argument.Lifetime {value: move first}, variables, &mut bindings.*)
     return Unification.Unified
   }
@@ -5045,10 +5190,40 @@ effect fn unifyLifetimes(
     }
     return Unification.Distinct
   }
-  if Lifetime.equalsShared(&first, &second) {
-    return Unification.Unified
+  if Lifetime.equalsShared(&first, &second) { return Unification.Unified }
+  if Lifetime.atomCount(&first) > usize.ONE || Lifetime.atomCount(&second) > usize.ONE {
+    let mut open = false
+    let mut side = usize.ZERO
+    while side < 2 {
+      let selected = environmentLifetimeOnSide(side == usize.ZERO, &first, &second)
+      let atoms = Lifetime.atomCount(selected)
+      let mut atomAt = usize.ZERO
+      while atomAt < atoms {
+        let atom = Lifetime.atomAt(selected, atomAt)
+        let slot = Shared.with<Lifetime, UnifySlot>(&atom, fn(region: &Lifetime) -> UnifySlot {
+          return lifetimeSlot(region, variables)
+        })
+        open = open || slot.owner != usize.MAX
+        atomAt = atomAt + usize.ONE
+      }
+      side = side + usize.ONE
+    }
+    if open {
+      let mut one = Vector.make<Shared<Lifetime>>()
+      run Vector.append<Shared<Lifetime>>(&mut one, Shared.clone<Lifetime>(&first))
+      let leftSet = run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&one)))
+      Vector.clear<Shared<Lifetime>>(&mut one)
+      run Vector.append<Shared<Lifetime>>(&mut one, Shared.clone<Lifetime>(&second))
+      let rightSet = run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&one)))
+      return run Type.unifyEnvironments(&leftSet, &rightSet, at, variables, &mut bindings.*)
+    }
   }
   return Unification.Distinct
+}
+
+fn environmentLifetimeOnSide<'a>(firstSide: bool, first: &'a Shared<Lifetime>, second: &'a Shared<Lifetime>) -> &'a Shared<Lifetime> {
+  if firstSide { return first }
+  return second
 }
 
 // A union or single type as a list of set members.
@@ -6433,7 +6608,7 @@ effect fn nodeCopy(value: &Shared<Type>) -> Type
       }
     })
     if let Option<OpaqueNode>.Some {value: node} = move copied {
-      return Type.OpaqueRepresentation {application: run Shared.make<Application>(run Application.copyShared(&node.application)),
+      return Type.OpaqueRepresentation {application: move node.application,
         contract: move node.contract, detached: node.detached, nonParking: node.nonParking}
     }
     return absurd<Type>()
@@ -6943,7 +7118,112 @@ impl Argument {
   }
 }
 
+fn observingOrFailed(numbering: &Numbering) -> bool {
+  if Numbering.isCollecting(numbering) { return true }
+  return match move Numbering.failure(numbering) { Option<CanonicalizationFailure>.Some {..} => true _ => false }
+}
+
+// Only owned scalar payloads are copied by nodeCopy; retained graph handles remain shared.
+fn nodePayload(value: &Type) -> usize {
+  return match &value.* {
+    Type.Primitive {name} => Bytes.length(&name)
+    Type.Nominal {declaration, ..} => RuntimeEncoding.declarationPayload(&declaration)
+    Type.Parameter {declaration, ..} => RuntimeEncoding.declarationPayload(&declaration)
+    Type.Array {extent, ..} => Bytes.length(&extent)
+    _ => usize.ZERO
+  }
+}
+fn numberingDeclarationCost(value: &DeclarationId, numbering: &mut Numbering) -> bool {
+  if !Numbering.units(&mut numbering.*, DeclarationId.ownerSteps(value).length) { return false }
+  return Numbering.bytes(&mut numbering.*, RuntimeEncoding.declarationPayload(value))
+}
+fn numberingSchemaCost(value: &SectionSchema, numbering: &mut Numbering) -> bool {
+  if !Numbering.units(&mut numbering.*, Vector.length<Binding>(&value.selected)) { return false }
+  if !Numbering.units(&mut numbering.*, Vector.length<usize>(&value.deferred)) { return false }
+  return Shared.with<DeclarationId, bool>(&value.target,
+    fn(identity: &DeclarationId) -> bool { return numberingDeclarationCost(identity, &mut numbering.*) })
+}
+fn numberingWitnessCost(value: &WitnessRecipe, numbering: &mut Numbering) -> bool {
+  if !Numbering.units(&mut numbering.*, CallableWitness.bindingCount(value)) { return false }
+  if !Numbering.units(&mut numbering.*, CallableWitness.argumentCount(value)) { return false }
+  if !Numbering.units(&mut numbering.*, CallableWitness.loanCount(value)) { return false }
+  return Shared.with<DeclarationId, bool>(&value.operation,
+    fn(identity: &DeclarationId) -> bool { return numberingDeclarationCost(identity, &mut numbering.*) })
+}
+fn numberingNodeCost(value: &Type, numbering: &mut Numbering) -> bool {
+  if !Numbering.isActive(&numbering.*) { return true }
+  if !Numbering.bytes(&mut numbering.*, nodePayload(value)) { return false }
+  // Count local vector elements before their metadata is copied. Structural children themselves
+  // are also charged by enter/rewriteArgument; this never relies on runtime traversal order.
+  return match &value.* {
+    Type.Nominal {declaration, arguments, ..} => {
+      if !Numbering.units(&mut numbering.*, DeclarationId.ownerSteps(&declaration).length) { return false }
+      return Numbering.units(&mut numbering.*, Vector.length<Argument>(&arguments))
+    }
+    Type.Parameter {declaration, ..} => Numbering.units(&mut numbering.*, DeclarationId.ownerSteps(&declaration).length)
+    Type.CallableOrigin {application, ..} => Shared.with<Application, bool>(&application,
+      fn(selected: &Application) -> bool { return Application.numberingCost(selected, &mut numbering.*) })
+    Type.OpaqueRepresentation {application, ..} => Shared.with<Application, bool>(&application,
+      fn(selected: &Application) -> bool { return Application.numberingCost(selected, &mut numbering.*) })
+    Type.CallableWitnessResult {witness} => Shared.with<WitnessRecipe, bool>(&witness,
+      fn(recipe: &WitnessRecipe) -> bool { return numberingWitnessCost(recipe, &mut numbering.*) })
+    Type.Anonymous {occurrence, members} => {
+      if !Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&members)) { return false }
+      let generator = Shared.with<AnonymousOccurrence, Shared<DeclarationId>>(&occurrence,
+        fn(site: &AnonymousOccurrence) -> Shared<DeclarationId> { return Shared.clone<DeclarationId>(&site.declaration) })
+      return Shared.with<DeclarationId, bool>(&generator,
+        fn(identity: &DeclarationId) -> bool { return numberingDeclarationCost(identity, &mut numbering.*) })
+    }
+    Type.Union {members} => Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&members))
+    Type.Callable {parameters, invocationBounds, ..} => {
+      if !Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&parameters)) { return false }
+      return Numbering.units(&mut numbering.*, Vector.length<Outlives>(&invocationBounds))
+    }
+    Type.CallableValue {application, captures, fieldInputs, ..} => {
+      let affordable = Shared.with<Application, bool>(&application,
+        fn(selected: &Application) -> bool { return Application.numberingCost(selected, &mut numbering.*) })
+      if !affordable { return false }
+      if !Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&captures)) { return false }
+      return Numbering.units(&mut numbering.*, Vector.length<CallableFieldInput>(&fieldInputs))
+    }
+    Type.CallableSchema {schema, captures, fieldInputs, ..} => {
+      let affordable = Shared.with<SectionSchema, bool>(&schema,
+        fn(selected: &SectionSchema) -> bool { return numberingSchemaCost(selected, &mut numbering.*) })
+      if !affordable { return false }
+      if !Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&captures)) { return false }
+      return Numbering.units(&mut numbering.*, Vector.length<CallableFieldInput>(&fieldInputs))
+    }
+    Type.CallableStage {captures, ..} => Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&captures))
+    Type.CallableResult {arguments, selected, selectedOrdinals, ..} => {
+      if !Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&arguments)) { return false }
+      if !Numbering.units(&mut numbering.*, Vector.length<Argument>(&selected)) { return false }
+      return Numbering.units(&mut numbering.*, Vector.length<usize>(&selectedOrdinals))
+    }
+    Type.EffectComposite {parts, ..} => Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&parts))
+    Type.EffectJoin {alternatives, ..} => Numbering.units(&mut numbering.*, Vector.length<Shared<Type>>(&alternatives))
+    _ => true
+  }
+}
+
 effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Shared<Type>
+! OutOfMemoryError ? &mut Allocator {
+  let address = Shared.with<Type, usize>(value, fn(held: &Type) -> usize {
+    return Pointer.address<Type>(Pointer.fromRef<Type>(held))
+  })
+  let entered = run Numbering.enter(&mut numbering.*, address, 0)
+  if !entered { return Shared.clone<Type>(value) }
+  let affordable = Shared.with<Type, bool>(value,
+    fn(node: &Type) -> bool { return numberingNodeCost(node, &mut numbering.*) })
+  if !affordable {
+    Numbering.leave(&mut numbering.*)
+    return Shared.clone<Type>(value)
+  }
+  let rewritten = run rewriteTypeInside(value, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+  Numbering.leave(&mut numbering.*)
+  return move rewritten
+}
+
+effect fn rewriteTypeInside(value: &Shared<Type>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Shared<Type>
 ! OutOfMemoryError ? &mut Allocator {
     let exactSupplied = Shared.with<Type, Option<Argument>>(value, fn(node: &Type) -> Option<Argument> {
       if let Type.Parameter {declaration, ordinal} = &node.* {
@@ -7066,19 +7346,23 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
       }
       Type.Union {members} => {
         let listed = Vector.asSlice<Shared<Type>>(&members)
+        if listed.length > usize.ONE { Numbering.unordered(&mut numbering.*) }
         let mut normalized = Vector.make<Shared<Type>>()
         let mut at = usize.ZERO
         while at < listed.length {
           let replaced = run rewriteType(&listed[at], owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
-          run Type.joinMember(&mut normalized, &replaced)
+          if Numbering.isActive(&numbering.*) {
+            run Vector.append<Shared<Type>>(&mut normalized, move replaced)
+          } else { run Type.joinMember(&mut normalized, &replaced) }
           at = at + usize.ONE
         }
+        if observingOrFailed(&numbering.*) { return Shared.clone<Type>(value) }
         if Vector.length<Shared<Type>>(&normalized) == usize.ONE {
           return firstNormalized(&normalized)
         }
         return run Shared.make<Type>(Type.Union {members: move normalized})
       }
-      Type.CallableValue {isPublic, application, contract, captures, fieldInputs, ..} => {
+      Type.CallableValue {isPublic, application, contract, captures, fieldInputs, runtime} => {
         let rewritten = run rewriteCallableApplication(&application, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
         let mut fields = Vector.make<Shared<Type>>()
         let previous = Vector.asSlice<Shared<Type>>(&captures)
@@ -7087,10 +7371,17 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
           run Vector.append<Shared<Type>>(&mut fields, run rewriteType(&previous[at], owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*))
           at = at + usize.ONE
         }
+        let reboundContract = run rewriteType(&contract, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+        if observingOrFailed(&numbering.*) { return Shared.clone<Type>(value) }
+        if Numbering.isActive(&numbering.*) {
+          return run Shared.make<Type>(Type.CallableValue {isPublic: isPublic,
+            application: run Shared.make<Application>(move rewritten), contract: move reboundContract,
+            captures: move fields, fieldInputs: move fieldInputs, runtime: move runtime})
+        }
         return run Type.callableValue(isPublic, run Shared.make<Application>(move rewritten),
-          run rewriteType(&contract, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*), move fields, move fieldInputs)
+          move reboundContract, move fields, move fieldInputs)
       }
-      Type.CallableSchema {schema, captures, fieldInputs, ..} => {
+      Type.CallableSchema {schema, captures, fieldInputs, runtime} => {
         let mut copied = run CallableSchema.copy(&schema)
         let values = Vector.asMutSlice<Binding>(&mut copied.selected)
         let mut at = usize.ZERO
@@ -7107,6 +7398,11 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
         while at < previous.length {
           run Vector.append<Shared<Type>>(&mut fields, run rewriteType(&previous[at], owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*))
           at = at + usize.ONE
+        }
+        if observingOrFailed(&numbering.*) { return Shared.clone<Type>(value) }
+        if Numbering.isActive(&numbering.*) {
+          return run Shared.make<Type>(Type.CallableSchema {schema: run Shared.make<SectionSchema>(move copied),
+            captures: move fields, fieldInputs: move fieldInputs, runtime: move runtime})
         }
         return run Type.callableSchema(run Shared.make<SectionSchema>(move copied), move fields, move fieldInputs)
       }
@@ -7156,6 +7452,10 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
       Type.CallableView {representation, contract} => {
         let reboundRepresentation = run rewriteType(&representation, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
         let reboundContract = run rewriteType(&contract, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+        if observingOrFailed(&numbering.*) { return Shared.clone<Type>(value) }
+        if Numbering.isActive(&numbering.*) {
+          return run Shared.make<Type>(Type.CallableView {representation: move reboundRepresentation, contract: move reboundContract})
+        }
         return run Type.callableView(move reboundRepresentation, move reboundContract)
       }
       Type.CallableStage {base, contract, captures, remaining, suffixMode} => {
@@ -7169,6 +7469,11 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
         }
         let reboundBase = run rewriteType(&base, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
         let reboundContract = run rewriteType(&contract, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+        if observingOrFailed(&numbering.*) { return Shared.clone<Type>(value) }
+        if Numbering.isActive(&numbering.*) {
+          return run Shared.make<Type>(Type.CallableStage {base: move reboundBase, contract: move reboundContract,
+            captures: move fields, remaining: remaining, suffixMode: suffixMode})
+        }
         return run Type.stagedCallable(move reboundBase, move reboundContract, move fields, remaining, suffixMode, owner)
       }
       Type.Callable {
@@ -7197,6 +7502,7 @@ effect fn rewriteType(value: &Shared<Type>, owner: &DeclarationId, arguments: &[
           at = at + usize.ONE
         }
         let reboundEnvironment = run rewriteEnvironment(&environment, owner, arguments, fresh, instantiate, bindings, &nestedInvocation, &mut numbering.*)
+        if Vector.length<Outlives>(&invocationBounds) > usize.ONE { Numbering.unordered(&mut numbering.*) }
         let reboundBounds = run rewriteOutlives(&invocationBounds, owner, arguments, fresh, instantiate, bindings, &nestedInvocation, &mut numbering.*)
         let reboundResult = run rewriteType(&result, owner, arguments, fresh, instantiate, bindings, &nestedInvocation, opaque, &mut numbering.*)
         return run Shared.make<Type>(
@@ -7250,6 +7556,7 @@ effect fn rewrittenArguments(
 }
 effect fn rewriteArgument(value: &Argument, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Argument
 ! OutOfMemoryError ? &mut Allocator {
+  if !Numbering.units(&mut numbering.*, 2) { return Argument.copy(value) }
   return match &value.* {
     Argument.Type {value: ty} => Argument.Type {value: run rewriteType(&ty, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)}
     Argument.Row {value: row} => Argument.Row {value: run rewriteRow(&row, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)}
@@ -7287,8 +7594,28 @@ impl Row {
 
 effect fn rewriteRow(value: &Shared<Row>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Shared<Row>
 ! OutOfMemoryError ? &mut Allocator {
+  let address = Shared.with<Row, usize>(value, fn(held: &Row) -> usize {
+    return Pointer.address<Row>(Pointer.fromRef<Row>(held))
+  })
+  let entered = run Numbering.enter(&mut numbering.*, address, 1)
+  if !entered { return Shared.clone<Row>(value) }
+  let affordable = Shared.with<Row, bool>(value, fn(held: &Row) -> bool {
+    if !Numbering.units(&mut numbering.*, Vector.length<Requirement>(&held.entries)) { return false }
+    if !Numbering.units(&mut numbering.*, Vector.length<RowParameter>(&held.parameters)) { return false }
+    return Numbering.units(&mut numbering.*, Vector.length<RowSubtraction>(&held.subtractions))
+  })
+  if !affordable { Numbering.leave(&mut numbering.*)
+    return Shared.clone<Row>(value) }
+  let rewritten = run rewriteRowInside(value, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+  Numbering.leave(&mut numbering.*)
+  return move rewritten
+}
+
+effect fn rewriteRowInside(value: &Shared<Row>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Shared<Row>
+! OutOfMemoryError ? &mut Allocator {
     let mut result = Row.empty()
     let count = Shared.with<Row, usize>(value, rowEntryCount)
+    if count > usize.ONE || subtractionCount(value) > usize.ONE { Numbering.unordered(&mut numbering.*) }
     let mut at = usize.ZERO
     while at < count {
       let entry = entryAt(value, at)
@@ -7298,14 +7625,17 @@ effect fn rewriteRow(value: &Shared<Row>, owner: &DeclarationId, arguments: &[Ar
         )
         Option<Shared<Type>>.None => Option.none<Shared<Type>>()
       }
-      run Row.require(
-        &mut result,
-        Requirement {
-          capability: run rewriteType(&entry.capability, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*),
-          roleType: move roleValue,
-          access: entry.access,
-        },
-      )
+      let capability = run rewriteType(&entry.capability, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+      if !observingOrFailed(&numbering.*) {
+        let rewritten = Requirement {capability: move capability, roleType: move roleValue, access: entry.access}
+        if Numbering.isActive(&numbering.*) {
+          // Injective alpha renaming preserves the authenticated normalized row keys and access.
+          // Re-running semantic factories would do unnecessary, unmetered equality/inference.
+          run Vector.append<Requirement>(&mut result.entries, move rewritten)
+        } else {
+          run Row.require(&mut result, move rewritten)
+        }
+      }
       at = at + usize.ONE
     }
     let parameterCount = Shared.with<Row, usize>(value, rowParameterCount)
@@ -7317,6 +7647,13 @@ effect fn rewriteRow(value: &Shared<Row>, owner: &DeclarationId, arguments: &[Ar
           return rowParameterAt(row, at)
         },
       )
+      if Numbering.isActive(&numbering.*) {
+        if !observingOrFailed(&numbering.*) {
+          run Vector.append<RowParameter>(&mut result.parameters, move parameter)
+        }
+        at = at + usize.ONE
+        continue
+      }
       let exactSupplied = exactSharedArgument(bindings, &parameter.declaration, parameter.ordinal)
       if let Option<Argument>.Some {value: Argument.Row {value: bound}} = move exactSupplied {
         run Row.merge(&mut result, &bound)
@@ -7345,9 +7682,16 @@ effect fn rewriteRow(value: &Shared<Row>, owner: &DeclarationId, arguments: &[Ar
       let term = subtractionAt(value, at)
       let source = run rewriteRow(&term.source, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
       let removed = run rewriteRow(&term.removed, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
-      run Row.subtract(&mut result, &source, &removed)
+      if !observingOrFailed(&numbering.*) {
+        if Numbering.isActive(&numbering.*) {
+          run Vector.append<RowSubtraction>(&mut result.subtractions, RowSubtraction {source: move source, removed: move removed})
+        } else {
+          run Row.subtract(&mut result, &source, &removed)
+        }
+      }
       at = at + usize.ONE
     }
+    if observingOrFailed(&numbering.*) { return Shared.clone<Row>(value) }
     return run Shared.make<Row>(move result)
 }
 
@@ -7366,12 +7710,24 @@ impl Type {
 // `numbering` is active.
 effect fn rewriteLifetime(value: &Shared<Lifetime>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, numbering: &mut Numbering) -> Shared<Lifetime>
 ! OutOfMemoryError ? &mut Allocator {
-  let substituted = run substitutedLifetime(value, owner, arguments, fresh, instantiate, bindings, invocation)
-  return run Numbering.region(&mut numbering.*, &substituted)
+  if Numbering.isActive(&numbering.*) { return run Numbering.region(&mut numbering.*, value) }
+  return run substitutedLifetime(value, owner, arguments, fresh, instantiate, bindings, invocation)
 }
 
 effect fn substitutedLifetime(value: &Shared<Lifetime>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>) -> Shared<Lifetime>
 ! OutOfMemoryError ? &mut Allocator {
+  let atoms = Lifetime.atomCount(value)
+  if atoms > usize.ONE {
+    let mut rewrittenAtoms = Vector.make<Shared<Lifetime>>()
+    let mut atomAt = usize.ZERO
+    while atomAt < atoms {
+      let atom = Lifetime.atomAt(value, atomAt)
+      let rewritten = run substitutedLifetime(&atom, owner, arguments, fresh, instantiate, bindings, invocation)
+      run Vector.append<Shared<Lifetime>>(&mut rewrittenAtoms, move rewritten)
+      atomAt = atomAt + usize.ONE
+    }
+    return run Lifetime.meet(Vector.asSlice<Shared<Lifetime>>(&rewrittenAtoms))
+  }
   if let Option<DeclarationId>.Some {value: caller} = &invocation.* {
     let ordinal = Shared.with<Lifetime, usize>(value, fn(region: &Lifetime) -> usize {
       return match &region.* { Lifetime.Invocation {ordinal} => ordinal _ => usize.MAX }
@@ -7413,18 +7769,26 @@ effect fn substitutedLifetime(value: &Shared<Lifetime>, owner: &DeclarationId, a
 
 effect fn rewriteEnvironment(value: &Shared<Intersection>, owner: &DeclarationId, arguments: &[Argument], fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, numbering: &mut Numbering) -> Shared<Intersection>
 ! OutOfMemoryError ? &mut Allocator {
+  if Numbering.isActive(&numbering.*) {
+    return run Numbering.environment(&mut numbering.*, value)
+  }
   if !instantiate && !Numbering.isActive(&numbering.*) {
     if let Option<DeclarationId>.None = &fresh.* { return Shared.clone<Intersection>(value) }
   }
   let mut regions = Vector.make<Shared<Lifetime>>()
   let count = environmentSize(value)
+  if !Numbering.units(&mut numbering.*, count) { return Shared.clone<Intersection>(value) }
   let mut at = usize.ZERO
   while at < count {
     if let Option<Shared<Lifetime>>.Some {value: region} = move environmentMember(value, at) {
-      run Vector.append<Shared<Lifetime>>(&mut regions, run rewriteLifetime(&region, owner, arguments, fresh, instantiate, bindings, invocation, &mut numbering.*))
+      run Vector.append<Shared<Lifetime>>(&mut regions, run substitutedLifetime(&region, owner, arguments, fresh, instantiate, bindings, invocation))
     }
     at = at + usize.ONE
   }
+  let whole = run Lifetime.meet(Vector.asSlice<Shared<Lifetime>>(&regions))
+  let rewritten = run Numbering.region(&mut numbering.*, &whole)
+  Vector.clear<Shared<Lifetime>>(&mut regions)
+  run Vector.append<Shared<Lifetime>>(&mut regions, move rewritten)
   return run Shared.make<Intersection>(run Intersection.of(Vector.asSlice<Shared<Lifetime>>(&regions)))
 }
 
@@ -7504,6 +7868,11 @@ impl Type {
     exact: bool,
     coordinates: &mut Coordinates,
   ) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    if coordinates.exceeded { return Bytes.make() }
+    let affordable = Shared.with<Type, bool>(value, fn(node: &Type) -> bool {
+      return RuntimeEncoding.recordPayload(&mut coordinates.*, nodePayload(node))
+    })
+    if !affordable { return Bytes.make() }
     let node = run nodeCopy(value)
     if !exact {
       if let Type.CallableView {representation, ..} = &node {
@@ -7512,7 +7881,7 @@ impl Type {
     }
     let mut output = Bytes.make()
     let kind = nodeKind(&node)
-    run RuntimeEncoding.word(&mut output, usize.toU64(kind))
+    run RuntimeEncoding.recordWord(&mut output, usize.toU64(kind), &mut coordinates.*)
     if exact {
       let mut regions = Vector.make<Bytes>()
       let count = ownLifetimeCount(&node)
@@ -7528,17 +7897,17 @@ impl Type {
       // Ordered argument lifetimes are encoded below. Only environments are unordered here.
       match & node {
         Type.String {..} => {
-          run RuntimeEncoding.set(&mut output, &regions)
+          run RuntimeEncoding.recordSet(&mut output, &regions, &mut coordinates.*)
         }
         Type.Reference {..} => {
-          run RuntimeEncoding.set(&mut output, &regions)
+          run RuntimeEncoding.recordSet(&mut output, &regions, &mut coordinates.*)
         }
         Type.Slice {..} => {
-          run RuntimeEncoding.set(&mut output, &regions)
+          run RuntimeEncoding.recordSet(&mut output, &regions, &mut coordinates.*)
         }
         Type.Callable {invocationBinders, invocationBounds, ..} => {
-          run RuntimeEncoding.set(&mut output, &regions)
-          run RuntimeEncoding.word(&mut output, usize.toU64(invocationBinders))
+          run RuntimeEncoding.recordSet(&mut output, &regions, &mut coordinates.*)
+          run RuntimeEncoding.recordWord(&mut output, usize.toU64(invocationBinders), &mut coordinates.*)
           let bounds = Vector.asSlice<Outlives>(&invocationBounds)
           let mut encodedBounds = Vector.make<Bytes>()
           at = usize.ZERO
@@ -7549,20 +7918,20 @@ impl Type {
             run Vector.append<Bytes>(&mut encodedBounds, move bound)
             at = at + usize.ONE
           }
-          run RuntimeEncoding.set(&mut output, &encodedBounds)
+          run RuntimeEncoding.recordSet(&mut output, &encodedBounds, &mut coordinates.*)
         }
         Type.Effect {..} => {
-          run RuntimeEncoding.set(&mut output, &regions)
+          run RuntimeEncoding.recordSet(&mut output, &regions, &mut coordinates.*)
         }
         _ => {}
       }
     }
     match & node {
       Type.Primitive {name} => {
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&name))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&name), &mut coordinates.*)
       }
       Type.Nominal {declaration, arguments, ..} => {
-        run RuntimeEncoding.declaration(&mut output, &declaration)
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
         run encodeIdentityArguments(
           &mut output,
           Vector.asSlice<Argument>(&arguments),
@@ -7573,19 +7942,25 @@ impl Type {
       }
       Type.CallableWitnessResult {witness} => {
         let recipe = Shared.with<WitnessRecipe, WitnessRecipe>(&witness, CallableWitness.copy)
+        let affordableOwner = Shared.with<DeclarationId, bool>(&recipe.operation,
+          fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+        if !affordableOwner { return Bytes.make() }
         let operation = run DeclarationId.copyShared(&recipe.operation)
-        run RuntimeEncoding.declaration(&mut output, &operation)
+        run RuntimeEncoding.recordDeclaration(&mut output, &operation, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &recipe.contract, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &recipe.provider, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &recipe.result, owner, exact, &mut coordinates.*)
         let count = CallableWitness.bindingCount(&recipe)
-        run RuntimeEncoding.word(&mut output, usize.toU64(count))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(count), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < count {
           let binding = CallableWitness.bindingAt(&recipe, at)
-          let declaration = run DeclarationId.copyShared(&binding.declaration)
-          run RuntimeEncoding.declaration(&mut output, &declaration)
-          run RuntimeEncoding.word(&mut output, usize.toU64(binding.ordinal))
+          let affordableOwner = Shared.with<DeclarationId, bool>(&binding.declaration,
+          fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+        if !affordableOwner { return Bytes.make() }
+        let declaration = run DeclarationId.copyShared(&binding.declaration)
+          run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
+          run RuntimeEncoding.recordWord(&mut output, usize.toU64(binding.ordinal), &mut coordinates.*)
           let mut selected = Vector.make<Argument>()
           run Vector.append<Argument>(&mut selected, move binding.value)
           run encodeIdentityArguments(
@@ -7598,7 +7973,7 @@ impl Type {
           at = at + usize.ONE
         }
         let supplied = CallableWitness.argumentCount(&recipe)
-        run RuntimeEncoding.word(&mut output, usize.toU64(supplied))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(supplied), &mut coordinates.*)
         at = usize.ZERO
         while at < supplied {
           run encodeIdentityChild(
@@ -7610,70 +7985,75 @@ impl Type {
           )
           at = at + usize.ONE
         }
-        run RuntimeEncoding.word(&mut output, usize.toU64(CallableWitness.loanCount(&recipe)))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(CallableWitness.loanCount(&recipe)), &mut coordinates.*)
         at = usize.ZERO
         while at < CallableWitness.loanCount(&recipe) {
           let selected = CallableWitness.loanAt(&recipe, at)
           match move selected {
             Option<Shared<Lifetime>>.Some {value: region} => {
-              run RuntimeEncoding.word(&mut output, 1)
+              run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
               if exact {
                 run RuntimeEncoding.lifetime(&mut output, &region, &mut coordinates.*)
               }
             }
             _ => {
-              run RuntimeEncoding.word(&mut output, 0)
+              run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
             }
           }
           at = at + usize.ONE
         }
       }
       Type.CallableOrigin {application, contract} => {
+        let affordableApplication = Shared.with<Application, bool>(&application,
+          fn(selected: &Application) -> bool { return Application.copiedPayloadFits(selected, &mut coordinates.*) })
+        if !affordableApplication { return Bytes.make() }
         let selected = run Application.copyShared(&application)
         let encoding = run Application.encoding(&selected, exact, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoding))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
       }
       Type.OpaqueRepresentation {application, ..} => {
+        let affordableApplication = Shared.with<Application, bool>(&application,
+          fn(selected: &Application) -> bool { return Application.copiedPayloadFits(selected, &mut coordinates.*) })
+        if !affordableApplication { return Bytes.make() }
         let selected = run Application.copyShared(&application)
         let encoding = run Application.encoding(&selected, exact, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoding))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
       }
       Type.Parameter {declaration, ordinal} => {
-        run RuntimeEncoding.declaration(&mut output, &declaration)
-        run RuntimeEncoding.word(&mut output, usize.toU64(ordinal))
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(ordinal), &mut coordinates.*)
       }
       Type.Reference {referent, access, ..} => {
-        run RuntimeEncoding.word(&mut output, accessCode(access))
+        run RuntimeEncoding.recordWord(&mut output, accessCode(access), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &referent, owner, exact, &mut coordinates.*)
       }
       Type.Slice {element, access, ..} => {
-        run RuntimeEncoding.word(&mut output, accessCode(access))
+        run RuntimeEncoding.recordWord(&mut output, accessCode(access), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &element, owner, exact, &mut coordinates.*)
       }
       Type.Pointer {pointee, access, nullable, multiplicity, alignment} => {
-        run RuntimeEncoding.word(&mut output, accessCode(access))
-        run RuntimeEncoding.word(&mut output, boolCode(nullable))
-        run RuntimeEncoding.word(
+        run RuntimeEncoding.recordWord(&mut output, accessCode(access), &mut coordinates.*)
+        run RuntimeEncoding.recordWord(&mut output, boolCode(nullable), &mut coordinates.*)
+        run RuntimeEncoding.recordWord(
           &mut output,
           match multiplicity {
             Multiplicity.Single => 0
             Multiplicity.Many => 1
-          },
-        )
+          }, &mut coordinates.*)
         match & alignment {
           Option<u64>.Some {value: aligned} => {
-            run RuntimeEncoding.word(&mut output, 1)
-            run RuntimeEncoding.word(&mut output, aligned)
+            run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
+            run RuntimeEncoding.recordWord(&mut output, aligned, &mut coordinates.*)
           }
           Option<u64>.None => {
-            run RuntimeEncoding.word(&mut output, 0)
+            run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
           }
         }
         run encodeIdentityChild(&mut output, &pointee, owner, exact, &mut coordinates.*)
       }
       Type.Array {element, extent} => {
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&extent))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&extent), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &element, owner, exact, &mut coordinates.*)
       }
       Type.Union {members} => {
@@ -7687,19 +8067,24 @@ impl Type {
           )
           at = at + usize.ONE
         }
-        run RuntimeEncoding.set(&mut output, &encodings)
+        run RuntimeEncoding.recordSet(&mut output, &encodings, &mut coordinates.*)
       }
       Type.CallableValue {runtime, application, contract, captures, ..} => {
+        let count = Shared.with<Bytes, usize>(&runtime, Bytes.length)
+        if !RuntimeEncoding.recordPayload(&mut coordinates.*, count) { return move output }
         let key = run copyCallableBytes(&runtime)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&key))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&key), &mut coordinates.*)
         if exact {
+          let affordableApplication = Shared.with<Application, bool>(&application,
+            fn(selected: &Application) -> bool { return Application.copiedPayloadFits(selected, &mut coordinates.*) })
+          if !affordableApplication { return Bytes.make() }
           let selected = run Application.copyShared(&application)
           let identity = run Application.encoding(&selected, true, &mut coordinates.*)
-          run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+          run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&identity), &mut coordinates.*)
         }
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
         let fields = Vector.asSlice<Shared<Type>>(&captures)
-        run RuntimeEncoding.word(&mut output, usize.toU64(fields.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(fields.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < fields.length {
           run encodeIdentityChild(&mut output, &fields[at], owner, exact, &mut coordinates.*)
@@ -7707,15 +8092,17 @@ impl Type {
         }
       }
       Type.CallableSchema {runtime, schema, captures, ..} => {
+        let count = Shared.with<Bytes, usize>(&runtime, Bytes.length)
+        if !RuntimeEncoding.recordPayload(&mut coordinates.*, count) { return move output }
         let key = run copyCallableBytes(&runtime)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&key))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&key), &mut coordinates.*)
         if exact {
           let selected = run CallableSchema.copy(&schema)
           let identity = run CallableSchema.encoding(&selected, true, &mut coordinates.*)
-          run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+          run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&identity), &mut coordinates.*)
         }
         let fields = Vector.asSlice<Shared<Type>>(&captures)
-        run RuntimeEncoding.word(&mut output, usize.toU64(fields.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(fields.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < fields.length {
           run encodeIdentityChild(&mut output, &fields[at], owner, exact, &mut coordinates.*)
@@ -7732,11 +8119,11 @@ impl Type {
         )
         let ordinals = Vector.asSlice<usize>(&selectedOrdinals)
         let mut ordinalAt = usize.ZERO
-        while ordinalAt < ordinals.length { run RuntimeEncoding.word(&mut output, usize.toU64(ordinals[ordinalAt])) ordinalAt = ordinalAt + usize.ONE }
+        while ordinalAt < ordinals.length { run RuntimeEncoding.recordWord(&mut output, usize.toU64(ordinals[ordinalAt]), &mut coordinates.*) ordinalAt = ordinalAt + usize.ONE }
         run encodeIdentityChild(&mut output, &producer, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
         let listed = Vector.asSlice<Shared<Type>>(&arguments)
-        run RuntimeEncoding.word(&mut output, usize.toU64(listed.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(listed.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < listed.length {
           run encodeIdentityChild(&mut output, &listed[at], owner, exact, &mut coordinates.*)
@@ -7744,11 +8131,11 @@ impl Type {
         }
       }
       Type.EffectComposite {operation, selector, contract, parts} => {
-        run RuntimeEncoding.word(&mut output, compositionCode(operation))
+        run RuntimeEncoding.recordWord(&mut output, compositionCode(operation), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &selector, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
         let fields = Vector.asSlice<Shared<Type>>(&parts)
-        run RuntimeEncoding.word(&mut output, usize.toU64(fields.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(fields.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < fields.length {
           run encodeIdentityChild(&mut output, &fields[at], owner, exact, &mut coordinates.*)
@@ -7758,7 +8145,7 @@ impl Type {
       Type.EffectJoin {contract, alternatives} => {
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
         let listed = Vector.asSlice<Shared<Type>>(&alternatives)
-        run RuntimeEncoding.word(&mut output, usize.toU64(listed.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(listed.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < listed.length {
           run encodeIdentityChild(&mut output, &listed[at], owner, exact, &mut coordinates.*)
@@ -7766,12 +8153,12 @@ impl Type {
         }
       }
       Type.CallableStage {base, contract, captures, remaining, suffixMode} => {
-        run RuntimeEncoding.word(&mut output, usize.toU64(remaining))
-        run RuntimeEncoding.word(&mut output, modeCode(suffixMode))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(remaining), &mut coordinates.*)
+        run RuntimeEncoding.recordWord(&mut output, modeCode(suffixMode), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &base, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &contract, owner, exact, &mut coordinates.*)
         let fields = Vector.asSlice<Shared<Type>>(&captures)
-        run RuntimeEncoding.word(&mut output, usize.toU64(fields.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(fields.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < fields.length {
           run encodeIdentityChild(&mut output, &fields[at], owner, exact, &mut coordinates.*)
@@ -7779,10 +8166,10 @@ impl Type {
         }
       }
       Type.Callable {mode, isUnsafe, parameters, result, ..} => {
-        run RuntimeEncoding.word(&mut output, modeCode(mode))
-        run RuntimeEncoding.word(&mut output, boolCode(isUnsafe))
+        run RuntimeEncoding.recordWord(&mut output, modeCode(mode), &mut coordinates.*)
+        run RuntimeEncoding.recordWord(&mut output, boolCode(isUnsafe), &mut coordinates.*)
         let listed = Vector.asSlice<Shared<Type>>(&parameters)
-        run RuntimeEncoding.word(&mut output, usize.toU64(listed.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(listed.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < listed.length {
           run encodeIdentityChild(&mut output, &listed[at], owner, exact, &mut coordinates.*)
@@ -7791,11 +8178,11 @@ impl Type {
         run encodeIdentityChild(&mut output, &result, owner, exact, &mut coordinates.*)
       }
       Type.Effect {mode, success, failure, requirements, ..} => {
-        run RuntimeEncoding.word(&mut output, modeCode(mode))
+        run RuntimeEncoding.recordWord(&mut output, modeCode(mode), &mut coordinates.*)
         run encodeIdentityChild(&mut output, &success, owner, exact, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &failure, owner, exact, &mut coordinates.*)
         let row = run Row.encoding(&requirements, owner, exact, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&row))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&row), &mut coordinates.*)
       }
       Type.CallableView {representation, contract} => {
         run encodeIdentityChild(&mut output, &representation, owner, exact, &mut coordinates.*)
@@ -7813,11 +8200,14 @@ impl Type {
         let generator = Shared.with<AnonymousOccurrence, Shared<DeclarationId>>(&occurrence, fn(value: &AnonymousOccurrence) -> Shared<DeclarationId> {
           return Shared.clone<DeclarationId>(&value.declaration)
         })
+        let affordableOwner = Shared.with<DeclarationId, bool>(&generator,
+          fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+        if !affordableOwner { return Bytes.make() }
         let declaration = run DeclarationId.copyShared(&generator)
-        run RuntimeEncoding.declaration(&mut output, &declaration)
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
         let listed = Vector.asSlice<Shared<Type>>(&members)
-        run RuntimeEncoding.word(&mut output, usize.toU64(syntax))
-        run RuntimeEncoding.word(&mut output, usize.toU64(listed.length))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(syntax), &mut coordinates.*)
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(listed.length), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < listed.length {
           run encodeIdentityChild(&mut output, &listed[at], owner, exact, &mut coordinates.*)
@@ -7838,7 +8228,7 @@ effect fn encodeIdentityChild(
   coordinates: &mut Coordinates,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
   let encoding = run Type.encoding(value, owner, exact, &mut coordinates.*)
-  return run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&encoding))
+  return run RuntimeEncoding.recordField(&mut output.*, Bytes.asSlice(&encoding), &mut coordinates.*)
 }
 
 effect fn encodeIdentityArguments(
@@ -7848,11 +8238,11 @@ effect fn encodeIdentityArguments(
   exact: bool,
   coordinates: &mut Coordinates,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
-  run RuntimeEncoding.word(&mut output.*, usize.toU64(values.length))
+  run RuntimeEncoding.recordWord(&mut output.*, usize.toU64(values.length), &mut coordinates.*)
   let mut at = usize.ZERO
   while at < values.length {
     let encoding = run Argument.encoding(&values[at], owner, exact, &mut coordinates.*)
-    run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&encoding))
+    run RuntimeEncoding.recordField(&mut output.*, Bytes.asSlice(&encoding), &mut coordinates.*)
     at = at + usize.ONE
   }
   return ()
@@ -7875,19 +8265,19 @@ impl Argument {
     let mut output = Bytes.make()
     match & value.* {
       Argument.Type {value: ty} => {
-        run RuntimeEncoding.word(&mut output, 0)
+        run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
         run encodeIdentityChild(&mut output, &ty, owner, exact, &mut coordinates.*)
       }
       Argument.Lifetime {value: region} => {
-        run RuntimeEncoding.word(&mut output, 1)
+        run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
         if exact {
           run RuntimeEncoding.lifetime(&mut output, &region, &mut coordinates.*)
         }
       }
       Argument.Row {value: row} => {
-        run RuntimeEncoding.word(&mut output, 2)
+        run RuntimeEncoding.recordWord(&mut output, 2, &mut coordinates.*)
         let encoding = run Row.encoding(&row, owner, exact, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoding))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
       }
     }
     return move output
@@ -7913,6 +8303,7 @@ impl Row {
     exact: bool,
     coordinates: &mut Coordinates,
   ) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    if coordinates.exceeded { return Bytes.make() }
     let mut entries = Vector.make<EncodedRequirement>()
     let count = Shared.with<Row, usize>(value, rowEntryCount)
     let mut at = usize.ZERO
@@ -7921,24 +8312,25 @@ impl Row {
       let mut key = run Type.encoding(&entry.capability, owner, exact, &mut coordinates.*)
       match & entry.roleType {
         Option<Shared<Type>>.Some {value: roleValue} => {
-          run RuntimeEncoding.word(&mut key, 1)
+          run RuntimeEncoding.recordWord(&mut key, 1, &mut coordinates.*)
           run encodeIdentityChild(&mut key, &roleValue, owner, exact, &mut coordinates.*)
         }
         Option<Shared<Type>>.None => {
-          run RuntimeEncoding.word(&mut key, 0)
+          run RuntimeEncoding.recordWord(&mut key, 0, &mut coordinates.*)
         }
       }
       let known = Vector.asMutSlice<EncodedRequirement>(&mut entries)
       let mut found = false
       let mut check = usize.ZERO
       while check < known.length {
-        if RuntimeEncoding.equals(Bytes.asSlice(&known[check].key), Bytes.asSlice(&key)) {
+        if RuntimeEncoding.recordEqual(Bytes.asSlice(&known[check].key), Bytes.asSlice(&key), &mut coordinates.*) {
           found = true
           if entry.access == Access.Mutable {
             known[check].access = Access.Mutable
           }
           break
         }
+        if coordinates.exceeded { return Bytes.make() }
         check = check + usize.ONE
       }
       if !found {
@@ -7953,13 +8345,13 @@ impl Row {
     let listed = Vector.asSlice<EncodedRequirement>(&entries)
     at = usize.ZERO
     while at < listed.length {
-      let mut entry = run Bytes.copy(Bytes.asSlice(&listed[at].key))
-      run RuntimeEncoding.word(&mut entry, accessCode(listed[at].access))
+      let mut entry = run RuntimeEncoding.recordCopy(Bytes.asSlice(&listed[at].key), &mut coordinates.*)
+      run RuntimeEncoding.recordWord(&mut entry, accessCode(listed[at].access), &mut coordinates.*)
       run Vector.append<Bytes>(&mut encoded, move entry)
       at = at + usize.ONE
     }
     let mut output = Bytes.make()
-    run RuntimeEncoding.set(&mut output, &encoded)
+    run RuntimeEncoding.recordSet(&mut output, &encoded, &mut coordinates.*)
     let mut parameters = Vector.make<Bytes>()
     let parameterCount = Shared.with<Row, usize>(value, rowParameterCount)
     at = usize.ZERO
@@ -7970,6 +8362,9 @@ impl Row {
           return rowParameterAt(row, at)
         },
       )
+      let affordableOwner = Shared.with<DeclarationId, bool>(&parameter.declaration,
+        fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+      if !affordableOwner { return Bytes.make() }
       let selected = Option.some<DeclarationId>(
         run DeclarationId.copyShared(&parameter.declaration),
       )
@@ -7981,12 +8376,12 @@ impl Row {
         }
       }
       let mut encoding = Bytes.make()
-      run RuntimeEncoding.declaration(&mut encoding, &declaration)
-      run RuntimeEncoding.word(&mut encoding, usize.toU64(parameter.ordinal))
+      run RuntimeEncoding.recordDeclaration(&mut encoding, &declaration, &mut coordinates.*)
+      run RuntimeEncoding.recordWord(&mut encoding, usize.toU64(parameter.ordinal), &mut coordinates.*)
       run Vector.append<Bytes>(&mut parameters, move encoding)
       at = at + usize.ONE
     }
-    run RuntimeEncoding.set(&mut output, &parameters)
+    run RuntimeEncoding.recordSet(&mut output, &parameters, &mut coordinates.*)
     let mut subtractions = Vector.make<Bytes>()
     let terms = subtractionCount(value)
     at = usize.ZERO
@@ -7995,12 +8390,12 @@ impl Row {
       let source = run Row.encoding(&term.source, owner, exact, &mut coordinates.*)
       let removed = run Row.encoding(&term.removed, owner, exact, &mut coordinates.*)
       let mut encoding = Bytes.make()
-      run RuntimeEncoding.field(&mut encoding, Bytes.asSlice(&source))
-      run RuntimeEncoding.field(&mut encoding, Bytes.asSlice(&removed))
+      run RuntimeEncoding.recordField(&mut encoding, Bytes.asSlice(&source), &mut coordinates.*)
+      run RuntimeEncoding.recordField(&mut encoding, Bytes.asSlice(&removed), &mut coordinates.*)
       run Vector.append<Bytes>(&mut subtractions, move encoding)
       at = at + usize.ONE
     }
-    run RuntimeEncoding.set(&mut output, &subtractions)
+    run RuntimeEncoding.recordSet(&mut output, &subtractions, &mut coordinates.*)
     return move output
   }
 }
@@ -8397,7 +8792,15 @@ effect fn rewriteCallableApplication(value: &Shared<Application>, owner: &Declar
       arguments: run rewrittenArguments(&scope.arguments, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*), argumentOrdinals: move ordinals})
     at = at + usize.ONE
   }
-  let Application {argumentOrdinals, statics, ..} = move copied
+  let Application {argumentOrdinals, statics: oldStatics, ..} = move copied
+  let mut statics = Vector.make<StaticSlot>()
+  let suppliedStatics = Vector.asSlice<StaticSlot>(&oldStatics)
+  at = usize.ZERO
+  while at < suppliedStatics.length {
+    run Vector.append<StaticSlot>(&mut statics, StaticSlot {ordinal: suppliedStatics[at].ordinal,
+      value: run StaticValue.numberRegions(&suppliedStatics[at].value, owner, &mut numbering.*)})
+    at = at + usize.ONE
+  }
   return Application {target: move target, arguments: move own, argumentOrdinals: move argumentOrdinals, scopes: move scopes, statics: move statics}
 }
 
@@ -8459,6 +8862,12 @@ effect fn encodeCallableInputs(output: &mut Bytes, inputs: &[CallableFieldInput]
 effect fn rewriteSchemaEnvironment(value: &Shared<Type>, owner: &DeclarationId, arguments: &[Argument],
   fresh: &Option<DeclarationId>, instantiate: bool, bindings: &[Binding], invocation: &Option<DeclarationId>, opaque: &Option<Application>, numbering: &mut Numbering) -> Shared<Type>
 ! OutOfMemoryError ? &mut Allocator {
+  // Region numbering is an injective rename of free Local/Supplied atoms, not substitution
+  // through the target binders. It therefore visits the complete blueprint with all original
+  // Parameter/Invocation owners retained. Real substitution keeps the existing bound barrier.
+  if Numbering.isActive(&numbering.*) {
+    return run rewriteType(value, owner, arguments, fresh, instantiate, bindings, invocation, opaque, &mut numbering.*)
+  }
   let node = run nodeCopy(value)
   if let Type.Callable {mode, isUnsafe, environment, invocationBinders, invocationBounds, parameters, result} = move node {
     return run Shared.make<Type>(Type.Callable {mode: mode, isUnsafe: isUnsafe,
