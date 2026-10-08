@@ -489,6 +489,10 @@ it.effect(
           f.encode()
         },
         (f) => {
+          f.phaseRows[0].fact = { kind: 'not-demanded' }
+          f.encode()
+        },
+        (f) => {
           f.input.sources[0].bytes = Buffer.from('wrong source')
         },
         (f) => {
@@ -1106,12 +1110,7 @@ const pairedNativeRows = [
     phase: 'body',
     eligibility: 'no-body',
     has_body: false,
-    fact: {
-      kind: 'rejected',
-      code: 'Unsupported',
-      module: { origin: 'memory', package: 'codec', path: 'result.silk' },
-      span: { start: 127, end: 145 },
-    },
+    fact: { kind: 'not-demanded' },
   },
   {
     schema: 'silk.strict-inventory',
@@ -1193,12 +1192,7 @@ const pairedNativeRows = [
     phase: 'signature',
     eligibility: 'inactive',
     has_body: true,
-    fact: {
-      kind: 'rejected',
-      code: 'UnknownMember',
-      module: { origin: 'memory', package: 'codec', path: 'result.silk' },
-      span: { start: 0, end: 0 },
-    },
+    fact: { kind: 'not-demanded' },
   },
   {
     schema: 'silk.strict-inventory',
@@ -1223,12 +1217,7 @@ const pairedNativeRows = [
     phase: 'body',
     eligibility: 'inactive',
     has_body: true,
-    fact: {
-      kind: 'rejected',
-      code: 'UnknownMember',
-      module: { origin: 'memory', package: 'codec', path: 'result.silk' },
-      span: { start: 0, end: 0 },
-    },
+    fact: { kind: 'not-demanded' },
   },
 ]
 
