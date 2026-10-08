@@ -162,11 +162,15 @@ Each entry records:
   subtyping (a `'static` subject meets `Maybe<&'a i32>`, as in the bootstrap). An inferred lifetime binder that earlier `'static` evidence fixed
   shortens to a later operand's caller-local region when every parameter stores the binder
   covariantly and no bound or environment names it.
-- **Source migration:** none.
+- **Source migration:** `checkExpressionUnder` held an integer suffix slice borrowed from a
+  borrowed `if let` binding past its conditional. That binding is a pattern-local loan that ends
+  with the selected body (PATT-009), so the source now keeps the suffix in one owned `Bytes`.
 - **Diagnostics and limits:** a fresh loan of body-owned storage still needs a declared premise,
   a pattern region longer than the subject's stays `TypeMismatch`, and a
   binder that a parameter stores invariantly keeps its first `'static` evidence and reports the
-  operand's `TypeMismatch` where the bootstrap infers the shorter region.
+  operand's `TypeMismatch` where the bootstrap infers the shorter region. A view derived from a
+  borrowed pattern binding that outlives its conditional is `TypeMismatch` in selfhost; the
+  bootstrap accepts it, against PATT-009.
 - **Evidence:** `callerLocalRegionsRelateAtFixedBoundaries` and
   `patternElisionInfersOmittedLifetimesFromTheSubject` in
   `compiler/src/semantic/SemanticCallableCases.silk`.
@@ -1627,7 +1631,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   regions. Native fixes an inferred binder by its first evidence and shortens it when a later
   operand offers another region for a binder every parameter stores covariantly: to that region
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
-  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. A `T: 'binder` bound
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
+  literal binder that the declaration stores covariantly shortens the same way at a later field,
+  as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). A `T: 'binder` bound
   that the binder's evidence does not cover shortens a covariant inferred binder to the meet of the
   regions `T` retains, so `Effect.useReleaseNonParking` with a borrowing resource and a capture-free
   callback no longer fixes `'env` to `'static`; an invariant or written binder never moves. The bootstrap solves for the shortest region directly, so a binder
@@ -1644,8 +1650,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   shortened or widened, but an operand meets it by the same covariant subtyping. Native call arguments
   still unify exactly apart from shared-loan shortening and this binder-region relation.
 - **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
-  `staticStringSubtypingPreservesOrdinaryMismatches` and
-  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence` in
+  `staticStringSubtypingPreservesOrdinaryMismatches`,
+  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence` and
+  `callerLocalRegionsRelateAtFixedBoundaries` in
   `compiler/src/semantic/SemanticCallableCases.silk`, `providedCallPrefixesMapLifetimesSeparately`
   in `compiler/src/semantic/SemanticLoweringCases.silk`,
   `sliceConversionsRetainRegionAccessAndDiagnostics` in
