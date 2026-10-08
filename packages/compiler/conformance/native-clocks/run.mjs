@@ -86,7 +86,10 @@ const program = Effect.gen(function* () {
     ),
   )(
     yield* fs.readFileString(
-      path.join(directory, '../../../../openspec/changes/source-owned-native-clocks/supplies.json'),
+      path.join(
+        directory,
+        '../../../../openspec/changes/archive/2026-09-10-source-owned-native-clocks/supplies.json',
+      ),
     ),
   )
   const headers = pins.headers[target]

@@ -39,7 +39,7 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(
       join(
         directory,
-        '../../../../openspec/changes/establish-foreign-call-contracts/supplies.json',
+        '../../../../openspec/changes/archive/2026-09-10-establish-foreign-call-contracts/supplies.json',
       ),
     ),
   )
@@ -54,7 +54,7 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(
       join(
         directory,
-        '../../../../openspec/changes/synchronous-native-callback-contracts/supplies.json',
+        '../../../../openspec/changes/archive/2026-09-10-synchronous-native-callback-contracts/supplies.json',
       ),
     ),
   )

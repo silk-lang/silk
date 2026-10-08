@@ -13,7 +13,7 @@ its unaligned byte address to an aligned `int32_t *`.
 
 ## Pinned supplies
 
-The [supply manifest](../../../../openspec/changes/add-native-pointer-boundary/supplies.json)
+The [supply manifest](../../../../openspec/changes/archive/2026-09-10-add-native-pointer-boundary/supplies.json)
 records normative revisions, LLVM/Clang 22.1.8, the macOS 15.5 SDK and deployment target 11.0.0,
 and GNU compiler/linker/libc packages and header hashes. The runner verifies compiler versions,
 SDK/header hashes, and every listed GNU package before conformance.
