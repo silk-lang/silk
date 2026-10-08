@@ -1,0 +1,3906 @@
+//! Declaration demands, revisions, signature and effect contracts, and receiver calls.
+
+import hir.Hir {Access, CallableMode, OwnerKind}
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Intersection, Lifetime}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.Query {Cycle}
+import semantic.Semantic {
+  Answer,
+  ConflictingPackageSource,
+  Constraint,
+  Contract,
+  Dependency,
+  Family,
+  Member,
+  Outcome,
+  RegistrationClosed,
+  Semantic,
+  Signature,
+  Request,
+  Value,
+}
+import semantic.SourceIndex {NoRejection, RevisionMismatch, SourceIndex}
+import semantic.Rejection {GenericKind, Rejection, RejectionCode}
+import semantic.SourceRevision {Revision}
+import semantic.StaticValue
+import semantic.Specialization {Application as SpecializationApplication, ScopeBinding}
+import semantic.Type {Argument, Binding, Outlives, Row, Type}
+import semantic.Target {Id as TargetId, Target as MachineTarget}
+import semantic.TypedBody {
+  Expression as BodyExpression,
+  NodeId as BodyNodeId,
+  NodeKind as BodyNodeKind,
+  ReceiverPass as BodyReceiverPass,
+  SafetyObligation as BodySafetyObligation,
+  Stage as BodyStage,
+  TypedBody,
+}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.string {String}
+import silk.testing {AssertionError, Testing}
+import silk.u8
+import silk.usize
+import silk.vector {Vector}
+import semantic.SemanticCaseSupport {
+  AnswerView,
+  NestedFailureAllocator,
+  answersEqual,
+  bodyAnswerIsContractTyped,
+  bodyCallGenericCount,
+  bodyCalls,
+  bodyIsFullyChecked,
+  channelsEqual,
+  checkedBody,
+  contractSlotOf,
+  cyclePathLength,
+  directApplicationAt,
+  directCallType,
+  effectFailure,
+  effectRequirements,
+  effectSuccess,
+  failureOf,
+  firstParameterMode,
+  hasTypeLookup,
+  hits,
+  inspect,
+  isBool,
+  isCycle,
+  isI32,
+  isNominal,
+  makeSemantic,
+  modeOf,
+  module,
+  nominalResult,
+  offsetOf,
+  onSignature,
+  ownBinder,
+  parameterContractAt,
+  parameterCountOf,
+  present,
+  preserved,
+  reads,
+  rejectedTypeApplication,
+  rejection,
+  rejectionCode,
+  rejectionSpells,
+  rejectsAt,
+  rejectsFrom,
+  rejectsSpan,
+  rejectsWith,
+  requireIndexedIdentity,
+  resultEquals,
+  reused,
+  rotatedPair,
+  rowCountIs,
+  rowSize,
+  sameBytes,
+  sameCycleAnswers,
+  sameStep,
+  signatureHasOrdinaryBinder,
+  signatureIsI32,
+  signatureResult,
+  signatureSucceeded,
+  slotOf,
+  slotsEqual,
+  spanStart,
+  starts,
+  staticEnvironment,
+  staticSemantic,
+  succeeded,
+  typesEqual,
+  writtenResult,
+  wrongTypeArity,
+}
+
+struct InterfaceCallPair {
+  firstContract: Shared<Type>
+  secondContract: Shared<Type>
+  firstProvider: Shared<Type>
+  secondProvider: Shared<Type>
+  sameOperation: bool
+  sameWitness: bool
+  hasWitness: bool
+  oneReceiverPerCall: bool
+  qualifiedThenReceiver: bool
+}
+
+struct ForwardedTypes {
+  local: Shared<Type>
+  moved: Shared<Type>
+  entry: Shared<Type>
+  deferred: Shared<Type>
+}
+
+fn forwardedTypes(body: &TypedBody) -> Option<ForwardedTypes> {
+  let locals = TypedBody.localSlice(body)
+  let nodes = TypedBody.nodeSlice(body)
+  if locals.length != usize.ONE || nodes.length != 4 {
+    return Option.none<ForwardedTypes>()
+  }
+  let moved = match &nodes[usize.ONE].kind {
+    BodyNodeKind.Expression {ty, form: BodyExpression.Move {..}} => Option.some<Shared<Type>>(
+      Shared.clone<Type>(&ty),
+    )
+    _ => Option.none<Shared<Type>>()
+  }
+  let mut entry = Option.none<Shared<Type>>()
+  let mut deferred = Option.none<Shared<Type>>()
+  let stage = TypedBody.checkingStage(body)
+  if let BodyStage.ContractTyped {obligations} = &stage.* {
+    let entries = Vector.asSlice<BodySafetyObligation>(&obligations)
+    if entries.length == 2 {
+      if let BodySafetyObligation.WholeValue {ty, ..} = &entries[usize.ZERO] {
+        entry = Option.some<Shared<Type>>(Shared.clone<Type>(&ty))
+      }
+      if let BodySafetyObligation.WholeValue {ty, ..} = &entries[usize.ONE] {
+        deferred = Option.some<Shared<Type>>(Shared.clone<Type>(&ty))
+      }
+    }
+  }
+  if let Option<Shared<Type>>.Some {value: movedType} = move moved {
+    if let Option<Shared<Type>>.Some {value: entryType} = move entry {
+      if let Option<Shared<Type>>.Some {value: deferredType} = move deferred {
+        return Option.some<ForwardedTypes>(ForwardedTypes {
+          local: Shared.clone<Type>(&locals[usize.ZERO].ty),
+          moved: move movedType,
+          entry: move entryType,
+          deferred: move deferredType,
+        })
+      }
+    }
+  }
+  return Option.none<ForwardedTypes>()
+}
+
+fn sameWitness(
+  left: &Option<Shared<DeclarationId>>,
+  right: &Option<Shared<DeclarationId>>,
+) -> bool {
+  return match &left.* {
+    Option<Shared<DeclarationId>>.None => match &right.* {
+      Option<Shared<DeclarationId>>.None => true
+      _ => false
+    }
+    Option<Shared<DeclarationId>>.Some {value: first} => match &right.* {
+      Option<Shared<DeclarationId>>.Some {value: second} => sameStep(&first, &second)
+      _ => false
+    }
+  }
+}
+
+fn interfaceCallPair(body: &TypedBody) -> Option<InterfaceCallPair> {
+  let nodes = TypedBody.nodeSlice(body)
+  let mut first = usize.MAX
+  let mut second = usize.MAX
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {form: BodyExpression.InterfaceCall {..}, ..} = &nodes[at].kind {
+      if first == usize.MAX {
+        first = at
+      } else if second == usize.MAX {
+        second = at
+      }
+    }
+    at = at + usize.ONE
+  }
+  if first == usize.MAX || second == usize.MAX {
+    return Option.none<InterfaceCallPair>()
+  }
+  if let BodyNodeKind.Expression {
+    form: BodyExpression.InterfaceCall {
+      contract: firstContract,
+      provider: firstProvider,
+      operation: firstOperation,
+      implementation: firstWitness,
+      receiverPass: firstPass,
+      arguments: firstArguments,
+      ..
+    }, ..
+  } = &nodes[first].kind {
+    if let BodyNodeKind.Expression {
+      form: BodyExpression.InterfaceCall {
+        contract: secondContract,
+        provider: secondProvider,
+        operation: secondOperation,
+        implementation: secondWitness,
+        receiverPass: secondPass,
+        arguments: secondArguments,
+        ..
+      }, ..
+    } = &nodes[second].kind {
+      let hasWitness = match &firstWitness {
+        Option<Shared<DeclarationId>>.Some {..} => true
+        _ => false
+      }
+      let firstExplicit = match &firstPass {
+        Option<BodyReceiverPass>.None => true
+        _ => false
+      }
+      let secondMethod = match &secondPass {
+        Option<BodyReceiverPass>.Some {..} => true
+        _ => false
+      }
+      return Option.some<InterfaceCallPair>(InterfaceCallPair {
+        firstContract: Shared.clone<Type>(&firstContract),
+        secondContract: Shared.clone<Type>(&secondContract),
+        firstProvider: Shared.clone<Type>(&firstProvider),
+        secondProvider: Shared.clone<Type>(&secondProvider),
+        sameOperation: DeclarationId.equals(&firstOperation, &secondOperation),
+        sameWitness: sameWitness(&firstWitness, &secondWitness),
+        hasWitness: hasWitness,
+        oneReceiverPerCall: Vector.length<BodyNodeId>(&firstArguments) == usize.ONE && Vector.length<BodyNodeId>(&secondArguments) == usize.ONE,
+        qualifiedThenReceiver: firstExplicit && secondMethod,
+      })
+    }
+  }
+  return Option.none<InterfaceCallPair>()
+}
+
+fn answerInterfaceCallPair(answer: &Result<Answer, NoRejection>) -> Option<InterfaceCallPair> {
+  let body = checkedBody(answer)
+  if let Option<Shared<TypedBody>>.Some {value} = move body {
+    return Shared.with<TypedBody, Option<InterfaceCallPair>>(&value, interfaceCallPair)
+  }
+  return Option.none<InterfaceCallPair>()
+}
+
+fn isUnknownName(value: &Rejection) -> bool {
+  return value.code == RejectionCode.UnknownName
+}
+
+fn isUnknownMember(value: &Rejection) -> bool {
+  return value.code == RejectionCode.UnknownMember
+}
+
+fn isMissingModule(value: &Rejection) -> bool {
+  return value.code == RejectionCode.MissingModule && value.span.end > value.span.start
+}
+
+fn isPrivateExposure(value: &Rejection) -> bool {
+  return value.code == RejectionCode.PrivateTypeExposure && value.span.end > value.span.start
+}
+
+fn isCollision(value: &Rejection) -> bool {
+  return value.code == RejectionCode.Collision
+}
+
+fn cycleAnchoredAt(answer: &Result<Answer, NoRejection>, start: usize) -> bool {
+  let found = rejection(answer)
+  if let Option<Shared<Rejection>>.Some {value} = move found {
+    return Shared.with<Rejection, bool>(
+      &value,
+      fn(diagnostic: &Rejection) -> bool {
+        return diagnostic.code == RejectionCode.Cycle && diagnostic.span.start == start && diagnostic.span.end == start + usize.ONE
+      },
+    )
+  }
+  return false
+}
+
+fn importCycleAnchor(value: &Rejection) -> bool {
+  return value.span.end > value.span.start
+}
+
+fn memberNames(answer: &Result<Answer, NoRejection>, first: &[u8], second: &[u8]) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Members {members, ..}} => {
+        let entries = Vector.asSlice(&members)
+        if entries.length != 2 {
+          return false
+        }
+        return match & entries[0].name {
+          Option<Bytes>.Some {value: left} => match & entries[1].name {
+            Option<Bytes>.Some {value: right} => sameBytes(Bytes.asSlice(&left), first) && sameBytes(
+              Bytes.asSlice(&right),
+              second,
+            )
+            _ => false
+          }
+          _ => false
+        }
+      }
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn memberSingleName(answer: &Result<Answer, NoRejection>, expected: &[u8]) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Members {members, ..}} => {
+        let entries = Vector.asSlice<Member>(&members)
+        if entries.length != 1 {
+          return false
+        }
+        return match & entries[0].name {
+          Option<Bytes>.Some {value: name} => sameBytes(Bytes.asSlice(&name), expected)
+          Option<Bytes>.None => false
+        }
+      }
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn shapeCount(answer: &Result<Answer, NoRejection>) -> usize {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => Vector.length<Shared<Type>>(&types)
+      _ => usize.MAX
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => usize.MAX
+  }
+}
+
+fn shapeFirstIsBool(answer: &Result<Answer, NoRejection>) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let values = Vector.asSlice<Shared<Type>>(&types)
+        return values.length == 1 && Shared.with<Type, bool>(&values[0], isBool)
+      }
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn shapeFirstIsI32(answer: &Result<Answer, NoRejection>) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let values = Vector.asSlice<Shared<Type>>(&types)
+        return values.length == 1 && Shared.with<Type, bool>(&values[0], isI32)
+      }
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn shapeFirstIsNominal(answer: &Result<Answer, NoRejection>) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let values = Vector.asSlice<Shared<Type>>(&types)
+        return values.length == 1 && Shared.with<Type, bool>(&values[0], isNominal)
+      }
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn zeroArrayOfNominal(value: &Type) -> bool {
+  return match & value.* {
+    Type.Array {element, extent} => sameBytes(Bytes.asSlice(&extent), b"0") && Shared.with<
+      Type,
+      bool,
+    >(&element, isNominal)
+    _ => false
+  }
+}
+
+fn signatureIsZeroNominalArray(answer: &Result<Answer, NoRejection>) -> bool {
+  let result = signatureResult(answer)
+  if let Option<Shared<Type>>.Some {value: ty} = move result {
+    return Shared.with<Type, bool>(&ty, zeroArrayOfNominal)
+  }
+  return false
+}
+
+// Demands one fixed set of member facts and their consumers. Warm and fresh stores must agree at
+// each stage: 0 is the initial source, 1 changes the field type, and 2 renames the fields, makes
+// the second member present, and writes an unknown first field type.
+effect fn memberFacts(
+  semantic: &mut Semantic,
+  geometry: &ModuleId,
+  consumer: &ModuleId,
+  point: &Shared<Type>,
+  text: &[u8],
+  stage: usize,
+) -> bool ! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch ? &mut Allocator {
+  let mut request = Request.make()
+  let identity = run Semantic.demandIdentity(&mut semantic.*, &mut request, geometry, b"Point")
+  let names = run Semantic.demandMembers(&mut semantic.*, &mut request, geometry, b"Point")
+  let first = run Semantic.demandMemberShape(
+    &mut semantic.*,
+    &mut request,
+    geometry,
+    b"Point",
+    0,
+    point,
+  )
+  let second = run Semantic.demandMemberShape(
+    &mut semantic.*,
+    &mut request,
+    geometry,
+    b"Point",
+    1,
+    point,
+  )
+  let origin = run Semantic.demandSignature(&mut semantic.*, &mut request, consumer, b"origin")
+  let caller = run Semantic.demandBody(&mut semantic.*, &mut request, consumer, b"caller")
+  let sameIdentity = run typesEqual(
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&identity, nominalResult),
+    Option.some<Shared<Type>>(Shared.clone<Type>(point)),
+  )
+  let sameParameter = run typesEqual(
+    slotOf(&origin, usize.ZERO),
+    Option.some<Shared<Type>>(Shared.clone<Type>(point)),
+  )
+  let callerBody = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(
+    &caller,
+    checkedBody,
+  )
+  let mut callsLeaf = false
+  if let Option<Shared<TypedBody>>.Some {value} = move callerBody {
+    callsLeaf = Shared.with<TypedBody, bool>(
+      &value,
+      fn(body: &TypedBody) -> bool {
+        return bodyCalls(body, geometry, usize.ZERO)
+      },
+    )
+  }
+  let consumers = sameIdentity && sameParameter && callsLeaf && Request.hasDiscovered(
+    &request,
+    geometry,
+  )
+  if stage == 2 {
+    return consumers && Shared.with<Result<Answer, NoRejection>, bool>(
+      &names,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return memberNames(answer, b"height", b"depth")
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &first,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionSpells(answer, RejectionCode.UnknownLifetime, text, b"'undeclared")
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(&second, shapeFirstIsI32)
+  }
+  let widthOnly = Shared.with<Result<Answer, NoRejection>, bool>(
+    &names,
+    fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return memberSingleName(answer, b"width")
+    },
+  )
+  let absent = Shared.with<Result<Answer, NoRejection>, bool>(
+    &second,
+    fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return rejectedTypeApplication(answer, RejectionCode.UnknownMember)
+    },
+  )
+  if stage == usize.ONE {
+    return consumers && widthOnly && absent && Shared.with<Result<Answer, NoRejection>, bool>(
+      &first,
+      shapeFirstIsBool,
+    )
+  }
+  return consumers && widthOnly && absent && Shared.with<Result<Answer, NoRejection>, bool>(
+    &first,
+    shapeFirstIsI32,
+  )
+}
+
+effect fn memberRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let geometry = run module("geometry.silk")
+  let consumer = run module("consumer.silk")
+  let consumerSource = run present(
+    "import geometry as Geometry\nfn origin(at: Geometry.Point) -> () { return () }\nfn caller() -> i32 { return Geometry.leaf() }\nfn unrelated() -> i32 { return 2 }\n",
+  )
+  let initialText = "type Element = i32\npub struct Point { width: Element }\npub fn leaf() -> i32 { return 1 }\n"
+  let initialSource = run present(initialText)
+  let base = run Revision.publish(&Revision.make(), &consumer, &consumerSource)
+  let held = run Revision.publish(&base, &geometry, &initialSource)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut original = Request.make()
+  let identity = run Semantic.demandIdentity(&mut semantic, &mut original, &geometry, b"Point")
+  let nominal = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &identity,
+    nominalResult,
+  )
+  let point = match move nominal {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => {
+      run Testing.expect(false, "the nominal identity resolves")
+      return ()
+    }
+  }
+  let initial = run memberFacts(
+    &mut semantic,
+    &geometry,
+    &consumer,
+    &point,
+    String.utf8Bytes(initialText),
+    usize.ZERO,
+  )
+  let unrelated = run Semantic.demandBody(&mut semantic, &mut original, &consumer, b"unrelated")
+  run Testing.expect(
+    initial && Shared.with<Result<Answer, NoRejection>, AnswerView>(&unrelated, inspect).success && starts(
+      Semantic.eventLog(&semantic),
+      Family.Body,
+    ) == 2,
+    "names, one field type, an absent member, and their consumers are separate facts",
+  )
+  let typeText = "type Element = bool\npub struct Point { width: Element }\npub fn leaf() -> i32 { return 1 }\n"
+  let typeSource = run present(typeText)
+  let typeRevision = run Revision.publish(&held, &geometry, &typeSource)
+  Semantic.revise(&mut semantic, run Revision.copy(&typeRevision))
+  let warmType = run memberFacts(
+    &mut semantic,
+    &geometry,
+    &consumer,
+    &point,
+    String.utf8Bytes(typeText),
+    usize.ONE,
+  )
+  let mut unrelatedRequest = Request.make()
+  let kept = run Semantic.demandBody(&mut semantic, &mut unrelatedRequest, &consumer, b"unrelated")
+  let mut freshType = makeSemantic(run Revision.copy(&typeRevision))
+  let coldType = run memberFacts(
+    &mut freshType,
+    &geometry,
+    &consumer,
+    &point,
+    String.utf8Bytes(typeText),
+    usize.ONE,
+  )
+  run Testing.expect(
+    warmType && coldType && Shared.with<Result<Answer, NoRejection>, AnswerView>(&kept, inspect).success && reused(
+      Semantic.eventLog(&semantic),
+    ) == 1 && starts(Semantic.eventLog(&semantic), Family.Body) == 3 && hits(
+      Semantic.eventLog(&semantic),
+      Family.Body,
+    ) == 1 && starts(Semantic.eventLog(&freshType), Family.Body) == 1,
+    "a field type edit changes shape consumers while equal identity, names, and callee signature keep the caller",
+  )
+  let renamedText = "type Element = bool\npub struct Point {\n height: &'undeclared i32\n depth: i32\n}\npub fn leaf() -> i32 { return 1 }\n"
+  let renamedSource = run present(renamedText)
+  let renamedRevision = run Revision.publish(&typeRevision, &geometry, &renamedSource)
+  Semantic.revise(&mut semantic, run Revision.copy(&renamedRevision))
+  let warmRenamed = run memberFacts(
+    &mut semantic,
+    &geometry,
+    &consumer,
+    &point,
+    String.utf8Bytes(renamedText),
+    2,
+  )
+  let mut freshRenamed = makeSemantic(run Revision.copy(&renamedRevision))
+  let coldRenamed = run memberFacts(
+    &mut freshRenamed,
+    &geometry,
+    &consumer,
+    &point,
+    String.utf8Bytes(renamedText),
+    2,
+  )
+  run Testing.expect(
+    warmRenamed && coldRenamed && reused(Semantic.eventLog(&semantic)) == 2 && starts(
+      Semantic.eventLog(&semantic),
+      Family.Body,
+    ) == 4,
+    "renamed names, a newly present member, and a current field diagnostic reach only their consumers",
+  )
+  let faultText = "type Element = bool\npub struct Point {\n height: bool\n depth: i32\n}\npub fn leaf() -> i32 { return 1 }\n// This unique source allocation fails while the caller revalidates.\n"
+  let faultSource = run present(faultText)
+  let faultRevision = run Revision.publish(&renamedRevision, &geometry, &faultSource)
+  Semantic.revise(&mut semantic, move faultRevision)
+  let mut fault = NestedFailureAllocator {
+    targetBytes: String.utf8Bytes(faultText).length,
+    rejected: false,
+  }
+  let mut failedRequest = Request.make()
+  let attempted = run Effect.result(
+    Semantic.demandBody(&mut semantic, &mut failedRequest, &consumer, b"caller"),
+  )
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let failed = match move attempted {
+    Result<
+      Shared<Result<Answer, NoRejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError,
+    >.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      _ => false
+    }
+    Result<
+      Shared<Result<Answer, NoRejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError,
+    >.Success {value: ignored} => false
+  }
+  let mut retriedRequest = Request.make()
+  let retried = run Semantic.demandBody(&mut semantic, &mut retriedRequest, &consumer, b"caller")
+  run Testing.expect(
+    failed && fault.rejected && Request.rootCount(&failedRequest) == 0 && Shared.with<
+      Result<Answer, NoRejection>,
+      AnswerView,
+    >(&retried, inspect).success && Request.hasDiscovered(&retriedRequest, &geometry) && reused(
+      Semantic.eventLog(&semantic),
+    ) == 2 && starts(Semantic.eventLog(&semantic), Family.Body) == 6,
+    "a failure during caller revalidation publishes nothing, and the retry checks the current caller",
+  )
+  return ()
+}
+
+fn staleMemberKindRejected(answer: &Result<Answer, NoRejection>) -> bool {
+  let diagnostic = rejection(answer)
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    return Shared.with<Rejection, bool>(
+      &value,
+      fn(found: &Rejection) -> bool {
+        return found.code == RejectionCode.TypeArgumentKind && found.span.end > found.span.start && Bytes.asSlice(
+          &found.parameterName,
+        ).length > usize.ZERO && found.expectedKind == GenericKind.Lifetime && found.suppliedKind == GenericKind.Type
+      },
+    )
+  }
+  return false
+}
+
+effect fn memberKindRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("member-kind-edits.silk")
+  let source = run present("struct Box<T> { value: T }\nfn applied() -> Box<bool> { return () }\n")
+  let held = run Revision.publish(&Revision.make(), &entry, &source)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut original = Request.make()
+  let signature = run Semantic.demandSignature(&mut semantic, &mut original, &entry, b"applied")
+  let applied = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &signature,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value: application} = move applied {
+    let changed = run present("struct Box<'life> { value: bool }\n")
+    let revision = run Revision.publish(&held, &entry, &changed)
+    Semantic.revise(&mut semantic, move revision)
+    let mut request = Request.make()
+    let shape = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Box",
+      0,
+      &application,
+    )
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&shape, staleMemberKindRejected),
+      "a stale application reports the changed generic argument kind at a source span",
+    )
+  } else {
+    run Testing.expect(false, "the original generic application resolves")
+  }
+  return ()
+}
+
+fn nameIsA(value: &Bytes) -> bool {
+  let name = Bytes.asSlice(value)
+  return name.length == 1 && name[usize.ZERO] == 65
+}
+
+fn isWrongTypeKind(found: &Rejection) -> bool {
+  if found.code != RejectionCode.TypeArgumentKind || found.span.end <= found.span.start {
+    return false
+  }
+  return nameIsA(&found.parameterName) && found.expectedKind == GenericKind.Type && found.suppliedKind == GenericKind.Lifetime
+}
+
+fn wrongTypeKind(answer: &Result<Answer, NoRejection>) -> bool {
+  let diagnostic = rejection(answer)
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    return Shared.with<Rejection, bool>(&value, isWrongTypeKind)
+  }
+  return false
+}
+
+fn nominalOwnedBy(resolved: &Type, module: &ModuleId) -> bool {
+  return match & resolved.* {
+    Type.Nominal {declaration, ..} => ModuleId.equals(DeclarationId.moduleId(&declaration), module)
+    _ => false
+  }
+}
+
+fn signatureOwnedBy(answer: &Shared<Result<Answer, NoRejection>>, module: &ModuleId) -> bool {
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    answer,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value} = move result {
+    return Shared.with<Type, bool>(
+      &value,
+      fn(resolved: &Type) -> bool {
+        return nominalOwnedBy(resolved, module)
+      },
+    )
+  }
+  return false
+}
+
+fn signatureIsBool(answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    answer,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value} = move result {
+    return Shared.with<Type, bool>(&value, isBool)
+  }
+  return false
+}
+
+fn importedSignatureHasDependencies(answer: &Result<Answer, NoRejection>) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => {
+      let dependencies = Vector.asSlice<Dependency>(&value.dependencies)
+      let mut selected = false
+      let mut namespace = false
+      let mut publicName = false
+      let mut alias = false
+      let mut identity = false
+      let mut at = usize.ZERO
+      while at < dependencies.length {
+        let item = &dependencies[at]
+        if item.family == Family.Import {
+          match move Dependency.member(item) {
+            Option<usize>.Some {value: ordinal} => {
+              if ordinal == usize.ZERO {
+                selected = true
+              }
+            }
+            Option<usize>.None => {
+              namespace = true
+            }
+          }
+        }
+        if item.family == Family.Name && item.external {
+          publicName = true
+        }
+        if item.family == Family.Alias {
+          alias = true
+        }
+        if item.family == Family.Identity {
+          identity = true
+        }
+        at = at + usize.ONE
+      }
+      return selected && namespace && publicName && alias && identity
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+effect fn lazyClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let missing = run module("missing.silk")
+  let source = run present(
+    "import missing as Ghost\ntype Broken = Unknown\nfn entry() -> i32 { return unknown() }\nfn missing(value: Ghost.Thing) -> i32 { return 0 }\n",
+  )
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let signature = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let first = Shared.with<Result<Answer, NoRejection>, AnswerView>(&signature, inspect)
+  run Testing.expect(
+    first.success && first.sources == 1,
+    "written signature needs entry source only",
+  )
+  run Testing.expect(
+    reads(Semantic.sourceEvents(&semantic), &entry) == 1 && reads(
+      Semantic.sourceEvents(&semantic),
+      &missing,
+    ) == 0,
+    "unused import target stays unread",
+  )
+  run Testing.expect(
+    starts(Semantic.eventLog(&semantic), Family.Import) == 0 && starts(
+      Semantic.eventLog(&semantic),
+      Family.Alias,
+    ) == 0,
+    "unused import and bad alias stay undemanded",
+  )
+  let broken = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Broken")
+  let rejected = Shared.with<Result<Answer, NoRejection>, AnswerView>(&broken, inspect)
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &broken,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    run Testing.expect(
+      !rejected.success && Shared.with<Rejection, bool>(&value, isUnknownName) && rejected.dependencies > 0 && rejected.sources == 1,
+      "demanded bad alias records negative name dependency",
+    )
+  } else {
+    run Testing.expect(false, "demanded bad alias has a typed rejection")
+  }
+  let again = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let hit = Shared.with<Result<Answer, NoRejection>, AnswerView>(&again, inspect)
+  run Testing.expect(
+    hit.success && hit.sources == first.sources && reads(Semantic.sourceEvents(&semantic), &entry) == 1,
+    "memo hit retains evidence without another source read",
+  )
+  let demanded = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"missing")
+  let missingDiagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &demanded,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move missingDiagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isMissingModule),
+      "demanded import target absence is anchored",
+    )
+  } else {
+    run Testing.expect(false, "demanded missing import has a typed rejection")
+  }
+  run Testing.expect(
+    reads(Semantic.sourceEvents(&semantic), &missing) == 1,
+    "missing target is read only on demand",
+  )
+  return ()
+}
+
+test effect fn defersUnusedDeclarationsAndReusesWrittenSignature() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run lazyClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn importClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let library = run module("library.silk")
+  let librarySource = run present(
+    "pub struct Thing { field: &'undeclared i32 }\npub type PublicAlias = Thing\n",
+  )
+  let first = run Revision.publish(&Revision.make(), &library, &librarySource)
+  let entrySource = run present(
+    "import library as Library { PublicAlias as Alias }\nfn entry(value: Alias) -> Library.Thing { return move value }\n",
+  )
+  let revision = run Revision.publish(&first, &entry, &entrySource)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let signature = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let result = Shared.with<Result<Answer, NoRejection>, AnswerView>(&signature, inspect)
+  run Testing.expect(result.success, "imported alias resolves from written signature")
+  run Testing.expect(result.dependencies > 0, "imported alias records nested demands")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&signature, importedSignatureHasDependencies),
+    "signature keeps selected import ordinal, namespace, public name, alias, and identity edges",
+  )
+  run Testing.expect(result.sources == 2, "signature records each directly inspected source")
+  let writtenResult = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &signature,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value} = move writtenResult {
+    run Testing.expect(
+      Shared.with<Type, bool>(&value, isNominal),
+      "alias result retains nominal identity",
+    )
+  } else {
+    run Testing.expect(false, "signature has a written result")
+  }
+  run Testing.expect(
+    reads(Semantic.sourceEvents(&semantic), &entry) == 1 && reads(
+      Semantic.sourceEvents(&semantic),
+      &library,
+    ) == 1,
+    "import target is read only when alias is used",
+  )
+  run Testing.expect(
+    starts(Semantic.eventLog(&semantic), Family.Import) == 2 && starts(
+      Semantic.eventLog(&semantic),
+      Family.Alias,
+    ) == 1 && starts(Semantic.eventLog(&semantic), Family.Identity) == 1,
+    "hybrid namespace and selected alias share nominal identity",
+  )
+  let again = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let cached = Shared.with<Result<Answer, NoRejection>, AnswerView>(&again, inspect)
+  run Testing.expect(
+    cached.success && cached.dependencies == result.dependencies && cached.sources == result.sources,
+    "imported signature memo hit keeps fact and dependency evidence",
+  )
+  run Testing.expect(
+    reads(Semantic.sourceEvents(&semantic), &entry) == 1 && reads(
+      Semantic.sourceEvents(&semantic),
+      &library,
+    ) == 1,
+    "imported signature memo hit does not reread sources",
+  )
+  let priorSignatureStarts = starts(Semantic.eventLog(&semantic), Family.Signature)
+  let priorSignatureHits = hits(Semantic.eventLog(&semantic), Family.Signature)
+  let mut fresh = Request.make()
+  run Testing.expect(
+    Request.rootCount(&fresh) == 0 && !Request.hasDiscovered(&fresh, &library),
+    "fresh request has no inherited roots or discoveries",
+  )
+  let replayed = run Semantic.demandSignature(&mut semantic, &mut fresh, &entry, b"entry")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&replayed, inspect).success && Request.rootCount(
+      &fresh,
+    ) == 1 && Request.hasRoot(&fresh, Family.Signature, &entry, b"entry") && Request.hasDiscovered(
+      &fresh,
+      &entry,
+    ) && Request.hasDiscovered(&fresh, &library) && Request.hasDemand(
+      &fresh,
+      Family.Alias,
+      &library,
+    ) && Request.hasDemand(&fresh, Family.Identity, &library),
+    "fresh request replays imported discovery and nested demand evidence",
+  )
+  run Testing.expect(
+    priorSignatureStarts == starts(Semantic.eventLog(&semantic), Family.Signature) && hits(
+      Semantic.eventLog(&semantic),
+      Family.Signature,
+    ) == priorSignatureHits + 1 && reads(Semantic.sourceEvents(&semantic), &library) == 1,
+    "replay emits only the actual root hit and no new provider read",
+  )
+  return ()
+}
+
+test effect fn resolvesImportedAliasWithoutFieldsOrBodies() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run importClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// MODULE-STATIC-001/002: selected arm members belong to the module namespace, inactive ones are
+// absent, and a failed condition admits neither arm.
+effect fn moduleSelectionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | RegistrationClosed | ConflictingPackageSource | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let library = run module("library.silk")
+  let helper = run module("helper.silk")
+  let missing = run module("missing.silk")
+  let libraryText = """
+static if true && true {
+  import helper { Helped }
+  pub fn helped(value: Helped) -> i32 { return 0 }
+  pub param gated: bool
+  pub struct Chosen {}
+  impl Chosen {
+    pub fn make() -> Chosen { return Chosen {} }
+  }
+  static if false {
+    pub fn pick() -> bool { return true }
+  } else {
+    pub fn pick() -> i32 { return 1 }
+  }
+} else {
+  import missing { Gone }
+  pub struct Chosen {}
+  pub struct Hidden {}
+}
+static if false {
+  import helper { Helped as Twin }
+} else {
+  import helper { Helped as Twin }
+}
+pub fn twin(value: Twin) -> i32 { return 0 }
+static if 7 {
+  pub fn broken() -> i32 { return 0 }
+}
+static if cyclic() {
+  pub static fn cyclic() -> bool { return true }
+}
+static if false {
+  pub param hiddenParameter: bool
+}
+static if 7 {
+  pub param brokenParameter: bool
+}
+"""
+  let entryText = "import library { Chosen, Hidden }\nfn entry(value: Chosen) -> i32 { return 0 }\nfn hiddenUse(value: Hidden) -> i32 { return 0 }\n"
+  let librarySource = run present(libraryText)
+  let entrySource = run present(entryText)
+  let helperSource = run present("pub struct Helped {}\n")
+  let first = run Revision.publish(&Revision.make(), &library, &librarySource)
+  let second = run Revision.publish(&first, &helper, &helperSource)
+  let revision = run Revision.publish(&second, &entry, &entrySource)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  run Request.registerSchemaModule(&mut request, &library)
+  let chosen = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let helped = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"helped")
+  let twin = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"twin")
+  let cyclic = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"cyclic")
+  let gated = run Semantic.demandParameterSchema(&mut semantic, &mut request, &library, b"gated")
+  let hiddenParameter = run Semantic.demandParameterSchema(&mut semantic, &mut request, &library, b"hiddenParameter")
+  let brokenParameter = run Semantic.demandParameterSchema(&mut semantic, &mut request, &library, b"brokenParameter")
+  let hidden = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"hiddenUse")
+  let pick = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"pick")
+  let make = run Semantic.demandInherentMember(&mut semantic, &mut request, &library, b"Chosen", b"make")
+  let broken = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"broken")
+  let picked = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&pick, signatureResult)
+  let pickIsI32 = match &picked {
+    Option<Shared<Type>>.Some {value} => Shared.with<Type, bool>(&value, isI32)
+    Option<Shared<Type>>.None => false
+  }
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&chosen, inspect).success && pickIsI32,
+    "an importer and the module see only the selected arm, including a nested else arm",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&make, inspect).success,
+    "an impl in a selected arm publishes inherent members",
+  )
+  run Testing.expect(
+    rejectsSpan(&hidden, RejectionCode.UnknownMember, entryText, "Hidden", usize.ZERO),
+    "an inactive-only declaration is absent at its import",
+  )
+  run Testing.expect(
+    rejectsSpan(&broken, RejectionCode.ConditionNotBool, libraryText, "7", usize.ZERO),
+    "a non-bool condition admits neither arm and keeps its anchored rejection",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&helped, inspect).success && reads(
+      Semantic.sourceEvents(&semantic),
+      &missing,
+    ) == 0,
+    "a selected arm's import resolves while an inactive arm's import is never read",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&twin, inspect).success,
+    "the same import in both arms survives through whichever arm is selected",
+  )
+  run Testing.expect(
+    rejectsSpan(&cyclic, RejectionCode.Cycle, libraryText, "cyclic", usize.ONE) &&
+      rejectsFrom(&gated, RejectionCode.ConditionalParameter, offsetOf(libraryText, "pub param gated", usize.ZERO)) &&
+      rejectsFrom(&hiddenParameter, RejectionCode.ConditionalParameter, offsetOf(libraryText, "pub param hiddenParameter", usize.ZERO)) &&
+      rejectsFrom(&brokenParameter, RejectionCode.ConditionalParameter, offsetOf(libraryText, "pub param brokenParameter", usize.ZERO)),
+    "a condition using its own arm is a cycle, and any conditional package parameter is rejected before selection",
+  )
+  return ()
+}
+
+test effect fn moduleArmsSelectNativeDeclarations() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | RegistrationClosed | ConflictingPackageSource | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run moduleSelectionClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Answers for one condition's helpers must not depend on which demand reaches them first. Each
+// order uses a fresh store.
+effect fn conditionOrderClaims(conditionFirst: bool) -> bool
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch
+? &mut Allocator {
+  let library = run module("ordered.silk")
+  let fast = run module("fast.silk")
+  let librarySource = run present("""
+static fn enabled() -> bool { return 1 == 1 }
+static if enabled() {
+  import fast { Engine }
+  pub fn engine(value: Engine) -> i32 { return 0 }
+}
+""")
+  let fastSource = run present("pub struct Engine {}\n")
+  let first = run Revision.publish(&Revision.make(), &library, &librarySource)
+  let revision = run Revision.publish(&first, &fast, &fastSource)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  if conditionFirst {
+    let armFirst = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"engine")
+    let helperLater = run Semantic.demandBody(&mut semantic, &mut request, &library, b"enabled")
+    return Shared.with<Result<Answer, NoRejection>, AnswerView>(&armFirst, inspect).success &&
+      Shared.with<Result<Answer, NoRejection>, AnswerView>(&helperLater, inspect).success
+  }
+  let enabled = run Semantic.demandBody(&mut semantic, &mut request, &library, b"enabled")
+  let engine = run Semantic.demandSignature(&mut semantic, &mut request, &library, b"engine")
+  return Shared.with<Result<Answer, NoRejection>, AnswerView>(&engine, inspect).success &&
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&enabled, inspect).success
+}
+
+test effect fn conditionOrderSelectNativeAnswers() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let conditionFirst = run conditionOrderClaims(true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let helperFirst = run conditionOrderClaims(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    conditionFirst && helperFirst,
+    "a condition's helper and its arm answer the same whichever is demanded first",
+  )
+  return ()
+}
+
+effect fn cycleClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let source = run present(
+    "type A = B\ntype B = A\nfn f() -> i32 { return g() }\nfn g() -> i32 { return f() }\n",
+  )
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+  let mut semantic = makeSemantic(run Revision.copy(&revision))
+  let mut request = Request.make()
+  let function = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"f")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&function, inspect).success && starts(
+      Semantic.eventLog(&semantic),
+      Family.Signature,
+    ) == 1,
+    "recursive bodies do not demand another signature",
+  )
+  let alias = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"A")
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &alias,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isCycle),
+      "alias cycle has a typed code",
+    )
+    run Testing.expect(
+      Shared.with<Rejection, usize>(&value, cyclePathLength) == 3,
+      "alias cycle has a declaration path",
+    )
+  } else {
+    run Testing.expect(false, "alias cycle has a typed rejection")
+  }
+  let other = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"B")
+  let mut reversed = makeSemantic(move revision)
+  let mut reversedRequest = Request.make()
+  let reversedOther = run Semantic.demandAlias(&mut reversed, &mut reversedRequest, &entry, b"B")
+  let reversedAlias = run Semantic.demandAlias(&mut reversed, &mut reversedRequest, &entry, b"A")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(
+      &alias,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return cycleAnchoredAt(answer, 9)
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &other,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return cycleAnchoredAt(answer, 20)
+      },
+    ) && rotatedPair(&alias, &other) && sameCycleAnswers(&alias, &reversedAlias) && sameCycleAnswers(
+      &other,
+      &reversedOther,
+    ),
+    "each alias cycle member rejects at its own reference in either demand order",
+  )
+  return ()
+}
+
+test effect fn separatesSignatureRecursionFromAliasCycles() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run cycleClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn visibilityClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let text = """struct Hidden { field: i32 }
+pub fn reveal() -> Hidden { return () }
+type Clash = i32
+struct Clash {}
+pub type HiddenExact = typeof(reveal)
+pub fn identity<T>(value: T) -> T { return value }
+fn caller() -> i32 {
+  let hidden = Hidden { field: 42 }
+  let copied = identity(hidden)
+  return copied.field
+}
+pub struct Box<T> { value: T }
+impl<T> Box<T> {
+  pub fn withMut<F: once fn(&mut T) -> ()>(self: &mut Self, use: F) -> () {
+    use(&mut self.value)
+    return ()
+  }
+}
+fn touch(value: &mut Hidden) -> () { value.field = value.field + 1 return () }
+fn privateBoundCaller() -> i32 {
+  let mut boxed = Box<Hidden> { value: Hidden { field: 42 } }
+  Box.withMut(&mut boxed, touch)
+  return boxed.value.field
+}
+pub fn authoredPrivateCallback<F: once fn(&mut Hidden) -> ()>(use: F) -> () { drop use return () }
+interface PrivateWitness { fn mark(self: &Self) -> () }
+pub fn authoredPrivateInterface<T: PrivateWitness>(value: T) -> () { drop value return () }
+"""
+  let source = run present(text)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let revealed = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"reveal")
+  let privateType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &revealed,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move privateType {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isPrivateExposure),
+      "public written signature rejects private nominal type at its use",
+    )
+  } else {
+    run Testing.expect(false, "private type exposure has a typed rejection")
+  }
+  let clash = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Clash")
+  let collision = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &clash,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move collision {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isCollision),
+      "complete name bucket rejects collision without winner",
+    )
+  } else {
+    run Testing.expect(false, "colliding name has a typed rejection")
+  }
+  let hiddenExact = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"HiddenExact")
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &hiddenExact,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isPrivateExposure),
+      "exact representations cannot bypass a rejected public callable signature",
+    )
+  } else {
+    run Testing.expect(false, "exact representation has a typed rejection")
+  }
+  let caller = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"caller")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&caller, inspect).success,
+    "a public generic instantiated with a caller-private record does not publish that record",
+  )
+  let boundCaller = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"privateBoundCaller")
+  let selected = run directApplicationAt(&boundCaller, usize.ZERO)
+  let mut privateBound = false
+  if let Option<SpecializationApplication>.Some {value: application} = move selected {
+    let start = offsetOf(text, "Box.withMut(&mut boxed, touch)", usize.ZERO)
+    let site = b"Box.withMut(&mut boxed, touch)"
+    let signature = run Semantic.specializeSignature(&mut semantic, &mut request, &application, &entry,
+      Span.make(start, start + site.length))
+    privateBound = privateCallbackScope(&application)
+      && Shared.with<Result<Answer, NoRejection>, bool>(&signature, privateCallbackBound)
+  }
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&boundCaller, privateCallbackBodyPresent) && privateBound,
+    "a public generic member's selected callback bound retains the caller-private type in its distinct impl scope and types the source call")
+  let callback = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"authoredPrivateCallback")
+  let interfaceBound = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"authoredPrivateInterface")
+  run Testing.expect(rejectsSpan(&callback, RejectionCode.PrivateTypeExposure, text, "once fn(&mut Hidden) -> ()", usize.ZERO)
+    && rejectsSpan(&interfaceBound, RejectionCode.PrivateTypeExposure, text, "PrivateWitness", usize.ONE),
+    "authored public callback and interface bounds still reject their explicit private types at the exact bound syntax")
+  return ()
+}
+
+fn privateCallbackBodyPresent(answer: &Result<Answer, NoRejection>) -> bool {
+  return match move checkedBody(answer) { Option<Shared<TypedBody>>.Some {..} => true _ => false }
+}
+
+fn privateCallbackScope(value: &SpecializationApplication) -> bool {
+  let member = SpecializationApplication.bodyDeclaration(value)
+  if !DeclarationId.named(member, b"withMut") { return false }
+  let scopes = Vector.asSlice<ScopeBinding>(&value.scopes)
+  if scopes.length != usize.ONE || Shared.with<DeclarationId, bool>(&scopes[usize.ZERO].owner,
+    fn(owner: &DeclarationId) -> bool { return DeclarationId.equals(owner, member) }) { return false }
+  let arguments = Vector.asSlice<Argument>(&scopes[usize.ZERO].arguments)
+  let ordinals = Vector.asSlice<usize>(&scopes[usize.ZERO].argumentOrdinals)
+  if arguments.length != usize.ONE || ordinals.length != usize.ONE || ordinals[usize.ZERO] != usize.ZERO { return false }
+  let privateScope = match &arguments[usize.ZERO] {
+    Argument.Type {value: ty} => Shared.with<Type, bool>(&ty, privateHidden) _ => false }
+  let own = Vector.asSlice<Argument>(&value.arguments)
+  let ownOrdinals = Vector.asSlice<usize>(&value.argumentOrdinals)
+  if !privateScope || own.length != ownOrdinals.length { return false }
+  let mut at = usize.ZERO
+  while at < own.length {
+    if ownOrdinals[at] == usize.ZERO {
+      return match &own[at] { Argument.Type {..} => true _ => false }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn privateHidden(value: &Type) -> bool {
+  return match &value.* { Type.Nominal {declaration, isPublic, arguments, ..} => !isPublic
+    && DeclarationId.named(&declaration, b"Hidden") && Vector.length<Argument>(&arguments) == usize.ZERO _ => false }
+}
+
+fn privateMutableHiddenReference(value: &Type) -> bool {
+  return match &value.* { Type.Reference {access, referent, ..} => access == Access.Mutable
+    && Shared.with<Type, bool>(&referent, privateHidden) _ => false }
+}
+
+fn privateOnceHiddenContract(value: &Type) -> bool {
+  if let Type.Callable {mode, parameters, ..} = &value.* {
+    let inputs = Vector.asSlice<Shared<Type>>(&parameters)
+    return mode == CallableMode.Once && inputs.length == usize.ONE
+      && Shared.with<Type, bool>(&inputs[usize.ZERO], privateMutableHiddenReference)
+  }
+  return false
+}
+
+fn privateCallbackBound(answer: &Result<Answer, NoRejection>) -> bool {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      let bounds = Vector.asSlice<Constraint>(&signature.constraints)
+      let mut at = usize.ZERO
+      while at < bounds.length {
+        if let Constraint.Represents {contract, ..} = &bounds[at] {
+          let found = Shared.with<Type, bool>(&contract, privateOnceHiddenContract)
+          if found { return true }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return false
+}
+
+test effect fn rejectsPrivateExposureAndCollisions() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run visibilityClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn namedCallableRepresentationsKeepExactIdentity() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("named-representations.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = "fn first(value: i32) -> i32 { return value }\nfn second(value: i32) -> i32 { return value }\ntype First = typeof(first)\ntype FirstAgain = typeof(first)\ntype Second = typeof(second)\ntype Use = fn(i32) -> i32\npub type Leaked = typeof(first)\nfn generic<T>(value: T) -> T { return move value }\ntype Open = typeof(generic)\ntype Closed = typeof(generic<i32>)\nfn scoped<T>() -> typeof(generic<T>) { return () }\nservice Clock {}\nfn rowItem<?R>(value: i32) -> i32 { return value }\ntype RowOnce = typeof(rowItem<&Clock>)\ntype RowRepeated = typeof(rowItem<&Clock | &Clock>)\n"
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let first = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"First")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let again = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"FirstAgain")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Second")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let useContract = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Use")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let closed = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Closed")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let scoped = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"scoped")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let open = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Open")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let leaked = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Leaked")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rowOnce = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"RowOnce")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rowRepeated = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"RowRepeated")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &first,
+    nominalResult,
+  )
+  let againType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &again,
+    nominalResult,
+  )
+  let secondType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &second,
+    nominalResult,
+  )
+  let useType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &useContract,
+    nominalResult,
+  )
+  if let Option<Shared<Type>>.Some {value: firstValue} = move firstType {
+    if let Option<Shared<Type>>.Some {value: againValue} = move againType {
+      if let Option<Shared<Type>>.Some {value: secondValue} = move secondType {
+        let repeated = run Type.equalsShared(&firstValue, &againValue)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        let distinct = run Type.equalsShared(&firstValue, &secondValue)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        let mut separateUse = false
+        if let Option<Shared<Type>>.Some {value: callableUse} = move useType {
+          let sameUse = run Type.equalsShared(&firstValue, &callableUse)
+            |> Effect.provideMut<Allocator>(&mut allocator)
+          separateUse = !sameUse
+        }
+        run Testing.expect(Shared.with<Type, bool>(&firstValue, StaticValue.intrinsicallyForbidden),
+          "canonical named callable values remain forbidden as source static data")
+        run Testing.expect(
+          repeated && !distinct && separateUse,
+          "named items retain distinct exact identities despite identical callable signatures",
+        )
+      } else {
+        run Testing.expect(false, "second item has an exact representation")
+      }
+    } else {
+      run Testing.expect(false, "repeated item has an exact representation")
+    }
+  } else {
+    run Testing.expect(false, "first item has an exact representation")
+  }
+  let normalizedRows = run typesEqual(
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&rowOnce, nominalResult),
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &rowRepeated,
+      nominalResult,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    normalizedRows && Shared.with<Result<Answer, NoRejection>, AnswerView>(&closed, inspect).success
+      && rejectsSpan(&scoped, RejectionCode.InvalidExactRepresentation,
+        text,
+        "typeof(generic<T>)", usize.ZERO) && Shared.with<
+      Result<Answer, NoRejection>,
+      bool,
+    >(
+      &open,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.InvalidExactRepresentation)
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &leaked,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.PrivateTypeExposure)
+      },
+    ),
+    "typeof normalizes row arguments, requires full specialization, and keeps private item identity inside its module",
+  )
+  return ()
+}
+
+test effect fn opaqueResultContractsKeepProducerFamiliesDistinct() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("opaque-results.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = run present(
+    "fn make() -> some<F: fn<'static>(i32) -> i32> F { return () }\nfn other() -> some<F: fn<'static>(i32) -> i32> F { return () }\nfn nested() -> some<F: fn<'static>(i32) -> i32> Effect<'static; F> { return () }\nfn unused() -> some<F: fn<'static>(i32) -> i32> i32 { return 0 }\ninterface Maker { fn absent() -> some<F: fn<'static>(i32) -> i32> F }\nstruct Hidden {}\npub fn leak() -> some<F: fn<'static>(Hidden) -> i32> F { return () }\n",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let made = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"make")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let other = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"other")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let nested = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"nested")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let unused = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"unused")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let bodyless = run Semantic.demandOperation(&mut semantic, &mut request, &entry, b"Maker", b"absent")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let leak = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"leak")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &made,
+    signatureResult,
+  )
+  let otherType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &other,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value: firstResult} = move firstType {
+    if let Option<Shared<Type>>.Some {value: otherResult} = move otherType {
+      let exact = Shared.with<Type, bool>(
+        &firstResult,
+        fn(ty: &Type) -> bool {
+          return match & ty.* {
+            Type.OpaqueRepresentation {..} => true
+            _ => false
+          }
+        },
+      )
+      let sameFamily = run Type.equalsShared(&firstResult, &otherResult)
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(exact && !sameFamily, "each opaque producer owns a distinct representation")
+    } else {
+      run Testing.expect(false, "other producer has an opaque result contract")
+    }
+  } else {
+    run Testing.expect(false, "first producer has an opaque result contract")
+  }
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&nested, inspect).success && Shared.with<
+      Result<Answer, NoRejection>,
+      bool,
+    >(
+      &unused,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.InvalidOpaqueResult)
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &bodyless,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.InvalidOpaqueResult)
+      },
+    ),
+    "an opaque binder may appear inside the result, but cannot be unused or bodyless",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(
+      &leak,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.PrivateTypeExposure)
+      },
+    ),
+    "an opaque result cannot hide a private type in its public use contract",
+  )
+  return ()
+}
+
+// Hidden representation inputs and retained outer owners are part of the opaque family key.
+test effect fn opaqueProducerApplicationsRetainCompleteHeaderEvidence() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run opaqueApplicationClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn opaqueApplicationClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let id = run module("opaque-applications.silk")
+  let text = """
+fn positive(value: i32) -> i32 { return value + 1 }
+fn negative(value: i32) -> i32 { return value - 1 }
+type Positive = typeof(positive)
+type Negative = typeof(negative)
+fn keep(callback: fn<'static>(i32) -> i32) -> some<F: fn<'static>(i32) -> i32> F { return positive }
+fn phantom<'a>() -> some<F: fn<'static>(i32) -> i32> F { return positive }
+struct Box<T> { value: T }
+impl<T> Box<T> {
+  fn wrap(callback: fn<'static>(T) -> T) -> some<F: fn<'static>(T) -> T> F { return fn(value: T) -> T { return move value } }
+}
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+  let mut request = Request.make()
+  let keep = run Semantic.demandSignature(&mut store, &mut request, &id, b"keep")
+  let phantom = run Semantic.demandSignature(&mut store, &mut request, &id, b"phantom")
+  let scoped = run Semantic.demandInherentMember(&mut store, &mut request, &id, b"Box", b"wrap")
+  let positive = run Semantic.demandAlias(&mut store, &mut request, &id, b"Positive")
+  let negative = run Semantic.demandAlias(&mut store, &mut request, &id, b"Negative")
+  let family = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&keep, signatureResult)
+  let first = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&positive, nominalResult)
+  let second = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&negative, nominalResult)
+  if let Option<Shared<Type>>.Some {value: source} = move family {
+    if let Option<Shared<Type>>.Some {value: increment} = move first {
+      if let Option<Shared<Type>>.Some {value: decrement} = move second {
+        let firstFamily = run bindOpaqueArgument(&source, Argument.Type {value: move increment})
+        let secondFamily = run bindOpaqueArgument(&source, Argument.Type {value: move decrement})
+        let copy = run Shared.make<Type>(run Type.copy(&firstFamily))
+        let copied = run Type.equalsShared(&copy, &firstFamily)
+        let sameFamily = run Type.equalsShared(&firstFamily, &secondFamily)
+        let distinctRuntime = run opaqueRuntimeDiffers(&firstFamily, &secondFamily)
+        run Testing.expect(copied && !sameFamily && distinctRuntime,
+          "opaque hidden representations distinguish equal-contract targets in semantic and runtime identity")
+        run Testing.expect(run opaqueFormalOwnSlot(&source), "binding copies preserve the producer's symbolic hidden slot")
+      } else { run Testing.expect(false, "the second exact target is available") }
+    } else { run Testing.expect(false, "the first exact target is available") }
+  } else { run Testing.expect(false, "the producer publishes its opaque family") }
+  let lifetimeFamily = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&phantom, signatureResult)
+  if let Option<Shared<Type>>.Some {value: source} = move lifetimeFamily {
+    let app = match move Type.opaqueApplication(&source) {
+      Option<Shared<SpecializationApplication>>.Some {value} => run SpecializationApplication.copyShared(&value)
+      _ => { run Testing.expect(false, "the phantom lifetime retains an application") return () }
+    }
+    let local = run Shared.make<Lifetime>(Lifetime.Local {
+      declaration: run DeclarationId.copy(SpecializationApplication.bodyDeclaration(&app)), ordinal: 7})
+    let fixed = run bindOpaqueArgument(&source, Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Static)})
+    let borrowed = run bindOpaqueArgument(&source, Argument.Lifetime {value: move local})
+    let sameFamily = run Type.equalsShared(&fixed, &borrowed)
+    let distinctRuntime = run opaqueRuntimeDiffers(&fixed, &borrowed)
+    run Testing.expect(!sameFamily && !distinctRuntime,
+      "selected lifetimes distinguish semantic families while the runtime projection erases only validity")
+  } else { run Testing.expect(false, "the unused written lifetime retains its producer schema") }
+  let scopedFamily = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(&scoped, signatureResult)
+  if let Option<Shared<Type>>.Some {value: source} = move scopedFamily {
+    run Testing.expect(run opaqueScopedSlots(&source),
+      "the hidden own representation and retained impl T keep independent original owner slots")
+  } else { run Testing.expect(false, "the inherent producer publishes its scoped family") }
+}
+
+effect fn opaqueRuntimeDiffers(first: &Shared<Type>, second: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let app = match move Type.opaqueApplication(first) {
+    Option<Shared<SpecializationApplication>>.Some {value} => run SpecializationApplication.copyShared(&value)
+    _ => { return false }
+  }
+  let owner = SpecializationApplication.bodyDeclaration(&app)
+  let one = run Type.runtimeEncoding(first, owner)
+  let two = run Type.runtimeEncoding(second, owner)
+  return !sameBytes(Bytes.asSlice(&one), Bytes.asSlice(&two))
+}
+
+effect fn bindOpaqueArgument(source: &Shared<Type>, value: Argument) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  let app = match move Type.opaqueApplication(source) {
+    Option<Shared<SpecializationApplication>>.Some {value: selected} => run SpecializationApplication.copyShared(&selected)
+    _ => { return Shared.clone<Type>(source) }
+  }
+  let indices = Vector.asSlice<usize>(&app.argumentOrdinals)
+  if indices.length != usize.ONE { return Shared.clone<Type>(source) }
+  let mut bindings = Vector.make<Binding>()
+  run Vector.append<Binding>(&mut bindings, Binding {
+    declaration: run Shared.make<DeclarationId>(run DeclarationId.copy(SpecializationApplication.bodyDeclaration(&app))),
+    ordinal: indices[usize.ZERO], value: move value})
+  return run Type.applyBindings(source, Vector.asSlice<Binding>(&bindings), true)
+}
+
+effect fn opaqueFormalOwnSlot(source: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let app = match move Type.opaqueApplication(source) {
+    Option<Shared<SpecializationApplication>>.Some {value} => run SpecializationApplication.copyShared(&value)
+    _ => { return false }
+  }
+  let values = Vector.asSlice<Argument>(&app.arguments)
+  let ordinals = Vector.asSlice<usize>(&app.argumentOrdinals)
+  if values.length != usize.ONE || ordinals.length != usize.ONE || ordinals[usize.ZERO] != usize.ZERO { return false }
+  if let Argument.Type {value} = &values[usize.ZERO] {
+    return Shared.with<Type, usize>(&value, fn(ty: &Type) -> usize {
+      return Type.parameterOrdinalOf(ty, SpecializationApplication.bodyDeclaration(&app))
+    }) == usize.ZERO
+  }
+  return false
+}
+
+effect fn opaqueScopedSlots(source: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !run opaqueFormalOwnSlot(source) { return false }
+  let app = match move Type.opaqueApplication(source) {
+    Option<Shared<SpecializationApplication>>.Some {value} => run SpecializationApplication.copyShared(&value)
+    _ => { return false }
+  }
+  let scopes = Vector.asSlice<ScopeBinding>(&app.scopes)
+  if scopes.length != usize.ONE { return false }
+  let scopeOwner = run DeclarationId.copyShared(&scopes[usize.ZERO].owner)
+  let values = Vector.asSlice<Argument>(&scopes[usize.ZERO].arguments)
+  let ordinals = Vector.asSlice<usize>(&scopes[usize.ZERO].argumentOrdinals)
+  if values.length != usize.ONE || ordinals.length != usize.ONE || ordinals[usize.ZERO] != usize.ZERO
+    || DeclarationId.equals(&scopeOwner, SpecializationApplication.bodyDeclaration(&app)) { return false }
+  if let Argument.Type {value} = &values[usize.ZERO] {
+    return Shared.with<Type, usize>(&value, fn(ty: &Type) -> usize {
+      return Type.parameterOrdinalOf(ty, &scopeOwner)
+    }) == usize.ZERO
+  }
+  return false
+}
+
+effect fn importCycleClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let firstModule = run module("first.silk")
+  let secondModule = run module("second.silk")
+  let firstSource = run present("pub import second { Alias }\n")
+  let first = run Revision.publish(&Revision.make(), &firstModule, &firstSource)
+  let secondSource = run present("pub import first { Alias }\n")
+  let second = run Revision.publish(&first, &secondModule, &secondSource)
+  let entrySource = run present("import first { Alias }\nfn entry() -> Alias { return () }\n")
+  let entered = run Revision.publish(&second, &entry, &entrySource)
+  let otherModule = run module("other.silk")
+  let otherSource = run present("import second { Alias }\nfn other() -> Alias { return () }\n")
+  let revision = run Revision.publish(&entered, &otherModule, &otherSource)
+  let mut semantic = makeSemantic(run Revision.copy(&revision))
+  let mut request = Request.make()
+  let signature = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"entry")
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &signature,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isCycle),
+      "public import-name cycle has a typed code",
+    )
+    run Testing.expect(
+      Shared.with<Rejection, usize>(&value, cyclePathLength) == 3,
+      "public import-name cycle has a declaration path",
+    )
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, importCycleAnchor),
+      "public import-name cycle is anchored",
+    )
+  } else {
+    run Testing.expect(false, "public import-name cycle has a typed rejection")
+  }
+  run Testing.expect(
+    reads(Semantic.sourceEvents(&semantic), &firstModule) == 1 && reads(
+      Semantic.sourceEvents(&semantic),
+      &secondModule,
+    ) == 1,
+    "import-name cycle opens each target once",
+  )
+  let other = run Semantic.demandSignature(&mut semantic, &mut request, &otherModule, b"other")
+  let mut reversed = makeSemantic(move revision)
+  let mut reversedRequest = Request.make()
+  let reversedOther = run Semantic.demandSignature(
+    &mut reversed,
+    &mut reversedRequest,
+    &otherModule,
+    b"other",
+  )
+  let reversedEntry = run Semantic.demandSignature(
+    &mut reversed,
+    &mut reversedRequest,
+    &entry,
+    b"entry",
+  )
+  run Testing.expect(
+    rotatedPair(&signature, &other) && sameCycleAnswers(&signature, &reversedEntry) && sameCycleAnswers(
+      &other,
+      &reversedOther,
+    ),
+    "consumers entering an import-name cycle at either member agree in either demand order",
+  )
+  return ()
+}
+
+test effect fn rejectsPublicImportNameCycle() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run importCycleClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn revisionReuseClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let library = run module("library.silk")
+  let unrelated = run module("unrelated.silk")
+  let a = run present("import library { Alias }\nfn entry() -> Alias { return () }\n")
+  let b = run present("pub type Alias = i32\n")
+  let first = run Revision.publish(&Revision.make(), &entry, &a)
+  let held = run Revision.publish(&first, &library, &b)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut coldRequest = Request.make()
+  let cold = run Semantic.demandSignature(&mut semantic, &mut coldRequest, &entry, b"entry")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&cold, inspect).success && Request.hasDiscovered(
+      &coldRequest,
+      &library,
+    ),
+    "cold signature discovers its imported alias source",
+  )
+  let startsBefore = starts(Semantic.eventLog(&semantic), Family.Signature)
+  let c = run present("fn changed() -> i32 { return 3 }\n")
+  let irrelevant = run Revision.publish(&held, &unrelated, &c)
+  Semantic.revise(&mut semantic, move irrelevant)
+  let mut fresh = Request.make()
+  let warm = run Semantic.demandSignature(&mut semantic, &mut fresh, &entry, b"entry")
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&warm, inspect).success && Request.hasDiscovered(
+      &fresh,
+      &library,
+    ) && !Request.hasDiscovered(&fresh, &unrelated) && starts(
+      Semantic.eventLog(&semantic),
+      Family.Signature,
+    ) == startsBefore && hits(Semantic.eventLog(&semantic), Family.Signature) == 1,
+    "unrelated revision keeps the completed signature and replays only its discoveries",
+  )
+  let changed = run present("pub type Alias = bool\n")
+  let relevant = run Revision.publish(&held, &library, &changed)
+  Semantic.revise(&mut semantic, move relevant)
+  let mut revised = Request.make()
+  let updated = run Semantic.demandSignature(&mut semantic, &mut revised, &entry, b"entry")
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &updated,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value} = move result {
+    run Testing.expect(
+      Shared.with<Type, bool>(&value, isBool) && starts(
+        Semantic.eventLog(&semantic),
+        Family.Signature,
+      ) == startsBefore + 1,
+      "changed imported alias header recomputes the transitive signature",
+    )
+  } else {
+    run Testing.expect(false, "recomputed signature has a written result")
+  }
+  return ()
+}
+
+test effect fn reusesUnrelatedRevisionAndInvalidatesImportedHeader() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run revisionReuseClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn negativeRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("entry.silk")
+  let library = run module("library.silk")
+  let a = run present("import library { Alias }\nfn entry() -> Alias { return () }\n")
+  let held = run Revision.publish(&Revision.make(), &entry, &a)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut firstRequest = Request.make()
+  let missing = run Semantic.demandSignature(&mut semantic, &mut firstRequest, &entry, b"entry")
+  let diagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &missing,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move diagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isMissingModule) && !Request.hasDiscovered(
+        &firstRequest,
+        &library,
+      ),
+      "absent imported path records a typed rejection without a present discovery",
+    )
+  } else {
+    run Testing.expect(false, "absent imported path rejects")
+  }
+  let b = run present("pub type Other = i32\n")
+  let appeared = run Revision.publish(&held, &library, &b)
+  Semantic.revise(&mut semantic, move appeared)
+  let mut secondRequest = Request.make()
+  let missingName = run Semantic.demandSignature(
+    &mut semantic,
+    &mut secondRequest,
+    &entry,
+    b"entry",
+  )
+  let nameDiagnostic = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &missingName,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move nameDiagnostic {
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isUnknownMember) && Request.hasDiscovered(
+        &secondRequest,
+        &library,
+      ),
+      "formerly absent path is discovered and its absent-name bucket rejects",
+    )
+  } else {
+    run Testing.expect(false, "present imported module with absent name rejects")
+  }
+  let named = run present("pub type Other = i32\npub type Alias = bool\n")
+  let namedRevision = run Revision.publish(&held, &library, &named)
+  Semantic.revise(&mut semantic, move namedRevision)
+  let mut namedRequest = Request.make()
+  let resolved = run Semantic.demandSignature(&mut semantic, &mut namedRequest, &entry, b"entry")
+  let result = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &resolved,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value} = move result {
+    run Testing.expect(
+      Shared.with<Type, bool>(&value, isBool) && Request.hasDiscovered(&namedRequest, &library),
+      "new imported name invalidates the transitive negative bucket",
+    )
+  } else {
+    run Testing.expect(false, "new imported name resolves")
+  }
+  let shifted = run present(
+    "// prefix\nimport library { Alias }\nfn entry() -> Alias { return () }\n",
+  )
+  let absentAgain = run Revision.publish(&held, &entry, &shifted)
+  Semantic.revise(&mut semantic, move absentAgain)
+  let mut shiftedRequest = Request.make()
+  let newFailure = run Semantic.demandSignature(
+    &mut semantic,
+    &mut shiftedRequest,
+    &entry,
+    b"entry",
+  )
+  let anchored = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(
+    &newFailure,
+    rejection,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move anchored {
+    let offset = Shared.with<Rejection, usize>(&value, spanStart)
+    run Testing.expect(
+      Shared.with<Rejection, bool>(&value, isMissingModule) && offset == 17 && String.utf8Bytes(
+        "// prefix\nimport library { Alias }\nfn entry() -> Alias { return () }\n",
+      )[offset] == 108,
+      "recomputed rejection span points into exact changed entry bytes",
+    )
+  } else {
+    run Testing.expect(false, "changed entry bytes produce a new anchored rejection")
+  }
+  return ()
+}
+
+test effect fn invalidatesNegativePathAndNameAndReanchorsDiagnostic() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run negativeRevisionClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn nestedFailureRetryClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let entry = run module("entry.silk")
+    |> Effect.provideMut<Allocator>(&mut system)
+  let library = run module("library.silk")
+    |> Effect.provideMut<Allocator>(&mut system)
+  let entrySource = run present("import library { Alias }\nfn entry() -> Alias { return () }\n")
+    |> Effect.provideMut<Allocator>(&mut system)
+  let libraryText = "pub type Alias = bool\n// This unique source allocation is rejected inside the nested import.\n"
+  let librarySource = run present(libraryText)
+    |> Effect.provideMut<Allocator>(&mut system)
+  let first = run Revision.publish(&Revision.make(), &entry, &entrySource)
+    |> Effect.provideMut<Allocator>(&mut system)
+  let revision = run Revision.publish(&first, &library, &librarySource)
+    |> Effect.provideMut<Allocator>(&mut system)
+  let mut semantic = makeSemantic(move revision)
+  let mut failedRequest = Request.make()
+  let mut fault = NestedFailureAllocator {
+    targetBytes: String.utf8Bytes(libraryText).length,
+    rejected: false,
+  }
+  let attempted = run Effect.result(
+    Semantic.demandSignature(&mut semantic, &mut failedRequest, &entry, b"entry"),
+  )
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let failed = match move attempted {
+    Result<
+      Shared<Result<Answer, NoRejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError,
+    >.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      _ => false
+    }
+    Result<
+      Shared<Result<Answer, NoRejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError,
+    >.Success {value: ignored} => false
+  }
+  run Testing.expect(
+    failed && fault.rejected && Request.rootCount(&failedRequest) == 0 && starts(
+      Semantic.eventLog(&semantic),
+      Family.Signature,
+    ) == 1 && starts(Semantic.eventLog(&semantic), Family.Import) > 0,
+    "nested imported-signature provider failure publishes no root",
+  )
+  let mut retriedRequest = Request.make()
+  let retried = run Semantic.demandSignature(&mut semantic, &mut retriedRequest, &entry, b"entry")
+    |> Effect.provideMut<Allocator>(&mut system)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, AnswerView>(&retried, inspect).success && Request.rootCount(
+      &retriedRequest,
+    ) == 1 && Request.hasDiscovered(&retriedRequest, &library) && starts(
+      Semantic.eventLog(&semantic),
+      Family.Signature,
+    ) == 2,
+    "retry recomputes the same signature and publishes complete imported evidence",
+  )
+  return ()
+}
+
+test effect fn retriesNestedImportedSignatureAfterTypedFailure() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run nestedFailureRetryClaims()
+}
+
+test effect fn canonicalTypeIdentityKeepsNominalOwners() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let left = run module("left.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let right = run module("right.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let leftSource = run present(
+    "struct Item {}\ntype Alias = Item\nfn original() -> Item { return () }\nfn aliased() -> Alias { return () }\nfn count() -> i32 { return 1 }\nfn flag() -> bool { return true }\n",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rightSource = run present("struct Item {}\nfn original() -> Item { return () }\n")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &left, &leftSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let held = run Revision.publish(&first, &right, &rightSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move held)
+  let mut request = Request.make()
+  let original = run Semantic.demandSignature(&mut semantic, &mut request, &left, b"original")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let aliased = run Semantic.demandSignature(&mut semantic, &mut request, &left, b"aliased")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let other = run Semantic.demandSignature(&mut semantic, &mut request, &right, b"original")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let count = run Semantic.demandSignature(&mut semantic, &mut request, &left, b"count")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let flag = run Semantic.demandSignature(&mut semantic, &mut request, &left, b"flag")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    signatureOwnedBy(&original, &left) && signatureOwnedBy(&aliased, &left) && !signatureOwnedBy(
+      &other,
+      &left,
+    ) && signatureOwnedBy(&other, &right) && signatureIsI32(&count) && signatureIsBool(&flag),
+    "source signatures keep nominal module owners and distinct scalar kinds",
+  )
+  return ()
+}
+
+fn requirementsOf(answer: &Result<Answer, NoRejection>) -> Option<Shared<Row>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => Option.some<Shared<Row>>(
+        Shared.clone<Row>(&signature.requirements),
+      )
+      _ => Option.none<Shared<Row>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Row>>()
+  }
+}
+
+effect fn sameChannels(
+  first: &Shared<Result<Answer, NoRejection>>,
+  second: &Shared<Result<Answer, NoRejection>>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run channelsEqual(
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(first, failureOf),
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Row>>>(first, requirementsOf),
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(second, failureOf),
+    Shared.with<Result<Answer, NoRejection>, Option<Shared<Row>>>(second, requirementsOf),
+  )
+}
+
+// A written `Effect<...>` parameter has the channels of the declared effect function.
+effect fn pendingMatches(
+  pending: &Shared<Result<Answer, NoRejection>>,
+  declared: &Shared<Result<Answer, NoRejection>>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let parameter = contractSlotOf(pending, usize.ZERO)
+  if let Option<Shared<Type>>.Some {value} = move parameter {
+    return run channelsEqual(
+      Shared.with<Type, Option<Shared<Type>>>(&value, effectFailure),
+      Shared.with<Type, Option<Shared<Row>>>(&value, effectRequirements),
+      Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(declared, failureOf),
+      Shared.with<Result<Answer, NoRejection>, Option<Shared<Row>>>(declared, requirementsOf),
+    )
+  }
+  return false
+}
+
+fn firstModeIs(answer: &Result<Answer, NoRejection>, expected: usize) -> bool {
+  return onSignature(
+    answer,
+    fn(signature: &Signature) -> bool {
+      return firstParameterMode(signature) == expected
+    },
+  )
+}
+
+fn firstParameterOf(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => {
+        let parameters = Vector.asSlice<Shared<Type>>(&signature.parameters)
+        return Option.some<Shared<Type>>(Shared.clone<Type>(&parameters[usize.ZERO]))
+      }
+      _ => Option.none<Shared<Type>>()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option.none<Shared<Type>>()
+  }
+}
+
+// An Effect parameter is an exact representation slot; its bound keeps the written contract.
+fn firstContractOf(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome { return parameterContractAt(&signature, usize.ZERO) }
+  }
+  return Option.none<Shared<Type>>()
+}
+
+fn unionSize(value: &Type) -> usize {
+  return match & value.* {
+    Type.Union {members} => Vector.length<Shared<Type>>(&members)
+    _ => usize.ZERO
+  }
+}
+
+fn effectRowSize(value: &Type) -> usize {
+  return match & value.* {
+    Type.Effect {requirements, ..} => rowSize(&requirements)
+    _ => usize.ZERO
+  }
+}
+
+// `Pair<Box<i32>>` places one `Box<i32>` handle both as a union member and inside `Box<Box<i32>>`;
+// `Stored` does the same inside two generic service keys.
+effect fn substitutedShapes(
+  control: &Shared<Result<Answer, NoRejection>>,
+  nested: &Shared<Result<Answer, NoRejection>>,
+  again: &Shared<Result<Answer, NoRejection>>,
+  stored: &Shared<Result<Answer, NoRejection>>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let first = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    control,
+    firstParameterOf,
+  )
+  let second = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    nested,
+    firstParameterOf,
+  )
+  let third = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    again,
+    firstParameterOf,
+  )
+  let fourth = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    stored,
+    firstContractOf,
+  )
+  if let Option<Shared<Type>>.Some {value: plain} = move first {
+    if let Option<Shared<Type>>.Some {value: boxed} = move second {
+      if let Option<Shared<Type>>.Some {value: repeated} = move third {
+        if let Option<Shared<Type>>.Some {value: effectType} = move fourth {
+          let distinct = !run Type.equalsShared(&plain, &boxed)
+          let same = run Type.equalsShared(&boxed, &repeated)
+          return Shared.with<Type, usize>(&plain, unionSize) == 2 && Shared.with<Type, usize>(
+            &boxed,
+            unionSize,
+          ) == 2 && distinct && same && Shared.with<Type, usize>(&effectType, effectRowSize) == 2
+        }
+      }
+    }
+  }
+  return false
+}
+
+// Elided and spelled invocation binders give the same callable contract across declarations.
+effect fn sameFirstParameters(
+  left: &Shared<Result<Answer, NoRejection>>,
+  right: &Shared<Result<Answer, NoRejection>>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run typesEqual(contractSlotOf(left, usize.ZERO), contractSlotOf(right, usize.ZERO)
+)
+}
+
+// `'a & 'b` equals `'b & 'static & 'a`; `'a & 'a` equals `'a` and differs from the pair.
+effect fn environmentsNormalize(answer: &Shared<Result<Answer, NoRejection>>) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  if Shared.with<Result<Answer, NoRejection>, usize>(answer, parameterCountOf) != 4 {
+    return false
+  }
+  let pair = run slotsEqual(answer, usize.ZERO, usize.ONE)
+  let single = run slotsEqual(answer, 2, 3)
+  let different = !run slotsEqual(answer, usize.ZERO, 3)
+  return pair && single && different
+}
+
+fn writtenEnvironment(signature: &Signature) -> bool {
+  let declared = Vector.asSlice<Constraint>(&signature.constraints)
+  let contents = declared.length == usize.ONE && match & declared[usize.ZERO] {
+    Constraint.Contents {..} => true
+    _ => false
+  }
+  return contents && match & signature.environment {
+    Option<Intersection>.Some {value} => Vector.length(&value.members) == usize.ONE
+    Option<Intersection>.None => false
+  }
+}
+
+fn retainsEnvironment(answer: &Result<Answer, NoRejection>) -> bool {
+  return onSignature(answer, writtenEnvironment)
+}
+
+fn representationBound(signature: &Signature) -> bool {
+  let declared = Vector.asSlice<Constraint>(&signature.constraints)
+  return declared.length == usize.ONE && match & declared[usize.ZERO] {
+    Constraint.Represents {contract, ..} => Shared.with<Type, usize>(&contract, modeOf) == usize.ONE
+    _ => false
+  }
+}
+
+fn representsCallable(answer: &Result<Answer, NoRejection>) -> bool {
+  return onSignature(answer, representationBound)
+}
+
+fn onContract(answer: &Result<Answer, NoRejection>, check: fn(&Contract) -> bool) -> bool {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Contract {contract}} => check(&contract)
+      _ => false
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => false
+  }
+}
+
+fn conformsOnly(contract: &Contract) -> bool {
+  let declared = Vector.asSlice<Constraint>(&contract.constraints)
+  return Vector.length(&contract.typeParameters) == usize.ONE && declared.length == usize.ONE && match & declared[usize.ZERO] {
+    Constraint.Conforms {..} => true
+    _ => false
+  }
+}
+
+fn sortedContract(answer: &Result<Answer, NoRejection>) -> bool {
+  return onContract(answer, conformsOnly)
+}
+
+fn generatedBoundLifetime(contract: &Contract) -> bool {
+  let constraints = Vector.asSlice<Constraint>(&contract.constraints)
+  return Vector.length<Shared<Type>>(&contract.typeParameters) == usize.ONE && Vector.length<Shared<Lifetime>>(
+    &contract.lifetimeParameters,
+  ) == usize.ONE && constraints.length == usize.ONE && match & constraints[usize.ZERO] {
+    Constraint.Conforms {..} => true
+    _ => false
+  }
+}
+
+fn datedBoxContract(answer: &Result<Answer, NoRejection>) -> bool {
+  return onContract(answer, generatedBoundLifetime)
+}
+
+fn rowBinderOnly(contract: &Contract) -> bool {
+  return Vector.length(&contract.rowParameters) == usize.ONE && Vector.length(
+    &contract.typeParameters,
+  ) == usize.ONE && Vector.length(&contract.constraints) == usize.ZERO
+}
+
+fn loadContract(answer: &Result<Answer, NoRejection>) -> bool {
+  return onContract(answer, rowBinderOnly)
+}
+
+fn representationOnly(contract: &Contract) -> bool {
+  let declared = Vector.asSlice<Constraint>(&contract.constraints)
+  return declared.length == usize.ONE && match & declared[usize.ZERO] {
+    Constraint.Represents {..} => true
+    _ => false
+  }
+}
+
+fn parserContract(answer: &Result<Answer, NoRejection>) -> bool {
+  return onContract(answer, representationOnly)
+}
+
+// `Loaded<? &Clock>` splices the supplied row beside the alias's own `&Logger` entry.
+fn splicedRow(answer: &Result<Answer, NoRejection>) -> bool {
+  let parameter = firstContractOf(answer)
+  if let Option<Shared<Type>>.Some {value} = move parameter {
+    return Shared.with<Type, usize>(&value, effectRowSize) == 2
+  }
+  return false
+}
+
+effect fn sameResults(
+  left: &Shared<Result<Answer, NoRejection>>,
+  right: &Shared<Result<Answer, NoRejection>>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run answersEqual(left, right, usize.MAX)
+}
+
+fn environmentSizeOf(signature: &Signature) -> usize {
+  return match & signature.environment {
+    Option<Intersection>.Some {value} => Vector.length(&value.members)
+    Option<Intersection>.None => usize.MAX
+  }
+}
+
+fn environmentMembers(answer: &Result<Answer, NoRejection>) -> usize {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Signature {signature}} => environmentSizeOf(&signature)
+      _ => usize.MAX - usize.ONE
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => usize.MAX - usize.ONE
+  }
+}
+
+fn contentsOnly(contract: &Contract) -> bool {
+  let declared = Vector.asSlice<Constraint>(&contract.constraints)
+  return declared.length == usize.ONE && match & declared[usize.ZERO] {
+    Constraint.Contents {..} => true
+    _ => false
+  }
+}
+
+fn lifetimeBoundOnly(answer: &Result<Answer, NoRejection>) -> bool {
+  return onContract(answer, contentsOnly)
+}
+
+fn constraintCount(contract: &Contract) -> usize {
+  return Vector.length(&contract.constraints)
+}
+
+fn contractConstraints(answer: &Result<Answer, NoRejection>) -> usize {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.Contract {contract}} => constraintCount(&contract)
+      _ => usize.MAX
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => usize.MAX
+  }
+}
+
+fn declaredEffect(answer: &Result<Answer, NoRejection>) -> bool {
+  return hasTypeLookup(answer, Family.Identity) && onSignature(
+    answer,
+    fn(signature: &Signature) -> bool {
+      return signature.isEffect && rowSize(&signature.requirements) == usize.ONE && Shared.with<
+        Type,
+        bool,
+      >(&signature.failure, isNominal)
+    },
+  )
+}
+
+fn unsafeOrdinary(answer: &Result<Answer, NoRejection>) -> bool {
+  return onSignature(
+    answer,
+    fn(signature: &Signature) -> bool {
+      return signature.isUnsafe && !signature.isEffect
+    },
+  )
+}
+
+fn constraintOrder(signature: &Signature) -> bool {
+  let declared = Vector.asSlice<Constraint>(&signature.constraints)
+  if declared.length != 4 {
+    return false
+  }
+  let outlives = match & declared[usize.ZERO] {
+    Constraint.Outlives {..} => true
+    _ => false
+  }
+  let hash = match & declared[usize.ONE] {
+    Constraint.Conforms {contract, ..} => Shared.with<Type, bool>(&contract, isNominal)
+    _ => false
+  }
+  let logger = match & declared[2] {
+    Constraint.Conforms {..} => true
+    _ => false
+  }
+  let contents = match & declared[3] {
+    Constraint.Contents {..} => true
+    _ => false
+  }
+  return outlives && hash && logger && contents
+}
+
+// Give each independent contract claim only the declarations it needs to resolve.
+fn contractFixture(part: usize) -> string<'static> {
+  if part == 0 {
+    return "import services { Clock }\nservice Logger {}\ninterface Hash {}\nstruct Problem {}\nstruct Other {}\nrole Primary\nfn apply(transform: fn(i32) -> i32, value: i32) -> i32 { return value }\nfn consume(transform: once fn(i32) -> i32) -> i32 { return 0 }\neffect fn load(id: i32) -> i32 ! Problem ? &Clock { return id }\neffect fn both() -> i32 ! Problem | Other ? &Logger | &Clock at Primary | &mut Clock at Primary | &Clock { return 0 }\neffect fn swapped() -> i32 ! Other | Problem | Other ? &mut Clock at Primary | &Clock | &Logger { return 0 }\neffect fn closed() -> i32 { return 0 }\neffect fn spelled() -> i32 ! never ? never { return 0 }\nfn pending(value: Effect<i32 ! Problem ? &Clock>) -> i32 { return 0 }\nfn preserve<'env, A, ?R>(pending: once Effect<'env; A ? R>) -> Effect<'env; A ? R> { return move pending }\nfn bounded<'long: 'short, 'short, T: Hash + Logger + 'short>(value: &'long T) -> &'short i32 { return () }\nunsafe fn risky() -> i32 { return 1 }\nstruct Box<T> { value: T }\ntype Pair<T> = T | Box<T>\nfn control(value: Pair<i32>) -> i32 { return 0 }\nfn nested(value: Pair<Box<i32>>) -> i32 { return 0 }\nfn again(value: Pair<Box<i32>>) -> i32 { return 0 }\nservice Store<T> {}\ntype Stored<'env, T> = Effect<'env; i32 ? &Store<T> | &Store<Box<T>>>\nfn stored<'a>(value: Stored<'a, Box<i32>>) -> i32 { return 0 }\ntest effect fn checked() -> () ! Problem { return () }\ntest fn parameterized(value: i32) {}\n"
+  }
+  if part == 1 {
+    return "import services { Clock }\nservice Logger {}\ninterface Hash {}\nstruct Plain {}\nstruct Problem {}\nstruct Other {}\nrole Primary\ntype Borrowed = &'static i32\neffect fn notService() -> i32 ? &Plain { return 0 }\neffect fn interfaceRow() -> i32 ? &Hash { return 0 }\neffect fn badRole() -> i32 ? &Clock at Plain { return 0 }\nfn notBound<T: Plain>() -> i32 { return 0 }\nfn repeated<T: Hash + Hash>() -> i32 { return 0 }\nfn ordinaryFailure() -> i32 ! Problem { return 0 }\nfn rowAsType<?R>(value: R) -> i32 { return 0 }\nfn borrowedUnion() -> Borrowed | i32 { return 0 }\nfn ambiguousCallable(transform: fn<'static>(&i32, &i32) -> &i32) -> i32 { return 0 }\nfn nestedQuantifier(transform: for<'a> fn<'static>(for<'b> fn<'static>(&'b i32) -> i32) -> i32) -> i32 { return 0 }\nfn twoUses(transform: for<use 'a, use 'b> fn<'static>(&'a i32, &'b i32) -> i32) -> i32 { return 0 }\nfn boundedUse(transform: for<use 'a: 'static> fn<'static>(&'a i32) -> i32) -> i32 { return 0 }\nfn ordinaryRow() -> i32 ? &Clock { return 0 }\npub fn exposedCallable(transform: fn(Plain) -> i32) -> i32 { return 0 }\npub effect fn exposedRow() -> i32 ? &Logger { return 0 }\n"
+  }
+  if part == 2 {
+    return "fn closedEffect() -> Effect<i32> { return () }\nfn explicitStatic() -> Effect<'static; i32> { return () }\nfn inputEffect(value: i32) -> Effect<i32> { return () }\neffect fn closedDeferred() -> i32 { return 0 }\neffect fn inputDeferred(value: i32) -> i32 { return value }\neffect fn sameRegion<'a>(left: &'a i32, right: &'a i32, count: i32) -> i32 { return count }\neffect fn heldDeferred<'a>(value: Held<'a, i32>) -> i32 { return 0 }\nfn genericEffect<T>(value: T) -> Effect<i32> { return () }\nfn twoBorrowEffect(left: &i32, right: &i32) -> Effect<i32> { return () }\nfn heldEffect(value: Held<'static, i32>, count: i32) -> Effect<i32> { return () }\nstruct Held<'a, T: 'a> { value: &'a T }\n"
+  }
+  if part == 3 {
+    return "interface Hash {}\neffect fn sameRegion<'a>(left: &'a i32, right: &'a i32, count: i32) -> i32 { return count }\neffect fn heldDeferred<'a>(value: Held<'a, i32>) -> i32 { return 0 }\neffect fn runPending<A, E>(pending: once Effect<'static; A ! E>) -> i32 { return 0 }\neffect fn callbackDeferred<A>(callback: fn<'static>(A) -> A) -> i32 { return 0 }\neffect fn keepPending<A>(pending: once Effect<A>) -> i32 { return 0 }\nfn heldOpenEffect<'a>(value: Held<'a, i32>) -> Effect<i32> { return () }\nfn nestedStatic() -> Effect<'static; Effect<i32>> { return () }\neffect fn representedBorrowed<'a, F: fn<'a>(i32) -> i32>(callback: F) -> i32 { return 0 }\neffect fn representedStatic<A, F: once Effect<'static; A>>(pending: F) -> i32 { return 0 }\neffect fn conformedStored<T: Hash>(value: T) -> i32 { return 0 }\neffect fn effectSuccess() -> Effect<i32> { return () }\neffect fn effectSuccessStatic() -> Effect<'static; i32> { return () }\neffect fn borrowedDeferred(value: &i32, count: i32) -> i32 { return count }\neffect fn twoBorrowed(left: &i32, right: &i32) -> i32 { return 0 }\neffect fn genericDeferred<Kept>(value: &i32, stored: Kept) -> i32 { return 0 }\nstruct Held<'a, T: 'a> { value: &'a T }\n"
+  }
+  if part == 4 {
+    return "fn orderedA(transform: for<'a, 'b> fn<'static>(Effect<'a & 'b; i32>, &'a i32) -> i32) -> i32 { return 0 }\nfn orderedB(transform: for<'a, 'b> fn<'static>(Effect<'b & 'a; i32>, &'a i32) -> i32) -> i32 { return 0 }\nstruct HolderA<'x> { v: &'x i32 }\nstruct HolderB<'x> { v: &'x i32 }\nfn unionAB(transform: for<'a, 'b> fn<'static>(HolderA<'a> | HolderB<'b>) -> i32) -> i32 { return 0 }\nfn unionBA(transform: for<'a, 'b> fn<'static>(HolderB<'b> | HolderA<'a>) -> i32) -> i32 { return 0 }\nfn unionShared(transform: for<'a> fn<'static>(HolderA<'a> | HolderB<'a>) -> i32) -> i32 { return 0 }\nservice SA<'x> {}\nservice SB<'x> {}\nfn rowAB(transform: for<'a, 'b> fn<'static>(Effect<'static; i32 ? &SA<'a> | &SB<'b>>) -> i32) -> i32 { return 0 }\nfn rowBA(transform: for<'a, 'b> fn<'static>(Effect<'static; i32 ? &SB<'b> | &SA<'a>>) -> i32) -> i32 { return 0 }\nfn overlapAB(transform: for<'a, 'b, 'c> fn<'static>(Effect<'a & 'b; i32>, Effect<'a & 'c; i32>) -> i32) -> i32 { return 0 }\nfn overlapBA(transform: for<'a, 'b, 'c> fn<'static>(Effect<'b & 'a; i32>, Effect<'a & 'c; i32>) -> i32) -> i32 { return 0 }\nfn overlapApart(transform: for<'a, 'b, 'c> fn<'static>(Effect<'a & 'b; i32>, Effect<'c; i32>) -> i32) -> i32 { return 0 }\nfn orderedSingle(transform: for<'a> fn<'static>(Effect<'a; i32>, &'a i32) -> i32) -> i32 { return 0 }\n"
+  }
+  if part == 5 {
+    return "fn nestedRef(transform: for<'a> fn<'static>(fn<'static>(&'a i32) -> i32) -> i32) -> i32 { return 0 }\nfn nestedRefAgain(transform: for<'z> fn<'static>(fn<'static>(&'z i32) -> i32) -> i32) -> i32 { return 0 }\nfn nestedFirst(transform: for<'a, 'b> fn<'static>(fn<'static>(&'a i32) -> i32, &'a i32, &'b i32) -> i32) -> i32 { return 0 }\nfn nestedFirstRenamed(transform: for<'x, 'y> fn<'static>(fn<'static>(&'x i32) -> i32, &'x i32, &'y i32) -> i32) -> i32 { return 0 }\nfn nestedSecond(transform: for<'a, 'b> fn<'static>(fn<'static>(&'b i32) -> i32, &'a i32, &'b i32) -> i32) -> i32 { return 0 }\nfn nestedUnion(transform: for<'a, 'b> fn<'static>(Box<fn<'static>(&'b i32) -> i32> | Box<fn<'static>(&'a i32) -> i32>, &'a i32) -> i32) -> i32 { return 0 }\nfn nestedUnionSwapped(transform: for<'a, 'b> fn<'static>(Box<fn<'static>(&'a i32) -> i32> | Box<fn<'static>(&'b i32) -> i32>, &'a i32) -> i32) -> i32 { return 0 }\nfn nestedUnionOne(transform: for<'a> fn<'static>(Box<fn<'static>(&'a i32) -> i32> | Box<fn<'static>(&'a i32, &'a i32) -> i32>, &'a i32) -> i32) -> i32 { return 0 }\nfn mixedBinders(transform: for<'a> fn<'static>(&i32, &'a i32) -> i32) -> i32 { return 0 }\nfn elidedBinders(transform: fn<'static>(&i32, &i32) -> i32) -> i32 { return 0 }\nfn permutedBinders(transform: for<'b, 'a> fn<'static>(&'a i32, &'b i32) -> i32) -> i32 { return 0 }\nfn unusedBinder(transform: for<'a> fn<'static>(i32) -> i32) -> i32 { return 0 }\nfn plainCallable(transform: fn<'static>(i32) -> i32) -> i32 { return 0 }\nfn boundedBinders(transform: for<'a: 'b, 'b> fn<'static>(&'a i32, &'b i32) -> i32) -> i32 { return 0 }\nfn swappedBound(transform: for<'y, 'x: 'y> fn<'static>(&'x i32, &'y i32) -> i32) -> i32 { return 0 }\nfn markedUse(transform: for<'a, use 'call> fn<'static>(&'a i32, &'call i32) -> i32) -> i32 { return 0 }\nfn markedRenamed(transform: for<'b, use 'z> fn<'static>(&'b i32, &'z i32) -> i32) -> i32 { return 0 }\nfn markedOther(transform: for<use 'a, 'call> fn<'static>(&'a i32, &'call i32) -> i32) -> i32 { return 0 }\nfn unusedUse(transform: for<use 'call> fn<'static>(i32) -> i32) -> i32 { return 0 }\nstruct Box<T> { value: T }\n"
+  }
+  if part == 6 {
+    return "import services { Clock }\nservice Logger {}\ninterface Hash {}\nstruct Problem {}\nfn quantified(transform: fn<'static>(&i32) -> &i32) -> i32 { return 0 }\nfn spelledQuantifier(transform: for<'call> fn<'static>(&'call i32) -> &'call i32) -> i32 { return 0 }\nfn environments<'a, 'b>(first: Effect<'a & 'b; i32>, second: Effect<'b & 'static & 'a; i32>, third: Effect<'a & 'a; i32>, fourth: Effect<'a; i32>) -> i32 { return 0 }\neffect<'env> fn retain<T: 'env, 'env>(value: T) -> i32 { return 0 }\nfn parse<F: fn(i32) -> i32>(parser: F) -> i32 { return 0 }\nstruct Sorted<T: Hash> { value: T }\ninterface Dated<'a> {}\nstruct DatedBox<T: Dated> { value: T }\nfn useSorted(value: Sorted<i32>) -> i32 { return 0 }\ninterface Load<E, ?R> {}\nfn loadable<T: Load<Problem ? &Clock>>(source: &T) -> i32 { return 0 }\nfn wrongRow<T: Load<Problem>>(source: &T) -> i32 { return 0 }\nstruct Parser<F: fn<'static>(i32) -> i32> { parse: F }\ntype Loaded<?R> = Effect<'static; i32 ? &Logger | R>\nfn loaded(value: Loaded<? &Clock>) -> i32 { return 0 }\n"
+  }
+  if part == 7 {
+    return "import services { Clock }\ninterface Hash {}\nstruct Problem {}\neffect fn load(id: i32) -> i32 ! Problem ? &Clock { return id }\nstruct Held<'a, T: 'a> { value: &'a T }\nfn held(value: Held<'static, i32>) -> i32 { return 0 }\n"
+  }
+  if part == 8 {
+    return "fn manyA(transform: for<'b0, 'b1, 'b2, 'b3, 'b4, 'b5, 'b6, 'b7, 'b8, 'b9, 'b10, 'b11, 'b12, 'b13, 'b14, 'b15, 'b16, 'b17, 'b18, 'b19, 'b20> fn<'static>(&'b0 i32, &'b1 i32, &'b2 i32, &'b3 i32, &'b4 i32, &'b5 i32, &'b6 i32, &'b7 i32, &'b8 i32, &'b9 i32, &'b10 i32, &'b11 i32, &'b12 i32, &'b13 i32, &'b14 i32, &'b15 i32, &'b16 i32, &'b17 i32, &'b18 i32, &'b19 i32, &'b20 i32) -> &'b0 i32) -> i32 { return 0 }\nfn manyB(transform: for<'b20, 'b19, 'b18, 'b17, 'b16, 'b15, 'b14, 'b13, 'b12, 'b11, 'b10, 'b9, 'b8, 'b7, 'b6, 'b5, 'b4, 'b3, 'b2, 'b1, 'b0> fn<'static>(&'b0 i32, &'b1 i32, &'b2 i32, &'b3 i32, &'b4 i32, &'b5 i32, &'b6 i32, &'b7 i32, &'b8 i32, &'b9 i32, &'b10 i32, &'b11 i32, &'b12 i32, &'b13 i32, &'b14 i32, &'b15 i32, &'b16 i32, &'b17 i32, &'b18 i32, &'b19 i32, &'b20 i32) -> &'b0 i32) -> i32 { return 0 }\nfn manyC(transform: for<'b0, 'b1, 'b2, 'b3, 'b4, 'b5, 'b6, 'b7, 'b8, 'b9, 'b10, 'b11, 'b12, 'b13, 'b14, 'b15, 'b16, 'b17, 'b18, 'b19, 'b20> fn<'static>(&'b0 i32, &'b1 i32, &'b2 i32, &'b3 i32, &'b4 i32, &'b5 i32, &'b6 i32, &'b7 i32, &'b8 i32, &'b9 i32, &'b10 i32, &'b11 i32, &'b12 i32, &'b13 i32, &'b14 i32, &'b15 i32, &'b16 i32, &'b17 i32, &'b18 i32, &'b19 i32, &'b20 i32) -> &'b1 i32) -> i32 { return 0 }\nfn manyD(transform: for<'b0, 'b1, 'b2, 'b3, 'b4, 'b5, 'b6, 'b7, 'b8, 'b9, 'b10, 'b11, 'b12, 'b13, 'b14, 'b15, 'b16, 'b17, 'b18, 'b19, 'b20> fn<'static>(&'b0 i32, &'b1 i32, &'b2 i32, &'b3 i32, &'b4 i32, &'b5 mut i32, &'b6 i32, &'b7 i32, &'b8 i32, &'b9 i32, &'b10 i32, &'b11 i32, &'b12 i32, &'b13 i32, &'b14 i32, &'b15 i32, &'b16 i32, &'b17 i32, &'b18 i32, &'b19 i32, &'b20 i32) -> &'b0 i32) -> i32 { return 0 }\n"
+  }
+  return ""
+}
+
+effect fn contractClaims(part: usize) -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator {
+  let entry = run module("contracts.silk")
+  let services = run module("services.silk")
+  let text = contractFixture(part)
+  let source = run present(text)
+  let clock = run present("pub service Clock {}\n")
+  let bounds = run module("bounds.silk")
+  let ranked = run present(
+    "interface Hash {}\ninterface Show {}\nstruct Ranked<T: Hash> { value: T }\nfn wrongRanked(value: Ranked<'static>) -> i32 { return 0 }\n",
+  )
+  let first = run Revision.publish(&Revision.make(), &entry, &source)
+  let seeded = run Revision.publish(&first, &services, &clock)
+  let held = run Revision.publish(&seeded, &bounds, &ranked)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut request = Request.make()
+  if part == 0 {
+    let apply = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"apply")
+    let consume = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"consume")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(
+        &apply,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return firstModeIs(answer, usize.ONE)
+        },
+      ) && Shared.with<Result<Answer, NoRejection>, bool>(
+        &consume,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return firstModeIs(answer, 3)
+        },
+      ),
+      "callable parameters keep shared and consuming invocation modes",
+    )
+    let load = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"load")
+    let pending = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"pending")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&load, declaredEffect) && (run pendingMatches(
+        &pending,
+        &load,
+      )),
+      "an effect declaration and a written Effect type resolve the same channels",
+    )
+    let both = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"both")
+    let swapped = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"swapped")
+    let closed = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"closed")
+    let spelled = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"spelled")
+    run Testing.expect(
+      (run sameChannels(&both, &swapped)) && !(run sameChannels(&both, &load)) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(
+        &both,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return rowCountIs(answer, 3)
+        },
+      ) && (run sameChannels(&closed, &spelled)) && !(run sameChannels(&closed, &load)),
+      "failure unions and requirement rows normalize; omitted channels equal never and empty",
+    )
+    let preserve = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"preserve")
+    let bounded = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"bounded")
+    let risky = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"risky")
+    run Testing.expect(
+      (run preserved(&preserve)) && Shared.with<Result<Answer, NoRejection>, bool>(
+        &bounded,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return onSignature(answer, constraintOrder)
+        },
+      ) && Shared.with<Result<Answer, NoRejection>, bool>(&risky, unsafeOrdinary),
+      "row binders, run modes, ordered bounds and unsafe contracts are retained",
+    )
+    let control = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"control")
+    let nested = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"nested")
+    let again = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"again")
+    let stored = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"stored")
+    run Testing.expect(
+      (run substitutedShapes(&control, &nested, &again, &stored)),
+      "substituted unions and rows compare a handle shared at different depths",
+    )
+    let loadBody = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"load")
+    run Testing.expect(succeeded(&loadBody), "an effect body is typed against its declared success type")
+    let checked = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"checked")
+    let checkedBody = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"checked")
+    let parameterized = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"parameterized")
+    run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&checked, declaredEffect) && succeeded(&checkedBody)
+      && rejectsWith(&parameterized, RejectionCode.Unsupported),
+      "a valid test entry is analyzed like any other function; an invalid entry stays unsupported")
+  }
+  if part == 1 {
+    let notService = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"notService")
+    let interfaceRow = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"interfaceRow",
+    )
+    let badRole = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"badRole")
+    let notBound = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"notBound")
+    let repeated = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"repeated")
+    let ordinaryFailure = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"ordinaryFailure",
+    )
+    let rowAsType = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"rowAsType")
+    let borrowedUnion = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"borrowedUnion",
+    )
+    let ambiguousCallable = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"ambiguousCallable",
+    )
+    let nestedQuantifier = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedQuantifier",
+    )
+    let ordinaryRow = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"ordinaryRow",
+    )
+    let twoUses = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"twoUses")
+    let boundedUse = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"boundedUse")
+    let exposedCallable = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"exposedCallable",
+    )
+    let exposedRow = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"exposedRow")
+    run Testing.expect(
+      rejectsAt(&notService, RejectionCode.InvalidRequirement) && rejectsAt(
+        &interfaceRow,
+        RejectionCode.InvalidRequirement,
+      ) && rejectsAt(&badRole, RejectionCode.InvalidRequirement) && rejectsAt(
+        &notBound,
+        RejectionCode.InvalidBound,
+      ) && rejectsAt(&repeated, RejectionCode.DuplicateBound) && rejectsAt(
+        &ordinaryFailure,
+        RejectionCode.EffectChannelOnOrdinary,
+      ) && rejectsAt(&ordinaryRow, RejectionCode.EffectChannelOnOrdinary) && rejectsAt(
+        &rowAsType,
+        RejectionCode.TypeArgumentKind,
+      ) && rejectsAt(&borrowedUnion, RejectionCode.InvalidUnionMember) && rejectsAt(
+        &ambiguousCallable,
+        RejectionCode.AmbiguousLifetime,
+      ) && rejectsAt(&nestedQuantifier, RejectionCode.NestedQuantifier) && rejectsAt(
+        &twoUses,
+        RejectionCode.InvalidLifetime,
+      ) && rejectsAt(&boundedUse, RejectionCode.InvalidLifetime) && rejectsAt(
+        &exposedCallable,
+        RejectionCode.PrivateTypeExposure,
+      ) && rejectsAt(&exposedRow, RejectionCode.PrivateTypeExposure),
+      "invalid contracts reject at their spans",
+    )
+  }
+  if part == 2 {
+    let closedEffect = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"closedEffect")
+    let explicitStatic = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"explicitStatic",
+    )
+    let inputEffect = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"inputEffect",
+    )
+    let closedDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"closedDeferred",
+    )
+    let inputDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"inputDeferred",
+    )
+    let genericEffect = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"genericEffect",
+    )
+    let twoBorrowEffect = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"twoBorrowEffect",
+    )
+    let heldEffect = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"heldEffect")
+    let staticClosed = run sameResults(&closedEffect, &explicitStatic)
+    let staticOwned = run sameResults(&inputEffect, &explicitStatic)
+    let staticHeld = run sameResults(&heldEffect, &explicitStatic)
+    run Testing.expect(
+      staticClosed && staticOwned && staticHeld && rejectsAt(
+        &genericEffect,
+        RejectionCode.AmbiguousLifetime,
+      ) && rejectsAt(&twoBorrowEffect, RejectionCode.AmbiguousLifetime) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&closedDeferred, staticEnvironment) && Shared.with<Result<Answer, NoRejection>, bool>(
+        &inputDeferred,
+        staticEnvironment,
+      ),
+      "inputs free of borrowed data give an omitted Effect environment 'static",
+    )
+  }
+  if part == 3 {
+    let nestedStatic = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedStatic",
+    )
+    let borrowedDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"borrowedDeferred",
+    )
+    let twoBorrowed = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"twoBorrowed",
+    )
+    let genericDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"genericDeferred",
+    )
+    let sameRegion = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"sameRegion")
+    let heldDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"heldDeferred",
+    )
+    let runPending = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"runPending")
+    let callbackDeferred = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"callbackDeferred",
+    )
+    let keepPending = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"keepPending",
+    )
+    let heldOpenEffect = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"heldOpenEffect",
+    )
+    let representedBorrowed = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"representedBorrowed",
+    )
+    let representedStatic = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"representedStatic",
+    )
+    let conformedStored = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"conformedStored",
+    )
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, usize>(&representedBorrowed, environmentMembers) == usize.ONE && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&representedStatic, environmentMembers) == usize.ZERO && rejectsAt(
+        &conformedStored,
+        RejectionCode.AmbiguousLifetime,
+      ),
+      "a representation parameter retains its contract environment; other stored parameters are unknown",
+    )
+    let effectSuccess = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"effectSuccess",
+    )
+    let effectSuccessStatic = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"effectSuccessStatic",
+    )
+    run Testing.expect(
+      rejectsAt(&effectSuccess, RejectionCode.AmbiguousLifetime) && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&effectSuccessStatic, environmentMembers) == usize.ZERO,
+      "an effect fn success Effect gets no environment default; its capture environment stays 'static",
+    )
+    run Testing.expect(
+      rejectsAt(&nestedStatic, RejectionCode.AmbiguousLifetime) && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&borrowedDeferred, environmentMembers) == usize.ONE && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&twoBorrowed, environmentMembers) == 2 && Shared.with<Result<Answer, NoRejection>, usize>(
+        &sameRegion,
+        environmentMembers,
+      ) == usize.ONE && rejectsAt(&genericDeferred, RejectionCode.AmbiguousLifetime) && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&heldDeferred, environmentMembers) == usize.ONE && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&runPending, environmentMembers) == usize.ZERO && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&callbackDeferred, environmentMembers) == usize.ZERO && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&keepPending, environmentMembers) == usize.ONE && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(
+        &genericDeferred,
+        fn(value: &Result<Answer, NoRejection>) -> bool {
+          return rejectionSpells(
+            value,
+            RejectionCode.AmbiguousLifetime,
+            String.utf8Bytes(text),
+            b"Kept",
+          )
+        },
+      ) && Shared.with<Result<Answer, NoRejection>, bool>(
+        &heldOpenEffect,
+        fn(value: &Result<Answer, NoRejection>) -> bool {
+          return rejectionSpells(
+            value,
+            RejectionCode.AmbiguousLifetime,
+            String.utf8Bytes(text),
+            b"Effect<i32>",
+          )
+        },
+      ),
+      "an effect fn intersects retained regions; stored generic contents need an environment",
+    )
+  }
+  if part == 4 {
+    let orderedA = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"orderedA")
+    let orderedB = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"orderedB")
+    let orderedSingle = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"orderedSingle",
+    )
+    run Testing.expect(
+      (run sameFirstParameters(&orderedA, &orderedB)) && !(run sameFirstParameters(
+        &orderedA,
+        &orderedSingle,
+      )),
+      "intersection member order does not number invocation binders",
+    )
+    let unionAB = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"unionAB")
+    let unionBA = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"unionBA")
+    let unionShared = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"unionShared",
+    )
+    let rowAB = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"rowAB")
+    let rowBA = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"rowBA")
+    let overlapAB = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"overlapAB")
+    let overlapBA = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"overlapBA")
+    let overlapApart = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"overlapApart",
+    )
+    run Testing.expect(
+      (run sameFirstParameters(&unionAB, &unionBA)) && (run sameFirstParameters(&rowAB, &rowBA)) && (run sameFirstParameters(
+        &overlapAB,
+        &overlapBA,
+      )) && !(run sameFirstParameters(&unionAB, &unionShared)) && !(run sameFirstParameters(
+        &overlapAB,
+        &overlapApart,
+      )),
+      "callables equal up to a renaming of invocation binders across unions, rows and environments",
+    )
+  }
+  if part == 5 {
+    let nestedRef = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"nestedRef")
+    let nestedRefAgain = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedRefAgain",
+    )
+    let nestedFirst = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedFirst",
+    )
+    let nestedFirstRenamed = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedFirstRenamed",
+    )
+    let nestedSecond = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedSecond",
+    )
+    let nestedUnion = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedUnion",
+    )
+    let nestedUnionSwapped = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedUnionSwapped",
+    )
+    let nestedUnionOne = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"nestedUnionOne",
+    )
+    let refSame = run sameFirstParameters(&nestedRef, &nestedRefAgain)
+    let firstSame = run sameFirstParameters(&nestedFirst, &nestedFirstRenamed)
+    let firstSecond = run sameFirstParameters(&nestedFirst, &nestedSecond)
+    let unionSame = run sameFirstParameters(&nestedUnion, &nestedUnionSwapped)
+    let unionOne = run sameFirstParameters(&nestedUnion, &nestedUnionOne)
+    run Testing.expect(
+      refSame && firstSame && !firstSecond && unionSame && !unionOne,
+      "an unquantified inner callable refers to its enclosing contract's invocation binders",
+    )
+    let mixedBinders = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"mixedBinders",
+    )
+    let elidedBinders = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"elidedBinders",
+    )
+    let permutedBinders = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"permutedBinders",
+    )
+    let unusedBinder = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"unusedBinder",
+    )
+    let plainCallable = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"plainCallable",
+    )
+    let boundedBinders = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"boundedBinders",
+    )
+    let swappedBound = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"swappedBound",
+    )
+    run Testing.expect(
+      (run sameFirstParameters(&mixedBinders, &elidedBinders)) && (run sameFirstParameters(
+        &permutedBinders,
+        &elidedBinders,
+      )) && (run sameFirstParameters(&unusedBinder, &plainCallable)) && !(run sameFirstParameters(
+        &boundedBinders,
+        &elidedBinders,
+      )) && (run sameFirstParameters(&boundedBinders, &swappedBound)),
+      "invocation binders number by first use; unused names vanish and bounds stay meaningful",
+    )
+    let markedUse = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"markedUse")
+    let markedRenamed = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"markedRenamed")
+    let markedOther = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"markedOther")
+    let unusedUse = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"unusedUse")
+    run Testing.expect(
+      (run sameFirstParameters(&markedUse, &markedRenamed)) && !(run sameFirstParameters(&markedUse, &mixedBinders))
+        && !(run sameFirstParameters(&markedUse, &markedOther))
+        && (run sameFirstParameters(&unusedUse, &plainCallable)),
+      "a `for<use 'call>` marker is contract identity at its binder; an unused marker vanishes",
+    )
+  }
+  if part == 6 {
+    let quantified = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"quantified")
+    let spelledQuantifier = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"spelledQuantifier",
+    )
+    let environments = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"environments",
+    )
+    let retain = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"retain")
+    let parse = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"parse")
+    run Testing.expect(
+      (run sameFirstParameters(&quantified, &spelledQuantifier)) && (run environmentsNormalize(
+        &environments,
+      )) && Shared.with<Result<Answer, NoRejection>, bool>(&retain, retainsEnvironment) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&parse, representsCallable),
+      "invocation binders, environment intersections and representation bounds are canonical",
+    )
+    let sorted = run Semantic.demandContract(&mut semantic, &mut request, &entry, b"Sorted")
+    let datedBox = run Semantic.demandContract(&mut semantic, &mut request, &entry, b"DatedBox")
+    let loadInterface = run Semantic.demandContract(&mut semantic, &mut request, &entry, b"Load")
+    let parser = run Semantic.demandContract(&mut semantic, &mut request, &entry, b"Parser")
+    let useSorted = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"useSorted")
+    let loadable = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"loadable")
+    let wrongRow = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"wrongRow")
+    let loaded = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"loaded")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&sorted, sortedContract) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&datedBox, datedBoxContract) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&loadInterface, loadContract) && Shared.with<Result<Answer, NoRejection>, bool>(
+        &parser,
+        parserContract,
+      ),
+      "declaration contracts record bounds, row binders and representation parameters",
+    )
+    run Testing.expect(
+      rejectsFrom(&useSorted, RejectionCode.MissingConformance, offsetOf(text, "Sorted<i32>", usize.ZERO)),
+      "a bounded application rejects at its written use when Hash is unproved",
+    )
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&loadable, signatureSucceeded) && rejectsAt(
+        &wrongRow,
+        RejectionCode.TypeArgumentKind,
+      ) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&loaded, splicedRow),
+      "a row argument binds and splices through an alias",
+    )
+  }
+  if part == 7 {
+    let heldAnswer = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"held")
+    let heldContract = run Semantic.demandContract(&mut semantic, &mut request, &entry, b"Held")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&heldAnswer, signatureSucceeded) && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&heldContract, lifetimeBoundOnly),
+      "a lifetime-only bound is recorded and does not block applications",
+    )
+    let rankedMembers = run Semantic.demandMembers(&mut semantic, &mut request, &bounds, b"Ranked")
+    let rankedContract = run Semantic.demandContract(&mut semantic, &mut request, &bounds, b"Ranked")
+    let wrongRanked = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &bounds,
+      b"wrongRanked",
+    )
+    run Testing.expect(
+      !Shared.with<Result<Answer, NoRejection>, bool>(
+        &rankedMembers,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return hasTypeLookup(answer, Family.Contract)
+        },
+      ) && Shared.with<Result<Answer, NoRejection>, usize>(&rankedContract, contractConstraints) == usize.ONE && rejectsAt(
+        &wrongRanked,
+        RejectionCode.TypeArgumentKind,
+      ),
+      "bounded applications check arguments before proof, without affecting declaration identity",
+    )
+    let changed = run present("pub interface Clock {}\n")
+    Semantic.revise(&mut semantic, run Revision.publish(&held, &services, &changed))
+    let mut revised = Request.make()
+    let reloaded = run Semantic.demandSignature(&mut semantic, &mut revised, &entry, b"load")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(
+        &reloaded,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return rejectedTypeApplication(answer, RejectionCode.InvalidRequirement)
+        },
+      ),
+      "an imported service becoming an interface invalidates its requirement use",
+    )
+    let reranked = run present(
+      "interface Hash {}\ninterface Show {}\nstruct Ranked<T: Hash + Show> { value: T }\n",
+    )
+    Semantic.revise(&mut semantic, run Revision.publish(&held, &bounds, &reranked))
+    let mut edited = Request.make()
+    let editedContract = run Semantic.demandContract(&mut semantic, &mut edited, &bounds, b"Ranked")
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, usize>(&editedContract, contractConstraints) == 2,
+      "editing only a bound yields the new contract",
+    )
+  }
+  if part == 8 {
+    let manyA = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"manyA")
+    let manyB = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"manyB")
+    let manyC = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"manyC")
+    let manyD = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"manyD")
+    let manySame = run sameFirstParameters(&manyA, &manyB)
+    let manyResult = run sameFirstParameters(&manyA, &manyC)
+    let manyAccess = run sameFirstParameters(&manyA, &manyD)
+    run Testing.expect(
+      manySame && !manyResult && !manyAccess,
+      "contracts with many invocation binders compare without enumerating permutations",
+    )
+  }
+  return ()
+}
+
+test effect fn callableAndEffectSignatureContracts() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn invalidWrittenSignatureContracts() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(1)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn effectEnvironmentDefaults() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(2)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn retainedEffectEnvironments() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(3)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn callableBinderOrdering() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn wideCallableBinderComparison() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(8)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn nestedCallableBinders() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(5)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn declarationContracts() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(6)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn contractRevisionInvalidation() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractClaims(7)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn nominalMembersAndRequestedCompositeShapes() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("shapes.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  // A written but undeclared lifetime fails only when its member is demanded: it never needs
+  // resolving to know a declaration's lifetime arity. A field type name does, so `Missing` makes
+  // every application of `Held` and `Maybe` reject while their identities stay available.
+  let shapesText = "struct Node { next: Node }\nstruct Box<T> {\n value: T\n deferred: &'undeclared i32\n}\nunion Choice<T> { None, Some { payload: T }, Broken { payload: &'undeclared i32 } }\ntuple Pair(i32, bool)\nenum State { Start, Done }\nfn boxed() -> Box<bool> { return () }\nfn boxedAgain() -> Box<bool> { return () }\nfn chosen() -> Choice<bool> { return () }\nfn array() -> [Node; 0] { return () }\nconst COUNT: u32 = 0\nfn pending() -> [Node; COUNT] { return () }\nstruct Held<T> {\n value: T\n deferred: Missing\n}\nunion Maybe<T> { None, Broken { payload: Missing } }\nfn held() -> Held<bool> { return () }\nfn maybe() -> Maybe<bool> { return () }\n"
+  let source = run present(shapesText)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let node = run Semantic.demandIdentity(&mut semantic, &mut request, &entry, b"Node")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let recursive = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &node,
+    nominalResult,
+  )
+  if let Option<Shared<Type>>.Some {value: nodeType} = move recursive {
+    let names = run Semantic.demandMembers(&mut semantic, &mut request, &entry, b"Node")
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let shape = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Node",
+      0,
+      &nodeType,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, AnswerView>(&names, inspect).success && Shared.with<
+        Result<Answer, NoRejection>,
+        bool,
+      >(&shape, shapeFirstIsNominal),
+      "recursive nominal identity and written member type terminate without layout",
+    )
+  } else {
+    run Testing.expect(false, "recursive nominal identity resolves")
+  }
+  let boxed = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"boxed")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let boxType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &boxed,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value: applied} = move boxType {
+    let names = run Semantic.demandMembers(&mut semantic, &mut request, &entry, b"Box")
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let value = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Box",
+      0,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let deferred = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Box",
+      1,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(
+        &names,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return memberNames(answer, b"value", b"deferred")
+        },
+      ),
+      "member names survive an unrelated invalid field",
+    )
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&value, shapeFirstIsBool),
+      "applied field type substitutes T",
+    )
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(
+        &deferred,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return rejectionSpells(answer, RejectionCode.UnknownLifetime, String.utf8Bytes(shapesText), b"'undeclared")
+        },
+      ),
+      "an arity-independent invalid field rejects only when its member is requested",
+    )
+    let sameShapeStarts = starts(Semantic.eventLog(&semantic), Family.MemberShape)
+    let sameShapeHits = hits(Semantic.eventLog(&semantic), Family.MemberShape)
+    let separatelyWritten = run Semantic.demandSignature(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"boxedAgain",
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let secondApplication = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+      &separatelyWritten,
+      signatureResult,
+    )
+    if let Option<Shared<Type>>.Some {value: separatelyDerived} = move secondApplication {
+      let repeated = run Semantic.demandMemberShape(
+        &mut semantic,
+        &mut request,
+        &entry,
+        b"Box",
+        0,
+        &separatelyDerived,
+      )
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(
+        Shared.with<Result<Answer, NoRejection>, bool>(&repeated, shapeFirstIsBool) && starts(
+          Semantic.eventLog(&semantic),
+          Family.MemberShape,
+        ) == sameShapeStarts && hits(Semantic.eventLog(&semantic), Family.MemberShape) > sameShapeHits,
+        "equal separately derived nominal applications reuse one member-shape fact",
+      )
+    } else {
+      run Testing.expect(false, "the second generic nominal application resolves")
+    }
+  } else {
+    run Testing.expect(false, "generic nominal application resolves")
+  }
+  let chosen = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"chosen")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let choiceType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &chosen,
+    signatureResult,
+  )
+  if let Option<Shared<Type>>.Some {value: applied} = move choiceType {
+    let names = run Semantic.demandMembers(&mut semantic, &mut request, &entry, b"Choice")
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let empty = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Choice",
+      0,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let some = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Choice",
+      1,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, AnswerView>(&names, inspect).success && Shared.with<
+        Result<Answer, NoRejection>,
+        usize,
+      >(&empty, shapeCount) == 0 && Shared.with<Result<Answer, NoRejection>, bool>(
+        &some,
+        shapeFirstIsBool,
+      ),
+      "union variant payload is selected and substituted independently",
+    )
+  } else {
+    run Testing.expect(false, "generic union application resolves")
+  }
+  let pair = run Semantic.demandIdentity(&mut semantic, &mut request, &entry, b"Pair")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let tupleType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &pair,
+    nominalResult,
+  )
+  if let Option<Shared<Type>>.Some {value: applied} = move tupleType {
+    let position = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"Pair",
+      1,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(&position, shapeFirstIsBool),
+      "tuple position resolves its selected written type",
+    )
+  } else {
+    run Testing.expect(false, "tuple identity resolves")
+  }
+  let enumeration = run Semantic.demandIdentity(&mut semantic, &mut request, &entry, b"State")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let enumType = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &enumeration,
+    nominalResult,
+  )
+  if let Option<Shared<Type>>.Some {value: applied} = move enumType {
+    let names = run Semantic.demandMembers(&mut semantic, &mut request, &entry, b"State")
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let case = run Semantic.demandMemberShape(
+      &mut semantic,
+      &mut request,
+      &entry,
+      b"State",
+      0,
+      &applied,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      Shared.with<Result<Answer, NoRejection>, bool>(
+        &names,
+        fn(answer: &Result<Answer, NoRejection>) -> bool {
+          return memberNames(answer, b"Start", b"Done")
+        },
+      ) && Shared.with<Result<Answer, NoRejection>, usize>(&case, shapeCount) == 0,
+      "enum names are ordered and scalar cases have no payload",
+    )
+  } else {
+    run Testing.expect(false, "enum identity resolves")
+  }
+  let array = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"array")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let pending = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"pending")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&array, signatureIsZeroNominalArray) &&
+      Shared.with<Result<Answer, NoRejection>, bool>(&pending, signatureIsZeroNominalArray),
+    "literal and named constant extents select the same canonical array type",
+  )
+  let held = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"held")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let maybe = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"maybe")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let heldIdentity = run Semantic.demandIdentity(&mut semantic, &mut request, &entry, b"Held")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let heldNames = run Semantic.demandMembers(&mut semantic, &mut request, &entry, b"Held")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let heldArity = Shared.with<Result<Answer, NoRejection>, bool>(
+    &held,
+    fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return rejectionSpells(answer, RejectionCode.UnknownName, String.utf8Bytes(shapesText), b"Missing")
+    },
+  )
+  let maybeArity = rejectsAt(&maybe, RejectionCode.UnknownName)
+  let identityView = Shared.with<Result<Answer, NoRejection>, AnswerView>(&heldIdentity, inspect)
+  let namesView = Shared.with<Result<Answer, NoRejection>, AnswerView>(&heldNames, inspect)
+  run Testing.expect(
+    heldArity && maybeArity && identityView.success && namesView.success,
+    "an application needs its field type names for lifetime arity while identity and member names stay lazy",
+  )
+  return ()
+}
+
+test effect fn memberRevisionsReachOnlyTheirConsumers() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run memberRevisionClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn genericParameterKindEditRejectsStaleApplication() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run memberKindRevisionClaims()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn genericTypeBindersAndExplicitApplications() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("generic.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = run present(
+    "struct Pair<A, B> {}\nstruct Plain {}\ntype Same<T> = Pair<T, T>\nfn left<T>(value: T) -> T { return move value }\nfn right<T>(value: T) -> T { return move value }\nfn generic<T>() -> i32 { return 1 }\nfn duplicate<T, T>(value: T) -> T { return move value }\nfn one() -> Pair<i32, bool> { return () }\nfn two() -> Pair<i32, bool> { return () }\nfn swapped() -> Pair<bool, i32> { return () }\nfn alias() -> Same<bool> { return () }\nfn direct() -> Pair<bool, bool> { return () }\nfn arity() -> Pair<i32> { return () }\nfn omitted() -> Pair { return () }\nfn excess() -> Plain<i32> { return () }\nfn kind() -> Pair<'x, bool> { return () }\nfn missing() -> Pair<Unknown, bool> { return () }\n",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let left = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"left")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let right = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"right")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&left, signatureHasOrdinaryBinder) && Shared.with<
+      Result<Answer, NoRejection>,
+      bool,
+    >(&right, signatureHasOrdinaryBinder) && !(run resultEquals(&left, &right)
+      |> Effect.provideMut<Allocator>(&mut allocator)),
+    "each function owns a distinct ordinary T binder reused in its signature",
+  )
+  let one = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"one")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let two = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"two")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let swapped = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"swapped")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let alias = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"alias")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let direct = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"direct")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    (run resultEquals(&one, &two)
+      |> Effect.provideMut<Allocator>(&mut allocator)) && !(run resultEquals(&one, &swapped)
+      |> Effect.provideMut<Allocator>(&mut allocator)) && (run resultEquals(&alias, &direct)
+      |> Effect.provideMut<Allocator>(&mut allocator)),
+    "ordered nominal arguments are canonical and generic aliases substitute explicitly",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(
+      &alias,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return hasTypeLookup(answer, Family.Alias) && hasTypeLookup(answer, Family.Identity)
+      },
+    ),
+    "an applied alias retains alias and nominal identity dependencies",
+  )
+  let arity = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"arity")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let omitted = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"omitted")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let excess = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"excess")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let duplicate = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"duplicate")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let kind = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"kind")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let missing = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"missing")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&arity, wrongTypeArity) && Shared.with<
+      Result<Answer, NoRejection>,
+      bool,
+    >(&kind, wrongTypeKind) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &missing,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectedTypeApplication(answer, RejectionCode.UnknownName) && hasTypeLookup(
+          answer,
+          Family.Name,
+        )
+      },
+    ),
+    "wrong arity, wrong kind and absent argument names reject with anchored evidence",
+  )
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(
+      &omitted,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectedTypeApplication(answer, RejectionCode.TypeArity)
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &excess,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectedTypeApplication(answer, RejectionCode.TypeArity)
+      },
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &duplicate,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectedTypeApplication(answer, RejectionCode.DuplicateTypeParameter)
+      },
+    ),
+    "omitted, excess and duplicate generic declarations reject at source positions",
+  )
+  let genericBody = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"generic")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&genericBody, bodyAnswerIsContractTyped),
+    "a generic declaration with a scalar body is contract typed, not fully checked",
+  )
+  return ()
+}
+
+test effect fn abstractBodiesTypeForwardingAndBothRuntimeBranches() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("abstract-bodies.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = "struct Document { value: i32 }\nfn forward<T>(value: T) -> T { return move value }\nfn invoke<T>(value: T) -> T { return forward(move value) }\nfn writtenOnly<T>(value: T) -> T { return 0 }\nfn callWritten<T>(value: T) -> T { return writtenOnly(move value) }\nfn choose<T>(condition: bool, left: T, right: T) -> T { if condition { return move left } else { return move right } }\nfn wrongElse<T>(condition: bool, left: T, right: i32) -> T { if condition { return move left } else { return right } }\nfn unboundedOperator<T>(value: T) -> T { return value + value }\nfn lifetimeOnly<'a>(value: i32) -> i32 { return value }\nfn nominal(value: Document) -> Document { return move value }\nfn charPass(value: char) -> char { return value }\nfn floatPass(value: f64) -> f64 { return value }\nfn stringPass(value: string) -> string { return move value }\nfn scalar(value: i32) -> i32 { return value }\n"
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let forwarded = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"forward")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let forwarding = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(
+    &forwarded,
+    checkedBody,
+  )
+  let signature = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"forward")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let binder = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &signature,
+    ownBinder,
+  )
+  if let Option<Shared<TypedBody>>.Some {value} = move forwarding {
+    let types = Shared.with<TypedBody, Option<ForwardedTypes>>(&value, forwardedTypes)
+    if let Option<ForwardedTypes>.Some {value: found} = move types {
+      if let Option<Shared<Type>>.Some {value: parameter} = move binder {
+        let localMatches = run Type.equalsShared(&parameter, &found.local)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        let movedMatches = run Type.equalsShared(&parameter, &found.moved)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        let entryMatches = run Type.equalsShared(&parameter, &found.entry)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        let deferredMatches = run Type.equalsShared(&parameter, &found.deferred)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        run Testing.expect(
+          localMatches && movedMatches && entryMatches && deferredMatches,
+          "whole-value T forwarding retains its declaration-owned identity and entry/use safety obligations",
+        )
+      } else {
+        run Testing.expect(false, "the forwarded body has a declared type binder")
+      }
+    } else {
+      run Testing.expect(false, "whole-value T forwarding retains a typed move and safety obligation")
+    }
+  } else {
+    run Testing.expect(false, "whole-value T forwarding has a contract-typed body")
+  }
+  let invoked = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"invoke")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let writtenCaller = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"callWritten")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let writtenBody = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"writtenOnly")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&invoked, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(&writtenCaller, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(&writtenBody, fn(answer: &Result<Answer, NoRejection>) -> bool {
+      return rejectionCode(answer, RejectionCode.TypeMismatch)
+    }),
+    "written generic signatures type calls without requiring valid callee bodies",
+  )
+  let callerSignature = run Semantic.demandSignature(&mut semantic, &mut request, &entry, b"invoke")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let callerBinder = Shared.with<Result<Answer, NoRejection>, Option<Shared<Type>>>(
+    &callerSignature,
+    ownBinder,
+  )
+  let calledBody = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(
+    &invoked,
+    checkedBody,
+  )
+  if let Option<Shared<TypedBody>>.Some {value: body} = move calledBody {
+    let callType = Shared.with<TypedBody, Option<Shared<Type>>>(&body, directCallType)
+    let specialized = Shared.with<TypedBody, bool>(&body, fn(value: &TypedBody) -> bool {
+      return bodyCallGenericCount(value, usize.ONE)
+    })
+    if let Option<Shared<Type>>.Some {value: inferred} = move callType {
+      if let Option<Shared<Type>>.Some {value: parameter} = move callerBinder {
+        let sameResult = run Type.equalsShared(&parameter, &inferred)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        run Testing.expect(specialized && sameResult, "generic call result retains the caller's declaration-owned T")
+      } else {
+        run Testing.expect(false, "the generic caller has its own type binder")
+      }
+    } else {
+      run Testing.expect(false, "the generic caller retains a typed direct call")
+    }
+  } else {
+    run Testing.expect(false, "the generic caller has a contract-typed body")
+  }
+  let choose = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"choose")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let wrongElse = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"wrongElse")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let unboundedOperator = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"unboundedOperator")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&choose, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &wrongElse,
+      fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return rejectionCode(answer, RejectionCode.TypeMismatch)
+      },
+    ),
+    "both runtime branches are typed and a mismatched else return rejects",
+  )
+  run Testing.expect(
+    rejectsFrom(&unboundedOperator, RejectionCode.MissingOperator, offsetOf(text, "+", usize.ZERO)),
+    "an unbounded operator rejects at the operator",
+  )
+  let lifetimeOnly = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"lifetimeOnly")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&lifetimeOnly, bodyAnswerIsContractTyped),
+    "a lifetime-only generic body does not claim fully checked safety",
+  )
+  let nominal = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"nominal")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let character = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"charPass")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let floating = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"floatPass")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let stringBody = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"stringPass")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&nominal, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(&character, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(&floating, bodyAnswerIsContractTyped) && Shared.with<Result<Answer, NoRejection>, bool>(&stringBody, bodyAnswerIsContractTyped),
+    "concrete nominal and non-scalar value bodies retain a contract-typed safety boundary",
+  )
+  let scalar = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"scalar")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let scalarBody = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(
+    &scalar,
+    checkedBody,
+  )
+  if let Option<Shared<TypedBody>>.Some {value} = move scalarBody {
+    run Testing.expect(
+      Shared.with<TypedBody, bool>(&value, bodyIsFullyChecked),
+      "existing scalar bodies retain a fully checked result",
+    )
+  } else {
+    run Testing.expect(false, "the scalar body remains valid")
+  }
+  return ()
+}
+
+test effect fn qualifiedBoundCallsUseDeclaredContracts() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("qualified-bound-body.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = "interface Read { fn read(value: Self) -> i32 }\ninterface Write { fn write(value: Self) -> i32 }\nstruct Item {}\nimpl Read for Item { fn read(value: Self) -> i32 { return 1 } }\nfn bounded<T: Read>(value: T) -> i32 { return Read.read(move value) }\nfn without<T>(value: T) -> i32 { return Read.read(move value) }\nfn foreign<T: Read>(value: T) -> i32 { return Read.write(move value) }\nfn concrete(value: Item) -> i32 { return without(move value) }\nstruct Scanner<'input> { input: &'input [u8] }\ninterface Make { fn make(scanner: &mut Scanner) -> Self }\nfn made<T: Make>(scanner: &mut Scanner) -> T { return Make.make(&mut scanner.*) }\ninterface Peek { fn peek(self: &Self, scanner: &mut Scanner) -> i32 }\nimpl Peek for Item { fn peek(self: &Item, scanner: &mut Scanner) -> i32 { return 1 } }\nfn peeked(item: &Item, scanner: &mut Scanner) -> i32 { return item.peek(&mut scanner.*) }\n"
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let bounded = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"bounded")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let without = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"without")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let foreign = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"foreign")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let concrete = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"concrete")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&bounded, bodyAnswerIsContractTyped),
+    "the written Read bound types the qualified operation against symbolic T",
+  )
+  run Testing.expect(
+    rejectsFrom(&without, RejectionCode.MissingConformance, offsetOf(text, "Read.read(move value)", usize.ONE)) && succeeded(&concrete),
+    "removing the declared bound rejects the body even when a concrete caller is valid",
+  )
+  run Testing.expect(
+    rejectsFrom(&foreign, RejectionCode.UnknownMember, offsetOf(text, "Read.write", usize.ZERO)),
+    "a same-module operation from another interface is unknown at the qualified call",
+  )
+  let made = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"made")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let peeked = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"peeked")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&made, bodyAnswerIsContractTyped) && succeeded(&peeked),
+    "a reborrowed operand infers an operation's elided regions inside an invariant referent",
+  )
+  return ()
+}
+
+test effect fn receiverCallsShareQualifiedContractsAndWitnesses() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("receiver-interface-calls.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = "interface Printable { fn print(value: &Self) -> i32 }\nstruct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\nfn generic<T: Printable>(value: &T) -> i32 { let qualified = Printable.print(value) return value.print() }\nfn concrete(value: &Document) -> i32 { let qualified = Printable.print(value) return value.print() }\nfn concreteValue(value: Document) -> i32 { return value.print() }\nfn methodValue<T: Printable>(value: &T) -> i32 { let selected = value.print return 0 }\n"
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let generic = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"generic")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let concrete = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"concrete")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let concreteValue = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"concreteValue")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let methodValue = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"methodValue")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let genericPair = Shared.with<Result<Answer, NoRejection>, Option<InterfaceCallPair>>(
+    &generic, answerInterfaceCallPair,
+  )
+  let mut genericSelected = false
+  if let Option<InterfaceCallPair>.Some {value} = move genericPair {
+    let sameContract = run Type.equalsShared(&value.firstContract, &value.secondContract)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let sameProvider = run Type.equalsShared(&value.firstProvider, &value.secondProvider)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    genericSelected = sameContract && sameProvider && value.sameOperation && value.sameWitness
+      && !value.hasWitness && value.oneReceiverPerCall && value.qualifiedThenReceiver
+  }
+  let concretePair = Shared.with<Result<Answer, NoRejection>, Option<InterfaceCallPair>>(
+    &concrete, answerInterfaceCallPair,
+  )
+  let mut concreteSelected = false
+  if let Option<InterfaceCallPair>.Some {value} = move concretePair {
+    let sameContract = run Type.equalsShared(&value.firstContract, &value.secondContract)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let sameProvider = run Type.equalsShared(&value.firstProvider, &value.secondProvider)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    concreteSelected = sameContract && sameProvider && value.sameOperation && value.sameWitness
+      && value.hasWitness && value.oneReceiverPerCall && value.qualifiedThenReceiver
+  }
+  run Testing.expect(
+    genericSelected && concreteSelected && Shared.with<Result<Answer, NoRejection>, bool>(
+      &generic, bodyAnswerIsContractTyped,
+    ) && Shared.with<Result<Answer, NoRejection>, bool>(
+      &concreteValue, bodyAnswerIsContractTyped,
+    ),
+    "receiver and qualified calls select the same bound or concrete contract and witness",
+  )
+  run Testing.expect(
+    rejectsFrom(&methodValue, RejectionCode.Unsupported, offsetOf(text, "value.print return", usize.ZERO)),
+    "a bound interface method cannot be captured as a value in M2.3",
+  )
+  return ()
+}
+
+test effect fn receiverSuppliersTieBeforeArgumentsOrResult() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("receiver-ties.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = "interface First { fn choose(value: Self, item: i32) -> i32 }\ninterface Second { fn choose(value: Self) -> bool }\nstruct Choice {}\nimpl First for Choice { fn choose(value: Self, item: i32) -> i32 { return item } }\nimpl Second for Choice { fn choose(value: Self) -> bool { return true } }\nfn bounded<T: First + Second>(value: T) -> i32 { return value.choose(7) }\nfn concrete(value: Choice) -> i32 { return value.choose(7) }\nfn unbounded<T>(value: T) -> i32 { return value.choose(7) }\ninterface Third { fn third(value: Self) -> i32 }\nstruct Holder<T> { inner: T }\nimpl<T: First> Third for Holder<T> { fn third(value: Self) -> i32 { return value.inner.choose(7) } }\nservice Ranked { fn rank(value: &Self) -> i32 }\nfn served<T: Ranked>(value: &T) -> i32 { return Ranked.rank(value) }\n"
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut index = SourceIndex.make(run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator))
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let bounded = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"bounded")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let concrete = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"concrete")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let unbounded = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"unbounded")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    rejectsFrom(&bounded, RejectionCode.AmbiguousBoundMethod, offsetOf(text, "choose(7)", usize.ZERO))
+      && rejectsFrom(&concrete, RejectionCode.AmbiguousConformanceMethod, offsetOf(text, "choose(7)", usize.ONE))
+      && rejectsFrom(&unbounded, RejectionCode.UnknownMember, offsetOf(text, "choose(7)", 2)),
+    "method arguments and expected results cannot break bound or concrete supplier ties",
+  )
+  let thirdIdentity = run requireIndexedIdentity(&mut index, &entry, OwnerKind.Function, b"third", usize.ONE)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let held = run Semantic.demandBodyOf(&mut semantic, &mut request, &thirdIdentity)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsFrom(&held, RejectionCode.Unsupported, offsetOf(text, "choose(7)", 3)),
+    "a member body lacks its implementation's head bounds, so their method lookup is deferred rather than unknown")
+  let served = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"served")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsFrom(&served, RejectionCode.Unsupported, offsetOf(text, "Ranked.rank(value)", usize.ZERO)),
+    "a service operation taking its Self as an operand has no operand-dispatched native lane yet")
+  return ()
+}
+
+test effect fn ownerClaimsDoNotFallThroughToInterfaceMethods() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = run module("claimed-receiver-methods.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+interface Rescue { fn call(value: Self) -> i32 }
+struct FieldOwner { call: fn<'static>() -> i32 }
+impl Rescue for FieldOwner { fn call(value: Self) -> i32 { return 1 } }
+fn field(value: FieldOwner) -> i32 { return value.call() }
+struct ElidedFieldOwner { call: fn() -> i32 }
+impl Rescue for ElidedFieldOwner { fn call(value: Self) -> i32 { return 5 } }
+fn elided(value: ElidedFieldOwner) -> i32 { return value.call() }
+struct Repeated {}
+impl Rescue for Repeated { fn call(value: Self) -> i32 { return 2 } }
+impl Repeated { fn call(self: Self) -> i32 { return 3 } }
+impl Repeated { fn call(self: Self) -> i32 { return 4 } }
+fn duplicate(value: Repeated) -> i32 { return value.call() }
+"""
+  let source = run present(text)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let field = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"field")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let elided = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"elided")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let duplicate = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"duplicate")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Shared.with<Result<Answer, NoRejection>, bool>(&field, claimedCallableFieldFacts)
+      && rejectsAt(&duplicate, RejectionCode.Collision),
+    "a callable field invokes its original projected value, and a duplicate inherent name keeps its collision instead of selecting a conformance",
+  )
+  run Testing.expect(
+    rejectsSpan(&elided, RejectionCode.Unsupported, text,
+      "struct ElidedFieldOwner { call: fn() -> i32 }", usize.ZERO),
+    "an omitted callable field environment keeps its member-shape gap instead of selecting a conformance",
+  )
+  return ()
+}
+
+fn claimedCallableFieldFacts(answer: &Result<Answer, NoRejection>) -> bool {
+  if let Option<Shared<TypedBody>>.Some {value: body} = move checkedBody(answer) {
+    return Shared.with<TypedBody, bool>(&body, fn(value: &TypedBody) -> bool {
+      let nodes = TypedBody.nodeSlice(value)
+      let mut calls = usize.ZERO
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        match &nodes[at].kind {
+          BodyNodeKind.Expression {form: BodyExpression.InterfaceCall {..}, ..} => { return false }
+          BodyNodeKind.Expression {form: BodyExpression.DirectCall {..}, ..} => { return false }
+          BodyNodeKind.Expression {form: BodyExpression.CallableCall {callee, mode, arguments, pipeline, ..}, ..} => {
+            if mode != CallableMode.Shared || pipeline || Vector.length<BodyNodeId>(&arguments) != usize.ZERO
+              || callee.index >= nodes.length { return false }
+            if let BodyNodeKind.Expression {form: BodyExpression.Field {value: receiver, index}, ..} = &nodes[callee.index].kind {
+              if index != usize.ZERO || receiver.index >= nodes.length { return false }
+              if let BodyNodeKind.Expression {form: BodyExpression.Local {local}, ..} = &nodes[receiver.index].kind {
+                if local.index != usize.ZERO { return false }
+              } else { return false }
+            } else { return false }
+            calls = calls + usize.ONE
+          }
+          _ => ()
+        }
+        at = at + usize.ONE
+      }
+      return calls == usize.ONE
+    })
+  }
+  return false
+}
+
+test effect fn privateInherentReceiverNameBlocksConformanceFallback() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let library = run module("library.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let client = run module("method-client.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let libraryText = "pub interface Rescue { fn call(value: Self) -> i32 }\npub struct Hidden {}\nimpl Rescue for Hidden { fn call(value: Self) -> i32 { return 1 } }\nimpl Hidden { fn call(self: Self) -> i32 { return 2 } }\n"
+  let clientText = "import library { Hidden, Rescue }\nfn outside(value: Hidden) -> i32 { return value.call() }\n"
+  let librarySource = run present(libraryText)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let clientSource = run present(clientText)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &library, &librarySource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&first, &client, &clientSource)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  let outside = run Semantic.demandBody(&mut semantic, &mut request, &client, b"outside")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    rejectsFrom(&outside, RejectionCode.PrivateMember, offsetOf(clientText, "call()", usize.ZERO)),
+    "a private inherent name keeps its access error even when a public interface supplies it",
+  )
+  return ()
+}

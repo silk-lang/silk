@@ -29,10 +29,10 @@ including the canonical owning declaration. Effect execution belongs to Step 9.
 
 ## Validation
 
-`namedPipelinesShareDirectCallTypingAndOrder` in `SemanticCases.silk` uses one held source snapshot
-for contextual input typing, selected targets, input-before-call MIR, block match arms, static
-calls and slots, the remaining interface gap and its spans, and applied-qualifier validation for
-both call forms. The `callablePipeline` cases assert input-before-capture MIR, section suffix
-appending, unary arity codes and spans, and transferred input cleanup on callee exit.
-Runtime behavior is also exercised by the pinned `trivial-features` native corpus program and its
-B11 baseline entry.
+`namedPipelinesShareDirectCallTypingAndOrder` in `SemanticLoweringCases.silk` uses one held source
+snapshot for contextual input typing, selected targets, input-before-call MIR, block match arms,
+static calls and slots, the remaining interface gap and its spans, and applied-qualifier validation
+for both call forms. The `callablePipeline` cases in `SemanticCallableCases.silk` assert
+input-before-capture MIR, section suffix appending, unary arity codes and spans, and transferred
+input cleanup on callee exit. Runtime behavior is also exercised by the pinned `trivial-features`
+native corpus program and its B11 baseline entry.
