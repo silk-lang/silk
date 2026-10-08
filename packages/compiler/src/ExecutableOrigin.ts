@@ -4338,14 +4338,21 @@ export const make = (operations: Operations) => {
               name: handler.target.name,
             }
             const target = targetFunction(results, declaration)
-            const targetKey =
+            // Quantified named items omit only their original invocation lifetime slots.
+            // Keep those source-owned binders in discovery, as ordinary callable application
+            // does; the checked invocation supplies its concrete semantic selection later.
+            const arguments_ =
               target === undefined
+                ? undefined
+                : callableTargetArguments(target, handler.typeArguments)
+            const targetKey =
+              target === undefined || arguments_ === undefined
                 ? undefined
                 : keyOf(
                     declaration,
                     target.contract,
                     target.declaration.typeParameters.map((parameter) => parameter.type),
-                    handler.typeArguments,
+                    arguments_,
                   )
             const handlerEffect =
               target === undefined || targetKey === undefined

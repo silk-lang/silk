@@ -1,6 +1,7 @@
 import type * as AuthoredHir from './AuthoredHir.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as BodyQuery from './BodyQuery.js'
+import * as BodyLifetime from './BodyLifetime.js'
 import * as Result from 'effect/Result'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as ConformanceProof from './ConformanceProof.js'
@@ -2113,7 +2114,8 @@ const analyzeLoans = (
           scanRunEnds(statement.expression, statement.region)
           break
         case 'DropStatement': {
-          scanRunEnds(statement.expression, statement.region)
+          // The consuming boundary owns the retained loan's end, including the authored drop.
+          scanRunEnds(statement.expression, statement.region, statement.anchor)
           const site = directSite(statement.expression)?.site
           if (site?._tag === 'Let') {
             callableEnds.set(site.binding.ordinal, endpointAt(statement.anchor, statement.region))
@@ -3271,7 +3273,7 @@ const analyzeLoans = (
               fn.lifetimeFlow.input.regions.some((entry) =>
                 Lifetime.equals(entry.lifetime, obligation.lifetime),
               ) &&
-              obligation.lifetime.context === `Call:${obligation.binder.ordinal}` &&
+              obligation.lifetime.context === BodyLifetime.invocationContext(obligation.binder) &&
               origin !== undefined &&
               AuthoredIdentity.anchorKey(origin) ===
                 AuthoredIdentity.anchorKey(obligation.origin) &&

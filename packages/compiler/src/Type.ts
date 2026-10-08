@@ -3062,8 +3062,10 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
         else binderScope.set(Lifetime.key(binder), count - 1)
       }
     } else if (isCallable(type)) {
-      if (type.schema !== undefined) pushBinders(type.schema.binders)
       visitArgument(type.environment)
+      const deferred =
+        type.schema?.binders.filter((binder) => !type.schema?.substitution.has(key(binder))) ?? []
+      pushBinders(deferred)
       for (const binder of type.lifetimeBinders)
         binderScope.set(Lifetime.key(binder), (binderScope.get(Lifetime.key(binder)) ?? 0) + 1)
       for (const binder of type.lifetimeBinders) visitArgument(binder)
@@ -3078,23 +3080,22 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
       }
       for (const parameter_ of type.parameters) visitType(parameter_)
       visitType(type.result)
+      popBinders(deferred)
       if (type.schema !== undefined) {
+        pushBinders(type.schema.binders)
         visitContract(type.schema.contract)
-        if (type.schema.invocationAdapter !== undefined) {
-          visitArgument(type.schema.invocationAdapter.binder)
-          for (const slot of type.schema.invocationAdapter.lifetimes) {
-            visitType(slot.parameter)
-            visitArgument(slot.lifetime)
-          }
-        }
         for (const binder of type.schema.binders) {
           visitType(binder)
           if (binder.representationBound !== undefined) visitType(binder.representationBound)
         }
         for (const constraint of type.schema.constraints) visitConstraint(constraint)
         for (const evidence of type.schema.evidence) visitEvidence(evidence)
-        for (const argument of type.schema.substitution.values()) visitArgument(argument)
         popBinders(type.schema.binders)
+        if (type.schema.invocationAdapter !== undefined) {
+          visitArgument(type.schema.invocationAdapter.binder)
+          for (const slot of type.schema.invocationAdapter.lifetimes) visitArgument(slot.lifetime)
+        }
+        for (const argument of type.schema.substitution.values()) visitArgument(argument)
       }
       for (const binder of type.lifetimeBinders) {
         const count = binderScope.get(Lifetime.key(binder)) ?? 0
@@ -4181,7 +4182,11 @@ export const executableFormationRequirements = (
   const invocation = new Set([
     ...self.lifetimeBinders.map(Lifetime.key),
     ...(self.invocationUse === undefined ? [] : [Lifetime.key(self.invocationUse.lifetime)]),
-    ...(isCallable(self) ? (self.schema?.binders.map(key) ?? []) : []),
+    ...(isCallable(self)
+      ? (self.schema?.binders
+          .filter((binder) => !self.schema?.substitution.has(key(binder)))
+          .map(key) ?? [])
+      : []),
   ])
   // Inference opens invocation binders to rigid placeholders before comparing contracts. Those
   // placeholders still denote invocation requirements even after the binder list has been opened.

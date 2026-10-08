@@ -11,6 +11,7 @@ import * as Tir from './Tir.js'
 import * as InstanceDiagnostics from './InstanceDiagnostics.js'
 import * as Instances from './Instances.js'
 import * as ExecutableInputView from './ExecutableInputView.js'
+import * as EffectProducer from './EffectProducer.js'
 import { alignUp } from './internal/Align.js'
 import type {
   AddressScalar,
@@ -3099,9 +3100,14 @@ const collectEffectSites = (instance: Instances.Instance) => {
       ]
     })
   const effectSites = [
-    ...blocks.map((block) => ({ site: block.site, type: block.type, captures: block.captures })),
-    ...catchSites,
-    ...builtinSites,
+    ...blocks.map((block) => ({
+      site: block.site,
+      type: block.type,
+      captures: block.captures,
+      producer: block,
+    })),
+    ...catchSites.map((site) => ({ ...site, producer: undefined })),
+    ...builtinSites.map((site) => ({ ...site, producer: undefined })),
   ]
 
   return effectSites
@@ -3135,11 +3141,11 @@ const planEffectSite = Effect.fn('Layout.planEffectSite')(function* (
   bindings: EffectBindings,
   block: EffectSite,
 ): Effect.fn.Return<void> {
-  const structuralEffect = Type.substitute(
-    block.type,
-    instance.substitution,
-    instance.specialization.compatibility,
-  )
+  const structuralEffect =
+    (block.producer === undefined
+      ? undefined
+      : EffectProducer.returnedContract(instance, block.producer)) ??
+    Type.substitute(block.type, instance.substitution, instance.specialization.compatibility)
   if (!Type.isEffect(structuralEffect)) return
   const effectInstance = firstEffectInstance(
     state.discovery,
@@ -3266,10 +3272,17 @@ const planEffectCapture = Effect.fn('Layout.planEffectCapture')(function* (
   const parameter = instance.function.declaration.parameters
     .filter((entry) => entry.phase === 'Runtime')
     .at(ordinal)
+  const capturedCallableType =
+    capturedCallableEnvironment === undefined
+      ? undefined
+      : {
+          ...capturedCallableEnvironment.callable.type,
+          mode: capturedCallableEnvironment.callable.mode,
+        }
   const inputView =
     source !== 'Parameter' ||
-    !Type.isEffect(parameterType) ||
-    capturedEffectEnvironment === undefined ||
+    (!Type.isEffect(parameterType) && !Type.isCallable(parameterType)) ||
+    (capturedEffectEnvironment === undefined && capturedCallableEnvironment === undefined) ||
     parameter === undefined
       ? undefined
       : state.discovery.calls
@@ -3287,12 +3300,24 @@ const planEffectCapture = Effect.fn('Layout.planEffectCapture')(function* (
                 view.parameter.ordinal !== ordinal ||
                 AuthoredIdentity.anchorKey(view.parameter.source) !==
                   AuthoredIdentity.anchorKey(parameter.anchor) ||
-                !Type.isEffect(view.actual) ||
-                !Type.isEffect(view.expected) ||
                 !Type.equals(view.expected, parameterType) ||
-                !Type.equals(
-                  { ...view.actual, access: capturedEffectEnvironment.effect.access },
-                  capturedEffectEnvironment.effect,
+                !(
+                  (Type.isEffect(view.actual) &&
+                    Type.isEffect(view.expected) &&
+                    capturedEffectEnvironment !== undefined &&
+                    !Type.equals(
+                      { ...view.expected, access: capturedEffectEnvironment.effect.access },
+                      capturedEffectEnvironment.effect,
+                    ) &&
+                    Type.equals(
+                      { ...view.actual, access: capturedEffectEnvironment.effect.access },
+                      capturedEffectEnvironment.effect,
+                    )) ||
+                  (Type.isCallable(view.actual) &&
+                    Type.isCallable(view.expected) &&
+                    view.invocationSource !== undefined &&
+                    capturedCallableType !== undefined &&
+                    Type.equals(view.actual, capturedCallableType))
                 )
               )
                 return []
@@ -3307,13 +3332,17 @@ const planEffectCapture = Effect.fn('Layout.planEffectCapture')(function* (
             })
           })
           .at(0)
+  let checkedInputType: Type.Type | undefined
+  if (inputView !== undefined) {
+    if (Type.isEffect(inputView.view.expected))
+      checkedInputType = {
+        ...inputView.view.expected,
+        access: capturedEffectEnvironment?.effect.access ?? inputView.view.expected.access,
+      }
+    else checkedInputType = inputView.view.invocationSource?.selected
+  }
   const fieldType =
-    (inputView === undefined || !Type.isEffect(inputView.view.expected)
-      ? undefined
-      : {
-          ...inputView.view.expected,
-          access: capturedEffectEnvironment?.effect.access ?? inputView.view.expected.access,
-        }) ??
+    checkedInputType ??
     capturedEffectEnvironment?.effect ??
     (capturedCompositeRepresentation === undefined
       ? undefined

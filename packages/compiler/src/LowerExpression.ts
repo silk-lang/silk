@@ -26,6 +26,7 @@ import * as ConformanceProof from './ConformanceProof.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import type { LoweredExpression, LoweredValue } from './EffectLowering.js'
 import * as ExecutableOrigin from './ExecutableOrigin.js'
+import * as ExecutableInputView from './ExecutableInputView.js'
 import {
   borrowedWriteRoot,
   endLoans,
@@ -97,6 +98,7 @@ import {
   providerBindings,
   requirementsFor,
   resultCallableValueType,
+  returnedEffectValueType,
   runtimeRequirementArguments,
   storedCallableValueType,
   storedEffectValueType,
@@ -303,7 +305,26 @@ export const lowerCallOperand = (
   const lowered = lowerExpression(fn, expression, availableRequirements)
   if (lowered === undefined || lowered === 'Transferred') return lowered
   const result = captureCallOperand(fn, lowered.result, expression.span)
-  return result === undefined ? undefined : { result }
+  if (result === undefined) return undefined
+  const proof = ExecutableInputView.operandView(fn.instances, fn.calls, fn.owner.key, expression)
+  if (proof === undefined) return { result }
+  const actual = fn.localTypes.at(result.ordinal)
+  const selected = proof.view.invocationSource?.selected
+  if (actual?._tag !== 'CallableValue' || selected === undefined) return undefined
+  const type = { ...actual, type: selected, inputView: proof }
+  if (
+    ExecutableInputView.physicalCallable(
+      {
+        layout: fn.layout,
+        executableInputViews: ExecutableInputView.catalog(fn.instances, fn.calls),
+      },
+      type,
+    ) === undefined
+  )
+    return undefined
+  const destination = fn.alloc(type)
+  fn.emit({ _tag: 'Move', destination, source: result, provenance: authored(expression.span) })
+  return { result: destination }
 }
 
 /** Captures a selected eager computation, preserving ordinary return and loop exits. */
@@ -1718,7 +1739,8 @@ function lowerEffectBlockExpression(
 ): LoweredExpression | undefined {
   const semanticType = fn.semantic(expression.type)
   const type = Type.isEffect(semanticType)
-    ? effectValueType(fn.layout, fn.owner.key, expression, semanticType)
+    ? (returnedEffectValueType(fn.layout, fn.owner, expression) ??
+      effectValueType(fn.layout, fn.owner.key, expression, semanticType))
     : undefined
   if (type === undefined) return undefined
   const captures: Array<{

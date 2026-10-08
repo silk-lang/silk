@@ -2935,6 +2935,58 @@ it('scopes raw callable blueprint environments while retaining actual capture de
   assert.include(Type.freeLifetimes(retainedCapture).map(Lifetime.key), Lifetime.key(use))
 })
 
+it('keeps selected lexical generic contents outside the original callable blueprint quantifier', () => {
+  const owner = { module: 'lexical-blueprint', name: 'hidden' }
+  const lexical = Type.parameter({ ...owner, name: 'caller' }, 0, 'T')
+  const formation = Lifetime.local({ ...owner, name: 'caller' }, 'Environment', 1)
+  const contract = CallableContract.make({
+    ...detached,
+    functionKind: 'Function',
+    binders: [lexical],
+    parameters: [{ type: lexical, mode: 'Value' }],
+    result: lexical,
+  })
+  const schema: Type.CallableSchema = {
+    source: owner,
+    contract,
+    binders: [lexical],
+    constraints: [],
+    evidence: [],
+    substitution: new Map([[Type.key(lexical), lexical]]),
+    contractKey: CallableContract.key(contract),
+    constraintKeys: [],
+    evidenceKeys: [],
+    origins: [],
+  }
+  const actual = Type.callable(
+    [lexical],
+    lexical,
+    {
+      environment: formation,
+      lifetimeBinders: [],
+      typeOutlives: [{ type: lexical, lifetime: formation }],
+    },
+    'Take',
+    schema,
+  )
+  assert.deepEqual(Type.parameters(actual), [lexical])
+  assert.deepEqual(Type.storageParameters(actual), [])
+  assert.deepEqual(Type.executableFormationRequirements(actual).typeOutlives, [
+    { type: lexical, lifetime: formation },
+  ])
+  const unselected = Type.callable(actual.parameters, actual.result, actual, actual.mode, {
+    ...schema,
+    substitution: new Map(),
+  })
+  assert.deepEqual(Type.parameters(unselected), [])
+  assert.deepEqual(Type.executableFormationRequirements(unselected).typeOutlives, [])
+  const selectedBorrow = Type.callable([], 'i32', detached, 'Take', {
+    ...schema,
+    substitution: new Map([[Type.key(lexical), Type.reference('Shared', 'i32', formation)]]),
+  })
+  assert.include(Type.freeLifetimes(selectedBorrow).map(Lifetime.key), Lifetime.key(formation))
+})
+
 it('opens actual invocation lifetimes without defaulting independent data or generic inputs', () => {
   const owner = { module: 'invocation-opening', name: 'offered' }
   const caller = { module: 'invocation-opening', name: 'caller' }

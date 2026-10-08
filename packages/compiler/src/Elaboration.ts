@@ -326,6 +326,8 @@ export interface IdentifierExpressionDecision {
   /** Concrete compile-time value retained while residualizing a runtime specialization. */
   readonly staticValue?: StaticValue.Value
   readonly type: ExpressionTypeFact
+  readonly originalType?: SemanticType
+  readonly invocationSource?: Tir.StoredInvocationSource
   readonly anchor: AuthoredHir.Anchor
 }
 
@@ -339,6 +341,8 @@ export interface MoveExpressionDecision {
   >
   readonly concreteCallableIdentity?: true
   readonly type: ExpressionTypeFact
+  readonly originalType?: SemanticType
+  readonly invocationSource?: Tir.StoredInvocationSource
   readonly anchor: AuthoredHir.Anchor
 }
 
@@ -1247,6 +1251,7 @@ export interface ArgumentFact {
   /** Construction-only loan root needed by intrinsics that project through an argument. */
   readonly borrowRoot?: BorrowRootFact
   readonly type: ExpressionTypeFact
+  readonly invocationSource?: Tir.StoredInvocationSource
   readonly anchor: AuthoredHir.Anchor
 }
 
@@ -1856,6 +1861,13 @@ export const argumentFact = (
       }
     return undefined
   })()
+  const invocationSource = (() => {
+    if ('fact' in input)
+      return input.fact._tag === 'Identifier' || input.fact._tag === 'Move'
+        ? input.fact.invocationSource
+        : undefined
+    return input.invocationSource
+  })()
   return {
     _tag: 'Argument',
     id: {
@@ -1863,6 +1875,7 @@ export const argumentFact = (
       ordinal,
     },
     expression,
+    ...(invocationSource === undefined ? {} : { invocationSource }),
     ...(borrowRoot === undefined ? {} : { borrowRoot }),
     type,
     anchor,

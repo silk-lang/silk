@@ -9,6 +9,7 @@ import * as Instances from './Instances.js'
 import * as ExecutableInputView from './ExecutableInputView.js'
 import type * as Intrinsic from './Intrinsic.js'
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
+import * as EffectProducer from './EffectProducer.js'
 import * as Layout from './Layout.js'
 import type { ProvidedRequirement } from './Lower.js'
 import type {} from './LowerExpression.js'
@@ -285,15 +286,15 @@ export const returnedEffectValueType = (
   block: Extract<Tir.Expression, { readonly _tag: 'EffectBlock' }>,
 ): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
   const contract = instance.function.contract
-  // Body return admission and the solved instance establish this view. Construction itself
-  // keeps block.type; the descriptor still selects the same actual instance, site and fields.
+  // Body return admission and the solved instance establish the one contract of this exact
+  // returned producer. Its constructor and runner use the same physical instance and fields.
   const requested =
     contract._tag === 'Contract' &&
     contract.functionKind !== 'Effect' &&
     Type.isEffect(instance.specialization.result)
-      ? instance.specialization.result
+      ? EffectProducer.returnedContract(instance, block)
       : Type.substitute(block.type, instance.substitution, instance.specialization.compatibility)
-  return Type.isEffect(requested)
+  return requested !== undefined && Type.isEffect(requested)
     ? effectValueType(layout, instance.key, block, requested)
     : undefined
 }

@@ -22,6 +22,235 @@ const codesOf = (snapshot: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code)
 
 it.effect(
+  'keeps a private recovery binder distinct from the primitive outer environment binder',
+  () =>
+    Effect.gen(function* () {
+      const module = 'effect-typing/private-recovery-binder'
+      const snapshot = yield* snapshotOf(
+        module,
+        `struct Problem {}
+effect fn risky() -> i32 ! Problem { fail Problem {} }
+effect fn recover(error: Problem) -> i32 { drop error return 42 }
+fn inspectCatch() -> once Effect<'static; i32> {
+  return Intrinsic.catchFailure<Problem>(risky(), recover)
+}
+pub fn main() -> i32 { return run inspectCatch() }`,
+      )
+      assert.deepEqual(codesOf(snapshot), [])
+      const body =
+        snapshot.results
+          .get(module)
+          ?.bodies.find(
+            (candidate) =>
+              candidate.declaration.name._tag === 'Present' &&
+              candidate.declaration.name.spelling === 'inspectCatch',
+          ) ?? unreachable('expected original static recovery factory')
+      const caught =
+        body.function.statements
+          .flatMap(Tir.statementExpressions)
+          .flatMap(Tir.expressionTree)
+          .find((expression) => expression._tag === 'EffectCatch') ??
+        unreachable('expected original recovery producer')
+      if (caught._tag !== 'EffectCatch' || !Type.isEffect(caught.type))
+        return unreachable('expected original caught Effect')
+      const recipe = caught.recoveryInvocation ?? unreachable('expected private invocation recipe')
+      assert.strictEqual(recipe.binder.ordinal, 0)
+      assert.strictEqual(recipe.lifetime.context, `Invocation:${Lifetime.key(recipe.binder)}`)
+      assert.isFalse(Lifetime.equals(recipe.lifetime, caught.type.environment))
+      const expectedOwner = { _tag: 'CanonicalDeclarationId', module, name: 'inspectCatch' }
+      assert.deepEqual(recipe.owner, expectedOwner)
+    }),
+)
+
+it.effect(
+  'infers contextual anonymous data from the original caller input without changing explicit selections',
+  () =>
+    Effect.gen(function* () {
+      for (const prefix of ['', "<'data>"]) {
+        const module = `effect-typing/anonymous-data-${prefix.length === 0 ? 'implicit' : 'explicit'}`
+        const snapshot = yield* AnalysisFixture.retainingMain(
+          module,
+          ascii(`struct Owner { value: i32 }
+struct Guard { offset: i32 }
+impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
+effect<'data> fn applyOwned<'data>(owner: &'data Owner,
+  callback: for<use 'call> once fn<'static>(&'data Owner) -> once Effect<'call; i32>
+) -> i32 { return run callback(owner) }
+fn probe<'data>(owner: &'data Owner) -> i32 {
+  let guard = Guard { offset: 2 }
+  return run applyOwned${prefix}(owner, effect fn(input: &'data Owner) -> i32 {
+    let consumed = move guard
+    return input.value + consumed.offset
+  })
+}
+pub fn main() -> i32 {
+  let owner = Owner { value: 40 }
+  return probe(&owner)
+}`),
+          'wasm32-unknown-unknown',
+          { normalizeMir: false },
+        )
+        assert.deepEqual(codesOf(snapshot), [], prefix)
+        assert.strictEqual(snapshot.mir._tag, 'Available')
+        assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+        const body =
+          snapshot.results
+            .get(module)
+            ?.bodies.find(
+              (body) =>
+                body.declaration.name._tag === 'Present' &&
+                body.declaration.name.spelling === 'probe',
+            ) ?? unreachable('expected original caller body')
+        const owner = body.function.declaration.parameters[0]?.declaredType
+        if (owner?._tag !== 'Resolved' || !Type.isReference(owner.type))
+          return unreachable('expected original authored borrowed input')
+        const call =
+          body.function.statements
+            .flatMap(Tir.statementExpressions)
+            .flatMap(Tir.expressionTree)
+            .find(
+              (expression) =>
+                expression._tag === 'EffectConstruct' && expression.target.name === 'applyOwned',
+            ) ?? unreachable('expected contextual consumer')
+        if (call._tag !== 'EffectConstruct') return unreachable('expected consumer Effect')
+        assert.isTrue(
+          Type.equalsGenericArgument(call.typeArguments[0] ?? 'never', owner.type.lifetime),
+        )
+      }
+    }),
+)
+
+it.effect(
+  'defers original lifetime selections until a staged callable receives its missing input',
+  () =>
+    Effect.gen(function* () {
+      const module = 'effect-typing/staged-deferred-input'
+      const snapshot = yield* snapshotOf(
+        module,
+        `struct Owner { value: i32 }
+struct Guard { offset: i32 }
+impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
+effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
+  return owner.value + guard.offset
+}
+fn probe<'data>(owner: &'data Owner) -> i32 {
+  let base = recovered
+  let selected = base(Guard { offset: 2 })
+  return run selected(owner)
+}
+pub fn main() -> i32 {
+  let owner = Owner { value: 40 }
+  return probe(&owner)
+}`,
+      )
+      assert.deepEqual(codesOf(snapshot), [])
+      const body =
+        snapshot.results
+          .get(module)
+          ?.bodies.find(
+            (candidate) =>
+              candidate.declaration.name._tag === 'Present' &&
+              candidate.declaration.name.spelling === 'probe',
+          ) ?? unreachable('expected original staged caller')
+      const stage =
+        body.function.statements
+          .flatMap(Tir.statementExpressions)
+          .flatMap(Tir.expressionTree)
+          .find(
+            (expression) => expression._tag === 'CallableApply' && expression.staged !== undefined,
+          ) ?? unreachable('expected original staged producer')
+      if (stage._tag !== 'CallableApply' || !Type.isCallable(stage.type))
+        return unreachable('expected deferred original callable')
+      assert.lengthOf(stage.type.lifetimeBinders, 2)
+      const schema = stage.type.schema ?? unreachable('expected original source schema')
+      const originalSource = { _tag: 'CanonicalDeclarationId', module, name: 'recovered' }
+      assert.deepEqual(schema.source, originalSource)
+      for (const binder of stage.type.lifetimeBinders)
+        assert.isFalse(schema.substitution.has(Lifetime.key(binder)))
+    }),
+)
+
+for (const [name, formation] of [
+  ['immutable-section', 'let selected = recovered(Guard { offset: 2 })'],
+  ['immutable-stage', 'let base = recovered\n  let selected = base(Guard { offset: 2 })'],
+] as const) {
+  it.effect(`authenticates the original producer graph before adapting ${name}`, () =>
+    Effect.gen(function* () {
+      const module = `effect-typing/stored-${name}`
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        module,
+        ascii(`struct Owner { value: i32 }
+struct Guard { offset: i32 }
+impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
+effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
+  return owner.value + guard.offset
+}
+effect<'data> fn applyOwned<'data>(owner: &'data Owner,
+  callback: for<use 'call> once fn<'static>(&'data Owner) -> once Effect<'call; i32>
+) -> i32 { return run callback(owner) }
+fn probe<'data>(owner: &'data Owner) -> i32 {
+  ${formation}
+  return run applyOwned<'data>(owner, move selected)
+}
+pub fn main() -> i32 {
+  let owner = Owner { value: 40 }
+  return probe(&owner)
+}`),
+        'x86_64-unknown-linux-gnu',
+        { normalizeMir: false },
+      )
+      assert.deepEqual(codesOf(snapshot), [])
+      const body =
+        snapshot.results
+          .get(module)
+          ?.bodies.find(
+            (candidate) =>
+              candidate.declaration.name._tag === 'Present' &&
+              candidate.declaration.name.spelling === 'probe',
+          ) ?? unreachable('expected actual consuming caller')
+      const call =
+        body.function.statements
+          .flatMap(Tir.statementExpressions)
+          .flatMap(Tir.expressionTree)
+          .find(
+            (expression) =>
+              expression._tag === 'EffectConstruct' && expression.target.name === 'applyOwned',
+          ) ?? unreachable('expected checked consumer')
+      if (call._tag !== 'EffectConstruct') return unreachable('expected original Effect producer')
+      const view =
+        call.inputViews?.find((view) => view.parameter.ordinal === 1) ??
+        unreachable('expected immutable source admission')
+      const source = view.invocationSource ?? unreachable('expected held original producer graph')
+      assert.deepEqual(source.target, { _tag: 'CanonicalDeclarationId', module, name: 'recovered' })
+      assert.deepEqual(source.originalInputs, [0, 1])
+      assert.deepEqual(source.parameters, [0])
+      assert.lengthOf(source.captures, 1)
+      assert.strictEqual(source.captures[0]?.parameter, 1)
+      assert.strictEqual(source.producers[0]?.kind, 'Binding')
+      assert.strictEqual(
+        source.producers.some((producer) => producer.kind === 'Stage'),
+        name === 'immutable-stage',
+      )
+      const operand = call.arguments[1] ?? unreachable('expected consuming operand')
+      assert.strictEqual(operand._tag, 'Move')
+      if (
+        operand._tag !== 'Move' ||
+        !Type.isCallable(operand.type) ||
+        !Type.isCallable(view.actual)
+      )
+        return unreachable('expected original callable')
+      assert.isUndefined(operand.type.invocationUse)
+      assert.isTrue(Type.equals(operand.type, view.actual))
+      assert.lengthOf(operand.type.lifetimeBinders, 2)
+      assert.isDefined(source.selected.invocationUse)
+      assert.strictEqual(source.selected.schema?.invocationAdapter?.parameters[0], 0)
+      assert.strictEqual(snapshot.mir._tag, 'Available')
+      assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
+    }),
+  )
+}
+
+it.effect(
   'retains original call and operand provenance for checked executable parameter views',
   () =>
     Effect.gen(function* () {

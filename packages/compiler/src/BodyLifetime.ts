@@ -96,6 +96,22 @@ export const region = (
     : Lifetime.local(self.owner, `${role}:${binderOrdinal}`, ordinal)
 }
 
+/** An invocation role is identified by its original binder, beyond its ordinal namespace. */
+export const invocationContext = (binder: Lifetime.Bound): string =>
+  `Invocation:${Lifetime.key(binder)}`
+
+/** Opens the original input-use role without aliasing a free environment/data template slot. */
+export const invocationRegion = (
+  self: BodyLifetime,
+  anchor: AuthoredHir.Anchor,
+  binder: Lifetime.Bound,
+): Lifetime.Local | undefined => {
+  const ordinal = self.points.get(AuthoredIdentity.anchorKey(anchor))
+  return ordinal === undefined
+    ? undefined
+    : Lifetime.local(self.owner, invocationContext(binder), ordinal)
+}
+
 /** Creates one body comparison cache; local obligations are retained for its finite region solve. */
 export const compatibility = (
   self: BodyLifetime,

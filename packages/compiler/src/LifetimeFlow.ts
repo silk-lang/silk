@@ -452,7 +452,7 @@ export const analyze = (
     usage: Pick<Tir.InvocationUseObligation, 'owner' | 'origin' | 'binder' | 'lifetime'>,
     point: number,
   ): void => {
-    const expected = BodyLifetime.region(body, usage.origin, 'Call', usage.binder.ordinal)
+    const expected = BodyLifetime.invocationRegion(body, usage.origin, usage.binder)
     if (
       usage.owner.module !== body.owner.module ||
       usage.owner.name !== body.owner.name ||

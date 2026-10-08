@@ -510,23 +510,22 @@ pub fn main() -> i32 {
       ) ?? unreachable('expected genuine marked invocation')
     if (invocation._tag !== 'Call' && invocation._tag !== 'ApplyCallable')
       return assert.fail('expected checked actual invocation')
-    if (
-      invocation._tag !== 'ApplyCallable' ||
-      invocation.callable === undefined ||
-      invocation.target?._tag !== 'DeclarationCallableTarget'
-    )
+    if (invocation._tag !== 'ApplyCallable' || invocation.callable === undefined)
       return assert.fail('expected actual recovery handler declaration and callable')
     const descriptor = main.localTypes.at(invocation.callable.ordinal)
     assert.strictEqual(descriptor?._tag, 'CallableValue')
-    if (descriptor?._tag !== 'CallableValue')
+    if (
+      descriptor?._tag !== 'CallableValue' ||
+      descriptor.target._tag !== 'DeclarationCallableTarget'
+    )
       return assert.fail('expected actual callable descriptor')
-    assert.deepStrictEqual(invocation.target, descriptor.target)
+    assert.isUndefined(invocation.target)
     assert.strictEqual(
-      invocation.target.declaration.module,
+      descriptor.target.declaration.module,
       'test/mir-normalization-invocation-use',
     )
-    assert.strictEqual(invocation.target.declaration.name, 'construct')
-    const target = invocation.target.declaration
+    assert.strictEqual(descriptor.target.declaration.name, 'construct')
+    const target = descriptor.target.declaration
     const constructor =
       program.functions.find(
         (fn) => fn.id.module === target.module && fn.id.name === target.name,

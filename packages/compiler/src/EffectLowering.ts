@@ -37,6 +37,7 @@ import * as SourceSpan from './SourceSpan.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
 import * as TypeInference from './internal/TypeInference.js'
+import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import {
   baseRunnerKey,
   effectValueByIdentity,
@@ -1902,17 +1903,36 @@ export const lowerServiceEffectValue = (
     call.target.declaration.name !== target.name
   )
     return undefined
-  const typeArguments = call?.target.typeArguments ?? provided.witness.typeArguments
+  const typeArguments = call.target.typeArguments
   const semanticType = fn.semantic(subject.type)
   const effectValue =
-    (call?.resultEffect === undefined
+    (call.resultEffect === undefined
       ? undefined
-      : effectValueByIdentity(
-          fn.layout,
-          call.resultEffect,
-          Type.isEffect(semanticType) ? semanticType : undefined,
-        )) ?? fn.effectResults.get(Instances.keyText(call.target))
-  if (effectValue === undefined) return undefined
+      : effectValueByIdentity(fn.layout, call.resultEffect, undefined)) ??
+    fn.effectResults.get(Instances.keyText(call.target))
+  // A selected source provider implements the service requirement itself. Its physical Effect
+  // retains the original provider inputs and environment; only that exact witnessed row member
+  // may differ from the authored service contract.
+  const witnessedProvider =
+    provided.requirementAccess === subject.access &&
+    Type.equals(provided.witness.capability, service) &&
+    Type.equals(provided.witness.provider, provided.providerType) &&
+    (call.providers ?? []).every(
+      (provider) =>
+        provider.role !== provided.role ||
+        !Type.equals(provider.capability, provided.capability) ||
+        Type.equals(provider.providerType, provided.providerType),
+    )
+  const authorizations = witnessedProvider ? [provided] : []
+  const physicalContract =
+    effectValue === undefined ? undefined : EffectExecutionContract.fromType(effectValue.type)
+  if (
+    effectValue === undefined ||
+    physicalContract === undefined ||
+    !Type.isEffect(semanticType) ||
+    !EffectExecutionContract.matches(semanticType, physicalContract, authorizations)
+  )
+    return undefined
   const effect = fn.alloc(effectValue)
   fn.emit({
     _tag: 'Call',

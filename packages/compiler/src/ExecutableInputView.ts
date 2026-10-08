@@ -1,12 +1,16 @@
 import * as AuthoredIdentity from './AuthoredIdentity.js'
+import * as BodyView from './BodyView.js'
 import * as CallableContract from './CallableContract.js'
 import * as Constraint from './Constraint.js'
 import * as Instances from './Instances.js'
 import * as Lifetime from './Lifetime.js'
-import type * as Mir from './Mir.js'
+import * as Layout from './Layout.js'
+import * as Mir from './Mir.js'
 import * as Tir from './Tir.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
+import * as TypeInference from './internal/TypeInference.js'
+import * as StoredInvocationView from './StoredInvocationView.js'
 import * as ValueType from './ValueType.js'
 
 /** Replays one executable parameter view against the held original checked call graph. */
@@ -50,6 +54,9 @@ export const key = (view: Tir.ExecutableInputView): string =>
     view.operand.node.ordinal,
     AuthoredIdentity.anchorKey(view.operandOrigin),
     typeKey(view.actual),
+    view.invocationSource === undefined
+      ? undefined
+      : [StoredInvocationView.key(view.invocationSource), typeKey(view.invocationSource.selected)],
     view.target.module,
     view.target.name,
     view.parameter.ordinal,
@@ -152,7 +159,7 @@ const authenticateChecked = (
     !sameDeclaration(callerId.id, original.caller) ||
     !sameDeclaration(calleeId.id, original.target) ||
     caller.ownership.verdict._tag !== 'Satisfied' ||
-    caller.view.causes.length !== 0 ||
+    BodyView.hasUnavailable(caller.view) ||
     caller.view.lifetimes === undefined ||
     caller.view.lifetimes.diagnostics.length !== 0 ||
     caller.view.lifetimes.solution._tag !== 'Solved' ||
@@ -196,6 +203,11 @@ const authenticateChecked = (
     return undefined
   const actual = Type.isRepresented(operand.type) ? operand.type.contract : operand.type
   if (typeKey(actual) !== typeKey(original.actual)) return undefined
+  if (
+    original.invocationSource !== undefined &&
+    !StoredInvocationView.authentic(caller, original, operand)
+  )
+    return undefined
   const selectedSource = Tir.substituteExecutableInputView(
     original,
     caller.substitution,
@@ -258,8 +270,43 @@ const authenticateChecked = (
     typeBounds: selected.premises.typeBounds,
     invocationInputs: selected.premises.invocationInputs,
   })
+  let checked = selected.actual
+  if (selected.invocationSource !== undefined) {
+    if (!Type.isCallable(selected.actual) || !Type.isCallable(selected.expected)) return undefined
+    const schema = selected.actual.schema
+    if (schema === undefined) return undefined
+    const formations = selected.premises.formations.filter((formation) =>
+      Lifetime.equals(formation.environment, selected.actual.environment),
+    )
+    const formationContext = {
+      ...compatibility,
+      assumptions: Lifetime.mergeAssumptions(
+        compatibility.assumptions,
+        Lifetime.assumptions(formations.flatMap((formation) => formation.lifetimeBounds)),
+      ),
+      typeBounds: [
+        ...compatibility.typeBounds,
+        ...formations.flatMap((formation) => formation.typeOutlives),
+      ],
+    }
+    const replay = TypeInference.adaptInvocationCallable(
+      selected.actual,
+      selected.expected,
+      schema.binders,
+      selected.invocationSource.originalSubstitution,
+      formationContext,
+      undefined,
+      selected.invocationSource.parameters,
+    )
+    if (
+      replay === undefined ||
+      typeKey(replay.callable) !== typeKey(selected.invocationSource.selected)
+    )
+      return undefined
+    checked = replay.callable
+  }
   return TypeCompatibility.isCompatible(
-    TypeCompatibility.check(selected.actual, selected.expected, compatibility),
+    TypeCompatibility.check(checked, selected.expected, compatibility),
   )
     ? source
     : undefined
@@ -304,6 +351,88 @@ export const authority = (
 
 /** Independently held original source graph and its physical layout. */
 type Program = Pick<Mir.Module, 'layout' | 'executableInputViews'>
+
+/** Selects only the unique held call argument that is being consumed at this source occurrence. */
+export const operandView = (
+  instances: ReadonlyArray<Instances.Instance>,
+  calls: ReadonlyArray<Instances.CallInstance>,
+  owner: Instances.InstanceKey,
+  operand: Tir.Expression,
+): Mir.ExecutableInputView | undefined => {
+  if (operand.id === undefined) return undefined
+  const candidates = catalog(instances, calls).filter(
+    (source) =>
+      Instances.keyText(source.call.owner) === Instances.keyText(owner) &&
+      source.original.operand.node.ordinal === operand.id?.ordinal &&
+      source.original.invocationSource !== undefined,
+  )
+  const source = candidates.at(0)
+  if (candidates.length !== 1 || source?.call.node === undefined) return undefined
+  const proof = { owner, callNode: source.call.node, view: source.selected }
+  return authority(instances, calls, proof) === undefined ? undefined : proof
+}
+
+/** Replays a stored callable view against the exact original physical closure and runtime lanes. */
+export const physicalCallable = (
+  program: Program,
+  local: Extract<Mir.Type, { readonly _tag: 'CallableValue' }>,
+): Extract<Mir.Type, { readonly _tag: 'CallableValue' }> | undefined => {
+  if (local.inputView === undefined) return undefined
+  const { inputView, ...raw } = local
+  const source = authenticate(program.executableInputViews ?? [], inputView)
+  const selection = source?.selected.invocationSource
+  const actual = source?.selected.actual
+  if (
+    source === undefined ||
+    selection === undefined ||
+    actual === undefined ||
+    !Type.isCallable(actual)
+  )
+    return undefined
+  const environment = local.environment
+  const original = source.original.invocationSource
+  const producer = original?.producers.find((item) => item.kind !== 'Binding')
+  const held =
+    producer === undefined
+      ? undefined
+      : expressions(source.caller.function).find(
+          (expression) => expression.id?.ordinal === producer.node.node.ordinal,
+        )
+  let site: Tir.CallableSiteId | undefined
+  if (held?._tag === 'CallableApply') site = held.staged?.site
+  else if (held?._tag === 'CallableSection') site = held.site
+  if (
+    local.target._tag !== 'DeclarationCallableTarget' ||
+    !sameDeclaration(local.target.declaration, selection.target) ||
+    typeKey(local.type) !== typeKey(selection.selected) ||
+    Type.runtimeKey(actual) !== Type.runtimeKey(selection.selected)
+  )
+    return undefined
+  if (environment === undefined) {
+    return held?._tag === 'FunctionItem' && site === undefined && local.site === undefined
+      ? { ...raw, type: actual }
+      : undefined
+  }
+  const environments = program.layout.callableEnvironments.filter(
+    (candidate) =>
+      candidate._tag === 'CallableEnvironment' &&
+      Instances.keyText(candidate.callable.owner) === Instances.keyText(source.caller.key) &&
+      site !== undefined &&
+      Tir.sameExecutableSite(candidate.callable.site, site),
+  )
+  const physical = environments.at(0)
+  if (
+    environments.length !== 1 ||
+    physical?._tag !== 'CallableEnvironment' ||
+    environment !== physical ||
+    local.site === undefined ||
+    !Tir.sameExecutableSite(local.site, physical.callable.site) ||
+    typeKey({ ...physical.callable.type, mode: physical.callable.mode }) !== typeKey(actual) ||
+    !Mir.runtimeArgumentsEqual(local.typeArguments ?? [], Layout.callableTargetArguments(physical))
+  )
+    return undefined
+  return { ...raw, type: actual }
+}
 
 /** Authenticates a parameter view without changing its actual closure identity or channels. */
 export const physical = (

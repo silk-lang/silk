@@ -1172,7 +1172,7 @@ export type Operation =
       readonly staticArguments?: ReadonlyArray<StaticValue.Value>
       readonly arguments: ReadonlyArray<LocalId>
       readonly outcomeType: Extract<Type, { readonly _tag: 'EffectOutcome' }>
-      readonly propagationType: Extract<Type, { readonly _tag: 'EffectOutcome' }>
+      readonly propagationType?: Extract<Type, { readonly _tag: 'EffectOutcome' }>
       readonly tagMappings: ReadonlyArray<{
         readonly source: number
         readonly target: number

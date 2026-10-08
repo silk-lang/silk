@@ -31,6 +31,28 @@ export type InvocationCapturePathStep =
   | { readonly _tag: 'Base'; readonly site: CallableSiteId }
   | { readonly _tag: 'Capture'; readonly site: CallableSiteId; readonly ordinal: number }
 
+/** Original evaluated immutable producer graph for a consuming contextual invocation view. */
+export interface StoredInvocationSource {
+  readonly target: DeclarationFacts.CanonicalId
+  readonly producers: ReadonlyArray<{
+    readonly node: NodeRef
+    readonly origin: AuthoredIdentity.Anchor
+    readonly kind: 'Binding' | 'Stage' | 'Section' | 'FunctionItem'
+    readonly binding?: LocalId
+  }>
+  readonly originalInputs: ReadonlyArray<number>
+  readonly parameters: ReadonlyArray<number>
+  readonly captures: ReadonlyArray<{
+    readonly parameter: number
+    readonly capture: number
+    readonly expression: NodeRef
+    readonly leaf: CallableSiteId
+    readonly capturePath?: ReadonlyArray<InvocationCapturePathStep>
+  }>
+  readonly originalSubstitution: Type.Substitution
+  readonly selected: Type.Callable
+}
+
 /** One source-checked executable argument at its original declaration parameter boundary. */
 export interface ExecutableInputView {
   readonly caller: DeclarationFacts.CanonicalId
@@ -38,6 +60,7 @@ export interface ExecutableInputView {
   readonly operand: NodeRef
   readonly operandOrigin: AuthoredIdentity.Anchor
   readonly actual: Type.Callable | Type.Effect
+  readonly invocationSource?: StoredInvocationSource
   readonly target: DeclarationFacts.CanonicalId
   readonly parameter: {
     readonly ordinal: number
@@ -72,11 +95,17 @@ export const substituteExecutableInputView = (
 ): ExecutableInputView => {
   const actual = Type.substitute(view.actual, substitution, compatibility)
   const expected = Type.substitute(view.expected, substitution, compatibility)
+  const selected =
+    view.invocationSource === undefined
+      ? undefined
+      : Type.substitute(view.invocationSource.selected, substitution, compatibility)
   if (
     (!Type.isCallable(actual) && !Type.isEffect(actual)) ||
     (!Type.isCallable(expected) && !Type.isEffect(expected))
   )
     throw new RangeError('executable argument view lost its original source kind')
+  if (selected !== undefined && !Type.isCallable(selected))
+    throw new RangeError('stored invocation source lost its selected callable')
   const bound = (entry: Lifetime.Outlives): Lifetime.Outlives => ({
     longer: Type.substituteLifetime(entry.longer, substitution),
     shorter: Type.substituteLifetime(entry.shorter, substitution),
@@ -89,6 +118,20 @@ export const substituteExecutableInputView = (
     ...view,
     actual,
     expected,
+    ...(view.invocationSource === undefined || selected === undefined
+      ? {}
+      : {
+          invocationSource: {
+            ...view.invocationSource,
+            originalSubstitution: new Map(
+              [...view.invocationSource.originalSubstitution].map(([key, argument]) => [
+                key,
+                Type.substituteGenericArgument(argument, substitution, compatibility),
+              ]),
+            ),
+            selected,
+          },
+        }),
     substitution: new Map(
       [...view.substitution].map(([key, argument]) => [
         key,

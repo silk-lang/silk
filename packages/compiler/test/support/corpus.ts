@@ -7420,6 +7420,71 @@ pub effect fn main() -> i32 ! StartupProblem | HostInputError ? &mut HostInput {
   fail StartupProblem {}
 }`
 
+// Reuse the authored lifetime-sensitive event oracles while varying ordinary handler storage.
+const borrowedRecoveryVariants = (
+  name: string,
+  substitutions: ReadonlyArray<{
+    readonly inline: string
+    readonly stored: string
+    readonly staged: string
+  }>,
+): ReadonlyArray<CorpusProgram> => {
+  const original = corpus.find((program) => program.name === name)
+  if (original === undefined) throw new Error(`missing canonical borrowed recovery case ${name}`)
+  return (['stored-handler', 'staged-handler'] as const).map((variant) => {
+    let source = original.source
+    for (const substitution of substitutions) {
+      if (!source.includes(substitution.inline))
+        throw new Error(`missing canonical recovery call in ${name}`)
+      source = source.replace(
+        substitution.inline,
+        variant === 'stored-handler' ? substitution.stored : substitution.staged,
+      )
+    }
+    return { ...original, name: `${name}-${variant}`, source }
+  })
+}
+
+const borrowedRecoveryStorageCorpus: ReadonlyArray<CorpusProgram> = [
+  ...borrowedRecoveryVariants('effect-borrowed-recovery-owned-cleanup', [
+    {
+      inline:
+        '  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), recovered(Guard { id: 2, offset: 2 }))',
+      stored:
+        '  let selectedHandler = recovered(Guard { id: 2, offset: 2 })\n  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), move selectedHandler)',
+      staged:
+        '  let selectedBase = recovered\n  let selectedHandler = selectedBase(Guard { id: 2, offset: 2 })\n  let selected = run Effect.catchAll<never, i32, &Owner, never>(failed(&owner), move selectedHandler)',
+    },
+    {
+      inline:
+        '  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), recovered(Guard { id: 3, offset: 2 }))',
+      stored:
+        '  let bypassedHandler = recovered(Guard { id: 3, offset: 2 })\n  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), move bypassedHandler)',
+      staged:
+        '  let bypassedBase = recovered\n  let bypassedHandler = bypassedBase(Guard { id: 3, offset: 2 })\n  let bypassed = run Effect.catchAll<i32, i32, &Owner, never>(succeeded(&owner), move bypassedHandler)',
+    },
+  ]),
+  ...borrowedRecoveryVariants('effect-borrowed-recovery-park-resume-cancel', [
+    {
+      inline: `  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    recovered(Guard { offset: 2, resume: resume }),
+  )`,
+      stored: `  let handler = recovered(Guard { offset: 2, resume: resume })
+  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    move handler,
+  )`,
+      staged: `  let base = recovered
+  let handler = base(Guard { offset: 2, resume: resume })
+  let result = run Effect.catchAll<never, i32, &Owner, never>(
+    failed(&owner),
+    move handler,
+  )`,
+    },
+  ]),
+]
+
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
   {
     name: 'owned-allocation-preflight-refusal',
@@ -9852,6 +9917,7 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   ...corpus,
+  ...borrowedRecoveryStorageCorpus,
   ...algorithmExamples,
   algorithmicCompilerFold,
   ...pressurePrograms,

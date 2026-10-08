@@ -59,10 +59,11 @@ pub fn main() -> i32 {
   let owner = Owner { value: 40 }
   return probe(&owner)
 }`
-      const snapshot = yield* AnalysisFixture.frontend(
+      const snapshot = yield* AnalysisFixture.retainingMain(
         'stored-callable-mir/anonymous-invocation-provenance',
         ascii(source),
         Target.wasm32UnknownUnknown.id,
+        { normalizeMir: false },
       )
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
       const section = Analysis.expressionsOf(snapshot, snapshot.closure.rootModule).find(
@@ -120,6 +121,7 @@ pub fn main() -> i32 {
           return selected !== undefined && Type.equalsGenericArgument(selected, argument)
         }),
       )
+      assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
       const borrowedCaptureSource = source.replace(
         'let consumed = move guard\n    return input.value + consumed.offset',
         'return input.value + guard.offset',

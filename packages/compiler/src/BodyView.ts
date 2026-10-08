@@ -44,3 +44,33 @@ export const cause = (
   self: BodyView,
   ref: Tir.CauseRef,
 ): Diagnostic.Identity<Location.Location> | undefined => self.causes.at(ref.ordinal)
+
+/** Diagnostic payload rows can outlive their references; availability follows held runtime nodes. */
+export const hasUnavailable = (self: BodyView): boolean => {
+  const seen = new Set<Tir.Statement>()
+  const visit = (statements: ReadonlyArray<Tir.Statement>): boolean => {
+    for (const statement of statements) {
+      if (seen.has(statement)) continue
+      seen.add(statement)
+      if (statement._tag === 'UnavailableStatement') return true
+      if (statement._tag === 'Unsafe' && visit(statement.statements)) return true
+      if (statement._tag === 'While' && visit(statement.body)) return true
+      if (
+        (statement._tag === 'If' || statement._tag === 'IfLet') &&
+        (visit(statement.taken) || visit(statement.otherwise))
+      )
+        return true
+      for (const expression of Tir.statementExpressions(statement).flatMap(
+        Tir.runtimeExpressionTree,
+      )) {
+        if (expression._tag === 'Unavailable') return true
+        if (expression._tag === 'EffectBlock' && visit(expression.statements)) return true
+        if (expression._tag === 'Match')
+          for (const arm of expression.arms)
+            if (arm.body._tag === 'Block' && visit(arm.body.statements)) return true
+      }
+    }
+    return false
+  }
+  return visit(self.function.statements)
+}

@@ -66,15 +66,62 @@ type ConstructorGuard = 'SingleRegion' | 'TrivialCleanup'
 const constructorGuardOf = (shape: ConstructorShape): ConstructorGuard =>
   shape.fn.regions.length === 1 ? 'SingleRegion' : 'TrivialCleanup'
 
+/** A captureless function item remains an exact target through its real callable value. */
+const itemTarget = (
+  owner: Mir.MirFunction | undefined,
+  operation: Extract<Mir.Operation, { readonly _tag: 'ApplyCallable' }>,
+): DeclarationFacts.CanonicalId | undefined => {
+  if (owner === undefined || operation.callable === undefined) return undefined
+  const type = owner.localTypes.at(operation.callable.ordinal)
+  if (
+    type?._tag !== 'CallableValue' ||
+    type.environment !== undefined ||
+    type.site !== undefined ||
+    type.inputView !== undefined ||
+    type.target._tag !== 'DeclarationCallableTarget'
+  )
+    return undefined
+  const definitions = owner.regions
+    .flatMap(Mir.operationsOf)
+    .flatMap(Mir.operationTree)
+    .filter(
+      (candidate) =>
+        candidate._tag === 'MakeCallable' &&
+        candidate.destination.ordinal === operation.callable?.ordinal,
+    )
+  const definition = definitions.at(0)
+  if (
+    definitions.length !== 1 ||
+    definition?._tag !== 'MakeCallable' ||
+    definition.base !== undefined ||
+    definition.captures.length !== 0 ||
+    definition.target._tag !== 'DeclarationCallableTarget' ||
+    definition.target.declaration.module !== type.target.declaration.module ||
+    definition.target.declaration.name !== type.target.declaration.name ||
+    !Type.equals(definition.type.type, type.type) ||
+    !Mir.runtimeArgumentsEqual(definition.typeArguments, operation.typeArguments)
+  )
+    return undefined
+  return type.target.declaration
+}
+
+const declarationOf = (
+  owner: Mir.MirFunction | undefined,
+  operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+): DeclarationFacts.CanonicalId | undefined => {
+  if (operation._tag === 'Call') return operation.target
+  return operation.target?._tag === 'DeclarationCallableTarget'
+    ? operation.target.declaration
+    : itemTarget(owner, operation)
+}
+
 const directTarget = (
   functions: FunctionIndex.FunctionIndex<Mir.MirFunction>,
   operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+  owner?: Mir.MirFunction,
 ): ConstructorShape | undefined => {
   if (operation.invocationUse !== undefined) {
-    let declaration: Mir.MirFunction['id'] | undefined
-    if (operation._tag === 'Call') declaration = operation.target
-    else if (operation.target?._tag === 'DeclarationCallableTarget')
-      declaration = operation.target.declaration
+    const declaration = declarationOf(owner, operation)
     if (declaration === undefined) return undefined
     const candidates = FunctionIndex.mirInstances(
       functions,
@@ -120,13 +167,9 @@ const directTarget = (
 const hasConcreteTarget = (
   functions: FunctionIndex.FunctionIndex<Mir.MirFunction>,
   operation: Extract<Mir.Operation, { readonly _tag: 'Call' | 'ApplyCallable' }>,
+  owner: Mir.MirFunction,
 ): boolean => {
-  let declaration: DeclarationFacts.CanonicalId | undefined
-  if (operation._tag === 'Call') {
-    declaration = operation.target
-  } else if (operation.target?._tag === 'DeclarationCallableTarget') {
-    declaration = operation.target.declaration
-  }
+  const declaration = declarationOf(owner, operation)
   return (
     declaration !== undefined &&
     FunctionIndex.mirInstances(functions, declaration, operation.typeArguments).length > 0
@@ -208,7 +251,16 @@ export const invocationConstructionValid = (
   )
     return false
   const index = FunctionIndex.make(program.functions, (fn) => fn.id)
-  const target = directTarget(index, source)
+  const owners = program.functions.filter((fn) =>
+    fn.regions
+      .flatMap(Mir.operationsOf)
+      .flatMap(Mir.operationTree)
+      .some(
+        (operation) => operation._tag === 'MakeEffect' && operation.invocationSource === source,
+      ),
+  )
+  if (owners.length !== 1) return false
+  const target = directTarget(index, source, owners.at(0))
   const expected = foldConstructor(target, source)
   if (
     expected === undefined ||
@@ -440,7 +492,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
       const operations = region.operations.map((operation) => {
         const target =
           operation._tag === 'Call' || operation._tag === 'ApplyCallable'
-            ? directTarget(functionIndex, operation)
+            ? directTarget(functionIndex, operation, fn)
             : undefined
         const targetSuspension =
           target === undefined
@@ -459,7 +511,7 @@ export const normalize = (program: Mir.Module, provisional: ProvisionalMir.Modul
               _tag: 'Rejected',
               reason:
                 targetSuspension ??
-                (hasConcreteTarget(functionIndex, operation)
+                (hasConcreteTarget(functionIndex, operation, fn)
                   ? 'ComplexConstructor'
                   : 'DynamicTarget'),
               function: fn.id,

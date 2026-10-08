@@ -77,6 +77,16 @@ const sourceParametersOf = (
       ]
     })
 
+/** An authored callable has source identity even when its signature needs no lifetime annotation. */
+const sourceOwnerOf = (lowering: FunctionLowering): Pick<Mir.MirFunction, 'sourceOwner'> => {
+  const declaration = lowering.owner.function.declaration
+  const canonical = declaration.canonical
+  const owner =
+    declaration.lifetimeElaboration?.owner ??
+    (canonical._tag === 'Canonical' ? canonical.id : undefined)
+  return owner === undefined ? {} : { sourceOwner: owner }
+}
+
 const publishRunnerSuccess = (
   fn: FunctionLowering,
   id: Mir.RegionId,
@@ -517,11 +527,7 @@ export const lowerInstance = (
           sourceInvocationUse: DeclarationFacts.executableLifetimes(fn.declaration).invocationUse,
         }),
     sourceParameters: sourceParametersOf(lowering),
-    ...(lowering.owner.function.declaration.lifetimeElaboration === undefined
-      ? {}
-      : {
-          sourceOwner: lowering.owner.function.declaration.lifetimeElaboration.owner,
-        }),
+    ...sourceOwnerOf(lowering),
     id: instance.key.declaration,
     instance: instance.key,
     ...(fn.declaration.machine === undefined ? {} : { machine: fn.declaration.machine }),
@@ -586,7 +592,11 @@ const effectCaptureParameterTypes = (
     }
     if (field.callableIdentity !== undefined && Type.isCallable(field.type)) {
       const callable = callableValueByIdentity(layout, field.callableIdentity, field.type)
-      return callable === undefined ? [] : [callable]
+      if (callable === undefined) return []
+      if (field.inputView === undefined) return [callable]
+      const selected = field.inputView.view.invocationSource?.selected
+      if (selected === undefined || !Type.equals(selected, field.type)) return []
+      return [{ ...callable, type: selected, inputView: field.inputView }]
     }
     if (Type.isRepresented(field.type)) {
       const represented = representedValueType(layout, opaqueRealizations, field.type, new Map())
@@ -711,11 +721,7 @@ export const lowerEffectRunner = (
     runner: {
       _tag: 'MirFunction',
       sourceParameters: sourceParametersOf(lowering),
-      ...(lowering.owner.function.declaration.lifetimeElaboration === undefined
-        ? {}
-        : {
-            sourceOwner: lowering.owner.function.declaration.lifetimeElaboration.owner,
-          }),
+      ...sourceOwnerOf(lowering),
       id,
       instance,
       parameterCount: parameterTypes.length,
@@ -822,11 +828,7 @@ export const lowerCatchEffectRunner = (
   return {
     _tag: 'MirFunction',
     sourceParameters: sourceParametersOf(lowering),
-    ...(lowering.owner.function.declaration.lifetimeElaboration === undefined
-      ? {}
-      : {
-          sourceOwner: lowering.owner.function.declaration.lifetimeElaboration.owner,
-        }),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: parameterTypes.length,
@@ -950,11 +952,7 @@ export const lowerBuiltinEffectRunner = (
   return {
     _tag: 'MirFunction',
     sourceParameters: sourceParametersOf(lowering),
-    ...(lowering.owner.function.declaration.lifetimeElaboration === undefined
-      ? {}
-      : {
-          sourceOwner: lowering.owner.function.declaration.lifetimeElaboration.owner,
-        }),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: allParameters.length,
@@ -1180,11 +1178,7 @@ export const lowerWitnessEffectRunner = (
   return {
     _tag: 'MirFunction',
     sourceParameters: sourceParametersOf(lowering),
-    ...(lowering.owner.function.declaration.lifetimeElaboration === undefined
-      ? {}
-      : {
-          sourceOwner: lowering.owner.function.declaration.lifetimeElaboration.owner,
-        }),
+    ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
     parameterCount: allParameters.length,

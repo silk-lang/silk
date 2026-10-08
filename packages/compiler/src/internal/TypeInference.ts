@@ -31,6 +31,7 @@ import {
   lifetimes,
   encode,
   equals,
+  equalsGenericArgument,
   failureMemberParameters,
   failureMembers,
   failureType,
@@ -1409,6 +1410,21 @@ export const adaptInvocationCallable = (
           return undefined
         reclosed.set(identity, closed)
       }
+      // Context may select only slots the original evaluated producer left deferred.
+      // An authored or earlier-stage selection remains the same source-owned argument.
+      if (
+        [...initial].some(([identity, argument]) => {
+          const selected = reclosed.get(identity)
+          return selected === undefined || !equalsGenericArgument(argument, selected)
+        }) ||
+        binders.some(
+          (binder) =>
+            binder.kind === 'Lifetime' &&
+            !initial.has(key(binder)) &&
+            !source.lifetimeBinders.some((original) => Lifetime.key(original) === key(binder)),
+        )
+      )
+        return undefined
       const closedSource = substitute(sourcePattern, reclosed)
       if (!isCallable(closedSource)) return undefined
       const originalInputs =

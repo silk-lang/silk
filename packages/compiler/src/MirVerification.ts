@@ -1532,12 +1532,20 @@ export const invocationUseIssues = (
               ),
             )
       const selected = targets.length === 1 ? targets.at(0) : undefined
+      const inputSource =
+        actual?._tag === 'CallableValue' &&
+        actual.inputView !== undefined &&
+        ExecutableInputView.physicalCallable(program, actual) !== undefined
+          ? ExecutableInputView.authenticate(program.executableInputViews ?? [], actual.inputView)
+          : undefined
+      const viewedDesignation =
+        inputSource?.selected.invocationSource?.selected.invocationUse?.lifetime
       // A parameter descriptor may carry the required callable view. Only a concrete
       // environment or the uniquely selected source header supplies the offered designation.
       const originalDesignation =
         actual?._tag === 'CallableValue' && actual.environment !== undefined
-          ? actual.environment.callable.type.invocationUse?.lifetime
-          : selected?.sourceInvocationUse?.lifetime
+          ? (actual.environment.callable.type.invocationUse?.lifetime ?? viewedDesignation)
+          : (selected?.sourceInvocationUse?.lifetime ?? viewedDesignation)
       if (
         originalDesignation?._tag === 'BoundLifetime' &&
         !Lifetime.equals(originalDesignation, invocation.binder)
@@ -5140,7 +5148,9 @@ const computeVerify = Effect.fnUntraced(function* (
           )
             continue
           const valid =
-            local._tag === 'EffectValue' && ExecutableInputView.physical(self, local) !== undefined
+            local._tag === 'EffectValue'
+              ? ExecutableInputView.physical(self, local) !== undefined
+              : ExecutableInputView.physicalCallable(self, local) !== undefined
           if (!valid)
             violations.push({
               _tag: 'Violation',
