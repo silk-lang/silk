@@ -2332,7 +2332,9 @@ export interface Module {
 }
 
 /** Normalizes one header's contract, or keeps it explicitly unavailable with its cause. */
-export const contractOf = (declaration: DeclarationFacts.DeclarationFact): ContractFact => {
+export const contractOf = (
+  declaration: DeclarationFacts.DeclarationFact | DeclarationFacts.ServiceOperationFact,
+): ContractFact => {
   const parameters: Array<DeclarationFacts.SemanticType> = []
   for (const parameter of declaration.parameters) {
     if (parameter.phase === 'Static') continue

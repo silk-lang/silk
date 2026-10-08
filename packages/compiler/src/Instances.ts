@@ -919,6 +919,27 @@ const effectParameterOrdinals = (
   substitution: Type.Substitution,
 ): ReadonlyArray<number> => executableParameters(fn, substitution).effects
 
+/** Maps an original declaration input to the contract's dense runtime parameter tuple. */
+export const runtimeParameterOrdinal = (
+  fn: Tir.TirFunction,
+  originalOrdinal: number,
+): number | undefined => {
+  const parameters = fn.declaration.parameters
+  if (
+    fn.contract._tag !== 'Contract' ||
+    !Number.isInteger(originalOrdinal) ||
+    originalOrdinal < 0 ||
+    originalOrdinal >= parameters.length ||
+    parameters.some((parameter, ordinal) => parameter.id.ordinal !== ordinal) ||
+    parameters.filter((parameter) => parameter.phase === 'Runtime').length !==
+      fn.contract.parameters.length ||
+    parameters.at(originalOrdinal)?.phase !== 'Runtime'
+  )
+    return undefined
+  return parameters.slice(0, originalOrdinal).filter((parameter) => parameter.phase === 'Runtime')
+    .length
+}
+
 export const parameterEffectRepresentationArgument = (
   fn: Tir.TirFunction,
   key: InstanceKey,
@@ -3049,7 +3070,7 @@ export const discover = (
             ? undefined
             : resultEffectIdentity(target, provided.target, results, index)
         providerCalls.set(
-          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${keyText(provided.target)}`,
+          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${provided.node?.ordinal ?? -1}\u0005${keyText(provided.target)}`,
           {
             _tag: 'CallInstance',
             owner: provided.owner,

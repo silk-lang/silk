@@ -5,6 +5,8 @@ import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import type * as CleanupPlan from '../src/CleanupPlan.js'
+import * as ConformanceProof from '../src/ConformanceProof.js'
+import * as Instances from '../src/Instances.js'
 import * as CoroutineFrame from '../src/CoroutineFrame.js'
 import * as Layout from '../src/Layout.js'
 import * as Lifetime from '../src/Lifetime.js'
@@ -17,6 +19,8 @@ import * as NativeOutcomeStorage from '../src/NativeOutcomeStorage.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as ProvisionalMir from '../src/ProvisionalMir.js'
 import * as SourceFile from '../src/SourceFile.js'
+import * as SourceCallView from '../src/SourceCallView.js'
+import * as Tir from '../src/Tir.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as SuspensionMir from '../src/SuspensionMir.js'
 import * as SuspensionOwnership from '../src/SuspensionOwnership.js'
@@ -470,6 +474,189 @@ pub fn main() -> i32 {
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     assert.deepEqual(yield* MirVerification.verify(module), [])
     assert.isTrue(module.functions.some((fn) => fn.id.name.startsWith('impl@0.get$effect$')))
+    const discovery = Analysis.instancesOf(snapshot)
+    const caller =
+      discovery.instances.find((candidate) => candidate.key.declaration.name === 'read') ??
+      unreachable('expected original service caller')
+    const subject = caller.function.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .find(
+        (node): node is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+          node._tag === 'ServiceEffectConstruct',
+      )
+    if (subject === undefined) return unreachable('expected held original service operation')
+    const call = discovery.calls.find(
+      (candidate) =>
+        Instances.keyText(candidate.owner) === Instances.keyText(caller.key) &&
+        candidate.node?.ordinal === subject.id?.ordinal,
+    )
+    if (call === undefined) return unreachable('expected source-owned service call')
+    const implementation = discovery.instances.find(
+      (candidate) => Instances.keyText(candidate.key) === Instances.keyText(call.target),
+    )
+    if (implementation === undefined) return unreachable('expected physical service implementation')
+    const environment = module.layout.effectEnvironments.find(
+      (candidate) =>
+        candidate._tag === 'EffectEnvironment' &&
+        Instances.keyText(candidate.instance) === Instances.keyText(call.target) &&
+        Instances.effectIdentity(candidate.instance, candidate.site) === call.resultEffect,
+    )
+    if (environment?._tag !== 'EffectEnvironment')
+      return unreachable('expected physical service environment')
+    const receiver = implementation.specialization.parameters.at(0)
+    if (receiver === undefined || !Type.isReference(receiver) || !Type.isNominal(receiver.target))
+      return unreachable('expected selected provider receiver')
+    const capability = Type.substitute(subject.service, caller.substitution)
+    if (!Type.isNominal(capability)) return unreachable('expected original Read capability')
+    const index = Analysis.declarationIndex(snapshot)
+    const witness = ConformanceProof.witness(index, receiver.target, capability)
+    if (witness?._tag !== 'SourceConformanceWitness')
+      return unreachable('expected original checked service witness')
+    const binding = {
+      capability,
+      providerType: receiver.target,
+      witness,
+      role: subject.role,
+      access: subject.access,
+      requirementAccess: subject.access,
+    }
+    const held = {
+      owner: caller,
+      index,
+      calls: discovery.calls,
+      instances: discovery.instances,
+      layout: module.layout,
+      semantic: (type: Type.Type) => Type.substitute(type, caller.substitution),
+    }
+    const view =
+      SourceCallView.service(held, subject, call, binding, environment.effect) ??
+      unreachable('expected checked public service input admission')
+    assert.deepEqual(view.operationMapping.contract?.source.declaration.id, view.sourceOperation.id)
+    assert.strictEqual(view.conformance.validity._tag, 'ValidConformance')
+    assert.strictEqual(view.sourceParameters.length, subject.arguments.length)
+    // The public input and physical implementation preserve their distinct original lifetimes.
+    assert.isFalse(
+      Type.equals(
+        view.sourceParameters.at(0) ?? unreachable('expected original public input'),
+        view.implementationParameters.at(1) ?? unreachable('expected physical input'),
+      ),
+    )
+    const sourceParameter = view.sourceParameters.at(0)
+    if (sourceParameter === undefined || !Type.isNominal(sourceParameter))
+      return unreachable('expected original Request input')
+    assert.isTrue(
+      Type.equalsGenericArgument(
+        sourceParameter.arguments.at(0) ?? unreachable('expected public input region'),
+        capability.arguments.at(0) ?? unreachable('expected public capability region'),
+      ),
+    )
+    const copiedOwner = { ...caller, function: { ...caller.function } }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, owner: copiedOwner },
+        subject,
+        call,
+        binding,
+        environment.effect,
+      ),
+    )
+    const copiedSubject = { ...subject }
+    assert.isUndefined(
+      SourceCallView.service(held, copiedSubject, call, binding, environment.effect),
+    )
+    const foreignTarget = {
+      ...call,
+      target: { ...call.target, declaration: { ...call.target.declaration, name: 'foreign' } },
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        {
+          ...held,
+          calls: held.calls.map((candidate) => (candidate === call ? foreignTarget : candidate)),
+        },
+        subject,
+        foreignTarget,
+        binding,
+        environment.effect,
+      ),
+    )
+    const originalMappingContract =
+      view.operationMapping.contract ?? unreachable('expected original typed operation mapping')
+    const copiedMapping = {
+      ...view.operationMapping,
+      contract: {
+        ...originalMappingContract,
+        source: {
+          ...originalMappingContract.source,
+          declaration: {
+            ...view.sourceOperation,
+            id: { ...view.sourceOperation.id, ordinal: view.sourceOperation.id.ordinal + 1 },
+          },
+        },
+      },
+    }
+    const foreignMapping = {
+      ...held.index,
+      modules: held.index.modules.map((entry) => ({
+        ...entry,
+        conformances: entry.conformances.map((candidate) =>
+          candidate === view.conformance
+            ? {
+                ...candidate,
+                operations: candidate.operations.map((mapping) =>
+                  mapping === view.operationMapping ? copiedMapping : mapping,
+                ),
+              }
+            : candidate,
+        ),
+      })),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, index: foreignMapping },
+        subject,
+        call,
+        binding,
+        environment.effect,
+      ),
+    )
+    const changedHeader = {
+      ...view.sourceOperation,
+      parameters: view.sourceOperation.parameters.map((parameter) => ({
+        ...parameter,
+        declaredType:
+          parameter.declaredType._tag === 'Resolved'
+            ? { ...parameter.declaredType, type: Type.unit }
+            : parameter.declaredType,
+      })),
+    }
+    const changedSourceHeader = {
+      ...held.index,
+      modules: held.index.modules.map((entry) => ({
+        ...entry,
+        services: entry.services.map((service) =>
+          service === view.sourceService
+            ? {
+                ...service,
+                operations: service.operations.map((operation) =>
+                  operation === view.sourceOperation ? changedHeader : operation,
+                ),
+              }
+            : service,
+        ),
+      })),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, index: changedSourceHeader },
+        subject,
+        call,
+        binding,
+        environment.effect,
+      ),
+    )
+
     const run =
       module.functions
         .flatMap(MirVerification.operations)

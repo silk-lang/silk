@@ -383,14 +383,14 @@ export const capturedEffect = (
   field: Layout.EffectEnvironmentField,
   context: TypeCompatibility.Context,
 ): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
-  const declared = owner.specialization.parameters.at(field.ordinal)
+  const ordinal = Instances.runtimeParameterOrdinal(owner.function, field.ordinal)
+  const declared = ordinal === undefined ? undefined : owner.specialization.parameters.at(ordinal)
   const expected =
     declared !== undefined && Type.isRepresented(declared) ? declared.contract : declared
-  const identity = Instances.parameterEffectIdentityArgument(
-    owner.function,
-    owner.key,
-    field.ordinal,
-  )
+  const identity =
+    ordinal === undefined
+      ? undefined
+      : Instances.parameterEffectIdentityArgument(owner.function, owner.key, ordinal)
   if (
     field.source !== 'Parameter' ||
     expected === undefined ||
@@ -543,11 +543,19 @@ export const physical = (
       : undefined
   const identity =
     representedIdentity ??
-    Instances.parameterEffectIdentityArgument(
-      source.callee.function,
-      source.callee.key,
-      source.selected.parameter.ordinal,
-    )
+    (() => {
+      const ordinal = Instances.runtimeParameterOrdinal(
+        source.callee.function,
+        source.selected.parameter.ordinal,
+      )
+      return ordinal === undefined
+        ? undefined
+        : Instances.parameterEffectIdentityArgument(
+            source.callee.function,
+            source.callee.key,
+            ordinal,
+          )
+    })()
   const physical =
     identity === undefined
       ? undefined

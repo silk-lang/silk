@@ -1,5 +1,8 @@
+import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as BodyView from './BodyView.js'
+import * as CallableContract from './CallableContract.js'
 import * as ConformanceProof from './ConformanceProof.js'
+import * as DeclarationFacts from './DeclarationFacts.js'
 import * as ExecutableInputView from './ExecutableInputView.js'
 import type { FunctionLowering } from './FunctionLowering.js'
 import * as Instances from './Instances.js'
@@ -7,6 +10,7 @@ import * as Lifetime from './Lifetime.js'
 import type * as Layout from './Layout.js'
 import type { ProvidedRequirement } from './Lower.js'
 import * as NominalVariance from './NominalVariance.js'
+import * as StaticValue from './StaticValue.js'
 import * as Tir from './Tir.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
@@ -18,10 +22,46 @@ export interface SourceCallView {
   readonly caller: Instances.Instance
   readonly call: Instances.CallInstance
   readonly implementation: Instances.Instance
+  readonly sourceService: DeclarationFacts.ServiceFact
+  readonly sourceOperation: DeclarationFacts.ServiceOperationFact
+  readonly conformance: DeclarationFacts.ConformanceFact
+  readonly operationMapping: DeclarationFacts.ConformanceFact['operations'][number]
+  readonly sourceParameters: ReadonlyArray<Type.Type>
+  readonly implementationParameters: ReadonlyArray<Type.Type>
   readonly publicContract: Type.Effect
   readonly physicalContract: Type.Effect
   readonly invocationContract: Type.Effect
 }
+
+/** Completion may retain separate fact objects for the same original source declaration. */
+const sameOperation = (
+  self: DeclarationFacts.ServiceOperationFact,
+  other: DeclarationFacts.ServiceOperationFact,
+  service: DeclarationFacts.ServiceFact,
+): boolean =>
+  self.id.sourceId === other.id.sourceId &&
+  self.id.ordinal === other.id.ordinal &&
+  AuthoredIdentity.anchorKey(self.anchor) === AuthoredIdentity.anchorKey(other.anchor) &&
+  self.state._tag === 'Unique' &&
+  other.state._tag === 'Unique' &&
+  self.state.id.name === other.state.id.name &&
+  self.state.id.service.sourceId === other.state.id.service.sourceId &&
+  self.state.id.service.ordinal === other.state.id.service.ordinal &&
+  self.parameterCount === other.parameterCount &&
+  self.parameters.length === other.parameters.length &&
+  self.parameters.every((parameter, ordinal) => {
+    const original = other.parameters.at(ordinal)
+    return (
+      original !== undefined &&
+      parameter.phase === original.phase &&
+      parameter.id.ordinal === original.id.ordinal &&
+      parameter.id.function.sourceId === original.id.function.sourceId &&
+      parameter.id.function.ordinal === original.id.function.ordinal
+    )
+  }) &&
+  Tir.contractOf(self)._tag === 'Contract' &&
+  CallableContract.key(DeclarationFacts.callableContract(self, service.typeParameters)) ===
+    CallableContract.key(DeclarationFacts.callableContract(other, service.typeParameters))
 
 const realizedAccess = (
   instances: ReadonlyArray<Instances.Instance>,
@@ -56,10 +96,27 @@ const realizedAccess = (
   if (context === undefined) return undefined
   for (const [ordinal, capture] of root.captures.entries()) {
     const field = environment.fields.at(ordinal)
-    const parameter =
+    const runtimeOrdinal =
       capture.parameter === undefined
         ? undefined
-        : implementation.specialization.parameters.at(capture.parameter.ordinal)
+        : Instances.runtimeParameterOrdinal(implementation.function, capture.parameter.ordinal)
+    const parameter =
+      runtimeOrdinal === undefined
+        ? undefined
+        : implementation.specialization.parameters.at(runtimeOrdinal)
+    const capturedEffect =
+      field === undefined ||
+      parameter === undefined ||
+      (Type.equals(field.type, parameter) && field.access === capture.access)
+        ? undefined
+        : ExecutableInputView.capturedEffect(
+            instances,
+            calls,
+            layout,
+            implementation,
+            field,
+            context,
+          )
     if (
       field === undefined ||
       capture.parameter === undefined ||
@@ -69,23 +126,11 @@ const realizedAccess = (
       field.ordinal !== capture.parameter.ordinal ||
       ordinals.has(field.ordinal) ||
       parameter === undefined ||
-      (!Type.equals(field.type, parameter) &&
-        ExecutableInputView.capturedEffect(
-          instances,
-          calls,
-          layout,
-          implementation,
-          field,
-          context,
-        ) === undefined)
+      (!Type.equals(field.type, parameter) && capturedEffect === undefined)
     )
       return undefined
     ordinals.add(field.ordinal)
-    const access =
-      capture.access === 'Take' && ConformanceProof.copyType(index, parameter)
-        ? 'Copy'
-        : capture.access
-    if (field.access !== access) return undefined
+    if (field.access !== (capturedEffect?.type.access ?? capture.access)) return undefined
   }
   if (environment.fields.some((field) => field.access === 'Take')) return 'Take'
   if (environment.fields.some((field) => field.access === 'Exclusive')) return 'Exclusive'
@@ -156,6 +201,11 @@ export const service = (
     Instances.keyText(call.owner) !== Instances.keyText(caller.key) ||
     call.node?.ordinal !== subject.id.ordinal ||
     !fn.calls.includes(call) ||
+    call.target.staticArguments.length !== subject.staticArguments.length ||
+    !call.target.staticArguments.every((argument, ordinal) => {
+      const original = subject.staticArguments.at(ordinal)
+      return original !== undefined && StaticValue.equals(argument, original)
+    }) ||
     provider.witness._tag !== 'SourceConformanceWitness' ||
     provider.role !== subject.role ||
     provider.requirementAccess !== subject.access
@@ -190,6 +240,62 @@ export const service = (
     call.target.declaration.module !== target.module ||
     call.target.declaration.name !== target.name ||
     !Instances.callMatchesProviders(call, [provider])
+  )
+    return undefined
+  const services = fn.index.modules
+    .find((module) => module.module === subject.service.module)
+    ?.services.filter(
+      (candidate) =>
+        candidate.canonical._tag === 'Canonical' &&
+        candidate.canonical.id.name === subject.service.name,
+    )
+  const sourceService = services?.at(0)
+  const operations = sourceService?.operations.filter(
+    (candidate) =>
+      candidate.name._tag === 'Present' && candidate.name.spelling === subject.operation,
+  )
+  const sourceOperation = operations?.at(0)
+  const conformances = fn.index.modules
+    .find((module) => module.module === witness.module)
+    ?.conformances.filter((candidate) => candidate.ordinal === witness.ordinal)
+  const conformance = conformances?.at(0)
+  const mappings = conformance?.operations.filter(
+    (candidate) =>
+      candidate.name._tag === 'Present' && candidate.name.spelling === subject.operation,
+  )
+  const operationMapping = mappings?.at(0)
+  const sourceSubstitution =
+    sourceService === undefined || sourceOperation === undefined
+      ? undefined
+      : TypeInference.substitution(
+          [...sourceService.typeParameters, ...sourceOperation.typeParameters].map(
+            (parameter) => parameter.type,
+          ),
+          subject.typeArguments.map((argument) =>
+            Type.substituteGenericArgument(argument, caller.substitution),
+          ),
+        )
+  const sourceContract = sourceOperation === undefined ? undefined : Tir.contractOf(sourceOperation)
+  if (
+    services?.length !== 1 ||
+    sourceService === undefined ||
+    operations?.length !== 1 ||
+    sourceOperation === undefined ||
+    sourceOperation.state._tag !== 'Unique' ||
+    sourceOperation.state.id.service.sourceId !== sourceService.id.sourceId ||
+    sourceOperation.state.id.service.ordinal !== sourceService.id.ordinal ||
+    conformances?.length !== 1 ||
+    conformance === undefined ||
+    conformance.validity._tag !== 'ValidConformance' ||
+    mappings?.length !== 1 ||
+    operationMapping === undefined ||
+    operationMapping.target._tag !== 'TypePath' ||
+    operationMapping.contract === undefined ||
+    !sameOperation(operationMapping.contract.declaration, sourceOperation, sourceService) ||
+    !sameOperation(operationMapping.contract.source.declaration, sourceOperation, sourceService) ||
+    operationMapping.targetArguments === undefined ||
+    sourceSubstitution === undefined ||
+    sourceContract?._tag !== 'Contract'
   )
     return undefined
   const selected = fn.instances.filter(
@@ -229,6 +335,7 @@ export const service = (
   if (
     selected.length !== 1 ||
     implementation === undefined ||
+    implementation.function !== implementation.view.function ||
     implementation.ownership.verdict._tag !== 'Satisfied' ||
     BodyView.hasUnavailable(implementation.view) ||
     !Type.isEffect(implementation.specialization.result) ||
@@ -238,18 +345,24 @@ export const service = (
     !Type.equals(physicalContract, { ...implementation.specialization.result, access }) ||
     invocation === undefined ||
     originalContract?._tag !== 'Contract' ||
+    operationMapping.targetArguments.length !==
+      implementation.function.declaration.typeParameters.length ||
     invocationContract === undefined ||
     !Type.isEffect(invocationContract) ||
     context === undefined ||
     !Type.isEffect(publicContract)
   )
     return undefined
-  const parameters = originalContract.parameters.map((parameter) =>
+  const implementationParameters = originalContract.parameters.map((parameter) =>
     Type.substitute(parameter, invocation),
   )
-  const receiver = parameters.at(0)
+  const sourceParameters = sourceContract.parameters.map((parameter) =>
+    Type.substitute(parameter, sourceSubstitution),
+  )
+  const receiver = implementationParameters.at(0)
   if (
-    parameters.length !== subject.arguments.length + 1 ||
+    implementationParameters.length !== subject.arguments.length + 1 ||
+    sourceParameters.length !== subject.arguments.length ||
     receiver === undefined ||
     !Type.isReference(receiver) ||
     !Type.equals(receiver.target, provider.providerType) ||
@@ -257,7 +370,7 @@ export const service = (
   )
     return undefined
   for (const [ordinal, operand] of subject.arguments.entries()) {
-    const expected = parameters.at(ordinal + 1)
+    const expected = sourceParameters.at(ordinal)
     if (
       operand._tag === 'Unavailable' ||
       operand.id === undefined ||
@@ -291,5 +404,18 @@ export const service = (
     )
   )
     return undefined
-  return { caller, call, implementation, publicContract, physicalContract, invocationContract }
+  return {
+    caller,
+    call,
+    implementation,
+    sourceService,
+    sourceOperation,
+    conformance,
+    operationMapping,
+    sourceParameters,
+    implementationParameters,
+    publicContract,
+    physicalContract,
+    invocationContract,
+  }
 }

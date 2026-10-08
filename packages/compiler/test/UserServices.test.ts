@@ -1,8 +1,13 @@
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as ConformanceProof from '../src/ConformanceProof.js'
+import * as Instances from '../src/Instances.js'
+import * as SourceCallView from '../src/SourceCallView.js'
+import * as Tir from '../src/Tir.js'
 import * as Type from '../src/Type.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import { unreachable } from './support/raise.js'
 
 const encoder = new TextEncoder()
 
@@ -50,6 +55,126 @@ pub fn main() -> i32 {
     assert.deepEqual(Analysis.diagnostics(self), [])
     const mir = Analysis.loweredMir(self)
     assert.isTrue(mir.functions.some((fn) => fn.id.name.includes('with')))
+    const discovery = Analysis.instancesOf(self)
+    const caller =
+      discovery.instances.find((instance) => instance.key.declaration.name === 'useDispatch') ??
+      unreachable('missing generic service caller')
+    const subject = caller.function.statements
+      .flatMap(Tir.statementExpressions)
+      .flatMap(Tir.expressionTree)
+      .find(
+        (node): node is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+          node._tag === 'ServiceEffectConstruct',
+      )
+    if (subject === undefined) return unreachable('missing original generic service operation')
+    const call = discovery.calls.find(
+      (candidate) =>
+        Instances.keyText(candidate.owner) === Instances.keyText(caller.key) &&
+        candidate.node?.ordinal === subject.id?.ordinal,
+    )
+    if (call === undefined) return unreachable('missing original generic service call')
+    const implementation = discovery.instances.find(
+      (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
+    )
+    if (implementation === undefined) return unreachable('missing selected generic implementation')
+    const root = implementation.function.statements
+      .flatMap(Tir.statementExpressions)
+      .find((node) => node._tag === 'EffectBlock')
+    if (root?._tag !== 'EffectBlock') return unreachable('missing original generic Effect body')
+    const capture = root.captures.find((entry) => entry.parameter?.ordinal === 1)
+    assert.strictEqual(capture?.access, 'Take')
+    assert.strictEqual(implementation.specialization.parameters.at(1), 'i32')
+    const environment = mir.layout.effectEnvironments.find(
+      (candidate) =>
+        candidate._tag === 'EffectEnvironment' &&
+        Instances.keyText(candidate.instance) === Instances.keyText(call.target) &&
+        Instances.effectIdentity(candidate.instance, candidate.site) === call.resultEffect,
+    )
+    if (environment?._tag !== 'EffectEnvironment')
+      return unreachable('missing actual generic capture environment')
+    assert.strictEqual(environment.fields.find((field) => field.ordinal === 1)?.access, 'Take')
+    const receiver = implementation.specialization.parameters.at(0)
+    if (receiver === undefined || !Type.isReference(receiver) || !Type.isNominal(receiver.target))
+      return unreachable('missing original generic provider receiver')
+    const capability = Type.substitute(subject.service, caller.substitution)
+    if (!Type.isNominal(capability)) return unreachable('missing generic service capability')
+    const witness = ConformanceProof.witness(
+      Analysis.declarationIndex(self),
+      receiver.target,
+      capability,
+    )
+    if (witness?._tag !== 'SourceConformanceWitness')
+      return unreachable('missing original generic service witness')
+    const provider = {
+      capability,
+      providerType: receiver.target,
+      witness,
+      role: subject.role,
+      access: subject.access,
+      requirementAccess: subject.access,
+    }
+    const held = {
+      owner: caller,
+      index: Analysis.declarationIndex(self),
+      instances: discovery.instances,
+      calls: discovery.calls,
+      layout: mir.layout,
+      semantic: (type: Type.Type) => Type.substitute(type, caller.substitution),
+    }
+    assert.isDefined(SourceCallView.service(held, subject, call, provider, environment.effect))
+    const copyCapture = {
+      ...mir.layout,
+      effectEnvironments: mir.layout.effectEnvironments.map((candidate) =>
+        candidate === environment
+          ? {
+              ...environment,
+              fields: environment.fields.map((field) =>
+                field.ordinal === 1 ? { ...field, access: 'Copy' as const } : field,
+              ),
+            }
+          : candidate,
+      ),
+    }
+    assert.isUndefined(
+      SourceCallView.service(
+        { ...held, layout: copyCapture },
+        subject,
+        call,
+        provider,
+        environment.effect,
+      ),
+    )
+    const copiedRoot = {
+      ...root,
+      captures: root.captures.map((entry) =>
+        entry === capture ? { ...entry, access: 'Copy' as const } : entry,
+      ),
+    }
+    const copiedFunction: Tir.TirFunction = {
+      ...implementation.function,
+      statements: implementation.function.statements.map((statement) =>
+        statement._tag === 'Return' && statement.expression === root
+          ? { ...statement, expression: copiedRoot }
+          : statement,
+      ),
+    }
+    assert.include(copiedFunction.statements.flatMap(Tir.statementExpressions), copiedRoot)
+    const copiedImplementation = { ...implementation, function: copiedFunction }
+    assert.isUndefined(
+      SourceCallView.service(
+        {
+          ...held,
+          instances: discovery.instances.map((candidate) =>
+            candidate === implementation ? copiedImplementation : candidate,
+          ),
+          layout: copyCapture,
+        },
+        subject,
+        call,
+        provider,
+        environment.effect,
+      ),
+    )
   }),
 )
 
