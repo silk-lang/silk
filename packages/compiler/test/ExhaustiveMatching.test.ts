@@ -626,6 +626,10 @@ pub fn escaped(spelled: Maybe) -> usize {
 pub fn contained(spelled: Maybe) -> usize {
   if let Maybe.Held {value} = &spelled { let view = whole(&value) return view.length }
   return 0
+}
+pub fn referenced(spelled: &Maybe) -> &[u8] {
+  if let Maybe.Held {value} = &spelled.* { return whole(&value) }
+  return b"i32"
 }`
   const escapedView = analyze('borrowed-owner-if-let-view', escapedViewSource)
   const escapedUse = escapedViewSource.indexOf('selected.length')

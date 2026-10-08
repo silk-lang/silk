@@ -526,23 +526,23 @@ export const analyze = (
     statement: AuthoredHir.Anchor,
     position: AuthoredHir.Anchor,
     referent = false,
-  ): void => {
+  ): boolean => {
     const span = context.spanOf(position)
     const alias =
       source._tag === 'PatternRoot'
         ? patternRoots.get(Ownership.siteKey(rootSite(source, builder)))
         : undefined
     if (alias !== undefined) {
-      anchor(
+      const owned = anchor(
         lifetime,
         { ...alias, path: [...alias.path, ...source.path] },
         statement,
         position,
         true,
       )
-      // A borrowed `if let` binding is a loan that ends with its selected body, even though the
-      // owner it aliases lives on (PATT-009).
-      if (source._tag === 'PatternRoot') {
+      // A borrowed `if let` binding of an owned local is a loan that ends with its selected body,
+      // even though the owner lives on (PATT-009). Behind a reference it keeps the referent's region.
+      if (owned && source._tag === 'PatternRoot') {
         const selected = selectedBody(source.binding.anchor)
         if (selected !== undefined) {
           const region = ensure(lifetime)
@@ -554,7 +554,7 @@ export const analyze = (
           for (const point of allPoints) if (!allowed.has(point)) region.unavailable.add(point)
         }
       }
-      return
+      return owned
     }
     // Indexing a stored slice borrows its backing allocation, whose validity is
     // independent of the receiver used to retrieve the slice descriptor.
@@ -570,7 +570,7 @@ export const analyze = (
         at: position,
         anchor: position,
       })
-      return
+      return false
     }
     let rootType: Type.Type | undefined
     if (source._tag === 'ParameterRoot' && source.parameter.declaredType._tag === 'Resolved')
@@ -594,7 +594,7 @@ export const analyze = (
         at: position,
         anchor: position,
       })
-      return
+      return false
     }
     let origin = root
     if (source._tag === 'BindingRoot' || source._tag === 'PatternRoot')
@@ -634,6 +634,7 @@ export const analyze = (
       at: position,
       anchor: position,
     })
+    return true
   }
   const borrowedCapture = (
     expression: Elaboration.ExpressionDecision | Tir.Expression,
