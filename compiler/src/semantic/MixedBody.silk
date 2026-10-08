@@ -3,11 +3,11 @@
 //! The held semantic source owns every HIR identity in a successful body. A failed selection
 //! publishes no body, runtime call, or embedded value.
 
-import hir.Hir {HirId, HirRef, Node, ParameterMode, Range}
+import hir.Hir {HirId, HirRef, Node, OwnerKind, ParameterMode, Range}
 import hir.Intern {Symbol}
 import semantic.CallInput {CallInput, Arguments as CallArguments}
 import lexer.Span {Span}
-import semantic.DeclarationId {DeclarationId}
+import semantic.DeclarationId {DeclarationId, OwnerStep, Part as DeclarationPart, Projection as DeclarationProjection}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Arm, Candidate, CandidateKind, IndexedDeclaration}
 import semantic.Query {Cycle}
@@ -18,7 +18,7 @@ import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target as
 import semantic.StaticExecution
 import semantic.StaticExecution {Binding as StaticBinding, Diagnostic as StaticDiagnostic, Machine as StaticMachine}
 import semantic.StaticValue
-import semantic.StaticValue {Value as StaticData}
+import semantic.StaticValue {IntegerType as StaticIntegerType, Sign as StaticSign, Value as StaticData}
 import semantic.Type {Argument, Binding as TypeBinding, Type as SemanticType}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
@@ -46,11 +46,15 @@ pub enum Fault {
   ConditionalName,
 }
 
+/// Authored iteration identity, preserved on a failed selection as well as successful bodies.
+pub struct IterationOccurrence {pub syntax: HirId pub ordinal: usize}
+
 pub struct Diagnostic {
   pub fault: Fault
   pub code: RejectionCode
   pub span: Span
   pub rejection: Option<Shared<Rejection>>
+  pub occurrence: Option<IterationOccurrence>
 }
 
 /// Static values substituted into selected runtime expressions.
@@ -96,6 +100,8 @@ pub struct Body {
   pub staticArguments: Vector<StaticArguments>
   pub obligations: Vector<Obligation>
   pub root: Residual
+  /// Each static-for retains its own ordered selection contexts, never repeated flat HIR facts.
+  pub iterations: Vector<StaticForSelection>
 }
 
 /// The static argument values one reached call supplies, evaluated once in the caller's checked
@@ -121,6 +127,256 @@ struct Selection {
   span: Span
 }
 
+pub struct StaticForSelection {
+  pub syntax: HirId
+  pub iterations: Vector<Iteration>
+}
+
+pub struct Iteration {
+  pub ordinal: usize
+  pub selection: Shared<Body>
+}
+
+// An immutable child context is copied one owned entry at a time. No Shared loan spans an
+// allocator/query effect, and descendants keep their existing immutable handles.
+fn bodyProjection(source: &Shared<Body>, binding: usize, part: DeclarationPart,
+  owner: usize, byte: usize) -> DeclarationProjection {
+  return Shared.with<Body, DeclarationProjection>(source, fn(body: &Body) -> DeclarationProjection {
+    if binding == usize.MAX { return DeclarationId.project(&body.declaration, part, owner, byte) }
+    let entries = Vector.asSlice<StaticBinding>(&body.staticBindings)
+    return bodyModuleProjection(&entries[binding].module, part, byte)
+  })
+}
+
+fn bodyModuleProjection(module: &ModuleId, part: DeclarationPart, byte: usize) -> DeclarationProjection {
+  let mut bytes = ModuleId.logicalPath(module)
+  if part == DeclarationPart.Origin { bytes = ModuleId.sourceOrigin(module) }
+  else if part == DeclarationPart.Package { bytes = ModuleId.packageIdentity(module) }
+  let mut selected: u8 = 0
+  if byte < bytes.length { selected = bytes[byte] }
+  return DeclarationProjection {length: bytes.length, byte: selected, kind: OwnerKind.Damaged,
+    occurrence: usize.ZERO, named: false}
+}
+
+effect fn copyBodyBytes(source: &Shared<Body>, binding: usize, part: DeclarationPart,
+  owner: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = bodyProjection(source, binding, part, owner, usize.MAX).length
+  let mut bytes = run Bytes.zeroed(length)
+  let output = Bytes.asMutSlice(&mut bytes)
+  let mut at = usize.ZERO
+  while at < length {
+    let selected = bodyProjection(source, binding, part, owner, at)
+    output[at] = selected.byte
+    at = at + usize.ONE
+  }
+  return move bytes
+}
+
+effect fn copyBodyModule(source: &Shared<Body>, binding: usize) -> ModuleId
+! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let origin = run copyBodyBytes(source, binding, DeclarationPart.Origin, usize.MAX)
+  let package = run copyBodyBytes(source, binding, DeclarationPart.Package, usize.MAX)
+  let path = run copyBodyBytes(source, binding, DeclarationPart.Path, usize.MAX)
+  return run ModuleId.fromParts(move origin, move package, move path)
+}
+
+effect fn copyBodyDeclaration(source: &Shared<Body>) -> DeclarationId
+! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let module = run copyBodyModule(source, usize.MAX)
+  let count = bodyProjection(source, usize.MAX, DeclarationPart.Owners, usize.MAX, usize.MAX).length
+  let mut owners = Vector.make<OwnerStep>()
+  let mut at = usize.ZERO
+  while at < count {
+    let selected = bodyProjection(source, usize.MAX, DeclarationPart.Owners, at, usize.MAX)
+    let mut name = Option.none<Bytes>()
+    if selected.named {
+      name = Option.some<Bytes>(run copyBodyBytes(source, usize.MAX, DeclarationPart.Owners, at))
+    }
+    run Vector.append<OwnerStep>(&mut owners, OwnerStep {kind: selected.kind,
+      name: move name, occurrence: selected.occurrence})
+    at = at + usize.ONE
+  }
+  return DeclarationId.fromParts(move module, move owners)
+}
+
+fn bodyRootLeaf(root: &Residual) -> Option<Residual> {
+  return match &root.* {
+    Residual.Source {syntax} => Option.some<Residual>(Residual.Source {syntax: syntax})
+    Residual.Block {..} => Option.none<Residual>()
+    Residual.Branch {condition, thenBranch, elseBranch} => {
+      let mut otherwise = Option.none<Shared<Residual>>()
+      if let Option<Shared<Residual>>.Some {value} = &elseBranch {
+        otherwise = Option.some<Shared<Residual>>(Shared.clone<Residual>(&value))
+      }
+      return Option.some<Residual>(Residual.Branch {condition: condition,
+        thenBranch: Shared.clone<Residual>(&thenBranch), elseBranch: move otherwise})
+    }
+    Residual.Loop {condition, body} => Option.some<Residual>(Residual.Loop {
+      condition: condition, body: Shared.clone<Residual>(&body)})
+  }
+}
+
+// Inconsistent immutable metadata is an internal invariant failure, never an empty success.
+fn invalidBodySnapshot() -> never {
+  let broken = 1 / 0
+  return invalidBodySnapshot()
+}
+
+effect fn copyBodyRoot(source: &Shared<Body>) -> Residual
+! OutOfMemoryError ? &mut Allocator {
+  let leaf = Shared.with<Body, Option<Residual>>(source, fn(body: &Body) -> Option<Residual> {
+    return bodyRootLeaf(&body.root)
+  })
+  if let Option<Residual>.Some {value} = move leaf { return move value }
+  let count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize {
+    return match &body.root {
+      Residual.Block {statements} => Vector.length<Shared<Residual>>(&statements)
+      _ => invalidBodySnapshot()
+    }
+  })
+  let mut statements = Vector.make<Shared<Residual>>()
+  let mut at = usize.ZERO
+  while at < count {
+    let statement = Shared.with<Body, Shared<Residual>>(source, fn(body: &Body) -> Shared<Residual> {
+      return match &body.root {
+        Residual.Block {statements: children} => {
+          let entries = Vector.asSlice<Shared<Residual>>(&children)
+          return Shared.clone<Residual>(&entries[at])
+        }
+        _ => invalidBodySnapshot()
+      }
+    })
+    run Vector.append<Shared<Residual>>(&mut statements, move statement)
+    at = at + usize.ONE
+  }
+  return Residual.Block {statements: move statements}
+}
+
+/// Copies the complete immutable context without recursively copying any selected descendant.
+/// Work is linear in this already-budgeted context and its original identity bytes.
+pub effect fn copySharedBody(source: &Shared<Body>) -> Body
+! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let declaration = run copyBodyDeclaration(source)
+  let mut parameters = Vector.make<HirId>()
+  let mut count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<HirId>(&body.runtimeParameters) })
+  let mut at = usize.ZERO
+  while at < count {
+    let parameter = Shared.with<Body, HirId>(source, fn(body: &Body) -> HirId {
+      let entries = Vector.asSlice<HirId>(&body.runtimeParameters)
+      return entries[at]
+    })
+    run Vector.append<HirId>(&mut parameters, parameter)
+    at = at + usize.ONE
+  }
+  let mut bindings = Vector.make<StaticBinding>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<StaticBinding>(&body.staticBindings) })
+  at = usize.ZERO
+  while at < count {
+    let module = run copyBodyModule(source, at)
+    let binder = Shared.with<Body, HirId>(source, fn(body: &Body) -> HirId {
+      let entries = Vector.asSlice<StaticBinding>(&body.staticBindings)
+      return entries[at].binder
+    })
+    let value = Shared.with<Body, Shared<StaticData>>(source, fn(body: &Body) -> Shared<StaticData> {
+      let entries = Vector.asSlice<StaticBinding>(&body.staticBindings)
+      return Shared.clone<StaticData>(&entries[at].value)
+    })
+    run Vector.append<StaticBinding>(&mut bindings, StaticBinding {module: move module, binder: binder, value: move value})
+    at = at + usize.ONE
+  }
+  let mut embedded = Vector.make<Embedded>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<Embedded>(&body.embedded) })
+  at = usize.ZERO
+  while at < count {
+    let entry = Shared.with<Body, Embedded>(source, fn(body: &Body) -> Embedded {
+      let entries = Vector.asSlice<Embedded>(&body.embedded)
+      return Embedded {syntax: entries[at].syntax, value: Shared.clone<StaticData>(&entries[at].value)}
+    })
+    run Vector.append<Embedded>(&mut embedded, move entry)
+    at = at + usize.ONE
+  }
+  let mut decisions = Vector.make<Decision>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<Decision>(&body.decisions) })
+  at = usize.ZERO
+  while at < count {
+    let entry = Shared.with<Body, Decision>(source, fn(body: &Body) -> Decision {
+      let entries = Vector.asSlice<Decision>(&body.decisions)
+      return Decision {condition: entries[at].condition, selected: entries[at].selected}
+    })
+    run Vector.append<Decision>(&mut decisions, move entry)
+    at = at + usize.ONE
+  }
+  let mut arguments = Vector.make<StaticArguments>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<StaticArguments>(&body.staticArguments) })
+  at = usize.ZERO
+  while at < count {
+    let call = Shared.with<Body, HirId>(source, fn(body: &Body) -> HirId {
+      let entries = Vector.asSlice<StaticArguments>(&body.staticArguments)
+      return entries[at].call
+    })
+    let slots = Shared.with<Body, usize>(source, fn(body: &Body) -> usize {
+      let entries = Vector.asSlice<StaticArguments>(&body.staticArguments)
+      return Vector.length<StaticSlot>(&entries[at].slots)
+    })
+    let mut copied = Vector.make<StaticSlot>()
+    let mut slot = usize.ZERO
+    while slot < slots {
+      let entry = Shared.with<Body, StaticSlot>(source, fn(body: &Body) -> StaticSlot {
+        let entries = Vector.asSlice<StaticArguments>(&body.staticArguments)
+        let values = Vector.asSlice<StaticSlot>(&entries[at].slots)
+        return StaticSlot {ordinal: values[slot].ordinal, value: Shared.clone<StaticData>(&values[slot].value)}
+      })
+      run Vector.append<StaticSlot>(&mut copied, move entry)
+      slot = slot + usize.ONE
+    }
+    run Vector.append<StaticArguments>(&mut arguments, StaticArguments {call: call, slots: move copied})
+    at = at + usize.ONE
+  }
+  let mut obligations = Vector.make<Obligation>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<Obligation>(&body.obligations) })
+  at = usize.ZERO
+  while at < count {
+    let entry = Shared.with<Body, Obligation>(source, fn(body: &Body) -> Obligation {
+      let entries = Vector.asSlice<Obligation>(&body.obligations)
+      return match &entries[at] {
+        Obligation.Expression {syntax} => Obligation.Expression {syntax: syntax}
+        Obligation.RuntimeCall {syntax} => Obligation.RuntimeCall {syntax: syntax}
+      }
+    })
+    run Vector.append<Obligation>(&mut obligations, move entry)
+    at = at + usize.ONE
+  }
+  let mut iterations = Vector.make<StaticForSelection>()
+  count = Shared.with<Body, usize>(source, fn(body: &Body) -> usize { return Vector.length<StaticForSelection>(&body.iterations) })
+  at = usize.ZERO
+  while at < count {
+    let syntax = Shared.with<Body, HirId>(source, fn(body: &Body) -> HirId {
+      let entries = Vector.asSlice<StaticForSelection>(&body.iterations)
+      return entries[at].syntax
+    })
+    let children = Shared.with<Body, usize>(source, fn(body: &Body) -> usize {
+      let entries = Vector.asSlice<StaticForSelection>(&body.iterations)
+      return Vector.length<Iteration>(&entries[at].iterations)
+    })
+    let mut copied = Vector.make<Iteration>()
+    let mut child = usize.ZERO
+    while child < children {
+      let entry = Shared.with<Body, Iteration>(source, fn(body: &Body) -> Iteration {
+        let entries = Vector.asSlice<StaticForSelection>(&body.iterations)
+        let values = Vector.asSlice<Iteration>(&entries[at].iterations)
+        return Iteration {ordinal: values[child].ordinal, selection: Shared.clone<Body>(&values[child].selection)}
+      })
+      run Vector.append<Iteration>(&mut copied, move entry)
+      child = child + usize.ONE
+    }
+    run Vector.append<StaticForSelection>(&mut iterations, StaticForSelection {syntax: syntax, iterations: move copied})
+    at = at + usize.ONE
+  }
+  return Body {declaration: move declaration, runtimeParameters: move parameters, staticBindings: move bindings,
+    embedded: move embedded, decisions: move decisions, staticArguments: move arguments, obligations: move obligations,
+    root: run copyBodyRoot(source), iterations: move iterations}
+}
+
 struct Draft {
   ordinal: usize
   bindings: Vector<StaticBinding>
@@ -130,6 +386,8 @@ struct Draft {
   staticArguments: Vector<StaticArguments>
   obligations: Vector<Obligation>
   nodes: usize
+  inIteration: bool
+  iterations: Vector<StaticForSelection>
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {
@@ -155,7 +413,7 @@ fn faultCode(fault: Fault) -> RejectionCode {
 }
 
 effect fn reject(fault: Fault, span: Span) -> never ! Diagnostic {
-  fail Diagnostic {fault: fault, code: faultCode(fault), span: span, rejection: Option.none<Shared<Rejection>>()}
+  fail Diagnostic {fault: fault, code: faultCode(fault), span: span, rejection: Option.none<Shared<Rejection>>(), occurrence: Option.none<IterationOccurrence>()}
 }
 
 effect fn rejectSemantic(fault: Fault, reason: Shared<Rejection>) -> never ! Diagnostic {
@@ -166,6 +424,7 @@ effect fn rejectSemantic(fault: Fault, reason: Shared<Rejection>) -> never ! Dia
     code: code,
     span: sourceSpan,
     rejection: Option.some<Shared<Rejection>>(move reason),
+    occurrence: Option.none<IterationOccurrence>(),
   }
 }
 
@@ -381,10 +640,11 @@ effect fn select<'source>(machine: &Machine<'source>, ordinal: usize) -> Selecti
   return run reject(Fault.InvalidHeader, span)
 }
 
-effect fn count<'source>(machine: &Machine<'source>, draft: &mut Draft, syntax: HirId) -> () ! Diagnostic {
+effect fn count<'source>(machine: &mut Machine<'source>, draft: &mut Draft, syntax: HirId) -> () ! Diagnostic | StaticDiagnostic | OutOfMemoryError ? &mut Allocator {
   if draft.nodes >= machine.residualLimit {
     return run reject(Fault.ResidualGrowth, span(&machine.*, syntax))
   }
+  run StaticExecution.generatedWork(&mut machine.execution, syntax)
   draft.nodes = draft.nodes + usize.ONE
   return ()
 }
@@ -394,7 +654,7 @@ struct CheckedValue {
   checked: Shared<Result<Answer, NoRejection>>
 }
 
-effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId, expectation: StaticRootExpectation) -> CheckedValue
+effect fn checkedAnswer<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId, expectation: StaticRootExpectation) -> Shared<Result<Answer, NoRejection>>
 ! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
   let module = run ModuleId.copy(&machine.module)
@@ -415,6 +675,12 @@ effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expre
       RevisionMismatch {} => run reject(Fault.InvalidStaticValue, span(&machine.*, expression))
     }
   }
+  return move answer
+}
+
+effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expression: HirId, expectation: StaticRootExpectation) -> CheckedValue
+! Diagnostic | StaticDiagnostic | OutOfMemoryError ? &mut Allocator {
+  let answer = run checkedAnswer(&mut machine.*, draft, expression, move expectation)
   let checked = Shared.with<Result<Answer, NoRejection>, Option<StaticExecution.CheckedRoot>>(
     &answer,
     StaticExecution.checkedRoot,
@@ -438,6 +704,7 @@ effect fn evaluate<'source>(machine: &mut Machine<'source>, draft: &Draft, expre
     Vector.asSlice<StaticBinding>(&draft.bindings),
     expression,
   )
+  run StaticExecution.retainGenerated(&mut machine.execution, &value, expression)
   return CheckedValue {value: move value, checked: move answer}
 }
 
@@ -508,6 +775,16 @@ effect fn inspect<'source>(machine: &mut Machine<'source>, draft: &mut Draft, ex
 ! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
   let node = run authoredNode(&machine.*, expression)
+  if draft.inIteration { run StaticExecution.generatedWork(&mut machine.execution, expression) }
+  if draft.inIteration {
+    match node {
+      Node.BorrowExpression {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, expression)) }
+      Node.CallableExpression {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, expression)) }
+      Node.EffectExpression {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, expression)) }
+      Node.RunExpression {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, expression)) }
+      _ => ()
+    }
+  }
   if let Option<CallInput>.Some {value: input} = move CallInput.ofNode(node) {
     let callee = input.callee
     let arguments = input.arguments
@@ -564,6 +841,7 @@ effect fn inspect<'source>(machine: &mut Machine<'source>, draft: &mut Draft, ex
     Node.IdentifierExpression {name, binding} => {
       if binding.present {
         if let Option<Shared<StaticData>>.Some {value} = move staticBinder(&draft.*, binding.id) {
+          run StaticExecution.retainGenerated(&mut machine.execution, &value, expression)
           run Vector.append<Embedded>(&mut draft.embedded, Embedded {syntax: expression, value: move value})
         } else if let Node.Declaration {header, ..} = run authoredNode(&machine.*, binding.id) {
           if let Node.FunctionHeader {contract, ..} = run authoredNode(&machine.*, header) {
@@ -700,7 +978,79 @@ effect fn residual<'source>(machine: &mut Machine<'source>, draft: &mut Draft, s
 ! Diagnostic | StaticDiagnostic | OutOfMemoryError
 ? &mut Allocator {
   let node = run authoredNode(&machine.*, statement)
+  if draft.inIteration {
+    match node {
+      Node.StaticForStatement {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, statement)) }
+      Node.ReturnStatement {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, statement)) }
+      Node.FailStatement {..} => { return run reject(Fault.InvalidSyntax, span(&machine.*, statement)) }
+      Node.BreakStatement => { return run reject(Fault.InvalidSyntax, span(&machine.*, statement)) }
+      Node.ContinueStatement => { return run reject(Fault.InvalidSyntax, span(&machine.*, statement)) }
+      _ => ()
+    }
+  }
   match node {
+    Node.StaticForStatement {binding, iterable, body} => {
+      let answer = run checkedAnswer(&mut machine.*, &draft.*, iterable, StaticRootExpectation.Inferred)
+      let iterableSpan = span(&machine.*, iterable)
+      let evaluated = run StaticExecution.evaluateSequence(&mut machine.execution, &answer, Vector.asSlice<StaticBinding>(&draft.bindings), iterable, iterableSpan)
+      let length = StaticExecution.sequenceLength(&evaluated)
+      let proof = run Shared.make<StaticExecution.SequenceEvidence>(move evaluated)
+      let mut iterations = Vector.make<Iteration>()
+      let mut at = usize.ZERO
+      while at < length {
+        let evidence = match move StaticExecution.iteration(&proof, at) {
+          Option<StaticExecution.IterationEvidence>.Some {value} => value
+          Option<StaticExecution.IterationEvidence>.None => { return run reject(Fault.InvalidStaticValue, span(&machine.*, statement)) }
+        }
+        let value = match move StaticExecution.iterationValue(&evidence) {
+          Option<Shared<StaticData>>.Some {value} => value
+          Option<Shared<StaticData>>.None => { return run reject(Fault.InvalidStaticValue, span(&machine.*, statement)) }
+        }
+        let mut child = run iterationDraft(&draft.*)
+        run Vector.append<StaticRootBinder>(&mut child.checkedBinders, StaticRootBinder.Iteration {
+          syntax: statement, evidence: move evidence,
+        })
+        run Vector.append<StaticBinding>(&mut child.bindings, StaticBinding {
+          module: run ModuleId.copy(&machine.module), binder: binding, value: move value,
+        })
+        let attempted = run Effect.result(residual(&mut machine.*, &mut child, body))
+        let selected = match move attempted {
+          Result<Residual, Diagnostic | StaticDiagnostic | OutOfMemoryError>.Success {value: residualBody} => residualBody
+          Result<Residual, Diagnostic | StaticDiagnostic | OutOfMemoryError>.Failure {error} => match move error {
+            OutOfMemoryError {} => { fail OutOfMemoryError {} }
+            Diagnostic {fault, code, span: failedSpan, rejection, ..} => {
+              fail Diagnostic {fault: fault, code: code, span: failedSpan, rejection: move rejection,
+                occurrence: Option.some<IterationOccurrence>(IterationOccurrence {syntax: statement, ordinal: at})}
+            }
+            StaticDiagnostic {fault, code, span: failedSpan, target, message, origin, byteOffset, rejection, needed, missing, trace} => {
+              let mut path = move trace
+              let mut arguments = Vector.make<Shared<StaticData>>()
+              run Vector.append<Shared<StaticData>>(&mut arguments, run Shared.make<StaticData>(StaticData.Integer {
+                ty: StaticIntegerType.Usize, sign: StaticSign.Positive, magnitude: usize.toU64(at),
+              }))
+              run Vector.append<StaticExecution.TraceStep>(&mut path, StaticExecution.TraceStep {
+                name: run Bytes.copy(b"static for"), arguments: move arguments, span: span(&machine.*, statement),
+              })
+              fail StaticDiagnostic {fault: fault, code: code, span: failedSpan, target: target, message: move message,
+                origin: move origin, byteOffset: move byteOffset, rejection: move rejection, needed: move needed, missing: move missing, trace: move path}
+            }
+          }
+        }
+        draft.nodes = child.nodes
+        let identity = run currentDeclaration(&machine.*, draft.ordinal)
+        let selection = Body {
+          declaration: move identity, runtimeParameters: Vector.make<HirId>(),
+          staticBindings: move child.bindings, embedded: move child.embedded, decisions: move child.decisions,
+          staticArguments: move child.staticArguments, obligations: move child.obligations, root: move selected,
+          iterations: move child.iterations,
+        }
+        run Vector.append<Iteration>(&mut iterations, Iteration {ordinal: at, selection: run Shared.make<Body>(move selection)})
+        at = at + usize.ONE
+      }
+      run count(&mut machine.*, &mut draft.*, statement)
+      run Vector.append<StaticForSelection>(&mut draft.iterations, StaticForSelection {syntax: statement, iterations: move iterations})
+      return Residual.Source {syntax: statement}
+    }
     Node.Block {statements} => {
       let mut retained = Vector.make<Shared<Residual>>()
       let mut at = usize.ZERO
@@ -709,7 +1059,7 @@ effect fn residual<'source>(machine: &mut Machine<'source>, draft: &mut Draft, s
         run retainBlockStatement(&mut machine.*, &mut draft.*, &mut retained, syntax)
         at = at + usize.ONE
       }
-      run count(&machine.*, &mut draft.*, statement)
+      run count(&mut machine.*, &mut draft.*, statement)
       return Residual.Block {statements: move retained}
     }
     Node.ConditionalStatement {condition: tested, thenBranch, elseBranch} => {
@@ -719,13 +1069,13 @@ effect fn residual<'source>(machine: &mut Machine<'source>, draft: &mut Draft, s
       if elseBranch.present {
         otherwise = Option.some<Shared<Residual>>(run Shared.make<Residual>(run residual(&mut machine.*, &mut draft.*, elseBranch.id)))
       }
-      run count(&machine.*, &mut draft.*, statement)
+      run count(&mut machine.*, &mut draft.*, statement)
       return Residual.Branch {condition: tested, thenBranch: move chosen, elseBranch: move otherwise}
     }
     Node.WhileStatement {condition: tested, body} => {
       run inspect(&mut machine.*, &mut draft.*, tested)
       let selected = run Shared.make<Residual>(run residual(&mut machine.*, &mut draft.*, body))
-      run count(&machine.*, &mut draft.*, statement)
+      run count(&mut machine.*, &mut draft.*, statement)
       return Residual.Loop {condition: tested, body: move selected}
     }
     Node.BindingStatement {initializer, ..} => run inspect(&mut machine.*, &mut draft.*, initializer)
@@ -756,12 +1106,12 @@ effect fn residual<'source>(machine: &mut Machine<'source>, draft: &mut Draft, s
         return run residual(&mut machine.*, &mut draft.*, thenBranch)
       }
       if elseBranch.present { return run residual(&mut machine.*, &mut draft.*, elseBranch.id) }
-      run count(&machine.*, &mut draft.*, statement)
+      run count(&mut machine.*, &mut draft.*, statement)
       return Residual.Block {statements: Vector.make<Shared<Residual>>()}
     }
     _ => ()
   }
-  run count(&machine.*, &mut draft.*, statement)
+  run count(&mut machine.*, &mut draft.*, statement)
   return Residual.Source {syntax: statement}
 }
 
@@ -862,6 +1212,8 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
     staticArguments: Vector.make<StaticArguments>(),
     obligations: Vector.make<Obligation>(),
     nodes: usize.ZERO,
+    inIteration: false,
+    iterations: Vector.make<StaticForSelection>(),
   }
   // Static values come only from the application, each at its original parameter index.
   let staticArguments = Vector.asSlice<StaticSlot>(&application.statics)
@@ -919,5 +1271,44 @@ pub effect fn specialize<'source>(machine: &mut Machine<'source>, application: &
     staticArguments: move draft.staticArguments,
     obligations: move draft.obligations,
     root: move root,
+    iterations: move draft.iterations,
+  }
+}
+
+// A child owns only its occurrence's selected facts; enclosing checked binders and values are
+// immutable evidence. The shared evaluator and parent's node count span every iteration.
+effect fn iterationDraft(parent: &Draft) -> Draft ! OutOfMemoryError ? &mut Allocator {
+  let mut bindings = Vector.make<StaticBinding>()
+  let outer = Vector.asSlice<StaticBinding>(&parent.bindings)
+  let mut at = usize.ZERO
+  while at < outer.length {
+    run Vector.append<StaticBinding>(&mut bindings, StaticBinding {
+      module: run ModuleId.copy(&outer[at].module), binder: outer[at].binder, value: StaticValue.copy(&outer[at].value),
+    })
+    at = at + usize.ONE
+  }
+  let mut checked = Vector.make<StaticRootBinder>()
+  let proofs = Vector.asSlice<StaticRootBinder>(&parent.checkedBinders)
+  at = usize.ZERO
+  while at < proofs.length {
+    let copy = match &proofs[at] {
+      StaticRootBinder.Parameter {syntax} => StaticRootBinder.Parameter {syntax: syntax}
+      StaticRootBinder.Binding {syntax, checked: answer} => StaticRootBinder.Binding {syntax: syntax, checked: Shared.clone<Result<Answer, NoRejection>>(&answer)}
+      StaticRootBinder.Iteration {syntax, evidence} => StaticRootBinder.Iteration {syntax: syntax, evidence: StaticExecution.copyIteration(&evidence)}
+    }
+    run Vector.append<StaticRootBinder>(&mut checked, move copy)
+    at = at + usize.ONE
+  }
+  return Draft {ordinal: parent.ordinal, bindings: move bindings, checkedBinders: move checked,
+    embedded: Vector.make<Embedded>(), decisions: Vector.make<Decision>(), staticArguments: Vector.make<StaticArguments>(),
+    obligations: Vector.make<Obligation>(), nodes: parent.nodes, inIteration: true, iterations: Vector.make<StaticForSelection>()}
+}
+
+effect fn currentDeclaration<'source>(machine: &Machine<'source>, ordinal: usize) -> DeclarationId
+! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let found = run StaticExecution.sourceDeclaration(&machine.execution, &machine.cursor, ordinal)
+  return match move found {
+    Option<IndexedDeclaration>.Some {value} => run DeclarationId.copy(&value.identity)
+    Option<IndexedDeclaration>.None => run reject(Fault.InvalidHeader, Span.make(usize.ZERO, usize.ZERO))
   }
 }

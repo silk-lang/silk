@@ -39,6 +39,12 @@ descriptor as a slice. Slice subranges and unions with string or f64 members rem
 Runtime string `==` and `!=` compare byte lengths and then exact UTF-8 bytes with a bounded MIR
 loop. Both operands are evaluated once, left to right; empty views and unequal lengths require no
 backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
+Native source elaboration includes finite static-for expansion over genuine phase-only sealed
+`Intrinsic.StaticSequence` values with homogeneous scalar elements. Each evaluated element owns
+separate static-selection facts and ordinary local/node ranges; the emitted blocks follow element
+order. Empty sequences skip body elaboration. Reflected collections, nested loops, generated
+closures/Effects, control transfers and newly generated loans retain authored Unsupported refusals.
+This source implementation is under focused validation; it does not claim SHA2 or N1 completion.
 Semantic instances keep `'static` and region-sharing evidence but number caller-local regions by
 first appearance, so call sites that lend different locals share one instance; each semantic
 instance is validated separately. Complete selected MIR recipes

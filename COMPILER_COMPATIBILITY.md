@@ -1672,6 +1672,14 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
   `compiler/src/semantic/SemanticCases.silk`.
 
+
+### Finite scalar StaticSequence iteration in the native frontend
+
+- **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
+- **Native subset:** focused locally verified on 2026-10-07. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or stored member types.
+- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; reflected collections, nested static-for, generated closures/Effects, authored return/fail/break/continue inside iterations and newly generated loans remain unsupported. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
+- **Evidence:** the pre-repair optimized native reduction rejected the whole static-for as typed-form; the no-loop phase control rejected the sealed sequence type as core-type. The focused existing-actor run passed five tests in 50 ms, including distinct iteration locals, exact selected callee/MIR arguments, empty-body non-elaboration, borrowed outside storage and exact refusal codes/spans. Its timing gate passed; production pinned-bootstrap checking also passed. After integrating canonical finite lifetime meets, the same five focused tests passed in 8 ms on 2026-10-08. Sealed static sequences participate in the complete numbering transaction, including retained types and charged child traversal. This entry claims no optimized N0, SHA2 lowering, gap removal, N1 artifact or smoke success.
+
 ### Selfhost preserves unchanged inexact capture-loop availability
 
 - **Status:** locally verified on 2026-10-07.
