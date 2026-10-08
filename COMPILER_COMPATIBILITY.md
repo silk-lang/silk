@@ -971,6 +971,23 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `sliceConversionsRetainRegionAccessAndDiagnostics` asserts `TypeMismatch` at
   `&local` and `&[42]`. The bootstrap's `RuntimeSliceOwnership.test.ts` asserts `OWN0019`.
 
+### Selfhost test declaration diagnostics
+
+- **Status:** recorded on 2026-10-08 with the Stage 1 census tail.
+- **Rule:** [TEST-001](apps/docs/content/reference/testing.md#test-001--test-marks-a-parameterless-unit-function)
+  admits a module-level, safe, non-static function with a body, no generic or value parameters and
+  unit success as a test entry; [TEST-002](apps/docs/content/reference/testing.md#test-002--ordinary-builds-do-not-execute-or-retain-tests)
+  analyzes an active test entry like any other function in an ordinary build.
+- **Compilers:** both analyze a valid test entry as an ordinary function. The bootstrap reports an
+  invalid entry as `InvalidTestDeclaration`; selfhost has no test declaration diagnostic yet and
+  refuses that signature as `Unsupported`.
+- **Source migration:** none.
+- **Diagnostics and limits:** selfhost does not discover, describe or run tests.
+- **Evidence:** `callableAndEffectSignatureContracts` in
+  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` signature and
+  body and the refused parameterized entry.
+- **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or
