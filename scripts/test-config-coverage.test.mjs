@@ -166,7 +166,7 @@ void test('exact-head full verification remains explicit and complete', () => {
       event: 'workflow_dispatch',
       full: false,
       workload: 'a'.repeat(40),
-      enabled: ['selfhost-bootstrap-benchmark'],
+      enabled: ['selfhost-bootstrap-plan'],
     },
     {
       event: 'workflow_dispatch',
@@ -182,19 +182,17 @@ void test('exact-head full verification remains explicit and complete', () => {
     },
   ]
   for (const scenario of scenarios) {
-    const enabled = [
-      'full-verification',
-      'selfhost-bootstrap-benchmark',
-      'platform-supplies',
-    ].filter((job) => {
-      const condition = /^    if: ([^\n]+)$/m.exec(ciJobBody(job))?.[1]
-      assert.ok(condition, `${job} must declare its event gate`)
-      // These repository-owned GitHub gates use the shared JavaScript boolean/string operators.
-      return runInNewContext(condition, {
-        github: { event_name: scenario.event },
-        inputs: { full_verification: scenario.full, selfhost_sha: scenario.workload },
-      })
-    })
+    const enabled = ['full-verification', 'selfhost-bootstrap-plan', 'platform-supplies'].filter(
+      (job) => {
+        const condition = /^    if: ([^\n]+)$/m.exec(ciJobBody(job))?.[1]
+        assert.ok(condition, `${job} must declare its event gate`)
+        // These repository-owned GitHub gates use the shared JavaScript boolean/string operators.
+        return runInNewContext(condition, {
+          github: { event_name: scenario.event },
+          inputs: { full_verification: scenario.full, selfhost_sha: scenario.workload },
+        })
+      },
+    )
     assert.deepEqual(enabled, scenario.enabled, JSON.stringify(scenario))
   }
 })
