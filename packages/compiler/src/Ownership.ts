@@ -4683,7 +4683,17 @@ const checkFunction = (
       }
     } else if (expression.access === 'Move' && scrutineePlace !== undefined) {
       if (!checkPlaceInterior(state, live, expression.scrutinee, guard, false)) return false
-      checkPath(state, live, scrutineePlace.root, scrutineePlace.path, expression.span, 'Move')
+      // A borrowed pattern binding is a loan of the outer subject. Consuming its affine
+      // payload would move or drop a value the arm does not own (MATCH-002).
+      if (
+        (scrutineeBinding?.matchAccess === 'Shared' ||
+          scrutineeBinding?.matchAccess === 'Exclusive') &&
+        categoryOf(index, scrutineeType, copyAssumptions)._tag === 'MoveOnly'
+      )
+        state.diagnostics.push(
+          Diagnostic.matchBorrowEscape(scrutineeBinding.name ?? '?', expression.scrutinee.span),
+        )
+      else checkPath(state, live, scrutineePlace.root, scrutineePlace.path, expression.span, 'Move')
     } else {
       if (!checkExpression(state, live, expression.scrutinee, expression.access === 'Move', guard))
         return false
