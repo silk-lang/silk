@@ -1079,6 +1079,7 @@ const genericParameters = (
             _tag: 'LifetimeParameter',
             name: nameIn(draft, parameterCursor, element, ['Lifetime']),
             bounds,
+            ...(hasToken(element, 'Identifier') ? { invocationUse: true } : {}),
           },
           causes,
         ),

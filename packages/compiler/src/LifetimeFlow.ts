@@ -39,6 +39,14 @@ export interface LifetimeFlow {
   readonly retirementWork: { readonly comparisons: number; readonly comparisonCacheHits: number }
   readonly syntaxPointCount: number
   readonly input: Lifetime.Input
+  /** Original body antecedents, held separately from per-call offered obligations. */
+  readonly sourcePremises?: {
+    readonly assumptions: Lifetime.Assumptions
+    readonly typeBounds: ReadonlyArray<Type.TypeOutlives>
+    readonly invocationInputs: ReadonlyArray<Type.InvocationInputBound>
+  }
+  /** Only actual construction premises; activated and invocation obligations are excluded. */
+  readonly formations?: ReadonlyArray<BodyLifetime.Formation>
   readonly solution: Lifetime.Solution
   readonly origins: ReadonlyMap<string, Origin>
   readonly spans: ReadonlyMap<number, SourceSpan.SourceSpan>
@@ -440,6 +448,47 @@ export const analyze = (
     const bound = { longer, shorter }
     constraints.set(Lifetime.assumptions([bound]).key, bound)
   }
+  const registerInvocation = (
+    usage: Pick<Tir.InvocationUseObligation, 'owner' | 'origin' | 'binder' | 'lifetime'>,
+    point: number,
+  ): void => {
+    const expected = BodyLifetime.invocationRegion(body, usage.origin, usage.binder)
+    if (
+      usage.owner.module !== body.owner.module ||
+      usage.owner.name !== body.owner.name ||
+      expected === undefined ||
+      !Lifetime.equals(expected, usage.lifetime)
+    ) {
+      const diagnostic = Diagnostic.typeArgumentInference(
+        'invocation-use region',
+        Location.at(usage.origin),
+      )
+      applicationDiagnostics.set(
+        `invocation:${AuthoredIdentity.anchorKey(usage.origin)}`,
+        diagnostic,
+      )
+      return
+    }
+    const scope = scopeOf(usage.origin)
+    const created = body.points.get(AuthoredIdentity.anchorKey(usage.origin))
+    const available = entries.flatMap(([position, ordinal]) =>
+      created !== undefined && ordinal >= created && encloses(context, scope, position)
+        ? [ordinal]
+        : [],
+    )
+    // The finite source scope excludes public return/failure boundary points. Result uses,
+    // cleanup and suspension ownership add requirements; registering it proves no input.
+    const target = ensure(usage.lifetime)
+    target.required.add(point)
+    const allowed = new Set(available)
+    for (const candidate of allPoints)
+      if (!allowed.has(candidate)) target.unavailable.add(candidate)
+    origins.set(Lifetime.key(usage.lifetime), {
+      lifetime: usage.lifetime,
+      span: context.spanOf(usage.origin),
+      at: usage.origin,
+    })
+  }
   const requireType = (type: Type.Type, point: number): void => {
     for (const lifetime of Type.storageLifetimes(type)) ensure(lifetime).required.add(point)
   }
@@ -630,6 +679,25 @@ export const analyze = (
       expressionUses.set(expressionKey, expression)
     }
     const point = charged ? body.points.get(expressionKey) : undefined
+    if (point !== undefined) {
+      let invocation: Tir.InvocationUseObligation | undefined
+      if (expression._tag === 'CallableApply') invocation = expression.invocationUse
+      else if (expression._tag === 'Call') {
+        if ('origin' in expression) invocation = expression.invocationUse
+        else if (expression.contract._tag === 'Compatible')
+          invocation = expression.contract.invocationUse
+      }
+      if (invocation !== undefined) {
+        registerInvocation(invocation, point)
+        // Concrete stored loans participate in the use extent. Unknown generic contents
+        // remain owning input obligations for specialization/ownership, not empty proof.
+        for (const input of invocation.inputs)
+          for (const stored of Type.storageLifetimes(input.type))
+            constrain(stored, invocation.lifetime)
+      }
+      if (expression._tag === 'EffectCatch' && expression.recoveryInvocation !== undefined)
+        registerInvocation(expression.recoveryInvocation, point)
+    }
     if (charged && expressionType._tag === 'Available') {
       const value = Type.isRepresented(expressionType.type)
         ? expressionType.type.contract
@@ -664,20 +732,30 @@ export const analyze = (
               value.lifetimeBinders.some((binder) => Lifetime.equals(binder, region)),
             ) &&
             Type.isTypeArgument(failure.argument) &&
-            Type.satisfiesOutlives(
-              failure.argument,
-              failure.required,
-              [...value.typeOutlives, ...(inputLifetimes?.typeOutlives ?? [])],
-              (longer, shorter) =>
+            (Type.invocationInputBounds(value)?.some(
+              (input) =>
+                Type.isTypeArgument(failure.argument) &&
+                Type.equals(input.type, failure.argument) &&
                 Lifetime.outlives(
-                  Lifetime.assumptions([
-                    ...value.lifetimeBounds,
-                    ...(inputLifetimes?.lifetimeBounds ?? []),
-                  ]),
-                  longer,
-                  shorter,
+                  Lifetime.assumptions(value.lifetimeBounds),
+                  input.lifetime,
+                  failure.required,
                 ),
-            )
+            ) === true ||
+              Type.satisfiesOutlives(
+                failure.argument,
+                failure.required,
+                [...value.typeOutlives, ...(inputLifetimes?.typeOutlives ?? [])],
+                (longer, shorter) =>
+                  Lifetime.outlives(
+                    Lifetime.assumptions([
+                      ...value.lifetimeBounds,
+                      ...(inputLifetimes?.lifetimeBounds ?? []),
+                    ]),
+                    longer,
+                    shorter,
+                  ),
+              ))
           )
             continue
           const diagnostic = Diagnostic.unsatisfiedLifetimeBound(
@@ -1180,7 +1258,12 @@ export const analyze = (
   }
   const universalAssumptions = Lifetime.mergeAssumptions(
     outlivesScope.assumptions,
-    Lifetime.assumptions(DeclarationFacts.executableLifetimes(declaration).lifetimeBounds ?? []),
+    Lifetime.assumptions([
+      ...(DeclarationFacts.executableLifetimes(declaration).lifetimeBounds ?? []),
+      ...body.invocationInputs.flatMap((input) =>
+        Type.storageLifetimes(input.type).map((longer) => ({ longer, shorter: input.lifetime })),
+      ),
+    ]),
   )
   const universalDiagnostics = new Map<string, Diagnostic.Located>()
   const incoming = new Map<string, Array<Lifetime.Lifetime>>()
@@ -1204,7 +1287,14 @@ export const analyze = (
       const required = pending.pop()
       if (required === undefined || visited.has(Lifetime.key(required))) continue
       visited.add(Lifetime.key(required))
+      const conditional = BodyLifetime.provesInvocationInput(
+        body,
+        parameter,
+        required,
+        universalAssumptions,
+      )
       if (
+        conditional ||
         Lifetime.atoms(required).every(
           (member) => member._tag === 'BoundLifetime' || member._tag === 'StaticLifetime',
         )
@@ -1215,6 +1305,7 @@ export const analyze = (
           lifetime: region,
         }))
         if (
+          !conditional &&
           !Type.satisfiesOutlives(parameter, required, bounds, (longer, shorter) =>
             Lifetime.outlives(universalAssumptions, longer, shorter),
           )
@@ -1332,6 +1423,20 @@ export const analyze = (
     retirementWork,
     syntaxPointCount: entries.length,
     input,
+    sourcePremises: {
+      assumptions: universalAssumptions,
+      typeBounds: Type.normalizeTypeOutlives([
+        ...(DeclarationFacts.executableLifetimes(declaration).typeOutlives ?? []),
+        ...[...outlivesScope.parameters].flatMap(([key, parameter]) =>
+          (outlivesScope.parameterBounds.get(key) ?? []).map((lifetime) => ({
+            type: parameter.type,
+            lifetime,
+          })),
+        ),
+      ]),
+      invocationInputs: body.invocationInputs,
+    },
+    formations: [...body.formations.values()],
     solution,
     origins,
     spans,

@@ -2353,6 +2353,89 @@ fn visit(callback: for<'a> fn(&'a i32) -> &'a i32) {}`
   }),
 )
 
+it.effect(
+  'elaborates invocation-use role with original bound coordinates and complete positional inputs',
+  () =>
+    Effect.gen(function* () {
+      const source = `fn mixed(callback: for<'data, use 'call> fn<'static>(&'data i32, i32) -> i32) {}
+fn pure<E>(callback: for<use 'call> fn<'static>(E) -> i32) {}
+fn ordinary(callback: for<'call> fn<'static>(i32) -> i32) {}`
+      const index = yield* collect('root', [['root', source]])
+      assert.deepEqual(index.published, [])
+      const declarations = index.modules.at(0)?.declarations ?? []
+      const contract = (name: string) => {
+        const declaration =
+          declarations.find(
+            (value) => value.name._tag === 'Present' && value.name.spelling === name,
+          ) ?? unreachable(`expected ${name}`)
+        const context =
+          declaration.lifetimeElaboration ?? unreachable('expected lifetime elaboration')
+        const raw = [...context.callables.values()].at(0) ?? unreachable('expected raw callable')
+        const resolved = declaration.parameters.at(0)?.declaredType
+        if (resolved?._tag !== 'Resolved' || !Type.isCallable(resolved.type))
+          return unreachable('expected resolved callable parameter')
+        return { context, raw, selected: resolved.type }
+      }
+      const mixed = contract('mixed')
+      const use = mixed.raw.invocationUse ?? unreachable('expected invocation-use role')
+      assert.deepEqual(use.parameters, [0, 1])
+      assert.deepEqual(use.lifetime, Lifetime.bound(mixed.context.owner, 1, "'call", [0]))
+      assert.deepEqual(mixed.raw.lifetimeBinders.at(1), use.lifetime)
+      assert.deepEqual(mixed.selected.invocationUse, use)
+      assert.strictEqual(mixed.raw.lifetimeBounds?.length, 0)
+      // Role retention does not depend on a reference or returned computation mentioning κ.
+      const pure = contract('pure')
+      assert.deepEqual(pure.raw.invocationUse, {
+        lifetime: Lifetime.bound(pure.context.owner, 0, "'call", [0]),
+        parameters: [0],
+      })
+      assert.deepEqual(pure.selected.invocationUse, pure.raw.invocationUse)
+      assert.strictEqual(pure.selected.lifetimeBinders.length, 1)
+      assert.strictEqual(contract('ordinary').raw.invocationUse, undefined)
+      assert.strictEqual(contract('ordinary').selected.invocationUse, undefined)
+    }),
+)
+
+it.effect(
+  'rejects bounded, repeated, static, foreign and nested invocation-use roles at authored spans',
+  () =>
+    Effect.gen(function* () {
+      const source = `fn bounded(callback: for<use 'call: 'static> fn<'static>(i32) -> i32) {}
+fn repeated(callback: for<use 'first, use 'second> fn<'static>(i32) -> i32) {}
+fn staticRole(callback: for<use 'static> fn<'static>(i32) -> i32) {}
+fn foreignRole(callback: for<use 'call> extern "C" fn(i32) -> i32) {}
+fn nested(callback: fn<'static>(for<use 'inner> fn<'static>(i32) -> i32) -> i32) {}`
+      const index = yield* collect('root', [['root', source]])
+      const errors = index.published.filter(
+        (diagnostic) => diagnostic.code === Diagnostic.invalidLifetimeBinderCode,
+      )
+      const fragments = [
+        "use 'call: 'static",
+        "use 'second",
+        "use 'static",
+        "use 'call",
+        "for<use 'inner> fn<'static>(i32) -> i32",
+      ]
+      assert.strictEqual(errors.length, fragments.length)
+      for (const [ordinal, fragment] of fragments.entries()) {
+        const after = ordinal === 3 ? source.indexOf('fn foreignRole') : 0
+        const start = source.indexOf(fragment, after)
+        assert.isAtLeast(start, 0)
+        assert.isTrue(
+          errors.some(
+            (diagnostic) =>
+              diagnostic.span.sourceId === 'root' &&
+              diagnostic.span.start === start &&
+              diagnostic.span.end === start + fragment.length,
+          ),
+        )
+      }
+      for (const declaration of index.modules.at(0)?.declarations ?? [])
+        for (const contract of declaration.lifetimeElaboration?.callables.values() ?? [])
+          assert.strictEqual(contract.invocationUse, undefined)
+    }),
+)
+
 it.effect('diagnoses ambiguous outputs and unknown lifetime names at authored annotations', () =>
   Effect.gen(function* () {
     const text = `fn ambiguous(left: &i32, right: &i32) -> &i32 { return left }

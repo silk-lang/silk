@@ -5,6 +5,8 @@ import * as Result from 'effect/Result'
 import * as Analysis from '../src/Analysis.js'
 import * as CompilationProfile from '../src/CompilationProfile.js'
 import * as ConfigurationOrigin from '../src/ConfigurationOrigin.js'
+import * as Instances from '../src/Instances.js'
+import * as MirVerification from '../src/MirVerification.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceOrigin from '../src/SourceOrigin.js'
 import * as SourceResolver from '../src/SourceResolver.js'
@@ -604,12 +606,52 @@ it.effect('keeps the bundled runner environment complete for ordinary tests', ()
       discovery: { root: 'Cases' },
     }).pipe(
       Effect.provide(
-        SourceResolver.overlay([source('Cases', 'test fn cacheablePass() -> () {}')]).pipe(
-          Layer.provideMerge(SourceResolver.empty),
-        ),
+        SourceResolver.overlay([
+          source(
+            'Cases',
+            'test fn cacheablePass() -> () {}\ntest fn otherPass() -> () {}\ntest fn thirdPass() -> () {}',
+          ),
+        ]).pipe(Layer.provideMerge(SourceResolver.empty)),
       ),
     )
     assert.deepEqual(Analysis.diagnostics(analysis), [])
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(analysis)), [])
+    const discovery = Analysis.instancesOf(analysis)
+    const selected = discovery.instances.filter(
+      (instance) => instance.key.declaration.name === 'runSelected',
+    )
+    assert.isTrue(selected.length > 0)
+    let repeated = false
+    for (const instance of selected) {
+      const clockCalls = instance.function.statements
+        .flatMap(Tir.statementExpressions)
+        .flatMap(Tir.expressionTree)
+        .filter(
+          (
+            expression,
+          ): expression is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+            expression._tag === 'ServiceEffectConstruct' &&
+            expression.service.module === 'silk/monotonic_clock' &&
+            expression.operation === 'now',
+        )
+      for (const expression of clockCalls) {
+        assert.isDefined(expression.id)
+        const admitted = Instances.callsAtSite(
+          discovery.calls,
+          instance.key,
+          expression.span,
+        ).filter((call) => call.node?.ordinal === expression.id?.ordinal)
+        assert.strictEqual(admitted.length, 1)
+        const heldNode = admitted.at(0)?.node ?? unreachable('expected held service call node')
+        assert.isTrue(Tir.nodeOf(instance.function, heldNode) === expression)
+        repeated ||=
+          clockCalls.filter(
+            (other) =>
+              other.span.start === expression.span.start && other.span.end === expression.span.end,
+          ).length === 3
+      }
+    }
+    assert.isTrue(repeated)
     const catalog = analysis.testCatalog
     if (catalog === undefined) return unreachable('expected test catalog')
     const runner = yield* TestExecution.runnerIdentity(
@@ -632,11 +674,11 @@ it.effect('keeps the bundled runner environment complete for ordinary tests', ()
     )
     assert.deepEqual(
       manifest.entries.map((entry) => entry.test.name),
-      ['cacheablePass'],
+      ['cacheablePass', 'otherPass', 'thirdPass'],
     )
     assert.deepEqual(
       manifest.entries.map((entry) => entry.eligibility._tag),
-      ['Eligible'],
+      ['Eligible', 'Eligible', 'Eligible'],
     )
   }),
 )

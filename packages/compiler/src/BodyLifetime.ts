@@ -4,6 +4,14 @@ import * as Lifetime from './Lifetime.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
 
+/** Capture validity recorded at its actual construction, separate from invocation antecedents. */
+export interface Formation {
+  readonly origin: AuthoredHir.Anchor
+  readonly environment: Lifetime.Local
+  readonly lifetimeBounds: ReadonlyArray<Lifetime.Outlives>
+  readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
+}
+
 /** A declaration-local, finite authored domain shared by annotation and expression inference. */
 export interface BodyLifetime {
   readonly owner: Lifetime.Owner
@@ -11,12 +19,15 @@ export interface BodyLifetime {
   /** Every registered position by its point key, so a solver can walk the whole domain. */
   readonly anchors: ReadonlyMap<string, AuthoredHir.Anchor>
   readonly constraints: Map<string, Lifetime.Outlives>
+  readonly formations: Map<string, Formation>
   readonly activatedConstraints: Array<{
     readonly bound: Lifetime.Outlives
     readonly installed: AuthoredHir.Anchor
     readonly owner?: AuthoredHir.Anchor
   }>
   readonly parameterBounds: ReadonlyMap<string, ReadonlyArray<Lifetime.Lifetime>>
+  /** Hidden marked-body input antecedents, separate from universal declaration premises. */
+  readonly invocationInputs: ReadonlyArray<Type.InvocationInputBound>
   readonly genericStorage: Map<
     string,
     { readonly lifetime: Lifetime.Local; readonly parameter: Type.Parameter }
@@ -42,11 +53,35 @@ export const make = (
     points,
     anchors: registered,
     constraints: new Map(),
+    formations: new Map(),
     activatedConstraints: [],
     parameterBounds,
+    invocationInputs: [],
     genericStorage: new Map(),
   }
 }
+
+/** Installs the exact rebased hidden contract, never an actual invocation certificate. */
+export const withInvocationInputs = (
+  self: BodyLifetime,
+  expected: Type.Callable,
+): BodyLifetime | undefined => {
+  const inputs = Type.invocationInputBounds(expected)
+  if (inputs === undefined) return undefined
+  return { ...self, invocationInputs: [...self.invocationInputs, ...inputs] }
+}
+
+/** Only the designated exact input subject may shorten its invocation-local validity. */
+export const provesInvocationInput = (
+  self: BodyLifetime,
+  type: Type.Type,
+  lifetime: Lifetime.Lifetime,
+  assumptions: Lifetime.Assumptions,
+): boolean =>
+  self.invocationInputs.some(
+    (input) =>
+      Type.equals(input.type, type) && Lifetime.outlives(assumptions, input.lifetime, lifetime),
+  )
 
 /** Allocates an occurrence region only inside the already registered declaration domain. */
 export const region = (
@@ -61,14 +96,38 @@ export const region = (
     : Lifetime.local(self.owner, `${role}:${binderOrdinal}`, ordinal)
 }
 
+/** An invocation role is identified by its original binder, beyond its ordinal namespace. */
+export const invocationContext = (binder: Lifetime.Bound): string =>
+  `Invocation:${Lifetime.key(binder)}`
+
+/** Opens the original input-use role without aliasing a free environment/data template slot. */
+export const invocationRegion = (
+  self: BodyLifetime,
+  anchor: AuthoredHir.Anchor,
+  binder: Lifetime.Bound,
+): Lifetime.Local | undefined => {
+  const ordinal = self.points.get(AuthoredIdentity.anchorKey(anchor))
+  return ordinal === undefined
+    ? undefined
+    : Lifetime.local(self.owner, invocationContext(binder), ordinal)
+}
+
 /** Creates one body comparison cache; local obligations are retained for its finite region solve. */
 export const compatibility = (
   self: BodyLifetime,
   assumptions: Lifetime.Assumptions,
   nominalVariance: ReadonlyMap<string, ReadonlyArray<TypeCompatibility.Variance>> = new Map(),
 ): TypeCompatibility.Context => {
+  const conditionalAssumptions = Lifetime.mergeAssumptions(
+    assumptions,
+    Lifetime.assumptions(
+      self.invocationInputs.flatMap((input) =>
+        Type.storageLifetimes(input.type).map((longer) => ({ longer, shorter: input.lifetime })),
+      ),
+    ),
+  )
   const proves = (longer: Lifetime.Lifetime, shorter: Lifetime.Lifetime): boolean => {
-    if (Lifetime.outlives(assumptions, longer, shorter)) return true
+    if (Lifetime.outlives(conditionalAssumptions, longer, shorter)) return true
     if (
       [...Lifetime.atoms(longer), ...Lifetime.atoms(shorter)].some(
         (member) => member._tag === 'PlaceholderLifetime',
@@ -92,11 +151,12 @@ export const compatibility = (
       })),
     )
     return Type.satisfiesOutlives(type, lifetime, bounds, (longer, shorter) =>
-      Lifetime.outlives(assumptions, longer, shorter),
+      Lifetime.outlives(conditionalAssumptions, longer, shorter),
     )
   }
   return TypeCompatibility.context({
-    assumptions,
+    assumptions: conditionalAssumptions,
+    invocationInputs: self.invocationInputs,
     nominalVariance,
     outlives: proves,
     commitOutlives: (longer, shorter) => constrain(self, longer, shorter),
@@ -207,10 +267,17 @@ export const environment = (
   if (lifetime === undefined) return undefined
   const lifetimeBounds = dependencies.map((longer) => ({ longer, shorter: lifetime }))
   for (const bound of lifetimeBounds) constrain(self, bound.longer, bound.shorter)
+  const typeOutlives = retainedParameters.map((type) => ({ type, lifetime }))
+  self.formations.set(Lifetime.key(lifetime), {
+    origin: anchor,
+    environment: lifetime,
+    lifetimeBounds,
+    typeOutlives,
+  })
   return {
     environment: lifetime,
     lifetimeBinders: [],
     lifetimeBounds,
-    typeOutlives: retainedParameters.map((type) => ({ type, lifetime })),
+    typeOutlives,
   }
 }

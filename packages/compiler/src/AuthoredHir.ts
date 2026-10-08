@@ -65,6 +65,8 @@ export type GenericParameter = Node &
         readonly _tag: 'LifetimeParameter'
         readonly name: Name
         readonly bounds: ReadonlyArray<Type | Lifetime>
+        /** Explicit bounded invocation-use role; absent on ordinary data lifetime binders. */
+        readonly invocationUse?: boolean
       }
   )
 
@@ -766,7 +768,7 @@ export const fields = freezeFieldRegistry({
   Path: [...nodeFields, 'segments'],
   TypeParameter: [...nodeFields, 'name', 'bounds'],
   RowParameter: [...nodeFields, 'name'],
-  LifetimeParameter: [...nodeFields, 'name', 'bounds'],
+  LifetimeParameter: [...nodeFields, 'name', 'bounds', 'invocationUse'],
   Lifetime: [...nodeFields, 'name'],
   RequirementSelector: [...nodeFields, 'subject', 'role'],
   TypeArguments: [...nodeFields, 'arguments', 'environment', 'failures', 'requirements'],
@@ -931,11 +933,12 @@ type MissingFields = {
 export const completeFieldOrder: MissingFields extends never ? true : never = true
 
 type OptionalKeys<Value> = {
-  [Key in keyof Value]: undefined extends Value[Key] ? Key : never
+  [Key in keyof Value]-?: undefined extends Value[Key] ? Key : never
 }[keyof Value]
 
 /** Only these declared fields may carry the explicit absence marker. */
 export const optionalFields = freezeFieldRegistry({
+  LifetimeParameter: ['invocationUse'],
   IdentifierExpression: ['binding'],
   TypeArguments: ['environment', 'failures', 'requirements'],
   Requirement: ['access', 'role'],

@@ -1,3 +1,4 @@
+import * as CallableInputView from '../src/CallableInputView.js'
 import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
@@ -40,6 +41,47 @@ const failureMembers = (row: Type.FailureRow): ReadonlyArray<string> => {
   return concrete._tag === 'Concrete' ? concrete.row.members.map(Type.encode) : []
 }
 
+// Mutate control evidence while retaining authentic opened type and source proof objects.
+const replaceMirOperation = (
+  module: Mir.Module,
+  selected: Mir.Operation,
+  replacement: Mir.Operation,
+): Mir.Module => {
+  const execution = (value: Mir.Execution): Mir.Execution =>
+    Mir.mapExecutionOperations(value, (operations) => operations.map(operation))
+  const operation = (value: Mir.Operation): Mir.Operation => {
+    if (value === selected) return replacement
+    switch (value._tag) {
+      case 'Match':
+        return {
+          ...value,
+          arms: value.arms.map((arm) => ({
+            ...arm,
+            ...(arm.guard === undefined
+              ? {}
+              : { guard: { execution: execution(arm.guard.execution) } }),
+            selected: { ...arm.selected, execution: execution(arm.selected.execution) },
+          })),
+        }
+      case 'Conditional':
+        return { ...value, taken: execution(value.taken), otherwise: execution(value.otherwise) }
+      case 'ShortCircuit':
+        return { ...value, right: execution(value.right) }
+      case 'DiagnosticScope':
+        return { ...value, body: execution(value.body) }
+      default:
+        return value
+    }
+  }
+  return {
+    ...module,
+    functions: module.functions.map((fn) => ({
+      ...fn,
+      regions: execution({ entry: fn.entry, regions: fn.regions }).regions,
+    })),
+  }
+}
+
 /** A two-member failure row plus a handler for each member on its own. */
 const preamble = `pub struct A { code: i32 }
 pub struct B { code: i32 }
@@ -57,24 +99,78 @@ it.effect('uses nominal variant coverage when catching a mixed failure row', () 
     const self = yield* analyze(`import silk.effect { Effect }
 pub union Problem { Detailed { pub code: i32 }, Empty }
 pub struct Other { pub value: usize }
+struct Marker { value: i32 }
 effect fn risky(flag: bool) -> i32 ! Problem | Other {
   if flag { fail Problem.Detailed { code: 7 } }
   fail Other { value: 1 }
 }
 effect fn recoverProblem(error: Problem) -> i32 { drop error return 20 }
 effect fn recoverOther(error: Other) -> i32 { return 22 }
-effect fn recoverAll(error: Problem | Other) -> i32 { drop error return 42 }
+effect fn recoverAll(error: Problem | Other, marker: Marker) -> i32 {
+  match move error {
+    Other { value } => { return marker.value }
+    _ => { return marker.value }
+  }
+}
 effect fn selective(flag: bool) -> i32 ! Other {
   return run Effect.catch<Problem>(risky(flag), recoverProblem)
 }
 pub fn main() -> i32 {
-  let all = run Effect.catchAll(risky(true), recoverAll)
+  let all = run Effect.catchAll(risky(true), recoverAll(Marker { value: 42 }))
   let selected = run Effect.catchAll(selective(false), recoverOther)
   return all + selected
 }`)
     assert.deepEqual(codes(self), [])
     const module = Analysis.loweredMir(self)
     assert.deepEqual(yield* MirVerification.verify(module), [])
+    const captured = module.functions
+      .flatMap((fn) => fn.localTypes)
+      .find(
+        (local) =>
+          local._tag === 'CallableValue' &&
+          local.type.schema === undefined &&
+          local.target._tag === 'DeclarationCallableTarget' &&
+          local.target.declaration.name === 'recoverAll',
+      )
+    if (
+      captured?._tag !== 'CallableValue' ||
+      captured.target._tag !== 'DeclarationCallableTarget' ||
+      captured.environment === undefined
+    )
+      return unreachable('expected original non-generic owned section')
+    const inputView = CallableInputView.authenticate(module, captured)
+    assert.isDefined(inputView)
+    assert.deepEqual(inputView?.inputs, [0, 1])
+    assert.deepEqual(inputView?.visible, [0])
+    for (const changed of [
+      {
+        ...captured,
+        target: {
+          _tag: 'DeclarationCallableTarget',
+          declaration: { ...captured.target.declaration, name: 'recoverOther' },
+        },
+      },
+      {
+        ...captured,
+        environment: {
+          ...captured.environment,
+          fields: captured.environment.fields.map((field) => ({ ...field, parameterOrdinal: 0 })),
+        },
+      },
+    ] satisfies ReadonlyArray<Extract<Mir.Type, { readonly _tag: 'CallableValue' }>>)
+      assert.isUndefined(CallableInputView.authenticate(module, changed))
+    assert.isUndefined(
+      CallableInputView.authenticate({ ...module, callableInputSources: [] }, captured),
+    )
+    const missingSource = yield* MirVerification.verify({ ...module, callableInputSources: [] })
+    assert.isTrue(
+      missingSource.some(
+        (violation) =>
+          violation.detail === 'invocation fails complete original target input coverage' ||
+          violation.detail ===
+            'invocation captured input lacks its exact retained callable slot producer',
+      ),
+    )
     const matches = module.functions.flatMap((fn) =>
       MirVerification.operations(fn).filter(
         (operation) =>
@@ -286,32 +382,55 @@ pub fn main() -> i32 { return run Effect.catchAll(selective(true), recoverB) }`)
     assert.strictEqual(completedRecoveries, 2)
     assert.strictEqual(unselectedPropagations, 1)
     assert.include(MirEncoding.encode(module), 'recovery=%')
-    const wrongPropagationOwner = structuredClone(module)
-    const propagation = wrongPropagationOwner.functions
+    const propagation = module.functions
       .flatMap(MirVerification.operations)
       .find((operation) => operation._tag === 'PropagateEffectFailure')
     if (propagation?._tag !== 'PropagateEffectFailure')
       return unreachable('expected unselected failure propagation')
-    Reflect.set(propagation, 'outcome', propagation.source)
+    const wrongPropagationOwner = replaceMirOperation(module, propagation, {
+      ...propagation,
+      outcome: propagation.source,
+    })
     assert.include(
       (yield* MirVerification.verify(wrongPropagationOwner)).map((violation) => violation.rule),
       'InvalidEffectOperation',
     )
-    const forged = structuredClone(module)
-    const selected = forged.functions
+    const selectedMatch = module.functions
       .flatMap(MirVerification.operations)
-      .filter((operation) => operation._tag === 'Match')
-      .flatMap((operation) => operation.arms)
-      .find((arm) => arm.selected.execution.recoveryOutcome !== undefined)
+      .find(
+        (operation) =>
+          operation._tag === 'Match' &&
+          operation.arms.some((arm) => arm.selected.execution.recoveryOutcome !== undefined),
+      )
+    if (selectedMatch?._tag !== 'Match') return unreachable('expected selected recovery match')
+    const selected = selectedMatch.arms.find(
+      (arm) => arm.selected.execution.recoveryOutcome !== undefined,
+    )
     if (selected === undefined) return unreachable('expected selected recovery execution')
-    Reflect.set(selected.selected.execution, 'recoveryOutcome', { _tag: 'Local', ordinal: -1 })
+    const forged = replaceMirOperation(module, selectedMatch, {
+      ...selectedMatch,
+      arms: selectedMatch.arms.map((arm) =>
+        arm !== selected
+          ? arm
+          : {
+              ...arm,
+              selected: {
+                ...arm.selected,
+                execution: {
+                  ...arm.selected.execution,
+                  recoveryOutcome: { _tag: 'Local', ordinal: -1 },
+                },
+              },
+            },
+      ),
+    })
     assert.include(
       (yield* MirVerification.verify(forged)).map((violation) => violation.rule),
       'InvalidMatchJoin',
     )
-    const successScope = structuredClone(module)
+    let successScope = module
     let forgedSuccess = false
-    for (const fn of successScope.functions) {
+    for (const fn of module.functions) {
       const operations = MirVerification.operations(fn)
       const caught = operations.find((operation) => operation._tag === 'CatchEffect')
       if (caught === undefined) continue
@@ -321,7 +440,10 @@ pub fn main() -> i32 { return run Effect.catchAll(selective(true), recoverB) }`)
           operation.condition.ordinal === caught.destination.ordinal,
       )
       if (conditional?._tag !== 'Conditional') continue
-      Reflect.set(conditional.taken, 'recoveryOutcome', caught.outcome)
+      successScope = replaceMirOperation(module, conditional, {
+        ...conditional,
+        taken: { ...conditional.taken, recoveryOutcome: caught.outcome },
+      })
       forgedSuccess = true
       break
     }
@@ -534,10 +656,9 @@ it.effect('rejects failure-only loan metadata on every infallible MIR run form',
       form: 'RunEffect' | 'RunEffectValue' | 'RunStaticEffect',
       includeMetadata: boolean,
     ): Mir.Module => {
-      const forged = structuredClone(module)
       const sourceTag = form === 'RunStaticEffect' ? 'RunStaticEffect' : 'RunEffectValue'
       const owner =
-        forged.functions.find(
+        module.functions.find(
           (fn) =>
             MirVerification.operations(fn).some((operation) => operation._tag === sourceTag) &&
             MirVerification.operations(fn).some((operation) => operation._tag === 'EndLoan'),
@@ -558,18 +679,20 @@ it.effect('rejects failure-only loan metadata on every infallible MIR run form',
         (operation): operation is Mir.EndLoanOperation => operation._tag === 'EndLoan',
       )
       if (ending === undefined) return unreachable(`expected ${form} caller loan ending`)
-      if (form === 'RunEffect' && candidate._tag === 'RunEffectValue') {
-        Reflect.set(candidate, '_tag', 'RunEffect')
-        Reflect.set(candidate, 'target', candidate.runner)
-        Reflect.set(candidate, 'typeArguments', candidate.runnerTypeArguments)
-        Reflect.set(
-          candidate,
-          'arguments',
-          Object.freeze([candidate.effect, ...candidate.arguments]),
-        )
-      }
-      if (includeMetadata) Reflect.set(candidate, 'failureLoanEnds', Object.freeze([ending]))
-      return forged
+      const replacement: Mir.Operation =
+        form === 'RunEffect' && candidate._tag === 'RunEffectValue'
+          ? {
+              ...candidate,
+              _tag: 'RunEffect',
+              target: candidate.runner,
+              typeArguments: candidate.runnerTypeArguments,
+              arguments: Object.freeze([candidate.effect, ...candidate.arguments]),
+            }
+          : candidate
+      return replaceMirOperation(module, candidate, {
+        ...replacement,
+        ...(includeMetadata ? { failureLoanEnds: Object.freeze([ending]) } : {}),
+      })
     }
 
     for (const [module, form, rule] of [

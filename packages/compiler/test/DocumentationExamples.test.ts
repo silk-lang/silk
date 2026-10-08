@@ -4,7 +4,12 @@ import { fileURLToPath } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as ConformanceProof from '../src/ConformanceProof.js'
+import * as Instances from '../src/Instances.js'
+import * as SourceCallView from '../src/SourceCallView.js'
 import * as Stdlib from '../src/Stdlib.js'
+import * as Tir from '../src/Tir.js'
+import * as Type from '../src/Type.js'
 import { raise } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
@@ -172,6 +177,113 @@ for (const block of blocks) {
           [],
           `${block.file}:${block.line}\n${block.source}`,
         )
+        if (block.file === 'fibers.md' && block.line === 16) {
+          const discovery = Analysis.instancesOf(snapshot)
+          const caller = discovery.instances.find(
+            (instance) => instance.key.declaration.name === 'Fiber.forkChild',
+          )
+          if (caller === undefined) return raise('missing original fork caller')
+          const subject = caller.function.statements
+            .flatMap(Tir.statementExpressions)
+            .flatMap(Tir.expressionTree)
+            .find(
+              (
+                node,
+              ): node is Extract<Tir.Expression, { readonly _tag: 'ServiceEffectConstruct' }> =>
+                node._tag === 'ServiceEffectConstruct' && node.operation === 'prepare',
+            )
+          if (subject === undefined) return raise('missing original prepare operation')
+          const call = discovery.calls.find(
+            (candidate) =>
+              Instances.keyText(candidate.owner) === Instances.keyText(caller.key) &&
+              candidate.node?.ordinal === subject.id?.ordinal,
+          )
+          if (call === undefined) return raise('missing original selected prepare call')
+          const implementation = discovery.instances.find(
+            (instance) => Instances.keyText(instance.key) === Instances.keyText(call.target),
+          )
+          if (implementation === undefined) return raise('missing original prepare implementation')
+          const root = implementation.function.statements
+            .flatMap(Tir.statementExpressions)
+            .find((node) => node._tag === 'EffectBlock')
+          if (root?._tag !== 'EffectBlock') return raise('missing original prepare Effect body')
+          const capture = root.captures.find((entry) => entry.parameter?.ordinal === 1)
+          assert.strictEqual(capture?.access, 'Take')
+          const layout = Analysis.loweredMir(snapshot).layout
+          const environment = layout.effectEnvironments.find(
+            (candidate) =>
+              candidate._tag === 'EffectEnvironment' &&
+              Instances.keyText(candidate.instance) === Instances.keyText(call.target) &&
+              Instances.effectIdentity(candidate.instance, candidate.site) === call.resultEffect,
+          )
+          if (environment?._tag !== 'EffectEnvironment')
+            return raise('missing actual prepare environment')
+          const child = environment.fields.find((field) => field.ordinal === 1)
+          if (child === undefined || !Type.isEffect(child.type))
+            return raise('missing actual child Effect field')
+          assert.strictEqual(child.access, 'Shared')
+          assert.strictEqual(child.type.access, 'Shared')
+          const receiver = implementation.specialization.parameters.at(0)
+          if (
+            receiver === undefined ||
+            !Type.isReference(receiver) ||
+            !Type.isNominal(receiver.target)
+          )
+            return raise('missing original scheduler client receiver')
+          const capability = Type.substitute(subject.service, caller.substitution)
+          if (!Type.isNominal(capability)) return raise('missing original Scheduler capability')
+          const witness = ConformanceProof.witness(
+            Analysis.declarationIndex(snapshot),
+            receiver.target,
+            capability,
+          )
+          if (witness?._tag !== 'SourceConformanceWitness')
+            return raise('missing original Scheduler witness')
+          const provider = {
+            capability,
+            providerType: receiver.target,
+            witness,
+            role: subject.role,
+            access: subject.access,
+            requirementAccess: subject.access,
+          }
+          const held = {
+            owner: caller,
+            index: Analysis.declarationIndex(snapshot),
+            instances: discovery.instances,
+            calls: discovery.calls,
+            layout,
+            semantic: (type: Type.Type) => Type.substitute(type, caller.substitution),
+          }
+          assert.isDefined(
+            SourceCallView.service(held, subject, call, provider, environment.effect),
+          )
+          for (const forged of [
+            { ...child, access: 'Take' as const },
+            { ...child, effectIdentity: 'foreign-child' },
+          ]) {
+            const altered = {
+              ...layout,
+              effectEnvironments: layout.effectEnvironments.map((candidate) =>
+                candidate === environment
+                  ? {
+                      ...environment,
+                      fields: environment.fields.map((field) => (field === child ? forged : field)),
+                    }
+                  : candidate,
+              ),
+            }
+            assert.isUndefined(
+              SourceCallView.service(
+                { ...held, layout: altered },
+                subject,
+                call,
+                provider,
+                environment.effect,
+              ),
+            )
+          }
+        }
       }),
     timeout,
   )
