@@ -1609,8 +1609,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   compiles natively until step 14.
 - **Source migration:** none.
 - **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
-  widened to another, explicitly fixed lifetime slots, and owner, access, element, pointee,
-  extent, type-argument and requirement-row differences keep `TypeMismatch`. Native call arguments
+  widened to another, and owner, access, element, pointee, extent, type-argument and
+  requirement-row differences keep `TypeMismatch`. An explicitly written lifetime slot is never
+  shortened or widened, but an operand meets it by the same covariant subtyping. Native call arguments
   still unify exactly apart from shared-loan shortening and this binder-region relation.
 - **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
   `staticStringSubtypingPreservesOrdinaryMismatches`,
