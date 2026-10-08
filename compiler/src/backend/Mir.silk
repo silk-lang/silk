@@ -315,6 +315,13 @@ pub struct Reference {
   pub origin: Origin
 }
 
+// A temporary awaiting the end of its full expression, and how many owners preceded it, which
+// places it in the reverse acquisition order of an exit (CLEANUP-002).
+struct Pending {
+  local: usize
+  owners: usize
+}
+
 struct LoopTargets {
   exit: usize
   repeat: usize
@@ -600,7 +607,7 @@ struct Builder {
   cleanup: Vector<CleanupNode>
   scopes: Vector<usize>
   // Owned rvalues used only as places; they live until the end of their full expression.
-  temporaries: Vector<usize>
+  temporaries: Vector<Pending>
   // The remaining children of each partial consuming site, keyed by body node.
   remainders: Vector<Remainder>
   // Which typed-body locals and node values need cleanup, answered by semantic analysis.
@@ -1706,7 +1713,7 @@ effect fn endTemporaries(builder: &mut Builder, pending: usize, origin: Origin) 
 // A condition is copied out of its expression's temporaries before they end, so a test never reads
 // dropped storage.
 effect fn settledCondition(builder: &mut Builder, condition: Operand, pending: usize, origin: Origin) -> Operand ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  if Vector.length<usize>(&builder.temporaries) == pending { return move condition }
+  if Vector.length<Pending>(&builder.temporaries) == pending { return move condition }
   let boolean = run Shared.make<Type>(Type.Primitive {name: run Bytes.copy(b"bool")})
   let copied = run temporary(&mut builder.*, &boolean, origin)
   run assign(&mut builder.*, place(copied), Rvalue.Use {value: move condition}, origin)
@@ -2393,8 +2400,8 @@ effect fn dropOwnersFrom(builder: &mut Builder, from: usize, origin: Origin) -> 
 // Turns temporaries `from..` into owners of the enclosing scope, for bindings that view them.
 effect fn retainTemporaries(builder: &mut Builder, from: usize) -> () ! CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let mut at = from
-  while at < Vector.length<usize>(&builder.temporaries) {
-    let local = Vector.asSlice<usize>(&builder.temporaries)[at]
+  while at < Vector.length<Pending>(&builder.temporaries) {
+    let local = Vector.asSlice<Pending>(&builder.temporaries)[at].local
     let held = localType(&builder.*, local)
     // Only temporaries that need cleanup are pending.
     run acquire(&mut builder.*, local, &held, true)
@@ -2407,10 +2414,10 @@ effect fn retainTemporaries(builder: &mut Builder, from: usize) -> () ! Canonica
 // Drops owned temporaries `from..` in reverse creation order.
 effect fn dropTemporariesFrom(builder: &mut Builder, from: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
-  let mut at = Vector.length<usize>(&builder.temporaries)
+  let mut at = Vector.length<Pending>(&builder.temporaries)
   while at > from {
     at = at - usize.ONE
-    let local = Vector.asSlice<usize>(&builder.temporaries)[at]
+    let local = Vector.asSlice<Pending>(&builder.temporaries)[at].local
     let ty = localType(&builder.*, local)
     run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
   }
@@ -2418,14 +2425,36 @@ effect fn dropTemporariesFrom(builder: &mut Builder, from: usize, origin: Origin
 }
 
 fn truncateTemporaries(builder: &mut Builder, length: usize) -> () {
-  while Vector.length<usize>(&builder.temporaries) > length { drop Vector.pop<usize>(&mut builder.*.temporaries) }
+  while Vector.length<Pending>(&builder.temporaries) > length { drop Vector.pop<Pending>(&mut builder.*.temporaries) }
   return ()
 }
 
-// An exit leaves every temporary created after `temporaries` and every owner acquired after `owners`.
+effect fn pend(builder: &mut Builder, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Vector.append<Pending>(&mut builder.*.temporaries, Pending {local: local, owners: Vector.length<Owner>(&builder.owners)})
+}
+
+// An exit leaves every temporary created after `temporaries` and every owner acquired after `owners`,
+// together in reverse creation order: a temporary drops before the owners that preceded it.
 effect fn exitTo(builder: &mut Builder, owners: usize, temporaries: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  run dropTemporariesFrom(&mut builder.*, temporaries, origin)
-  return run dropOwnersFrom(&mut builder.*, owners, origin)
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut held = Vector.length<Owner>(&builder.owners)
+  let mut at = Vector.length<Pending>(&builder.temporaries)
+  while held > owners || at > temporaries {
+    let mut temporaryNext = false
+    if at > temporaries {
+      temporaryNext = held <= owners || Vector.asSlice<Pending>(&builder.temporaries)[at - usize.ONE].owners >= held
+    }
+    if temporaryNext {
+      at = at - usize.ONE
+      let local = Vector.asSlice<Pending>(&builder.temporaries)[at].local
+      let ty = localType(&builder.*, local)
+      run dropPlace(&mut builder.*, place(local), &ty, &owner, origin)
+    } else {
+      held = held - usize.ONE
+      run dropOwner(&mut builder.*, held, origin)
+    }
+  }
+  return ()
 }
 
 effect fn openScope(builder: &mut Builder) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -2601,7 +2630,7 @@ effect fn expressionPlace(
       }
       // An owned rvalue used as a place is a temporary of the enclosing full expression.
       if ownedRvalue(body, id) && Vector.length<Projection>(&storage.projections) == usize.ZERO && CleanupNeeds.node(&builder.needs, id.index) {
-        run Vector.append<usize>(&mut builder.*.temporaries, storage.local)
+        run pend(&mut builder.*, storage.local)
       }
       return move storage
     }
@@ -2797,16 +2826,41 @@ effect fn guardOperand(builder: &mut Builder, body: &Shared<TypedBody>, child: B
   if !builder.live || !ownedRvalue(body, child) || !CleanupNeeds.node(&builder.needs, child.index) {
     return move produced
   }
-  let owner = InstanceKey.identity(&builder.function.key)
-  let ty = match move run instanceNodeType(&builder.*, body, child) {
-    Option<Shared<Type>>.Some {value} => move value
-    _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  // A fresh result temporary is itself the pending owner; anything else is captured first.
+  let mut captured = usize.MAX
+  match &produced {
+    Operand.Copy {place: stored} => { captured = freshTemporary(&builder.*, stored) }
+    Operand.Move {place: stored} => { captured = freshTemporary(&builder.*, stored) }
+    _ => {}
   }
-  let captured = run temporary(&mut builder.*, &ty, origin)
-  run assign(&mut builder.*, place(captured), Rvalue.Use {value: move produced}, origin)
-  run Vector.append<usize>(&mut builder.*.temporaries, captured)
+  if captured == usize.MAX {
+    let owner = InstanceKey.identity(&builder.function.key)
+    let ty = match move run instanceNodeType(&builder.*, body, child) {
+      Option<Shared<Type>>.Some {value} => move value
+      _ => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    }
+    captured = run temporary(&mut builder.*, &ty, origin)
+    run assign(&mut builder.*, place(captured), Rvalue.Use {value: move produced}, origin)
+  }
+  run pend(&mut builder.*, captured)
   run Vector.append<usize>(&mut transferred.*, captured)
   return Operand.Move {place: place(captured)}
+}
+
+// The compiler temporary a whole place names, unless it is already pending cleanup.
+fn freshTemporary(builder: &Builder, stored: &Place) -> usize {
+  if Vector.length<Projection>(&stored.projections) != usize.ZERO { return usize.MAX }
+  let locals = Vector.asSlice<Local>(&builder.function.locals)
+  if stored.local >= locals.length { return usize.MAX }
+  let temporary = match &locals[stored.local].kind { LocalKind.Temp => true _ => false }
+  if !temporary { return usize.MAX }
+  let pending = Vector.asSlice<Pending>(&builder.temporaries)
+  let mut at = usize.ZERO
+  while at < pending.length {
+    if pending[at].local == stored.local { return usize.MAX }
+    at = at + usize.ONE
+  }
+  return stored.local
 }
 
 fn transferGuarded(builder: &mut Builder, transferred: &Vector<usize>) -> () {
@@ -2844,7 +2898,7 @@ effect fn witnessArgument(
     // Capture an arbitrary owned rvalue exactly once before lending its storage.
     let captured = run temporary(&mut builder.*, &operand.value, origin)
     run assign(&mut builder.*, place(captured), Rvalue.Use {value: move argument}, origin)
-    if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) { run Vector.append<usize>(&mut builder.*.temporaries, captured) }
+    if ownedRvalue(body, child) && CleanupNeeds.node(&builder.needs, child.index) { run pend(&mut builder.*, captured) }
     let reference = run temporary(&mut builder.*, &operand.parameter, origin)
     run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: place(captured)}, origin)
     return Operand.Copy {place: place(reference)}
@@ -2925,7 +2979,7 @@ effect fn pipedArgument(builder: &mut Builder, body: &Shared<TypedBody>, hir: &M
   run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: move input}, origin)
   let mut cleanup = Option.none<usize>()
   if transfers && CleanupNeeds.node(&builder.needs, child.index) {
-    run Vector.append<usize>(&mut builder.*.temporaries, snapshot)
+    run pend(&mut builder.*, snapshot)
     cleanup = Option.some<usize>(snapshot)
   }
   let mut operand = Operand.Copy {place: place(snapshot)}
@@ -3023,11 +3077,11 @@ effect fn storedCallArguments(builder: &Builder, node: BodyNodeId) -> Option<Sto
 // Release only the cleanup owner transferred into a new aggregate, retaining any other
 // temporaries whose referents must remain live through this full expression.
 fn transferTemporary(builder: &mut Builder, local: usize) -> () {
-  let mut at = Vector.length<usize>(&builder.temporaries)
+  let mut at = Vector.length<Pending>(&builder.temporaries)
   while at > usize.ZERO {
     at = at - usize.ONE
-    if Vector.asSlice<usize>(&builder.temporaries)[at] == local {
-      drop Vector.remove<usize>(&mut builder.*.temporaries, at)
+    if Vector.asSlice<Pending>(&builder.temporaries)[at].local == local {
+      drop Vector.remove<Pending>(&mut builder.*.temporaries, at)
       return ()
     }
   }
@@ -3076,7 +3130,7 @@ effect fn stagedCallableFields(builder: &mut Builder, body: &Shared<TypedBody>, 
   run assign(&mut builder.*, place(snapshot), Rvalue.Use {value: move input}, origin)
   let mut transferred = Vector.make<usize>()
   if consumes && CleanupNeeds.node(&builder.needs, callee.index) {
-    run Vector.append<usize>(&mut builder.*.temporaries, snapshot)
+    run pend(&mut builder.*, snapshot)
     run Vector.append<usize>(&mut transferred, snapshot)
   }
   let mut retained = baseCount
@@ -3106,7 +3160,7 @@ effect fn stagedCallableFields(builder: &mut Builder, body: &Shared<TypedBody>, 
       }
       let captured = run temporary(&mut builder.*, &ty, origin)
       run assign(&mut builder.*, place(captured), Rvalue.Use {value: move produced}, origin)
-      run Vector.append<usize>(&mut builder.*.temporaries, captured)
+      run pend(&mut builder.*, captured)
       run Vector.append<usize>(&mut transferred, captured)
       value = Operand.Move {place: place(captured)}
     } else { value = move produced }
@@ -3172,9 +3226,9 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
     environment = place(snapshot)
     run projectCallableReceiver(&mut environment, dereferences)
   }
-  let pending = Vector.length<usize>(&builder.temporaries)
+  let pending = Vector.length<Pending>(&builder.temporaries)
   let guarded = stored.consumes && CleanupNeeds.node(&builder.needs, callee.index)
-  if guarded { run Vector.append<usize>(&mut builder.*.temporaries, environment.local) }
+  if guarded { run pend(&mut builder.*, environment.local) }
   if let Option<StoredEnvironment>.Some {value: input} = &stored.environment {
     let mut field = run copyPlace(&environment)
     if let Option<Place>.Some {value} = &original { field = run copyPlace(&value) }
@@ -3217,7 +3271,7 @@ effect fn sectionArguments(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   }
   // A diverging written argument cleaned the transferred environment. On the call edge every
   // capture moves into its original target parameter, so remove the temporary cleanup owner.
-  if guarded { drop Vector.remove<usize>(&mut builder.*.temporaries, pending) }
+  if guarded { drop Vector.remove<Pending>(&mut builder.*.temporaries, pending) }
   commitPipedArgument(&mut builder.*, move pipedCleanup)
   return move values
 }
@@ -4098,7 +4152,7 @@ effect fn lowerMatch(
   }
   let mut scrutinee = place(usize.ZERO)
   if placeMatch {
-    let pending = Vector.length<usize>(&builder.temporaries)
+    let pending = Vector.length<Pending>(&builder.temporaries)
     scrutinee = run expressionPlace(&mut builder.*, body, hir, subject)
     // A borrowing destructuring `let` keeps its subject's temporaries alive for its bindings'
     // scope, like a borrowing binding (BORROW-006).
@@ -4211,7 +4265,7 @@ effect fn lowerMatch(
       }
       if let Option<BodyNodeId>.Some {value: condition} = &armSlice[at].guard {
         // A guard's temporaries end before it selects the arm or resumes dispatch.
-        let guardPending = Vector.length<usize>(&builder.temporaries)
+        let guardPending = Vector.length<Pending>(&builder.temporaries)
         let evaluated = run expression(&mut builder.*, body, hir, condition)
         run checkUnchanged(&builder.*, &entryStates, nodeOrigin(body, condition))
         let passed = run settledCondition(&mut builder.*, move evaluated, guardPending, armOrigin)
@@ -4237,10 +4291,10 @@ effect fn lowerMatch(
       run statement(&mut builder.*, body, hir, result)
     } else {
       // An arm's temporaries end with the arm, after its value is stored.
-      let armPending = Vector.length<usize>(&builder.temporaries)
+      let armPending = Vector.length<Pending>(&builder.temporaries)
       let value = run expression(&mut builder.*, body, hir, result)
       // A borrowing result could still view an arm temporary after the arm ends; that is not lowered.
-      if Vector.length<usize>(&builder.temporaries) > armPending && Shared.with<Type, bool>(ty, borrowingType) {
+      if Vector.length<Pending>(&builder.temporaries) > armPending && Shared.with<Type, bool>(ty, borrowingType) {
         return run unsupported(&owner, armOrigin, GapCode.Cleanup)
       }
       if valued && builder.live {
@@ -4344,7 +4398,7 @@ effect fn shortCircuit(
   run Vector.append<Arrival>(&mut arrivals, run arrival(&builder.*))
   terminate(&mut builder.*, Terminator.Goto {target: join, origin: origin})
   resume(&mut builder.*, rhsBlock)
-  let pending = Vector.length<usize>(&builder.temporaries)
+  let pending = Vector.length<Pending>(&builder.temporaries)
   let rhs = run expression(&mut builder.*, body, hir, right)
   if builder.live {
     run assign(&mut builder.*, place(output), Rvalue.Use {value: move rhs}, origin)
@@ -4392,7 +4446,7 @@ effect fn statement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modul
   if !builder.live {
     return ()
   }
-  let pending = Vector.length<usize>(&builder.temporaries)
+  let pending = Vector.length<Pending>(&builder.temporaries)
   run lowerStatement(&mut builder.*, body, hir, id, pending)
   // Owned temporaries live until the end of their full expression.
   if builder.live { run dropTemporariesFrom(&mut builder.*, pending, nodeOrigin(body, id)) }
@@ -6446,7 +6500,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
         },
       )
       let ownersBefore = Vector.length<Owner>(&builder.owners)
-      let temporariesBefore = Vector.length<usize>(&builder.temporaries)
+      let temporariesBefore = Vector.length<Pending>(&builder.temporaries)
       let iteration = run copyStates(&entry)
       run Vector.append<LoopTargets>(&mut builder.*.loops, LoopTargets {
         exit: exit, repeat: header, owners: ownersBefore, temporaries: temporariesBefore, entry: move iteration, exits: move exits,
@@ -6938,7 +6992,7 @@ impl MirFunction {
       owners: Vector.make<Owner>(),
       cleanup: Vector.make<CleanupNode>(),
       scopes: Vector.make<usize>(),
-      temporaries: Vector.make<usize>(),
+      temporaries: Vector.make<Pending>(),
       remainders: move remainders,
       needs: move needs,
       failure: failureLocal,
