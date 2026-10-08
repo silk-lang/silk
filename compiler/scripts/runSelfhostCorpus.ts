@@ -44,7 +44,10 @@ export interface Summary {
 }
 
 const unsupportedPrefix = 'SILK_UNSUPPORTED_JSON='
-const processTimeoutMs = 30_000
+// A native build of certificate-bounded-decoding takes 28.5-30 s on the hosted Linux runner, so a
+// 30 s build deadline timed it out at random; builds get 4x that, while program runs stay short.
+const buildTimeoutMs = 120_000
+const runTimeoutMs = 30_000
 
 const text = (value: string | null): string => value ?? ''
 
@@ -184,11 +187,11 @@ const runExecutable = (executable: string, invocation: NativeRun): SpawnSyncRetu
           executable,
           ...(invocation.arguments ?? []),
         ],
-        { encoding: 'utf8', timeout: processTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
+        { encoding: 'utf8', timeout: runTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
       )
     : spawnSync(executable, invocation.arguments ?? [], {
         encoding: 'utf8',
-        timeout: processTimeoutMs,
+        timeout: runTimeoutMs,
         maxBuffer: 4 * 1024 * 1024,
       })
 
@@ -250,7 +253,7 @@ export const runCase = (
         {
           cwd: directory,
           encoding: 'utf8',
-          timeout: processTimeoutMs,
+          timeout: buildTimeoutMs,
           maxBuffer: 4 * 1024 * 1024,
         },
       )
