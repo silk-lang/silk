@@ -69,6 +69,8 @@ export interface InvocationUse {
     readonly capturePath?: ReadonlyArray<Tir.InvocationCapturePathStep>
     /** Genuine incoming parameter authority, separate from original formation provenance. */
     readonly header?: { readonly parameter: number; readonly source: AuthoredIdentity.Anchor }
+    /** Original catch producer for a generated incoming handler; never an authored parameter. */
+    readonly producer?: Tir.NodeRef
     readonly argument: LocalId
     readonly type: SilkType.Type
     readonly source?: AuthoredIdentity.Anchor
@@ -1756,6 +1758,11 @@ export interface MirFunction {
     readonly contract: SilkType.Type
     /** Complete selected semantic header, including the actual callable schema. */
     readonly type: SilkType.Type
+  }>
+  /** Physical incoming handlers of generated selective-catch runners. */
+  readonly sourceCallableCaptures?: ReadonlyArray<{
+    readonly local: LocalId
+    readonly producer: Tir.NodeRef
   }>
   readonly machine?: MachineFunction.MachineFunction
   readonly initializationFlags?: ReadonlyArray<{

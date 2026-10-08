@@ -4,6 +4,7 @@ import * as Instances from '../src/Instances.js'
 import * as Lifetime from '../src/Lifetime.js'
 import * as SourceSpan from '../src/SourceSpan.js'
 import * as Type from '../src/Type.js'
+import type * as Tir from '../src/Tir.js'
 import * as Option from 'effect/Option'
 import { unreachable } from './support/raise.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
@@ -257,6 +258,20 @@ it('recovers admitted call providers across proof lifetimes without changing phy
     FunctionLowering.selectCall(calls, owner, { span }, undefined, [], [], [selected])
   assert.strictEqual(select([retained], provider(first)), retained)
   assert.strictEqual(select([retained], provider(second)), retained)
+  const required = provider(second)
+  assert.strictEqual(
+    FunctionLowering.selectCall(
+      [retained],
+      owner,
+      { span },
+      retained.target.declaration,
+      [],
+      [],
+      [required],
+      required,
+    ),
+    retained,
+  )
   assert.isUndefined(select([retained], provider(second, 'OtherLoan')))
   const exact = { ...retained, target: key('exact'), providers: [provider(second)] }
   assert.strictEqual(select([retained, exact], provider(second)), exact)
@@ -311,4 +326,89 @@ it('selects independently expanded calls that share one authored span', () => {
     ),
     second,
   )
+})
+
+it('selects the admitted service edge in its original provider context', () => {
+  const key = (name: string): Instances.InstanceKey => ({
+    _tag: 'InstanceKey',
+    declaration: { _tag: 'CanonicalDeclarationId', module: 'service-edge', name },
+    typeArguments: [],
+    evidence: [],
+    staticArguments: [],
+    contractRow: [],
+  })
+  const owner = key('caller')
+  const span = Option.getOrElse(
+    SourceSpan.make(SourceFile.make('service-edge', encoder.encode('x')), 0, 1),
+    () => unreachable('valid span'),
+  )
+  const selected: Instances.CallProvider = {
+    capability: Type.nominal('service-edge', 'FileSystem', []),
+    providerType: Type.nominal('service-edge', 'Files', []),
+    role: 'DefaultRole',
+  }
+  const unrelated: Instances.CallProvider = {
+    capability: Type.nominal('service-edge', 'Clock', []),
+    providerType: Type.nominal('service-edge', 'Timer', []),
+    role: 'DefaultRole',
+  }
+  const node: Tir.NodeId = { _tag: 'TirNode', ordinal: 1 }
+  const contextFree: Instances.CallInstance = {
+    _tag: 'CallInstance',
+    owner,
+    node,
+    span,
+    target: key('removeFile'),
+    resultEffect: 'original-result',
+  }
+  const contextual: Instances.CallInstance = { ...contextFree, providers: [selected] }
+  const select = (
+    calls: ReadonlyArray<Instances.CallInstance>,
+    available: ReadonlyArray<Instances.CallProvider> = [selected, unrelated],
+  ) =>
+    FunctionLowering.selectCall(
+      calls,
+      owner,
+      { span, id: node },
+      contextFree.target.declaration,
+      [],
+      [],
+      available,
+      selected,
+    )
+  assert.strictEqual(select([contextFree, contextual]), contextual)
+  assert.strictEqual(select([contextFree]), contextFree)
+  assert.isUndefined(select([contextFree], [unrelated]))
+  assert.strictEqual(
+    select([
+      contextFree,
+      { ...contextual, providers: [{ ...selected, providerType: unrelated.providerType }] },
+    ]),
+    contextFree,
+  )
+  assert.strictEqual(
+    select([contextFree, { ...contextual, target: key('otherTarget') }]),
+    contextFree,
+  )
+  assert.strictEqual(
+    select([
+      contextFree,
+      {
+        ...contextual,
+        target: {
+          ...contextual.target,
+          typeArguments: [Type.nominal('service-edge', 'ForeignArgument', [])],
+        },
+      },
+    ]),
+    contextFree,
+  )
+  assert.isUndefined(select([contextual], [unrelated]))
+  assert.isUndefined(select([{ ...contextual, providers: [unrelated] }]))
+  assert.isUndefined(select([{ ...contextual, providers: [{ ...selected, role: 'OtherRole' }] }]))
+  assert.isUndefined(
+    select([{ ...contextual, providers: [{ ...selected, providerType: unrelated.providerType }] }]),
+  )
+  assert.isUndefined(select([{ ...contextual, target: key('otherTarget') }]))
+  assert.isUndefined(select([contextual, { ...contextual, resultEffect: 'foreign-result' }]))
 })

@@ -810,6 +810,8 @@ export const lowerCatchEffectRunner = (
       }
     }),
   )
+  const producer = Tir.nodeReference(spec.owner.view.artifact, spec.expression)
+  lowering.incomingCallables.set(1, producer)
   const region = lowering.reserve()
   const [success, operations] = lowering.capture(() =>
     lowerEffectCatch(lowering, spec.expression, spec.expression.span, {
@@ -828,6 +830,7 @@ export const lowerCatchEffectRunner = (
   return {
     _tag: 'MirFunction',
     sourceParameters: sourceParametersOf(lowering),
+    sourceCallableCaptures: [{ local: local(1), producer }],
     ...sourceOwnerOf(lowering),
     id: spec.id,
     instance,
