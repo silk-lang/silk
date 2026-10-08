@@ -58,9 +58,10 @@ actual Local regions of the same caller is admitted at the region the binder alr
 body retains a `RegionRelation` safety obligation for the later checked caller-region/outlives
 stage; this does not admit fixed Static, incompatible access/element, or foreign owner evidence.
 See "Native typing retains unproven caller-local region relations" below. Immediate raw
-pointer weakening removes mutation capability and adds nullability, preserving invariant
-pointee/extent and identical other qualifiers; it does not implement reverse access, nested pointee
-covariance, alignment weakening, or other qualifier conversions. Ownership, lifetime, and cleanup
+pointer weakening removes mutation capability, adds nullability, and weakens alignment as the
+bootstrap does (any requirement to `align(1)`, a written alignment to a smaller written one),
+preserving invariant pointee/extent; it does not implement reverse access, nested pointee
+covariance, or other qualifier conversions. Ownership, lifetime, and cleanup
 checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
 complete language oracle.
 
@@ -1596,9 +1597,11 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   or a region an earlier operand fixed for the same binder, including a `'static` Effect
   environment such as `Effect.provideMut(program(), &mut allocator)`), native admits the value at the
   expected region and the body keeps a `RegionRelation` safety obligation with the origin and both
-  regions. Native fixes an inferred binder by its first evidence, while the bootstrap solves for the
-  shortest region, so a binder an earlier operand fixed to `'static` also relates a later loan of a
-  declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
+  regions. Native fixes an inferred binder by its first evidence and shortens it when a later
+  operand offers another region for a binder every parameter stores covariantly: to that region
+  over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. The bootstrap solves for the shortest region directly, so a binder
+  an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
   proves its representation bound once. Such bodies are `ContractTyped` and counted by the
@@ -1606,8 +1609,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   compiles natively until step 14.
 - **Source migration:** none.
 - **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
-  widened to another, explicitly fixed lifetime slots, and owner, access, element, pointee,
-  extent, type-argument and requirement-row differences keep `TypeMismatch`. Native call arguments
+  widened to another, and owner, access, element, pointee, extent, type-argument and
+  requirement-row differences keep `TypeMismatch`. An explicitly written lifetime slot is never
+  shortened or widened, but an operand meets it by the same covariant subtyping. Native call arguments
   still unify exactly apart from shared-loan shortening and this binder-region relation.
 - **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
   `staticStringSubtypingPreservesOrdinaryMismatches`,

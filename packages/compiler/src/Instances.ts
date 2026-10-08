@@ -3070,7 +3070,7 @@ export const discover = (
             ? undefined
             : resultEffectIdentity(target, provided.target, results, index)
         providerCalls.set(
-          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${provided.node?.ordinal ?? -1}\u0005${keyText(provided.target)}`,
+          `${keyText(provided.owner)}\u0005${provided.span.sourceId}:${provided.span.start}:${provided.span.end}\u0005${provided.node?.ordinal ?? -1}\u0005${keyText(provided.target)}\u0005${ExecutableOrigin.providerContextKey(provided.providers ?? [])}`,
           {
             _tag: 'CallInstance',
             owner: provided.owner,
@@ -3088,7 +3088,7 @@ export const discover = (
       let scheduledProvided = false
       for (const provided of currentGraph.providedTargets) {
         executionEdges.set(
-          `${keyText(provided.owner)}\u0005Provider\u0005${keyText(provided.target)}`,
+          `${keyText(provided.owner)}\u0005Provider\u0005${keyText(provided.target)}\u0005${ExecutableOrigin.providerContextKey(provided.providers ?? [])}`,
           {
             _tag: 'ExecutionEdge',
             kind: 'Provider',

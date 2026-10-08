@@ -10056,7 +10056,7 @@ pub effect fn main() ! NotFoundError | OfflineError {
   fail OfflineError { code: 42 }
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.OfflineError\n  at memory/driver.main (memory/driver:5:3)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
+      'unhandled error: memory/driver.OfflineError\n  at memory/driver.main (memory/driver:5:3)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
     // A failed Effect entry must exit with status 1 even when reporting cannot write to fd 2.
     // Unused process arguments must not change either its status or its diagnostic trace.
     nativeRuns: [
@@ -10093,7 +10093,7 @@ pub effect fn main() ! NotFoundError {
   return ()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:4:3)\n  at memory/driver.middle (memory/driver:8:11)\n  at memory/driver.main (memory/driver:13:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
+      'unhandled error: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:4:3)\n  at memory/driver.middle (memory/driver:8:11)\n  at memory/driver.main (memory/driver:13:11)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -10124,7 +10124,7 @@ pub effect fn main() ! Primary {
   run primary()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:6:3)\n  at memory/driver.main (memory/driver:24:3)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
+      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:6:3)\n  at memory/driver.main (memory/driver:24:3)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -10147,7 +10147,7 @@ pub effect fn main() ! OfflineError {
   return ()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.OfflineError\n  at memory/driver.recover (memory/driver:11:3)\n  at silk/effect.Effect.catch (silk/effect:405:12)\n  at memory/driver.main (memory/driver:15:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\nwhile handling: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:7:3)\n',
+      'unhandled error: memory/driver.OfflineError\n  at memory/driver.recover (memory/driver:11:3)\n  at silk/effect.Effect.catch (silk/effect:413:12)\n  at memory/driver.main (memory/driver:15:11)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\nwhile handling: memory/driver.NotFoundError\n  at memory/driver.load (memory/driver:7:3)\n',
     expected: { _tag: 'Trap' },
   },
   {
@@ -10179,7 +10179,7 @@ pub effect fn load() -> i32 ! NotFoundError {
 }`,
     },
     nativeStderr:
-      'unhandled error: errors/kinds.NotFoundError\n  at errors/kinds.load (errors/kinds:3:3)\n  at memory/driver.main (memory/driver:3:11)\n  at silk/effect.Effect.flatMap (silk/effect:301:19)\n',
+      'unhandled error: errors/kinds.NotFoundError\n  at errors/kinds.load (errors/kinds:3:3)\n  at memory/driver.main (memory/driver:3:11)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
     expected: { _tag: 'Trap' },
   },
   {

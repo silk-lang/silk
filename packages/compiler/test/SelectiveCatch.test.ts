@@ -185,6 +185,88 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('replays generated catch handler inputs against the original producer and factory', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`import silk.effect { Effect }
+struct Selected {}
+struct Residual {}
+struct Marker { value: i32 }
+effect fn risky() -> i32 ! Selected | Residual { fail Selected {} }
+effect fn recoverSelected(error: Selected, held: Marker) -> i32 { return held.value }
+effect fn recoverResidual(error: Residual) -> i32 { return 0 }
+effect fn build() -> i32 {
+  let handler = recoverSelected(Marker { value: 42 })
+  let caught = Intrinsic.catchFailure<Selected>(risky(), move handler)
+  return run Effect.catchAll(move caught, recoverResidual)
+}
+pub fn main() -> i32 { return run build() }`)
+    assert.deepEqual(codes(self), [])
+    const module = Analysis.loweredMir(self)
+    assert.deepEqual(yield* MirVerification.verify(module), [])
+    const runner = module.functions.find((fn) => (fn.sourceCallableCaptures?.length ?? 0) !== 0)
+    const incoming = runner?.sourceCallableCaptures?.at(0)
+    if (runner === undefined || incoming === undefined) return unreachable('missing catch input')
+    const operation = MirVerification.operations(runner).find(
+      (candidate) =>
+        candidate._tag === 'ApplyCallable' &&
+        candidate.invocationUse?.inputs.some((input) => input.producer !== undefined),
+    )
+    if (operation?._tag !== 'ApplyCallable' || operation.invocationUse === undefined)
+      return unreachable('missing captured recovery invocation')
+    const captured = operation.invocationUse.inputs.find((input) => input.producer !== undefined)
+    assert.deepEqual(captured?.parameter, 1)
+    assert.deepEqual(captured?.capture, 0)
+    assert.isUndefined(captured?.header)
+    assert.isTrue(MirVerification.invocationUseIssues(runner, module).length === 0)
+    const rejects = (changed: Mir.MirFunction, program: Mir.Module = module) => {
+      assert.isTrue(
+        MirVerification.invocationUseIssues(changed, program).some(
+          (issue) =>
+            issue.detail ===
+            'invocation captured input lacks its exact retained callable slot producer',
+        ),
+      )
+    }
+    rejects({ ...runner, sourceCallableCaptures: [] })
+    rejects({
+      ...runner,
+      sourceCallableCaptures: [{ ...incoming, local: { _tag: 'Local', ordinal: 0 } }],
+    })
+    rejects({
+      ...runner,
+      sourceCallableCaptures: [
+        {
+          ...incoming,
+          producer: {
+            ...incoming.producer,
+            node: { ...incoming.producer.node, ordinal: incoming.producer.node.ordinal + 1 },
+          },
+        },
+      ],
+    })
+    const strippedFactory = {
+      ...module,
+      functions: module.functions.map((fn) => ({
+        ...fn,
+        regions: fn.regions.map((region) =>
+          region._tag !== 'OperationRegion'
+            ? region
+            : {
+                ...region,
+                operations: region.operations.filter(
+                  (candidate) =>
+                    candidate._tag !== 'MakeEffect' ||
+                    candidate.runner.module !== runner.effectRunner?.base.declaration.module ||
+                    candidate.runner.name !== runner.effectRunner.base.declaration.name,
+                ),
+              },
+        ),
+      })),
+    }
+    rejects(runner, strippedFactory)
+  }),
+)
+
 it.effect('lowers fully handled intrinsic catches in ordinary functions and destructors', () =>
   Effect.gen(function* () {
     const self = yield* analyze(`${preamble}

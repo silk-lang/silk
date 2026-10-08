@@ -145,8 +145,8 @@ const runLane = Effect.fnUntraced(
         path.join(
           directory,
           mode === 'child-fault'
-            ? '../../../../openspec/changes/complete-native-runtime-migration/process-child-supplies.json'
-            : '../../../../openspec/changes/complete-native-runtime-migration/process-supplies.json',
+            ? '../../../../openspec/changes/archive/2026-09-10-complete-native-runtime-migration/process-child-supplies.json'
+            : '../../../../openspec/changes/archive/2026-09-10-complete-native-runtime-migration/process-supplies.json',
         ),
       ),
     )

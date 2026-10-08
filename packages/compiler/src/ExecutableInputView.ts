@@ -88,8 +88,30 @@ export const key = (view: Tir.ExecutableInputView): string =>
     ]),
   ])
 
-/** Builds proof-only source records; no runtime layout or representation identity is changed. */
+const catalogs = new WeakMap<
+  ReadonlyArray<Instances.Instance>,
+  WeakMap<ReadonlyArray<Instances.CallInstance>, ReadonlyArray<Mir.ExecutableInputViewSource>>
+>()
+
+/** Enumerates the held immutable source graph; authentication still replays each selected use. */
 export const catalog = (
+  instances: ReadonlyArray<Instances.Instance>,
+  calls: ReadonlyArray<Instances.CallInstance>,
+): ReadonlyArray<Mir.ExecutableInputViewSource> => {
+  let callsByInstances = catalogs.get(instances)
+  if (callsByInstances === undefined) {
+    callsByInstances = new WeakMap()
+    catalogs.set(instances, callsByInstances)
+  }
+  const previous = callsByInstances.get(calls)
+  if (previous !== undefined) return previous
+  const result = collect(instances, calls)
+  callsByInstances.set(calls, result)
+  return result
+}
+
+/** Builds proof-only source records; no runtime layout or representation identity is changed. */
+const collect = (
   instances: ReadonlyArray<Instances.Instance>,
   calls: ReadonlyArray<Instances.CallInstance>,
 ): ReadonlyArray<Mir.ExecutableInputViewSource> => {
@@ -328,27 +350,12 @@ export const authenticate = (
 }
 
 /** Uses the same held-source replay during lowering and independent MIR verification. */
-const catalogs = new WeakMap<
-  ReadonlyArray<Instances.Instance>,
-  WeakMap<ReadonlyArray<Instances.CallInstance>, ReadonlyArray<Mir.ExecutableInputViewSource>>
->()
-
 export const authority = (
   instances: ReadonlyArray<Instances.Instance>,
   calls: ReadonlyArray<Instances.CallInstance>,
   proof: Mir.ExecutableInputView,
 ): Mir.ExecutableInputViewSource | undefined => {
-  let callsByInstances = catalogs.get(instances)
-  if (callsByInstances === undefined) {
-    callsByInstances = new WeakMap()
-    catalogs.set(instances, callsByInstances)
-  }
-  let sources = callsByInstances.get(calls)
-  if (sources === undefined) {
-    sources = catalog(instances, calls)
-    callsByInstances.set(calls, sources)
-  }
-  return authenticate(sources, proof)
+  return authenticate(catalog(instances, calls), proof)
 }
 
 /** Independently held original source graph and its physical layout. */

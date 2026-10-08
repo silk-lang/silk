@@ -17,6 +17,7 @@ import type * as Ownership from './Ownership.js'
 import type * as SourceSpan from './SourceSpan.js'
 import * as StaticValue from './StaticValue.js'
 import * as Type from './Type.js'
+import * as CallableDeclarationView from './CallableDeclarationView.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
 import * as NominalVariance from './NominalVariance.js'
 import * as Lifetime from './Lifetime.js'
@@ -55,20 +56,7 @@ export const invocationFormationContext = (
     actual.storage === undefined &&
     actual.target._tag === 'DeclarationCallableTarget'
   ) {
-    const target = actual.target.declaration
-    const arguments_ = actual.typeArguments ?? []
-    const selected = fn.instances.filter(
-      (instance) =>
-        instance.key.declaration.module === target.module &&
-        instance.key.declaration.name === target.name &&
-        instance.key.typeArguments.length === arguments_.length &&
-        instance.key.typeArguments.every((argument, ordinal) => {
-          const supplied = arguments_.at(ordinal)
-          return supplied !== undefined && Type.equalsGenericArgument(argument, supplied)
-        }),
-    )
-    if (selected.length === 1 && selected.at(0)?.ownership.verdict._tag === 'Satisfied') return base
-    return undefined
+    return CallableDeclarationView.original(fn.index, actual) === undefined ? undefined : base
   }
   const producerKey = actual.environment?.callable.owner
   if (producerKey === undefined) return undefined
@@ -161,12 +149,33 @@ export const selectCall = (
   typeArguments?: ReadonlyArray<Type.GenericArgument>,
   staticArguments?: ReadonlyArray<StaticValue.Value>,
   providers: ReadonlyArray<Instances.CallProvider> = [],
+  requiredProvider?: Instances.CallProvider,
 ): Instances.CallInstance | undefined => {
-  const atSite = Instances.callsAtSite(calls, owner, expression.span).filter(
+  if (
+    requiredProvider !== undefined &&
+    !providers.some(
+      (provider) =>
+        provider.role === requiredProvider.role &&
+        Type.equals(provider.capability, requiredProvider.capability) &&
+        Type.equals(provider.providerType, requiredProvider.providerType),
+    )
+  )
+    return undefined
+  const sourceEdges = Instances.callsAtSite(calls, owner, expression.span).filter(
     (call) =>
       expression.id === undefined ||
       call.node === undefined ||
       call.node.ordinal === expression.id.ordinal,
+  )
+  const atSite = sourceEdges.filter(
+    (call) =>
+      requiredProvider === undefined ||
+      (call.providers ?? []).length === 0 ||
+      call.providers?.some(
+        (provider) =>
+          provider.role === requiredProvider.role &&
+          Type.equals(provider.capability, requiredProvider.capability),
+      ) === true,
   )
   const exactProviders = atSite.filter((call) => Instances.callMatchesProviders(call, providers))
   const usedRuntimeProviderFallback = exactProviders.length === 0
@@ -248,11 +257,24 @@ export const selectCall = (
               return wanted !== undefined && StaticValue.equals(argument, wanted)
             }),
         )
-  if (staticallySpecialized.length === 1) return staticallySpecialized.at(0)
-  if (!usedRuntimeFallback || staticallySpecialized.length === 0) return undefined
-  const targets = new Map(
-    staticallySpecialized.map((call) => [Instances.keyText(call.target), call] as const),
-  )
+  // Prefer the admitted witnessed operation in its actual lexical provider context only after
+  // selecting its original target and arguments. Discovery also retains context-free edges.
+  const contextual =
+    requiredProvider === undefined
+      ? []
+      : staticallySpecialized.filter(
+          (call) =>
+            call.providers?.some(
+              (provider) =>
+                provider.role === requiredProvider.role &&
+                Type.equals(provider.capability, requiredProvider.capability) &&
+                Type.equals(provider.providerType, requiredProvider.providerType),
+            ) === true && Instances.callMatchesProviders(call, providers),
+        )
+  const admitted = contextual.length === 0 ? staticallySpecialized : contextual
+  if (admitted.length === 1) return admitted.at(0)
+  if (!usedRuntimeFallback || admitted.length === 0) return undefined
+  const targets = new Map(admitted.map((call) => [Instances.keyText(call.target), call] as const))
   return targets.size === 1 ? [...targets.values()].at(0) : undefined
 }
 
@@ -326,6 +348,7 @@ export class FunctionLowering {
     number,
     Extract<Mir.Operation, { readonly _tag: 'MakeCallable' }>
   >()
+  readonly incomingCallables = new Map<number, Tir.NodeRef>()
   // Allocation metadata survives branch/loop rewrites; loanLocals tracks path-local liveness.
   readonly temporaryBorrowOwners = new Map<string, TemporaryBorrowOwner>()
   readonly expressionLocals = new Map<string, Mir.LocalId>()
@@ -583,6 +606,16 @@ export class FunctionLowering {
     staticArguments?: ReadonlyArray<StaticValue.Value>,
     providers: ReadonlyArray<ProvidedRequirement> = this.providedRequirements,
   ): Instances.CallInstance | undefined {
+    const requiredProvider =
+      expression._tag === 'ServiceEffectConstruct'
+        ? providers.find(
+            (provider) =>
+              provider.role === expression.role &&
+              Type.equals(provider.capability, this.semantic(expression.service)),
+          )
+        : undefined
+    if (expression._tag === 'ServiceEffectConstruct' && requiredProvider === undefined)
+      return undefined
     return selectCall(
       this.calls,
       this.owner.key,
@@ -591,6 +624,7 @@ export class FunctionLowering {
       typeArguments,
       staticArguments,
       providers,
+      requiredProvider,
     )
   }
 }

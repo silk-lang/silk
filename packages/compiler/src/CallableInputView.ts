@@ -207,3 +207,33 @@ export const authenticate = (
     captures: section.captures.filter((capture) => inputs.includes(capture.parameterOrdinal)),
   }
 }
+
+/** Replays a generated catch's handler from its actual original source producer. */
+export const catchInput = (
+  program: Pick<Mir.Module, 'layout' | 'callableInputSources'>,
+  actual: Extract<Mir.Type, { readonly _tag: 'CallableValue' }>,
+  producer: Tir.NodeRef,
+): CallableInputView | undefined => {
+  const view = authenticate(program, actual)
+  if (view === undefined) return undefined
+  const caught = BodyView.node(view.owner.view, producer) as Tir.Expression | undefined
+  if (caught?._tag !== 'EffectCatch' || caught.origin._tag !== 'Authored') return undefined
+  const nodes = Tir.nodesOf(view.owner.function) as ReadonlyArray<Tir.Expression | Tir.Statement>
+  const follows = (expression: Tir.Expression, seen: ReadonlySet<number>): boolean => {
+    if (expression === view.section) return true
+    if (expression._tag === 'Move') return follows(expression.subject, seen)
+    if (expression._tag !== 'BindingReference' || seen.has(expression.binding.ordinal)) return false
+    const bindings = nodes.filter(
+      (node): node is Extract<Tir.Statement, { readonly _tag: 'Bind' }> & Tir.PublishedNode =>
+        node._tag === 'Bind' &&
+        node.binding.ordinal === expression.binding.ordinal &&
+        node.mutability === 'Immutable',
+    )
+    const binding = bindings.length === 1 ? bindings.at(0) : undefined
+    return (
+      binding !== undefined &&
+      follows(binding.initializer, new Set([...seen, expression.binding.ordinal]))
+    )
+  }
+  return follows(caught.handler, new Set()) ? view : undefined
+}
