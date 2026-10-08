@@ -159,12 +159,20 @@ Each entry records:
   and at a variant pattern that writes its regions, which admits the subject by covariant region
   subtyping (a `'static` subject meets `Maybe<&'a i32>`, as in the bootstrap). An inferred lifetime binder that earlier `'static` evidence fixed
   shortens to a later operand's caller-local region when every parameter stores the binder
-  covariantly and no bound or environment names it.
-- **Source migration:** none.
+  covariantly and no bound or environment names it. Since 2026-10-08 an inferred struct literal
+  binder that an earlier field fixed to `'static` or one of the caller's own lifetimes shortens
+  when a later field offers a different region: to that region when it is caller-local, otherwise
+  to the literal's own loan region, which both caller lifetimes outlive
+  (`Scoped {count: &mut count.*, view: view}`).
+- **Source migration:** `checkExpressionUnder` held an integer suffix slice borrowed from a
+  borrowed `if let` binding past its conditional. That binding is a pattern-local loan that ends
+  with the selected body (PATT-009), so the source now keeps the suffix in one owned `Bytes`.
 - **Diagnostics and limits:** a fresh loan of body-owned storage still needs a declared premise,
   a pattern region longer than the subject's stays `TypeMismatch`, and a
   binder that a parameter stores invariantly keeps its first `'static` evidence and reports the
-  operand's `TypeMismatch` where the bootstrap infers the shorter region.
+  operand's `TypeMismatch` where the bootstrap infers the shorter region. A view derived from a
+  borrowed pattern binding that outlives its conditional is `TypeMismatch` in selfhost; the
+  bootstrap accepts it, against PATT-009.
 - **Evidence:** `callerLocalRegionsRelateAtFixedBoundaries` and
   `patternElisionInfersOmittedLifetimesFromTheSubject` in `compiler/src/semantic/SemanticCases.silk`.
 
