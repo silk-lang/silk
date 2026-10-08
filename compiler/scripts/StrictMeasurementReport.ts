@@ -75,6 +75,7 @@ const Fact = Schema.Union([
   }),
   Schema.Struct({ kind: Schema.Literal('query-error'), code: S }),
   Schema.Struct({ kind: Schema.Literal('wrong-value') }),
+  Schema.Struct({ kind: Schema.Literal('not-demanded') }),
 ])
 const Header = { schema: Schema.Literal('silk.strict-inventory'), version: Schema.Literal(1) }
 const FunctionRow = Schema.Struct({
@@ -746,7 +747,9 @@ const collect = Effect.fnUntraced(function* (input: Input) {
       return yield* reject('Coverage', 'Duplicate or inconsistent canonical phase')
     if (
       (row.fact.kind === 'signature' && row.phase !== 'signature') ||
-      (row.fact.kind === 'body' && (row.phase !== 'body' || !row.has_body))
+      (row.fact.kind === 'body' && (row.phase !== 'body' || !row.has_body)) ||
+      (row.fact.kind === 'not-demanded') !==
+        (row.eligibility === 'inactive' || (row.eligibility === 'no-body' && row.phase === 'body'))
     )
       return yield* reject('Coverage', 'Wrong phase success discriminator')
     if (row.fact.kind === 'rejected' || row.fact.kind === 'unsupported') {
@@ -788,7 +791,7 @@ const collect = Effect.fnUntraced(function* (input: Input) {
         footer.expected_records !== null ||
         footer.strict_success)) ||
     (footer.strict_success &&
-      (functions.some((f) => f.fact.kind !== f.phase) ||
+      (functions.some((f) => f.fact.kind !== f.phase && f.fact.kind !== 'not-demanded') ||
         imports.length > 0 ||
         modules.some((m) => m.role === 'compiler-subject' && m.excluded_damaged > 0)))
   )
