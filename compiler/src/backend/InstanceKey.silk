@@ -1,13 +1,13 @@
 //! Exact semantic keys and canonical erased runtime families for selected instances.
 //!
 //! A key is canonical by construction: its application and provider types number their caller
-//! regions by first appearance ([`Numbering`]), so call sites that lend different caller-local
+//! regions across the complete closed input domain ([`Numbering`]), so call sites that lend different caller-local
 //! regions in the same pattern share one instance.
 
 import hir.Hir {OwnerKind}
 import semantic.DeclarationId {DeclarationId}
 import semantic.InternIndex {InternIndex}
-import semantic.Lifetime {Numbering}
+import semantic.Lifetime {Numbering, CanonicalizationFailure}
 import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target}
 import semantic.Type {Argument, Requirement, Type}
 import semantic.RuntimeEncoding
@@ -16,6 +16,7 @@ import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.hash {Hash}
 import silk.option {Option}
+import silk.result {Result}
 import silk.pointer {Pointer}
 import silk.shared {Shared}
 import silk.u64
@@ -119,7 +120,7 @@ impl InstanceKey {
   }
   /// Constructs the canonical key of a call edge's actual application; all cached fields are
   /// derived here.
-  pub effect fn function(application: Application) -> InstanceKey
+  pub effect fn function(application: Application) -> Result<InstanceKey, CanonicalizationFailure>
   ! OutOfMemoryError
   ? &mut Allocator {
     return run InstanceKey.withProviders(move application, Vector.make<ProviderEntry>())
@@ -131,54 +132,148 @@ impl InstanceKey {
   /// `actual` and `served` carry the call edge's actual regions. One numbering renames the caller
   /// regions of both, application first, so a region shared between an argument and a provider
   /// stays shared.
-  pub effect fn withProviders(actual: Application, served: Vector<ProviderEntry>) -> InstanceKey
+  pub effect fn withProviders(actual: Application, served: Vector<ProviderEntry>) -> Result<InstanceKey, CanonicalizationFailure>
   ! OutOfMemoryError
   ? &mut Allocator {
-    let mut numbering = Numbering.make()
-    let application = run Application.numberRegions(&actual, &mut numbering)
+    let mut numbering = Numbering.collecting()
+    // This privately owned draft only records complete free region occurrences. It is discarded
+    // before freeze; no call/query can observe it.
+    let observed = run Application.numberRegions(&actual, &mut numbering)
+    match move observed {
+      Result<Application, CanonicalizationFailure>.Success {value: draft} => { drop draft }
+      Result<Application, CanonicalizationFailure>.Failure {error: reason} => {
+        return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+      }
+    }
+    if !Numbering.units(&mut numbering, Vector.length<ProviderEntry>(&served)) { return failedKey(&numbering) }
+    let observedProviders = Vector.asSlice<ProviderEntry>(&served)
+    let observedOwner = Application.bodyDeclaration(&actual)
+    let mut observedAt = usize.ZERO
+    while observedAt < observedProviders.length {
+      if let Option<Shared<Type>>.Some {value: namedRole} = &observedProviders[observedAt].key.roleType {
+        let observedRole = run Type.numberRegions(&namedRole, observedOwner, &mut numbering)
+        drop observedRole
+      }
+      let observedCapability = run Type.numberRegions(&observedProviders[observedAt].key.capability, observedOwner, &mut numbering)
+      drop observedCapability
+      let observedProvider = run Type.numberRegions(&observedProviders[observedAt].provider, observedOwner, &mut numbering)
+      drop observedProvider
+      observedAt = observedAt + usize.ONE
+    }
+    let search = match move run Numbering.freeze(&mut numbering) {
+      Result<bool, CanonicalizationFailure>.Success {value: required} => required
+      Result<bool, CanonicalizationFailure>.Failure {error: reason} => {
+        return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+      }
+    }
+    let mut best = Option.none<InstanceKey>()
+    let mut bestRecord = Bytes.make()
+    while true {
+      if !Numbering.attempt(&mut numbering) { return failedKey(&numbering) }
+      let candidate = match move run InstanceKey.numberedFunction(&actual, &served, &mut numbering) {
+        Result<InstanceKey, CanonicalizationFailure>.Success {value: numbered} => move numbered
+        Result<InstanceKey, CanonicalizationFailure>.Failure {error: reason} => {
+          return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+        }
+      }
+      if let Option<CanonicalizationFailure>.Some {value: reason} = move Numbering.failure(&numbering) {
+        return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+      }
+      let available = Numbering.remainingBytes(&numbering)
+      let mut coordinates = RuntimeEncoding.limitedCoordinates(available)
+      let record = run InstanceKey.encodingAt(&candidate, &mut coordinates)
+      if !Numbering.bytes(&mut numbering, available - coordinates.remainingBytes) { return failedKey(&numbering) }
+      if coordinates.exceeded { return Result.failResult<InstanceKey, CanonicalizationFailure>(CanonicalizationFailure.Resource) }
+      let mut selected = true
+      if let Option<InstanceKey>.Some {..} = &best {
+        if !Numbering.bytes(&mut numbering, Bytes.asSlice(&record).length)
+          || !Numbering.bytes(&mut numbering, Bytes.asSlice(&bestRecord).length) { return failedKey(&numbering) }
+        selected = RuntimeEncoding.less(Bytes.asSlice(&record), Bytes.asSlice(&bestRecord))
+      }
+      if selected {
+        best = Option.some<InstanceKey>(move candidate)
+        bestRecord = move record
+      }
+      if !search || !Numbering.next(&mut numbering) { break }
+    }
+    return match move best {
+      Option<InstanceKey>.Some {value: canonical} => Result.succeed<InstanceKey, CanonicalizationFailure>(move canonical)
+      _ => Result.failResult<InstanceKey, CanonicalizationFailure>(CanonicalizationFailure.UncollectedAtom)
+    }
+  }
+  effect fn numberedFunction(actual: &Application, served: &Vector<ProviderEntry>, numbering: &mut Numbering)
+    -> Result<InstanceKey, CanonicalizationFailure> ! OutOfMemoryError ? &mut Allocator {
+    let application = match move run Application.numberRegions(actual, &mut numbering.*) {
+      Result<Application, CanonicalizationFailure>.Success {value: renamed} => move renamed
+      Result<Application, CanonicalizationFailure>.Failure {error: reason} => {
+        return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+      }
+    }
+    if !Numbering.bytes(&mut numbering.*, RuntimeEncoding.declarationPayload(Application.bodyDeclaration(&application))) {
+      return failedKey(&numbering.*)
+    }
     let owner = run DeclarationId.copy(Application.bodyDeclaration(&application))
     let mut providers = Vector.make<ProviderEntry>()
-    let entries = Vector.asSlice<ProviderEntry>(&served)
+    let entries = Vector.asSlice<ProviderEntry>(served)
     let mut entryAt = usize.ZERO
     while entryAt < entries.length {
       let mut roleType = Option.none<Shared<Type>>()
       if let Option<Shared<Type>>.Some {value: written} = &entries[entryAt].key.roleType {
-        roleType = Option.some<Shared<Type>>(run Type.numberRegions(&written, &owner, &mut numbering))
+        roleType = Option.some<Shared<Type>>(run Type.numberRegions(&written, &owner, &mut numbering.*))
       }
-      let capability = run Type.numberRegions(&entries[entryAt].key.capability, &owner, &mut numbering)
-      let provider = run Type.numberRegions(&entries[entryAt].provider, &owner, &mut numbering)
+      let capability = run Type.numberRegions(&entries[entryAt].key.capability, &owner, &mut numbering.*)
+      let provider = run Type.numberRegions(&entries[entryAt].provider, &owner, &mut numbering.*)
       run Vector.append<ProviderEntry>(&mut providers, ProviderEntry {
         key: Requirement {capability: move capability, roleType: move roleType, access: entries[entryAt].key.access},
         provider: move provider,
       })
       entryAt = entryAt + usize.ONE
     }
-    let mut runtime = run Application.runtime(&application)
+    if let Option<CanonicalizationFailure>.Some {value: reason} = move Numbering.failure(&numbering.*) {
+      return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+    }
+    let available = Numbering.remainingBytes(&numbering.*)
+    let mut coordinates = RuntimeEncoding.limitedCoordinates(available)
+    let candidateResult = run InstanceKey.fromCanonical(move application, move providers, &mut coordinates)
+    let consumed = available - coordinates.remainingBytes
+    if !Numbering.bytes(&mut numbering.*, consumed) { return failedKey(&numbering.*) }
+    if coordinates.exceeded { return Result.failResult<InstanceKey, CanonicalizationFailure>(CanonicalizationFailure.Resource) }
+    return move candidateResult
+  }
+  // Only a proved complete renamed domain, or an empty named domain, reaches this assembler.
+  effect fn fromCanonical(application: Application, providers: Vector<ProviderEntry>, coordinates: &mut Coordinates) -> Result<InstanceKey, CanonicalizationFailure>
+  ! OutOfMemoryError ? &mut Allocator {
+    let owner = Application.bodyDeclaration(&application)
+    let mut runtime = run Application.encoding(&application, false, &mut coordinates.*)
     let listed = Vector.asSlice<ProviderEntry>(&providers)
     if listed.length > usize.ZERO {
-      run RuntimeEncoding.word(&mut runtime, 4)
-      run RuntimeEncoding.word(&mut runtime, usize.toU64(listed.length))
+      run RuntimeEncoding.recordWord(&mut runtime, 4, &mut coordinates.*)
+      run RuntimeEncoding.recordWord(&mut runtime, usize.toU64(listed.length), &mut coordinates.*)
       let mut at = usize.ZERO
       while at < listed.length {
-        let capability = run Type.runtimeEncoding(&listed[at].key.capability, &owner)
-        run RuntimeEncoding.field(&mut runtime, Bytes.asSlice(&capability))
+        let capability = run Type.encoding(&listed[at].key.capability, owner, false, &mut coordinates.*)
+        run RuntimeEncoding.recordField(&mut runtime, Bytes.asSlice(&capability), &mut coordinates.*)
         if let Option<Shared<Type>>.Some {value: roleValue} = &listed[at].key.roleType {
-          let encodedRole = run Type.runtimeEncoding(&roleValue, &owner)
-          run RuntimeEncoding.word(&mut runtime, 1)
-          run RuntimeEncoding.field(&mut runtime, Bytes.asSlice(&encodedRole))
-        } else { run RuntimeEncoding.word(&mut runtime, 0) }
-        let provider = run Type.runtimeEncoding(&listed[at].provider, &owner)
-        run RuntimeEncoding.field(&mut runtime, Bytes.asSlice(&provider))
+          let encodedRole = run Type.encoding(&roleValue, owner, false, &mut coordinates.*)
+          run RuntimeEncoding.recordWord(&mut runtime, 1, &mut coordinates.*)
+          run RuntimeEncoding.recordField(&mut runtime, Bytes.asSlice(&encodedRole), &mut coordinates.*)
+        } else { run RuntimeEncoding.recordWord(&mut runtime, 0, &mut coordinates.*) }
+        let provider = run Type.encoding(&listed[at].provider, owner, false, &mut coordinates.*)
+        run RuntimeEncoding.recordField(&mut runtime, Bytes.asSlice(&provider), &mut coordinates.*)
         at = at + usize.ONE
       }
     }
-    let identity = run Shared.make<DeclarationId>(move owner)
-    return InstanceKey.Function {
+    if coordinates.exceeded { return Result.failResult<InstanceKey, CanonicalizationFailure>(CanonicalizationFailure.Resource) }
+    if !RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(owner)) {
+      return Result.failResult<InstanceKey, CanonicalizationFailure>(CanonicalizationFailure.Resource)
+    }
+    let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(owner))
+    return Result.succeed<InstanceKey, CanonicalizationFailure>(InstanceKey.Function {
       application: run Shared.make<Application>(move application),
       identity: move identity,
       runtime: run Shared.make<Bytes>(move runtime),
       providers: run Shared.make<Vector<ProviderEntry>>(move providers),
-    }
+    })
   }
   /// The providers serving this instance's requirement row; none for other keys.
   pub fn providers(self: &Self) -> Option<Shared<Vector<ProviderEntry>>> {
@@ -189,35 +284,90 @@ impl InstanceKey {
   }
   /// The drop glue of `ty`, or absence when the type mentions no declaration that could own cleanup.
   /// The glue's type numbers its caller regions canonically, like a function application.
-  pub effect fn dropGlue(actual: &Shared<Type>) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
-    let owner = match move run Type.glueOwner(actual) {
-      Option<DeclarationId>.Some {value} => value
-      Option<DeclarationId>.None => { return Option.none<InstanceKey>() }
+  pub effect fn dropGlue(actual: &Shared<Type>, sourceOwner: &DeclarationId) -> Result<Option<InstanceKey>, CanonicalizationFailure> ! OutOfMemoryError ? &mut Allocator {
+    // Source context permits bounded observation before recursive glue-owner discovery.
+    // It is not part of the resulting glue identity.
+    let mut numbering = Numbering.collecting()
+    let observed = run Type.numberRegions(actual, sourceOwner, &mut numbering)
+    drop observed
+    if let Option<CanonicalizationFailure>.Some {value: reason} = move Numbering.failure(&numbering) {
+      return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(reason)
     }
-    let mut numbering = Numbering.make()
-    let ty = run Type.numberRegions(actual, &owner, &mut numbering)
-    let encoded = run Type.runtimeEncoding(&ty, &owner)
-    let mut runtime = Bytes.make()
-    // Tag 2 keeps glue identities disjoint from named (0) and operation (1) applications.
-    run RuntimeEncoding.word(&mut runtime, 2)
-    run RuntimeEncoding.field(&mut runtime, Bytes.asSlice(&encoded))
-    return Option.some<InstanceKey>(InstanceKey.DropGlue {
-      ty: move ty, owner: run Shared.make<DeclarationId>(move owner), runtime: run Shared.make<Bytes>(move runtime),
-    })
+    let ownerAvailable = Numbering.remainingBytes(&numbering)
+    let mut ownerCoordinates = RuntimeEncoding.limitedCoordinates(ownerAvailable)
+    let ownerCandidate = run Type.glueOwner(actual, &mut ownerCoordinates)
+    if !Numbering.bytes(&mut numbering, ownerAvailable - ownerCoordinates.remainingBytes) { return failedGlue(&numbering) }
+    if ownerCoordinates.exceeded {
+      return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(CanonicalizationFailure.Resource)
+    }
+    let owner = match move ownerCandidate {
+      Option<DeclarationId>.Some {value: originalOwner} => move originalOwner
+      _ => { return Result.succeed<Option<InstanceKey>, CanonicalizationFailure>(Option.none<InstanceKey>()) }
+    }
+    let search = match move run Numbering.freeze(&mut numbering) {
+      Result<bool, CanonicalizationFailure>.Success {value: required} => required
+      Result<bool, CanonicalizationFailure>.Failure {error: reason} => {
+        return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(reason)
+      }
+    }
+    let mut best = Option.none<InstanceKey>()
+    let mut bestRecord = Bytes.make()
+    while true {
+      if !Numbering.attempt(&mut numbering) { return failedGlue(&numbering) }
+      let ty = run Type.numberRegions(actual, &owner, &mut numbering)
+      if let Option<CanonicalizationFailure>.Some {value: reason} = move Numbering.failure(&numbering) {
+        return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(reason)
+      }
+      let runtimeAvailable = Numbering.remainingBytes(&numbering)
+      let mut runtimeCoordinates = RuntimeEncoding.limitedCoordinates(runtimeAvailable)
+      let encoded = run Type.encoding(&ty, &owner, false, &mut runtimeCoordinates)
+      let mut runtime = Bytes.make()
+      run RuntimeEncoding.recordWord(&mut runtime, 2, &mut runtimeCoordinates)
+      run RuntimeEncoding.recordField(&mut runtime, Bytes.asSlice(&encoded), &mut runtimeCoordinates)
+      let runtimeConsumed = runtimeAvailable - runtimeCoordinates.remainingBytes
+      if !Numbering.bytes(&mut numbering, runtimeConsumed) { return failedGlue(&numbering) }
+      if runtimeCoordinates.exceeded {
+        return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(CanonicalizationFailure.Resource)
+      }
+      if !Numbering.bytes(&mut numbering, RuntimeEncoding.declarationPayload(&owner)) { return failedGlue(&numbering) }
+      let candidate = InstanceKey.DropGlue {ty: move ty,
+        owner: run Shared.make<DeclarationId>(run DeclarationId.copy(&owner)), runtime: run Shared.make<Bytes>(move runtime)}
+      let available = Numbering.remainingBytes(&numbering)
+      let mut coordinates = RuntimeEncoding.limitedCoordinates(available)
+      let record = run InstanceKey.encodingAt(&candidate, &mut coordinates)
+      if !Numbering.bytes(&mut numbering, available - coordinates.remainingBytes) { return failedGlue(&numbering) }
+      if coordinates.exceeded { return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(CanonicalizationFailure.Resource) }
+      let mut selected = true
+      if let Option<InstanceKey>.Some {..} = &best {
+        if !Numbering.bytes(&mut numbering, Bytes.asSlice(&record).length)
+          || !Numbering.bytes(&mut numbering, Bytes.asSlice(&bestRecord).length) { return failedGlue(&numbering) }
+        selected = RuntimeEncoding.less(Bytes.asSlice(&record), Bytes.asSlice(&bestRecord))
+      }
+      if selected { best = Option.some<InstanceKey>(move candidate)
+        bestRecord = move record }
+      if !search || !Numbering.next(&mut numbering) { break }
+    }
+    return Result.succeed<Option<InstanceKey>, CanonicalizationFailure>(move best)
   }
   /// Constructs the application of a declaration with no generic arguments.
   pub effect fn named(declaration: &Shared<DeclarationId>) -> InstanceKey
   ! OutOfMemoryError
   ? &mut Allocator {
-    return run InstanceKey.function(
+    let mut coordinates = RuntimeEncoding.coordinates()
+    let named = run InstanceKey.fromCanonical(
       Application {
         target: Target.Named {declaration: run DeclarationId.copyShared(declaration)},
         arguments: Vector.make<Argument>(),
         argumentOrdinals: Vector.make<usize>(),
         scopes: Vector.make<ScopeBinding>(),
         statics: Vector.make<StaticSlot>(),
-      },
+      }, Vector.make<ProviderEntry>(), &mut coordinates,
     )
+    // Unbounded empty-domain construction has no canonicalization resource/cycle refusal.
+    return match move named {
+      Result<InstanceKey, CanonicalizationFailure>.Success {value: canonical} => move canonical
+      Result<InstanceKey, CanonicalizationFailure>.Failure {..} => absurd<InstanceKey>()
+    }
   }
   /// Returns the selected semantic application; an entry shim has no generic contract.
   pub fn application(self: &Self) -> Option<Shared<Application>> {
@@ -370,21 +520,25 @@ impl InstanceKey {
   pub effect fn encodingAt(self: &Self, coordinates: &mut Coordinates) -> Bytes
   ! OutOfMemoryError
   ? &mut Allocator {
+    if coordinates.exceeded { return Bytes.make() }
     let mut output = Bytes.make()
-    run RuntimeEncoding.field(&mut output, b"silk.instance.v3")
+    run RuntimeEncoding.recordField(&mut output, b"silk.instance.v3", &mut coordinates.*)
     match & self.* {
       InstanceKey.Function {application, providers, ..} => {
-        run RuntimeEncoding.word(&mut output, 0)
+        run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
+        let affordable = Shared.with<Application, bool>(&application,
+          fn(value: &Application) -> bool { return Application.copiedPayloadFits(value, &mut coordinates.*) })
+        if !affordable { return Bytes.make() }
         let selected = run Application.copyShared(&application)
         let identity = run Application.encoding(&selected, true, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&identity), &mut coordinates.*)
         let count = Shared.with<Vector<ProviderEntry>, usize>(
           &providers,
           fn(entries: &Vector<ProviderEntry>) -> usize {
             return Vector.length<ProviderEntry>(entries)
           },
         )
-        run RuntimeEncoding.word(&mut output, usize.toU64(count))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(count), &mut coordinates.*)
         let mut at = usize.ZERO
         while at < count {
           let entry = Shared.with<Vector<ProviderEntry>, ProviderEntry>(
@@ -400,18 +554,18 @@ impl InstanceKey {
             true,
             &mut coordinates.*,
           )
-          run RuntimeEncoding.field(&mut output, Bytes.asSlice(&capability))
+          run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&capability), &mut coordinates.*)
           if let Option<Shared<Type>>.Some {value: roleValue} = &entry.key.roleType {
-            run RuntimeEncoding.word(&mut output, 1)
+            run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
             let encodedRole = run Type.encoding(
               &roleValue,
               Application.bodyDeclaration(&selected),
               true,
               &mut coordinates.*,
             )
-            run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encodedRole))
+            run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encodedRole), &mut coordinates.*)
           } else {
-            run RuntimeEncoding.word(&mut output, 0)
+            run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
           }
           let provider = run Type.encoding(
             &entry.provider,
@@ -419,26 +573,32 @@ impl InstanceKey {
             true,
             &mut coordinates.*,
           )
-          run RuntimeEncoding.field(&mut output, Bytes.asSlice(&provider))
+          run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&provider), &mut coordinates.*)
           at = at + usize.ONE
         }
       }
       InstanceKey.Entry {main} => {
-        run RuntimeEncoding.word(&mut output, 1)
+        run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
+        if !RuntimeEncoding.declarationFits(&main, &mut coordinates.*) { return Bytes.make() }
         let declaration = run DeclarationId.copyShared(&main)
-        run RuntimeEncoding.declaration(&mut output, &declaration)
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
       }
       InstanceKey.Export {function, symbol} => {
-        run RuntimeEncoding.word(&mut output, 3)
+        run RuntimeEncoding.recordWord(&mut output, 3, &mut coordinates.*)
+        if !RuntimeEncoding.declarationFits(&function, &mut coordinates.*) { return Bytes.make() }
         let declaration = run DeclarationId.copyShared(&function)
-        run RuntimeEncoding.declaration(&mut output, &declaration)
-        run appendShared(&mut output, &symbol)
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
+        let count = Shared.with<Bytes, usize>(&symbol, Bytes.length)
+        if !RuntimeEncoding.recordPayload(&mut coordinates.*, count) { return Bytes.make() }
+        let symbolBytes = run copyShared(&symbol)
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&symbolBytes), &mut coordinates.*)
       }
       InstanceKey.DropGlue {ty, owner, ..} => {
-        run RuntimeEncoding.word(&mut output, 2)
+        run RuntimeEncoding.recordWord(&mut output, 2, &mut coordinates.*)
+        if !RuntimeEncoding.declarationFits(&owner, &mut coordinates.*) { return Bytes.make() }
         let declaration = run DeclarationId.copyShared(&owner)
         let identity = run Type.encoding(&ty, &declaration, true, &mut coordinates.*)
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&identity), &mut coordinates.*)
       }
     }
     return move output
@@ -537,4 +697,19 @@ fn sameRuntimeRight(first: &Bytes, right: &Shared<Bytes>) -> bool {
 fn absurd<T>() -> T {
   let boom = 1 / 0
   return absurd<T>()
+}
+
+fn failedKey(numbering: &Numbering) -> Result<InstanceKey, CanonicalizationFailure> {
+  let reason = match move Numbering.failure(numbering) {
+    Option<CanonicalizationFailure>.Some {value: recorded} => recorded
+    _ => CanonicalizationFailure.UncollectedAtom
+  }
+  return Result.failResult<InstanceKey, CanonicalizationFailure>(reason)
+}
+fn failedGlue(numbering: &Numbering) -> Result<Option<InstanceKey>, CanonicalizationFailure> {
+  let reason = match move Numbering.failure(numbering) {
+    Option<CanonicalizationFailure>.Some {value: recorded} => recorded
+    _ => CanonicalizationFailure.UncollectedAtom
+  }
+  return Result.failResult<Option<InstanceKey>, CanonicalizationFailure>(reason)
 }
