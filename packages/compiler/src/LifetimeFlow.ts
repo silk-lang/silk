@@ -428,6 +428,24 @@ export const analyze = (
     }
     return root
   }
+  // The `then` block an `if let` pattern selects. A match arm's binding may still flow out as the
+  // arm's result, and a `let` destructuring pattern selects no body; both keep the owner's scope.
+  const selectedBody = (binding: AuthoredHir.Anchor): AuthoredHir.Anchor | undefined => {
+    let outermost: number | undefined
+    for (let at = binding.path.length - 1; at >= 0; at -= 1) {
+      const role = binding.path[at]?.role
+      if (role !== undefined && scopeRoles.has(role)) break
+      if (role === 'pattern') outermost = at
+    }
+    if (outermost === undefined) return undefined
+    const prefix = binding.path.slice(0, outermost)
+    if (prefix.at(-1)?.role === 'arm') return undefined
+    const then: AuthoredHir.Anchor = {
+      ...binding,
+      path: prefix.concat({ _tag: 'LocalSegment', role: 'then', occurrence: 0 }),
+    }
+    return entries.some(([entry]) => encloses(context, then, entry)) ? then : undefined
+  }
   const ensure = (lifetime: Lifetime.Lifetime): Region => {
     const key = Lifetime.key(lifetime)
     const previous = regions.get(key)
@@ -522,6 +540,20 @@ export const analyze = (
         position,
         true,
       )
+      // A borrowed `if let` binding is a loan that ends with its selected body, even though the
+      // owner it aliases lives on (PATT-009).
+      if (source._tag === 'PatternRoot') {
+        const selected = selectedBody(source.binding.anchor)
+        if (selected !== undefined) {
+          const region = ensure(lifetime)
+          const allowed = new Set(
+            entries.flatMap(([entry, point]) =>
+              encloses(context, selected, entry) ? [point] : [],
+            ),
+          )
+          for (const point of allPoints) if (!allowed.has(point)) region.unavailable.add(point)
+        }
+      }
       return
     }
     // Indexing a stored slice borrows its backing allocation, whose validity is
