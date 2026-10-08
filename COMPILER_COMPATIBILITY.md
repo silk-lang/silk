@@ -1633,7 +1633,10 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
   `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
   literal binder that the declaration stores covariantly shortens the same way at a later field,
-  as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). The bootstrap solves for the shortest region directly, so a binder
+  as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). A `T: 'binder` bound
+  that the binder's evidence does not cover shortens a covariant inferred binder to the meet of the
+  regions `T` retains, so `Effect.useReleaseNonParking` with a borrowing resource and a capture-free
+  callback no longer fixes `'env` to `'static`; an invariant or written binder never moves. The bootstrap solves for the shortest region directly, so a binder
   an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
