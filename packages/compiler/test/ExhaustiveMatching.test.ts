@@ -578,6 +578,24 @@ pub fn inspect(input: Box) -> Payload {
     'OWN0006',
   )
 
+  const consumedBorrowSource = `pub struct Payload {}
+pub struct Box { value: Payload code: i32 }
+pub fn consumed(input: Box) -> i32 {
+  return match &input { Box { value, code } => match move value { _ => 0 } }
+}
+pub fn inspected(input: Box) -> i32 {
+  return match &input { Box { value, code } => match &value { _ => match move code { _ => 0 } } }
+}`
+  const consumedBorrow = analyze('borrowed-owner-match-move', consumedBorrowSource)
+  const consumedStart = consumedBorrowSource.indexOf('value { _ => 0 }')
+  assert.deepEqual(
+    [...consumedBorrow.diagnostics, ...ownership(consumedBorrow).diagnostics].map((diagnostic) => ({
+      code: diagnostic.code,
+      span: [diagnostic.span.start, diagnostic.span.end],
+    })),
+    [{ code: 'OWN0006', span: [consumedStart, consumedStart + 'value'.length] }],
+  )
+
   const copiedOwnerSource = `pub struct Payload {}
 pub struct Box { value: Payload }
 pub fn inspect(input: Box) -> i32 {
@@ -595,6 +613,35 @@ pub fn inspect(input: Box) -> i32 {
       span: [diagnostic.span.start, diagnostic.span.end],
     })),
     [{ code: 'OWN0006', span: [heldStart, heldStart + 'value'.length] }],
+  )
+
+  const escapedViewSource = `pub struct Inner { values: [u8; 4] }
+pub union Maybe { Held { value: Inner }, Empty }
+fn whole(inner: &Inner) -> &[u8] { return &inner.values }
+pub fn escaped(spelled: Maybe) -> usize {
+  let mut selected = b"i32"
+  if let Maybe.Held {value} = &spelled { selected = whole(&value) }
+  return selected.length
+}
+pub fn contained(spelled: Maybe) -> usize {
+  if let Maybe.Held {value} = &spelled { let view = whole(&value) return view.length }
+  return 0
+}
+pub fn referenced(spelled: &Maybe) -> &[u8] {
+  if let Maybe.Held {value} = &spelled.* { return whole(&value) }
+  return b"i32"
+}`
+  const escapedView = analyze('borrowed-owner-if-let-view', escapedViewSource)
+  const escapedUse = escapedViewSource.indexOf('selected.length')
+  assert.deepEqual(
+    [
+      ...new Set(
+        [...escapedView.diagnostics, ...ownership(escapedView).diagnostics].map((diagnostic) =>
+          JSON.stringify([diagnostic.code, diagnostic.span.start, diagnostic.span.end]),
+        ),
+      ),
+    ],
+    [JSON.stringify(['OWN0019', escapedUse, escapedUse + 'selected'.length])],
   )
 })
 
