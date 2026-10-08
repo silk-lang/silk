@@ -22,6 +22,9 @@ const proofOf = (source: Mir.ExecutableInputViewSource): Mir.ExecutableInputView
 const replaceSourceView = (
   source: Mir.ExecutableInputViewSource,
   original: Tir.ExecutableInputView,
+  changeCall: (
+    node: Extract<Tir.Expression, { readonly _tag: 'Call' | 'EffectConstruct' }>,
+  ) => Extract<Tir.Expression, { readonly _tag: 'Call' | 'EffectConstruct' }> = (node) => node,
 ): Mir.ExecutableInputViewSource => {
   const node = source.caller.function.statements
     .flatMap(Tir.statementExpressions)
@@ -30,7 +33,7 @@ const replaceSourceView = (
   if (node?._tag !== 'Call' && node?._tag !== 'EffectConstruct')
     return unreachable('expected actual checked call')
   const replaced = {
-    ...node,
+    ...changeCall(node),
     inputViews: node.inputViews?.map((view) =>
       view.parameter.ordinal === original.parameter.ordinal ? original : view,
     ),
@@ -323,14 +326,26 @@ it.effect(
     Effect.gen(function* () {
       const snapshot = yield* AnalysisFixture.retainingMain(
         'input-view/physical-source',
-        bytes(`effect fn first() -> i32 { return 1 }
+        bytes(`service Extra {}
+effect fn first() -> i32 { return 1 }
 effect fn second() -> i32 { return 2 }
-effect fn consume(input: once Effect<'static; i32>) -> i32 { return 0 }
-pub fn main() -> i32 {
-  let firstRun = run consume(first())
-  let secondRun = run consume(second())
-  return firstRun + secondRun
-}`),
+effect<'call> fn retained<'call>(input: once Effect<'call; i32 ? &Extra>) -> i32 {
+  drop input
+  return 0
+}
+effect<'call> fn consume<'call>(input: once Effect<'call; i32>, other: once Effect<'call; i32>) -> i32 {
+  let left = run input
+  return left + run other
+}
+struct Owner { value: i32 }
+fn probe<'scope>(owner: &'scope Owner) -> i32 {
+  let pending = retained<'scope>(first())
+  drop pending
+  let firstRun = run consume<'scope>(first(), second())
+  let secondRun = run consume<'scope>(second(), first())
+  return firstRun + secondRun + owner.value
+}
+pub fn main() -> i32 { let owner = Owner { value: 0 } return probe(&owner) }`),
         'wasm32-unknown-unknown',
         { normalizeMir: false },
       )
@@ -339,7 +354,10 @@ pub fn main() -> i32 {
       assert.deepEqual(yield* MirVerification.verify(mir), [])
       const sources =
         mir.executableInputViews ?? unreachable('expected independently held call edges')
-      const calls = sources.filter((source) => source.selected.target.name === 'consume')
+      const calls = sources.filter(
+        (source) =>
+          source.selected.target.name === 'consume' && source.original.parameter.ordinal === 0,
+      )
       assert.lengthOf(calls, 2)
       const first = calls.at(0) ?? unreachable('expected first original input')
       const second = calls.at(1) ?? unreachable('expected second original input')
@@ -356,6 +374,17 @@ pub fn main() -> i32 {
           },
         }),
       )
+      for (const altered of [
+        replaceSourceView(first, first.original, (node) => ({
+          ...node,
+          target: { ...node.target, name: 'first' },
+        })),
+        replaceSourceView(first, first.original, (node) => ({
+          ...node,
+          arguments: [...node.arguments].reverse(),
+        })),
+      ])
+        assert.isUndefined(ExecutableInputView.authenticate([altered], proof))
       const viewed = mir.functions.flatMap((fn, functionOrdinal) =>
         fn.localTypes.flatMap((local, localOrdinal) =>
           local._tag === 'EffectValue' && local.inputView !== undefined
@@ -363,13 +392,23 @@ pub fn main() -> i32 {
             : [],
         ),
       )
+      const retained =
+        viewed.find((item) => item.local.inputView?.view.target.name === 'retained') ??
+        unreachable('expected genuine wider requirement parameter view')
+      assert.isDefined(ExecutableInputView.physical(mir, retained.local))
+      // Passing the accepted header does not authorize running a different requirement ABI.
+      assert.isUndefined(ExecutableInputView.outcome(mir, retained.local, retained.local.type))
       const original =
         viewed.find(
-          (item) => item.local.inputView?.callNode.ordinal === first.call.node?.ordinal,
+          (item) =>
+            item.local.inputView?.callNode.ordinal === first.call.node?.ordinal &&
+            item.local.inputView?.view.parameter.ordinal === first.selected.parameter.ordinal,
         ) ?? unreachable('expected physical descriptor with original input view')
       const foreign =
         viewed.find(
-          (item) => item.local.inputView?.callNode.ordinal === second.call.node?.ordinal,
+          (item) =>
+            item.local.inputView?.callNode.ordinal === second.call.node?.ordinal &&
+            item.local.inputView?.view.parameter.ordinal === second.selected.parameter.ordinal,
         ) ?? unreachable('expected distinct real physical producer')
       assert.isTrue(Type.equals(original.local.type, foreign.local.type))
       const changed = {

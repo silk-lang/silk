@@ -3053,6 +3053,7 @@ export const discover = (
           {
             _tag: 'CallInstance',
             owner: provided.owner,
+            ...(provided.node === undefined ? {} : { node: provided.node }),
             span: provided.span,
             target: provided.target,
             ...(provided.providers === undefined ? {} : { providers: provided.providers }),

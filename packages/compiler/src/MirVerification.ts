@@ -1,3 +1,4 @@
+import * as CallableInputView from './CallableInputView.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as Mir from './Mir.js'
 import * as MirNormalization from './MirNormalization.js'
@@ -1259,6 +1260,7 @@ const invocationCapturedSource = (
 const invocationHeaderCapture = (
   fn: MirFunction,
   input: Mir.InvocationUse['inputs'][number],
+  program: InvocationProgram,
 ):
   | {
       readonly contents: ReadonlyArray<
@@ -1317,26 +1319,34 @@ const invocationHeaderCapture = (
   const schema = header.type.schema
   const field = container.environment?.fields.at(input.capture)
   if (
-    schema === undefined ||
     field === undefined ||
     field.ordinal !== input.capture ||
     field.parameterOrdinal !== input.parameter ||
     !SilkType.equals(field.type, input.type) ||
-    !SilkType.invocationAdapterValid(
-      header.type.invocationUse,
-      header.type.parameters.length,
-      schema,
-    )
+    (schema !== undefined &&
+      !SilkType.invocationAdapterValid(
+        header.type.invocationUse,
+        header.type.parameters.length,
+        schema,
+      ))
   )
     return undefined
+  const sourceView =
+    schema === undefined ? CallableInputView.authenticate(program, container) : undefined
   const originalInputs =
-    schema.invocationAdapter?.originalInputs ?? SilkType.callableInputOrdinals(schema.contract)
+    schema === undefined
+      ? sourceView?.inputs
+      : (schema.invocationAdapter?.originalInputs ??
+        SilkType.callableInputOrdinals(schema.contract))
   const visible =
-    schema.invocationAdapter?.parameters ??
-    Array.from({ length: header.type.parameters.length }, (_, ordinal) => ordinal)
+    schema === undefined
+      ? sourceView?.visible
+      : (schema.invocationAdapter?.parameters ??
+        Array.from({ length: header.type.parameters.length }, (_, ordinal) => ordinal))
   if (
     originalInputs === undefined ||
     !originalInputs.includes(input.parameter) ||
+    visible === undefined ||
     visible.includes(input.parameter)
   )
     return undefined
@@ -1603,11 +1613,22 @@ export const invocationUseIssues = (
     let originalInputs: ReadonlyArray<number> | undefined
     if (operation._tag !== 'ApplyCallable')
       originalInputs = Array.from({ length: operation.arguments.length }, (_, ordinal) => ordinal)
-    else if (schema === undefined)
+    else if (schema === undefined) {
+      const actual =
+        operation.callable === undefined ? undefined : fn.localTypes.at(operation.callable.ordinal)
+      const sourceView =
+        actual?._tag === 'CallableValue' && actual.environment !== undefined
+          ? CallableInputView.authenticate(program, actual)
+          : undefined
       originalInputs =
-        operation.callableType.invocationUse?.parameters ??
-        Array.from({ length: operation.callableType.parameters.length }, (_, ordinal) => ordinal)
-    else
+        actual?._tag === 'CallableValue' && actual.environment !== undefined
+          ? sourceView?.inputs
+          : (operation.callableType.invocationUse?.parameters ??
+            Array.from(
+              { length: operation.callableType.parameters.length },
+              (_, ordinal) => ordinal,
+            ))
+    } else
       originalInputs =
         schema.invocationAdapter?.originalInputs ?? SilkType.callableInputOrdinals(schema.contract)
     if (
@@ -1624,9 +1645,18 @@ export const invocationUseIssues = (
         ))
     )
       invalid('invocation fails complete original target input coverage')
+    const callable =
+      operation._tag === 'ApplyCallable' && operation.callable !== undefined
+        ? fn.localTypes.at(operation.callable.ordinal)
+        : undefined
     const coordinates =
       operation._tag === 'ApplyCallable'
-        ? operation.callableType.schema?.invocationAdapter?.parameters
+        ? (operation.callableType.schema?.invocationAdapter?.parameters ??
+          (callable?._tag === 'CallableValue' &&
+          callable.type.schema === undefined &&
+          callable.environment !== undefined
+            ? CallableInputView.authenticate(program, callable)?.visible
+            : undefined))
         : undefined
     for (const [ordinal, argument] of operation.arguments.entries()) {
       const original = coordinates?.at(ordinal) ?? ordinal
@@ -1690,7 +1720,7 @@ export const invocationUseIssues = (
           input.source,
           input.capturePath,
         )
-        const incoming = invocationHeaderCapture(fn, input)
+        const incoming = invocationHeaderCapture(fn, input, program)
         if (
           operation._tag !== 'ApplyCallable' ||
           operation.callable?.ordinal !== input.argument.ordinal ||
@@ -1942,7 +1972,10 @@ export interface InvocationRetentionAnalysis {
   readonly issues: ReadonlyArray<InvocationUseIssue>
 }
 
-type InvocationProgram = Pick<Mir.Module, 'layout' | 'functions' | 'executableInputViews'>
+type InvocationProgram = Pick<
+  Mir.Module,
+  'layout' | 'functions' | 'executableInputViews' | 'callableInputSources'
+>
 
 type InvocationChannel = 'Value' | 'Success' | 'Failure'
 
@@ -2593,7 +2626,7 @@ export const invocationRetentions = (
                 input.capturePath,
               )
         if (actual === undefined) {
-          const incoming = invocationHeaderCapture(fn, input)
+          const incoming = invocationHeaderCapture(fn, input, program)
           if (incoming === undefined)
             issues.push({
               _tag: 'InvalidInvocationUse',
@@ -5605,7 +5638,13 @@ const computeVerify = Effect.fnUntraced(function* (
     const missingTypes = new Set(
       [...fn.localTypes, fn.result]
         .filter((type) => type._tag !== 'CallableValue')
-        .map(semanticType)
+        .map((type) =>
+          semanticType(
+            type._tag === 'EffectValue' && type.inputView !== undefined
+              ? (ExecutableInputView.physical(self, type) ?? type)
+              : type,
+          ),
+        )
         .filter(
           (type) =>
             Layout.entry(self.layout, type) === undefined &&
@@ -8963,6 +9002,7 @@ const computeVerify = Effect.fnUntraced(function* (
                 })()
           const valid =
             effectValue !== undefined &&
+            physicalOutcome !== undefined &&
             outcome?._tag === 'EffectOutcome' &&
             destination !== undefined &&
             SilkType.equals(effectValue.type, operation.outcomeType.type) &&

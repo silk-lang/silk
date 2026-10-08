@@ -34,6 +34,7 @@ import * as Match from './Match.js'
 import * as Ownership from './Ownership.js'
 import * as Mir from './Mir.js'
 import * as SourceSpan from './SourceSpan.js'
+import * as SourceCallView from './SourceCallView.js'
 import * as Type from './Type.js'
 import * as TypeCompatibility from './TypeCompatibility.js'
 import * as TypeInference from './internal/TypeInference.js'
@@ -1923,14 +1924,18 @@ export const lowerServiceEffectValue = (
         !Type.equals(provider.capability, provided.capability) ||
         Type.equals(provider.providerType, provided.providerType),
     )
-  const authorizations = witnessedProvider ? [provided] : []
   const physicalContract =
     effectValue === undefined ? undefined : EffectExecutionContract.fromType(effectValue.type)
   if (
     effectValue === undefined ||
+    effectValue._tag !== 'EffectValue' ||
+    Instances.keyText(effectValue.environment.instance) !== Instances.keyText(call.target) ||
+    call.resultEffect !==
+      Instances.effectIdentity(effectValue.environment.instance, effectValue.site) ||
     physicalContract === undefined ||
     !Type.isEffect(semanticType) ||
-    !EffectExecutionContract.matches(semanticType, physicalContract, authorizations)
+    !witnessedProvider ||
+    SourceCallView.service(fn, subject, call, provided, physicalContract) === undefined
   )
     return undefined
   const effect = fn.alloc(effectValue)

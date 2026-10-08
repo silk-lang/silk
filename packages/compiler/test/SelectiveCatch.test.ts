@@ -1,3 +1,4 @@
+import * as CallableInputView from '../src/CallableInputView.js'
 import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
@@ -98,24 +99,78 @@ it.effect('uses nominal variant coverage when catching a mixed failure row', () 
     const self = yield* analyze(`import silk.effect { Effect }
 pub union Problem { Detailed { pub code: i32 }, Empty }
 pub struct Other { pub value: usize }
+struct Marker { value: i32 }
 effect fn risky(flag: bool) -> i32 ! Problem | Other {
   if flag { fail Problem.Detailed { code: 7 } }
   fail Other { value: 1 }
 }
 effect fn recoverProblem(error: Problem) -> i32 { drop error return 20 }
 effect fn recoverOther(error: Other) -> i32 { return 22 }
-effect fn recoverAll(error: Problem | Other) -> i32 { drop error return 42 }
+effect fn recoverAll(error: Problem | Other, marker: Marker) -> i32 {
+  match move error {
+    Other { value } => { return marker.value }
+    _ => { return marker.value }
+  }
+}
 effect fn selective(flag: bool) -> i32 ! Other {
   return run Effect.catch<Problem>(risky(flag), recoverProblem)
 }
 pub fn main() -> i32 {
-  let all = run Effect.catchAll(risky(true), recoverAll)
+  let all = run Effect.catchAll(risky(true), recoverAll(Marker { value: 42 }))
   let selected = run Effect.catchAll(selective(false), recoverOther)
   return all + selected
 }`)
     assert.deepEqual(codes(self), [])
     const module = Analysis.loweredMir(self)
     assert.deepEqual(yield* MirVerification.verify(module), [])
+    const captured = module.functions
+      .flatMap((fn) => fn.localTypes)
+      .find(
+        (local) =>
+          local._tag === 'CallableValue' &&
+          local.type.schema === undefined &&
+          local.target._tag === 'DeclarationCallableTarget' &&
+          local.target.declaration.name === 'recoverAll',
+      )
+    if (
+      captured?._tag !== 'CallableValue' ||
+      captured.target._tag !== 'DeclarationCallableTarget' ||
+      captured.environment === undefined
+    )
+      return unreachable('expected original non-generic owned section')
+    const inputView = CallableInputView.authenticate(module, captured)
+    assert.isDefined(inputView)
+    assert.deepEqual(inputView?.inputs, [0, 1])
+    assert.deepEqual(inputView?.visible, [0])
+    for (const changed of [
+      {
+        ...captured,
+        target: {
+          _tag: 'DeclarationCallableTarget',
+          declaration: { ...captured.target.declaration, name: 'recoverOther' },
+        },
+      },
+      {
+        ...captured,
+        environment: {
+          ...captured.environment,
+          fields: captured.environment.fields.map((field) => ({ ...field, parameterOrdinal: 0 })),
+        },
+      },
+    ] satisfies ReadonlyArray<Extract<Mir.Type, { readonly _tag: 'CallableValue' }>>)
+      assert.isUndefined(CallableInputView.authenticate(module, changed))
+    assert.isUndefined(
+      CallableInputView.authenticate({ ...module, callableInputSources: [] }, captured),
+    )
+    const missingSource = yield* MirVerification.verify({ ...module, callableInputSources: [] })
+    assert.isTrue(
+      missingSource.some(
+        (violation) =>
+          violation.detail === 'invocation fails complete original target input coverage' ||
+          violation.detail ===
+            'invocation captured input lacks its exact retained callable slot producer',
+      ),
+    )
     const matches = module.functions.flatMap((fn) =>
       MirVerification.operations(fn).filter(
         (operation) =>

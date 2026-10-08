@@ -1,3 +1,4 @@
+import type * as CallableInputView from './CallableInputView.js'
 import type * as Lifetime from './Lifetime.js'
 import type * as AuthoredIdentity from './AuthoredIdentity.js'
 import type * as ExecutionStorageComponent from './ExecutionStorageComponent.js'
@@ -1792,6 +1793,8 @@ export interface MirFunction {
 }
 
 export interface Module {
+  /** Held original producer/target bodies for non-generic physical sections. */
+  readonly callableInputSources?: ReadonlyArray<CallableInputView.Source>
   /** Held checked call graph for semantic views whose physical layout is shared. */
   readonly executableInputViews?: ReadonlyArray<ExecutableInputViewSource>
   /** Source component selected only for reachable private frame storage. */

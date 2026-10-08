@@ -1,3 +1,4 @@
+import * as CallableInputView from './CallableInputView.js'
 import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as ConcreteCleanup from './ConcreteCleanup.js'
 import {
@@ -1112,18 +1113,20 @@ export const lowerRecoveryInvocationInputs = (
     return undefined
   const schema = actual.type.schema
   if (schema === undefined) {
-    // A bare named item has no lexical packet. Its complete original input header is
-    // nevertheless held by the exact checked target instance, independently of the
-    // contextual callable promise selected by the consumer.
+    // A named item's original input header belongs to its exact source target,
+    // independently of the contextual promise selected by the consumer.
     if (
       actual.target._tag !== 'DeclarationCallableTarget' ||
-      actual.environment !== undefined ||
       actual.storage !== undefined ||
-      actual.site !== undefined
+      (actual.environment === undefined && actual.site !== undefined)
     )
       return undefined
     const target = actual.target.declaration
-    const arguments_ = actual.typeArguments ?? []
+    const environment = actual.environment
+    const arguments_ =
+      environment === undefined
+        ? (actual.typeArguments ?? [])
+        : Layout.callableTargetArguments(environment)
     const sources = fn.instances.filter(
       (instance) =>
         instance.key.declaration.module === target.module &&
@@ -1142,7 +1145,7 @@ export const lowerRecoveryInvocationInputs = (
       sources.length !== 1 ||
       source === undefined ||
       source.ownership.verdict._tag !== 'Satisfied' ||
-      source.view.causes.length !== 0 ||
+      BodyView.hasUnavailable(source.view) ||
       source.view.lifetimes?.diagnostics.length !== 0
     )
       return undefined
@@ -1151,6 +1154,83 @@ export const lowerRecoveryInvocationInputs = (
     const parameters = source.function.declaration.parameters.filter(
       (parameter) => parameter.phase === 'Runtime',
     )
+    if (environment !== undefined) {
+      const view = CallableInputView.authenticate(
+        {
+          layout: fn.layout,
+          callableInputSources: CallableInputView.catalog(fn.instances, fn.layout),
+        },
+        actual,
+      )
+      const visible = view?.visible.at(0)
+      if (
+        view === undefined ||
+        view.visible.length !== 1 ||
+        visible === undefined ||
+        !Type.equals(actual.type.parameters.at(0) ?? 'never', selected)
+      )
+        return undefined
+      const inputs: Array<Mir.InvocationUse['inputs'][number]> = [
+        { parameter: visible, argument, type: selected },
+      ]
+      const definition = fn.callableDefinitions.get(callable.ordinal)
+      const headers = fn.owner.function.declaration.parameters.filter(
+        (parameter) =>
+          parameter.phase === 'Runtime' &&
+          parameter.captureAccess === undefined &&
+          fn.parameterLocals.get(parameter.id.ordinal)?.ordinal === callable.ordinal,
+      )
+      const header = headers.at(0)
+      if (
+        (definition === undefined && (headers.length !== 1 || header === undefined)) ||
+        (definition !== undefined &&
+          (definition.base !== undefined ||
+            definition.type.environment !== environment ||
+            definition.target._tag !== 'DeclarationCallableTarget' ||
+            definition.target.declaration.module !== target.module ||
+            definition.target.declaration.name !== target.name ||
+            definition.captures.length !== view.section.captures.length))
+      )
+        return undefined
+      for (const capture of view.captures) {
+        const field = environment.fields.at(capture.ordinal)
+        if (field === undefined) return undefined
+        if (definition !== undefined) {
+          const retained = definition.captures.at(capture.ordinal)
+          const descriptor =
+            retained === undefined ? undefined : fn.localTypes.at(retained.source.ordinal)
+          if (
+            retained === undefined ||
+            descriptor === undefined ||
+            retained.ordinal !== capture.ordinal ||
+            retained.parameterOrdinal !== capture.parameterOrdinal ||
+            retained.access !== capture.access ||
+            retained.sourceOrigin === undefined ||
+            AuthoredIdentity.anchorKey(retained.sourceOrigin) !==
+              AuthoredIdentity.anchorKey(capture.value.origin.anchor) ||
+            !Type.equals(Mir.semanticType(descriptor), field.type)
+          )
+            return undefined
+          inputs.push({
+            parameter: capture.parameterOrdinal,
+            argument: retained.source,
+            type: field.type,
+            source: retained.sourceOrigin,
+          })
+        } else if (header !== undefined) {
+          inputs.push({
+            parameter: capture.parameterOrdinal,
+            capture: capture.ordinal,
+            argument: callable,
+            type: field.type,
+            source: header.anchor,
+            header: { parameter: header.id.ordinal, source: header.anchor },
+          })
+        }
+      }
+      const offered = view.contract.invocationUse?.lifetime
+      return { binder: offered?._tag === 'BoundLifetime' ? offered : binder, inputs }
+    }
     const parameter = parameters.at(0)
     const selectedParameter = source.specialization.parameters.at(0)
     if (

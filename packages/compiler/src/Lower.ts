@@ -1,3 +1,4 @@
+import * as CallableInputView from './CallableInputView.js'
 import * as CompilerTrace from './CompilerTrace.js'
 import * as CleanupPlan from './CleanupPlan.js'
 import * as ConformanceProof from './ConformanceProof.js'
@@ -731,6 +732,7 @@ export const lowerProgram = (
         left.declarationSpan.end - right.declarationSpan.end,
     )
   const executableInputViews = ExecutableInputView.catalog(discovery.instances, discovery.calls)
+  const callableInputSources = CallableInputView.catalog(discovery.instances, layout)
   const program: Mir.Module = {
     _tag: 'MirModule',
     module: discovery.rootModule,
@@ -739,6 +741,7 @@ export const lowerProgram = (
     foreignExports: discovery.foreignExports,
     retainedRoots: discovery.retention,
     ...(executableInputViews.length === 0 ? {} : { executableInputViews }),
+    ...(callableInputSources.length === 0 ? {} : { callableInputSources }),
     foreignStatics,
     layout: finalizedLayout,
     staticData,

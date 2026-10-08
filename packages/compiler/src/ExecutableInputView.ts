@@ -177,20 +177,22 @@ const authenticateChecked = (
   const held =
     node.inputViews?.filter((view) => view.parameter.ordinal === original.parameter.ordinal) ?? []
   if (
+    !sameDeclaration(node.target, original.target) ||
     held.length !== 1 ||
     held.at(0) === undefined ||
     key(held.at(0) ?? original) !== key(original) ||
     AuthoredIdentity.anchorKey(node.origin.anchor) !== AuthoredIdentity.anchorKey(original.call)
   )
     return undefined
-  const operands = node.arguments.filter(
-    (operand) => operand.id?.ordinal === original.operand.node.ordinal,
-  )
-  const operand = operands.at(0)
-  const parameter = callee.function.declaration.parameters.at(original.parameter.ordinal)
+  const parameters = callee.function.declaration.parameters
+  const parameter = parameters.at(original.parameter.ordinal)
+  const runtimeOrdinal = parameters
+    .slice(0, original.parameter.ordinal)
+    .filter((item) => item.phase === 'Runtime').length
+  const operand = node.arguments.at(runtimeOrdinal)
   if (
-    operands.length !== 1 ||
     operand === undefined ||
+    operand.id?.ordinal !== original.operand.node.ordinal ||
     operand._tag === 'Unavailable' ||
     parameter?.phase !== 'Runtime' ||
     parameter.declaredType._tag !== 'Resolved' ||
@@ -372,6 +374,81 @@ export const operandView = (
   return authority(instances, calls, proof) === undefined ? undefined : proof
 }
 
+/** Replays one captured Effect through its original parameter's concrete hidden identity. */
+export const capturedEffect = (
+  instances: ReadonlyArray<Instances.Instance>,
+  calls: ReadonlyArray<Instances.CallInstance>,
+  layout: Layout.Plan,
+  owner: Instances.Instance,
+  field: Layout.EffectEnvironmentField,
+  context: TypeCompatibility.Context,
+): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
+  const declared = owner.specialization.parameters.at(field.ordinal)
+  const expected =
+    declared !== undefined && Type.isRepresented(declared) ? declared.contract : declared
+  const identity = Instances.parameterEffectIdentityArgument(
+    owner.function,
+    owner.key,
+    field.ordinal,
+  )
+  if (
+    field.source !== 'Parameter' ||
+    expected === undefined ||
+    !Type.isEffect(expected) ||
+    identity === undefined ||
+    field.effectIdentity !== identity.identity
+  )
+    return undefined
+  const physical = ValueType.effectValueByIdentity(
+    layout,
+    identity.identity,
+    undefined,
+    identity.owner,
+  )
+  if (
+    physical === undefined ||
+    (field.resolvedEffectIdentity !== undefined &&
+      field.resolvedEffectIdentity !==
+        Instances.effectIdentity(physical.environment.instance, physical.site))
+  )
+    return undefined
+  const producers = instances.filter(
+    (instance) =>
+      Instances.keyText(instance.key) === Instances.keyText(physical.environment.instance),
+  )
+  const producer = producers.at(0)
+  if (
+    producers.length !== 1 ||
+    producer === undefined ||
+    producer.function !== producer.view.function ||
+    producer.ownership.verdict._tag !== 'Satisfied' ||
+    BodyView.hasUnavailable(producer.view) ||
+    producer.view.lifetimes === undefined ||
+    producer.view.lifetimes.diagnostics.length !== 0 ||
+    producer.view.lifetimes.solution._tag !== 'Solved' ||
+    producer.view.lifetimes.solution.violations.length !== 0
+  )
+    return undefined
+  if (field.inputView !== undefined) {
+    const source = authority(instances, calls, field.inputView)
+    if (
+      source === undefined ||
+      Instances.keyText(source.callee.key) !== Instances.keyText(owner.key) ||
+      source.selected.parameter.ordinal !== field.ordinal ||
+      !Type.isEffect(source.selected.actual) ||
+      !Type.isEffect(source.selected.expected) ||
+      !Type.equals({ ...source.selected.actual, access: physical.type.access }, physical.type) ||
+      !Type.equals({ ...source.selected.expected, access: physical.type.access }, field.type)
+    )
+      return undefined
+    return physical
+  }
+  return Type.equals(field.type, physical.type) &&
+    TypeCompatibility.isCompatible(TypeCompatibility.check(physical.type, expected, context))
+    ? physical
+    : undefined
+}
+
 /** Replays a stored callable view against the exact original physical closure and runtime lanes. */
 export const physicalCallable = (
   program: Program,
@@ -499,11 +576,15 @@ export const physical = (
       Type.runtimeKey({
         ...source.selected.expected,
         access: source.selected.actual.access,
+        // The checked parameter may offer more requirements than this concrete producer
+        // needs. Its captured payload and outcome ABI still belong to the actual producer;
+        // success/failure channels must retain the same runtime shape.
+        requirementRow: source.selected.actual.requirementRow,
       })
   return valid ? physical : undefined
 }
 
-/** A checked parameter view opens the original physical runner's channels at this call. */
+/** Direct execution additionally requires the actual runner's complete runtime contract. */
 export const outcome = (
   program: Program,
   local: Mir.Type | undefined,
@@ -511,5 +592,9 @@ export const outcome = (
 ): Type.Effect | undefined => {
   if (local?._tag !== 'EffectValue' || local.inputView === undefined) return requested
   if (!Type.equals(local.type, requested)) return undefined
-  return physical(program, local)?.environment.effect
+  const actual = physical(program, local)?.environment.effect
+  return actual !== undefined &&
+    Type.runtimeKey(actual) === Type.runtimeKey({ ...requested, access: actual.access })
+    ? actual
+    : undefined
 }

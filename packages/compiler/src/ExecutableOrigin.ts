@@ -4189,6 +4189,11 @@ export const make = (operations: Operations) => {
                 owner: instance.key,
                 target,
                 span,
+                ...(service.expression.id !== undefined &&
+                keyText(service.context.owner) === keyText(instance.key) &&
+                Tir.nodeOf(instance.function, service.expression.id) === service.expression
+                  ? { node: service.expression.id }
+                  : {}),
                 ...(service.expression.staticArgumentOrigins === undefined
                   ? {}
                   : { staticArgumentOrigins: service.expression.staticArgumentOrigins }),
@@ -4232,6 +4237,11 @@ export const make = (operations: Operations) => {
                 owner: instance.key,
                 target,
                 span,
+                ...(service.expression.id !== undefined &&
+                keyText(service.context.owner) === keyText(instance.key) &&
+                Tir.nodeOf(instance.function, service.expression.id) === service.expression
+                  ? { node: service.expression.id }
+                  : {}),
                 ...(service.expression.staticArgumentOrigins === undefined
                   ? {}
                   : { staticArgumentOrigins: service.expression.staticArgumentOrigins }),
@@ -4680,6 +4690,9 @@ export const make = (operations: Operations) => {
             {
               owner: context.owner,
               target,
+              ...(deferredCall.expression.id === undefined
+                ? {}
+                : { node: deferredCall.expression.id }),
               span,
               ...(deferredCall.expression.staticArgumentOrigins === undefined
                 ? {}
@@ -4721,6 +4734,9 @@ export const make = (operations: Operations) => {
               {
                 owner: serviceCall.context.owner,
                 target,
+                ...(serviceCall.expression.id === undefined
+                  ? {}
+                  : { node: serviceCall.expression.id }),
                 span: serviceCall.expression.span,
                 providers: [
                   {
