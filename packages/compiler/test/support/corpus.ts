@@ -8326,7 +8326,9 @@ import silk.shared { Shared }
 struct Counts { order: i32 }
 struct Guard { counts: Shared<Counts> digit: i32 }
 struct Pair { selected: Guard omitted: Guard }
+struct Held { first: Guard value: i32 }
 fn read(counts: &Counts) -> i32 { return counts.order }
+impl Guard { fn keep(self: Self, value: i32) -> i32 { return value } }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     let digit = self.digit
@@ -8347,14 +8349,53 @@ fn early(counts: &Shared<Counts>) -> i32 {
     Pair { selected, .. } => { let local = guard(counts, 4) return 17 }
   })
 }
+fn field(counts: &Shared<Counts>) -> i32 {
+  let held = Held { first: guard(counts, 1), value: match move (Pair {
+    selected: guard(counts, 2), omitted: guard(counts, 3),
+  }) {
+    Pair { selected, .. } => { return 17 }
+  } }
+  return held.value
+}
+fn element(counts: &Shared<Counts>) -> i32 {
+  let items = [guard(counts, 1), match move (Pair {
+    selected: guard(counts, 2), omitted: guard(counts, 3),
+  }) {
+    Pair { selected, .. } => { return 17 }
+  }]
+  return 99
+}
+fn receiver(counts: &Shared<Counts>) -> i32 {
+  return guard(counts, 1).keep(match move (Pair {
+    selected: guard(counts, 2), omitted: guard(counts, 3),
+  }) {
+    Pair { selected, .. } => { return 17 }
+  })
+}
+fn ordered(counts: Shared<Counts>, result: i32) -> i32 {
+  if result != 17 { return -1 }
+  let order = Shared.with<Counts, i32>(&counts, read)
+  drop counts
+  return order
+}
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let counts = run Shared.make<Counts>(Counts { order: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  if early(&counts) != 17 { return 1 }
-  let order = Shared.with<Counts, i32>(&counts, read)
-  drop counts
-  if order != 4231 { return 2 }
+  let result = early(&counts)
+  if ordered(move counts, result) != 4231 { return 2 }
+  let fieldCounts = run Shared.make<Counts>(Counts { order: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fieldResult = field(&fieldCounts)
+  if ordered(move fieldCounts, fieldResult) != 231 { return 3 }
+  let elementCounts = run Shared.make<Counts>(Counts { order: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let elementResult = element(&elementCounts)
+  if ordered(move elementCounts, elementResult) != 231 { return 4 }
+  let receiverCounts = run Shared.make<Counts>(Counts { order: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let receiverResult = receiver(&receiverCounts)
+  if ordered(move receiverCounts, receiverResult) != 231 { return 5 }
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return -1 }
