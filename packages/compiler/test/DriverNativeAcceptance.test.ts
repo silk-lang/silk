@@ -1051,6 +1051,8 @@ it.effect.each(selected.native)(
         let compilationMessage = caseName
         if (outcome._tag === 'BackendFailed') {
           compilationMessage = `${caseName}: ${outcome.error.message}\n${Json.stringify(outcome.error.reason)}`
+        } else if (outcome._tag === 'VerificationFailed') {
+          compilationMessage = `${caseName}: ${outcome.error.message}\n${Json.stringify(outcome.error.violations)}`
         } else if (outcome._tag === 'Rejected') {
           compilationMessage = `${caseName}: ${outcome.diagnostics
             .map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)

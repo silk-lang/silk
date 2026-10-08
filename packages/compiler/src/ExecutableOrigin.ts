@@ -464,6 +464,16 @@ interface ProviderBinding {
 
 type ProviderEnvironment = ReadonlyArray<ProviderBinding>
 
+/** Original lexical tuples remain distinct even when their physical instance keys coalesce. */
+export const providerContextKey = (providers: ReadonlyArray<Instances.CallProvider>): string =>
+  JSON.stringify(
+    providers.map((provider) => [
+      provider.role,
+      Type.key(provider.capability),
+      Type.key(provider.providerType),
+    ]),
+  )
+
 interface ProviderWorklist {
   readonly relevant: ReadonlySet<string>
   readonly pending: Array<{ readonly node: string; readonly environment: ProviderEnvironment }>
@@ -4685,9 +4695,14 @@ export const make = (operations: Operations) => {
         }
         const target = targetKeyOfInvocation(deferredCall.expression, context)
         if (target !== undefined) {
+          const selectedProviders = [...selectedBindings.values()].map((binding) => ({
+            capability: binding.witness.capability,
+            providerType: binding.witness.provider,
+            role: binding.selected.role,
+          }))
           const span = deferredCall.expression.span
           providedTargets.set(
-            `${keyText(context.owner)}\0${keyText(target)}\0${deferredCall.expression.id?.ordinal ?? -1}\0${span.sourceId}:${span.start}:${span.end}`,
+            `${keyText(context.owner)}\0${keyText(target)}\0${deferredCall.expression.id?.ordinal ?? -1}\0${span.sourceId}:${span.start}:${span.end}\0${providerContextKey(selectedProviders)}`,
             {
               owner: context.owner,
               target,
@@ -4698,11 +4713,7 @@ export const make = (operations: Operations) => {
               ...(deferredCall.expression.staticArgumentOrigins === undefined
                 ? {}
                 : { staticArgumentOrigins: deferredCall.expression.staticArgumentOrigins }),
-              providers: [...selectedBindings.values()].map((binding) => ({
-                capability: binding.witness.capability,
-                providerType: binding.witness.provider,
-                role: binding.selected.role,
-              })),
+              providers: selectedProviders,
             },
           )
           const targetNode = executionNodeForKey(target)
@@ -4730,8 +4741,15 @@ export const make = (operations: Operations) => {
             binding.receiver,
           )
           if (target !== undefined) {
+            const selectedProviders = [
+              {
+                capability: binding.witness.capability,
+                providerType: binding.witness.provider,
+                role: binding.selected.role,
+              },
+            ]
             providedTargets.set(
-              `${keyText(serviceCall.context.owner)}\0${keyText(target)}\0${serviceCall.expression.id?.ordinal ?? -1}\0${serviceCall.expression.span.sourceId}:${serviceCall.expression.span.start}:${serviceCall.expression.span.end}`,
+              `${keyText(serviceCall.context.owner)}\0${keyText(target)}\0${serviceCall.expression.id?.ordinal ?? -1}\0${serviceCall.expression.span.sourceId}:${serviceCall.expression.span.start}:${serviceCall.expression.span.end}\0${providerContextKey(selectedProviders)}`,
               {
                 owner: serviceCall.context.owner,
                 target,
@@ -4739,13 +4757,7 @@ export const make = (operations: Operations) => {
                   ? {}
                   : { node: serviceCall.expression.id }),
                 span: serviceCall.expression.span,
-                providers: [
-                  {
-                    capability: binding.witness.capability,
-                    providerType: binding.witness.provider,
-                    role: binding.selected.role,
-                  },
-                ],
+                providers: selectedProviders,
                 ...(serviceCall.expression.staticArgumentOrigins === undefined
                   ? {}
                   : { staticArgumentOrigins: serviceCall.expression.staticArgumentOrigins }),

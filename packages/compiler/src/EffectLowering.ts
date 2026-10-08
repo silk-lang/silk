@@ -1,4 +1,5 @@
 import * as ConcreteCleanup from './ConcreteCleanup.js'
+import * as CallableDeclarationView from './CallableDeclarationView.js'
 import {
   authored,
   cleanupForLocal,
@@ -11,7 +12,6 @@ import {
   propagationReleases,
 } from './CleanupEmission.js'
 import * as ConformanceProof from './ConformanceProof.js'
-import * as DeclarationFacts from './DeclarationFacts.js'
 import type {} from './EntryAssembly.js'
 import type {} from './Forwarding.js'
 import { inlineForwardedRequirement } from './Forwarding.js'
@@ -48,7 +48,6 @@ import {
   providerBindings,
   requirementsFor,
   runtimeRequirementArguments,
-  sameArguments,
 } from './ValueType.js'
 
 export const lowerCatchEffectValue = (
@@ -713,18 +712,9 @@ const callableInvocationBinder = (
   if (callable.environment !== undefined) {
     usage = callable.environment.callable.type.invocationUse
   } else {
-    const target = callable.target
-    if (target._tag !== 'DeclarationCallableTarget') return undefined
-    const arguments_ = callableTargetArguments(callable)
-    const producers = fn.instances.filter(
-      (instance) =>
-        instance.key.declaration.module === target.declaration.module &&
-        instance.key.declaration.name === target.declaration.name &&
-        sameArguments(instance.key.typeArguments, arguments_),
-    )
-    const producer = producers.length === 1 ? producers.at(0) : undefined
-    if (producer === undefined) return undefined
-    usage = DeclarationFacts.executableLifetimes(producer.function.declaration).invocationUse
+    const source = CallableDeclarationView.original(fn.index, callable)
+    if (source === undefined) return undefined
+    usage = source.contract.invocationUse
   }
   if (usage === undefined) return {}
   return usage.lifetime._tag === 'BoundLifetime' ? { binder: usage.lifetime } : undefined
@@ -1167,8 +1157,23 @@ export const lowerEffectCatch = (
   const resultSubstitution = new Map(opened.substitution)
   if (offered.binder !== undefined)
     resultSubstitution.set(Lifetime.key(offered.binder), recipe.lifetime)
+  // The physical body can be shared with another caller's finite lifetime tuple. Read this
+  // named operand's result from its original header and complete actual source arguments;
+  // keep the physical environment, runner and body arguments as selected by layout.
+  const originalHandler =
+    handlerType.type.schema === undefined &&
+    handlerType.environment === undefined &&
+    handlerType.storage === undefined
+      ? CallableDeclarationView.original(fn.index, handlerType)
+      : undefined
+  const originalResult =
+    originalHandler === undefined
+      ? undefined
+      : Type.substitute(originalHandler.contract.result, originalHandler.substitution)
   const handlerResult = Type.substitute(
-    physicalHandlerEffectType.type,
+    originalResult !== undefined && Type.isEffect(originalResult)
+      ? { ...originalResult, access: physicalHandlerEffectType.type.access }
+      : physicalHandlerEffectType.type,
     resultSubstitution,
     compatibility,
   )
@@ -1915,7 +1920,7 @@ export const lowerServiceEffectValue = (
   // retains the original provider inputs and environment; only that exact witnessed row member
   // may differ from the authored service contract.
   const witnessedProvider =
-    provided.requirementAccess === subject.access &&
+    SourceCallView.serves(provided, subject.access) &&
     Type.equals(provided.witness.capability, service) &&
     Type.equals(provided.witness.provider, provided.providerType) &&
     (call.providers ?? []).every(

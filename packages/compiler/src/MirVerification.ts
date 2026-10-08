@@ -1256,6 +1256,121 @@ const invocationCapturedSource = (
     : invocationCapturedSource(definitions, definition.base, ordinal, parameter, source, path, next)
 }
 
+/** Independently replays the actual generated runner and its original factory capture. */
+const invocationCatchCapture = (
+  fn: MirFunction,
+  input: Mir.InvocationUse['inputs'][number],
+  declared: LocalId,
+  container: Extract<Mir.Type, { readonly _tag: 'CallableValue' }>,
+  program: InvocationProgram,
+): ReturnType<typeof invocationHeaderCapture> => {
+  if (
+    input.producer === undefined ||
+    input.header !== undefined ||
+    input.capture === undefined ||
+    fn.sourceOwner === undefined ||
+    declared.ordinal !== 1
+  )
+    return undefined
+  const incoming = fn.sourceCallableCaptures ?? []
+  const held = incoming.length === 1 ? incoming.at(0) : undefined
+  if (
+    held === undefined ||
+    held.local.ordinal !== declared.ordinal ||
+    !Tir.nodeRefEquals(held.producer, input.producer)
+  )
+    return undefined
+  const view = CallableInputView.catchInput(program, container, input.producer)
+  if (
+    view === undefined ||
+    fn.sourceOwner.module !== view.owner.key.declaration.module ||
+    fn.sourceOwner.name !== view.owner.key.declaration.name
+  )
+    return undefined
+  const site = Tir.effectCatchSite(
+    input.producer,
+    view.owner.key.declaration,
+    view.owner.function.declaration.id.ordinal,
+  )
+  const runner = Tir.effectRunnerId(view.owner.key.declaration, site)
+  const base = fn.effectRunner?.base
+  const sameArguments = (
+    left: ReadonlyArray<SilkType.GenericArgument>,
+    right: ReadonlyArray<SilkType.GenericArgument>,
+  ) =>
+    left.length === right.length &&
+    left.every((argument, ordinal) => {
+      const original = right.at(ordinal)
+      return original !== undefined && SilkType.equalsGenericArgument(argument, original)
+    })
+  if (
+    base === undefined ||
+    base.declaration.module !== runner.module ||
+    base.declaration.name !== runner.name ||
+    !sameArguments(base.typeArguments, view.owner.key.typeArguments) ||
+    fn.instance.staticArguments.length !== view.owner.key.staticArguments.length ||
+    fn.instance.staticArguments.some((argument, ordinal) => {
+      const original = view.owner.key.staticArguments.at(ordinal)
+      return original === undefined || !StaticValue.equals(argument, original)
+    })
+  )
+    return undefined
+  const capture = view.captures.find((value) => value.ordinal === input.capture)
+  const field = container.environment?.fields.at(input.capture)
+  if (
+    capture === undefined ||
+    field === undefined ||
+    capture.parameterOrdinal !== input.parameter ||
+    field.parameterOrdinal !== input.parameter ||
+    !SilkType.equals(field.type, input.type) ||
+    input.source === undefined ||
+    AuthoredIdentity.anchorKey(input.source) !==
+      AuthoredIdentity.anchorKey(capture.value.origin.anchor)
+  )
+    return undefined
+  const factories = program.functions.flatMap((factory) =>
+    operations(factory)
+      .filter(
+        (operation): operation is Extract<Operation, { readonly _tag: 'MakeEffect' }> =>
+          operation._tag === 'MakeEffect' &&
+          operation.runner.module === runner.module &&
+          operation.runner.name === runner.name &&
+          operation.type.environment._tag === 'EffectEnvironment' &&
+          Instances.keyText(operation.type.environment.instance) ===
+            Instances.keyText(view.owner.key) &&
+          Tir.sameExecutableSite(operation.type.site, site) &&
+          sameArguments(operation.runnerTypeArguments, base.typeArguments),
+      )
+      .map((operation) => ({ factory, operation })),
+  )
+  if (
+    factories.length === 0 ||
+    !factories.every(({ factory, operation }) => {
+      const handler = operation.captures.length === 2 ? operation.captures.at(1) : undefined
+      const actual =
+        handler === undefined ? undefined : factory.localTypes.at(handler.source.ordinal)
+      return (
+        actual?._tag === 'CallableValue' &&
+        actual.environment === container.environment &&
+        SilkType.equals(actual.type, container.type) &&
+        operation.type.environment.fields.length === 2
+      )
+    })
+  )
+    return undefined
+  const retained = SilkType.retention(input.type)
+  const ordinal = input.capture
+  return {
+    conditional: retained.unknown.length !== 0,
+    contents: retained.regions.map((region) => ({
+      parameter: declared.ordinal,
+      path: [{ _tag: 'Capture', ordinal }],
+      type: input.type,
+      region,
+    })),
+  }
+}
+
 /** Checked incoming section storage is authority only at its actual authored parameter boundary. */
 const invocationHeaderCapture = (
   fn: MirFunction,
@@ -1269,8 +1384,7 @@ const invocationHeaderCapture = (
       readonly conditional: boolean
     }
   | undefined => {
-  if (input.capture === undefined || input.header === undefined || fn.sourceOwner === undefined)
-    return undefined
+  if (input.capture === undefined || fn.sourceOwner === undefined) return undefined
   const definitions = invocationDefinitions(fn)
   const actualContainer = fn.localTypes.at(input.argument.ordinal)
   if (actualContainer?._tag !== 'CallableValue') return undefined
@@ -1289,6 +1403,13 @@ const invocationHeaderCapture = (
     declared = producer.source
   }
   if (declared.ordinal >= fn.parameterCount) return undefined
+  if (input.producer !== undefined) {
+    const container = fn.localTypes.at(declared.ordinal)
+    return container?._tag === 'CallableValue'
+      ? invocationCatchCapture(fn, input, declared, container, program)
+      : undefined
+  }
+  if (input.header === undefined) return undefined
   const capture = input.capture
   const declaredHeaders = fn.sourceParameters ?? []
   if (
@@ -2806,6 +2927,7 @@ const invocationRetentionText = (retention: Mir.InvocationUseRetention): string 
     retention.invocation.inputs.map((input) => [
       input.parameter,
       input.capture ?? null,
+      input.producer === undefined ? null : Tir.nodeRefKey(input.producer),
       input.header === undefined
         ? null
         : [input.header.parameter, AuthoredIdentity.anchorKey(input.header.source)],
