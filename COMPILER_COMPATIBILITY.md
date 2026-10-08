@@ -95,7 +95,7 @@ Each entry records:
 - **Diagnostics and limits:** noninteger tails, zero-fixed imports, variadic exports and bodies,
   ordinary variadic functions, first-class variadic values and GNU AArch64 remain refused. Fixed
   C contract, unsafe, failure, provider, retention and callback boundaries still apply.
-- **Evidence:** four existing SemanticCases actors cover actual Body/MIR/LLVM facts, exact
+- **Evidence:** four existing SemanticLoweringCases actors cover actual Body/MIR/LLVM facts, exact
   negative outcomes, original signature identity and warm/fresh imported revisions. Local focused
   execution passed all four actors plus the global semantic canary (5 PASS, 0 FAIL, 77 ms).
   Actual optimized N0 integer calls linked to an independently compiled C receiver returned 42
@@ -124,7 +124,7 @@ Each entry records:
   summarized, and declarations whose member shape is unavailable are treated as invariant. Such
   calls keep the original `TypeMismatch` at the call.
 - **Evidence:** `sharedLoansShortenCovariantNominalArguments` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
@@ -144,8 +144,10 @@ Each entry records:
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
   bootstrap infers the shorter region.
-- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` and
-  `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
+  `compiler/src/semantic/SemanticCaptureCases.silk` and
+  `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
+  `compiler/src/semantic/SemanticConformanceCases.silk`.
 
 ### Caller-local region relations and 'static binder shortening in selfhost
 
@@ -170,7 +172,8 @@ Each entry records:
   borrowed pattern binding that outlives its conditional is `TypeMismatch` in selfhost; the
   bootstrap accepts it, against PATT-009.
 - **Evidence:** `callerLocalRegionsRelateAtFixedBoundaries` and
-  `patternElisionInfersOmittedLifetimesFromTheSubject` in `compiler/src/semantic/SemanticCases.silk`.
+  `patternElisionInfersOmittedLifetimesFromTheSubject` in
+  `compiler/src/semantic/SemanticCallableCases.silk`.
 
 ### Catalog-defined runtime intrinsic coverage in selfhost
 
@@ -217,8 +220,8 @@ Each entry records:
   `TypeArity`, `MissingConformance` for a non-Copy read, and the unsafe acknowledgement codes. A
   stored `systemAllocationAcquire` Effect that is not run in place reports the `effect-form` gap.
 - **Evidence:** `sealedCoreLayoutsAndCleanup` and `storagePrimitivesFollowTheirContracts` in
-  `compiler/src/semantic/SemanticCases.silk`, and the native corpus programs that use the storage
-  core.
+  `compiler/src/semantic/SemanticCallableCases.silk`, and the native corpus programs that use the
+  storage core.
 
 ### Generic record union members and cleanup re-entry in selfhost
 
@@ -238,8 +241,9 @@ Each entry records:
 - **Diagnostics and limits:** growth outside the root's owned structure, including a hook that
   drops a larger value of its own type, keeps `ExpandingSpecialization`. A closed instance whose
   members collapse to one runtime identity keeps the `union-form` gap.
-- **Evidence:** `genericRecordUnionsInjectAndMatchInGenericBodies` and
-  `cleanupReentryStaysWithinItsOwnedRoot` in `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `genericRecordUnionsInjectAndMatchInGenericBodies` in
+  `compiler/src/semantic/SemanticLoweringCases.silk` and `cleanupReentryStaysWithinItsOwnedRoot` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`.
 
 ### Static aggregate reflection subset in selfhost
 
@@ -261,10 +265,11 @@ Each entry records:
   `Unsupported` static evaluation failure for a missing intrinsic operation, reported as
   `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An unlisted reflection
   member remains `UnknownMember`.
-- **Evidence:** in `compiler/src/semantic/SemanticCases.silk`, `selectedTypeSelectionReadsReflectedKinds`
-  covers the two-type static selection, `reflectedKindCodesMatchTheLibrary` covers both kind codes
-  and the unsupported owner, and `reflectedDescriptorsStayOutOfRuntimeCode` covers each runtime
-  boundary. The shared corpus program `static-type-selection` exercises the bootstrap natively.
+- **Evidence:** in `compiler/src/semantic/SemanticStaticCases.silk`,
+  `selectedTypeSelectionReadsReflectedKinds` covers the two-type static selection,
+  `reflectedKindCodesMatchTheLibrary` covers both kind codes and the unsupported owner, and
+  `reflectedDescriptorsStayOutOfRuntimeCode` covers each runtime boundary. The shared corpus program
+  `static-type-selection` exercises the bootstrap natively.
 - **Open questions:** when selfhost needs fields, add the remaining members with the same
   phase-only descriptor rules.
 
@@ -293,9 +298,9 @@ Each entry records:
   used by the condition or its helpers cannot be supplied by an interface that only the condition's
   own arm imports or declares: the condition resolves as if that interface were absent instead of
   reporting `Cycle`.
-- **Evidence:** in `compiler/src/semantic/SemanticCases.silk`, `moduleArmsSelectNativeDeclarations`,
-  `conditionOrderSelectNativeAnswers` (both demand orders in fresh stores) and
-  `mixedConditionalNameSelectNativeBoundary`.
+- **Evidence:** `moduleArmsSelectNativeDeclarations` and `conditionOrderSelectNativeAnswers` (both
+  demand orders in fresh stores) in `compiler/src/semantic/SemanticSignatureCases.silk`, and
+  `mixedConditionalNameSelectNativeBoundary` in `compiler/src/semantic/SemanticStaticCases.silk`.
 - **Open questions:** expose arm availability through the static port so mixed-body routing can
   select arms, and decide whether the scan bound should instead report `Cycle` when a skipped
   interface would apply.
@@ -311,7 +316,7 @@ Each entry records:
   owner types.
 - **Source migration:** none.
 - **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
 
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
@@ -332,13 +337,14 @@ Each entry records:
   `K: Copy` or a shared callable representation does; an unbounded abstract owner of a generic
   named instance keeps the `cleanup` gap.
 - **Source migration:** none.
-- **Evidence:** `cleanupStackDropsWhatEachExitLeaves`, `cleanupFollowsLoopsAndConditionalPaths`,
-  `partialMovesDropTheRemainingChildren` and `dropGlueCleansHookThenChildren` in
-  `compiler/src/semantic/SemanticCases.silk` cover the lowered forms and the holes, runtime-index,
-  guard, loop and borrowing match result gaps. The extended partial-move actor authenticates real
-  Move/Copy chains, exact source checkpoints, both conditional cleanup paths, receiving glue,
-  distinct component flags and literal refill. Seven focused tests passed in 247 ms (maximum 71 ms),
-  with the timing gate passing. Deferred glue forms and real N1 completion remain unproved.
+- **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
+  `compiler/src/semantic/SemanticLoweringCases.silk`, and `cleanupFollowsLoopsAndConditionalPaths`
+  and `partialMovesDropTheRemainingChildren` in `compiler/src/semantic/SemanticCaptureCases.silk`
+  cover the lowered forms and the holes, runtime-index, guard, loop and borrowing match result gaps.
+  The extended partial-move actor authenticates real Move/Copy chains, exact source checkpoints,
+  both conditional cleanup paths, receiving glue, distinct component flags and literal refill. Seven
+  focused tests passed in 247 ms (maximum 71 ms), with the timing gate passing. Deferred glue forms
+  and real N1 completion remain unproved.
 
 ### Selfhost keeps unavailable conditional sealed-property proofs explicit
 
@@ -355,7 +361,7 @@ Each entry records:
   not a generic-instance layout or library-constructor exception.
 - **Evidence:** `genericSealedCopyUsesLexicalAndLifetimePremises`,
   `genericSealedDropRetainsExactHeadBindings` and `genericSealedUnknownDropProofIsNotAbsence` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
 
 ### Selfhost resolves complete selected instance recipes before emission sharing
 
@@ -763,7 +769,7 @@ Each entry records:
   - Do not silently redefine the rule, and do not patch a compiler, without first classifying the
     mismatch against this entry.
 - **Evidence:** the `callableAndEffectSignatureContracts` case in
-  `compiler/src/semantic/SemanticCases.silk` asserts:
+  `compiler/src/semantic/SemanticSignatureCases.silk` asserts:
   - `closedEffect`, `inputEffect` and `heldEffect` equal `explicitStatic`;
   - `genericEffect`, `twoBorrowEffect` and `nestedStatic` reject as `AmbiguousLifetime`, and
     `heldOpenEffect` does so spanning its written `Effect<i32>` result;
@@ -851,8 +857,8 @@ Each entry records:
   no diagnostic report.
 - **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
 - **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
-  `SemanticCases` covers runtime C export roots, lane extensions, inactive arms, absent runtime
-  sources, and manifest default selection.
+  `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive arms, absent
+  runtime sources, and manifest default selection.
 
 ### Selfhost failure reports carry origin only
 
@@ -886,7 +892,7 @@ Each entry records:
   cleanup are unchanged.
 - **Evidence:** `observedFailuresCarryOriginContext`, `observationsCarryContextThroughExpansions`,
   `nestedObservationsStartFresh` and `observedInstancesEmitTheContextAbi` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticCallableCases.silk`.
 
 ### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
 
@@ -905,7 +911,8 @@ Each entry records:
 - **Source migration:** none; no program that compiles under selfhost parks.
 - **Diagnostics and limits:** the failure is a structured `suspension` gap at the parking site
   instead of the bootstrap's unsatisfied-property diagnostic at the bounded call.
-- **Evidence:** `nonParkingFinalizersAreAdmitted` in `compiler/src/semantic/SemanticCases.silk`.
+- **Evidence:** `nonParkingFinalizersAreAdmitted` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`.
 
 ### Nominal qualification requires an inherent member
 
@@ -983,8 +990,9 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   refuses that signature as `Unsupported`.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost does not discover, describe or run tests.
-- **Evidence:** `callableAndEffectSignatureContracts` in `compiler/src/semantic/SemanticCases.silk`
-  checks a valid `test effect fn` signature and body and the refused parameterized entry.
+- **Evidence:** `callableAndEffectSignatureContracts` in
+  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` signature and
+  body and the refused parameterized entry.
 - **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
 
 ## Maintaining this file
@@ -1015,8 +1023,8 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   lowering constructs those environments and directly invokes their ordinary function instances.
 - **Source migration:** none.
 - **Evidence:** `anonymousNestedBodiesRetainTheirOwnCaptures` in
-  `compiler/src/semantic/SemanticCases.silk` checks both environment capture sets through production
-  body queries. Native runtime execution is not claimed by this typing test.
+  `compiler/src/semantic/SemanticCaptureCases.silk` checks both environment capture sets through
+  production body queries. Native runtime execution is not claimed by this typing test.
 
 ### Native stored-section loans retain an explicit borrow obligation
 
@@ -1640,10 +1648,13 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   still unify exactly apart from shared-loan shortening and this binder-region relation.
 - **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
   `staticStringSubtypingPreservesOrdinaryMismatches`,
-  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence`,
-  `providedCallPrefixesMapLifetimesSeparately`, `callerLocalRegionsRelateAtFixedBoundaries` and
-  `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
-  and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
+  `nominalRegionShorteningPreservesExactTypesAndFixedEvidence` and
+  `callerLocalRegionsRelateAtFixedBoundaries` in
+  `compiler/src/semantic/SemanticCallableCases.silk`, `providedCallPrefixesMapLifetimesSeparately`
+  in `compiler/src/semantic/SemanticLoweringCases.silk`,
+  `sliceConversionsRetainRegionAccessAndDiagnostics` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`, and `effectSectionDeferralClaims` in
+  `compiler/src/semantic/CallableResultCases.silk`.
 
 ### Native scalar enum consuming matches
 
@@ -1675,8 +1686,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   such an argument, and any shared- or mutable-access one, as unsupported (the `typed-form` gap)
   instead of `ExplicitMoveRequired`, which it keeps for an exact `once` value, a reference to a
   callable, and every return.
-- **Evidence:** `plainCallableAffineArgumentClaims` in `compiler/src/semantic/SemanticCases.silk` and
-  `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
+- **Evidence:** `plainCallableAffineArgumentClaims` in
+  `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
+  `compiler/src/semantic/CallableResultCases.silk`.
 
 ### Native member bodies without implementation head bounds
 
@@ -1688,7 +1700,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
   `UnknownMember`, which it keeps for a function's own unbounded type parameter.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 ### Native service operations with a `Self` operand
 
@@ -1699,7 +1711,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
   `typed-form` gap) instead of a `TypeMismatch` at the operand.
 - **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticCases.silk`.
+  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 
 ### Finite scalar StaticSequence iteration in the native frontend
