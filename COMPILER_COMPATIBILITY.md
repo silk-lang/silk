@@ -159,11 +159,7 @@ Each entry records:
   and at a variant pattern that writes its regions, which admits the subject by covariant region
   subtyping (a `'static` subject meets `Maybe<&'a i32>`, as in the bootstrap). An inferred lifetime binder that earlier `'static` evidence fixed
   shortens to a later operand's caller-local region when every parameter stores the binder
-  covariantly and no bound or environment names it. Since 2026-10-08 an inferred struct literal
-  binder that an earlier field fixed to `'static` or one of the caller's own lifetimes shortens
-  when a later field offers a different region: to that region when it is caller-local, otherwise
-  to the literal's own loan region, which both caller lifetimes outlive
-  (`Scoped {count: &mut count.*, view: view}`).
+  covariantly and no bound or environment names it.
 - **Source migration:** `checkExpressionUnder` held an integer suffix slice borrowed from a
   borrowed `if let` binding past its conditional. That binding is a pattern-local loan that ends
   with the selected body (PATT-009), so the source now keeps the suffix in one owned `Bytes`.
@@ -1627,7 +1623,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   regions. Native fixes an inferred binder by its first evidence and shortens it when a later
   operand offers another region for a binder every parameter stores covariantly: to that region
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
-  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. The bootstrap solves for the shortest region directly, so a binder
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
+  literal binder that the declaration stores covariantly shortens the same way at a later field,
+  as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). The bootstrap solves for the shortest region directly, so a binder
   an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
@@ -1643,7 +1641,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Evidence:** `expectedBoundariesAdmitCovariantRegions`,
   `staticStringSubtypingPreservesOrdinaryMismatches`,
   `nominalRegionShorteningPreservesExactTypesAndFixedEvidence`,
-  `providedCallPrefixesMapLifetimesSeparately` and
+  `providedCallPrefixesMapLifetimesSeparately`, `callerLocalRegionsRelateAtFixedBoundaries` and
   `sliceConversionsRetainRegionAccessAndDiagnostics` in `compiler/src/semantic/SemanticCases.silk`,
   and `effectSectionDeferralClaims` in `compiler/src/semantic/CallableResultCases.silk`.
 
