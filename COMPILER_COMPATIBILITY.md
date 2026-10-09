@@ -632,8 +632,8 @@ Each entry records:
 
 ### Interface `effect fn` operations in selfhost
 
-- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); narrower
-  remainders below.
+- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); stored and
+  returned qualified constructions implemented in PR #1290 (2026-10-09); narrower remainders below.
 - **Rule:** [INTF-006](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-006--a-qualified-interface-call-requires-one-static-application)
   lets an unapplied qualified call `Interface.operation(value)` take its one application from the
   provider's conformances. Under
@@ -647,23 +647,26 @@ Each entry records:
   as one direct call of the selected witness; there is no adapter or runtime dispatch. The call's
   failure edge has the witness's own declared failure, which EFF-009 bounds by the promised one,
   and injects it into the promised failure's sink; a `never` witness gets no edge. Service
-  operations dispatched to a provider's witness lower the same way. Selfhost infers the provider
-  from the first operand only; the bootstrap uses the operand whose declared type is `Self` or
-  `&Self`.
-- **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
-  to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
-  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The
-  pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  operations dispatched to a provider's witness lower the same way. A qualified call no `run`
+  executes in place, bound to a local or returned, is the selected witness's exact Effect: the
+  witness application with the call's arguments as stored fields, as a direct call of that witness
+  constructs it. Through a generic bound the witness resolves once the provider is concrete.
+  Selfhost infers the provider from the first operand only; the bootstrap uses the operand whose
+  declared type is `Self` or `&Self`.
+- **Diagnostics and limits:** a receiver-method call (`value.take()`), operator syntax, a callable
+  success, and a stored construction whose witness borrows an owned operand report
+  `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The pipeline form
+  `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
   failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
-  `never` witness of a fallible operation, and the ambiguous, missing, bound and returned
-  rejections at their call spans. `ownedProviderServesGenericBinding` asserts the same edges for
+  `never` witness of a fallible operation, the ambiguous and missing rejections at their call
+  spans, and a bound, a returned and a generic-bound returned construction that check and lower. `ownedProviderServesGenericBinding` asserts the same edges for
   service witnesses run directly and inside a bound section. `providersServeRowsInKeyOrder` lowers
-  `run Present.present(value)` to a witness call. The native corpus pins `borrowed-outcome-stream`,
-  `generic-inline-effect-conformance` and `scalar-display`.
-- **Owner:** stored constructions, receiver-method, operator and pipeline forms: #567 Step 9
-  follow-ups.
+  `run Present.present(value)` to a witness call and a stored, later run construction to MIR. The
+  native corpus pins `borrowed-outcome-stream`, `generic-inline-effect-conformance`,
+  `scalar-display` and the four `static-composition` programs.
+- **Owner:** receiver-method, operator and pipeline forms: #567 Step 9 follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 
@@ -818,50 +821,34 @@ Each entry records:
   (note `201bb5aa-9e93-4b5b-ab5c-d5e4caedf259`), recorded 2026-09-26. It is a decision record, not
   an implementation plan.
 
-### Native entry uses a generated C `main` unless the build selects a source runtime
+### Selfhost selects runtimes from defaults only
 
-- **Status:** temporary divergence approved by Julia on 2026-10-02
-  ([compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md), D5 and
-  decision Q1). Selected source runtimes are implemented natively as of 2026-10-06. The rest is
-  retired when selfhost compiles `silk/native_start` as the default hosted runtime root and the
-  `Entry { main }` key is deleted.
+- **Status:** temporary divergence. Selfhost has no generated entry as of 2026-10-09: decision Q1
+  in [compiler/docs/effect-calling-convention.md](compiler/docs/effect-calling-convention.md) is
+  complete. This entry is retired when selfhost reads the remaining composition inputs below.
 - **Rule:** [ENTRY-001](apps/docs/content/reference/program-entry.md#entry-001--runtime-source-chooses-a-visible-application-function)
-  to ENTRY-003 put program entry in source. The runtime module calls the application, provides
-  `HostInput`, recovers unhandled typed failures, and chooses the exit status. The compiler has no
-  generated invocation adapter.
+  to ENTRY-003 put program entry in source.
   [ARTIFACT-001](apps/docs/content/reference/artifact-roots-and-requirements.md#artifact-001--form-stage-and-runtime-are-separate)
   and ARTIFACT-002 select the runtime from the build composition and bind `Intrinsic.application`
   to the application module.
-- **Compilers:** the bootstrap follows the rule through `silk/native_start`, or through the runtime
-  that `[build].composition` selects. Selfhost reads the `defaults` and `runtimes` of
-  `[build].composition` in the nearest `silk.toml`. One default selects that runtime module as a
-  second analysis root. Its active module-level `export "C" fn` declarations are then the only
-  build roots. Each one is a C ABI definition with the requested symbol that forwards
-  immediate scalar and pointer lanes, including C narrow-integer extensions, to the ordinary Silk
-  definition. `import Intrinsic.application` binds the application module. Two defaults, or a
-  default that `runtimes` does not list, stop the build. An absent source is a `MissingModule`
-  rejection at the runtime module. No default keeps the generated entry: `Entry { main }` emits
-  a C `main` that calls `fn main() -> i32` directly and reports `entry-signature` for every other
-  signature, including `pub effect fn main`. Compiling `native_start` needs `Execution` frames and
-  the diagnostic observer intrinsics, which follow the suspension stage.
-
-  Selfhost does not yet read profile `runtime` requests (`none` or a named runtime), composition
-  `retention`, `components` or `requirements`, and it does not make exports declared outside the
-  selected runtime module build roots. A Silk call to an exported definition remains the
-  `foreign-export` gap. An export lane outside the immediate C subset keeps its C ABI gap. Compiling
-  the bodies of `silk/native_start_sync` natively also depends on the generic Effect handler,
-  provider, callable-bound and core storage work that other selfhost stages own. An `unsafe` read
-  of an imported C static of scalar or pointer type loads the external object named by its linkage
-  symbol; exported statics remain `ForeignStaticUnavailable`.
-- **Source migration:** none. Programs whose `main` returns `i32` behave the same under both
-  compilers. A `fn main` can only `run` closed Effects (EFF-006), so no unhandled typed failure
-  reaches the generated `main`. The compiler package selects `silk/native_start_sync` in
-  `compiler/silk.toml`. An unhandled failure from the compiler's `main` exits with status 1 and
-  no diagnostic report.
-- **Diagnostics and limits:** `entry-signature` is a structured backend gap, not a language error.
-- **Evidence:** the native corpus runner reports `entry-signature` for each affected program.
-  `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive arms, absent
-  runtime sources, and manifest default selection.
+- **Compilers:** both compilers root every executable at the active module-level
+  `export "C" fn` declarations of the selected runtime and of the application module. Selfhost takes the single default of
+  `[build].composition` in the nearest `silk.toml`; without a composition it takes the
+  standard-library `compositions.json` runtime listed for the target and libc, as the bootstrap
+  does. A composition with no default, two defaults, an unlisted default, or no catalog runtime
+  for the target and libc stops the build. Selfhost does not yet read profile `runtime` requests
+  (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
+  exports declared in other imported modules build roots. A Silk call to an exported
+  definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
+  its C ABI gap. Exported statics remain `ForeignStaticUnavailable`. Native C ABI lanes cover
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin only, so on aarch64-unknown-linux-gnu every
+  selfhost build stops at the runtime's first C export with `c-abi-target`.
+- **Source migration:** none for defaulted builds. A build that relies on a profile `runtime`
+  request or on retention roots needs the bootstrap.
+- **Diagnostics and limits:** an unselected runtime is `InvalidBuildComposition` before analysis.
+- **Evidence:** `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive
+  arms, absent runtime sources, manifest default selection, and catalog selection by target and
+  libc.
 
 ### Selfhost failure reports carry origin only
 
@@ -1479,8 +1466,8 @@ repeated invocation and capture-only drop glue.
   this correction does not change them. General borrow safety remains Step 14.
 - **Boundary:** anonymous invocation schemas retain their original lifetime-to-declaration map.
   Ordinary named sections now use that same map when still-unsupplied operands can infer the
-  invocation lifetime, including staged sections and independent caller loans. Effect-valued
-  targets with deferred invocation lifetimes retain their separate source-recipe boundary; generic
+  invocation lifetime, including staged sections and independent caller loans. An `effect fn`
+  target, whose invocation constructs its Effect, defers its lifetime binders the same way; generic
   requirement rows now defer through the upstream Step 10 section recipe. The guard
   inspects substituted result representations, union members, and target/caller contract premises;
   an Effect hidden behind a generic result cannot enter the ordinary section lane. Explicitly
@@ -1544,8 +1531,8 @@ repeated invocation and capture-only drop glue.
   evidence, actual schema and capture storage remain unchanged. Fixed lifetimes, mode, unsafe
   authority, exclusive content and callable environments retain ordinary contract proof. Nested
   invocation quantifiers and deferred type/row bindings embedding private rigids retain explicit
-  `Unsupported` boundaries; explicitly quantified public section contracts and Effect-valued
-  lifetime deferral remain separate gaps.
+  `Unsupported` boundaries; explicitly quantified public section contracts and a section whose
+  result is itself an Effect value remain separate gaps.
 - **Quantified structural controls:** `quantifiedNamedCallbacksRetainTheirInvocationRecipes` in
   `CallableResultCases` demands concrete consumers and original callbacks, checks two independent
   invocation loans, original lifetime slots 0 and 1, and staged capture inputs/projections.

@@ -1131,6 +1131,48 @@ pub fn main() -> i32 { return restored() }`
   }),
 )
 
+it.effect('reads a borrowed match scrutinee through a pattern-derived slice view', () =>
+  Effect.gen(function* () {
+    const source = `import silk.vector { Vector }
+union Kind { First, Second }
+struct Item { kind: Kind }
+union Outcome { Done { items: Vector<Item> }, Empty }
+fn firstIs(answer: &Outcome) -> bool {
+  if let Outcome.Done {items} = &answer.* {
+    let listed = Vector.asSlice<Item>(&items)
+    if listed.length == 1 {
+      return match &listed[0].kind { Kind.First => true _ => false }
+    }
+  }
+  return false
+}
+fn takesFirst(answer: &Outcome) -> bool {
+  if let Outcome.Done {items} = &answer.* {
+    let listed = Vector.asSlice<Item>(&items)
+    return match move listed[0].kind { Kind.First => true _ => false }
+  }
+  return false
+}`
+    const self = yield* analyze(source)
+    const moving = source.indexOf('fn takesFirst')
+    const diagnostics = Analysis.diagnostics(self)
+    assert.deepEqual(
+      diagnostics.filter((d) => d.span.start < moving).map((d) => d.code),
+      [],
+    )
+    assert.deepEqual(
+      diagnostics
+        .filter((d) => d.code === 'OWN0011')
+        .map((d) => ({
+          code: d.code,
+          moving: d.span.start >= moving,
+          span: source.slice(d.span.start, d.span.end),
+        })),
+      [{ code: 'OWN0011', moving: true, span: 'listed[0].kind' }],
+    )
+  }),
+)
+
 it.effect('suspends all owner access for an exclusive returned view until its last use', () =>
   Effect.gen(function* () {
     const self =

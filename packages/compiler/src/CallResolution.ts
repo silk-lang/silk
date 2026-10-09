@@ -43,6 +43,7 @@ import {
   constructionExpressionType,
   contextualIntegerCompatible,
   expressionNode,
+  immutableRoot,
   lookupDeclaration,
   referenceNames,
   referencePath,
@@ -1008,7 +1009,7 @@ const selectedCallLifetimes = (
 }
 
 /** Discharges written call preconditions, retaining local obligations for the body's solver. */
-const selectedLifetimeBoundDiagnostics = (
+export const selectedLifetimeBoundDiagnostics = (
   bounds: ReadonlyArray<Lifetime.Outlives>,
   substitution: Type.Substitution,
   compatibility: TypeCompatibility.Context | undefined,
@@ -2535,6 +2536,7 @@ export interface BuiltinSignature {
   readonly typeParameters?: ReadonlyArray<Type.Parameter>
   readonly parameters: ReadonlyArray<SemanticType>
   readonly result: Intrinsic.ResultPolicy
+  readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
   readonly unsafe?: boolean
 }
 
@@ -2551,6 +2553,7 @@ export const builtinSignature = (
     typeParameters: catalog.rule.typeParameters,
     parameters: parameterKind === 'Call' ? catalog.callParameters : catalog.rule.parameters,
     result: catalog.rule.result,
+    typeOutlives: catalog.rule.typeOutlives,
     unsafe: catalog.unsafe,
   }
 }
@@ -2584,6 +2587,10 @@ export const instantiateBuiltinSignature = (
       Type.substitute(parameter, selected.substitution),
     ),
     result: Intrinsic.substituteResult(signature.result, selected.substitution),
+    typeOutlives: signature.typeOutlives.map((bound) => ({
+      type: bound.type,
+      lifetime: Type.substituteLifetime(bound.lifetime, selected.substitution),
+    })),
   }
 }
 
@@ -4807,8 +4814,7 @@ export const finishCallableApplication = (
   if (
     callable?.mode === 'Exclusive' &&
     callee.fact._tag === 'Identifier' &&
-    callee.fact.reference._tag === 'ResolvedBinding' &&
-    callee.fact.reference.binding.mutability !== 'Mutable'
+    immutableRoot(callee.fact.reference)
   ) {
     diagnostics.push(
       Diagnostic.invalidCallableInvocationAccess('Exclusive', Location.at(callee.fact.anchor)),
