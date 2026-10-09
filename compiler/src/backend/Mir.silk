@@ -339,6 +339,27 @@ struct Pending {
   owners: usize
 }
 
+// One drop a function exit performs: a cleanup node's value, behind the node's flag when its
+// state is Maybe, or a pending temporary (`node` is then usize.MAX).
+struct ExitDrop {
+  node: usize
+  guarded: bool
+  temporary: usize
+}
+
+impl Copy for ExitDrop {}
+
+// One step of the function-exit cleanup ladder. A step performs its drop and continues into
+// `next`; a root (`next` is usize.MAX) returns or fails. Exits whose remaining drops agree share
+// those steps, so the ladder holds one step per distinct drop suffix rather than one copy per exit.
+struct ExitStep {
+  next: usize
+  released: ExitDrop
+  fails: bool
+  block: usize
+  children: Vector<usize>
+}
+
 struct LoopTargets {
   exit: usize
   repeat: usize
@@ -628,6 +649,8 @@ struct Builder {
   scopes: Vector<usize>
   // Owned rvalues used only as places; they live until the end of their full expression.
   temporaries: Vector<Pending>
+  // The shared drop ladder that `return`, `fail` and failure propagation leave the function through.
+  exits: Vector<ExitStep>
   // The remaining children of each partial consuming site, keyed by body node.
   remainders: Vector<Remainder>
   // Which typed-body locals and node values need cleanup, answered by semantic analysis.
@@ -2516,6 +2539,162 @@ effect fn exitTo(builder: &mut Builder, owners: usize, temporaries: usize, origi
       run dropOwner(&mut builder.*, held, origin)
     }
   }
+  return ()
+}
+
+// The drops `exitTo(builder, 0, 0, ..)` would emit, in the same order: every temporary and owner,
+// innermost first, each owner as its complete root or as its live and Maybe components.
+effect fn exitDrops(builder: &Builder) -> Vector<ExitDrop> ! OutOfMemoryError ? &mut Allocator {
+  let mut drops = Vector.make<ExitDrop>()
+  let owners = Vector.asSlice<Owner>(&builder.owners)
+  let pending = Vector.asSlice<Pending>(&builder.temporaries)
+  let mut held = owners.length
+  let mut at = pending.length
+  while held > usize.ZERO || at > usize.ZERO {
+    let mut temporaryNext = false
+    if at > usize.ZERO {
+      temporaryNext = held == usize.ZERO || pending[at - usize.ONE].owners >= held
+    }
+    if temporaryNext {
+      at = at - usize.ONE
+      run Vector.append<ExitDrop>(&mut drops, ExitDrop {node: usize.MAX, guarded: false, temporary: pending[at].local})
+    } else {
+      held = held - usize.ONE
+      if !owners[held].ended && allComponentsLive(&owners[held].components) {
+        run Vector.append<ExitDrop>(&mut drops, ExitDrop {node: owners[held].root, guarded: false, temporary: usize.MAX})
+      } else {
+        let components = Vector.asSlice<ComponentState>(&owners[held].components)
+        let mut position = usize.ZERO
+        while position < components.length {
+          if components[position].state != OwnerState.Moved {
+            run Vector.append<ExitDrop>(&mut drops, ExitDrop {node: components[position].node,
+              guarded: components[position].state == OwnerState.Maybe, temporary: usize.MAX})
+          }
+          position = position + usize.ONE
+        }
+      }
+    }
+  }
+  return move drops
+}
+
+fn sameExitDrop(left: ExitDrop, right: ExitDrop) -> bool {
+  return left.node == right.node && left.guarded == right.guarded && left.temporary == right.temporary
+}
+
+fn exitTerminator(fails: bool, origin: Origin) -> Terminator {
+  if fails { return Terminator.Fail {origin: origin} }
+  return Terminator.Return {origin: origin}
+}
+
+// The root step that returns or fails, created once per function and kind.
+effect fn exitRoot(builder: &mut Builder, fails: bool, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let steps = Vector.asSlice<ExitStep>(&builder.exits)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if steps[at].next == usize.MAX && steps[at].fails == fails { return at }
+    at = at + usize.ONE
+  }
+  let root = run block(&mut builder.*, origin)
+  let mut blocks = Vector.asMutSlice<Block>(&mut builder.*.function.blocks)
+  blocks[root].terminator = exitTerminator(fails, origin)
+  let index = Vector.length<ExitStep>(&builder.exits)
+  run Vector.append<ExitStep>(&mut builder.*.exits, ExitStep {next: usize.MAX,
+    released: ExitDrop {node: usize.MAX, guarded: false, temporary: usize.MAX}, fails: fails, block: root, children: Vector.make<usize>()})
+  return index
+}
+
+// The existing step after `parent` that performs `wanted`, or usize.MAX.
+fn exitChild(builder: &Builder, parent: usize, wanted: ExitDrop) -> usize {
+  let steps = Vector.asSlice<ExitStep>(&builder.exits)
+  let children = Vector.asSlice<usize>(&steps[parent].children)
+  let mut at = usize.ZERO
+  while at < children.length {
+    if sameExitDrop(steps[children[at]].released, wanted) { return children[at] }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Fills step block `at` with its drop, then continues into `next`; a Maybe drop runs only when
+// the node's flag holds.
+effect fn emitExitDrop(builder: &mut Builder, at: usize, wanted: ExitDrop, next: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let identity = InstanceKey.identity(&builder.function.key)
+  resume(&mut builder.*, at)
+  if wanted.temporary != usize.MAX {
+    let ty = localType(&builder.*, wanted.temporary)
+    run dropPlace(&mut builder.*, place(wanted.temporary), &ty, &identity, origin)
+    terminate(&mut builder.*, Terminator.Goto {target: next, origin: origin})
+    return ()
+  }
+  let nodes = Vector.asSlice<CleanupNode>(&builder.cleanup)
+  let stored = run copyPlace(&nodes[wanted.node].place)
+  let glue = match &nodes[wanted.node].glue {
+    Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
+    _ => { return run unsupported(&identity, origin, GapCode.Cleanup) }
+  }
+  if !wanted.guarded {
+    run dropPrepared(&mut builder.*, move stored, move glue, origin)
+    terminate(&mut builder.*, Terminator.Goto {target: next, origin: origin})
+    return ()
+  }
+  let flag = nodes[wanted.node].flag
+  if flag == usize.MAX { return run unsupported(&identity, origin, GapCode.Cleanup) }
+  let dropping = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(flag)}, thenBlock: dropping, elseBlock: next, origin: origin})
+  resume(&mut builder.*, dropping)
+  run dropPrepared(&mut builder.*, move stored, move glue, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: next, origin: origin})
+  return ()
+}
+
+// Leaves the function from the current block, then returns or fails. The exit drops exactly what
+// `exitTo(builder, 0, 0, ..)` would, in the same order, but through the shared ladder: it enters at
+// the first of its drops that no earlier exit's remaining drops already end with, so the cleanup a
+// function emits grows with its distinct live sets rather than with live set times exit count.
+effect fn leaveFunction(builder: &mut Builder, fails: bool, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if !builder.live { return () }
+  let drops = run exitDrops(&builder.*)
+  let listed = Vector.asSlice<ExitDrop>(&drops)
+  if listed.length == usize.ZERO {
+    terminate(&mut builder.*, exitTerminator(fails, origin))
+    return ()
+  }
+  let exit = builder.current
+  // The outermost drops run last, so the shared part of the ladder is the end of `listed`.
+  let mut reached = run exitRoot(&mut builder.*, fails, origin)
+  let mut missing = listed.length
+  while missing > usize.ZERO {
+    let child = exitChild(&builder.*, reached, listed[missing - usize.ONE])
+    if child == usize.MAX { break }
+    reached = child
+    missing = missing - usize.ONE
+  }
+  // The new steps get blocks innermost first, in the order the exit runs them.
+  let mut blocks = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < missing {
+    run Vector.append<usize>(&mut blocks, run block(&mut builder.*, origin))
+    at = at + usize.ONE
+  }
+  let allocated = Vector.asSlice<usize>(&blocks)
+  at = missing
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let next = Vector.asSlice<ExitStep>(&builder.exits)[reached].block
+    run emitExitDrop(&mut builder.*, allocated[at], listed[at], next, origin)
+    let step = Vector.length<ExitStep>(&builder.exits)
+    run Vector.append<ExitStep>(&mut builder.*.exits, ExitStep {next: reached, released: listed[at], fails: fails,
+      block: allocated[at], children: Vector.make<usize>()})
+    let mut steps = Vector.asMutSlice<ExitStep>(&mut builder.*.exits)
+    run Vector.append<usize>(&mut steps[reached].children, step)
+    reached = step
+  }
+  let entry = Vector.asSlice<ExitStep>(&builder.exits)[reached].block
+  resume(&mut builder.*, exit)
+  terminate(&mut builder.*, Terminator.Goto {target: entry, origin: origin})
   return ()
 }
 
@@ -5454,9 +5633,7 @@ effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<T
   let destination = builder.failure
   run widenInto(&mut builder.*, caught, from, destination, origin)
   run carry(&mut builder.*, caught, destination, origin)
-  run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
-  terminate(&mut builder.*, Terminator.Fail {origin: origin})
-  return ()
+  return run leaveFunction(&mut builder.*, true, origin)
 }
 
 // Moves a failure of type `from` into `destination`, injecting it into a wider failure union.
@@ -6572,8 +6749,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let destination = builder.failure
       run assign(&mut builder.*, place(destination), Rvalue.Use {value: move failed}, origin)
       run raise(&mut builder.*, origin)
-      run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
-      terminate(&mut builder.*, Terminator.Fail {origin: origin})
+      run leaveFunction(&mut builder.*, true, origin)
     }
     View.Binding {index, initializer, origin} => {
       let value = run expression(&mut builder.*, body, hir, initializer)
@@ -6603,8 +6779,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
         if !builder.live { return () }
         run assign(&mut builder.*, place(usize.ZERO), Rvalue.Use {value: move result}, origin)
       }
-      run exitTo(&mut builder.*, usize.ZERO, usize.ZERO, origin)
-      terminate(&mut builder.*, Terminator.Return {origin: origin})
+      run leaveFunction(&mut builder.*, false, origin)
     }
     View.Branch {condition, thenBranch, elseBranch, origin} => {
       let evaluated = run expression(&mut builder.*, body, hir, condition)
@@ -7163,6 +7338,7 @@ impl MirFunction {
       cleanup: Vector.make<CleanupNode>(),
       scopes: Vector.make<usize>(),
       temporaries: Vector.make<Pending>(),
+      exits: Vector.make<ExitStep>(),
       remainders: move remainders,
       needs: move needs,
       failure: failureLocal,
