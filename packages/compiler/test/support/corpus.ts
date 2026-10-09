@@ -169,6 +169,16 @@ const sourceSection = (source: string, start: string, end: string): string => {
   return source.slice(startOffset, endOffset)
 }
 
+// Copies one complete top-level declaration, from its header through its closing brace, so later
+// private neighbors in the source module are never pulled into the program.
+const sourceDeclaration = (source: string, header: string): string => {
+  const startOffset = source.indexOf(header)
+  const endOffset = source.indexOf('\n}\n', startOffset)
+  if (startOffset < 0 || endOffset < 0)
+    throw new Error(`Cannot find test source declaration ${header}`)
+  return source.slice(startOffset, endOffset + 2)
+}
+
 const tlsHkdfSource = readFileSync(
   new URL('../../stdlib/silk/tls_hkdf.silk', import.meta.url),
   'utf8',
@@ -199,7 +209,9 @@ const sha2Source = readFileSync(new URL('../../stdlib/silk/sha2.silk', import.me
 
 const sha2LengthTestSource = `import silk.u64
 
-${sourceSection(sha2Source, 'struct Length64Transition {', 'fn makeState32')}
+${sourceDeclaration(sha2Source, 'struct Length64Transition {')}
+
+${sourceDeclaration(sha2Source, 'fn length64Transition(')}
 
 fn __testLength64Transition() -> bool {
   let carry = length64Transition(7, u64.MAX - 7, 1)
@@ -9771,7 +9783,7 @@ interface Decoder { effect fn decode(value: &mut Self) -> i32 ! Problem }
 struct Cell { code: i32 }
 effect fn decodeCell(value: &Cell) -> i32 ! Problem { fail Problem { code: 1 } }
 impl Decoder for Cell { decode: Cell.decodeCell }
-fn pending<T: Decoder>(value: &mut T) -> Effect<i32 ! Problem> { return Decoder.decode(value) }
+fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(value) }
 fn observe(result: Result<i32, Problem>) -> i32 {
   return match move result {
     Result<i32, Problem>.Success { value } => value
