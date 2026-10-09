@@ -2273,6 +2273,18 @@ function lowerRunExpression(
       })
       return { result: destination }
     }
+    if (recipe?._tag === 'BuiltinCall' && recipe.operation === 'ExecutionCurrent') {
+      const type = fn.type(expression.type)
+      if (type?._tag !== 'Nominal' || !Type.isExecutionRef(type.type)) return undefined
+      const destination = fn.alloc(type)
+      fn.emit({
+        _tag: 'ExecutionCurrent' as const,
+        destination,
+        type,
+        provenance: authored(expression.span),
+      })
+      return { result: destination }
+    }
     if (recipe?._tag === 'BuiltinCall' && recipe.operation === 'ExecutionRelinquish') {
       const type = fn.type(expression.type)
       if (type?._tag !== 'Nominal' || !Type.equals(type.type, Type.unit)) return undefined

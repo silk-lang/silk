@@ -112,7 +112,7 @@ const program = Effect.gen(function* () {
   const cases = [{ name: 'abi', source, receiver }]
   if (!faults) {
     for (const [name, expected] of [
-      ['latched-destroy', 1042],
+      ['latched-destroy', 42],
       ['finalized-destroy', 42],
       ['multiple-packages', 42],
       ['suspended-failure', 42],

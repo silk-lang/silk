@@ -1590,8 +1590,15 @@ const intrinsicOperations = [
     operation: 'ExecutionCurrent',
     parameters: [],
     semanticParameters: [],
-    result: 'ExecutionRef',
-    semanticResult: closedResult(Type.executionRef),
+    result: 'Effect<ExecutionRef>',
+    semanticResult: closedResult(
+      Type.effect(
+        Type.executionRef,
+        [],
+        { environment: contractLifetime('current'), lifetimeBinders: [] },
+        'Take',
+      ),
+    ),
   }),
   builtin({
     actor: 'Execution',

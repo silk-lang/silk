@@ -1775,20 +1775,6 @@ export const emit = (context: Context, operation: Operation) => {
       const base = NativeStorage.materialize(storage, operation.execution).at(0)
       if (base === undefined)
         throw new RangeError('LLVM execution drive lost its package reference')
-      // A package whose readiness endpoint is running is not driveable.
-      const notNotifying = (tag: string) =>
-        Emitter.integerCompare(
-          body,
-          'eq',
-          Emitter.load(
-            body,
-            usizeType,
-            controlPointer(context, base, ExecutionPackage.notificationWord, `${tag}_flag_ptr`),
-            `${tag}_flag`,
-          ),
-          Emitter.integerUnsigned(builder, usizeType, 0n),
-          `${tag}_not_notifying`,
-        )
       const emitDirectPackage = (package_: ExecutionPackage.Plan) => {
         if (package_.specialization.suspension.modes.length !== 0)
           throw new RangeError('LLVM direct execution selected a suspendable package')
@@ -1823,22 +1809,12 @@ export const emit = (context: Context, operation: Operation) => {
           packagePointer,
           `drive${operation.destination.ordinal}_direct_package`,
         )
-        const validState = Emitter.binary(
+        const validState = Emitter.integerCompare(
           body,
-          'and',
-          Emitter.integerCompare(
-            body,
-            'eq',
-            state,
-            Emitter.integerUnsigned(
-              builder,
-              usizeType,
-              BigInt(ExecutionTransition.tagOf('Unstarted')),
-            ),
-            `drive${operation.destination.ordinal}_direct_unstarted`,
-          ),
-          notNotifying(`drive${operation.destination.ordinal}_direct`),
-          `drive${operation.destination.ordinal}_direct_ready`,
+          'eq',
+          state,
+          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Unstarted'))),
+          `drive${operation.destination.ordinal}_direct_unstarted`,
         )
         const validPackage = Emitter.integerCompare(
           body,
@@ -2061,15 +2037,9 @@ export const emit = (context: Context, operation: Operation) => {
         )
         const validState = Emitter.binary(
           body,
-          'and',
-          Emitter.binary(
-            body,
-            'or',
-            initial,
-            relinquished,
-            `drive${operation.destination.ordinal}_driveable`,
-          ),
-          notNotifying(`drive${operation.destination.ordinal}`),
+          'or',
+          initial,
+          relinquished,
           `drive${operation.destination.ordinal}_valid_state`,
         )
         const validPackage = Emitter.integerCompare(

@@ -23,7 +23,7 @@ const connectionSource = (
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution {Execution, Wake}
 import silk.https_identity {HttpsIdentity, IdentityError, OriginHost, ReferenceIdentity}
 import silk.memory_byte_duplex {
   MemoryByteDuplex,

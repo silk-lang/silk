@@ -651,7 +651,7 @@ effect fn deadlineCancellationProgram() -> i32 ! ResolverError | OutOfMemoryErro
 
 export const deadlineResolverFixtureSource = `
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution {Execution, Wake}
 
 ${deadlineResolverProviderSource}
 
@@ -862,7 +862,7 @@ void freeaddrinfo(struct addrinfo *result) {
 export const nativeResolverStubAcceptanceSource = `
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution {Execution, Wake}
 import silk.layout {Layout}
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_resolver {NativeSystemResolver}

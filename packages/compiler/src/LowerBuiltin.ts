@@ -967,18 +967,6 @@ const lowerBuiltinOperation = (
     })
     return finishBuiltin(destination)
   }
-  if (expression.operation === 'ExecutionCurrent') {
-    const type = fn.type(expression.type)
-    if (type?._tag !== 'Nominal' || !Type.isExecutionRef(type.type)) return undefined
-    const destination = fn.alloc(type)
-    fn.emit({
-      _tag: 'ExecutionCurrent' as const,
-      destination,
-      type,
-      provenance: authored(expression.span),
-    })
-    return finishBuiltin(destination)
-  }
   if (expression.operation === 'ExecutionRefOf') {
     const [execution] = argumentLocals
     const executionType = execution === undefined ? undefined : fn.localTypes.at(execution.ordinal)
@@ -1069,7 +1057,11 @@ const lowerBuiltinOperation = (
     }
     return finishBuiltin(destination)
   }
-  if (expression.operation === 'ExecutionDrive' || expression.operation === 'ExecutionRelinquish')
+  if (
+    expression.operation === 'ExecutionDrive' ||
+    expression.operation === 'ExecutionRelinquish' ||
+    expression.operation === 'ExecutionCurrent'
+  )
     return undefined
   if (expression.operation === 'StringEqualsExact' || expression.operation === 'NativeAssembly')
     return undefined

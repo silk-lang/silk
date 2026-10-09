@@ -3992,7 +3992,11 @@ export const make = (operations: Operations) => {
             effectIdentities.add(identity)
             addBuiltinCallbacks(expression, execution)
             if (expression.operation === 'EffectSuspend') nestedRoots.add(execution)
-            else if (expression.operation === 'ExecutionRelinquish') externalRoots.add(execution)
+            else if (
+              expression.operation === 'ExecutionRelinquish' ||
+              expression.operation === 'ExecutionCurrent'
+            )
+              externalRoots.add(execution)
             else if (expression.operation === 'EffectObserveDiagnostics') {
               diagnosticObservations.add(execution)
               // Scope exit restores the enclosing context before either owner is dropped.
@@ -4145,7 +4149,12 @@ export const make = (operations: Operations) => {
       }
 
       const isExternalParkSubject = (expression: Tir.Expression): boolean => {
-        if (expression._tag === 'BuiltinCall' && expression.operation === 'ExecutionRelinquish')
+        // Only a frame-based function can name its running package, so asking parks like relinquish.
+        if (
+          expression._tag === 'BuiltinCall' &&
+          (expression.operation === 'ExecutionRelinquish' ||
+            expression.operation === 'ExecutionCurrent')
+        )
           return true
         if (expression._tag === 'BindingReference') {
           const initializer = bindings.get(expression.binding.ordinal)
