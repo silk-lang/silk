@@ -275,7 +275,7 @@ it.effect('joins return payloads before releasing diagnostic outcomes in one loo
       'golden/program',
       ascii(`import silk.effect { Effect }
 struct Problem {}
-fn observing<'env, S, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
   return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
 }
 fn observer(state: &mut (), event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 0 }

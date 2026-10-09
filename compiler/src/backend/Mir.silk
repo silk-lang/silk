@@ -587,6 +587,9 @@ pub union RunPlan {
   /// Runs part 0, the deferred child, at an explicit suspension boundary (SUSP-001). Its run is
   /// ordinary; the instance that reaches it becomes a suspension origin.
   Suspend {pub inner: usize},
+  /// Runs the Effect an exclusive reference lends: `inner` runs the lender's storage through the
+  /// reference without consuming it (EFFECT-OWN-002).
+  Lent {pub inner: usize},
 }
 
 /// One alternative of a finite Effect join and the step that runs it.
@@ -4154,6 +4157,16 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
         run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move borrowed}}, origin)
         return Operand.Copy {place: place(output)}
       }
+      // Reborrowing a lent exclusive view normalizes to the lender reference it already holds
+      // (see `Type.callableView`), so the runtime value is a copy of that reference.
+      let lender = run instanceNodeType(&builder.*, body, value)
+      if let Option<Shared<Type>>.Some {value: lent} = move lender {
+        let held = viewStorage(&lent)
+        if Shared.with<Type, bool>(&held, exclusiveLender) && run Type.runtimeEqualsShared(&viewStorage(&ty), &held) {
+          run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move borrowed}}, origin)
+          return Operand.Copy {place: place(output)}
+        }
+      }
       run assign(
         &mut builder.*,
         place(output),
@@ -5323,11 +5336,31 @@ fn constructedBy(result: &Type, declaration: &DeclarationId) -> bool {
   return false
 }
 
+// The runtime storage of a callable or Effect view is its representation.
+fn viewStorage(value: &Shared<Type>) -> Shared<Type> {
+  let inner = Shared.with<Type, Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> {
+    return match &node.* {
+      Type.CallableView {representation, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&representation))
+      _ => Option.none<Shared<Type>>()
+    }
+  })
+  if let Option<Shared<Type>>.Some {value: stored} = move inner { return move stored }
+  return Shared.clone<Type>(value)
+}
+
+fn exclusiveLender(value: &Type) -> bool {
+  return match &value.* { Type.Reference {access, ..} => access == Access.Mutable _ => false }
+}
+
 fn effectFailure(value: &Type) -> Option<Shared<Type>> {
   return match &value.* {
     Type.Effect {failure, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&failure))
     Type.CallableValue {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
     Type.EffectComposite {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
+    // A lent exclusive view runs the lender's Effect under the view's contract, and a lent
+    // reference runs its lender's.
+    Type.CallableView {contract, ..} => Shared.with<Type, Option<Shared<Type>>>(&contract, effectFailure)
+    Type.Reference {referent, ..} => Shared.with<Type, Option<Shared<Type>>>(&referent, effectFailure)
     _ => Option.none<Shared<Type>>()
   }
 }
@@ -5975,6 +6008,8 @@ effect fn packageHelper(creator: &Builder, key: InstanceKey, package: &Shared<Ty
     }
   }
   if builder.live { terminate(&mut builder, Terminator.Return {origin: origin}) }
+  // A helper exit only records its drops and an Unreachable placeholder; the exit blocks close here.
+  run closeExits(&mut builder)
   run MirFunction.sortReferences(&mut builder.function.references)
   return move builder.function
 }
@@ -6869,6 +6904,11 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, &mut bound.*, origin)
       drop Vector.pop<BoundPlace>(&mut bound.*)
     }
+    RunPlan.Lent {inner} => {
+      let mut lender = run copyPlace(environment)
+      run Vector.append<Projection>(&mut lender.projections, Projection.Deref)
+      run executePlan(&mut builder.*, steps, inner, &lender, output, sink, &mut bound.*, origin)
+    }
     RunPlan.Suspend {inner} => {
       let marked = match &builder.function.suspension { Option<Origin>.Some {..} => true Option<Origin>.None => false }
       if !marked { builder.function.suspension = Option.some<Origin>(origin) }
@@ -7233,6 +7273,7 @@ effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMem
   match move shape {
     Type.Primitive {name} => { run Bytes.append(&mut output.*, Bytes.asSlice(&name)) }
     Type.Unit => { run Bytes.append(&mut output.*, b"()") }
+    Type.String {..} => { run Bytes.append(&mut output.*, b"string") }
     Type.Nominal {declaration, arguments, ..} => {
       run Bytes.append(&mut output.*, Bytes.asSlice(&run declarationName(&declaration)))
       let listed = Vector.asSlice<Argument>(&arguments)
@@ -7988,57 +8029,6 @@ impl MirFunction {
     let mut output = Vector.make<BodyNodeId>()
     drop run collectCallNodes(body, bodyRoot(body), &mut output)
     return move output
-  }
-  /// Makes the C entry instance as ordinary MIR that calls the selected Silk main.
-  pub effect fn entry(main: &Shared<DeclarationId>, result: &Shared<Type>, observing: bool) -> MirFunction
-  ! OutOfMemoryError
-  ? &mut Allocator {
-    let origin = Origin {syntax: HirId {index: usize.ZERO}, span: Span.make(usize.ZERO, usize.ZERO)}
-    let key = InstanceKey.Entry {main: Shared.clone<DeclarationId>(main)}
-    let callee = run InstanceKey.named(main)
-    let mut locals = Vector.make<Local>()
-    run Vector.append<Local>(
-      &mut locals,
-      Local {ty: Shared.clone<Type>(result), kind: LocalKind.Return, origin: origin},
-    )
-    let mut blocks = Vector.make<Block>()
-    run Vector.append<Block>(
-      &mut blocks,
-      Block {
-        statements: Vector.make<Statement>(),
-        terminator: Terminator.Call {
-          callee: Callee.Instance {key: InstanceKey.copy(&callee)},
-          arguments: Vector.make<Operand>(),
-          providers: Vector.make<Operand>(),
-          diagnostics: run independentDiagnostics(observing),
-          destination: place(usize.ZERO),
-          normal: usize.ONE,
-          failure: Option.none<FailureEdge>(),
-          origin: origin,
-        },
-      },
-    )
-    run Vector.append<Block>(
-      &mut blocks,
-      Block {statements: Vector.make<Statement>(), terminator: Terminator.Return {origin: origin}},
-    )
-    let mut references = Vector.make<Reference>()
-    run Vector.append<Reference>(
-      &mut references,
-      Reference {key: move callee, edge: Edge.Direct, origin: origin},
-    )
-    return MirFunction {
-      key: move key,
-      safetyChecked: true,
-      result: Shared.clone<Type>(result),
-      parameters: Vector.make<Shared<Type>>(),
-      locals: move locals,
-      blocks: move blocks,
-      references: move references,
-      externs: Vector.make<Shared<DeclarationId>>(),
-      observes: false,
-      contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(),
-    }
   }
   /// Makes one C export shim as ordinary MIR: its C-classified scalar and pointer lanes pass
   /// unchanged to the exported function's ordinary Silk instance, whose result it returns.

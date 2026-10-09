@@ -44,8 +44,8 @@ This source work landed on `main` and reached `selfhost` through a main sync. Th
 selects this runtime as its default in `compiler/silk.toml`, so the bootstrap links N0 through it:
 an unhandled failure from the compiler's `main` exits with status 1 and no diagnostic report. The
 native compiler reads the same `[build].composition` selection and roots the build at the
-runtime's C exports, with `Intrinsic.application` bound to the application module. Packages that
-select no runtime keep the native compiler's generated entry until the default hosted runtime
-compiles natively ([COMPILER_COMPATIBILITY.md](../../COMPILER_COMPATIBILITY.md)). Ordinary plain-i32
+runtime's C exports, with `Intrinsic.application` bound to the application module. A package
+without a composition takes the standard-library catalog runtime for its target and libc,
+`silk/native_start` on hosted targets; the native compiler has no generated entry. Ordinary plain-i32
 source adaptation is the separate follow-up [#931](https://github.com/julia-script/silk/issues/931).
 Native suspension and full observer support retain their separate implementation obligations.
