@@ -170,21 +170,46 @@ const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
       code: 'CORPUS_COMPONENT_INPUT',
       reason: 'the build CLI cannot supply native runtime components yet',
     })
-  if (
-    program.nativeCSources !== undefined ||
-    program.nativeDynamicLibraries?.some((library) => library !== 'c' && library !== 'm')
-  )
-    gaps.push({
-      code: 'CORPUS_NATIVE_LINK_INPUT',
-      reason: 'the build CLI cannot link corpus C objects or libraries beyond libc/libm yet',
-    })
   return gaps
+}
+
+const safeName = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
+
+/**
+ * Compiles each corpus C unit to an object beside the package with the C driver the compiler links
+ * with, as the bootstrap's `compileCObject` does, and returns the manifest's link input entries.
+ */
+const nativeLinkInputs = (directory: string, program: CorpusProgram): ReadonlyArray<string> => {
+  const clang = process.env.SILKC_CLANG ?? '/usr/bin/clang'
+  const objects = Object.entries(program.nativeCSources ?? {}).map(([unit, contents]) => {
+    if (!safeName.test(unit)) throw new Error(`unsafe corpus C unit name: ${unit}`)
+    writeFileSync(join(directory, `${unit}.c`), contents)
+    const compiled = spawnSync(
+      clang,
+      ['-c', '-x', 'c', `${unit}.c`, '-O2', '-fPIC', '-fvisibility=hidden', '-o', `${unit}.o`],
+      { cwd: directory, encoding: 'utf8', timeout: buildTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
+    )
+    if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
+      throw new Error(`C unit ${unit}: ${processFailure(compiled)}`)
+    return `{ object = ${JSON.stringify(`${unit}.o`)} }`
+  })
+  const libraries = (program.nativeDynamicLibraries ?? []).map((library) => {
+    if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
+    return `{ library = ${JSON.stringify(library)}, mode = "dynamic" }`
+  })
+  return [...objects, ...libraries]
 }
 
 const writeProgram = (directory: string, program: CorpusProgram): void => {
   const source = join(directory, 'main.silk')
   writeFileSync(source, program.nativeSource ?? program.source)
-  writeFileSync(join(directory, 'silk.toml'), '[package]\nname = "corpus"\nroot = "main.silk"\n')
+  const linkInputs = nativeLinkInputs(directory, program)
+  writeFileSync(
+    join(directory, 'silk.toml'),
+    `[package]\nname = "corpus"\nroot = "main.silk"\n${
+      linkInputs.length === 0 ? '' : `\n[build]\nnative-link-inputs = [${linkInputs.join(', ')}]\n`
+    }`,
+  )
   for (const [module, contents] of Object.entries(program.nativeImports ?? {})) {
     if (module.startsWith('/') || module.split('/').includes('..'))
       throw new Error(`unsafe corpus import path: ${module}`)
