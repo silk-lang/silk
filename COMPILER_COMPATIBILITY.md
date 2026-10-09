@@ -1642,7 +1642,11 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   callback no longer fixes `'env` to `'static`; an invariant or written binder never moves. As in the
   bootstrap's type-outlives proof, a stored type parameter without a contents premise names no region
   there: the bound proves the named regions beside it, as for `Query.demand`'s `Reservation<'owner, K, A, R>`,
-  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). The bootstrap solves for the shortest region directly, so a binder
+  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). A bare type parameter without a contents premise
+  outlives only a region local to the checked body, so `T: 'binder` for a declared region stays
+  `Unsupported`. A binder that holds only `'static` evidence, such as the environment of a
+  capture-free `effect fn` passed as a callback (`failCompleted` in `Effect.result`), shortens to the
+  call's local region instead, where the bootstrap solves for `'call & 'env`. The bootstrap solves for the shortest region directly, so a binder
   an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
