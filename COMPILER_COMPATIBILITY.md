@@ -1634,7 +1634,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   regions. Native fixes an inferred binder by its first evidence and shortens it when a later
   operand offers another region for a binder every parameter stores covariantly: to that region
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
-  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. A section's Effect
+  environment binder that an earlier operand fixed, as `'env` of `JsonObject.field("x", value)` piped
+  an Effect that borrows a declared region, shortens the same way to the regions that Effect retains. An inferred struct
   literal binder that the declaration stores covariantly shortens the same way at a later field,
   as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). A `T: 'binder` bound
   that the binder's evidence does not cover shortens a covariant inferred binder to the meet of the
@@ -1702,18 +1704,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Evidence:** `plainCallableAffineArgumentClaims` in
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
-
-### Native member bodies without implementation head bounds
-
-- **Status:** native gap; retires when native checks an implementation member's body under its
-  implementation head's bounds.
-- **Compilers:** the bootstrap checks `impl<T: Printable> Printable for Box<T>` members with
-  `T: Printable` as a premise, so `value.value.print()` selects the bound operation. Native member
-  bodies receive only the member signature's bounds, so a receiver call on such an enclosing type
-  parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
-  `UnknownMember`, which it keeps for a function's own unbounded type parameter.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 ### Native service operations with a `Self` operand
 
