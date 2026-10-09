@@ -963,7 +963,7 @@ pub fn main() -> i32 {
     for (const fn of module.functions) {
       const transient = NativeOutcomeStorage.transientLocals(fn, MirLinearization.linearize(fn))
       for (const region of fn.suspension?.regions ?? []) {
-        if (region.operation._tag !== 'ExecutionPark')
+        if (region.operation._tag !== 'ExecutionRelinquish')
           assert.isFalse(transient.has(region.operation.outcome.ordinal))
         if (region._tag === 'RunSuspendableEffectRegion') {
           for (const local of region.liveLocals) assert.isFalse(transient.has(local.ordinal))

@@ -122,7 +122,10 @@ value, aggregate, or suspended frame. Access does not expose a guard, lock, raw 
 release operation.
 
 **Diagnostics:** An escaping result or suspension reports `OWN0016` at the escape and relates it to
-the local-shared access boundary.
+the local-shared access boundary. A direct `Intrinsic.executionNotify` inside the callback reports
+`OWN0016` too. Signaling a `Wake` through `Execution.wake` is ordinary source and is not rejected
+statically; if the readiness endpoint reenters the same state, the SHARED-004 runtime conflict
+check traps before callback entry.
 
 **Evidence:** [standard-library access specification](../../../../openspec/changes/archive/2026-08-23-add-local-shared-standard-library/specs/bootstrap-silk-stdlib/spec.md),
 [local shared pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts).

@@ -8,7 +8,7 @@ import silk.buffered_duplex {BufferedDuplex}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.shared {Shared}
 import silk.http {Header, Status}
 import silk.http_body {Limits as BodyLimits}
@@ -308,8 +308,8 @@ impl ByteDuplex for UpgradeTransport {
   shutdownWriteRaw: UpgradeTransport.shutdown
   closeRaw: UpgradeTransport.close
 }
-struct ParkGuard {wake: Intrinsic.Wake}
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
 struct ParkingClock {}
 impl MonotonicClock for ParkingClock {
   effect fn now(self: &mut Self) -> Instant { return SystemClock.make(0, 0) }

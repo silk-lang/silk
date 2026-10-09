@@ -97,9 +97,13 @@ export const emit = (context: LoweringContext, operation: LinearOperation) => {
       return NativeLocalSharedOperation.emit(context.call, operation)
     case 'ExecutionFromAllocation':
     case 'ExecutionDrive':
-    case 'ExecutionNotifyInitial':
-    case 'ExecutionWake':
-    case 'ExecutionPark':
+    case 'ExecutionRelinquish':
+    case 'ExecutionCurrent':
+    case 'ExecutionRefOf':
+    case 'ExecutionLoad':
+    case 'ExecutionStore':
+    case 'ExecutionNotify':
+    case 'ExecutionLive':
       return NativeExecutionOperation.emit(context.execution, operation)
     case 'Move':
     case 'SetInitialized':

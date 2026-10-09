@@ -111,7 +111,8 @@ const ofTypeInner = (
   type: Type.Type,
   active: ReadonlySet<string>,
 ): ExecutionAffinity => {
-  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isWake(type)) return localExecution
+  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isExecutionRef(type))
+    return localExecution
   if (Type.isParameter(type)) return { _tag: 'ParameterDependent', parameters: [type] }
   if (Type.isFixedArray(type)) return ofTypeInner(index, type.element, active)
   if (Type.isSlice(type)) return ofTypeInner(index, type.element, active)

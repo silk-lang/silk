@@ -967,54 +967,100 @@ const lowerBuiltinOperation = (
     })
     return finishBuiltin(destination)
   }
-  if (expression.operation === 'ExecutionWake') {
-    const [wake] = argumentLocals
-    const wakeType = wake === undefined ? undefined : fn.localTypes.at(wake.ordinal)
-    const type = fn.type(expression.type)
-    if (
-      wake === undefined ||
-      wakeType?._tag !== 'Nominal' ||
-      !Type.isWake(wakeType.type) ||
-      type?._tag !== 'Nominal' ||
-      !Type.equals(type.type, Type.unit)
-    )
-      return undefined
-    const destination = fn.alloc(type)
-    fn.emit({
-      _tag: 'ExecutionWake' as const,
-      destination,
-      wake,
-      wakeAccess: 'Take' as const,
-      type,
-      provenance: authored(expression.span),
-    })
-    return finishBuiltin(destination)
-  }
-  if (expression.operation === 'ExecutionNotifyInitial') {
+  if (expression.operation === 'ExecutionRefOf') {
     const [execution] = argumentLocals
     const executionType = execution === undefined ? undefined : fn.localTypes.at(execution.ordinal)
     const type = fn.type(expression.type)
     if (
       execution === undefined ||
       executionType?._tag !== 'Reference' ||
-      executionType.type.access !== 'Exclusive' ||
       !Type.isExecution(executionType.type.target) ||
       type?._tag !== 'Nominal' ||
-      !Type.equals(type.type, Type.unit)
+      !Type.isExecutionRef(type.type)
     )
       return undefined
     const destination = fn.alloc(type)
     fn.emit({
-      _tag: 'ExecutionNotifyInitial' as const,
+      _tag: 'ExecutionRefOf' as const,
       destination,
       execution,
-      executionAccess: 'Exclusive' as const,
+      executionAccess: 'Shared' as const,
       type,
       provenance: authored(expression.span),
     })
     return finishBuiltin(destination)
   }
-  if (expression.operation === 'ExecutionDrive' || expression.operation === 'ExecutionPark')
+  if (
+    expression.operation === 'ExecutionLoad' ||
+    expression.operation === 'ExecutionStore' ||
+    expression.operation === 'ExecutionNotify' ||
+    expression.operation === 'ExecutionLive'
+  ) {
+    const [reference, word, value] = argumentLocals
+    const referenceType = reference === undefined ? undefined : fn.localTypes.at(reference.ordinal)
+    const type = fn.type(expression.type)
+    if (
+      reference === undefined ||
+      referenceType?._tag !== 'Reference' ||
+      !Type.isExecutionRef(referenceType.type.target) ||
+      type === undefined
+    )
+      return undefined
+    const destination = fn.alloc(type)
+    const provenance = authored(expression.span)
+    if (expression.operation === 'ExecutionLoad') {
+      if (word === undefined || type._tag !== 'usize') return undefined
+      fn.emit({
+        _tag: 'ExecutionLoad' as const,
+        destination,
+        reference,
+        word,
+        referenceAccess: 'Shared' as const,
+        type,
+        provenance,
+      })
+    } else if (expression.operation === 'ExecutionLive') {
+      if (type._tag !== 'bool') return undefined
+      fn.emit({
+        _tag: 'ExecutionLive' as const,
+        destination,
+        reference,
+        referenceAccess: 'Shared' as const,
+        type,
+        provenance,
+      })
+    } else {
+      if (type._tag !== 'Nominal' || !Type.equals(type.type, Type.unit)) return undefined
+      if (expression.operation === 'ExecutionNotify')
+        fn.emit({
+          _tag: 'ExecutionNotify' as const,
+          destination,
+          reference,
+          referenceAccess: 'Shared' as const,
+          type,
+          provenance,
+        })
+      else {
+        if (word === undefined || value === undefined) return undefined
+        fn.emit({
+          _tag: 'ExecutionStore' as const,
+          destination,
+          reference,
+          word,
+          value,
+          referenceAccess: 'Shared' as const,
+          type,
+          provenance,
+        })
+      }
+    }
+    return finishBuiltin(destination)
+  }
+  if (
+    expression.operation === 'ExecutionDrive' ||
+    expression.operation === 'ExecutionRelinquish' ||
+    expression.operation === 'ExecutionCurrent'
+  )
     return undefined
   if (expression.operation === 'StringEqualsExact' || expression.operation === 'NativeAssembly')
     return undefined
