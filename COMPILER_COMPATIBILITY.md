@@ -1705,18 +1705,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
 
-### Native member bodies without implementation head bounds
-
-- **Status:** native gap; retires when native checks an implementation member's body under its
-  implementation head's bounds.
-- **Compilers:** the bootstrap checks `impl<T: Printable> Printable for Box<T>` members with
-  `T: Printable` as a premise, so `value.value.print()` selects the bound operation. Native member
-  bodies receive only the member signature's bounds, so a receiver call on such an enclosing type
-  parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
-  `UnknownMember`, which it keeps for a function's own unbounded type parameter.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
-
 ### Native service operations with a `Self` operand
 
 - **Status:** native gap; retires when native dispatches such an operation on its operand.
