@@ -1339,6 +1339,21 @@ const assignmentPlaceBorrowAccess = (place: ExpressionDecision): Type.BorrowAcce
   return place.placeBorrowAccess
 }
 
+/**
+ * Whether a resolved identifier names an owned `let` binding or source parameter that was not
+ * declared `mut`. Exclusive run, invocation and lending need a mutable root (EFFECT-OWN-002,
+ * CALLABLE-002); anonymous capture parameters carry their access from the capture instead.
+ */
+export const immutableRoot = (reference: ParameterReferenceFact): boolean => {
+  if (reference._tag === 'ResolvedBinding') return reference.binding.mutability !== 'Mutable'
+  if (reference._tag === 'Resolved')
+    return (
+      reference.parameter.bindingMutability !== 'Mutable' &&
+      reference.parameter.captureAccess === undefined
+    )
+  return false
+}
+
 /** Classifies writable roots without conflating owned binding mutability with pointee access. */
 export const assignmentRootAccess = (
   root: AssignmentRootFact,
@@ -1911,12 +1926,8 @@ const visitExpressionDecision = (
   expression: ExpressionDecision | Tir.Expression,
   visitor: FactVisitor,
 ): void => {
-  if ('origin' in expression) {
-    visitor.node?.(expression)
-    for (const child of Tir.expressionChildren(expression)) visitExpressionDecision(child, visitor)
-    return
-  }
-  visitor.expression?.(expression)
+  if ('origin' in expression) visitor.node?.(expression)
+  else visitor.expression?.(expression)
   if (expression._tag === 'Match') {
     visitExpressionDecision(expression.scrutinee, visitor)
     for (const arm of expression.arms) {
@@ -1930,7 +1941,10 @@ const visitExpressionDecision = (
     if (visitor.descendEffectBlocks !== false) visitStatements(expression.statements, visitor)
     return
   }
-  for (const child of directExpressionChildren(expression)) visitExpressionDecision(child, visitor)
+  for (const child of 'origin' in expression
+    ? Tir.expressionChildren(expression)
+    : directExpressionChildren(expression))
+    visitExpressionDecision(child, visitor)
 }
 
 /** Visits one expression tree in deterministic source order. */

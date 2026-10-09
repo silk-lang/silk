@@ -1206,14 +1206,26 @@ const checkExpressionOperation = (
   guard = state.execution?.guard ?? false,
   escaping = false,
 ): boolean => {
+  // Lending a reusable exclusive Effect or callable to a parameter keeps the caller's value but
+  // grants the callee exclusive run access, so its root must be mutable (EFFECT-OWN-002).
+  const checkExclusiveLend = (argument: Tir.Expression): void => {
+    if (argument._tag !== 'ParameterReference' && argument._tag !== 'BindingReference') return
+    const site = useSite(argument)
+    if (site === undefined) return
+    const binding = state.bindings.get(siteKey(site))
+    if (binding !== undefined && !supportsExclusiveAccess(binding))
+      state.diagnostics.push(Diagnostic.invalidCallableInvocationAccess('Exclusive', argument.span))
+  }
   const argumentConsumes = (argument: Tir.Expression): boolean => {
     if (argument._tag === 'Unavailable') {
       return true
     }
     if (Type.isEffect(argument.type)) {
+      if (argument.type.access === 'Exclusive') checkExclusiveLend(argument)
       return argument.type.access === 'Take'
     }
     if (Type.isCallable(argument.type)) {
+      if (argument.type.mode === 'Exclusive') checkExclusiveLend(argument)
       return argument.type.mode === 'Take'
     }
     return true
@@ -3015,6 +3027,22 @@ const analyzeLoans = (
       ? 'Move'
       : 'Read'
 
+  // A borrowed match holds its own loan through the selected arm; only by-value forms consume.
+  const scrutineeAccess = (
+    expression: Extract<LoanView.Expression, { readonly _tag: 'Match' }>,
+  ): 'Read' | 'Write' | 'Move' => {
+    switch (expression.access) {
+      case 'Shared':
+      case 'Copy':
+        return 'Read'
+      case 'Exclusive':
+        return 'Write'
+      case 'Move':
+      case 'Place':
+        return naturalAccess(expression.scrutinee)
+    }
+  }
+
   const inspect = (
     expression: LoanView.Expression,
     region: Tir.RegionId,
@@ -3126,7 +3154,7 @@ const analyzeLoans = (
         }
         return
       case 'Match':
-        inspect(expression.scrutinee, region, active, naturalAccess(expression.scrutinee))
+        inspect(expression.scrutinee, region, active, scrutineeAccess(expression))
         for (const arm of expression.arms) {
           if (arm.guard !== undefined) inspect(arm.guard, region, active, 'Read')
           if (arm.body._tag === 'Expression') inspect(arm.body.expression, region, active, access)

@@ -335,6 +335,40 @@ pub fn main() -> i32 { return run f() }`,
   }),
 )
 
+// A borrowed parameter capture anchors its loan at the body use, not the parameter declaration.
+it.effect('types an inline effect block that borrows an enclosing parameter', () =>
+  Effect.gen(function* () {
+    const module = 'effect-typing/borrowed-parameter-capture'
+    const snapshot = yield* snapshotOf(
+      module,
+      `fn read(value: &i32) -> i32 { return value.* }
+effect fn ordered(value: i32) -> () {
+  run effect { let copied = read(&value) return () }
+  return ()
+}
+pub fn main() -> i32 { run ordered(1) return 42 }`,
+    )
+    assert.deepEqual(codesOf(snapshot), [])
+    const body =
+      snapshot.results
+        .get(module)
+        ?.bodies.find(
+          (candidate) =>
+            candidate.declaration.name._tag === 'Present' &&
+            candidate.declaration.name.spelling === 'ordered',
+        ) ?? unreachable('expected the effect function body')
+    const run =
+      body.function.statements
+        .flatMap(Tir.statementExpressions)
+        .flatMap(Tir.expressionTree)
+        .find((expression) => expression._tag === 'Run') ??
+      unreachable('expected the run of the inline effect block')
+    if (run._tag !== 'Run' || run.subject._tag !== 'EffectBlock')
+      return unreachable('expected the inline effect block as the run subject')
+    assert.isTrue(Type.isEffect(run.subject.type))
+  }),
+)
+
 // SUSP-005: a suspend wrapper keeps its failure and requirement channels and composes with
 // Effect.provide and Effect.catchAll in either order.
 const suspendComposition = (body: string) => `import silk.effect { Effect }
@@ -428,7 +462,7 @@ fn recover<'input>(error: &'input i32) -> &'input i32 {
 fn reify<E>(protected: once Effect<'static; i32 ! E>) -> Result<i32, E> {
   return run Effect.result(move protected)
 }
-effect fn again<E>(protected: mut Effect<'static; i32 ! E>) -> i32 ! E {
+effect fn again<E>(mut protected: mut Effect<'static; i32 ! E>) -> i32 ! E {
   return run Effect.retry(protected, 1)
 }
 fn anonymous<'input>(error: &'input i32) -> i32 {
@@ -945,5 +979,43 @@ pub fn main() -> i32 { return direct() + staged() }`),
     }
     const mir = Analysis.loweredMir(snapshot)
     assert.deepEqual(yield* MirVerification.verify(mir), [])
+  }),
+)
+
+// CAPTURE-002 / EFFECT-OWN-002: an exclusive capture, whether written through a place or retained
+// as an Effect operation operand, cannot hide behind a declared shared contract.
+it.effect('rejects a shared declared contract over a retained exclusive capture', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+struct Cell { code: i32 }
+interface Decoder { effect fn decode(value: &mut Self) -> i32 }
+effect fn decodeCell(value: &Cell) -> i32 { return value.code }
+impl Decoder for Cell { decode: Cell.decodeCell }
+fn block(cell: &mut Cell) -> Effect<i32> { return effect { cell.code = 3 return 1 } }
+fn callable(cell: &mut i32) -> fn() -> i32 { return fn() -> i32 { cell.* = 1 return 1 } }
+fn operation<T: Decoder>(value: &mut T) -> Effect<i32> { return Decoder.decode(value) }
+fn blockMut(cell: &mut Cell) -> mut Effect<i32> { return effect { cell.code = 3 return 1 } }
+fn callableMut(cell: &mut i32) -> mut fn() -> i32 { return fn() -> i32 { cell.* = 1 return 1 } }
+fn operationMut<T: Decoder>(value: &mut T) -> mut Effect<i32> { return Decoder.decode(value) }
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* snapshotOf('effect-typing/exclusive-capture-contract', source)
+    const spanOf = (text: string) => {
+      const start = source.indexOf(text)
+      return { start, end: start + text.length }
+    }
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map(({ code, span }) => ({
+        code,
+        start: span.start,
+        end: span.end,
+      })),
+      [
+        { code: 'SEM0129', ...spanOf('effect { cell.code = 3 return 1 }') },
+        { code: 'SEM0129', ...spanOf('fn() -> i32 { cell.* = 1 return 1 }') },
+        // The rejected operand reborrow also fails to outlive the shared return contract.
+        { code: 'OWN0019', ...spanOf('Decoder.decode(value)') },
+        { code: 'SEM0129', ...spanOf('Decoder.decode(value)') },
+      ],
+    )
   }),
 )

@@ -1418,6 +1418,7 @@ static int silk_listener_wake_releases = 0;
 static int silk_listener_context_releases = 0;
 static int silk_listener_completions = 0;
 static int silk_listener_setup_order = 0;
+static int silk_listener_domain = AF_UNSPEC;
 static int silk_listener_fcntls = 0;
 
 int silk_listener_loopback_available(void) {
@@ -1463,6 +1464,7 @@ void silk_listener_stub_reset(int mode) {
   silk_listener_context_releases = 0;
   silk_listener_completions = 0;
   silk_listener_setup_order = 0;
+  silk_listener_domain = AF_UNSPEC;
   silk_listener_fcntls = 0;
 }
 
@@ -1496,6 +1498,7 @@ int socket(int domain, int type, int protocol) {
   if (!silk_listener_scripted()) return (int)syscall(SYS_socket, domain, type, protocol);
   if (silk_listener_setup_order != 0) silk_listener_configuration_ok = 0;
   silk_listener_setup_order = 1;
+  silk_listener_domain = domain;
   if (silk_listener_mode == 125) { errno = ECONNREFUSED; return -1; }
   if (silk_listener_mode == 112) { errno = ENOMEM; return -1; }
   if (domain != AF_INET && domain != AF_INET6 && domain != AF_UNIX)
@@ -1615,7 +1618,9 @@ int accept4(int fd, struct sockaddr *address, socklen_t *length, int flags) {
   if (!silk_listener_scripted()) return silk_listener_http_admitted(fd,
     (int)syscall(SYS_accept4, fd, address, length, flags));
   silk_listener_accepts += 1;
-  if (silk_listener_setup_order != 5) silk_listener_configuration_ok = 0;
+  // Pathname Unix listeners keep their requested path, so only internet listeners ask getsockname.
+  if (silk_listener_setup_order != (silk_listener_domain == AF_UNIX ? 4 : 5))
+    silk_listener_configuration_ok = 0;
   if (fd != 40 || address == NULL || length == NULL || *length != 128
       || flags != (SOCK_NONBLOCK | SOCK_CLOEXEC))
     silk_listener_configuration_ok = 0;
@@ -1691,7 +1696,10 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
     return 0;
   }
   if (silk_listener_mode == 121) { fds[0].revents = POLLNVAL; return 1; }
-  if (silk_listener_mode == 122) { fds[0].revents = POLLERR; return 1; }
+  if (silk_listener_mode == 122 || silk_listener_mode == 123) {
+    fds[0].revents = POLLERR;
+    return 1;
+  }
   fds[0].revents = POLLIN;
   return 1;
 }

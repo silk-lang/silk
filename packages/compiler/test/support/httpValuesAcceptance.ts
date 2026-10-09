@@ -2201,7 +2201,7 @@ fn runWithMadeAllocationHeaders<'value>(
     Result<Headers<'value>, ValueError>.Success {value} => value
   }
   let mut allocator = Allocator.systemAllocatorProvider()
-  let program = runCases(&allocationHeaders) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut program = runCases(&allocationHeaders) |> Effect.provideMut<Allocator>(&mut allocator)
   return run Effect.catchAll(program, recover)
 }
 
