@@ -1380,6 +1380,8 @@ struct Resolver {
   currentApplication: usize
   active: Vector<Word>
   frames: Vector<SourceFrame>
+  // Query lifecycle events, recorded only by a traced store; every demand, hit included, adds one.
+  tracing: bool
   events: Vector<Event>
   nextAnswerId: usize
   // Never published; separates nested inference transactions within this resolver.
@@ -3879,6 +3881,9 @@ effect fn rejectKind(
 effect fn emit(resolver: &mut Resolver, kind: EventKind, key: Word) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
+  if !resolver.tracing {
+    return ()
+  }
   let stored = Vector.get<ScopedKey>(&resolver.keys, u64.toUsize(key.value))
   let selected = stored.key
   run Vector.append<Event>(
@@ -44563,6 +44568,7 @@ effect fn preparationAnswer(resolver: &Resolver, identity: &Shared<DeclarationId
 
 // Generated glue queries cache refusal without a requesting source origin. The actual body or
 // worklist caller anchors canonicalization failure when it consumes this completed fact.
+// Diagnostics keep the ordinary MIR rule: a backend-category refusal remains a gap carrying it.
 effect fn preparationQueryAnswer(identity: &Shared<DeclarationId>, failure: PreparationFailure,
   dependencies: Vector<Dependency>) -> Answer ! OutOfMemoryError ? &mut Allocator {
   return match move failure {
@@ -44570,7 +44576,7 @@ effect fn preparationQueryAnswer(identity: &Shared<DeclarationId>, failure: Prep
       gap: run Shared.make<BackendGap>(BackendGap.make(code, identity, Span.make(usize.ZERO, usize.ZERO)))}, move dependencies)
     PreparationFailure.Canonicalization {reason} => memberSuccess(
       Value.CanonicalizationFailed {reason: reason}, move dependencies)
-    PreparationFailure.Rejected {diagnostic} => memberRejected(move diagnostic, move dependencies)
+    PreparationFailure.Rejected {diagnostic} => run mirRejection(identity, move diagnostic, move dependencies)
   }
 }
 
@@ -48328,7 +48334,7 @@ effect fn invokedTarget(resolver: &mut Resolver, owner: &mut Query<Word, Answer,
 
 // The prepared invocations of a checked scalar operation's carriers: `present` with the produced
 // scalar and `absent` with nothing, both producing the call's result. A carrier that owns cleanup
-// would need the unselected one dropped, which is not lowered yet.
+// records its type so the path that does not invoke it drops it.
 effect fn carrierPlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, caller: &Application,
   callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>,
@@ -48337,6 +48343,7 @@ effect fn carrierPlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, N
   let start = ScalarOperation.arity(operation)
   let produced = run primitiveType(ScalarOperation.scalarSpelling(ScalarOperation.result(operation)))
   let mut targets = Vector.make<MirCallTarget>()
+  let mut drops = Vector.make<Option<Shared<Type>>>()
   let mut at = usize.ZERO
   while at < 2 {
     let argument = match move TypedBody.callArgument(body, node, start + at) {
@@ -48344,9 +48351,11 @@ effect fn carrierPlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, N
       Option<CallArgument>.None => { fail RevisionMismatch {} }
     }
     let closed = run Type.applyBindings(&argument.ty, callerBindings, true)
-    if run ownsCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed, argument.origin) {
-      return Result.failResult<MirCarrierPlan, PreparationFailure>(PreparationFailure.Coverage {code: GapCode.Cleanup})
+    let cleanup = match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed, argument.origin) {
+      Result<Option<Shared<Type>>, PreparationFailure>.Success {value} => value
+      Result<Option<Shared<Type>>, PreparationFailure>.Failure {error} => { return Result.failResult<MirCarrierPlan, PreparationFailure>(error) }
     }
+    run Vector.append<Option<Shared<Type>>>(&mut drops, move cleanup)
     let none = Vector.make<Constraint>()
     let contract = match move run valueCallableContract(&argument.ty, Vector.asSlice<Constraint>(&none)) {
       Option<Shared<Type>>.Some {value} => value
@@ -48373,7 +48382,10 @@ effect fn carrierPlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, N
   }
   let present = Vector.remove<MirCallTarget>(&mut targets, usize.ZERO)
   let absent = Vector.remove<MirCallTarget>(&mut targets, usize.ZERO)
-  return Result.succeed<MirCarrierPlan, PreparationFailure>(MirCarrierPlan {node: node, present: move present, absent: move absent})
+  let presentDrop = Vector.remove<Option<Shared<Type>>>(&mut drops, usize.ZERO)
+  let absentDrop = Vector.remove<Option<Shared<Type>>>(&mut drops, usize.ZERO)
+  return Result.succeed<MirCarrierPlan, PreparationFailure>(MirCarrierPlan {node: node, present: move present, absent: move absent,
+    presentDrop: move presentDrop, absentDrop: move absentDrop})
 }
 
 // Whether a stored part owns cleanup; an unanswerable verdict is treated as owning.
@@ -56776,6 +56788,60 @@ impl<'source> StaticPort<'source> {
   }
 }
 
+// Opens an empty store; a traced one also records every query lifecycle event.
+fn openStore(revision: Revision, target: MachineTarget, profile: Option<FinalProfile>, tracing: bool) -> Semantic {
+  let profileSlot = match &profile {
+    Option<FinalProfile>.Some {..} => usize.ONE
+    Option<FinalProfile>.None => usize.ZERO
+  }
+  let selectedTarget = match &profile {
+    Option<FinalProfile>.Some {value} => FinalProfile.target(&value)
+    Option<FinalProfile>.None => target
+  }
+  return Semantic {
+    resolver: Resolver {
+      source: SourceIndex.make(move revision),
+      baseTarget: target,
+      target: selectedTarget,
+      initialProfile: move profile,
+      assemblyFacts: Option.none<InitialProfile>(),
+      executionStorage: Option.none<ExecutionStorage>(),
+      profiles: Vector.make<FinalProfile>(),
+      profileSlot: profileSlot,
+      mirValues: Vector.make<MirFunction>(),
+      layoutValues: Vector.make<Shared<BackendLayout>>(),
+      emissionInputs: Vector.make<EmissionInputs>(),
+      llvmInputs: Vector.make<LlvmInput>(),
+      llvmValues: Vector.make<InstanceDefinition>(),
+      modules: Vector.make<ModuleId>(),
+      moduleLookup: InternIndex.make(),
+      names: StringTable.make(),
+      applications: Vector.make<Shared<Type>>(),
+      applicationLookup: InternIndex.make(),
+      layoutTypes: Vector.make<Shared<Type>>(),
+      layoutTypeLookup: InternIndex.make(),
+      backendInstances: Vector.make<BackendInstance>(),
+      backendInstanceLookup: InternIndex.make(),
+      originPlans: Vector.make<CallableOrigin.Plan>(),
+      originEvidence: Vector.make<CallableOrigin.Producer>(),
+      selectedApplications: Vector.make<Application>(),
+      selectedApplicationLookup: InternIndex.make(),
+      llvmInputLookup: InternIndex.make(),
+      keys: Vector.make<ScopedKey>(),
+      keyLookup: InternIndex.make(),
+      currentApplication: usize.MAX,
+      active: Vector.make<Word>(),
+      frames: Vector.make<SourceFrame>(),
+      tracing: tracing,
+      events: Vector.make<Event>(),
+      nextAnswerId: usize.ONE,
+      nextInferenceId: usize.ZERO,
+      bodies: Vector.make<BodyFrame>(),
+    },
+    query: Query.make<Word, Answer, NoRejection>(),
+  }
+}
+
 impl Semantic {
   /// Borrows the held resolver and query for a static demand outside a running provider.
   pub fn staticPort<'source>(self: &'source mut Self, dependencies: &'source mut Vector<Dependency>) -> StaticPort<
@@ -56789,56 +56855,13 @@ impl Semantic {
   }
   /// Creates a lazy semantic store for one held revision and explicitly selected target.
   pub fn make(revision: Revision, target: MachineTarget, profile: Option<FinalProfile>) -> Semantic {
-    let profileSlot = match &profile {
-      Option<FinalProfile>.Some {..} => usize.ONE
-      Option<FinalProfile>.None => usize.ZERO
-    }
-    let selectedTarget = match &profile {
-      Option<FinalProfile>.Some {value} => FinalProfile.target(&value)
-      Option<FinalProfile>.None => target
-    }
-    return Semantic {
-      resolver: Resolver {
-        source: SourceIndex.make(move revision),
-        baseTarget: target,
-        target: selectedTarget,
-        initialProfile: move profile,
-        assemblyFacts: Option.none<InitialProfile>(),
-        executionStorage: Option.none<ExecutionStorage>(),
-        profiles: Vector.make<FinalProfile>(),
-        profileSlot: profileSlot,
-        mirValues: Vector.make<MirFunction>(),
-        layoutValues: Vector.make<Shared<BackendLayout>>(),
-        emissionInputs: Vector.make<EmissionInputs>(),
-        llvmInputs: Vector.make<LlvmInput>(),
-        llvmValues: Vector.make<InstanceDefinition>(),
-        modules: Vector.make<ModuleId>(),
-        moduleLookup: InternIndex.make(),
-        names: StringTable.make(),
-        applications: Vector.make<Shared<Type>>(),
-        applicationLookup: InternIndex.make(),
-        layoutTypes: Vector.make<Shared<Type>>(),
-        layoutTypeLookup: InternIndex.make(),
-        backendInstances: Vector.make<BackendInstance>(),
-        backendInstanceLookup: InternIndex.make(),
-        originPlans: Vector.make<CallableOrigin.Plan>(),
-        originEvidence: Vector.make<CallableOrigin.Producer>(),
-        selectedApplications: Vector.make<Application>(),
-        selectedApplicationLookup: InternIndex.make(),
-        llvmInputLookup: InternIndex.make(),
-        keys: Vector.make<ScopedKey>(),
-        keyLookup: InternIndex.make(),
-        currentApplication: usize.MAX,
-        active: Vector.make<Word>(),
-        frames: Vector.make<SourceFrame>(),
-        events: Vector.make<Event>(),
-        nextAnswerId: usize.ONE,
-        nextInferenceId: usize.ZERO,
-        bodies: Vector.make<BodyFrame>(),
-      },
-      query: Query.make<Word, Answer, NoRejection>(),
-    }
+    return openStore(move revision, target, move profile, false)
   }
+  /// Opens a store that also records every query lifecycle event for `eventLog`.
+  pub fn traced(revision: Revision, target: MachineTarget, profile: Option<FinalProfile>) -> Semantic {
+    return openStore(move revision, target, move profile, true)
+  }
+
   /// Selects a new immutable source revision and validates completed facts on their next demand.
   ///
   /// # Details
@@ -56918,7 +56941,7 @@ impl Semantic {
     self.resolver.target = selectedTarget
     return ()
   }
-  /// Borrows the semantic query lifecycle events in demand order.
+  /// Borrows the semantic query lifecycle events in demand order; empty unless the store is traced.
   pub fn eventLog(self: &Self) -> &[Event] {
     return Vector.asSlice<Event>(&self.resolver.events)
   }
