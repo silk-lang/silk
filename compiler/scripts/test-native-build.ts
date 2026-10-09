@@ -49,7 +49,16 @@ const program = Effect.gen(function* () {
   const marker = join(directory, 'clang-called')
   yield* fs.writeFileString(sentinel, `#!/bin/sh\nprintf called > ${quote(marker)}\nexit 99\n`)
   yield* fs.chmod(sentinel, 0o755)
-  const argumentsFor = (output: string) => ['build', 'main.silk', '-o', output]
+  // The standard library supplies the catalog runtime that roots the build.
+  const standardLibrary = join(repository, 'packages/compiler/stdlib')
+  const argumentsFor = (output: string) => [
+    'build',
+    'main.silk',
+    '-o',
+    output,
+    '--stdlib',
+    standardLibrary,
+  ]
   const ir = yield* invoke(silkc, [...argumentsFor('module.ll'), '--emit', 'llvm-ir'], directory, {
     ...process.env,
     SILKC_CLANG: sentinel,
