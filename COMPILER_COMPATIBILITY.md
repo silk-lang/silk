@@ -837,7 +837,9 @@ Each entry records:
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
   exports declared outside the selected runtime module build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
-  its C ABI gap. Exported statics remain `ForeignStaticUnavailable`.
+  its C ABI gap. Exported statics remain `ForeignStaticUnavailable`. Native C ABI lanes cover
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin only, so on aarch64-unknown-linux-gnu every
+  selfhost build stops at the runtime's first C export with `c-abi-target`.
 - **Source migration:** none for defaulted builds. A build that relies on a profile `runtime`
   request or on retention roots needs the bootstrap.
 - **Diagnostics and limits:** an unselected runtime is `InvalidBuildComposition` before analysis.
