@@ -567,6 +567,13 @@ pub struct CarrierPlan {
   pub absentDrop: Option<Shared<Type>>
 }
 
+/// An interface call whose selected witness is a scalar intrinsic (by call node). It lowers in
+/// place as that intrinsic over the call's operands; no instance is called.
+pub struct WitnessIntrinsic {
+  pub node: BodyNodeId
+  pub member: IntrinsicMember
+}
+
 /// The expansion prepared for one `run` of a composed Effect: its steps, each after the steps it
 /// runs, so the root is last.
 pub struct NodePlan {
@@ -578,8 +585,9 @@ pub struct NodePlan {
 /// layouts and prepares targets.
 pub struct StoragePlan {
   pub node: BodyNodeId
-  /// The measured size (`layoutOf<T>`, or `T`'s control block for `sharedLayout` and
-  /// `sharedFromAllocation`) or element stride (`rawBufferFrom`, `rawBufferCopy`).
+  /// The measured size (`layoutOf<T>`, `T`'s control block for `sharedLayout` and
+  /// `sharedFromAllocation`, or the complete package for `executionLayout` and
+  /// `executionFromAllocation`) or element stride (`rawBufferFrom`, `rawBufferCopy`).
   pub size: usize
   pub alignment: usize
   /// The sealed C allocator functions `malloc`, `free`, `memmove` and `memset`, in that order.
@@ -644,6 +652,7 @@ struct Builder {
   storage: Vector<StoragePlan>
   // The carrier invocations of checked scalar operations, each consumed by its call node.
   carriers: Vector<CarrierPlan>
+  witnessIntrinsics: Vector<WitnessIntrinsic>
   // This function's `Provider` locals in canonical requirement-key order.
   providers: Vector<usize>
   // The current observer and selected-cause addresses passed to Silk callees; absent unless the
@@ -3591,6 +3600,13 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Call {environment, foreign, variadicArguments, count, node: callNode, ty, origin} => {
+      // An interface operation a scalar intrinsic implements runs that operation in place.
+      if let Option<IntrinsicMember>.Some {value: witnessed} = move witnessIntrinsic(&builder.*, callNode) {
+        let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, witnessed, &ty, origin)
+        let output = run temporary(&mut builder.*, &ty, origin)
+        run assign(&mut builder.*, place(output), move operation, origin)
+        return Operand.Copy {place: place(output)}
+      }
       // Invoking an `effect fn` value without `run` constructs its target's exact Effect: the
       // value's stored arguments and the supplied operands, in target parameter order (EFF-001).
       if environment && invokedConstruction(body, callNode) {
@@ -4943,7 +4959,8 @@ effect fn lowerReplace(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
 
 // `run systemAllocationAcquire(layout)`: validates the request, then acquires `bytes + alignment - 1`
 // bytes (at least one) from `malloc` and aligns the base inside them. A refused request or a null
-// result fails with `StorageFailure` before any allocation is owned (SUSP-015).
+// result fails with `StorageFailure` before any allocation is owned (SUSP-015); a null result is
+// passed to `free` first.
 effect fn lowerAcquisition(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, node: BodyNodeId, ty: &Shared<Type>,
   origin: Origin) -> Operand ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
@@ -5004,7 +5021,16 @@ effect fn lowerAcquisition(builder: &mut Builder, body: &Shared<TypedBody>, hir:
   let missing = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(raw)},
     Operand.Null {ty: Shared.clone<Type>(&address)}, origin)
   let acquired = run block(&mut builder.*, origin)
-  terminate(&mut builder.*, Terminator.Branch {condition: move missing, thenBlock: failed, elseBlock: acquired, origin: origin})
+  let released = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move missing, thenBlock: released, elseBlock: acquired, origin: origin})
+  // A null result is still released, as the bootstrap does: `free(NULL)` is inert, and an
+  // unoptimized build keeps the call the allocator observes.
+  resume(&mut builder.*, released)
+  let mut releasing = Vector.make<Operand>()
+  run Vector.append<Operand>(&mut releasing, Operand.Copy {place: place(raw)})
+  let unit = run Shared.make<Type>(Type.Unit)
+  drop run callAllocator(&mut builder.*, &plan, usize.ONE, move releasing, &unit, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: failed, origin: origin})
   resume(&mut builder.*, failed)
   let refusal = run storageValue(&mut builder.*, &failureType, Rvalue.Aggregate {fields: Vector.make<AggregateField>()}, origin)
   run propagateFailure(&mut builder.*, refusal, &failureType, origin)
@@ -5102,6 +5128,93 @@ effect fn lowerSharedAccess(builder: &mut Builder, body: &Shared<TypedBody>, nod
   return Operand.Copy {place: place(output)}
 }
 
+// Adopts a validated allocation as one `Initial` execution package: the transfer record is empty,
+// the drop function is the package's own glue, and the body, readiness state, endpoint and then the
+// allocation itself move into place. The handle addresses the package as erased bytes.
+effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNodeId, plan: &StoragePlan,
+  operands: Vector<Operand>, ty: &Shared<Type>, origin: Origin) -> Operand
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut inputs = move operands
+  let allocation = run operandPlace(&owner, Vector.remove<Operand>(&mut inputs, usize.ZERO), origin)
+  let mut packaged = Vector.make<Shared<Type>>()
+  let mut argument = usize.ZERO
+  while argument < 4 {
+    run Vector.append<Shared<Type>>(&mut packaged, run storageArgumentType(&builder.*, body, node, argument, origin))
+    argument = argument + usize.ONE
+  }
+  let anchor = match move run SealedCore.coreIdentity(ty) {
+    Option<DeclarationId>.Some {value} => value
+    Option<DeclarationId>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let types = Vector.asSlice<Shared<Type>>(&packaged)
+  let package = run SealedCore.packageBeside(&anchor, types)
+  let mut parts = Vector.make<usize>()
+  let mut field = usize.ONE
+  while field < 4 {
+    let stored = run storageValue(&mut builder.*, &types[field],
+      Rvalue.Use {value: Vector.remove<Operand>(&mut inputs, usize.ZERO)}, origin)
+    run Vector.append<usize>(&mut parts, stored)
+    field = field + usize.ONE
+  }
+  let sized = run storageCondition(&mut builder.*, InfixOperator.Equals,
+    Operand.Copy {place: run storagePlace(&allocation, false, &[SealedCore.ordinal(CoreField.AllocationBytes)])}, run wordOperand(plan.size), origin)
+  let aligned = run storageCondition(&mut builder.*, InfixOperator.Equals,
+    Operand.Copy {place: run storagePlace(&allocation, false, &[SealedCore.ordinal(CoreField.AllocationAlignment)])}, run wordOperand(plan.alignment), origin)
+  let valid = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move sized, move aligned, origin)
+  run trapUnless(&mut builder.*, move valid, origin)
+  let sourceOwner = run DeclarationId.copyShared(&owner)
+  let glue = match move run InstanceKey.dropGlue(&package, &sourceOwner) {
+    Result<Option<InstanceKey>, CanonicalizationFailure>.Success {value: canonicalGlue} => match move canonicalGlue {
+      Option<InstanceKey>.Some {value} => value
+      Option<InstanceKey>.None => { return run unsupported(&owner, origin, GapCode.Cleanup) }
+    }
+    Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {error: reason} => { fail move reason }
+  }
+  let blockPointer = run SealedCore.address(&package)
+  let base = run storagePlace(&allocation, false, &[SealedCore.ordinal(CoreField.AllocationBase)])
+  let block = run storageValue(&mut builder.*, &blockPointer, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: run copyPlace(&base)}, destinationType: Shared.clone<Type>(&blockPointer)}, origin)
+  let erased = run SealedCore.packageAddress()
+  let address = run storageValue(&mut builder.*, &erased, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: move base},
+    destinationType: Shared.clone<Type>(&erased)}, origin)
+  let bytes = run SealedCore.bytes()
+  let header = SealedCore.ordinal(CoreField.PackageHeader)
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderState)]),
+    Rvalue.Use {value: Operand.Null {ty: Shared.clone<Type>(&bytes)}}, origin)
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderTop)]),
+    Rvalue.Use {value: Operand.Null {ty: Shared.clone<Type>(&bytes)}}, origin)
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderFailed)]),
+    Rvalue.Use {value: Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: run storagePrimitive(b"u8")}}, origin)
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderLifecycle)]),
+    Rvalue.Use {value: run wordOperand(usize.ZERO)}, origin)
+  run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&glue), edge: Edge.Direct, origin: origin})
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderDrop)]),
+    Rvalue.FunctionAddress {key: move glue}, origin)
+  let mut cleared = SealedCore.ordinal(CoreField.HeaderNotify)
+  while cleared <= SealedCore.ordinal(CoreField.HeaderWakeGuard) {
+    run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, cleared]),
+      Rvalue.Use {value: Operand.Null {ty: Shared.clone<Type>(&bytes)}}, origin)
+    cleared = cleared + usize.ONE
+  }
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderWakeGeneration)]),
+    Rvalue.Use {value: run wordOperand(usize.ZERO)}, origin)
+  let stored = Vector.asSlice<usize>(&parts)
+  let mut at = usize.ZERO
+  while at < stored.length {
+    run assign(&mut builder.*, run storagePlace(&place(block), true, &[SealedCore.ordinal(CoreField.PackageBody) + at]),
+      Rvalue.Use {value: Operand.Move {place: place(stored[at])}}, origin)
+    at = at + usize.ONE
+  }
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[SealedCore.ordinal(CoreField.PackageAllocation)]),
+    Rvalue.Use {value: Operand.Move {place: run copyPlace(&allocation)}}, origin)
+  let mut fields = Vector.make<AggregateField>()
+  run Vector.append<AggregateField>(&mut fields, AggregateField {index: SealedCore.ordinal(CoreField.ExecutionPackage),
+    value: Operand.Copy {place: place(address)}})
+  let output = run storageValue(&mut builder.*, ty, Rvalue.Aggregate {fields: move fields}, origin)
+  return Operand.Move {place: place(output)}
+}
+
 fn referentOf(value: &Type) -> Option<Shared<Type>> {
   return match &value.* {
     Type.Reference {referent, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&referent))
@@ -5118,6 +5231,8 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
   if operation == StorageOperation.Replace { return run lowerReplace(&mut builder.*, body, hir, node, ty, origin) }
   // Only a run executes the allocation boundary; a stored acquisition Effect has no runner.
   if operation == StorageOperation.SystemAllocationAcquire { return run unsupported(&owner, origin, GapCode.EffectForm) }
+  // The readiness endpoint's erased notification is not lowered yet.
+  if operation == StorageOperation.ExecutionNotifyInitial { return run unsupported(&owner, origin, GapCode.CoreType) }
   let plan = match move takeStorage(&mut builder.*, node) {
     Option<StoragePlan>.Some {value} => value
     Option<StoragePlan>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
@@ -5130,7 +5245,8 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
   if StorageOperation.typeArity(operation) > usize.ZERO {
     element = run storageArgumentType(&builder.*, body, node, usize.ZERO, origin)
   }
-  if operation == StorageOperation.LayoutOf || operation == StorageOperation.SharedLayout {
+  if operation == StorageOperation.LayoutOf || operation == StorageOperation.SharedLayout
+    || operation == StorageOperation.ExecutionLayout {
     let mut fields = Vector.make<AggregateField>()
     run Vector.append<AggregateField>(&mut fields, AggregateField {index: usize.ZERO, value: run wordOperand(plan.size)})
     run Vector.append<AggregateField>(&mut fields, AggregateField {index: usize.ONE, value: run wordOperand(plan.alignment)})
@@ -5139,6 +5255,9 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
   }
   if operation == StorageOperation.SharedWithMut {
     return run lowerSharedAccess(&mut builder.*, body, node, &plan, move operands, &element, ty, origin)
+  }
+  if operation == StorageOperation.ExecutionFromAllocation {
+    return run lowerExecutionPackage(&mut builder.*, body, node, &plan, move operands, ty, origin)
   }
   let first = run operandPlace(&owner, Vector.remove<Operand>(&mut operands, usize.ZERO), origin)
   match operation {
@@ -5604,6 +5723,16 @@ effect fn checkedScalar(
   terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
   resume(&mut builder.*, joined)
   return Operand.Move {place: place(output)}
+}
+
+fn witnessIntrinsic(builder: &Builder, node: BodyNodeId) -> Option<IntrinsicMember> {
+  let listed = Vector.asSlice<WitnessIntrinsic>(&builder.witnessIntrinsics)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].node.index == node.index { return Option.some<IntrinsicMember>(listed[at].member) }
+    at = at + usize.ONE
+  }
+  return Option.none<IntrinsicMember>()
 }
 
 fn takeCarrierPlan(builder: &mut Builder, node: BodyNodeId) -> Option<CarrierPlan> {
@@ -7070,6 +7199,7 @@ impl MirFunction {
     plans: Vector<NodePlan>,
     storage: Vector<StoragePlan>,
     carriers: Vector<CarrierPlan>,
+    witnessIntrinsics: Vector<WitnessIntrinsic>,
     remainders: Vector<Remainder>,
     needs: CleanupNeeds,
     projections: Vector<RuntimeProjection>,
@@ -7176,6 +7306,7 @@ impl MirFunction {
       plans: move plans,
       storage: move storage,
       carriers: move carriers,
+      witnessIntrinsics: move witnessIntrinsics,
       providers: move providerLocals,
       diagnostics: move diagnostics,
       sites: move sites,
@@ -7340,7 +7471,7 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.Storage {ty, operation, node, origin} => View.Storage {
       ty: run RuntimeType.applyBindings(&ty, bindings, projections), operation: operation, node: node, origin: origin,
     }
-    View.Run {ty, value, origin} => View.Run {ty: run Type.applyBindings(&ty, bindings, true), value: value, origin: origin}
+    View.Run {ty, value, origin} => View.Run {ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin}
     View.Fail {value, origin} => View.Fail {value: value, origin: origin}
     View.Boolean {value, origin} => View.Boolean {value: value, origin: origin}
     View.Unit {origin} => View.Unit {origin: origin}
