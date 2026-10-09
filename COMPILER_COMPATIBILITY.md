@@ -828,14 +828,14 @@ Each entry records:
   [ARTIFACT-001](apps/docs/content/reference/artifact-roots-and-requirements.md#artifact-001--form-stage-and-runtime-are-separate)
   and ARTIFACT-002 select the runtime from the build composition and bind `Intrinsic.application`
   to the application module.
-- **Compilers:** both compilers root every executable at the selected runtime's active
-  module-level `export "C" fn` declarations. Selfhost takes the single default of
+- **Compilers:** both compilers root every executable at the active module-level
+  `export "C" fn` declarations of the selected runtime and of the application module. Selfhost takes the single default of
   `[build].composition` in the nearest `silk.toml`; without a composition it takes the
   standard-library `compositions.json` runtime listed for the target and libc, as the bootstrap
   does. A composition with no default, two defaults, an unlisted default, or no catalog runtime
   for the target and libc stops the build. Selfhost does not yet read profile `runtime` requests
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
-  exports declared outside the selected runtime module build roots. A Silk call to an exported
+  exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
   its C ABI gap. Exported statics remain `ForeignStaticUnavailable`. Native C ABI lanes cover
   x86_64-unknown-linux-gnu and aarch64-apple-darwin only, so on aarch64-unknown-linux-gnu every
