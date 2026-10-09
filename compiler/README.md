@@ -150,7 +150,8 @@ An instance receives one hidden provider address per entry of its requirement ro
 service-role key order (D2), and its key names each provider's type. Running
 `Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
 `Svc.op(args)` calls the witness for the serving provider's type with the provider address as its
-receiver. `effect fn main` keeps the `entry-signature` gap; `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`.
+receiver. Program entry is the selected runtime's C export (ENTRY-001): `silk/native_start` runs a `pub effect fn main` through its
+`EntryResult` adapters. `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`.
 Catalog `Intrinsic` type families outside the storage core, such as `Intrinsic.Execution`, report
 `core-type`.
 
@@ -198,8 +199,9 @@ With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-bu
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. The standard-library
-root contains `silk/`; it is an explicit CLI input. Standalone builds without standard-library
-imports may omit it. The nearest `silk.toml` selects `[package].root`, whose containing directory
+root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
+takes its runtime from the library's `compositions.json` for the target and libc, so such a build
+needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Without a manifest, the entry file's directory is the module
 root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
@@ -239,7 +241,7 @@ native build from the existing plain `trivialFeatures` corpus template; the rece
 that source's hash and the supplying corpus file's hash. `--corpus-source` can select an explicit
 copy of that corpus source file. Smoke success requires exit 42 and empty stdout.
 
-Build refusal (including the current `entry-signature` gap), missing output, signals, failed smoke
+Build refusal, missing output, signals, failed smoke
 compilation, and wrong exit/stdout retain a failed receipt and a nonzero driver exit. No fallback
 compiler, source repair, second build attempt or earlier output is used. The driver and its
 injected-producer contracts establish the receipt boundary; they do not claim a successful real
