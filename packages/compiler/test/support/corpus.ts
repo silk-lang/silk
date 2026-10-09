@@ -10140,6 +10140,109 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recoverAllocation) 
     source: inflateAcceptanceSource,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // Every suspension state shape keeps its value and its single owner. The borrowed referents
+  // (`counter` in main and `local` in `twice`) are borrowed across suspension points, so a frame
+  // that copied them instead of keeping them in place would update a dead copy.
+  {
+    name: 'suspension-borrowed-referent-frame',
+    source: `import silk.effect { Effect }
+struct Counter { value: i32 }
+effect fn bump(counter: &mut Counter, step: i32) -> i32 {
+  let before = counter.value
+  let next = run Effect.suspend(effect { return step })
+  counter.value = counter.value + next
+  return before
+}
+effect fn twice(counter: &mut Counter) -> i32 {
+  let mut local = Counter { value: 10 }
+  let view = &mut local
+  let first = run bump(&mut counter.*, 1)
+  let inner = run bump(&mut view.*, 5)
+  let second = run bump(&mut counter.*, 1)
+  return second - first + local.value - inner
+}
+pub fn main() -> i32 {
+  let mut counter = Counter { value: 34 }
+  let reference = &mut counter
+  let delta = run twice(&mut reference.*)
+  return counter.value + delta
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // An owner moved into a suspending callee, one created before and one after its suspension point,
+  // and one held by the caller across it, drop exactly once in source order: 3, 2, 1, then 4.
+  {
+    name: 'suspension-moved-owner-drop-order',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+struct Log { digits: i32 }
+struct Token { id: i32 log: Shared<Log> }
+fn append(log: &mut Log, id: i32) -> i32 {
+  log.digits = log.digits * 10 + id
+  return log.digits
+}
+fn digits(log: &Log) -> i32 { return log.digits }
+impl Drop for Token {
+  fn drop(self: &mut Token) -> () {
+    let id = self.id
+    let written = Shared.withMut<Log, i32>(&self.log, append(id))
+    return ()
+  }
+}
+fn token(id: i32, log: &Shared<Log>) -> Token { return Token { id: id, log: Shared.clone<Log>(log) } }
+effect fn hold(owned: Token, value: i32) -> i32 {
+  let kept = token(2, &owned.log)
+  let next = run Effect.suspend(effect { return value + 1 })
+  let early = token(3, &owned.log)
+  drop early
+  return next + owned.id + kept.id
+}
+effect fn relay(log: &Shared<Log>) -> i32 {
+  let first = token(1, log)
+  let outer = token(4, log)
+  let result = run hold(move first, 5)
+  return result
+}
+effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let log = run Shared.make<Log>(Log { digits: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run relay(&log)
+  let order = Shared.with<Log, i32>(&log, digits)
+  if result != 9 { return 1 }
+  if order != 3214 { return 2 }
+  return 42
+}
+effect fn recoverAllocation(error: OutOfMemoryError) -> i32 { return 3 }
+pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Copied scalars, an aggregate and a loop counter survive one suspension per iteration.
+  {
+    name: 'suspension-copied-state-loop',
+    source: `import silk.effect { Effect }
+struct Pair { left: i64 right: i64 }
+effect fn mix(seed: i64, count: i64) -> i64 {
+  let pair = Pair { left: seed, right: 7 }
+  let scale: i64 = 3
+  let flag = seed > 2
+  let mut total: i64 = 0
+  let mut at: i64 = 0
+  while at < count {
+    let step = run Effect.suspend(effect { return at })
+    total = total + step * scale + pair.right
+    at = at + 1
+  }
+  if flag { return total + pair.left }
+  return total
+}
+pub fn main() -> i32 {
+  let value = run mix(5, 3)
+  if value == 35 { return 42 }
+  return 1
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   // One million suspended recursive frames must complete without growing the machine stack (an
   // unbounded native frame protocol overflows it and dies on a signal). The same executable then
   // covers the unit-valued sibling of `suspension-retry-failure`: a resumed unit suspend, one retry

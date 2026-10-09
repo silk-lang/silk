@@ -51,6 +51,7 @@ chmod +x program
   return {
     repository,
     compiler,
+    cCompiler: '/usr/bin/clang',
     source,
     compilerSource,
     pins: path.join(repository, 'compiler/scripts/selfhost-track.json'),
@@ -63,7 +64,10 @@ it.effect('verifies all live pins and declared profiles/runs without changing it
     const self = yield* fixture()
     yield* fs.writeFileString(self.pins, '["literal"]')
     // An unpinned failing case must not execute.
-    yield* Verification.run(self, [literal, { ...literal, name: 'unselected', nativeCSources: {} }])
+    yield* Verification.run(self, [
+      literal,
+      { ...literal, name: 'unselected', nativeComponents: [] },
+    ])
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
     assert.strictEqual(
@@ -85,7 +89,7 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     const corpus: ReadonlyArray<CorpusProgram> = [
       literal,
       { ...literal, name: 'observed-failure', nativeStdout: '', nativeStderr: '' },
-      { ...literal, name: 'observed-gap', nativeCSources: {} },
+      { ...literal, name: 'observed-gap', nativeComponents: [] },
       { ...literal, name: 'observed-trap', expected: { _tag: 'Trap' } },
     ]
     const messages: Array<string> = []
@@ -125,7 +129,7 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     assert.strictEqual(manifest.programs.at(1)?.stderr, '')
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
-    // A failing unpinned case executes until its first mismatch; unsupported link inputs do
+    // A failing unpinned case executes until its first mismatch; unsupported components do
     // not compile. The trap case still runs both profiles and both declared invocations.
     assert.strictEqual(
       yield* fs.readFileString(`${self.compiler}.profiles`),
@@ -157,7 +161,7 @@ it.effect('fails pinned unsupported and mismatched outcomes', () =>
     const self = yield* fixture()
     yield* fs.writeFileString(self.pins, '["literal"]')
     for (const program of [
-      { ...literal, nativeCSources: {} },
+      { ...literal, nativeComponents: [] },
       { ...literal, nativeStdout: 'wrong' },
       { ...literal, expected: { _tag: 'Completes', result: 41 } },
     ] satisfies ReadonlyArray<CorpusProgram>) {
