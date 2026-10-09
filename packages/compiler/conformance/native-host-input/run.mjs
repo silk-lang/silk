@@ -171,7 +171,7 @@ const program = Effect.gen(function* () {
           })
           if (
             artifact.nativeRuntimeSymbols.some(
-              (symbol) => symbol !== 'malloc' && symbol !== 'free',
+              (symbol) => symbol !== 'malloc' && symbol !== 'calloc' && symbol !== 'free',
             ) ||
             /silk_coroutine_frame_(push|pop)_v1/.test(artifact.ir)
           )

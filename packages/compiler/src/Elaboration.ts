@@ -1911,12 +1911,8 @@ const visitExpressionDecision = (
   expression: ExpressionDecision | Tir.Expression,
   visitor: FactVisitor,
 ): void => {
-  if ('origin' in expression) {
-    visitor.node?.(expression)
-    for (const child of Tir.expressionChildren(expression)) visitExpressionDecision(child, visitor)
-    return
-  }
-  visitor.expression?.(expression)
+  if ('origin' in expression) visitor.node?.(expression)
+  else visitor.expression?.(expression)
   if (expression._tag === 'Match') {
     visitExpressionDecision(expression.scrutinee, visitor)
     for (const arm of expression.arms) {
@@ -1930,7 +1926,10 @@ const visitExpressionDecision = (
     if (visitor.descendEffectBlocks !== false) visitStatements(expression.statements, visitor)
     return
   }
-  for (const child of directExpressionChildren(expression)) visitExpressionDecision(child, visitor)
+  for (const child of 'origin' in expression
+    ? Tir.expressionChildren(expression)
+    : directExpressionChildren(expression))
+    visitExpressionDecision(child, visitor)
 }
 
 /** Visits one expression tree in deterministic source order. */
