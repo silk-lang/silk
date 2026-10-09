@@ -261,7 +261,8 @@ other function; N7 needs no drop-glue key change.
 Nothing in the corpus. Every program with a failure report is a `pub effect fn main` program, so
 it needs `silk/native_start` (ENTRY-001). `native_start` runs the application through
 `Execution.make` and `Execution.drive`, which stay `intrinsic-member` until the suspension stage.
-Decision Q1 keeps the `Entry { main }` shim until then; this note does not change it.
+Decision Q1 kept the `Entry { main }` shim until then. Selfhost has since removed it: every build
+roots at its runtime's C exports, `silk/native_start` by default.
 `test_runner.silk` is compiled by the bootstrap's `silk test`, never by selfhost today.
 
 The origin-only step is therefore proven by structured MIR tests (§6). A program that installs its
@@ -281,8 +282,8 @@ callable-value follow-up owns it.
 | ------------------- | --------- | -------------------------------------------------------------------------- | ------------------------------------ |
 | `intrinsic-member`  | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage                     |
 | `observer-callback` | **new**   | an `observeDiagnostics` callback that is not a direct function             | callback environments in the record  |
-| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive or unit type  | identity rendering for the remainder |
-| `entry-signature`   | unchanged | as before                                                                  | Q1                                   |
+| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive, string or unit type | identity rendering for the remainder |
+| `entry-signature`   | removed   | no generated entry; every build roots at its runtime's C exports           | default runtime selection            |
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
