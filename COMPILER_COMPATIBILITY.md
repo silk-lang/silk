@@ -1608,17 +1608,20 @@ elides a lifetime checks its initializer without contextual expectation, so a co
 initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
 exact region, so a later assignment with a different nonlocal lifetime is refused.
 
-An unannotated `let mut` binding instead takes its own body-scoped region, as LIFE-003 infers a
-local's lifetimes from its uses: each non-static region it retains through a reference, slice,
-string, array element or nominal argument becomes the binding's region, and an exclusive referent
-and `'static` regions stay exact. The initializer and every later assignment from an input region
-meet it as an enclosing-region loan, so `let mut s = a if flag { s = b }` types for unrelated
-inputs `a` and `b`, as in `Uri.resolveInto`. Where the bootstrap's body-lifetime solve rejects such
-a binding, native typing keeps each use at a longer region as a `RegionRelation` obligation for
-native borrow checking (roadmap step 14): `return s` at a declared `'a` after `s = b` compiles
-natively until then, and an assignment inside a loop body, which the bootstrap also rejects, types
-natively. Evidence: `reassignedBindingsMeetAtTheirBodyRegion` in
-`compiler/src/semantic/SemanticCallableCases.silk`. Ordinary
+An unannotated `let mut` binding instead meets its regions on reassignment, as LIFE-003 infers a
+local's lifetimes from its uses. An assignment at the binding's own loop depth gives the binding
+the meet of its current type and the value's in each reference, slice, string, array element and
+covariant nominal region, so `let mut s = a if flag { s = b }` types for unrelated inputs `a` and
+`b`, as in `Uri.resolveInto`, and every later use sees the shorter region. Uses before the
+assignment keep the earlier type. An assignment inside a deeper loop cannot widen the binding,
+because uses earlier in that loop were checked at the previous type, so the value must meet the
+binding's type as it stands; the bootstrap refuses such an assignment when the regions differ, and
+native accepts it only when the value's regions provably outlive the binding's. Where the bootstrap
+refuses an assignment that a later use makes too long, native refuses that use: `return s` at a
+declared `'a` after `s = b` is `TypeMismatch` at `return s`. A caller-local region assigned to a
+local never defers a relation to a region the body does not own; that is `TypeMismatch` at the
+value until native borrow checking (roadmap step 14) can enforce it. Evidence:
+`reassignedBindingsMeetAssignedRegions` in `compiler/src/semantic/SemanticCallableCases.silk`. Ordinary
 call-site generic arguments now infer omitted lifetimes in private invocation slots.
 The actual operands or expected result must close every omitted slot before the compiler publishes
 the selected application. Original target owners and sparse binder ordinals remain unchanged;
