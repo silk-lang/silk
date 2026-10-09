@@ -2816,3 +2816,23 @@ fn released(callback: for<use 'call> once fn<'static>(&'call mut [i32]) -> once 
       }
     }),
 )
+
+// Lifetime flow must see `let` initializers inside an inline Effect block: a borrowed array
+// temporary there keeps the binding's lexical validity, exactly as it does in a function body.
+it.effect('extends a let-bound array temporary borrowed inside an inline effect block', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* Analysis.ofSource(
+      'ownership/effect-block-array-temporary',
+      ascii(`struct Token { value: i32 }
+fn keep(slice: &[Token]) -> &[Token] { return slice }
+fn read() -> i32 {
+  return run effect {
+    let slice = keep(&[Token { value: 8 }])
+    return slice[0].value
+  }
+}
+pub fn main() -> i32 { return read() }`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+  }),
+)
