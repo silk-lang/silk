@@ -101,13 +101,13 @@ effect fn case5() -> bool ! OutOfMemoryError {
   let label: [u8; 3] = [107, 101, 121]
   let context: [u8; 0] = []
   let mut allocator = Allocator.systemAllocatorProvider()
-  let allocation = Bytes.zeroed(8160) |> Effect.provideMut(&mut allocator)
+  let mut allocation = Bytes.zeroed(8160) |> Effect.provideMut(&mut allocator)
   let mut output = run allocation
   if !ok(TlsHkdfSha256.expandLabel(&secret, &label, &context, Bytes.asMutSlice(&mut output))) { return false }
   let digest = Sha256.hash(Bytes.asSlice(&output))
   let expected: [u8; 32] = [8, 7, 166, 111, 103, 19, 26, 223, 248, 115, 15, 207, 249, 215, 141, 113, 35, 135, 98, 16, 10, 57, 69, 109, 205, 193, 160, 40, 137, 167, 109, 56]
   if !same(&digest, &expected) { return false }
-  let allocation2 = Bytes.zeroed(8161) |> Effect.provideMut(&mut allocator)
+  let mut allocation2 = Bytes.zeroed(8161) |> Effect.provideMut(&mut allocator)
   let mut excessive = run allocation2
   let rejected = TlsHkdfSha256.expandLabel(&secret, &label, &context, Bytes.asMutSlice(&mut excessive))
   let valid = match move rejected {
@@ -127,13 +127,13 @@ effect fn case6() -> bool ! OutOfMemoryError {
   let label: [u8; 3] = [107, 101, 121]
   let context: [u8; 0] = []
   let mut allocator = Allocator.systemAllocatorProvider()
-  let allocation = Bytes.zeroed(12240) |> Effect.provideMut(&mut allocator)
+  let mut allocation = Bytes.zeroed(12240) |> Effect.provideMut(&mut allocator)
   let mut output = run allocation
   if !ok(TlsHkdfSha384.expandLabel(&secret, &label, &context, Bytes.asMutSlice(&mut output))) { return false }
   let digest = Sha256.hash(Bytes.asSlice(&output))
   let expected: [u8; 32] = [158, 123, 101, 93, 14, 249, 130, 249, 216, 52, 120, 13, 247, 169, 134, 185, 44, 247, 214, 209, 161, 211, 35, 23, 241, 185, 126, 143, 93, 26, 229, 253]
   if !same(&digest, &expected) { return false }
-  let allocation2 = Bytes.zeroed(12241) |> Effect.provideMut(&mut allocator)
+  let mut allocation2 = Bytes.zeroed(12241) |> Effect.provideMut(&mut allocator)
   let mut excessive = run allocation2
   let rejected = TlsHkdfSha384.expandLabel(&secret, &label, &context, Bytes.asMutSlice(&mut excessive))
   let valid = match move rejected {
