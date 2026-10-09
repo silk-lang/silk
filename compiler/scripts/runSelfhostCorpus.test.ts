@@ -5,7 +5,7 @@ import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
 import {
-  parseBuildDiagnostic,
+  parseBuildDiagnostics,
   parseUnsupported,
   runCase,
   runCorpus,
@@ -133,6 +133,7 @@ void it('keeps build and runtime regressions in the failure count', () => {
       name: 'literal',
       status: 'fail',
       code: 'RUNTIME_MISMATCH',
+      diagnostics: [],
       reason: 'profile optimized: run 1: exit: expected 42, got 41',
     })
   })
@@ -141,7 +142,7 @@ void it('keeps build and runtime regressions in the failure count', () => {
 void it('fails the gate only for cases on the ordered selfhost track', () => {
   const results = [
     { name: 'literal', status: 'pass' },
-    { name: 'future', status: 'fail', code: 'UnknownName', reason: 'not ready' },
+    { name: 'future', status: 'fail', code: 'UnknownName', diagnostics: [], reason: 'not ready' },
     {
       name: 'later',
       status: 'unsupported',
@@ -189,27 +190,45 @@ chmod +x "$output"`
 void it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
   const record =
     'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34},"module":"main.silk"}'
+  const other =
+    'SILK_BUILD_ERROR={"code":"TypeMismatch","span":{"start":6,"end":9},"module":"silk/uri.silk"}'
+  const gaps = 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"typed-form","reason":"not lowered"}]}'
   withStub(`echo '${record}' >&2; exit 1`, (silkc) => {
     const result = runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
     if (result.status !== 'fail') throw new Error('expected rejection')
     assert.strictEqual(result.code, 'UnknownName')
-    assert.deepStrictEqual(result.span, { start: 28, end: 34 })
-    assert.strictEqual(result.module, 'main.silk')
+    assert.deepStrictEqual(result.diagnostics, [
+      { code: 'UnknownName', span: { start: 28, end: 34 }, module: 'main.silk' },
+    ])
     assert.deepStrictEqual(summarize([result], []).failureCounts, [
       { code: 'UnknownName', count: 1 },
     ])
   })
-  assert.strictEqual(parseBuildDiagnostic(`${record}\n${record}`), undefined)
+  // A build walk prints every refusal beside the gaps it reached; gaps never hide a refusal.
+  withStub(`printf '%s\\n' '${record}' '${other}' '${record}' '${gaps}' >&2; exit 1`, (silkc) => {
+    const result = runCase(silkc, literal)
+    assert.strictEqual(result.status, 'fail')
+    if (result.status !== 'fail') throw new Error('expected rejection')
+    assert.strictEqual(result.code, 'UnknownName')
+    assert.deepStrictEqual(
+      result.diagnostics.map((diagnostic) => diagnostic.code),
+      ['UnknownName', 'TypeMismatch'],
+    )
+  })
+  withStub(`echo '${gaps}' >&2; exit 1`, (silkc) => {
+    assert.strictEqual(runCase(silkc, literal).status, 'unsupported')
+  })
+  assert.strictEqual(parseBuildDiagnostics('unsupported: aggregates'), undefined)
   assert.strictEqual(
-    parseBuildDiagnostic(
-      'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28},"module":"main.silk"}',
+    parseBuildDiagnostics(
+      `${record}\nSILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28},"module":"main.silk"}`,
     ),
     undefined,
   )
-  assert.strictEqual(parseBuildDiagnostic('SILK_BUILD_ERROR=semantic-rejection'), undefined)
+  assert.strictEqual(parseBuildDiagnostics('SILK_BUILD_ERROR=semantic-rejection'), undefined)
   assert.strictEqual(
-    parseBuildDiagnostic('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'),
+    parseBuildDiagnostics('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'),
     undefined,
   )
 })
