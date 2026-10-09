@@ -1,0 +1,197 @@
+//! Native link inputs a package declares in `[build].native-link-inputs`, and their linker spelling.
+
+import semantic.Target {Id as TargetId, Target}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.bytes {Bytes}
+import silk.child_process {ChildProcess, ProcessRequest}
+import silk.filesystem {FileError, Path}
+import silk.option {Option}
+import silk.string {String}
+import silk.toml_value {Toml, TomlChild, Value as TomlValue}
+import silk.usize
+import silk.vector {Vector}
+
+/// A `[build].native-link-inputs` entry that is not exactly one object, static-archive,
+/// search-path, linker-script or framework value, or one library with a static or dynamic mode;
+/// or an input the build target cannot link.
+pub struct InvalidNativeLinkInput {}
+
+/// How a named library is resolved by the linker.
+pub enum Linkage { Static, Dynamic }
+
+/// One typed link input. Paths are resolved against the directory of the declaring manifest.
+pub union NativeLinkInput {
+  Object {path: Path},
+  StaticArchive {path: Path},
+  SearchPath {path: Path},
+  LinkerScript {path: Path},
+  Library {name: Bytes, linkage: Linkage},
+  Framework {name: Bytes},
+}
+
+fn sameText(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The number of members of a table, or none for another value kind.
+fn memberCount(value: &TomlValue) -> Option<usize> {
+  return match &value.* {
+    TomlValue.Table {entries, kind: _} => {
+      let boxed = Box.get<Vector<TomlChild>>(&entries)
+      return Option.some<usize>(Vector.length<TomlChild>(&boxed[0]))
+    }
+    _ => Option.none<usize>()
+  }
+}
+
+// A library or framework name: nonempty, not an option, and free of whitespace, NUL and separators.
+fn nativeName(text: &[u8]) -> bool {
+  if text.length == usize.ZERO || text[usize.ZERO] == 45 { return false }
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    // NUL, tab through carriage return, space, slash and backslash.
+    if byte == 0 || (byte >= 9 && byte <= 13) || byte == 32 || byte == 47 || byte == 92 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn namedText(entry: &TomlValue, key: string) -> Bytes
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  return match move Toml.asString(Toml.field(entry, key)) {
+    Option<string>.Some {value} => {
+      let text = String.utf8Bytes(value)
+      if !nativeName(text) { fail InvalidNativeLinkInput {} }
+      return run Bytes.copy(text)
+    }
+    Option<string>.None => { fail InvalidNativeLinkInput {} }
+  }
+}
+
+// A relative path below `directory`; `Path.join` rejects absolute, empty, dot and dot-dot spellings.
+effect fn relativePath(directory: &Path, entry: &TomlValue, key: string) -> Option<Path>
+! FileError | OutOfMemoryError ? &mut Allocator {
+  return match move Toml.asString(Toml.field(entry, key)) {
+    Option<string>.Some {value} => Option.some<Path>(run Path.join(directory, value))
+    Option<string>.None => Option.none<Path>()
+  }
+}
+
+effect fn decode(directory: &Path, entry: &TomlValue) -> NativeLinkInput
+! InvalidNativeLinkInput | FileError | OutOfMemoryError ? &mut Allocator {
+  let members = match move memberCount(entry) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { fail InvalidNativeLinkInput {} }
+  }
+  if members == usize.add(0, 2) {
+    let name = run namedText(entry, "library")
+    let mode = match move Toml.asString(Toml.field(entry, "mode")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { fail InvalidNativeLinkInput {} }
+    }
+    if sameText(mode, b"static") {
+      return NativeLinkInput.Library {name: move name, linkage: Linkage.Static}
+    }
+    if sameText(mode, b"dynamic") {
+      return NativeLinkInput.Library {name: move name, linkage: Linkage.Dynamic}
+    }
+    fail InvalidNativeLinkInput {}
+  }
+  if members != usize.ONE { fail InvalidNativeLinkInput {} }
+  let object = run relativePath(directory, entry, "object")
+  if let Option<Path>.Some {value} = move object {
+    return NativeLinkInput.Object {path: move value}
+  }
+  let archive = run relativePath(directory, entry, "static-archive")
+  if let Option<Path>.Some {value} = move archive {
+    return NativeLinkInput.StaticArchive {path: move value}
+  }
+  let searched = run relativePath(directory, entry, "search-path")
+  if let Option<Path>.Some {value} = move searched {
+    return NativeLinkInput.SearchPath {path: move value}
+  }
+  let script = run relativePath(directory, entry, "linker-script")
+  if let Option<Path>.Some {value} = move script {
+    return NativeLinkInput.LinkerScript {path: move value}
+  }
+  let framework = run namedText(entry, "framework")
+  return NativeLinkInput.Framework {name: move framework}
+}
+
+/// Reads `[build].native-link-inputs` from a parsed manifest in `directory`, in declaration order.
+pub effect fn read(document: &TomlValue, directory: &Path) -> Vector<NativeLinkInput>
+! InvalidNativeLinkInput | FileError | OutOfMemoryError ? &mut Allocator {
+  let mut inputs = Vector.make<NativeLinkInput>()
+  let declared = match move Toml.fieldAt(Toml.field(document, "build"), "native-link-inputs") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return move inputs }
+  }
+  let listed = match &declared.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed { fail InvalidNativeLinkInput {} }
+  let mut at = usize.ZERO
+  while true {
+    let entry = match move Toml.item(declared, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    let input = run decode(directory, entry)
+    run Vector.append<NativeLinkInput>(&mut inputs, move input)
+    at = at + usize.ONE
+  }
+  return move inputs
+}
+
+/// Appends the clang driver arguments that link `self` for `target`.
+pub effect fn appendArguments(self: &NativeLinkInput, target: &Target, process: &mut ProcessRequest) -> ()
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let darwin = Target.id(target) == TargetId.Aarch64AppleDarwin
+  match &self.* {
+    NativeLinkInput.Object {path} => {
+      run ChildProcess.addArgument(&mut process.*, Path.rawBytes(&path))
+    }
+    NativeLinkInput.StaticArchive {path} => {
+      run ChildProcess.addArgument(&mut process.*, Path.rawBytes(&path))
+    }
+    NativeLinkInput.SearchPath {path} => {
+      let mut argument = run Bytes.copy(b"-L")
+      run Bytes.append(&mut argument, Path.rawBytes(&path))
+      run ChildProcess.addArgument(&mut process.*, Bytes.asSlice(&argument))
+    }
+    NativeLinkInput.LinkerScript {path} => {
+      if !sameText(Target.operatingSystem(target), b"linux") { fail InvalidNativeLinkInput {} }
+      run ChildProcess.addArgument(&mut process.*, b"-Xlinker")
+      run ChildProcess.addArgument(&mut process.*, b"-T")
+      run ChildProcess.addArgument(&mut process.*, b"-Xlinker")
+      run ChildProcess.addArgument(&mut process.*, Path.rawBytes(&path))
+    }
+    NativeLinkInput.Library {name, linkage} => {
+      let mut argument = run Bytes.copy(b"-l")
+      run Bytes.append(&mut argument, Bytes.asSlice(&name))
+      if linkage == Linkage.Dynamic {
+        run ChildProcess.addArgument(&mut process.*, Bytes.asSlice(&argument))
+      } else {
+        if darwin { fail InvalidNativeLinkInput {} }
+        run ChildProcess.addArgument(&mut process.*, b"-Wl,-Bstatic")
+        run ChildProcess.addArgument(&mut process.*, Bytes.asSlice(&argument))
+        run ChildProcess.addArgument(&mut process.*, b"-Wl,-Bdynamic")
+      }
+    }
+    NativeLinkInput.Framework {name} => {
+      if !darwin { fail InvalidNativeLinkInput {} }
+      run ChildProcess.addArgument(&mut process.*, b"-framework")
+      run ChildProcess.addArgument(&mut process.*, Bytes.asSlice(&name))
+    }
+  }
+  return ()
+}
