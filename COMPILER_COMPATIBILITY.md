@@ -1606,7 +1606,19 @@ mismatching argument keep `TypeMismatch`.
 Equality is stricter than the bootstrap's region solve in two ways. A binding annotation that
 elides a lifetime checks its initializer without contextual expectation, so a context-typed
 initializer such as `&[1, 2]` for `&[u8]` is refused; and the binding keeps its initializer's
-exact region, so a later assignment with a different nonlocal lifetime is refused. Ordinary
+exact region, so a later assignment with a different nonlocal lifetime is refused.
+
+An unannotated `let mut` binding instead takes its own body-scoped region, as LIFE-003 infers a
+local's lifetimes from its uses: each non-static region it retains through a reference, slice,
+string, array element or nominal argument becomes the binding's region, and an exclusive referent
+and `'static` regions stay exact. The initializer and every later assignment from an input region
+meet it as an enclosing-region loan, so `let mut s = a if flag { s = b }` types for unrelated
+inputs `a` and `b`, as in `Uri.resolveInto`. Where the bootstrap's body-lifetime solve rejects such
+a binding, native typing keeps each use at a longer region as a `RegionRelation` obligation for
+native borrow checking (roadmap step 14): `return s` at a declared `'a` after `s = b` compiles
+natively until then, and an assignment inside a loop body, which the bootstrap also rejects, types
+natively. Evidence: `reassignedBindingsMeetAtTheirBodyRegion` in
+`compiler/src/semantic/SemanticCallableCases.silk`. Ordinary
 call-site generic arguments now infer omitted lifetimes in private invocation slots.
 The actual operands or expected result must close every omitted slot before the compiler publishes
 the selected application. Original target owners and sparse binder ordinals remain unchanged;
