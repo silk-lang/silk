@@ -198,14 +198,14 @@ const maximumChecks = maximumVectors.map((vector) => {
   ${declaration('prk', vector.prk)}
   let info: [u8; 5] = [108, 105, 109, 105, 116]
   ${declaration('expectedDigest', vector.expected)}
-  let outputAllocation = Bytes.zeroed(${maximum}) |> Effect.provideMut(&mut allocator)
+  let mut outputAllocation = Bytes.zeroed(${maximum}) |> Effect.provideMut(&mut allocator)
   let mut output = run outputAllocation
   if !succeeded(HkdfSha${vector.bits}.expand(&prk, &info, Bytes.asMutSlice(&mut output))) { return false }
   let digest = Sha256.hash(Bytes.asSlice(&output))
   if !equalBytes(&digest, &expectedDigest) { return false }
   let mut empty: [u8; 0] = []
   if !succeeded(HkdfSha${vector.bits}.expand(&prk, &info, &mut empty)) { return false }
-  let excessiveAllocation = Bytes.zeroed(${maximum + 1}) |> Effect.provideMut(&mut allocator)
+  let mut excessiveAllocation = Bytes.zeroed(${maximum + 1}) |> Effect.provideMut(&mut allocator)
   let mut excessive = run excessiveAllocation
   fillSentinel(Bytes.asMutSlice(&mut excessive))
   let result = HkdfSha${vector.bits}.expand(&prk, &info, Bytes.asMutSlice(&mut excessive))
