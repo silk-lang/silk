@@ -1,5 +1,6 @@
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import * as Data from 'effect/Data'
+import * as ConformanceProof from './ConformanceProof.js'
 import { generated, indexExits, initializationFlagsOf } from './CleanupEmission.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
@@ -12,7 +13,7 @@ import * as Tir from './Tir.js'
 import * as Instances from './Instances.js'
 import * as TypeInference from './internal/TypeInference.js'
 import type * as Layout from './Layout.js'
-import type { ExecutableEffectType } from './Lower.js'
+import type { ExecutableEffectType, ProvidedRequirement } from './Lower.js'
 import { i32, local, mirType, patternKey } from './Lower.js'
 import type {} from './LowerExpression.js'
 import { lowerExpressionInner } from './LowerExpression.js'
@@ -617,6 +618,52 @@ const effectCaptureParameterTypes = (
     ]
   })
 
+// Generated runners share one physical body across callers whose proven providers differ only in
+// proof-only lifetimes. The body was checked in its owner instance, so it lowers against the
+// owner's own selection of each source provider; the runner's provider contract keeps the
+// caller's proof, which matches it at runtime. A provider the owner selected without a witness
+// for this capability is a lowering failure, never a fallback to the caller's selection.
+const ownerRequirement = (
+  index: DeclarationIndex.Index,
+  calls: ReadonlyArray<Instances.CallInstance>,
+  owner: Instances.InstanceKey,
+  requirement: ProvidedRequirement,
+): ProvidedRequirement | undefined => {
+  if (requirement.witness._tag !== 'SourceConformanceWitness') return requirement
+  const ownerKey = Instances.keyText(owner)
+  const runtimeProvider = Type.runtimeKey(requirement.providerType)
+  const selected = calls
+    .filter((call) => Instances.keyText(call.owner) === ownerKey)
+    .flatMap((call) => call.providers ?? [])
+    .find(
+      (provider) =>
+        provider.role === requirement.role &&
+        Type.equals(provider.capability, requirement.capability) &&
+        Type.runtimeKey(provider.providerType) === runtimeProvider,
+    )
+  if (selected === undefined || Type.equals(selected.providerType, requirement.providerType))
+    return requirement
+  const witness = ConformanceProof.witness(index, selected.providerType, requirement.capability)
+  return witness?._tag === 'SourceConformanceWitness'
+    ? { ...requirement, providerType: selected.providerType, witness }
+    : undefined
+}
+
+/** Rebinds every provider to the runner owner, or reports that one has no witness there. */
+const ownerRequirements = (
+  index: DeclarationIndex.Index,
+  calls: ReadonlyArray<Instances.CallInstance>,
+  owner: Instances.InstanceKey,
+  requirements: ReadonlyArray<ProvidedRequirement>,
+): ReadonlyArray<ProvidedRequirement> | undefined => {
+  const owned = requirements.map((requirement) =>
+    ownerRequirement(index, calls, owner, requirement),
+  )
+  return owned.every((requirement) => requirement !== undefined)
+    ? owned.flatMap((requirement) => (requirement === undefined ? [] : [requirement]))
+    : undefined
+}
+
 export const lowerEffectRunner = (
   spec: GeneratedBlockEffectRunner,
   ownership: Ownership.ModuleOwnership | undefined,
@@ -650,7 +697,15 @@ export const lowerEffectRunner = (
   )
   if (captureParameterTypes.length !== block.captures.length)
     return unavailableEffectRunner(spec, runnerFallback(spec))
-  const parameterizedRequirements = spec.providedRequirements.filter(
+  const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
+  if (owned === undefined)
+    return unavailableEffectRunner(spec, {
+      boundary: 'Expression',
+      construct: 'EffectBlock',
+      provenance: { span: spec.block.span, generated: false },
+      reason: { _tag: 'OwnerProviderWitness' },
+    })
+  const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
   const requirementParameterTypes = parameterizedRequirements.flatMap((requirement) => {
@@ -680,7 +735,7 @@ export const lowerEffectRunner = (
     effectResults,
     generatedRunners,
     opaqueRealizations,
-    spec.providedRequirements.map((requirement) => {
+    owned.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
         ...requirement,
@@ -760,7 +815,9 @@ export const lowerCatchEffectRunner = (
   opaqueRealizations: OpaqueRealization.Catalog,
   registry: SemanticContext.Registry,
 ): Mir.MirFunction | undefined => {
-  const parameterizedRequirements = spec.providedRequirements.filter(
+  const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
+  if (owned === undefined) return undefined
+  const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
   const requirementParameterTypes = parameterizedRequirements.flatMap((requirement) => {
@@ -802,7 +859,7 @@ export const lowerCatchEffectRunner = (
     effectResults,
     generatedRunners,
     opaqueRealizations,
-    spec.providedRequirements.map((requirement) => {
+    owned.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
         ...requirement,
@@ -875,7 +932,9 @@ export const lowerBuiltinEffectRunner = (
     opaqueRealizations,
   )
   if (parameterTypes.length !== spec.expression.arguments.length) return undefined
-  const parameterizedRequirements = spec.providedRequirements.filter(
+  const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
+  if (owned === undefined) return undefined
+  const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
   const requirementParameterTypes = parameterizedRequirements.flatMap((requirement) => {
@@ -915,7 +974,7 @@ export const lowerBuiltinEffectRunner = (
     effectResults,
     generatedRunners,
     opaqueRealizations,
-    spec.providedRequirements.map((requirement) => {
+    owned.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
         ...requirement,
@@ -999,7 +1058,9 @@ export const lowerWitnessEffectRunner = (
     opaqueRealizations,
   )
   if (parameterTypes.length !== spec.type.environment.fields.length) return undefined
-  const parameterizedRequirements = spec.providedRequirements.filter(
+  const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
+  if (owned === undefined) return undefined
+  const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
   const requirementParameterTypes = parameterizedRequirements.flatMap((requirement) => {
@@ -1040,7 +1101,7 @@ export const lowerWitnessEffectRunner = (
     effectResults,
     generatedRunners,
     opaqueRealizations,
-    spec.providedRequirements.map((requirement) => {
+    owned.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
         ...requirement,
