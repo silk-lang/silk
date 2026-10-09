@@ -2,6 +2,7 @@
 
 import backend.CAbi
 import backend.CAbi {Extension as CExtension}
+import backend.Coroutine {Coroutine, Extent, Facts, FrameSlot, State}
 import backend.InstanceKey {InstanceKey}
 import backend.InstanceIdentity {InstanceIdentity}
 import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Tagged as TaggedFacts, TypeLayout}
@@ -2809,6 +2810,8 @@ effect fn emitBlock(
   block: &Block,
   foreign: &[CAbi.Signature],
   identities: &[InstanceIdentity],
+  suspended: &Option<Suspended>,
+  index: usize,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
   let statements = Vector.asSlice<Statement>(&block.statements)
   let locals = Vector.asSlice<Local>(&function.locals)
@@ -2878,28 +2881,43 @@ effect fn emitBlock(
       run label(&mut writer.*, elseBlock)
       run append(&mut writer.*, b"\n")
     }
-    Terminator.Return {origin} => {
-      run emitReturn(&mut writer.*, function, target, layouts, origin.span)
+    Terminator.Return {origin} => match &suspended.* {
+      Option<Suspended>.Some {value: stepping} => run emitStepReturn(&mut writer.*, function, target, layouts, &stepping, origin.span)
+      Option<Suspended>.None => run emitReturn(&mut writer.*, function, target, layouts, origin.span)
     }
     Terminator.Call {callee, arguments, providers, diagnostics, destination, normal, failure, origin} => {
-      run emitCall(
-        &mut writer.*,
-        function,
-        target,
-        layouts,
-        foreign,
-        identities,
-        &callee,
-        &arguments,
-        &providers,
-        &diagnostics,
-        &destination,
-        normal,
-        &failure,
-        origin.span,
-      )
+      let mut state = usize.MAX
+      if let Option<Suspended>.Some {value: stepping} = &suspended.* {
+        state = Coroutine.stateAfter(&stepping.coroutine, index)
+      }
+      if state != usize.MAX {
+        if let Option<Suspended>.Some {value: stepping} = &suspended.* {
+          run emitSuspendingCall(&mut writer.*, function, target, layouts, identities, &stepping, state, &callee,
+            &arguments, &providers, &diagnostics, &destination, &failure, origin.span)
+        }
+      } else {
+        run emitCall(
+          &mut writer.*,
+          function,
+          target,
+          layouts,
+          foreign,
+          identities,
+          &callee,
+          &arguments,
+          &providers,
+          &diagnostics,
+          &destination,
+          normal,
+          &failure,
+          origin.span,
+        )
+      }
     }
-    Terminator.Fail {origin} => run emitFail(&mut writer.*, function, target, layouts, origin.span)
+    Terminator.Fail {origin} => match &suspended.* {
+      Option<Suspended>.Some {value: stepping} => run emitStepFail(&mut writer.*, function, target, layouts, &stepping, origin.span)
+      Option<Suspended>.None => run emitFail(&mut writer.*, function, target, layouts, origin.span)
+    }
     Terminator.Trap {origin: _} => run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
     Terminator.Unreachable {origin: _} => run append(&mut writer.*, b"unreachable\n")
     Terminator.Switch {value, cases, otherwise, origin: _} => {
@@ -2936,10 +2954,53 @@ effect fn emitEntrySlots(
   target: &Target,
   layouts: &[TypeLayout],
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  run emitSlots(&mut writer.*, function, target, layouts, &Option.none<Suspended>())
   let locals = Vector.asSlice<Local>(&function.locals)
   let parameters = Vector.asSlice<Shared<Type>>(&function.parameters)
   let mut local = usize.ZERO
+  while local < parameters.length {
+    let parameterLayout = run layoutOf(layouts, &parameters[local], function,
+      locals[local + usize.ONE].origin.span)
+    let kind = storageRepresentation(&parameters[local], target, parameterLayout)
+    let mut parameterName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    run append(&mut parameterName, b"%p")
+    run decimal(&mut parameterName, local)
+    let input = move parameterName.text
+    let mut addressName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    run localName(&mut addressName, local + usize.ONE)
+    let address = Address {ty: Shared.clone<Type>(&parameters[local]), text: move addressName.text,
+      alignment: parameterLayout.alignment, representation: kind}
+    let value = Value {scalar: kind, text: move input}
+    run storeValue(&mut writer.*, &address, &value)
+    local = local + usize.ONE
+  }
+  return run emitHiddenStores(&mut writer.*, function)
+}
+
+/// Emits one storage address per local: a stack slot, or for a suspended step the frame slot of a
+/// frame-resident local. Then each failure slot's context companion.
+effect fn emitSlots(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &[TypeLayout],
+  suspended: &Option<Suspended>,
+) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let mut local = usize.ZERO
   while local < locals.length {
+    let mut resident = usize.MAX
+    if let Option<Suspended>.Some {value: stepping} = &suspended.* {
+      resident = Coroutine.residentAt(&stepping.coroutine, local)
+    }
+    if resident != usize.MAX {
+      run localName(&mut writer.*, local)
+      run append(&mut writer.*, b" = getelementptr i8, ptr %frame, i64 ")
+      run decimal(&mut writer.*, resident)
+      run append(&mut writer.*, b"\n")
+      local = local + usize.ONE
+      continue
+    }
     let localLayout = run layoutOf(
       layouts,
       &locals[local].ty,
@@ -2959,23 +3020,32 @@ effect fn emitEntrySlots(
     }
     local = local + usize.ONE
   }
-  local = usize.ZERO
-  while local < parameters.length {
-    let parameterLayout = run layoutOf(layouts, &parameters[local], function,
-      locals[local + usize.ONE].origin.span)
-    let kind = storageRepresentation(&parameters[local], target, parameterLayout)
-    let mut parameterName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
-    run append(&mut parameterName, b"%p")
-    run decimal(&mut parameterName, local)
-    let input = move parameterName.text
-    let mut addressName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
-    run localName(&mut addressName, local + usize.ONE)
-    let address = Address {ty: Shared.clone<Type>(&parameters[local]), text: move addressName.text,
-      alignment: parameterLayout.alignment, representation: kind}
-    let value = Value {scalar: kind, text: move input}
-    run storeValue(&mut writer.*, &address, &value)
-    local = local + usize.ONE
+  // Every failure slot except `Failure` owns a fixed-size context companion; `Failure`'s is the
+  // caller's `%context` (failure observer note N3). A step keeps every companion in its frame.
+  let companions = run companionLocals(function)
+  let owned = Vector.asSlice<usize>(&companions)
+  let word = u32.toUsize(Target.pointerBits(target)) / 8
+  let mut companionAt = usize.ZERO
+  while companionAt < owned.length {
+    run append(&mut writer.*, Bytes.asSlice(&run companionAddress(function, owned[companionAt])))
+    if let Option<Suspended>.Some {value: stepping} = &suspended.* {
+      run append(&mut writer.*, b" = getelementptr i8, ptr %frame, i64 ")
+      run decimal(&mut writer.*, Coroutine.companionAt(&stepping.coroutine, owned[companionAt]))
+      run append(&mut writer.*, b"\n")
+    } else {
+      run append(&mut writer.*, b" = alloca [4 x i")
+      run decimal(&mut writer.*, word * 8)
+      run append(&mut writer.*, b"], align ")
+      run decimal(&mut writer.*, word)
+      run append(&mut writer.*, b"\n")
+    }
+    companionAt = companionAt + usize.ONE
   }
+  return ()
+}
+
+/// Stores the hidden provider, observer and cause addresses into their locals.
+effect fn emitHiddenStores(writer: &mut Writer, function: &MirFunction) -> () ! OutOfMemoryError ? &mut Allocator {
   // Each hidden provider address lands in its `Provider` local.
   let mut provider = usize.ZERO
   while providerLocalAt(function, provider) != usize.MAX {
@@ -2986,21 +3056,6 @@ effect fn emitEntrySlots(
     run localName(&mut writer.*, slot)
     run append(&mut writer.*, b"\n")
     provider = provider + usize.ONE
-  }
-  // Every failure slot except `Failure` owns a fixed-size context companion; `Failure`'s is the
-  // caller's `%context` (failure observer note N3).
-  let companions = run companionLocals(function)
-  let owned = Vector.asSlice<usize>(&companions)
-  let word = u32.toUsize(Target.pointerBits(target)) / 8
-  let mut companionAt = usize.ZERO
-  while companionAt < owned.length {
-    run append(&mut writer.*, Bytes.asSlice(&run companionAddress(function, owned[companionAt])))
-    run append(&mut writer.*, b" = alloca [4 x i")
-    run decimal(&mut writer.*, word * 8)
-    run append(&mut writer.*, b"], align ")
-    run decimal(&mut writer.*, word)
-    run append(&mut writer.*, b"\n")
-    companionAt = companionAt + usize.ONE
   }
   // An observed function's observer and selected-cause addresses land in their locals (N1, N2).
   let observer = diagnosticLocal(function, usize.ZERO)
@@ -3015,12 +3070,16 @@ effect fn emitEntrySlots(
 }
 
 /// Emits one definition; the caller sorts complete definitions before joining a module.
+///
+/// A suspendable instance's `suspension` facts make its ordinary symbol a driver and add its
+/// `$enter` and `$step` definitions (`backend.Coroutine`).
 pub effect fn emit(
   function: &MirFunction,
   target: &Target,
   layouts: &[TypeLayout],
   foreign: &[CAbi.Signature],
   identities: &[InstanceIdentity],
+  suspension: &Option<Facts>,
 ) -> Bytes ! Gap | OutOfMemoryError ? &mut Allocator {
   let mut writer = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
   let locals = Vector.asSlice<Local>(&function.locals)
@@ -3095,6 +3154,20 @@ pub effect fn emit(
     if observed { run append(&mut writer, b", ptr %context") }
   }
   run append(&mut writer, b") {\n")
+  if let Option<Facts>.Some {value: facts} = &suspension.* {
+    let suspended = Option.some<Suspended>(
+      Suspended {facts: run Facts.copy(&facts), coroutine: run planFrame(function, target, layouts, &facts)},
+    )
+    let base = run Bytes.copy(Bytes.asSlice(&writer.symbol))
+    if let Option<Suspended>.Some {value: stepping} = &suspended {
+      run emitDriver(&mut writer, function, target, layouts, &stepping, Bytes.asSlice(&base))
+      run emitEnter(&mut writer, function, target, layouts, &stepping, Bytes.asSlice(&base))
+      run emitStep(&mut writer, function, target, layouts, foreign, identities, &suspended, &stepping, Bytes.asSlice(&base))
+    }
+    run Bytes.append(&mut writer.constants, Bytes.asSlice(&writer.text))
+    return move writer.constants
+  }
+  let ordinary = Option.none<Suspended>()
   let blocks = Vector.asSlice<Block>(&function.blocks)
   at = usize.ZERO
   while at < blocks.length {
@@ -3103,12 +3176,623 @@ pub effect fn emit(
     if at == usize.ZERO {
       run emitEntrySlots(&mut writer, function, target, layouts)
     }
-    run emitBlock(&mut writer, function, target, layouts, &blocks[at], foreign, identities)
+    run emitBlock(&mut writer, function, target, layouts, &blocks[at], foreign, identities, &ordinary, at)
     at = at + usize.ONE
   }
   run append(&mut writer, b"}\n")
   run Bytes.append(&mut writer.constants, Bytes.asSlice(&writer.text))
   return move writer.constants
+}
+
+/// A suspendable definition's facts and frame, while its step is emitted.
+struct Suspended {
+  facts: Facts
+  coroutine: Coroutine
+}
+
+fn wordSize(target: &Target) -> usize {
+  return u32.toUsize(Target.pointerBits(target)) / 8
+}
+
+effect fn planFrame(function: &MirFunction, target: &Target, layouts: &[TypeLayout], facts: &Facts) -> Coroutine
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let mut extents = Vector.make<Extent>()
+  let mut local = usize.ZERO
+  while local < locals.length {
+    let metrics = run layoutOf(layouts, &locals[local].ty, function, locals[local].origin.span)
+    let kind = storageRepresentation(&locals[local].ty, target, metrics)
+    let mut size = metrics.size
+    if kind.unit { size = usize.ZERO }
+    let mut alignment = metrics.alignment
+    if alignment == usize.ZERO { alignment = usize.ONE }
+    run Vector.append<Extent>(&mut extents, Extent {size: size, alignment: alignment})
+    local = local + usize.ONE
+  }
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let mut points = Vector.make<bool>()
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let mut point = false
+    if let Terminator.Call {callee, ..} = &blocks[block].terminator {
+      if let Callee.Instance {key} = &callee { point = run Facts.suspends(facts, &key) }
+    }
+    run Vector.append<bool>(&mut points, point)
+    block = block + usize.ONE
+  }
+  let mut providers = usize.ZERO
+  while providerLocalAt(function, providers) != usize.MAX { providers = providers + usize.ONE }
+  let companions = run companionLocals(function)
+  return run Coroutine.plan(function, Vector.asSlice<Extent>(&extents), Vector.asSlice<bool>(&points), providers,
+    Vector.asSlice<usize>(&companions), wordSize(target))
+}
+
+// Writes `@"<symbol><suffix>"`.
+effect fn suffixedSymbol(writer: &mut Writer, symbol: &[u8], suffix: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(symbol)
+  run Bytes.append(&mut name, suffix)
+  run append(&mut writer.*, b"@")
+  return run quoted(&mut writer.*, Bytes.asSlice(&name))
+}
+
+// Copies `size` bytes; frame states and stack slots never overlap.
+effect fn copyBytes(writer: &mut Writer, destination: &[u8], source: &[u8], size: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b"call void @llvm.memmove.p0.p0.i64(ptr ")
+  run append(&mut writer.*, destination)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, source)
+  run append(&mut writer.*, b", i64 ")
+  run decimal(&mut writer.*, size)
+  return run append(&mut writer.*, b", i1 false)\n")
+}
+
+effect fn storeWordAt(writer: &mut Writer, value: &[u8], base: &[u8], offset: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let address = run byteOffset(&mut writer.*, base, offset)
+  run append(&mut writer.*, b"store ptr ")
+  run append(&mut writer.*, value)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&address))
+  return run append(&mut writer.*, b"\n")
+}
+
+effect fn loadWordAt(writer: &mut Writer, base: &[u8], offset: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let address = run byteOffset(&mut writer.*, base, offset)
+  let loaded = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&loaded))
+  run append(&mut writer.*, b" = load ptr, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&address))
+  run append(&mut writer.*, b"\n")
+  return move loaded
+}
+
+// Writes `%name = load ptr` of one hidden caller address from the frame header.
+effect fn loadHidden(writer: &mut Writer, name: &[u8], offset: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let address = run byteOffset(&mut writer.*, b"%frame", offset)
+  run append(&mut writer.*, name)
+  run append(&mut writer.*, b" = load ptr, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&address))
+  return run append(&mut writer.*, b"\n")
+}
+
+// Whether a suspendable definition takes a result address: its failure convention always does,
+// and so does any result with a lane.
+effect fn takesResult(function: &MirFunction, target: &Target, layouts: &[TypeLayout]) -> bool
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let facts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.span)
+  return failureLocal(function) != usize.MAX || !storageRepresentation(&function.result, target, facts).unit
+}
+
+// The `$enter` lanes after the transfer record: the written parameter lanes, then the hidden
+// provider, observer and cause addresses, then the result (`out`, when not empty), failure and
+// context addresses. A definition and its driver spell them alike.
+effect fn enterLanes(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout], out: &[u8]) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let parameters = Vector.asSlice<Shared<Type>>(&function.parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.span)
+    let lane = storageRepresentation(&parameters[at], target, facts)
+    if !lane.unit {
+      run append(&mut writer.*, b", ")
+      if facts.abi == Abi.Indirect { run append(&mut writer.*, b"ptr") }
+      else { run typeName(&mut writer.*, lane) }
+      run append(&mut writer.*, b" %p")
+      run decimal(&mut writer.*, at)
+    }
+    at = at + usize.ONE
+  }
+  let mut provider = usize.ZERO
+  while providerLocalAt(function, provider) != usize.MAX {
+    run append(&mut writer.*, b", ptr %q")
+    run decimal(&mut writer.*, provider)
+    provider = provider + usize.ONE
+  }
+  let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
+  if observed { run append(&mut writer.*, b", ptr %observer, ptr %cause") }
+  if out.length > usize.ZERO {
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, out)
+  }
+  if failureLocal(function) != usize.MAX {
+    run append(&mut writer.*, b", ptr %fail")
+    if observed { run append(&mut writer.*, b", ptr %context") }
+  }
+  return ()
+}
+
+// The ordinary symbol's body: push the instance's frame, step the top frame until none remains,
+// destroy the storage state the frames used, and return the outcome under the ordinary convention.
+effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  stepping: &Suspended, symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let resultFacts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.span)
+  let result = storageRepresentation(&function.result, target, resultFacts)
+  let fallible = failureLocal(function) != usize.MAX
+  run append(&mut writer.*, b"entry:\n%transfer = alloca [3 x i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b"], align ")
+  run decimal(&mut writer.*, word)
+  run append(&mut writer.*, b"\nstore ptr null, ptr %transfer\n")
+  run storeWordAt(&mut writer.*, b"null", b"%transfer", Coroutine.transferTop(word))
+  let failed = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferFailed(word))
+  run append(&mut writer.*, b"store i8 0, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&failed))
+  run append(&mut writer.*, b"\n")
+  let mut out = Bytes.make()
+  if fallible || result.aggregate { out = run Bytes.copy(b"%out") }
+  else if !result.unit {
+    run append(&mut writer.*, b"%result = alloca ")
+    run typeName(&mut writer.*, result)
+    run memoryAlignment(&mut writer.*, resultFacts.alignment)
+    out = run Bytes.copy(b"%result")
+  }
+  run append(&mut writer.*, b"call void ")
+  run suffixedSymbol(&mut writer.*, symbol, b"$enter")
+  run append(&mut writer.*, b"(ptr %transfer")
+  run enterLanes(&mut writer.*, function, target, layouts, Bytes.asSlice(&out))
+  run append(&mut writer.*, b")\nbr label %drive\ndrive:\n")
+  let top = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferTop(word))
+  let empty = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&empty))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&top))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&empty))
+  run append(&mut writer.*, b", label %finish, label %step\nstep:\n")
+  let resume = run loadWordAt(&mut writer.*, Bytes.asSlice(&top), Coroutine.resumeOffset(word))
+  run append(&mut writer.*, b"call i32 ")
+  run append(&mut writer.*, Bytes.asSlice(&resume))
+  run append(&mut writer.*, b"(ptr %transfer, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&top))
+  run append(&mut writer.*, b")\nbr label %drive\nfinish:\n")
+  let state = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b" = load ptr, ptr %transfer\n")
+  let absent = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&absent))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&absent))
+  run append(&mut writer.*, b", label %exit, label %destroy\ndestroy:\ncall void @")
+  run quoted(&mut writer.*, Bytes.asSlice(&stepping.facts.destroy))
+  run append(&mut writer.*, b"(ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b")\nbr label %exit\nexit:\n")
+  if fallible {
+    let flag = run temp(&mut writer.*)
+    run append(&mut writer.*, Bytes.asSlice(&flag))
+    run append(&mut writer.*, b" = load i8, ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&failed))
+    run append(&mut writer.*, b"\n")
+    let status = run temp(&mut writer.*)
+    run append(&mut writer.*, Bytes.asSlice(&status))
+    run append(&mut writer.*, b" = icmp ne i8 ")
+    run append(&mut writer.*, Bytes.asSlice(&flag))
+    run append(&mut writer.*, b", 0\nret i1 ")
+    run append(&mut writer.*, Bytes.asSlice(&status))
+    return run append(&mut writer.*, b"\n}\n")
+  }
+  if result.aggregate || result.unit { return run append(&mut writer.*, b"ret void\n}\n") }
+  let value = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&value))
+  run append(&mut writer.*, b" = load ")
+  run typeName(&mut writer.*, result)
+  run append(&mut writer.*, b", ptr %result")
+  run memoryAlignment(&mut writer.*, resultFacts.alignment)
+  run append(&mut writer.*, b"ret ")
+  run typeName(&mut writer.*, result)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, Bytes.asSlice(&value))
+  return run append(&mut writer.*, b"\n}\n")
+}
+
+// `$enter` acquires the instance's frame from the transfer record's storage state, creating that
+// state on first use, records the caller's addresses and the parameters, and pushes the frame.
+// Storage refusal is the fatal execution-stack exhaustion trap (SUSP-006).
+effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  stepping: &Suspended, symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let takes = run takesResult(function, target, layouts)
+  run append(&mut writer.*, b"define void ")
+  run suffixedSymbol(&mut writer.*, symbol, b"$enter")
+  run append(&mut writer.*, b"(ptr %transfer")
+  let mut out = Bytes.make()
+  if takes { out = run Bytes.copy(b"%out") }
+  run enterLanes(&mut writer.*, function, target, layouts, Bytes.asSlice(&out))
+  run append(&mut writer.*, b") {\nentry:\n")
+  let current = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&current))
+  run append(&mut writer.*, b" = load ptr, ptr %transfer\n")
+  let missing = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&missing))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&current))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&missing))
+  run append(&mut writer.*, b", label %create, label %ready\ncreate:\n")
+  let created = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&created))
+  run append(&mut writer.*, b" = call ptr @")
+  run quoted(&mut writer.*, Bytes.asSlice(&stepping.facts.create))
+  run append(&mut writer.*, b"()\n")
+  let refused = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&refused))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&created))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&refused))
+  run append(&mut writer.*, b", label %exhausted, label %publish\npublish:\nstore ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&created))
+  run append(&mut writer.*, b", ptr %transfer\nbr label %ready\nready:\n")
+  let state = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b" = load ptr, ptr %transfer\n%frame = call ptr @")
+  run quoted(&mut writer.*, Bytes.asSlice(&stepping.facts.acquire))
+  run append(&mut writer.*, b"(ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b", i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b" ")
+  run decimal(&mut writer.*, stepping.coroutine.size)
+  run append(&mut writer.*, b", i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b" ")
+  run decimal(&mut writer.*, stepping.coroutine.alignment)
+  run append(&mut writer.*, b")\n")
+  let exhausted = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&exhausted))
+  run append(&mut writer.*, b" = icmp eq ptr %frame, null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&exhausted))
+  run append(&mut writer.*, b", label %exhausted, label %start\nexhausted:\ncall void @llvm.trap()\nunreachable\nstart:\n")
+  let parent = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferTop(word))
+  run append(&mut writer.*, b"store ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&parent))
+  run append(&mut writer.*, b", ptr %frame\n")
+  let resume = run byteOffset(&mut writer.*, b"%frame", Coroutine.resumeOffset(word))
+  run append(&mut writer.*, b"store ptr ")
+  run suffixedSymbol(&mut writer.*, symbol, b"$step")
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&resume))
+  run append(&mut writer.*, b"\n")
+  let initial = run byteOffset(&mut writer.*, b"%frame", Coroutine.stateOffset(word))
+  run append(&mut writer.*, b"store i32 0, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&initial))
+  run append(&mut writer.*, b"\n")
+  let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
+  let fallible = failureLocal(function) != usize.MAX
+  if takes { run storeWordAt(&mut writer.*, b"%out", b"%frame", Coroutine.outOffset(word)) }
+  if fallible {
+    run storeWordAt(&mut writer.*, b"%fail", b"%frame", Coroutine.failOffset(word))
+    if observed { run storeWordAt(&mut writer.*, b"%context", b"%frame", Coroutine.contextOffset(word)) }
+  }
+  if observed {
+    run storeWordAt(&mut writer.*, b"%observer", b"%frame", Coroutine.observerOffset(word))
+    run storeWordAt(&mut writer.*, b"%cause", b"%frame", Coroutine.causeOffset(word))
+  }
+  let mut provider = usize.ZERO
+  while providerLocalAt(function, provider) != usize.MAX {
+    let mut name = Writer {text: run Bytes.copy(b"%q"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    run decimal(&mut name, provider)
+    run storeWordAt(&mut writer.*, Bytes.asSlice(&name.text), b"%frame", Coroutine.providerOffset(word, provider))
+    provider = provider + usize.ONE
+  }
+  // Each parameter lands where the body reads it: its resident slot or its slot in state 0.
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let parameters = Vector.asSlice<Shared<Type>>(&function.parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let offset = Coroutine.parameterAt(&stepping.coroutine, at + usize.ONE)
+    let parameterLayout = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.span)
+    let kind = storageRepresentation(&parameters[at], target, parameterLayout)
+    if !kind.unit && offset != usize.MAX {
+      let slot = run byteOffset(&mut writer.*, b"%frame", offset)
+      let mut parameterName = Writer {text: run Bytes.copy(b"%p"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+      run decimal(&mut parameterName, at)
+      let address = Address {ty: Shared.clone<Type>(&parameters[at]), text: move slot,
+        alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: kind}
+      let value = Value {scalar: kind, text: move parameterName.text}
+      run storeValue(&mut writer.*, &address, &value)
+    }
+    at = at + usize.ONE
+  }
+  let pushed = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferTop(word))
+  run append(&mut writer.*, b"store ptr %frame, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&pushed))
+  return run append(&mut writer.*, b"\nret void\n}\n")
+}
+
+// Copies one state's saved locals between their stack slots and the frame.
+effect fn transferState(writer: &mut Writer, slots: &[FrameSlot], saving: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < slots.length {
+    let frame = run byteOffset(&mut writer.*, b"%frame", slots[at].offset)
+    let mut named = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    run localName(&mut named, slots[at].local)
+    if saving { run copyBytes(&mut writer.*, Bytes.asSlice(&frame), Bytes.asSlice(&named.text), slots[at].size) }
+    else { run copyBytes(&mut writer.*, Bytes.asSlice(&named.text), Bytes.asSlice(&frame), slots[at].size) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// `$step` runs the frame on top from its resume state: state 0 starts the body, and state `k + 1`
+// restores what lives after point `k`, then continues at that call's normal or failure edge.
+effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  foreign: &[CAbi.Signature], identities: &[InstanceIdentity], suspended: &Option<Suspended>, stepping: &Suspended,
+  symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  run append(&mut writer.*, b"define i32 ")
+  run suffixedSymbol(&mut writer.*, symbol, b"$step")
+  run append(&mut writer.*, b"(ptr %transfer, ptr %frame) {\nentry:\n")
+  run emitSlots(&mut writer.*, function, target, layouts, suspended)
+  let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
+  let fallible = failureLocal(function) != usize.MAX
+  if run takesResult(function, target, layouts) { run loadHidden(&mut writer.*, b"%out", Coroutine.outOffset(word)) }
+  if fallible {
+    run loadHidden(&mut writer.*, b"%fail", Coroutine.failOffset(word))
+    if observed { run loadHidden(&mut writer.*, b"%context", Coroutine.contextOffset(word)) }
+  }
+  if observed {
+    run loadHidden(&mut writer.*, b"%observer", Coroutine.observerOffset(word))
+    run loadHidden(&mut writer.*, b"%cause", Coroutine.causeOffset(word))
+  }
+  let mut provider = usize.ZERO
+  while providerLocalAt(function, provider) != usize.MAX {
+    let mut name = Writer {text: run Bytes.copy(b"%q"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make()}
+    run decimal(&mut name, provider)
+    run loadHidden(&mut writer.*, Bytes.asSlice(&name.text), Coroutine.providerOffset(word, provider))
+    provider = provider + usize.ONE
+  }
+  let stateAddress = run byteOffset(&mut writer.*, b"%frame", Coroutine.stateOffset(word))
+  let state = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b" = load i32, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&stateAddress))
+  run append(&mut writer.*, b"\nswitch i32 ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b", label %invalid [ i32 0, label %start")
+  let states = Vector.asSlice<State>(&stepping.coroutine.states)
+  let mut resumed = usize.ONE
+  while resumed < states.length {
+    run append(&mut writer.*, b" i32 ")
+    run decimal(&mut writer.*, resumed)
+    run append(&mut writer.*, b", label %resume")
+    run decimal(&mut writer.*, resumed)
+    resumed = resumed + usize.ONE
+  }
+  run append(&mut writer.*, b" ]\ninvalid:\nunreachable\nstart:\n")
+  run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[usize.ZERO].slots), false)
+  run emitHiddenStores(&mut writer.*, function)
+  run append(&mut writer.*, b"br label %")
+  run label(&mut writer.*, usize.ZERO)
+  run append(&mut writer.*, b"\n")
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let points = Vector.asSlice<usize>(&stepping.coroutine.points)
+  resumed = usize.ONE
+  while resumed < states.length {
+    run append(&mut writer.*, b"resume")
+    run decimal(&mut writer.*, resumed)
+    run append(&mut writer.*, b":\n")
+    run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[resumed].slots), false)
+    if let Terminator.Call {normal, failure, ..} = &blocks[points[resumed - usize.ONE]].terminator {
+      if let Option<FailureEdge>.Some {value: edge} = &failure {
+        let failed = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferFailed(word))
+        let flag = run temp(&mut writer.*)
+        run append(&mut writer.*, Bytes.asSlice(&flag))
+        run append(&mut writer.*, b" = load i8, ptr ")
+        run append(&mut writer.*, Bytes.asSlice(&failed))
+        run append(&mut writer.*, b"\n")
+        let taken = run temp(&mut writer.*)
+        run append(&mut writer.*, Bytes.asSlice(&taken))
+        run append(&mut writer.*, b" = icmp ne i8 ")
+        run append(&mut writer.*, Bytes.asSlice(&flag))
+        run append(&mut writer.*, b", 0\nbr i1 ")
+        run append(&mut writer.*, Bytes.asSlice(&taken))
+        run append(&mut writer.*, b", label %")
+        run label(&mut writer.*, edge.target)
+        run append(&mut writer.*, b", label %")
+      } else {
+        run append(&mut writer.*, b"br label %")
+      }
+      run label(&mut writer.*, normal)
+      run append(&mut writer.*, b"\n")
+    }
+    resumed = resumed + usize.ONE
+  }
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    run label(&mut writer.*, at)
+    run append(&mut writer.*, b":\n")
+    run emitBlock(&mut writer.*, function, target, layouts, &blocks[at], foreign, identities, suspended, at)
+    at = at + usize.ONE
+  }
+  return run append(&mut writer.*, b"}\n")
+}
+
+// Completes the frame on top: records whether it failed, pops it, releases it to its storage
+// state, and reports completion to the driver.
+effect fn emitPop(writer: &mut Writer, target: &Target, stepping: &Suspended, failed: Option<bool>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  if let Option<bool>.Some {value} = move failed {
+    let flag = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferFailed(word))
+    run append(&mut writer.*, b"store i8 ")
+    if value { run append(&mut writer.*, b"1") } else { run append(&mut writer.*, b"0") }
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&flag))
+    run append(&mut writer.*, b"\n")
+  }
+  let parent = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&parent))
+  run append(&mut writer.*, b" = load ptr, ptr %frame\n")
+  run storeWordAt(&mut writer.*, Bytes.asSlice(&parent), b"%transfer", Coroutine.transferTop(word))
+  let state = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b" = load ptr, ptr %transfer\ncall void @")
+  run quoted(&mut writer.*, Bytes.asSlice(&stepping.facts.release))
+  run append(&mut writer.*, b"(ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  return run append(&mut writer.*, b", ptr %frame)\nret i32 0\n")
+}
+
+// A step's `Return` writes the result through the caller's result address before completing.
+effect fn emitStepReturn(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  stepping: &Suspended, span: Span) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let resultLayout = run layoutOf(layouts, &function.result, function, span)
+  let kind = storageRepresentation(&function.result, target, resultLayout)
+  if !kind.unit {
+    let returned = Operand.Copy {place: Place {local: usize.ZERO, projections: Vector.make<Projection>()}}
+    let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
+    let output = Address {ty: Shared.clone<Type>(&function.result), text: run Bytes.copy(b"%out"),
+      alignment: resultLayout.alignment, representation: kind}
+    run storeValue(&mut writer.*, &output, &value)
+  }
+  let mut failed = Option.none<bool>()
+  if failureLocal(function) != usize.MAX { failed = Option.some<bool>(false) }
+  return run emitPop(&mut writer.*, target, stepping, move failed)
+}
+
+// A step's `Fail` writes the failure through the caller's failure address before completing.
+effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  stepping: &Suspended, span: Span) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let local = failureLocal(function)
+  if local == usize.MAX {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.make(GapCode.TypedForm, &owner, span)
+  }
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let failureLayout = run layoutOf(layouts, &locals[local].ty, function, span)
+  let kind = storageRepresentation(&locals[local].ty, target, failureLayout)
+  if !kind.unit {
+    let failedValue = Operand.Copy {place: Place {local: local, projections: Vector.make<Projection>()}}
+    let value = run emitOperand(&mut writer.*, function, target, layouts, &failedValue)
+    let output = Address {ty: Shared.clone<Type>(&locals[local].ty), text: run Bytes.copy(b"%fail"),
+      alignment: failureLayout.alignment, representation: kind}
+    run storeValue(&mut writer.*, &output, &value)
+  }
+  return run emitPop(&mut writer.*, target, stepping, Option.some<bool>(true))
+}
+
+// A call at a suspension point saves the locals its resume state restores, pushes the callee's
+// frame with the call's operands, and returns to the driver, which runs the callee next.
+effect fn emitSuspendingCall(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &[TypeLayout],
+  identities: &[InstanceIdentity],
+  stepping: &Suspended,
+  state: usize,
+  callee: &Callee,
+  arguments: &Vector<Operand>,
+  providers: &Vector<Operand>,
+  diagnostics: &Option<Diagnostics>,
+  destination: &Place,
+  failure: &Option<FailureEdge>,
+  span: Span,
+) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let mut symbol = Bytes.make()
+  if let Callee.Instance {key} = &callee.* { symbol = run InstanceIdentity.name(identities, &key) }
+  else {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.make(GapCode.TypedForm, &owner, span)
+  }
+  let word = wordSize(target)
+  let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
+  let mut failed = Option.none<Address>()
+  let mut context = Option.none<Bytes>()
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* {
+    failed = Option.some<Address>(run emitPlace(&mut writer.*, function, target, layouts, &edge.destination))
+    if let Option<Diagnostics>.Some {..} = &diagnostics.* {
+      context = Option.some<Bytes>(run companionAddress(function, edge.destination.local))
+    }
+  }
+  let values = Vector.asSlice<Operand>(arguments)
+  let mut evaluated = Vector.make<Value>()
+  let mut index = usize.ZERO
+  while index < values.length {
+    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index])
+    if !value.scalar.unit { run Vector.append<Value>(&mut evaluated, move value) }
+    index = index + usize.ONE
+  }
+  let mut addresses = Vector.make<Value>()
+  let hidden = Vector.asSlice<Operand>(providers)
+  index = usize.ZERO
+  while index < hidden.length {
+    run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &hidden[index]))
+    index = index + usize.ONE
+  }
+  if let Option<Diagnostics>.Some {value: observed} = &diagnostics.* {
+    run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &observed.observer))
+    run Vector.append<Value>(&mut addresses, run emitOperand(&mut writer.*, function, target, layouts, &observed.cause))
+  }
+  let resume = run byteOffset(&mut writer.*, b"%frame", Coroutine.stateOffset(word))
+  run append(&mut writer.*, b"store i32 ")
+  run decimal(&mut writer.*, state)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&resume))
+  run append(&mut writer.*, b"\n")
+  let states = Vector.asSlice<State>(&stepping.coroutine.states)
+  run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[state].slots), true)
+  run append(&mut writer.*, b"call void ")
+  run suffixedSymbol(&mut writer.*, Bytes.asSlice(&symbol), b"$enter")
+  run append(&mut writer.*, b"(ptr %transfer")
+  let prepared = Vector.asSlice<Value>(&evaluated)
+  index = usize.ZERO
+  while index < prepared.length {
+    run append(&mut writer.*, b", ")
+    run typeName(&mut writer.*, prepared[index].scalar)
+    run append(&mut writer.*, b" ")
+    run append(&mut writer.*, Bytes.asSlice(&prepared[index].text))
+    index = index + usize.ONE
+  }
+  let passed = Vector.asSlice<Value>(&addresses)
+  index = usize.ZERO
+  while index < passed.length {
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&passed[index].text))
+    index = index + usize.ONE
+  }
+  let fallible = match &failed { Option<Address>.Some {..} => true Option<Address>.None => false }
+  if fallible || !output.representation.unit {
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&output.text))
+  }
+  if let Option<Address>.Some {value: failureSlot} = &failed {
+    run append(&mut writer.*, b", ptr ")
+    run append(&mut writer.*, Bytes.asSlice(&failureSlot.text))
+    if let Option<Bytes>.Some {value: companion} = &context {
+      run append(&mut writer.*, b", ptr ")
+      run append(&mut writer.*, Bytes.asSlice(&companion))
+    }
+  }
+  return run append(&mut writer.*, b")\nret i32 1\n")
 }
 
 // The extension attribute, with its trailing space, that C requires of a narrow integer lane.
