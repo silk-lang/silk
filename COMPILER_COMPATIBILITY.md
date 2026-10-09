@@ -318,28 +318,6 @@ Each entry records:
 - **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 
-### Both compilers transfer a consuming-pattern binding read by value
-
-- **Status:** implemented on 2026-10-09 for native lowering; the reference rule is unchanged.
-- **Rule:** the reference requires `move` for every affine by-value use, including a binding of a
-  consuming match (OWN-002, MATCH-002: `Box { payload, .. } => move payload`).
-- **Compilers:** the bootstrap reports OWN0003 for a bare by-value use of an ordinary local, but
-  accepts a bare by-value use of a binding introduced by `match move` or `if let ... = move` (an
-  arm result, a `return`, an assignment or call argument) and lowers it as a transfer. Native
-  typing already transfers such a binding implicitly as a consuming call argument. Native MIR now
-  does the same for every other by-value read: a read that names a live binding owner copies the
-  value and marks that owner moved, exactly as `move` would. Before this, native lowering copied the
-  value and still dropped the owner at arm exit, which released a `Shared` handle twice; N1 trapped
-  in `Shared.with`'s conflict policy on the freed cell.
-- **Source migration:** prefer the reference's explicit `move`. The compiler's own sources contain
-  hundreds of bare reads, which both compilers now lower as transfers.
-- **Diagnostics and limits:** neither compiler reports OWN0003 for these reads yet. Native borrow
-  checking (roadmap step 14) is where the reference's diagnostic belongs.
-- **Evidence:** `consumedBindingsOwnTheirParts` in `compiler/src/semantic/SemanticCaptureCases.silk`
-  checks that a bare consuming-arm binding and its `move` form lower to identical drop facts.
-- **Open questions:** whether the reference should adopt the implicit transfer for consuming-pattern
-  bindings, or both compilers should report OWN0003 and the sources migrate to `move`.
-
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
