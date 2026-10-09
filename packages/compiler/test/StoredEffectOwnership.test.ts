@@ -296,3 +296,31 @@ pub fn main() -> i32 {
     assert.include(codesOf(shared), 'SEM0068')
   }),
 )
+
+it.effect('runs and lends a mut Effect parameter only from a mutable binding', () =>
+  Effect.gen(function* () {
+    const source = (binding: string) => `
+import silk.effect { Effect }
+effect fn twice<'env>(${binding}pending: mut Effect<'env; i32>) -> i32 {
+  let first = run pending
+  return first + run pending
+}
+effect fn lend<'env>(${binding}lent: mut Effect<'env; i32>) -> i32 {
+  let completed = run Effect.result(lent)
+  return run lent
+}
+pub fn main() -> i32 {
+  let mut count = 0
+  return run twice(effect { count = count + 1 return count })
+}`
+    const text = source('')
+    const immutable = yield* analyzed('stored-effect-ownership/immutable-mut-parameter', text)
+    const starts = Analysis.diagnostics(immutable)
+      .filter((candidate) => candidate.code === 'SEM0077')
+      .map((candidate) => candidate.span.start)
+    assert.include(starts, text.indexOf('pending', text.indexOf('run pending')))
+    assert.include(starts, text.indexOf('lent', text.indexOf('result(')))
+    const mutable = yield* analyzed('stored-effect-ownership/mutable-mut-parameter', source('mut '))
+    assert.notInclude(codesOf(mutable), 'SEM0077')
+  }),
+)

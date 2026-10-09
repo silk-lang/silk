@@ -83,6 +83,7 @@ import {
   constructionExpressionAnchor,
   constructionExpressionType,
   expressionNode,
+  immutableRoot,
   lookupDeclaration,
   lookupParameter,
   referenceNames,
@@ -10472,12 +10473,11 @@ function analyzeExpressionDecision(
         Diagnostic.runNonEffect(Type.display(subject.type), Location.at(node.anchor)),
       )
     // A `mut Effect` runs through exclusive access, which needs a mutable root (EFFECT-OWN-002,
-    // BORROW-002), exactly as invoking a `mut fn` binding does.
+    // BORROW-002), exactly as invoking a `mut fn` binding or parameter does.
     if (
       effect?.access === 'Exclusive' &&
       subject.fact._tag === 'Identifier' &&
-      subject.fact.reference._tag === 'ResolvedBinding' &&
-      subject.fact.reference.binding.mutability !== 'Mutable'
+      immutableRoot(subject.fact.reference)
     )
       diagnostics.push(
         Diagnostic.invalidCallableInvocationAccess('Exclusive', Location.at(subject.fact.anchor)),

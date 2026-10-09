@@ -43,6 +43,7 @@ import {
   constructionExpressionType,
   contextualIntegerCompatible,
   expressionNode,
+  immutableRoot,
   lookupDeclaration,
   referenceNames,
   referencePath,
@@ -4807,8 +4808,7 @@ export const finishCallableApplication = (
   if (
     callable?.mode === 'Exclusive' &&
     callee.fact._tag === 'Identifier' &&
-    callee.fact.reference._tag === 'ResolvedBinding' &&
-    callee.fact.reference.binding.mutability !== 'Mutable'
+    immutableRoot(callee.fact.reference)
   ) {
     diagnostics.push(
       Diagnostic.invalidCallableInvocationAccess('Exclusive', Location.at(callee.fact.anchor)),
