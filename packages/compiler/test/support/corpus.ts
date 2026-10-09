@@ -7331,6 +7331,118 @@ pub fn main() -> i32 {
   return run Effect.catchAll(body(), recoverAny)
 }`
 
+// A loop inside `if let` keeps the subject's ended union compact under its loop flag: a failed
+// `run` in the loop drops the bound fields once, a `break` joins the loop exit before `return`
+// drops the binding the omitted field left, and a nested `if let` joins inside the loop.
+export const selectedLoopExitDropProgram = `import silk.os_writer { StdoutWriter }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+import silk.format { Format }
+import silk.writer { Writer, WriterError }
+
+struct Log {
+  slots: [i32; 16]
+  count: usize
+}
+struct Tracer {
+  id: i32
+  log: Shared<Log>
+}
+fn record(log: &mut Log, id: i32) -> i32 {
+  log.slots[log.count] = id
+  log.count = log.count + 1
+  return 0
+}
+impl Drop for Tracer {
+  fn drop(self: &mut Tracer) -> () {
+    let id = self.id
+    let r = Shared.withMut<Log, i32>(&self.log, record(id))
+    return ()
+  }
+}
+fn encode(log: &Log) -> i32 {
+  let mut r = 0
+  let mut i: usize = 0
+  while i < log.count {
+    r = r * 10 + log.slots[i]
+    i = i + 1
+  }
+  return r
+}
+fn tracer(id: i32, log: &Shared<Log>) -> Tracer {
+  return Tracer { id: id, log: Shared.clone<Log>(log) }
+}
+union Held { Empty, Pair { kept: Tracer, rest: Tracer } }
+struct Stop {}
+effect fn step(n: i32) -> i32 ! Stop {
+  if n == 2 { fail Stop {} }
+  return n
+}
+effect fn failing(held: Held, log: &Shared<Log>) -> i32 ! Stop {
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 0
+    while n < 5 {
+      let seen = run step(n)
+      let marker = tracer(5 + seen, log)
+      n = n + 1
+    }
+    return kept.id + rest.id
+  }
+  return 0
+}
+fn returning(held: Held) -> i32 {
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 3
+    while n > 0 {
+      if n == 1 { break }
+      n = n - 1
+    }
+    return kept.id + n
+  }
+  return 0
+}
+union Cell { Missing, Present { token: Tracer } }
+fn cell(at: i32, log: &Shared<Log>) -> Cell {
+  if at == 1 { return Cell.Missing }
+  return Cell.Present { token: tracer(9, log) }
+}
+fn fallthrough(held: Held, log: &Shared<Log>) -> i32 {
+  let mut total = 0
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 0
+    while n < 2 {
+      let child = cell(n, log)
+      if let Cell.Present { token } = move child { total = total + token.id }
+      n = n + 1
+    }
+    total = total + kept.id
+  }
+  return total
+}
+effect fn stopped(problem: Stop) -> i32 { return 0 }
+effect fn printLog(log: &Shared<Log>) -> () ! WriterError {
+  let code = Shared.with<Log, i32>(log, encode)
+  let mut writer = StdoutWriter.make()
+  return run (Format.display(&code) |> Effect.provideMut<Writer>(&mut writer))
+}
+effect fn makeLog() -> Shared<Log> ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run (Shared.make<Log>(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
+}
+effect fn recoverAny(e: OutOfMemoryError | WriterError) -> i32 { return -1 }
+effect fn body() -> i32 ! OutOfMemoryError | WriterError {
+  let log = run makeLog()
+  let first = run Effect.catchAll(failing(Held.Pair { kept: tracer(1, &log), rest: tracer(2, &log) }, &log), stopped)
+  let second = returning(Held.Pair { kept: tracer(3, &log), rest: tracer(4, &log) })
+  let third = fallthrough(Held.Pair { kept: tracer(7, &log), rest: tracer(8, &log) }, &log)
+  run printLog(&log)
+  return first + second + third - 20
+}
+pub fn main() -> i32 {
+  return run Effect.catchAll(body(), recoverAny)
+}`
+
 const algorithmExampleIds = [
   'breadth-first-search',
   'crc-32',
@@ -9801,6 +9913,13 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recoverAllocation) 
     source: 'pub fn main() -> i32 { return 0 }',
     nativeSource: replaceDropProgram,
     nativeStdout: '1243',
+    expected: { _tag: 'Completes', result: 0 },
+  },
+  {
+    name: 'selected-loop-exit-drop',
+    source: 'pub fn main() -> i32 { return 0 }',
+    nativeSource: selectedLoopExitDropProgram,
+    nativeStdout: '562143987',
     expected: { _tag: 'Completes', result: 0 },
   },
   {
