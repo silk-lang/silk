@@ -119,6 +119,8 @@ Each entry records:
   (BORROW-005 never strengthens access); the operand keeps its exclusive type. In that argument,
   each referent lifetime in a covariant position is shortened to the argument's loan region, but
   only where the parameter writes its own loan lifetime. Every other lifetime keeps its evidence.
+  A binding annotated as a shared loan, named or elided, admits a moved exclusive loan the same
+  way, in covariant positions only.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
   rows, callable and Effect positions, services, interfaces, recursive declarations still being
