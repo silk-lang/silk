@@ -4371,13 +4371,13 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
       callable = Option.some<HirId>(contract)
       isPublic = visible
       foreign = linkage.present
-      plain = linkage.present || properties.length == usize.ZERO
+      plain = linkage.present || nonParkingProperties(hir, properties)
     }
     if let Node.OperationHeader {contract, properties, ..} = written {
       callable = Option.some<HirId>(contract)
       // An operation has no visibility of its own; it shares its interface's or service's.
       isPublic = contractPublic(hir, declarations, ordinal)
-      plain = properties.length == usize.ZERO
+      plain = nonParkingProperties(hir, properties)
     }
     if let Node.CallableContract {..} = written {
       callable = Option.some<HirId>(declarations[ordinal].header)
@@ -34208,6 +34208,16 @@ effect fn checkStorageCall<'scope>(
         run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&allocation)))
         run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&element)))
       }
+      // The package takes the allocation, then the body, readiness state and endpoint as written.
+      StorageOperation.ExecutionFromAllocation => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&allocation)))
+        let written = Vector.asSlice<Shared<Type>>(&instantiation)
+        let mut at = usize.ONE
+        while at < written.length {
+          run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&written[at])))
+          at = at + usize.ONE
+        }
+      }
       StorageOperation.SystemAllocationAcquire => {
         let layout = match move run layoutDescriptor(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
           Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
@@ -34334,6 +34344,21 @@ effect fn checkStorageCall<'scope>(
         }
       }
       StorageOperation.SharedFromAllocation => { ty = move shared }
+      StorageOperation.ExecutionLayout => {
+        ty = match move run layoutDescriptor(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+      }
+      StorageOperation.ExecutionFromAllocation => { ty = run SealedCore.applied(SealedKind.Execution, &element) }
+      StorageOperation.ExecutionNotifyInitial => {
+        let execution = run SealedCore.applied(SealedKind.Execution, &element)
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &execution)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+      }
       StorageOperation.SharedClone => {
         let accepted = match move run storageView(&subject, false) {
           Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &shared)
@@ -49335,6 +49360,18 @@ fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range)
   return fields <= usize.ONE
 }
 
+// A callable header's admitted properties: none, or one field-free `Intrinsic.nonParking()`.
+// Before the suspension stage, any parking the body reaches is itself the `suspension` gap at that
+// site, so the declaration adds no unchecked obligation (D6). Every other property is a gap.
+fn nonParkingProperties(hir: &Module, properties: Range) -> bool {
+  if properties.length == usize.ZERO { return true }
+  if properties.length != usize.ONE { return false }
+  if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, usize.ZERO)) {
+    return nameIs(hir, namespace, b"Intrinsic") && nameIs(hir, operation, b"nonParking") && written.length == usize.ZERO
+  }
+  return false
+}
+
 fn nameIs(hir: &Module, id: HirId, spelling: &[u8]) -> bool {
   return match Module.node(hir, id) {
     Node.Name {text} => same(Module.text(hir, text), spelling)
@@ -57754,6 +57791,18 @@ impl Semantic {
     }
     let mut roots = Vector.make<BuildRoot>()
     run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Entry {main: move main}, span: selected.span})
+    // The application's own C exports are roots beside `main`, so foreign code can call them.
+    let mut gaps = Vector.make<Shared<BackendGap>>()
+    let exported = run exportCandidates(&mut self.resolver, module)
+    if let Option<Vector<ExportCandidate>>.Some {value: listed} = move exported {
+      let refused = run Semantic.rootExports(&mut self.*, &mut request.*, module, &listed, &mut roots, &mut gaps)
+      if let Option<Shared<Rejection>>.Some {value} = move refused {
+        return refusedBuild(move value)
+      }
+    }
+    if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
+      return BackendBuild.Unsupported {gaps: move gaps}
+    }
     return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&roots), selected.span, closureNodes, false)
   }
   /// Builds an artifact whose roots are the active C exports of the selected runtime source. The
@@ -57770,51 +57819,11 @@ impl Semantic {
         return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.MissingModule, origin))
       }
     }
-    let moduleOrdinal = run internModule(&mut self.resolver, runtime)
-    // Root lookups observe governing conditions without a dependent answer.
-    let mut rootConditions = Vector.make<Dependency>()
     let mut roots = Vector.make<BuildRoot>()
     let mut gaps = Vector.make<Shared<BackendGap>>()
-    let candidates = Vector.asSlice<ExportCandidate>(&listed)
-    let mut at = usize.ZERO
-    while at < candidates.length {
-      let candidate = &candidates[at]
-      at = at + usize.ONE
-      let active = run available(&mut self.resolver, &mut self.query, &mut rootConditions, runtime, candidate.declaration, candidate.span)
-      let present = match move active {
-        Result<bool, Shared<Rejection>>.Success {value} => value
-        Result<bool, Shared<Rejection>>.Failure {error} => { return refusedBuild(move error) }
-      }
-      if !present { continue }
-      let declared = run declarationAt(&mut self.resolver, runtime, candidate.declaration)
-      let function = match move declared {
-        Option<DeclarationId>.Some {value} => run Shared.make<DeclarationId>(move value)
-        Option<DeclarationId>.None => {
-          return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.UnknownName, candidate.span))
-        }
-      }
-      let signature = run demandRaw(
-        &mut self.resolver,
-        &mut self.query,
-        Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: candidate.declaration, member: usize.ZERO, external: false},
-        candidate.span,
-      )
-      run recordRoot(&mut request.*, Family.Signature, runtime, Bytes.asSlice(&candidate.name), &signature)
-      let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&signature, answerRejection)
-      if let Option<Shared<Rejection>>.Some {value} = move failure {
-        let code = Shared.with<Rejection, RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
-          return rejection.code
-        })
-        let mut coverageGap = BackendGap.forRejection(code)
-        if code == RejectionCode.Unsupported { coverageGap = Option.some<GapCode>(GapCode.SignatureForm) }
-        if let Option<GapCode>.Some {value: gapCode} = move coverageGap {
-          run Vector.append<Shared<BackendGap>>(&mut gaps, run Shared.make<BackendGap>(BackendGap.fromRejection(gapCode, &function, &value)))
-          continue
-        }
-        return refusedBuild(move value)
-      }
-      let symbol = run Shared.make<Bytes>(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
-      run Vector.append<BuildRoot>(&mut roots, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span})
+    let refused = run Semantic.rootExports(&mut self.*, &mut request.*, runtime, &listed, &mut roots, &mut gaps)
+    if let Option<Shared<Rejection>>.Some {value} = move refused {
+      return refusedBuild(move value)
     }
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
@@ -57824,6 +57833,58 @@ impl Semantic {
       return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.UnknownName, origin))
     }
     return run Semantic.buildFrom(&mut self.*, runtime, Vector.asSlice<BuildRoot>(&roots), origin, closureNodes, false)
+  }
+  // Roots every active C export `module` declares. Signature gaps are collected beside the roots;
+  // any other refusal is returned.
+  effect fn rootExports(self: &mut Self, request: &mut Request, module: &ModuleId, listed: &Vector<ExportCandidate>,
+    roots: &mut Vector<BuildRoot>, gaps: &mut Vector<Shared<BackendGap>>) -> Option<Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator {
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    // Root lookups observe governing conditions without a dependent answer.
+    let mut rootConditions = Vector.make<Dependency>()
+    let candidates = Vector.asSlice<ExportCandidate>(listed)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      at = at + usize.ONE
+      let active = run available(&mut self.resolver, &mut self.query, &mut rootConditions, module, candidate.declaration, candidate.span)
+      let present = match move active {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {error} => { return Option.some<Shared<Rejection>>(move error) }
+      }
+      if !present { continue }
+      let declared = run declarationAt(&mut self.resolver, module, candidate.declaration)
+      let function = match move declared {
+        Option<DeclarationId>.Some {value} => run Shared.make<DeclarationId>(move value)
+        Option<DeclarationId>.None => {
+          return Option.some<Shared<Rejection>>(run reject(&self.resolver, module, RejectionCode.UnknownName, candidate.span))
+        }
+      }
+      let signature = run demandRaw(
+        &mut self.resolver,
+        &mut self.query,
+        Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: candidate.declaration, member: usize.ZERO, external: false},
+        candidate.span,
+      )
+      run recordRoot(&mut request.*, Family.Signature, module, Bytes.asSlice(&candidate.name), &signature)
+      let failure = Shared.with<Result<Answer, NoRejection>, Option<Shared<Rejection>>>(&signature, answerRejection)
+      if let Option<Shared<Rejection>>.Some {value} = move failure {
+        let code = Shared.with<Rejection, RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
+          return rejection.code
+        })
+        let mut coverageGap = BackendGap.forRejection(code)
+        if code == RejectionCode.Unsupported { coverageGap = Option.some<GapCode>(GapCode.SignatureForm) }
+        if let Option<GapCode>.Some {value: gapCode} = move coverageGap {
+          run Vector.append<Shared<BackendGap>>(&mut gaps.*, run Shared.make<BackendGap>(BackendGap.fromRejection(gapCode, &function, &value)))
+          continue
+        }
+        return Option.some<Shared<Rejection>>(move value)
+      }
+      let symbol = run Shared.make<Bytes>(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
+      run Vector.append<BuildRoot>(&mut roots.*, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span})
+    }
+    return Option.none<Shared<Rejection>>()
   }
   // Walks the instance graph from the roots. A program that runs any `observeDiagnostics` scope is
   // walked again with every function observing diagnostics (failure observer note N1).
