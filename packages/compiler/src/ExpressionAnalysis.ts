@@ -8243,6 +8243,7 @@ const analyzeMethodCall = (
       argumentsResult,
       typeArguments,
       resolution,
+      declaration,
       node,
       undefined,
       path,
@@ -8654,6 +8655,7 @@ const finishAppliedInterfaceOperation = (
     argumentsResult,
     callTypeArguments,
     resolution,
+    caller,
     node,
     target.application,
   )
@@ -8794,6 +8796,13 @@ export const effectExpressionAccess = (
   const type = constructionExpressionType(expression)
   if (type._tag === 'Available' && Type.isEffect(type.type)) return type.type.access
   if (type._tag === 'Available' && Type.isCallable(type.type)) return type.type.mode
+  // An exclusive borrow handed on as a value is retained as an exclusive loan (CAPTURE-002).
+  if (
+    type._tag === 'Available' &&
+    (Type.isReference(type.type) || Type.isSlice(type.type)) &&
+    type.type.access === 'Exclusive'
+  )
+    return 'Exclusive'
   // An owned affine value (a fresh temporary or a call result) enters the environment by
   // ownership whether or not the context spelled `move`, so running consumes it.
   if (
@@ -9140,6 +9149,22 @@ export const effectCaptureFacts = (
           if (arm.body._tag === 'Expression') expression(arm.body.expression)
           else visit(arm.body.statements)
         }
+        return
+      }
+      // A place keeps the access its use requests down to the captured root (CAPTURE-002): writing
+      // a field or through a `&mut` referent needs an exclusive capture, not a shared read.
+      if (fact._tag === 'Project') {
+        expression(fact.subject, requested)
+        return
+      }
+      if (fact._tag === 'IndexPlace' || fact._tag === 'SliceIndexPlace') {
+        expression(fact._tag === 'IndexPlace' ? fact.subject : fact.slice, requested)
+        expression(fact.index)
+        return
+      }
+      if (fact._tag === 'ReferentPlace') {
+        // Nothing moves out through a reference; only exclusive use reaches its binding.
+        expression(fact.subject, requested === 'Exclusive' ? 'Exclusive' : 'Shared')
         return
       }
       if (fact._tag === 'CallableApply' && fact.staged === undefined) {
@@ -10860,6 +10885,7 @@ function analyzeExpressionDecision(
           argumentsResult,
           callTypeArguments,
           resolution,
+          declaration,
         )
       const concrete = concreteContractOperationReference(
         context,
@@ -10877,6 +10903,7 @@ function analyzeExpressionDecision(
           argumentsResult,
           callTypeArguments,
           resolution,
+          declaration,
         )
       if (concrete?._tag === 'Rejected')
         return finishDeclarationCall(
@@ -11407,6 +11434,7 @@ export const finishInterfaceOperationCall = (
   argumentsResult: ArgumentsResult,
   callTypeArguments: CallTypeArgumentsResult,
   resolution: ResolutionContext,
+  caller: DeclarationFact,
   effectSiteNode: AuthoredHir.Expression = node,
   interfaceApplication?: DeclarationFacts.DeclaredTypeFact,
   path: ReferencePathFact = referencePath(context, node),
@@ -11441,12 +11469,27 @@ export const finishInterfaceOperationCall = (
     context.spanOf(node.anchor),
     resolution,
   )
+  const result = reference.result
+  // An Effect operation retains its operands like any Effect call, so their captures set its run
+  // access (EFFECT-OWN-002); the selected witness cannot weaken what the operation retains.
+  const resultType = Type.isEffect(result)
+    ? Type.effectWithRows(
+        result.success,
+        result.failureRow,
+        result,
+        strongestEffectAccess(
+          result.access,
+          effectCaptureAccess(argumentsResult.facts, resolution.index, copyAssumptionsOf(caller)),
+        ),
+        result.requirementRow,
+      )
+    : result
   const expressionType =
     syntaxAvailable &&
     typeArgumentDiagnostic === undefined &&
     callContract.fact._tag === 'Compatible' &&
     unsafeDiagnostic === undefined
-      ? availableExpressionType(reference.result)
+      ? availableExpressionType(resultType)
       : unavailableExpressionType
   return {
     fact: {
