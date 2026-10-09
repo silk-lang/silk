@@ -39,10 +39,10 @@ pub fn main() -> i32 { return 0 }`
 it.effect('rejects a callback that parks while holding the value borrow', () =>
   Effect.gen(function* () {
     const source = `${imports}
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Guard {}
 struct Box { value: i32 }
-fn register(wake: Intrinsic.Wake) -> Guard { drop wake return Guard {} }
+fn register(wake: Wake) -> Guard { drop wake return Guard {} }
 fn parking(value: &mut Box) -> () {
   let parked = run Execution.park(register)
   value.value = value.value

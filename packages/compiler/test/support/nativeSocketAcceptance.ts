@@ -2,7 +2,7 @@ export const nativeSocketAcceptanceSource = `
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.fiber {Fiber}
 import silk.i64
 import silk.local_scheduler {LocalScheduler, StalledError}
@@ -101,7 +101,7 @@ impl Drop for CancellationLifetime {
   }
 }
 
-struct AcquisitionParkGuard {wake: Intrinsic.Wake}
+struct AcquisitionParkGuard {wake: Wake}
 impl Drop for AcquisitionParkGuard {
   fn drop(self: &mut AcquisitionParkGuard) -> () {
     unsafe { silk_socket_stub_mark_guard_drop() }
@@ -109,7 +109,7 @@ impl Drop for AcquisitionParkGuard {
   }
 }
 
-fn retainAcquisitionWake(wake: Intrinsic.Wake) -> AcquisitionParkGuard {
+fn retainAcquisitionWake(wake: Wake) -> AcquisitionParkGuard {
   unsafe { silk_socket_stub_mark_wait_registration() }
   return AcquisitionParkGuard {wake: move wake}
 }

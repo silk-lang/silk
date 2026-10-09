@@ -2,25 +2,13 @@ import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as ExecutionAffinity from './ExecutionAffinity.js'
 import * as Type from './Type.js'
 
-/** Target-neutral logical states; backends remain free to fuse their physical tags. */
-export type State =
-  | 'Initial'
-  | 'InitialReady'
-  | 'Running'
-  | 'Dormant'
-  | 'Notifying'
-  | 'Eligible'
-  | 'Completed'
-  | 'Destroyed'
+/**
+ * Compiler-owned activation states. Readiness phases and generations are ordinary source policy
+ * stored in the package's source control words, so they are not lifecycle states.
+ */
+export type State = 'Unstarted' | 'Running' | 'Relinquished' | 'Completed' | 'Destroyed'
 
-export type Event =
-  | 'Drive'
-  | 'NotifyInitial'
-  | 'Park'
-  | 'BeginNotification'
-  | 'FinishNotification'
-  | 'Complete'
-  | 'Drop'
+export type Event = 'Drive' | 'Relinquish' | 'Complete' | 'Drop'
 
 export type Transition =
   | { readonly _tag: 'Transition'; readonly state: State }
@@ -35,7 +23,7 @@ export interface Fact {
   readonly copy: false
   readonly threadTransfer: false
   readonly affinity: ExecutionAffinity.ExecutionAffinity
-  readonly initial: 'Initial'
+  readonly initial: 'Unstarted'
   readonly states: ReadonlyArray<State>
   readonly loans: {
     readonly externalConstruction: 'Rejected'
@@ -54,12 +42,9 @@ export type FactResult =
   | { readonly _tag: 'Unavailable'; readonly reason: 'NotExecution' | 'UnavailableResult' }
 
 export const states: ReadonlyArray<State> = [
-  'Initial',
-  'InitialReady',
+  'Unstarted',
   'Running',
-  'Dormant',
-  'Notifying',
-  'Eligible',
+  'Relinquished',
   'Completed',
   'Destroyed',
 ]
@@ -80,7 +65,7 @@ export const ofType = (index: DeclarationIndex.Index, type: Type.Type): FactResu
       copy: false,
       threadTransfer: false,
       affinity: ExecutionAffinity.ofType(index, type),
-      initial: 'Initial',
+      initial: 'Unstarted',
       states,
       loans: {
         externalConstruction: 'Rejected',
@@ -96,27 +81,18 @@ export const ofType = (index: DeclarationIndex.Index, type: Type.Type): FactResu
   }
 }
 
-/** Applies the owner-neutral logical transition contract without selecting storage. */
+/** Applies the owner-neutral activation contract without selecting storage. */
 export const transition = (state: State, event: Event): Transition => {
   if (event === 'Drive') {
-    if (state === 'Initial' || state === 'InitialReady' || state === 'Eligible')
+    if (state === 'Unstarted' || state === 'Relinquished')
       return { _tag: 'Transition', state: 'Running' }
-    if (state === 'Dormant' || state === 'Notifying')
-      return { _tag: 'FatalIntrinsicStateTrap', state, event }
+    if (state === 'Running') return { _tag: 'FatalIntrinsicStateTrap', state, event }
     return { _tag: 'OwnershipRejected', state, event }
   }
-  if (event === 'NotifyInitial' && state === 'Initial')
-    return { _tag: 'Transition', state: 'InitialReady' }
-  if (event === 'Park' && state === 'Running') return { _tag: 'Transition', state: 'Dormant' }
-  if (event === 'BeginNotification' && state === 'Dormant')
-    return { _tag: 'Transition', state: 'Notifying' }
-  if (event === 'FinishNotification' && state === 'Notifying')
-    return { _tag: 'Transition', state: 'Eligible' }
+  if (event === 'Relinquish' && state === 'Running')
+    return { _tag: 'Transition', state: 'Relinquished' }
   if (event === 'Complete' && state === 'Running') return { _tag: 'Transition', state: 'Completed' }
-  if (
-    event === 'Drop' &&
-    (state === 'Initial' || state === 'InitialReady' || state === 'Dormant' || state === 'Eligible')
-  )
+  if (event === 'Drop' && (state === 'Unstarted' || state === 'Relinquished'))
     return { _tag: 'Transition', state: 'Destroyed' }
   return { _tag: 'OwnershipRejected', state, event }
 }
