@@ -1379,7 +1379,7 @@ it('matches the checked intrinsic inventory and records every unsafe invariant',
       },
       {
         operation: 'Intrinsic.executionCurrent',
-        signature: 'fn Intrinsic.executionCurrent() -> ExecutionRef',
+        signature: 'fn Intrinsic.executionCurrent() -> Effect<ExecutionRef>',
         unsafe: false,
         targets: Intrinsic.runtimeTargets,
       },

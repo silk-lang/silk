@@ -4,6 +4,7 @@ import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import { relinquishedReleases } from './support/relinquishedFrames.js'
 
 const implementation = readFileSync(
   new URL('../stdlib/silk/native_socket.silk', import.meta.url),
@@ -180,11 +181,10 @@ it.effect(
         assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [], target)
         if (snapshot.mir._tag === 'Available') {
           assert.deepEqual(
-            snapshot.mir.value.functions
-              .flatMap(MirVerification.operations)
-              .filter((operation) => operation._tag === 'ExecutionPark')
-              .map((operation) => ({ cleanup: operation.guardCleanup._tag })),
-            [{ cleanup: 'HookCleanup' }],
+            relinquishedReleases(snapshot.mir.value).map((releases) =>
+              releases.map((cleanup) => cleanup._tag),
+            ),
+            [['HookCleanup']],
             target,
           )
         }

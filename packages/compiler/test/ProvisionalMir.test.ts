@@ -454,7 +454,7 @@ pub fn main() -> i32 {
             operation._tag !== 'RunEffect' &&
             operation._tag !== 'RunEffectValue' &&
             operation._tag !== 'CatchEffect' &&
-            operation._tag !== 'ExecutionPark'
+            operation._tag !== 'ExecutionRelinquish'
           )
             continue
           const span = operation.provenance.span
