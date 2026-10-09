@@ -1339,6 +1339,21 @@ const assignmentPlaceBorrowAccess = (place: ExpressionDecision): Type.BorrowAcce
   return place.placeBorrowAccess
 }
 
+/**
+ * Whether a resolved identifier names an owned `let` binding or source parameter that was not
+ * declared `mut`. Exclusive run, invocation and lending need a mutable root (EFFECT-OWN-002,
+ * CALLABLE-002); anonymous capture parameters carry their access from the capture instead.
+ */
+export const immutableRoot = (reference: ParameterReferenceFact): boolean => {
+  if (reference._tag === 'ResolvedBinding') return reference.binding.mutability !== 'Mutable'
+  if (reference._tag === 'Resolved')
+    return (
+      reference.parameter.bindingMutability !== 'Mutable' &&
+      reference.parameter.captureAccess === undefined
+    )
+  return false
+}
+
 /** Classifies writable roots without conflating owned binding mutability with pointee access. */
 export const assignmentRootAccess = (
   root: AssignmentRootFact,

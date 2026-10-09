@@ -428,7 +428,7 @@ fn recover<'input>(error: &'input i32) -> &'input i32 {
 fn reify<E>(protected: once Effect<'static; i32 ! E>) -> Result<i32, E> {
   return run Effect.result(move protected)
 }
-effect fn again<E>(protected: mut Effect<'static; i32 ! E>) -> i32 ! E {
+effect fn again<E>(mut protected: mut Effect<'static; i32 ! E>) -> i32 ! E {
   return run Effect.retry(protected, 1)
 }
 fn anonymous<'input>(error: &'input i32) -> i32 {
