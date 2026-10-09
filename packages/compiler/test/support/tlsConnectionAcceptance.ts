@@ -518,8 +518,8 @@ effect fn countSharedCallback(self: &mut SharedCallbackCounter) -> () {
 impl CallbackAudit for SharedCallbackCounter {invoked: SharedCallbackCounter.countSharedCallback}
 
 struct ParkingClock {}
-struct ParkGuard {wake: Intrinsic.Wake}
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
 impl MonotonicClock for ParkingClock {
   effect fn now(self: &mut Self) -> Instant { return SystemClock.make(100, 0) }
   effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }

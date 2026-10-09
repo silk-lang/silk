@@ -254,7 +254,7 @@ const program = Effect.gen(function* () {
   const lifecycle = []
   for (const [name, expected] of [
     ['transient', 42],
-    ['latched-destroy', 42],
+    ['latched-destroy', 1042],
     ['finalized-destroy', 42],
     ['finalized-choice', 42],
     ['multiple-packages', 42],

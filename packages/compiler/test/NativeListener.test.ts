@@ -16,7 +16,7 @@ const reference = readFileSync(
 const encoder = new TextEncoder()
 
 const symbolAndCleanupSource = `import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, ListenOptions, Listener, NativeSocketError, accept, listen, withListener}
 import silk.network_address {Endpoint}
@@ -24,12 +24,12 @@ import silk.option {Option}
 import silk.system_clock {Instant, SystemClock}
 import silk.u64
 
-struct ParkGuard {wake: Intrinsic.Wake}
+struct ParkGuard {wake: Wake}
 impl Drop for ParkGuard {
   fn drop(self: &mut ParkGuard) -> () { return () }
 }
 
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard {
+fn retainWake(wake: Wake) -> ParkGuard {
   return ParkGuard {wake: move wake}
 }
 

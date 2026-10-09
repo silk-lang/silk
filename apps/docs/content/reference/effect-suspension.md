@@ -76,10 +76,12 @@ concrete application reports the property obligation at the application and reta
 capture/provider or reachability path.
 
 `Intrinsic.Execution<A>` is an opaque affine, non-copyable, initially non-thread-transferable local
-identity. Its logical lifecycle is `Initial`, `InitialReady`, `Running`, `Dormant`, `Notifying`,
-`Eligible`, `Completed`, and `Destroyed`; these are semantic states, not a promised backend tag
-layout. The owner may drive only `Initial`, `InitialReady`, or `Eligible`, and driving a dormant or
-notifying execution is a fatal intrinsic-state trap. Execution-internal stable loans may cross
+identity. Its compiler-owned activation lifecycle is `Unstarted`, `Running`, `Relinquished`,
+`Completed`, and `Destroyed`; these are semantic states, not a promised backend tag layout. The
+source readiness phases `Initial`, `InitialReady`, `Dormant`, and `Eligible` are ordinary
+`silk.execution` policy over two package control words. The owner may drive only `Initial`,
+`InitialReady`, or `Eligible`, and driving a dormant or notifying execution is a fatal state
+trap. Execution-internal stable loans may cross
 parking, but construction cannot retain caller loans and completion cannot return a loan into
 package-owned storage.
 
@@ -520,8 +522,8 @@ let value = run Effect.suspend(readNext())
 This transfers stack-safe execution of `readNext`; it does not wait for another task to publish a
 value unless `readNext` already has some separately defined synchronous way to complete.
 
-**Boundary:** Runtime parking and owner-controlled resumption use the separate `Execution` and
-`Wake` lifecycle. The shipped single-threaded scheduler and Fiber APIs add ready queues, child
+**Boundary:** Runtime parking and owner-controlled resumption use the separate `Execution`
+lifecycle and the source `Wake` policy. The shipped single-threaded scheduler and Fiber APIs add ready queues, child
 tasks, observation, and structured cancellation as ordinary source policy over that lifecycle.
 Those facilities still do not turn suspension into parking or establish a general async-I/O model.
 

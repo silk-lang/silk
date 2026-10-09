@@ -105,7 +105,7 @@ export const transientLocals = (
   // Resumption may read an outcome through lowering-only frame/transfer storage even
   // when no subsequent MIR operation explicitly mentions its payload.
   for (const region of fn.suspension?.regions ?? []) {
-    if (region.operation._tag !== 'ExecutionPark') required.add(region.operation.outcome.ordinal)
+    if (region.operation._tag !== 'ExecutionRelinquish') required.add(region.operation.outcome.ordinal)
     if (region._tag === 'RunSuspendableEffectRegion') {
       add(region.liveLocals)
       add(region.relay.state?.slots.map((slot) => slot.local) ?? [])

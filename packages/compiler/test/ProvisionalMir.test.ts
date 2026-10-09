@@ -467,10 +467,10 @@ pub fn main() -> i32 {
 it.effect('retains provider-specific parking through a generic interface handler', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.result {Result}
-struct ParkGuard {wake: Intrinsic.Wake}
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
 service Clock { effect fn wait() -> () ? &mut Clock }
 struct Fixed {}
 impl Clock for Fixed { effect fn wait(self: &mut Self) -> () { return () } }

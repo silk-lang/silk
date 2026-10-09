@@ -134,13 +134,21 @@ const operationText = (operation: Operation): string => {
     case 'ExecutionFromAllocation':
       return `${localText(operation.destination)} = execution-from-allocation ${localText(operation.allocation)}:take, ${localText(operation.body)}:take, ${localText(operation.endpoint)}:take, ${localText(operation.callback)}:take package=${operation.plan.provenance} allocation-fact=${operation.allocationFact} allocation-origin=${spanText(operation.allocationProvenance)} state=initial : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
     case 'ExecutionDrive':
-      return `${localText(operation.destination)} = execution-drive ${localText(operation.execution)}:take branch=${localText(operation.branch)}:take complete=${localText(operation.onComplete)}:take/${operation.completionCleanup._tag}<${operation.completionTypeArguments.map(SilkType.genericArgumentKey).join(',')}> suspend=${localText(operation.onSuspend)}:take/${operation.suspensionCleanup._tag}<${operation.suspensionTypeArguments.map(SilkType.genericArgumentKey).join(',')}> private-result=${localText(operation.result)} legal=initial|initial-ready|eligible trap=dormant|notifying result=unit ${provenanceText(operation.provenance)}`
-    case 'ExecutionNotifyInitial':
-      return `${localText(operation.destination)} = execution-notify-initial ${localText(operation.execution)}:exclusive transition=initial>initial-ready result=unit ${provenanceText(operation.provenance)}`
-    case 'ExecutionWake':
-      return `${localText(operation.destination)} = execution-wake ${localText(operation.wake)}:take transition=latched|notifying|cancelled-noop result=unit ${provenanceText(operation.provenance)}`
-    case 'ExecutionPark':
-      return `${localText(operation.destination)} = execution-park register=${localText(operation.register)}:take/${operation.registerCleanup._tag}<${operation.registrationTypeArguments.map(SilkType.genericArgumentKey).join(',')}> private-guard=${localText(operation.guard)}/${operation.guardCleanup._tag} transition=registering>latched|dormant result=unit ${provenanceText(operation.provenance)}`
+      return `${localText(operation.destination)} = execution-drive ${localText(operation.execution)}:take branch=${localText(operation.branch)}:take complete=${localText(operation.onComplete)}:take/${operation.completionCleanup._tag}<${operation.completionTypeArguments.map(SilkType.genericArgumentKey).join(',')}> suspend=${localText(operation.onSuspend)}:take/${operation.suspensionCleanup._tag}<${operation.suspensionTypeArguments.map(SilkType.genericArgumentKey).join(',')}> private-result=${localText(operation.result)} legal=unstarted|relinquished trap=running|notifying result=unit ${provenanceText(operation.provenance)}`
+    case 'ExecutionRelinquish':
+      return `${localText(operation.destination)} = execution-relinquish transition=running>relinquished result=unit ${provenanceText(operation.provenance)}`
+    case 'ExecutionCurrent':
+      return `${localText(operation.destination)} = execution-current authority=counted : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
+    case 'ExecutionRefOf':
+      return `${localText(operation.destination)} = execution-ref-of ${localText(operation.execution)}:shared authority=counted : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
+    case 'ExecutionLoad':
+      return `${localText(operation.destination)} = execution-load ${localText(operation.reference)}:shared word=${localText(operation.word)} : usize ${provenanceText(operation.provenance)}`
+    case 'ExecutionStore':
+      return `${localText(operation.destination)} = execution-store ${localText(operation.reference)}:shared word=${localText(operation.word)} value=${localText(operation.value)} result=unit ${provenanceText(operation.provenance)}`
+    case 'ExecutionNotify':
+      return `${localText(operation.destination)} = execution-notify ${localText(operation.reference)}:shared result=unit ${provenanceText(operation.provenance)}`
+    case 'ExecutionLive':
+      return `${localText(operation.destination)} = execution-live ${localText(operation.reference)}:shared : bool ${provenanceText(operation.provenance)}`
     case 'SharedClone':
       return `${localText(operation.destination)} = shared-clone ${localText(operation.self)} element=${SilkType.encode(operation.element)} layout=${operation.block.provenance} maximum=${operation.block.strongMaximum} transition=compare-trap-store : ${typeText(operation.type)} ${provenanceText(operation.provenance)}`
     case 'SharedWithMut':

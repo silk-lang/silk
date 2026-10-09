@@ -746,7 +746,7 @@ export const lowerProgram = (
     layout: finalizedLayout,
     staticData,
     executionTransitions: finalizedLayout.executionPackages.plans.map((plan, ordinal) =>
-      ExecutionTransition.authority(ordinal, ordinal + 1, plan.readinessStorage),
+      ExecutionTransition.authority(ordinal, ordinal + 1),
     ),
     functions: withLocalSharedDropPlans(layout, functions),
   }

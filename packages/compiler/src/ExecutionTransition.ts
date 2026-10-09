@@ -1,5 +1,4 @@
 import * as ExecutionLifecycle from './ExecutionLifecycle.js'
-import * as WakeCell from './WakeCell.js'
 
 /** Stable target-neutral identity for one independently owned execution package. */
 export interface Identity {
@@ -8,46 +7,31 @@ export interface Identity {
   readonly root: number
 }
 
-/** Complete logical state from which every backend transition is derived. */
+/** Complete compiler-owned activation state from which every backend transition is derived. */
 export interface State {
   readonly _tag: 'ExecutionTransitionState'
   readonly identity: Identity
-  readonly execution: ExecutionLifecycle.State | 'DestroyPending' | 'Released'
-  readonly wake?: WakeCell.State
+  readonly execution: ExecutionLifecycle.State
 }
 
-export type Event =
-  | 'Initialize'
-  | 'NotifyInitial'
-  | 'Drive'
-  | 'Register'
-  | 'RetainGuard'
-  | 'Relinquish'
-  | 'Wake'
-  | 'Notify'
-  | 'Eligible'
-  | 'Resume'
-  | 'Complete'
-  | 'Cancel'
-  | 'Release'
+export type Event = 'Start' | 'Relinquish' | 'Resume' | 'Complete' | 'Cancel'
 
 export interface Edge {
   readonly _tag: 'ExecutionTransitionEdge'
   readonly event: Event
   readonly before: State
   readonly after: State
-  readonly cleanup: ReadonlyArray<'Guard' | 'Body' | 'Endpoint' | 'Callback' | 'Allocation'>
+  readonly cleanup: ReadonlyArray<'Frames' | 'Body' | 'Endpoint' | 'Authority'>
 }
 
 /**
- * The complete backend-neutral transition authority carried by MIR for one exact package plan.
- * Backends may fuse physical tags, but only after this table has been verified.
+ * The complete backend-neutral activation authority carried by MIR for one exact package plan.
+ * Readiness policy is ordinary source over the package's control words and never appears here.
  */
 export interface Authority {
   readonly _tag: 'ExecutionTransitionAuthority'
   readonly package: number
   readonly root: number
-  readonly readiness: boolean
   readonly edges: ReadonlyArray<Edge>
 }
 
@@ -57,29 +41,17 @@ export type Result =
       readonly _tag: 'ExecutionTransitionViolation'
       readonly event: Event
       readonly state: State
-      readonly reason:
-        | 'IllegalPredecessor'
-        | 'WakeAuthority'
-        | 'PackageProvenance'
-        | 'CompletionLoan'
-        | 'EndpointBorrow'
     }
   | {
       readonly _tag: 'FatalExecutionTrap'
-      readonly event: 'Drive'
+      readonly event: 'Start' | 'Resume'
       readonly state: State
-      readonly reason: 'DormantOrNotifying'
     }
 
-const state = (
-  identity: Identity,
-  execution: State['execution'],
-  wake?: WakeCell.State,
-): State => ({
+const state = (identity: Identity, execution: State['execution']): State => ({
   _tag: 'ExecutionTransitionState',
   identity,
   execution,
-  ...(wake === undefined ? {} : { wake }),
 })
 
 const edge = (event: Event, before: State, after: State, cleanup: Edge['cleanup'] = []): Edge => ({
@@ -90,183 +62,58 @@ const edge = (event: Event, before: State, after: State, cleanup: Edge['cleanup'
   cleanup,
 })
 
-const violation = (
-  state_: State,
-  event: Event,
-  reason: Extract<Result, { readonly _tag: 'ExecutionTransitionViolation' }>['reason'],
-): Result => ({ _tag: 'ExecutionTransitionViolation', event, state: state_, reason })
+const violation = (self: State, event: Event): Result => ({
+  _tag: 'ExecutionTransitionViolation',
+  event,
+  state: self,
+})
 
-const transitionedWake = (
-  self: State,
-  event: Event,
-  transition: WakeCell.Transition,
-  execution: State['execution'] = self.execution,
-  cleanup: Edge['cleanup'] = [],
-): Result =>
-  transition._tag === 'WakeCellViolation'
-    ? violation(self, event, 'WakeAuthority')
-    : edge(event, self, state(self.identity, execution, transition.state), cleanup)
+/** Creates one deterministic Unstarted package/root pair before source body execution. */
+export const initialize = (packageIdentity: number, root: number): State =>
+  state({ _tag: 'ExecutionIdentity', package: packageIdentity, root }, 'Unstarted')
 
-/** Creates one deterministic package/root pair before source body execution. */
-export const initialize = (packageIdentity: number, root: number, readiness: boolean): State =>
-  state(
-    { _tag: 'ExecutionIdentity', package: packageIdentity, root },
-    'Initial',
-    readiness ? WakeCell.initial() : undefined,
-  )
-
-/** Notifies initial readiness exactly once before endpoint invocation. */
-export const notifyInitial = (self: State): Result => {
-  const logical = ExecutionLifecycle.transition(
-    self.execution === 'DestroyPending' || self.execution === 'Released'
-      ? 'Destroyed'
-      : self.execution,
-    'NotifyInitial',
-  )
-  return logical._tag === 'Transition'
-    ? edge('NotifyInitial', self, state(self.identity, 'InitialReady', self.wake))
-    : violation(self, 'NotifyInitial', 'IllegalPredecessor')
-}
-
-/** Enters only Initial, InitialReady, or Eligible and rejects drive while progress is external. */
+/** Starts an Unstarted body or resumes a Relinquished frame chain; anything else traps. */
 export const drive = (self: State): Result => {
-  const logical = ExecutionLifecycle.transition(
-    self.execution === 'DestroyPending' || self.execution === 'Released'
-      ? 'Destroyed'
-      : self.execution,
-    'Drive',
-  )
+  const event = self.execution === 'Relinquished' ? 'Resume' : 'Start'
+  const logical = ExecutionLifecycle.transition(self.execution, 'Drive')
   if (logical._tag === 'FatalIntrinsicStateTrap')
-    return {
-      _tag: 'FatalExecutionTrap',
-      event: 'Drive',
-      state: self,
-      reason: 'DormantOrNotifying',
-    }
-  if (logical._tag !== 'Transition') return violation(self, 'Drive', 'IllegalPredecessor')
-  if (self.execution === 'Eligible' && self.wake !== undefined) {
-    const resumed = WakeCell.resume(self.wake)
-    if (resumed._tag === 'WakeCellViolation') return violation(self, 'Drive', 'WakeAuthority')
-    return edge('Resume', self, state(self.identity, 'Running', resumed.state), ['Guard'])
-  }
-  return edge('Drive', self, state(self.identity, 'Running', self.wake))
+    return { _tag: 'FatalExecutionTrap', event, state: self }
+  if (logical._tag !== 'Transition') return violation(self, event)
+  return edge(event, self, state(self.identity, logical.state))
 }
 
-/** Begins one generation and publishes its sole affine Wake authority. */
-export const register = (self: State): Result =>
-  self.execution !== 'Running' || self.wake === undefined
-    ? violation(self, 'Register', 'IllegalPredecessor')
-    : transitionedWake(self, 'Register', WakeCell.beginRegistration(self.wake))
-
-/** Retains the ordinary registration guard before the execution relinquishes. */
-export const retainGuard = (self: State): Result =>
-  self.wake === undefined
-    ? violation(self, 'RetainGuard', 'IllegalPredecessor')
-    : transitionedWake(self, 'RetainGuard', WakeCell.retainGuard(self.wake))
-
-/** Completes the suspension callback boundary before allowing notification. */
+/** Saves the running frame chain and returns the drive through its suspension callback. */
 export const relinquish = (self: State): Result => {
-  if (
-    self.wake === undefined ||
-    (self.execution !== 'Running' &&
-      !(self.execution === 'Destroyed' && self.wake.phase === 'Cancelled'))
-  )
-    return violation(self, 'Relinquish', 'IllegalPredecessor')
-  const returned = WakeCell.suspensionReturned(self.wake)
-  if (returned._tag === 'WakeCellViolation') return violation(self, 'Relinquish', 'WakeAuthority')
-  let execution: 'Dormant' | 'Notifying' | 'Released' | 'Destroyed'
-  if (returned.state.phase === 'Notifying') {
-    execution = 'Notifying'
-  } else if (returned.state.phase === 'Released') {
-    execution = 'Released'
-  } else if (returned.state.phase === 'Cancelled') {
-    execution = 'Destroyed'
-  } else {
-    execution = 'Dormant'
-  }
-  let operation: Event
-  if (returned.state.phase === 'Notifying') operation = 'Notify'
-  else if (returned.state.phase === 'Released') operation = 'Release'
-  else operation = 'Relinquish'
-  return edge(operation, self, state(self.identity, execution, returned.state))
+  const logical = ExecutionLifecycle.transition(self.execution, 'Relinquish')
+  return logical._tag === 'Transition'
+    ? edge('Relinquish', self, state(self.identity, logical.state))
+    : violation(self, 'Relinquish')
 }
 
-/** Consumes the generation's Wake as readiness only. */
-export const wake = (self: State): Result => {
-  if (self.wake === undefined) {
-    return violation(self, 'Wake', 'IllegalPredecessor')
-  }
-  return transitionedWake(
-    self,
-    'Wake',
-    WakeCell.consumeWake(self.wake),
-    self.wake.phase === 'Dormant' ? 'Notifying' : self.execution,
-  )
-}
-
-/** Ends endpoint invocation; reentrant destruction never publishes Eligible. */
-export const notificationReturned = (self: State): Result => {
-  if (self.wake === undefined) return violation(self, 'Eligible', 'IllegalPredecessor')
-  const returned = WakeCell.notificationReturned(self.wake)
-  if (returned._tag === 'WakeCellViolation') return violation(self, 'Eligible', 'EndpointBorrow')
-  const released = returned.state.phase === 'Released'
-  return edge(
-    released ? 'Release' : 'Eligible',
-    self,
-    state(self.identity, released ? 'Released' : 'Eligible', returned.state),
-    released ? ['Guard', 'Body', 'Endpoint', 'Callback', 'Allocation'] : [],
-  )
-}
-
-/** Completes a running body and its terminal package cleanup. */
-export const complete = (self: State): Result =>
-  self.execution !== 'Running'
-    ? violation(self, 'Complete', 'IllegalPredecessor')
-    : edge('Complete', self, state(self.identity, 'Completed', self.wake), [
+/** Completes a running body, releasing frames and endpoint before the handle authority. */
+export const complete = (self: State): Result => {
+  const logical = ExecutionLifecycle.transition(self.execution, 'Complete')
+  return logical._tag === 'Transition'
+    ? edge('Complete', self, state(self.identity, logical.state), [
+        'Frames',
         'Endpoint',
-        'Callback',
-        'Allocation',
+        'Authority',
       ])
+    : violation(self, 'Complete')
+}
 
-/** Cancels an ordinary owner state or defers cleanup across an active endpoint borrow. */
+/** Drops an Unstarted body or cancels a Relinquished frame chain top-down. */
 export const cancel = (self: State): Result => {
-  if (self.wake === undefined) {
-    if (
-      self.execution !== 'Initial' &&
-      self.execution !== 'InitialReady' &&
-      self.execution !== 'Dormant' &&
-      self.execution !== 'Eligible'
-    )
-      return violation(self, 'Cancel', 'IllegalPredecessor')
-    return edge('Release', self, state(self.identity, 'Released'), [
-      'Body',
-      'Endpoint',
-      'Callback',
-      'Allocation',
-    ])
-  }
-  const destroyed = WakeCell.destroyExecution(self.wake)
-  if (destroyed._tag === 'WakeCellViolation') return violation(self, 'Cancel', 'WakeAuthority')
-  const pending = destroyed.state.phase === 'DestroyPending'
-  const released = destroyed.state.phase === 'Released'
-  if (pending) {
-    return edge('Cancel', self, state(self.identity, 'DestroyPending', destroyed.state), [])
-  }
-  if (released) {
-    return edge('Release', self, state(self.identity, 'Released', destroyed.state), [
-      'Guard',
-      'Body',
-      'Endpoint',
-      'Callback',
-      'Allocation',
-    ])
-  }
-  return edge('Cancel', self, state(self.identity, 'Destroyed', destroyed.state), [
-    'Guard',
-    'Body',
-    'Endpoint',
-    'Callback',
-  ])
+  const logical = ExecutionLifecycle.transition(self.execution, 'Drop')
+  if (logical._tag !== 'Transition') return violation(self, 'Cancel')
+  return edge(
+    'Cancel',
+    self,
+    state(self.identity, logical.state),
+    self.execution === 'Unstarted'
+      ? ['Body', 'Endpoint', 'Authority']
+      : ['Frames', 'Endpoint', 'Authority'],
+  )
 }
 
 /** Validates one edge independently of a backend's fused physical tags. */
@@ -275,10 +122,9 @@ export const verifyEdge = (self: Edge): ReadonlyArray<string> => {
   if (self.before.identity.package !== self.after.identity.package)
     violations.push('PackageProvenance')
   if (self.before.identity.root !== self.after.identity.root) violations.push('LogicalRoot')
-  if (self.after.wake !== undefined) violations.push(...WakeCell.verify(self.after.wake))
-  if (self.after.execution === 'DestroyPending' && self.cleanup.length > 0)
-    violations.push('EndpointCleanupBeforeInvocationReturn')
-  return [...new Set(violations)]
+  if (self.cleanup.length > 0 && self.cleanup.at(-1) !== 'Authority')
+    violations.push('AuthorityBeforeCleanup')
+  return violations
 }
 
 const requiredEdge = (result: Result): Edge => {
@@ -288,62 +134,31 @@ const requiredEdge = (result: Result): Edge => {
 }
 
 /** Builds the complete legal branch table that MIR validates before backend lowering. */
-export const authority = (packageIdentity: number, root: number, readiness: boolean): Authority => {
-  const initial = initialize(packageIdentity, root, readiness)
-  const running = requiredEdge(drive(initial))
-  const initialReady = requiredEdge(notifyInitial(initial))
-  const runningReady = requiredEdge(drive(initialReady.after))
-  const edges: Array<Edge> = [
-    running,
-    requiredEdge(complete(running.after)),
-    initialReady,
-    runningReady,
-    requiredEdge(complete(runningReady.after)),
-  ]
-  if (readiness) {
-    const registering = requiredEdge(register(running.after))
-    const guarded = requiredEdge(retainGuard(registering.after))
-    const dormant = requiredEdge(relinquish(guarded.after))
-    const notifying = requiredEdge(wake(dormant.after))
-    const eligible = requiredEdge(notificationReturned(notifying.after))
-    const resumed = requiredEdge(drive(eligible.after))
-    const latched = requiredEdge(wake(registering.after))
-    const latchedGuard = requiredEdge(retainGuard(latched.after))
-    const latchedNotify = requiredEdge(relinquish(latchedGuard.after))
-    const cancelledDormant = requiredEdge(cancel(dormant.after))
-    const releasedWake = requiredEdge(wake(cancelledDormant.after))
-    const destroyPending = requiredEdge(cancel(notifying.after))
-    const releasedNotification = requiredEdge(notificationReturned(destroyPending.after))
-    edges.push(
-      registering,
-      guarded,
-      dormant,
-      notifying,
-      eligible,
-      resumed,
-      requiredEdge(complete(resumed.after)),
-      latched,
-      latchedGuard,
-      latchedNotify,
-      cancelledDormant,
-      releasedWake,
-      destroyPending,
-      releasedNotification,
-    )
-  }
+export const authority = (packageIdentity: number, root: number): Authority => {
+  const unstarted = initialize(packageIdentity, root)
+  const started = requiredEdge(drive(unstarted))
+  const relinquished = requiredEdge(relinquish(started.after))
+  const resumed = requiredEdge(drive(relinquished.after))
   return {
     _tag: 'ExecutionTransitionAuthority',
     package: packageIdentity,
     root,
-    readiness,
-    edges: edges,
+    edges: [
+      started,
+      requiredEdge(complete(started.after)),
+      relinquished,
+      resumed,
+      requiredEdge(complete(resumed.after)),
+      requiredEdge(cancel(unstarted)),
+      requiredEdge(cancel(relinquished.after)),
+    ],
   }
 }
 
 /** Rejects forged, incomplete, reordered, or internally-invalid MIR transition authority. */
 export const verifyAuthority = (self: Authority): ReadonlyArray<string> => {
   const violations = self.edges.flatMap(verifyEdge)
-  const expected = authority(self.package, self.root, self.readiness)
+  const expected = authority(self.package, self.root)
   if (self.edges.length !== expected.edges.length) violations.push('IncompleteTransitionAuthority')
   if (
     self.edges.some((candidate, ordinal) => {
@@ -362,37 +177,25 @@ export const encodeAuthority = (self: Authority): ReadonlyArray<string> =>
       `execution-transition package=${self.package} root=${self.root} edge=${ordinal} ${encode(candidate)}`,
   )
 
-/** Compact private tag selected by LLVM lowering only after MIR validation. */
+/** Compact private activation-word tag selected by LLVM lowering only after MIR validation. */
 export const tagOf = (execution: State['execution']): number => {
   switch (execution) {
-    case 'Initial':
+    case 'Unstarted':
       return 0
-    case 'InitialReady':
-      return 9
     case 'Running':
       return 1
-    case 'Dormant':
+    case 'Relinquished':
       return 2
-    case 'Notifying':
-      return 3
-    case 'Eligible':
-      return 4
     case 'Completed':
-      return 5
+      return 3
     case 'Destroyed':
-      return 6
-    case 'DestroyPending':
-      return 7
-    case 'Released':
-      return 8
+      return 4
   }
 }
-
-export const tag = (self: State): number => tagOf(self.execution)
 
 /** Representation-free deterministic inspection of one state or transition edge. */
 export const encode = (self: State | Edge): string => {
   if (self._tag === 'ExecutionTransitionState')
-    return `execution id=e${self.identity.package} root=x${self.identity.root} state=${self.execution.toLowerCase()}${self.wake === undefined ? ' generation=none' : ` generation=${self.wake.generation} ${WakeCell.encode(self.wake)}`}`
+    return `execution id=e${self.identity.package} root=x${self.identity.root} state=${self.execution.toLowerCase()}`
   return `${encode(self.before)} --${self.event.toLowerCase()} cleanup=${self.cleanup.map((item) => item.toLowerCase()).join(',') || 'none'}--> ${encode(self.after)}`
 }

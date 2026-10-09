@@ -801,12 +801,12 @@ export const independentExecutionNonLifo = readFileSync(
 export const independentExecutionIllegalDormantDrive = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored }
-struct Guard { wake: Intrinsic.Wake }
-fn register(wake: Intrinsic.Wake) -> Guard { return Guard { wake: move wake } }
+struct Guard { wake: Wake }
+fn register(wake: Wake) -> Guard { return Guard { wake: move wake } }
 effect fn body() -> i32 { run Execution.park(register) return 42 }
 fn complete(owner: &mut Owner, result: i32) -> () { return () }
 fn suspend(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
@@ -837,22 +837,33 @@ effect fn program() -> i32 ! OutOfMemoryError {
 effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
 pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 
-/** Attempts to drive a Dormant execution reentrantly while its fixed endpoint is being notified. */
-export const independentExecutionIllegalNotifyingDrive = `import silk.allocator { Allocator, OutOfMemoryError }
-import silk.allocator { Allocator, OutOfMemoryError }
+/**
+ * Parks one generation dormant with its Wake held by the owner, then signals it after the owner
+ * stored the Execution. The fixed endpoint receives the stored Execution while it is notifying.
+ */
+const notifyingStoredExecution = (endpoint: string, signalled: string) => `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
-struct Owner { slot: Empty | Stored }
+struct Waiting { wake: Wake }
+struct Owner { slot: Empty | Stored waiting: Empty | Waiting }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard {
-  Intrinsic.wake(move wake)
+fn installWake(owner: &mut Owner, wake: Wake) -> () {
+  let previous = Intrinsic.replace(owner.waiting, Waiting { wake: move wake })
+  drop previous
+  return ()
+}
+fn register(wake: Wake, owner: Shared<Owner>) -> Guard {
+  let installing = installWake(move wake)
+  Shared.withMut(&owner, move installing)
+  drop owner
   return Guard {}
 }
-effect fn body() -> i32 {
-  run Execution.park(register)
+effect fn body(owner: Shared<Owner>) -> i32 {
+  let registration = register(move owner)
+  run Execution.park(move registration)
   return 42
 }
 fn install(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
@@ -863,28 +874,10 @@ fn install(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
 fn take(owner: &mut Owner) -> Empty | Stored {
   return Intrinsic.replace(owner.slot, Empty {})
 }
-fn reentrantComplete(state: &mut (), result: i32) -> () { return () }
-fn reentrantSuspend(state: &mut (), execution: Intrinsic.Execution<i32>) -> () {
-  drop execution
-  return ()
+fn takeWake(owner: &mut Owner) -> Empty | Waiting {
+  return Intrinsic.replace(owner.waiting, Empty {})
 }
-effect fn reenter(selected: Empty | Stored, state: &mut ()) -> () {
-  return match move selected {
-    Empty {} => ()
-    Stored { execution } => run Execution.drive(
-      move execution,
-      move state,
-      reentrantComplete,
-      reentrantSuspend
-    )
-  }
-}
-fn ready(owner: &Shared<Owner>) -> () {
-  let selected = Shared.withMut(owner, take)
-  let mut state = ()
-  run reenter(move selected, &mut state)
-  return ()
-}
+${endpoint}
 fn complete(state: &mut (), result: i32) -> () { return () }
 fn suspend(
   state: &mut (),
@@ -906,22 +899,58 @@ effect fn driveOnce<
 ) -> () {
   return run Execution.drive(move execution, move state, complete, move onSuspend)
 }
+fn signal(selected: Empty | Waiting) -> () {
+  return match move selected {
+    Empty {} => ()
+    Waiting { wake } => Execution.wake(move wake)
+  }
+}
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let owner = run Shared.make<Owner>(Owner { slot: Empty {} })
+  let owner = run Shared.make<Owner>(Owner { slot: Empty {}, waiting: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&owner)
+  let registrationOwner = Shared.clone(&owner)
   let suspensionOwner = Shared.clone(&owner)
   let onSuspend = suspend(move suspensionOwner)
-  let execution = run Execution.make(body(), move endpoint, ready)
+  let execution = run Execution.make(body(move registrationOwner), move endpoint, ready)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut state = ()
   run driveOnce(move execution, &mut state, move onSuspend)
+  let selected = Shared.withMut(&owner, takeWake)
+  signal(move selected)
   drop owner
-  return 0
+  return ${signalled}
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
 pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
+
+/** Attempts to drive a stored execution reentrantly while its fixed endpoint is being notified. */
+export const independentExecutionIllegalNotifyingDrive = notifyingStoredExecution(
+  `fn reentrantComplete(state: &mut (), result: i32) -> () { return () }
+fn reentrantSuspend(state: &mut (), execution: Intrinsic.Execution<i32>) -> () {
+  drop execution
+  return ()
+}
+effect fn reenter(selected: Empty | Stored, state: &mut ()) -> () {
+  return match move selected {
+    Empty {} => ()
+    Stored { execution } => run Execution.drive(
+      move execution,
+      move state,
+      reentrantComplete,
+      reentrantSuspend
+    )
+  }
+}
+fn ready(owner: &Shared<Owner>) -> () {
+  let selected = Shared.withMut(owner, take)
+  let mut state = ()
+  run reenter(move selected, &mut state)
+  return ()
+}`,
+  '0',
+)
 
 const fatalCallbackSentinel = `fn callbackSentinel(value: i32) -> () {
   let zero = value - value
@@ -1014,19 +1043,19 @@ export const independentExecutionMultiplePackages = readFileSync(
 export const independentExecutionLateCancelledWake = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Empty {}
-struct Waiting { wake: Intrinsic.Wake }
+struct Waiting { wake: Wake }
 struct Mailbox { slot: Empty | Waiting }
 struct Guard { mailbox: Shared<Mailbox> }
 struct ReadyState { called: i32 }
-fn install(mailbox: &mut Mailbox, wake: Intrinsic.Wake) -> () {
+fn install(mailbox: &mut Mailbox, wake: Wake) -> () {
   let previous = Intrinsic.replace(mailbox.slot, Waiting { wake: move wake })
   drop previous
   return ()
 }
-fn register(wake: Intrinsic.Wake, mailbox: Shared<Mailbox>) -> Guard {
+fn register(wake: Wake, mailbox: Shared<Mailbox>) -> Guard {
   let installing = install(move wake)
   Shared.withMut(&mailbox, move installing)
   return Guard { mailbox: move mailbox }
@@ -1078,98 +1107,290 @@ effect fn program() -> i32 ! OutOfMemoryError {
   drop readyState
   return result + called * 1000
 }
-fn signalLate(wake: Intrinsic.Wake) -> i32 {
-  Intrinsic.wake(move wake)
+fn signalLate(wake: Wake) -> i32 {
+  Execution.wake(move wake)
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
 pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 
-export const independentExecutionReentrantDestroy = `import silk.allocator { Allocator, OutOfMemoryError }
-import silk.allocator { Allocator, OutOfMemoryError }
+/** Signals a Wake while its generation registers; it latches and notifies exactly once. */
+export const independentExecutionLatchRace = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
-struct Owner { slot: Empty | Stored }
+struct Owner { slot: Empty | Stored result: i32 }
+struct Ledger { ready: i32 }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard {
-  Intrinsic.wake(move wake)
+fn register(wake: Wake) -> Guard {
+  Execution.wake(move wake)
   return Guard {}
 }
-effect fn body() -> i32 {
-  run Execution.park(register)
-  return 1
-}
-fn install(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
+effect fn body() -> i32 { run Execution.park(register) return 42 }
+fn markReady(ledger: &mut Ledger) -> () { ledger.ready = ledger.ready + 1 return () }
+fn ready(ledger: &Shared<Ledger>) -> () { Shared.withMut(ledger, markReady) return () }
+fn readReady(ledger: &mut Ledger) -> i32 { return ledger.ready }
+fn complete(owner: &mut Owner, result: i32) -> () { owner.result = result return () }
+fn suspend(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
   let previous = Intrinsic.replace(owner.slot, Stored { execution: move execution })
   drop previous
   return ()
 }
-fn take(owner: &mut Owner) -> Empty | Stored {
-  return Intrinsic.replace(owner.slot, Empty {})
+effect fn driveOnce(execution: Intrinsic.Execution<i32>, owner: &mut Owner) -> () {
+  return run Execution.drive(move execution, move owner, complete, suspend)
 }
-fn ready(owner: &Shared<Owner>) -> () {
-  let selected = Shared.withMut(owner, take)
-  drop selected
-  return ()
-}
-fn complete(state: &mut (), result: i32) -> () { return () }
-fn suspend(
-  state: &mut (),
-  execution: Intrinsic.Execution<i32>,
-  owner: Shared<Owner>
-) -> () {
-  let installing = install(move execution)
-  Shared.withMut(&owner, move installing)
-  drop owner
-  return ()
-}
-effect fn driveOnce<
-  'env, 'state,
-  S: once fn<'env>(&'state mut (), Intrinsic.Execution<i32>) -> () + Intrinsic.NonParking
->(
-  execution: Intrinsic.Execution<i32>,
-  state: &'state mut (),
-  onSuspend: S
-) -> () {
-  return run Execution.drive(move execution, move state, complete, move onSuspend)
+effect fn finish(selected: Empty | Stored, owner: &mut Owner) -> () {
+  return match move selected {
+    Empty {} => ()
+    Stored { execution } => run driveOnce(move execution, move owner)
+  }
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let owner = run Shared.make<Owner>(Owner { slot: Empty {} })
+  let ledger = run Shared.make<Ledger>(Ledger { ready: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let endpoint = Shared.clone(&owner)
-  let suspensionOwner = Shared.clone(&owner)
-  let onSuspend = suspend(move suspensionOwner)
+  let endpoint = Shared.clone(&ledger)
   let execution = run Execution.make(body(), move endpoint, ready)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut state = ()
-  run driveOnce(move execution, &mut state, move onSuspend)
-  drop owner
-  return 42
+  let mut owner = Owner { slot: Empty {}, result: 0 }
+  run driveOnce(move execution, &mut owner)
+  let selected = Intrinsic.replace(owner.slot, Empty {})
+  run finish(move selected, &mut owner)
+  let calls = Shared.withMut(&ledger, readReady)
+  drop ledger
+  return owner.result + calls * 100
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
 pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 
+/**
+ * Retains the first generation's Wake, resumes that generation through the raw control words, and
+ * signals the retained Wake while the second generation is dormant. Only the current Wake notifies.
+ */
+export const independentExecutionStaleGenerationWake = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution, Wake }
+import silk.shared { Shared }
+struct Empty {}
+struct Stored { execution: Intrinsic.Execution<i32> }
+struct Waiting { wake: Wake }
+struct Held { reference: Intrinsic.ExecutionRef }
+struct Mailbox { first: Empty | Waiting second: Empty | Waiting held: Empty | Held }
+struct Owner { slot: Empty | Stored result: i32 }
+struct Ledger { ready: i32 }
+struct Guard {}
+fn keepFirst(mailbox: &mut Mailbox, wake: Wake) -> () {
+  let previous = Intrinsic.replace(mailbox.first, Waiting { wake: move wake })
+  drop previous
+  return ()
+}
+fn keepSecond(mailbox: &mut Mailbox, wake: Wake) -> () {
+  let previous = Intrinsic.replace(mailbox.second, Waiting { wake: move wake })
+  drop previous
+  return ()
+}
+fn hold(mailbox: &mut Mailbox, reference: Intrinsic.ExecutionRef) -> () {
+  let previous = Intrinsic.replace(mailbox.held, Held { reference: move reference })
+  drop previous
+  return ()
+}
+fn registerFirst(wake: Wake, mailbox: Shared<Mailbox>) -> Guard {
+  let keeping = keepFirst(move wake)
+  Shared.withMut(&mailbox, move keeping)
+  drop mailbox
+  return Guard {}
+}
+fn registerSecond(wake: Wake, mailbox: Shared<Mailbox>) -> Guard {
+  let keeping = keepSecond(move wake)
+  Shared.withMut(&mailbox, move keeping)
+  drop mailbox
+  return Guard {}
+}
+effect fn body(mailbox: Shared<Mailbox>) -> i32 {
+  let reference = Intrinsic.executionCurrent()
+  let holding = hold(move reference)
+  Shared.withMut(&mailbox, move holding)
+  let firstMailbox = Shared.clone(&mailbox)
+  let first = registerFirst(move firstMailbox)
+  run Execution.park(move first)
+  let second = registerSecond(move mailbox)
+  run Execution.park(move second)
+  return 42
+}
+fn markReady(ledger: &mut Ledger) -> () { ledger.ready = ledger.ready + 1 return () }
+fn ready(ledger: &Shared<Ledger>) -> () { Shared.withMut(ledger, markReady) return () }
+fn readReady(ledger: &mut Ledger) -> i32 { return ledger.ready }
+fn complete(owner: &mut Owner, result: i32) -> () { owner.result = result return () }
+fn suspend(owner: &mut Owner, execution: Intrinsic.Execution<i32>) -> () {
+  let previous = Intrinsic.replace(owner.slot, Stored { execution: move execution })
+  drop previous
+  return ()
+}
+effect fn driveOnce(execution: Intrinsic.Execution<i32>, owner: &mut Owner) -> () {
+  return run Execution.drive(move execution, move owner, complete, suspend)
+}
+effect fn driveStored(owner: &mut Owner) -> () {
+  let selected = Intrinsic.replace(owner.slot, Empty {})
+  return match move selected {
+    Empty {} => ()
+    Stored { execution } => run driveOnce(move execution, move owner)
+  }
+}
+fn takeFirst(mailbox: &mut Mailbox) -> Empty | Waiting {
+  return Intrinsic.replace(mailbox.first, Empty {})
+}
+fn takeSecond(mailbox: &mut Mailbox) -> Empty | Waiting {
+  return Intrinsic.replace(mailbox.second, Empty {})
+}
+fn takeHeld(mailbox: &mut Mailbox) -> Empty | Held {
+  return Intrinsic.replace(mailbox.held, Empty {})
+}
+fn signal(selected: Empty | Waiting) -> () {
+  return match move selected {
+    Empty {} => ()
+    Waiting { wake } => Execution.wake(move wake)
+  }
+}
+// Forces the first generation eligible without its Wake. Phase 6 is silk.execution's Eligible.
+fn forceEligible(selected: Empty | Held) -> () {
+  return match move selected {
+    Empty {} => ()
+    Held { reference } => Intrinsic.executionStore(&reference, 0, 6)
+  }
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let ledger = run Shared.make<Ledger>(Ledger { ready: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mailbox = run Shared.make<Mailbox>(Mailbox { first: Empty {}, second: Empty {}, held: Empty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let endpoint = Shared.clone(&ledger)
+  let bodyMailbox = Shared.clone(&mailbox)
+  let execution = run Execution.make(body(move bodyMailbox), move endpoint, ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut owner = Owner { slot: Empty {}, result: 0 }
+  run driveOnce(move execution, &mut owner)
+  let held = Shared.withMut(&mailbox, takeHeld)
+  forceEligible(move held)
+  run driveStored(&mut owner)
+  let stale = Shared.withMut(&mailbox, takeFirst)
+  signal(move stale)
+  let current = Shared.withMut(&mailbox, takeSecond)
+  signal(move current)
+  run driveStored(&mut owner)
+  drop mailbox
+  let calls = Shared.withMut(&ledger, readReady)
+  drop ledger
+  return owner.result + calls * 100
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
+
+/** Drops a dormant Execution: its guard drops once, and its retained Wake publishes nothing. */
+export const independentExecutionDormantDrop = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution, Wake }
+import silk.shared { Shared }
+struct Empty {}
+struct Waiting { wake: Wake }
+struct Mailbox { slot: Empty | Waiting }
+struct Ledger { ready: i32 guards: i32 }
+struct Guard { ledger: Shared<Ledger> }
+fn countGuard(ledger: &mut Ledger) -> () { ledger.guards = ledger.guards + 1 return () }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    Shared.withMut<Ledger, ()>(&self.ledger, countGuard)
+    return ()
+  }
+}
+fn install(mailbox: &mut Mailbox, wake: Wake) -> () {
+  let previous = Intrinsic.replace(mailbox.slot, Waiting { wake: move wake })
+  drop previous
+  return ()
+}
+fn register(wake: Wake, mailbox: Shared<Mailbox>, ledger: Shared<Ledger>) -> Guard {
+  let installing = install(move wake)
+  Shared.withMut(&mailbox, move installing)
+  drop mailbox
+  return Guard { ledger: move ledger }
+}
+effect fn body(mailbox: Shared<Mailbox>, ledger: Shared<Ledger>) -> i32 {
+  let registration = register(move mailbox, move ledger)
+  run Execution.park(move registration)
+  return 1
+}
+fn markReady(ledger: &mut Ledger) -> () { ledger.ready = ledger.ready + 1 return () }
+fn ready(ledger: &Shared<Ledger>) -> () { Shared.withMut(ledger, markReady) return () }
+fn summarize(ledger: &mut Ledger) -> i32 { return ledger.guards * 100 + ledger.ready * 1000 }
+fn complete(state: &mut (), result: i32) -> () { return () }
+fn cancel(state: &mut (), execution: Intrinsic.Execution<i32>) -> () {
+  drop execution
+  return ()
+}
+fn extract(mailbox: &mut Mailbox) -> Empty | Waiting {
+  return Intrinsic.replace(mailbox.slot, Empty {})
+}
+fn signal(selected: Empty | Waiting) -> () {
+  return match move selected {
+    Empty {} => ()
+    Waiting { wake } => Execution.wake(move wake)
+  }
+}
+effect fn driveOnce(execution: Intrinsic.Execution<i32>, state: &mut ()) -> () {
+  return run Execution.drive(move execution, move state, complete, cancel)
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let ledger = run Shared.make<Ledger>(Ledger { ready: 0, guards: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mailbox = run Shared.make<Mailbox>(Mailbox { slot: Empty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let endpoint = Shared.clone(&ledger)
+  let guardLedger = Shared.clone(&ledger)
+  let bodyMailbox = Shared.clone(&mailbox)
+  let execution = run Execution.make(body(move bodyMailbox, move guardLedger), move endpoint, ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut state = ()
+  run driveOnce(move execution, &mut state)
+  let selected = Shared.withMut(&mailbox, extract)
+  drop mailbox
+  signal(move selected)
+  let summary = Shared.withMut(&ledger, summarize)
+  drop ledger
+  return 42 + summary
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return -2 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
+
+/** Drops a stored execution from its own fixed endpoint, deferring cleanup until notify returns. */
+export const independentExecutionReentrantDestroy = notifyingStoredExecution(
+  `fn ready(owner: &Shared<Owner>) -> () {
+  let selected = Shared.withMut(owner, take)
+  drop selected
+  return ()
+}`,
+  '42',
+)
+
 export const independentExecutionLocalReactor = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Empty {}
-struct Armed { wake: Intrinsic.Wake }
+struct Armed { wake: Wake }
 struct Reactor { slot: Empty | Armed }
 struct Guard { reactor: Shared<Reactor> }
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored result: i32 }
-fn install(reactor: &mut Reactor, wake: Intrinsic.Wake) -> () {
+fn install(reactor: &mut Reactor, wake: Wake) -> () {
   let previous = Intrinsic.replace(reactor.slot, Armed { wake: move wake })
   drop previous
   return ()
 }
-fn register(wake: Intrinsic.Wake, reactor: Shared<Reactor>) -> Guard {
+fn register(wake: Wake, reactor: Shared<Reactor>) -> Guard {
   let installing = install(move wake)
   Shared.withMut(&reactor, move installing)
   return Guard { reactor: move reactor }
@@ -1181,7 +1402,7 @@ fn poll(reactor: &Shared<Reactor>) -> () {
   let selected = Shared.withMut(reactor, extract)
   return match move selected {
     Empty {} => ()
-    Armed { wake } => Intrinsic.wake(move wake)
+    Armed { wake } => Execution.wake(move wake)
   }
 }
 effect fn body(reactor: Shared<Reactor>) -> i32 {
@@ -1226,12 +1447,12 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 export const independentExecutionRepeatedGenerations = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored result: i32 }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { Intrinsic.wake(move wake) return Guard {} }
+fn register(wake: Wake) -> Guard { Execution.wake(move wake) return Guard {} }
 effect fn body() -> i32 {
   run Execution.park(register)
   run Execution.park(register)
@@ -1271,12 +1492,12 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 export const independentExecutionEligibleDrop = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { Intrinsic.wake(move wake) return Guard {} }
+fn register(wake: Wake) -> Guard { Execution.wake(move wake) return Guard {} }
 effect fn body() -> i32 { run Execution.park(register) return 1 }
 fn ready(state: &()) -> () { return () }
 fn complete(owner: &mut Owner, result: i32) -> () { return () }
@@ -1304,14 +1525,14 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 export const independentExecutionParkedTypedFailure = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.result { Result }
 struct Failed { code: i32 }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<Result<i32, Failed>> }
 struct Owner { slot: Empty | Stored result: i32 }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { Intrinsic.wake(move wake) return Guard {} }
+fn register(wake: Wake) -> Guard { Execution.wake(move wake) return Guard {} }
 effect fn failed() -> i32 ! Failed { fail Failed { code: 42 } }
 effect fn body() -> Result<i32, Failed> {
   run Execution.park(register)
@@ -1396,12 +1617,12 @@ pub fn main() -> i32 {
  */
 export const frameRetainedExecutionAbandonedFrame = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { Intrinsic.wake(move wake) return Guard {} }
+fn register(wake: Wake) -> Guard { Execution.wake(move wake) return Guard {} }
 fn ready(state: &()) -> () { return () }
 effect fn child() -> i32 { return run Effect.suspend(effect { return 42 }) }
 effect fn holder(execution: Intrinsic.Execution<i32>) -> i32 {
@@ -6315,7 +6536,7 @@ int32_t silk_recovery_verify(void) {
     name: 'effect-borrowed-recovery-park-resume-cancel',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 unsafe extern "C" fn silk_scoped_event(id: i32) -> ()
 unsafe extern "C" fn silk_scoped_verify() -> i32
 struct Owner { value: i32 }
@@ -6346,7 +6567,7 @@ impl<'data> Drop for Held<'data> {
   }
 }
 struct ReadyGuard {}
-struct DormantGuard { wake: Intrinsic.Wake }
+struct DormantGuard { wake: Wake }
 impl Drop for ReadyGuard {
   fn drop(self: &mut ReadyGuard) -> () {
     unsafe { silk_scoped_event(5) }
@@ -6359,11 +6580,11 @@ impl Drop for DormantGuard {
     return ()
   }
 }
-fn registerReady(wake: Intrinsic.Wake) -> ReadyGuard {
-  Intrinsic.wake(move wake)
+fn registerReady(wake: Wake) -> ReadyGuard {
+  Execution.wake(move wake)
   return ReadyGuard {}
 }
-fn registerDormant(wake: Intrinsic.Wake) -> DormantGuard {
+fn registerDormant(wake: Wake) -> DormantGuard {
   return DormantGuard { wake: move wake }
 }
 effect<'data> fn failed<'data>(owner: &'data Owner) -> never ! &'data Owner { fail owner }
@@ -6907,13 +7128,13 @@ pub fn main() -> i32 {
 
 const independentExecutionLatchedResume = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Empty {}
 struct Stored { execution: Intrinsic.Execution<i32> }
 struct Owner { slot: Empty | Stored result: i32 }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard {
-  Intrinsic.wake(move wake)
+fn register(wake: Wake) -> Guard {
+  Execution.wake(move wake)
   return Guard {}
 }
 effect fn body() -> i32 {
@@ -10728,7 +10949,8 @@ pub fn main() -> i32 {
   {
     name: 'independent-execution-latched-destroy',
     source: independentExecutionLatchedDestroy,
-    expected: { _tag: 'Completes', result: 42 },
+    // A latched signal notifies when registration returns, before onSuspend drops the Execution.
+    expected: { _tag: 'Completes', result: 1042 },
   },
   {
     name: 'independent-execution-finalized-destroy',
@@ -10786,6 +11008,21 @@ pub fn main() -> i32 {
     name: 'independent-execution-late-cancelled-wake',
     source: independentExecutionLateCancelledWake,
     expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'independent-execution-latch-race',
+    source: independentExecutionLatchRace,
+    expected: { _tag: 'Completes', result: 142 },
+  },
+  {
+    name: 'independent-execution-stale-generation-wake',
+    source: independentExecutionStaleGenerationWake,
+    expected: { _tag: 'Completes', result: 142 },
+  },
+  {
+    name: 'independent-execution-dormant-drop',
+    source: independentExecutionDormantDrop,
+    expected: { _tag: 'Completes', result: 142 },
   },
   {
     name: 'independent-execution-reentrant-destroy',

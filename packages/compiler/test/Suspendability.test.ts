@@ -708,10 +708,10 @@ pub fn main() -> i32 { return invoke(nested) }`)
 
 it.effect('checks NonParking through an ordinary selected interface operation', () =>
   Effect.gen(function* () {
-    const source = `import silk.execution { Execution }
+    const source = `import silk.execution { Execution, Wake }
 interface Job<T> { fn code(value: T) -> i32 }
 struct Provider {}
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+fn register(wake: Wake) -> () { drop wake return () }
 impl Job<()> for Provider {
   fn code(value: ()) -> i32 { run Execution.park(register) return 42 }
 }
@@ -757,8 +757,8 @@ pub fn main() -> i32 { return run guard(protected(), release()) }`)
     assert.deepEqual(Analysis.diagnostics(genericAccepted), [])
 
     const rejected = yield* snapshot(`import silk.effect { Effect }
-import silk.execution { Execution }
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+import silk.execution { Execution, Wake }
+fn register(wake: Wake) -> () { drop wake return () }
 effect fn protected() -> i32 { return 42 }
 effect fn release() -> () { run Execution.park(register) return () }
 pub fn main() -> i32 { return run Effect.ensuringNonParking(protected(), release()) }`)
@@ -772,9 +772,9 @@ pub fn main() -> i32 { return run Effect.ensuringNonParking(protected(), release
 it.effect('retains one owned resource and forms disjoint use and release loans', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Resource { value: i32 }
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+fn register(wake: Wake) -> () { drop wake return () }
 effect fn use(resource: &mut Resource) -> i32 {
   resource.value = 41
   run Execution.park(register)
@@ -823,9 +823,9 @@ pub fn main() -> i32 {
     assert.lengthOf(armed ?? [], 1)
 
     const rejectedSource = `import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 struct Resource {}
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+fn register(wake: Wake) -> () { drop wake return () }
 effect fn use(resource: &mut Resource) -> i32 { return 42 }
 effect fn release(resource: &mut Resource) -> () {
   run Execution.park(register)
@@ -909,10 +909,10 @@ pub fn main() -> i32 {
     assert.deepEqual(Analysis.diagnostics(self), [])
 
     const parked = yield* snapshot(`import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 service Duplex { effect fn close() -> () ? &mut Duplex with Intrinsic.nonParking() }
 struct ParkingDuplex {}
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+fn register(wake: Wake) -> () { drop wake return () }
 impl Duplex for ParkingDuplex {
   effect fn close(self: &mut Self) -> () { run Execution.park(register) return () }
 }
@@ -952,8 +952,8 @@ pub fn main() -> i32 {
 it.effect('retains an armed cancellation finalizer and its selected provider', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
-import silk.execution { Execution }
-fn register(wake: Intrinsic.Wake) -> () { drop wake return () }
+import silk.execution { Execution, Wake }
+fn register(wake: Wake) -> () { drop wake return () }
 service Duplex { effect fn close() -> () ? &mut Duplex with Intrinsic.nonParking() }
 struct MemoryDuplex { closed: bool }
 impl Duplex for MemoryDuplex {
@@ -1757,12 +1757,12 @@ pub effect fn main() -> i32 ! Fault {
 it.effect('retains parking control through a provided service implementation', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.allocator { Allocator, OutOfMemoryError }
 service Clock { effect fn wait() -> () ? &mut Clock }
 service Transport { effect fn read() -> i32 ? &mut Transport | &mut Clock }
-struct Guard { wake: Intrinsic.Wake }
-fn register(wake: Intrinsic.Wake) -> Guard { return Guard { wake: move wake } }
+struct Guard { wake: Wake }
+fn register(wake: Wake) -> Guard { return Guard { wake: move wake } }
 struct ParkingClock {}
 impl Clock for ParkingClock {
   effect fn wait(self: &mut Self) -> () { run Execution.park(register) return () }
