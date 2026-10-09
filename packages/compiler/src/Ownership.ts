@@ -4208,10 +4208,10 @@ const checkFunction = (
     for (const statement of statements) {
       state.execution?.regions.push({ region: statement.region, frame: frames.length - 1 })
       // A lazy effect body is walked with its execution deferred: its moves never feed the
-      // enclosing flow, and its loop, match, and binding facts are published by lowering
-      // through its own compiled body rather than through these facts. Its exit plans DO
-      // survive — the body's compiled runner reuses this function's span-keyed exit plans to
-      // emit automatic cleanup, and the outer body never looks up a body-statement span.
+      // enclosing flow, and its loop and binding facts are published by lowering through its
+      // own compiled body rather than through these facts. Its exit plans and match facts DO
+      // survive: the body's compiled runner reuses this function's span-keyed exit plans and
+      // node-keyed match cleanup, and the outer body never looks up a body-statement node.
       for (const block of statementRootExpressions(statement).flatMap(deferredBlocks)) {
         const bodyLive = new Map(live)
         const bodyFrame: Array<string> = []
@@ -4235,7 +4235,6 @@ const checkFunction = (
           exits: exits.length,
           fixedPoints: fixedPoints.length,
           order: state.order.length,
-          matches: state.matches.length,
           callables: state.callables.length,
         }
         const enclosingExecution = state.execution
@@ -4245,7 +4244,6 @@ const checkFunction = (
         deferredReleaseOrder.push(...state.order.slice(marks.order))
         fixedPoints.length = marks.fixedPoints
         state.order.length = marks.order
-        state.matches.length = marks.matches
         state.callables.length = marks.callables
       }
       if (statement._tag === 'Unsafe') {
@@ -4379,22 +4377,39 @@ const checkFunction = (
         if (!checkPatternSubject(statement.selection, live)) return { returned: true, live }
         const continuing: Array<FlowState> = []
         let selectedSites: ReadonlyArray<BindingSite> = []
+        // Fields omitted by a consuming pattern stay owned by the taken body, like a match arm's
+        // remainder: every exit from that body releases them after its bindings.
+        const cleanup = patternSelectionCleanup(statement.selection, live, false)
+        const execution = state.execution
+        const matchMark = execution?.matches.length ?? 0
         for (const [arm, body] of [
           ['Taken', statement.taken],
           ['Otherwise', statement.otherwise],
         ] as const) {
           const armFrames = [...frames.map((frame) => [...frame]), []]
           const armLive = new Map(live)
-          if (arm === 'Taken')
+          let remainder: MatchRelease | undefined
+          if (arm === 'Taken') {
+            if (cleanup.length > 0)
+              remainder = {
+                ordinal: state.nextAcquisition++,
+                id: statement.selection.id,
+                arm: statement.selection.arm,
+                cleanup,
+              }
             selectedSites = introducePatternBindings(
               statement.selection,
               armLive,
               armFrames.at(-1) ?? [],
               statement.span,
             )
+            if (remainder !== undefined)
+              execution?.matches.push({ frame: armFrames.length - 1, release: remainder })
+          }
           const result = walkStatements(body, statement.span, armLive, armFrames, loopScopes)
+          if (execution !== undefined) execution.matches.length = matchMark
           const frame = armFrames.at(-1) ?? []
-          if (!result.returned && frame.length > 0)
+          if (!result.returned && (frame.length > 0 || remainder !== undefined))
             exits.push({
               kind: 'ArmEnd' as const,
               span: statement.span,
@@ -4402,6 +4417,7 @@ const checkFunction = (
               arm,
               sites: [...frame].reverse().filter((site) => present(result.live, site)),
               initialization: new Map(result.live),
+              ...(remainder === undefined ? {} : { matches: [remainder] }),
             })
           if (!result.returned) {
             for (const site of frame) result.live.delete(site)
@@ -4422,7 +4438,7 @@ const checkFunction = (
               universal: statement.selection.universal,
               provisionalGuard: false,
               bindings: selectedSites,
-              cleanup: patternSelectionCleanup(statement.selection, live, false),
+              cleanup,
             },
           ],
         })

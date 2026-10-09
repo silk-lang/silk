@@ -2524,6 +2524,117 @@ int32_t silk_finish_events(void) { puts(""); return 42; }
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // A consuming `if let` body or `match` arm owns the fields its `..` omits until it exits, after
+    // its bindings, on every exit: fall-through, return, break and failure propagation, in plain
+    // and effect functions alike. Each drop prints two digits and a comma through libc `putchar`.
+    name: 'moved-rest-pattern-omitted-field-cleanup',
+    source: `import silk.effect { Effect }
+unsafe extern "C" fn putchar(value: i32) -> i32
+fn mark(value: i32) -> () {
+  unsafe {
+    let tens = putchar(48 + value / 10)
+    let ones = putchar(48 + value % 10)
+    let comma = putchar(44)
+  }
+  return ()
+}
+struct Recorder { value: i32 }
+impl Drop for Recorder {
+  fn drop(self: &mut Recorder) -> () {
+    mark(self.value)
+    return ()
+  }
+}
+union Held { Pair { kept: Recorder, left: Recorder, right: Recorder }, Empty }
+fn make(base: i32) -> Held {
+  return Held.Pair { kept: Recorder { value: base + 1 }, left: Recorder { value: base + 2 }, right: Recorder { value: base + 3 } }
+}
+fn plainIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(16)
+  return ()
+}
+effect fn effectIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(26)
+  return ()
+}
+effect fn effectIfReturns(held: Held) -> i32 {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    return kept.value
+  }
+  return 0
+}
+effect fn effectMatch(held: Held) -> () {
+  match move held {
+    Held.Pair { kept, .. } => { mark(kept.value + 4) }
+    Held.Empty => {}
+  }
+  mark(46)
+  return ()
+}
+effect fn effectMatchReturns(held: Held) -> i32 {
+  match move held {
+    Held.Pair { kept, .. } => {
+      mark(kept.value + 4)
+      return kept.value
+    }
+    Held.Empty => {}
+  }
+  return 0
+}
+fn plainIfReturns(held: Held) -> i32 {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    return kept.value
+  }
+  return 0
+}
+fn loopBreaks(base: i32) -> () {
+  let mut n = 0
+  while n < 3 {
+    let held = make(base)
+    if let Held.Pair { kept, .. } = move held {
+      mark(kept.value + 4)
+      break
+    }
+    n = n + 1
+  }
+  mark(base + 6)
+  return ()
+}
+struct Stop {}
+effect fn stop() -> () ! Stop { fail Stop {} }
+effect fn effectIfFails(held: Held) -> i32 ! Stop {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    run stop()
+    return kept.value
+  }
+  return 0
+}
+effect fn stopped(problem: Stop) -> i32 { return 85 }
+pub fn main() -> i32 {
+  plainIf(make(10))
+  run effectIf(make(20))
+  let first = run effectIfReturns(make(30))
+  mark(first + 5)
+  run effectMatch(make(40))
+  let second = run effectMatchReturns(make(50))
+  mark(second + 5)
+  let third = plainIfReturns(make(60))
+  mark(third + 5)
+  loopBreaks(70)
+  let fourth = run Effect.catchAll(effectIfFails(make(80)), stopped)
+  mark(fourth + 1)
+  return 42
+}`,
+    nativeStdout:
+      '15,11,12,13,16,25,21,22,23,26,35,31,32,33,36,45,41,42,43,46,55,51,52,53,56,65,61,62,63,66,75,71,72,73,76,85,81,82,83,86,',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     // A generic item piped inside a generic owner: `U := T` is solved in the owner's terms.
     name: 'generic-item-pipeline-in-generic-owner',
     source: genericItemPipelineInGenericOwner,
@@ -7331,6 +7442,118 @@ pub fn main() -> i32 {
   return run Effect.catchAll(body(), recoverAny)
 }`
 
+// A loop inside `if let` keeps the subject's ended union compact under its loop flag: a failed
+// `run` in the loop drops the bound fields once, a `break` joins the loop exit before `return`
+// drops the binding the omitted field left, and a nested `if let` joins inside the loop.
+export const selectedLoopExitDropProgram = `import silk.os_writer { StdoutWriter }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+import silk.format { Format }
+import silk.writer { Writer, WriterError }
+
+struct Log {
+  slots: [i32; 16]
+  count: usize
+}
+struct Tracer {
+  id: i32
+  log: Shared<Log>
+}
+fn record(log: &mut Log, id: i32) -> i32 {
+  log.slots[log.count] = id
+  log.count = log.count + 1
+  return 0
+}
+impl Drop for Tracer {
+  fn drop(self: &mut Tracer) -> () {
+    let id = self.id
+    let r = Shared.withMut<Log, i32>(&self.log, record(id))
+    return ()
+  }
+}
+fn encode(log: &Log) -> i32 {
+  let mut r = 0
+  let mut i: usize = 0
+  while i < log.count {
+    r = r * 10 + log.slots[i]
+    i = i + 1
+  }
+  return r
+}
+fn tracer(id: i32, log: &Shared<Log>) -> Tracer {
+  return Tracer { id: id, log: Shared.clone<Log>(log) }
+}
+union Held { Empty, Pair { kept: Tracer, rest: Tracer } }
+struct Stop {}
+effect fn step(n: i32) -> i32 ! Stop {
+  if n == 2 { fail Stop {} }
+  return n
+}
+effect fn failing(held: Held, log: &Shared<Log>) -> i32 ! Stop {
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 0
+    while n < 5 {
+      let seen = run step(n)
+      let marker = tracer(5 + seen, log)
+      n = n + 1
+    }
+    return kept.id + rest.id
+  }
+  return 0
+}
+fn returning(held: Held) -> i32 {
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 3
+    while n > 0 {
+      if n == 1 { break }
+      n = n - 1
+    }
+    return kept.id + n
+  }
+  return 0
+}
+union Cell { Missing, Present { token: Tracer } }
+fn cell(at: i32, log: &Shared<Log>) -> Cell {
+  if at == 1 { return Cell.Missing }
+  return Cell.Present { token: tracer(9, log) }
+}
+fn fallthrough(held: Held, log: &Shared<Log>) -> i32 {
+  let mut total = 0
+  if let Held.Pair { kept, rest } = move held {
+    let mut n = 0
+    while n < 2 {
+      let child = cell(n, log)
+      if let Cell.Present { token } = move child { total = total + token.id }
+      n = n + 1
+    }
+    total = total + kept.id
+  }
+  return total
+}
+effect fn stopped(problem: Stop) -> i32 { return 0 }
+effect fn printLog(log: &Shared<Log>) -> () ! WriterError {
+  let code = Shared.with<Log, i32>(log, encode)
+  let mut writer = StdoutWriter.make()
+  return run (Format.display(&code) |> Effect.provideMut<Writer>(&mut writer))
+}
+effect fn makeLog() -> Shared<Log> ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run (Shared.make<Log>(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
+}
+effect fn recoverAny(e: OutOfMemoryError | WriterError) -> i32 { return -1 }
+effect fn body() -> i32 ! OutOfMemoryError | WriterError {
+  let log = run makeLog()
+  let first = run Effect.catchAll(failing(Held.Pair { kept: tracer(1, &log), rest: tracer(2, &log) }, &log), stopped)
+  let second = returning(Held.Pair { kept: tracer(3, &log), rest: tracer(4, &log) })
+  let third = fallthrough(Held.Pair { kept: tracer(7, &log), rest: tracer(8, &log) }, &log)
+  run printLog(&log)
+  return first + second + third - 20
+}
+pub fn main() -> i32 {
+  return run Effect.catchAll(body(), recoverAny)
+}`
+
 const algorithmExampleIds = [
   'breadth-first-search',
   'crc-32',
@@ -9801,6 +10024,13 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recoverAllocation) 
     source: 'pub fn main() -> i32 { return 0 }',
     nativeSource: replaceDropProgram,
     nativeStdout: '1243',
+    expected: { _tag: 'Completes', result: 0 },
+  },
+  {
+    name: 'selected-loop-exit-drop',
+    source: 'pub fn main() -> i32 { return 0 }',
+    nativeSource: selectedLoopExitDropProgram,
+    nativeStdout: '562143987',
     expected: { _tag: 'Completes', result: 0 },
   },
   {
