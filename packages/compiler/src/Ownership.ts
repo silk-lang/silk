@@ -1141,6 +1141,7 @@ const checkPatternUse = (
   consuming: boolean,
   guard: boolean,
   escaping: boolean,
+  bare = false,
 ): void => {
   const binding = state.bindings.get(siteKey(site))
   const moveOnly = binding?.category._tag === 'MoveOnly'
@@ -1161,6 +1162,13 @@ const checkPatternUse = (
     (consuming || escaping)
   ) {
     state.diagnostics.push(Diagnostic.matchBorrowEscape(binding.name ?? '?', span))
+    checkUse(state, live, site, span, false)
+    return
+  }
+  // A consuming pattern binding is an arm-local owner: a bare by-value use needs `move` exactly
+  // like any other affine binding (OWN-002, CONSUMING-MATCH).
+  if (bare && binding?.matchAccess === 'Move' && consuming && moveOnly) {
+    state.diagnostics.push(Diagnostic.explicitMoveRequired(binding.name ?? '?', span))
     checkUse(state, live, site, span, false)
     return
   }
@@ -1227,7 +1235,7 @@ const checkExpressionOperation = (
     case 'PatternBindingReference': {
       const site = useSite(expression)
       if (site === undefined) return true
-      checkPatternUse(state, live, site, expression.span, consuming, guard, escaping)
+      checkPatternUse(state, live, site, expression.span, consuming, guard, escaping, true)
       return true
     }
     case 'Move': {

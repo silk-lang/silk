@@ -547,6 +547,34 @@ pub fn inspect(event: Token) -> i32 { return match &mut event { Token { kind } =
   )
 })
 
+it('requires move for a bare by-value use of a consuming pattern owner', () => {
+  const source = `pub struct Payload { value: i32 }
+pub struct Box { payload: Payload }
+pub union Slot { Full { payload: Payload }, Empty }
+fn arm(input: Box) -> Payload { return match move input { Box { payload } => payload } }
+fn early(input: Box) -> Payload { match move input { Box { payload } => { return payload } } }
+fn assign(input: Slot, cell: &mut Payload) -> i32 {
+  if let Slot.Full { payload } = move input { cell.* = payload }
+  return 0
+}
+fn moved(input: Box) -> Payload { return match move input { Box { payload } => move payload } }`
+  const result = analyze('consuming-pattern-move', source)
+  // Each use sits after the arm or branch that binds it; the explicit `move` stays accepted.
+  const uses = [
+    source.indexOf('=> payload') + '=> '.length,
+    source.indexOf('return payload') + 'return '.length,
+    source.indexOf('= payload') + '= '.length,
+  ]
+  assert.deepEqual(
+    ownership(result).diagnostics.map(({ code, span }) => ({
+      code,
+      start: span.start,
+      end: span.end,
+    })),
+    uses.map((start) => ({ code: 'OWN0003', start, end: start + 'payload'.length })),
+  )
+})
+
 it('keeps guard bindings provisional and rejects borrowed payload escape', () => {
   const guarded = analyze(
     'guard-owner',
