@@ -9771,7 +9771,7 @@ interface Decoder { effect fn decode(value: &mut Self) -> i32 ! Problem }
 struct Cell { code: i32 }
 effect fn decodeCell(value: &Cell) -> i32 ! Problem { fail Problem { code: 1 } }
 impl Decoder for Cell { decode: Cell.decodeCell }
-fn pending<T: Decoder>(value: &mut T) -> Effect<i32 ! Problem> { return Decoder.decode(value) }
+fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(value) }
 fn observe(result: Result<i32, Problem>) -> i32 {
   return match move result {
     Result<i32, Problem>.Success { value } => value
