@@ -947,3 +947,41 @@ pub fn main() -> i32 { return direct() + staged() }`),
     assert.deepEqual(yield* MirVerification.verify(mir), [])
   }),
 )
+
+// CAPTURE-002 / EFFECT-OWN-002: an exclusive capture, whether written through a place or retained
+// as an Effect operation operand, cannot hide behind a declared shared contract.
+it.effect('rejects a shared declared contract over a retained exclusive capture', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+struct Cell { code: i32 }
+interface Decoder { effect fn decode(value: &mut Self) -> i32 }
+effect fn decodeCell(value: &Cell) -> i32 { return value.code }
+impl Decoder for Cell { decode: Cell.decodeCell }
+fn block(cell: &mut Cell) -> Effect<i32> { return effect { cell.code = 3 return 1 } }
+fn callable(cell: &mut i32) -> fn() -> i32 { return fn() -> i32 { cell.* = 1 return 1 } }
+fn operation<T: Decoder>(value: &mut T) -> Effect<i32> { return Decoder.decode(value) }
+fn blockMut(cell: &mut Cell) -> mut Effect<i32> { return effect { cell.code = 3 return 1 } }
+fn callableMut(cell: &mut i32) -> mut fn() -> i32 { return fn() -> i32 { cell.* = 1 return 1 } }
+fn operationMut<T: Decoder>(value: &mut T) -> mut Effect<i32> { return Decoder.decode(value) }
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* snapshotOf('effect-typing/exclusive-capture-contract', source)
+    const spanOf = (text: string) => {
+      const start = source.indexOf(text)
+      return { start, end: start + text.length }
+    }
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map(({ code, span }) => ({
+        code,
+        start: span.start,
+        end: span.end,
+      })),
+      [
+        { code: 'SEM0129', ...spanOf('effect { cell.code = 3 return 1 }') },
+        { code: 'SEM0129', ...spanOf('fn() -> i32 { cell.* = 1 return 1 }') },
+        // The rejected operand reborrow also fails to outlive the shared return contract.
+        { code: 'OWN0019', ...spanOf('Decoder.decode(value)') },
+        { code: 'SEM0129', ...spanOf('Decoder.decode(value)') },
+      ],
+    )
+  }),
+)
