@@ -25830,8 +25830,13 @@ effect fn checkReceiverCall<'scope>(
   if receiverPositionValue.ordinal != usize.ZERO || parameterCount != CallArguments.length(arguments) + usize.ONE {
     return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
   }
-  if Shared.with<Result<Answer, NoRejection>, bool>(&signature, signatureIsEffect) {
-    return run bodyRejection(&resolver.*, module, RejectionCode.InterfaceEffectUnavailable, span)
+  // An inherent `effect fn` method constructs its Effect like the qualified call; an interface
+  // operation's Effect needs the witness construction (named gap).
+  let effectCall = Shared.with<Result<Answer, NoRejection>, bool>(&signature, signatureIsEffect)
+  if effectCall {
+    if let ReceiverCallChoice.Interface {..} = &choice {
+      return run bodyRejection(&resolver.*, module, RejectionCode.InterfaceEffectUnavailable, span)
+    }
   }
   if Shared.with<Result<Answer, NoRejection>, usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO {
     if let ReceiverCallChoice.Interface {selected} = &choice {
@@ -26132,7 +26137,21 @@ effect fn checkReceiverCall<'scope>(
         Result<Application, Shared<Rejection>>.Success {value} => move value
         Result<Application, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
       }
-      if Shared.with<Type, bool>(&resultType, rawCallableType) {
+      if effectCall {
+        // The Effect's exact representation is this application with the receiver and written
+        // arguments as stored fields (EFF-001, REP-001), as for `Owner.method(receiver, ..)`.
+        let declaredFailure = run signatureFailure(&signature)
+        let declaredRequirements = run signatureRequirements(&signature)
+        let failure = run Type.applyBindings(&declaredFailure, Vector.asSlice<Binding>(&inferred), true)
+        let requirements = run Row.applyBindings(&declaredRequirements, Vector.asSlice<Binding>(&inferred), true)
+        let construction = run effectConstruction(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
+          Vector.asSlice<BodyNode>(&nodes.*), &application, Vector.asSlice<BodyNodeId>(&typedArguments), move resultType,
+          move failure, move requirements, constraints, expression.index, target.isPublic, span)
+        resultType = match move construction {
+          Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
+          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<BodyNodeId, Shared<Rejection>>(move error) }
+        }
+      } else if Shared.with<Type, bool>(&resultType, rawCallableType) {
         resultType = match move run callableResultType(&mut resolver.*, &mut owner.*, &mut dependencies.*,
           &application, constraints, span) {
           Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
@@ -35600,7 +35619,8 @@ effect fn checkExpressionUnder<'scope>(
             access, MatchArms.Written {arms: arms}, expected, constraints, contractBody, unsafeAllowed, span)
         }
       }
-      if access != MatchAccess.Default && access != MatchAccess.Place && access != MatchAccess.Move {
+      // Scalar enum arms bind nothing, so a shared borrow reads the Copy tag like a plain match.
+      if access == MatchAccess.Mutable {
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
       let mut subjectAccess = BodySubjectAccess.Copy
@@ -52377,6 +52397,16 @@ effect fn proveGoal(
   let all = Vector.asSlice<Constraint>(&required)
   at = usize.ZERO
   while at < all.length {
+    // The selected head's own outlives premise never chose it; the caller proves it (LIFE-002).
+    if let Constraint.Outlives {longer, shorter} = &all[at] {
+      if !run knownOutlives(declared, &longer, &shorter) {
+        return Option.some<Shared<Rejection>>(
+          run proofFailure(&resolver.*, siteModule, unprovedOutlivesCode(&longer, &shorter), siteSpan),
+        )
+      }
+      at = at + usize.ONE
+      continue
+    }
     if let Constraint.Conforms {provider, contract} = &all[at] {
       let requirement = ConformanceGoal {
         contract: Shared.clone<Type>(&contract),
@@ -55839,6 +55869,20 @@ effect fn selectOperator(
 // A borrow region, or an instance's caller region that numbers one; neither outlives `'static`.
 fn localLifetime(value: &Lifetime) -> bool { return match &value.* { Lifetime.Local {..} => true Lifetime.Supplied {..} => true _ => false } }
 fn staticLifetime(value: &Lifetime) -> bool { return match &value.* { Lifetime.Static => true _ => false } }
+fn namedLifetime(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Local {..} => true Lifetime.Supplied {..} => true Lifetime.Parameter {..} => true _ => false }
+}
+
+// Only a written premise lets a borrow region or a declared binder outlive `'static`. Once the
+// caller's premises fail to prove it, the bound is unsatisfied (bootstrap SEM0212). Any other
+// unproved relation stays outside the native proof.
+fn unprovedOutlivesCode(longer: &Shared<Lifetime>, shorter: &Shared<Lifetime>) -> RejectionCode {
+  if Shared.with<Lifetime, bool>(shorter, staticLifetime)
+    && (Lifetime.anyAtom(longer, localLifetime) || Lifetime.allAtoms(longer, namedLifetime)) {
+    return RejectionCode.UnsatisfiedLifetimeBound
+  }
+  return RejectionCode.Unsupported
+}
 
 // The type a provision's provider must make conform to the selected service: the referent of a
 // borrowed provider, otherwise the owned provider itself.
@@ -56103,6 +56147,51 @@ effect fn callerContentsCover(declared: &[Constraint], subject: &Shared<Type>, r
   return false
 }
 
+// Whether an applied type is `Intrinsic.Detached`: it retains no caller lexical or provider loan
+// (EXEC-004). A borrow, a borrowed capture and a provided requirement each surface as a region the
+// type retains, including through an Effect or callable environment, so every retained region must
+// be `'static`. A type parameter stored inside it is detached only through its own declared premise.
+effect fn provesDetached(assumptions: &[Constraint], subject: &Shared<Type>, module: &ModuleId) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let anchor = run DeclarationId.fromParts(run ModuleId.copy(module), Vector.make<OwnerStep>())
+  let mut retained = Vector.make<Shared<Lifetime>>()
+  let mut unresolved = Vector.make<Shared<Type>>()
+  if !run captureContents(subject, &anchor, assumptions, &mut retained, &mut unresolved) {
+    let mut alone = Vector.make<Shared<Type>>()
+    run Vector.append<Shared<Type>>(&mut alone, Shared.clone<Type>(subject))
+    return run detachedParameters(assumptions, Vector.asSlice<Shared<Type>>(&alone))
+  }
+  let regions = Vector.asSlice<Shared<Lifetime>>(&retained)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    if !Shared.with<Lifetime, bool>(&regions[at], staticLifetime) { return false }
+    at = at + usize.ONE
+  }
+  return run detachedParameters(assumptions, Vector.asSlice<Shared<Type>>(&unresolved))
+}
+
+// Whether each stored type parameter carries a declared Detached or `'static` contents premise.
+effect fn detachedParameters(assumptions: &[Constraint], parameters: &[Shared<Type>]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let mut premised = false
+    let mut premise = usize.ZERO
+    while premise < assumptions.length && !premised {
+      if let Constraint.Property {subject, property} = &assumptions[premise] {
+        premised = property == IntrinsicProperty.Detached && run Type.equalsShared(&subject, &parameters[at])
+      }
+      if let Constraint.Contents {subject, region} = &assumptions[premise] {
+        premised = Shared.with<Lifetime, bool>(&region, staticLifetime) && run Type.equalsShared(&subject, &parameters[at])
+      }
+      premise = premise + usize.ONE
+    }
+    if !premised { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 effect fn proveAppliedBounds(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -56130,8 +56219,13 @@ effect fn proveAppliedBounds(
     if assumed { at = at + usize.ONE continue }
     // NonParking is a transitive suspension summary. Before the suspension stage, reaching parking
     // is itself the `suspension` gap at that site, so every caller already fails through it (D6).
-    if let Constraint.Property {property, ..} = &bounds[at] {
+    if let Constraint.Property {subject, property} = &bounds[at] {
       if property == IntrinsicProperty.NonParking { at = at + usize.ONE continue }
+      if !run provesDetached(assumptions, &subject, module) {
+        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnsatisfiedExecutableProperty, span))
+      }
+      at = at + usize.ONE
+      continue
     }
     if let Constraint.Copyable {subject} = &bounds[at] {
       let copied = run copyType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, assumptions, span)
@@ -56148,10 +56242,7 @@ effect fn proveAppliedBounds(
     }
     if let Constraint.Outlives {longer, shorter} = &bounds[at] {
       if !run knownOutlives(Vector.asSlice<Constraint>(declared), &longer, &shorter) {
-        if Lifetime.anyAtom(&longer, localLifetime) && Shared.with<Lifetime, bool>(&shorter, staticLifetime) {
-          return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.UnsatisfiedLifetimeBound, span))
-        }
-        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
+        return Option.some<Shared<Rejection>>(run reject(&resolver.*, module, unprovedOutlivesCode(&longer, &shorter), span))
       }
       at = at + usize.ONE
       continue
