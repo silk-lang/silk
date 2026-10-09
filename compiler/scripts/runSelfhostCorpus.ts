@@ -28,8 +28,8 @@ export type CaseResult =
       readonly name: string
       readonly status: 'fail'
       readonly code: string
-      readonly span?: BuildDiagnostic['span']
-      readonly module?: string
+      /** Every distinct semantic rejection the build printed, in order; empty for other failures. */
+      readonly diagnostics: ReadonlyArray<BuildDiagnostic>
       readonly reason: string
     }
   | { readonly name: string; readonly status: 'unsupported'; readonly gaps: ReadonlyArray<Gap> }
@@ -44,6 +44,7 @@ export interface Summary {
 }
 
 const unsupportedPrefix = 'SILK_UNSUPPORTED_JSON='
+const buildErrorPrefix = 'SILK_BUILD_ERROR='
 // A native build of certificate-bounded-decoding takes 28.5-30 s on the hosted Linux runner, so a
 // 30 s build deadline timed it out at random; builds get 4x that, while program runs stay short.
 const buildTimeoutMs = 120_000
@@ -117,14 +118,9 @@ export const parseUnsupported = (stderr: string): ReadonlyArray<Gap> | undefined
   }
 }
 
-/** Reads one anchored semantic rejection; malformed records remain build failures. */
-export const parseBuildDiagnostic = (stderr: string): BuildDiagnostic | undefined => {
-  const prefix = 'SILK_BUILD_ERROR='
-  const records = stderr.split('\n').filter((line) => line.startsWith(prefix))
-  const record = records[0]
-  if (records.length !== 1 || record === undefined) return undefined
+const parseBuildRecord = (record: string): BuildDiagnostic | undefined => {
   try {
-    const value: unknown = JSON.parse(record.slice(prefix.length))
+    const value: unknown = JSON.parse(record)
     if (
       typeof value !== 'object' ||
       value === null ||
@@ -143,6 +139,28 @@ export const parseBuildDiagnostic = (stderr: string): BuildDiagnostic | undefine
   } catch {
     return undefined
   }
+}
+
+/**
+ * Reads every anchored semantic rejection in order, once each. A build walk reports each refused
+ * instance, so one rejection can repeat. Any malformed record leaves the build a process failure.
+ */
+export const parseBuildDiagnostics = (
+  stderr: string,
+): ReadonlyArray<BuildDiagnostic> | undefined => {
+  const records = stderr.split('\n').filter((line) => line.startsWith(buildErrorPrefix))
+  if (records.length === 0) return undefined
+  const diagnostics: BuildDiagnostic[] = []
+  const seen = new Set<string>()
+  for (const record of records) {
+    const diagnostic = parseBuildRecord(record.slice(buildErrorPrefix.length))
+    if (diagnostic === undefined) return undefined
+    const key = `${diagnostic.code}@${diagnostic.module}:${diagnostic.span.start}-${diagnostic.span.end}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    diagnostics.push(diagnostic)
+  }
+  return diagnostics
 }
 
 const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
@@ -258,20 +276,20 @@ export const runCase = (
         },
       )
       if (built.error !== undefined || built.status !== 0 || built.signal !== null) {
-        const gaps = built.error === undefined ? parseUnsupported(text(built.stderr)) : undefined
-        const diagnostic =
-          built.error === undefined ? parseBuildDiagnostic(text(built.stderr)) : undefined
-        return gaps === undefined
-          ? {
-              name: program.name,
-              status: 'fail',
-              code: diagnostic?.code ?? 'BUILD_PROCESS_FAILURE',
-              ...(diagnostic === undefined
-                ? {}
-                : { span: diagnostic.span, module: diagnostic.module }),
-              reason: `profile ${profile.name}: build: ${processFailure(built)}`,
-            }
-          : { name: program.name, status: 'unsupported', gaps }
+        const stderr = text(built.stderr)
+        // A semantic rejection is a failure even when the build also reached gaps beside it.
+        const rejected = stderr.split('\n').some((line) => line.startsWith(buildErrorPrefix))
+        const gaps = built.error === undefined && !rejected ? parseUnsupported(stderr) : undefined
+        if (gaps !== undefined) return { name: program.name, status: 'unsupported', gaps }
+        const diagnostics =
+          (built.error === undefined ? parseBuildDiagnostics(stderr) : undefined) ?? []
+        return {
+          name: program.name,
+          status: 'fail',
+          code: diagnostics[0]?.code ?? 'BUILD_PROCESS_FAILURE',
+          diagnostics,
+          reason: `profile ${profile.name}: build: ${processFailure(built)}`,
+        }
       }
 
       for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
@@ -281,6 +299,7 @@ export const runCase = (
             name: program.name,
             status: 'fail',
             code: 'RUNTIME_MISMATCH',
+            diagnostics: [],
             reason: `profile ${profile.name}: run ${ordinal + 1}: ${mismatch}`,
           }
       }
@@ -291,6 +310,7 @@ export const runCase = (
       name: program.name,
       status: 'fail',
       code: 'CORPUS_RUNNER_FAILURE',
+      diagnostics: [],
       reason: error instanceof Error ? error.message : String(error),
     }
   } finally {
@@ -360,7 +380,7 @@ export const runCorpus = (
   for (const result of results) {
     let detail = ''
     if (result.status === 'fail')
-      detail = `: code=${result.code} span=${result.span === undefined ? 'unavailable' : `${result.module ?? ''}:${result.span.start}-${result.span.end}`} ${result.reason}`
+      detail = `: code=${[...new Set(result.diagnostics.map((diagnostic) => diagnostic.code))].join(',') || result.code} span=${result.diagnostics.map((diagnostic) => `${diagnostic.module}:${diagnostic.span.start}-${diagnostic.span.end}`).join(',') || 'unavailable'} ${result.reason}`
     if (result.status === 'unsupported')
       detail = `: ${result.gaps
         .map(
