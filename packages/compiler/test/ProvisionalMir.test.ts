@@ -482,7 +482,7 @@ effect fn flushIo() -> () ! Problem ? &mut Io | &mut Clock {
  let result = run Effect.result(Io.flush())
  match move result {
   Result.Success {value} => { drop value return () }
-  Result.Failure {error} => { fail error }
+  Result.Failure {error} => { fail move error }
  }
 }
 struct Inner {}

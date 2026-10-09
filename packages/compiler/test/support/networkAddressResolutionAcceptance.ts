@@ -184,7 +184,7 @@ impl Resolver for ProbeResolver {
     let made = ResolvedEndpoints.make(64)
     let mut values = match move made {
       Result<ResolvedEndpoints, ResolverError>.Failure {error} => { fail move error }
-      Result<ResolvedEndpoints, ResolverError>.Success {value} => value
+      Result<ResolvedEndpoints, ResolverError>.Success {value} => move value
     }
     let port = ResolveRequest.port(request)
     let v6 = Endpoint.make(
@@ -238,7 +238,7 @@ effect fn numericRequest(
     move deadline,
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
-    Result<ResolveRequest, ResolverError>.Success {value} => value
+    Result<ResolveRequest, ResolverError>.Success {value} => move value
   }
 }
 
@@ -258,7 +258,7 @@ effect fn domainRequest(family: FamilySelection, maximum: usize) -> ResolveReque
     Option.none<Instant>(),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
-    Result<ResolveRequest, ResolverError>.Success {value} => value
+    Result<ResolveRequest, ResolverError>.Success {value} => move value
   }
 }
 
@@ -406,7 +406,7 @@ effect fn nativeProgram() -> i32
     Option.none<Instant>(),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
-    Result<ResolveRequest, ResolverError>.Success {value} => value
+    Result<ResolveRequest, ResolverError>.Success {value} => move value
   }
   let mut provider = NativeSystemResolver.make()
   let mut clock = NativeProbeClock {}
@@ -499,7 +499,7 @@ impl Resolver for DeterministicDeadlineResolver {
     let made = ResolvedEndpoints.make(ResolveRequest.maxResults(request))
     let mut result = match move made {
       Result<ResolvedEndpoints, ResolverError>.Failure {error} => { fail move error }
-      Result<ResolvedEndpoints, ResolverError>.Success {value} => value
+      Result<ResolvedEndpoints, ResolverError>.Success {value} => move value
     }
     let admitted = run ResolvedEndpoints.admit(
       &mut result,
@@ -539,7 +539,7 @@ effect fn fixtureRequest(deadline: Instant) -> ResolveRequest ! ResolverError {
     Option.some<Instant>(move deadline),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
-    Result<ResolveRequest, ResolverError>.Success {value} => value
+    Result<ResolveRequest, ResolverError>.Success {value} => move value
   }
 }
 
@@ -919,7 +919,7 @@ effect fn request(
     move deadline,
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
-    Result<ResolveRequest, ResolverError>.Success {value} => value
+    Result<ResolveRequest, ResolverError>.Success {value} => move value
   }
 }
 
@@ -1172,7 +1172,7 @@ effect fn nativeCases() -> i32 {
   let v4Result = run Effect.result(resolveSystem(FamilySelection.V4, 2, Option.none<Instant>()))
   let v4 = match move v4Result {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => { drop error return 39 }
-    Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => value
+    Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => move value
   }
   if ResolvedEndpoints.length(&v4) != usize.ONE { return 39 }
   let v4Endpoint = ResolvedEndpoints.get(&v4, usize.ZERO)
@@ -1183,7 +1183,7 @@ effect fn nativeCases() -> i32 {
   let v6Result = run Effect.result(resolveSystem(FamilySelection.V6, 2, Option.none<Instant>()))
   let v6 = match move v6Result {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => { drop error return 41 }
-    Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => value
+    Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => move value
   }
   if ResolvedEndpoints.length(&v6) != usize.ONE { return 41 }
   let v6Endpoint = ResolvedEndpoints.get(&v6, usize.ZERO)
