@@ -1,0 +1,617 @@
+//! The private coroutine of one suspendable instance (SUSP private lowering model).
+//!
+//! # Details
+//!
+//! An instance is suspendable when it runs a suspension boundary or calls a suspendable instance
+//! directly; every such call is a suspension point. Its ordinary symbol drives a transfer record:
+//! `$enter` pushes the instance's frame from the selected execution storage, and the driver runs the
+//! `$step` of the frame on top until no frame remains. A step returns 0 when its frame completed and
+//! was released, and 1 when it pushed the frame of the callee at one of its points.
+//!
+//! A frame never moves. Locals whose address can escape, and the places a suspended callee writes,
+//! stay in the frame for their whole lifetime. Every other local that lives across a point is saved
+//! into that point's resume state, and the states of different points share storage.
+
+import backend.InstanceKey {InstanceKey}
+import backend.Mir {
+  AggregateField,
+  Block,
+  Callee,
+  Diagnostics,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  SwitchCase,
+  Terminator,
+}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+/// The emission facts of one suspendable instance.
+pub struct Facts {
+  /// Its direct callees that are themselves suspendable, in first-call order.
+  pub callees: Vector<InstanceKey>
+  /// The C symbols of the selected execution-storage operations.
+  pub create: Bytes
+  pub acquire: Bytes
+  pub release: Bytes
+  pub destroy: Bytes
+}
+
+/// The size and alignment of one local's storage.
+pub struct Extent {
+  pub size: usize
+  pub alignment: usize
+}
+
+impl Copy for Extent {}
+
+/// One local's storage at a fixed frame offset.
+pub struct FrameSlot {
+  pub local: usize
+  pub offset: usize
+  pub size: usize
+}
+
+impl Copy for FrameSlot {}
+
+/// The locals one resume state restores.
+pub struct State {
+  pub slots: Vector<FrameSlot>
+}
+
+/// The frame of one suspendable instance.
+pub struct Coroutine {
+  pub size: usize
+  pub alignment: usize
+  /// Locals that live in the frame for their whole lifetime.
+  pub resident: Vector<FrameSlot>
+  /// The context companions of failure slots, named by the slot's local; always frame-resident.
+  pub companions: Vector<FrameSlot>
+  /// State 0 starts the body with its parameters; state `k + 1` resumes after point `k`.
+  pub states: Vector<State>
+  /// The block whose terminator is point `k`.
+  pub points: Vector<usize>
+}
+
+impl Facts {
+  pub effect fn copy(self: &Self) -> Facts ! OutOfMemoryError ? &mut Allocator {
+    let mut callees = Vector.make<InstanceKey>()
+    let listed = Vector.asSlice<InstanceKey>(&self.callees)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector.append<InstanceKey>(&mut callees, InstanceKey.copy(&listed[at]))
+      at = at + usize.ONE
+    }
+    return Facts {
+      callees: move callees,
+      create: run Bytes.copy(Bytes.asSlice(&self.create)),
+      acquire: run Bytes.copy(Bytes.asSlice(&self.acquire)),
+      release: run Bytes.copy(Bytes.asSlice(&self.release)),
+      destroy: run Bytes.copy(Bytes.asSlice(&self.destroy)),
+    }
+  }
+
+  /// Whether a call to `key` is a suspension point.
+  pub effect fn suspends(self: &Self, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let listed = Vector.asSlice<InstanceKey>(&self.callees)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if run InstanceKey.sameApplication(&listed[at], key) { return true }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  pub effect fn equals(self: &Self, other: &Facts) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let left = Vector.asSlice<InstanceKey>(&self.callees)
+    let right = Vector.asSlice<InstanceKey>(&other.callees)
+    if left.length != right.length { return false }
+    let mut at = usize.ZERO
+    while at < left.length {
+      if !run InstanceKey.sameApplication(&left[at], &right[at]) { return false }
+      at = at + usize.ONE
+    }
+    return same(Bytes.asSlice(&self.create), Bytes.asSlice(&other.create))
+      && same(Bytes.asSlice(&self.acquire), Bytes.asSlice(&other.acquire))
+      && same(Bytes.asSlice(&self.release), Bytes.asSlice(&other.release))
+      && same(Bytes.asSlice(&self.destroy), Bytes.asSlice(&other.destroy))
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn alignUp(value: usize, alignment: usize) -> usize {
+  if alignment <= usize.ONE { return value }
+  return (value + alignment - usize.ONE) / alignment * alignment
+}
+
+// One bit per local, `words` words per set, sets stored back to back.
+fn bitWord(local: usize) -> usize { return local / 64 }
+
+fn bitMask(local: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(local - local / 64 * 64)) }
+
+fn isSet(sets: &[u64], base: usize, local: usize) -> bool {
+  return u64.bitAnd(sets[base + bitWord(local)], bitMask(local)) != 0
+}
+
+fn mark(sets: &mut [u64], base: usize, local: usize) -> () {
+  let at = base + bitWord(local)
+  sets[at] = u64.bitOr(sets[at], bitMask(local))
+}
+
+effect fn zeros(count: usize) -> Vector<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Vector.make<u64>()
+  let mut at = usize.ZERO
+  while at < count {
+    run Vector.append<u64>(&mut result, 0)
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// The locals one block reads before writing them whole, and the locals it writes whole.
+struct Effects {
+  uses: Vector<u64>
+  defs: Vector<u64>
+}
+
+fn useLocal(effects: &mut Effects, local: usize) -> () {
+  if !isSet(Vector.asSlice<u64>(&effects.defs), usize.ZERO, local) {
+    mark(Vector.asMutSlice<u64>(&mut effects.uses), usize.ZERO, local)
+  }
+}
+
+fn usePlace(effects: &mut Effects, place: &Place) -> () {
+  useLocal(&mut effects.*, place.local)
+  let steps = Vector.asSlice<Projection>(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &steps[at] { useLocal(&mut effects.*, local) }
+    at = at + usize.ONE
+  }
+}
+
+fn useOperand(effects: &mut Effects, operand: &Operand) -> () {
+  match &operand.* {
+    Operand.Copy {place} => usePlace(&mut effects.*, &place)
+    Operand.Move {place} => usePlace(&mut effects.*, &place)
+    _ => {}
+  }
+}
+
+fn useFields(effects: &mut Effects, fields: &Vector<AggregateField>) -> () {
+  let listed = Vector.asSlice<AggregateField>(fields)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    useOperand(&mut effects.*, &listed[at].value)
+    at = at + usize.ONE
+  }
+}
+
+fn useOperands(effects: &mut Effects, operands: &Vector<Operand>) -> () {
+  let listed = Vector.asSlice<Operand>(operands)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    useOperand(&mut effects.*, &listed[at])
+    at = at + usize.ONE
+  }
+}
+
+fn useRvalue(effects: &mut Effects, value: &Rvalue) -> () {
+  match &value.* {
+    Rvalue.Aggregate {fields} => useFields(&mut effects.*, &fields)
+    Rvalue.Slice {data, count} => {
+      useOperand(&mut effects.*, &data)
+      useOperand(&mut effects.*, &count)
+    }
+    Rvalue.SliceLength {place} => usePlace(&mut effects.*, &place)
+    Rvalue.SliceData {place} => usePlace(&mut effects.*, &place)
+    Rvalue.PointerOffset {pointer, index, ..} => {
+      useOperand(&mut effects.*, &pointer)
+      useOperand(&mut effects.*, &index)
+    }
+    Rvalue.Use {value: used} => useOperand(&mut effects.*, &used)
+    Rvalue.Ref {place, ..} => usePlace(&mut effects.*, &place)
+    Rvalue.AddressOf {place, ..} => usePlace(&mut effects.*, &place)
+    Rvalue.Unary {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.Binary {left, right, ..} => {
+      useOperand(&mut effects.*, &left)
+      useOperand(&mut effects.*, &right)
+    }
+    Rvalue.ScalarBinary {left, right, ..} => {
+      useOperand(&mut effects.*, &left)
+      useOperand(&mut effects.*, &right)
+    }
+    Rvalue.ScalarUnary {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.Convert {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.Fits {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.AddressIntegerConversion {operand, ..} => useOperand(&mut effects.*, &operand)
+    Rvalue.Bitcast {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.Discriminant {place} => usePlace(&mut effects.*, &place)
+    Rvalue.Inject {value: used, ..} => useOperand(&mut effects.*, &used)
+    Rvalue.Variant {fields, ..} => useFields(&mut effects.*, &fields)
+    Rvalue.FunctionAddress {..} => {}
+    Rvalue.ContextOf {place} => usePlace(&mut effects.*, &place)
+    Rvalue.ForeignStatic {..} => {}
+    Rvalue.Assembly {inputs, ..} => useOperands(&mut effects.*, &inputs)
+  }
+}
+
+fn useDiagnostics(effects: &mut Effects, diagnostics: &Option<Diagnostics>) -> () {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    useOperand(&mut effects.*, &value.observer)
+    useOperand(&mut effects.*, &value.cause)
+  }
+}
+
+// An aggregate or variant store may write only some fields of a whole local, so it keeps the rest
+// live; every other whole-local store replaces it.
+fn replacesWhole(value: &Rvalue) -> bool {
+  return match &value.* {
+    Rvalue.Aggregate {..} => false
+    Rvalue.Variant {..} => false
+    _ => true
+  }
+}
+
+fn failureLocal(function: &MirFunction) -> usize {
+  let locals = Vector.asSlice<Local>(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let failure = match &locals[at].kind { LocalKind.Failure => true _ => false }
+    if failure { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+effect fn blockEffects(function: &MirFunction, block: &Block, words: usize) -> Effects
+! OutOfMemoryError ? &mut Allocator {
+  let mut effects = Effects {uses: run zeros(words), defs: run zeros(words)}
+  let statements = Vector.asSlice<Statement>(&block.statements)
+  let mut at = usize.ZERO
+  while at < statements.length {
+    match &statements[at] {
+      Statement.Assign {destination, value, ..} => {
+        useRvalue(&mut effects, &value)
+        if Vector.length<Projection>(&destination.projections) == usize.ZERO && replacesWhole(&value) {
+          mark(Vector.asMutSlice<u64>(&mut effects.defs), usize.ZERO, destination.local)
+        } else {
+          usePlace(&mut effects, &destination)
+        }
+      }
+      Statement.Drop {destination, diagnostics, ..} => {
+        usePlace(&mut effects, &destination)
+        useDiagnostics(&mut effects, &diagnostics)
+      }
+      Statement.FailureContext {destination, source, ..} => {
+        usePlace(&mut effects, &destination)
+        if let Option<Place>.Some {value: from} = &source { usePlace(&mut effects, &from) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  match &block.terminator {
+    Terminator.Branch {condition, ..} => useOperand(&mut effects, &condition)
+    Terminator.Return {..} => useLocal(&mut effects, usize.ZERO)
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, ..} => {
+      if let Callee.Indirect {address} = &callee { useOperand(&mut effects, &address) }
+      useOperands(&mut effects, &arguments)
+      useOperands(&mut effects, &providers)
+      useDiagnostics(&mut effects, &diagnostics)
+      usePlace(&mut effects, &destination)
+      if let Option<FailureEdge>.Some {value: edge} = &failure { usePlace(&mut effects, &edge.destination) }
+    }
+    Terminator.Fail {..} => {
+      let failed = failureLocal(function)
+      if failed != usize.MAX { useLocal(&mut effects, failed) }
+    }
+    Terminator.Switch {value, ..} => useOperand(&mut effects, &value)
+    _ => {}
+  }
+  return move effects
+}
+
+effect fn successors(terminator: &Terminator) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Vector.make<usize>()
+  match &terminator.* {
+    Terminator.Goto {target, ..} => run Vector.append<usize>(&mut result, target)
+    Terminator.Branch {thenBlock, elseBlock, ..} => {
+      run Vector.append<usize>(&mut result, thenBlock)
+      run Vector.append<usize>(&mut result, elseBlock)
+    }
+    Terminator.Call {normal, failure, ..} => {
+      run Vector.append<usize>(&mut result, normal)
+      if let Option<FailureEdge>.Some {value: edge} = &failure { run Vector.append<usize>(&mut result, edge.target) }
+    }
+    Terminator.Switch {cases, otherwise, ..} => {
+      let listed = Vector.asSlice<SwitchCase>(&cases)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run Vector.append<usize>(&mut result, listed[at].target)
+        at = at + usize.ONE
+      }
+      run Vector.append<usize>(&mut result, otherwise)
+    }
+    _ => {}
+  }
+  return move result
+}
+
+effect fn appendAll(sets: &mut Vector<u64>, values: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Vector.append<u64>(&mut sets.*, values[at])
+    at = at + usize.ONE
+  }
+}
+
+// The locals live on entry to each block, `words` words per block.
+effect fn liveness(function: &MirFunction, words: usize) -> Vector<u64> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let mut uses = Vector.make<u64>()
+  let mut defs = Vector.make<u64>()
+  let mut edges = Vector.make<Vector<usize>>()
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let effects = run blockEffects(function, &blocks[at], words)
+    run appendAll(&mut uses, Vector.asSlice<u64>(&effects.uses))
+    run appendAll(&mut defs, Vector.asSlice<u64>(&effects.defs))
+    run Vector.append<Vector<usize>>(&mut edges, run successors(&blocks[at].terminator))
+    at = at + usize.ONE
+  }
+  let mut live = run zeros(blocks.length * words)
+  let used = Vector.asSlice<u64>(&uses)
+  let written = Vector.asSlice<u64>(&defs)
+  let following = Vector.asSlice<Vector<usize>>(&edges)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut block = blocks.length
+    while block > usize.ZERO {
+      block = block - usize.ONE
+      let targets = Vector.asSlice<usize>(&following[block])
+      let mut index = usize.ZERO
+      while index < words {
+        let mut out: u64 = 0
+        let mut edge = usize.ZERO
+        while edge < targets.length {
+          out = u64.bitOr(out, Vector.asSlice<u64>(&live)[targets[edge] * words + index])
+          edge = edge + usize.ONE
+        }
+        let at = block * words + index
+        let entry = u64.bitOr(used[at], u64.bitAnd(out, u64.bitNot(written[at])))
+        let current = Vector.asMutSlice<u64>(&mut live)
+        if current[at] != entry {
+          current[at] = entry
+          changed = true
+        }
+        index = index + usize.ONE
+      }
+    }
+  }
+  return move live
+}
+
+// Locals whose address a reference or raw pointer can carry, and the places the callee of a point
+// writes after its caller's step returned.
+effect fn residentLocals(function: &MirFunction, points: &[bool], words: usize) -> Vector<u64>
+! OutOfMemoryError ? &mut Allocator {
+  let mut resident = run zeros(words)
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let statements = Vector.asSlice<Statement>(&blocks[at].statements)
+    let mut statementAt = usize.ZERO
+    while statementAt < statements.length {
+      if let Statement.Assign {value, ..} = &statements[statementAt] {
+        match &value {
+          Rvalue.Ref {place, ..} => mark(Vector.asMutSlice<u64>(&mut resident), usize.ZERO, place.local)
+          Rvalue.AddressOf {place, ..} => mark(Vector.asMutSlice<u64>(&mut resident), usize.ZERO, place.local)
+          _ => {}
+        }
+      }
+      statementAt = statementAt + usize.ONE
+    }
+    if points[at] {
+      if let Terminator.Call {destination, failure, ..} = &blocks[at].terminator {
+        mark(Vector.asMutSlice<u64>(&mut resident), usize.ZERO, destination.local)
+        if let Option<FailureEdge>.Some {value: edge} = &failure {
+          mark(Vector.asMutSlice<u64>(&mut resident), usize.ZERO, edge.destination.local)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move resident
+}
+
+// Packs the saved locals of one state from `base`; returns the state and its end offset.
+struct Packed {
+  state: State
+  end: usize
+}
+
+effect fn pack(extents: &[Extent], live: &[u64], resident: &[u64], base: usize) -> Packed
+! OutOfMemoryError ? &mut Allocator {
+  let mut slots = Vector.make<FrameSlot>()
+  let mut offset = base
+  let mut local = usize.ZERO
+  while local < extents.length {
+    if isSet(live, usize.ZERO, local) && !isSet(resident, usize.ZERO, local) && extents[local].size > usize.ZERO {
+      offset = alignUp(offset, extents[local].alignment)
+      run Vector.append<FrameSlot>(&mut slots, FrameSlot {local: local, offset: offset, size: extents[local].size})
+      offset = offset + extents[local].size
+    }
+    local = local + usize.ONE
+  }
+  return Packed {state: State {slots: move slots}, end: offset}
+}
+
+impl Coroutine {
+  /// The frame header: its parent frame at offset 0, its step function and resume state, then the
+  /// caller's result, failure and context addresses, the observer and cause, and one address per
+  /// provider.
+  pub fn resumeOffset(word: usize) -> usize { return word }
+  pub fn stateOffset(word: usize) -> usize { return word * 2 }
+  pub fn outOffset(word: usize) -> usize { return word * 3 }
+  pub fn failOffset(word: usize) -> usize { return word * 4 }
+  pub fn contextOffset(word: usize) -> usize { return word * 5 }
+  pub fn observerOffset(word: usize) -> usize { return word * 6 }
+  pub fn causeOffset(word: usize) -> usize { return word * 7 }
+  pub fn providerOffset(word: usize, index: usize) -> usize { return word * (8 + index) }
+
+  /// The three-word transfer record: the lazily created storage state at offset 0, the top frame,
+  /// and whether the frame that completed last failed.
+  pub fn transferTop(word: usize) -> usize { return word }
+  pub fn transferFailed(word: usize) -> usize { return word * 2 }
+
+  /// Plans the frame of `function`. `extents` sizes each local, `points` marks each block whose
+  /// terminator is a suspension point, and `companions` lists the failure slots that own a context
+  /// companion of four words.
+  pub effect fn plan(function: &MirFunction, extents: &[Extent], points: &[bool], providers: usize,
+    companions: &[usize], word: usize) -> Coroutine ! OutOfMemoryError ? &mut Allocator {
+    let count = extents.length
+    let words = count / 64 + usize.ONE
+    let resident = run residentLocals(function, points, words)
+    let resided = Vector.asSlice<u64>(&resident)
+    let mut alignment = word
+    let mut offset = Coroutine.providerOffset(word, providers)
+    let mut residentSlots = Vector.make<FrameSlot>()
+    let mut local = usize.ZERO
+    while local < count {
+      if isSet(resided, usize.ZERO, local) {
+        let mut size = extents[local].size
+        if size == usize.ZERO { size = usize.ONE }
+        let mut aligned = extents[local].alignment
+        if aligned == usize.ZERO { aligned = usize.ONE }
+        if aligned > alignment { alignment = aligned }
+        offset = alignUp(offset, aligned)
+        run Vector.append<FrameSlot>(&mut residentSlots, FrameSlot {local: local, offset: offset, size: size})
+        offset = offset + size
+      }
+      local = local + usize.ONE
+    }
+    let mut companionSlots = Vector.make<FrameSlot>()
+    let mut companionAt = usize.ZERO
+    while companionAt < companions.length {
+      offset = alignUp(offset, word)
+      run Vector.append<FrameSlot>(&mut companionSlots, FrameSlot {local: companions[companionAt], offset: offset, size: word * 4})
+      offset = offset + word * 4
+      companionAt = companionAt + usize.ONE
+    }
+    let base = offset
+    let mut end = base
+    let mut states = Vector.make<State>()
+    let mut parameterSet = run zeros(words)
+    let parameterCount = Vector.length<Shared<Type>>(&function.parameters)
+    local = usize.ONE
+    while local <= parameterCount {
+      mark(Vector.asMutSlice<u64>(&mut parameterSet), usize.ZERO, local)
+      local = local + usize.ONE
+    }
+    let start = run pack(extents, Vector.asSlice<u64>(&parameterSet), resided, base)
+    let Packed {state: initial, end: initialEnd} = move start
+    if initialEnd > end { end = initialEnd }
+    run Vector.append<State>(&mut states, move initial)
+    let live = run liveness(function, words)
+    let entries = Vector.asSlice<u64>(&live)
+    let blocks = Vector.asSlice<Block>(&function.blocks)
+    let mut pointBlocks = Vector.make<usize>()
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      if points[block] {
+        let mut after = run zeros(words)
+        let targets = run successors(&blocks[block].terminator)
+        let listed = Vector.asSlice<usize>(&targets)
+        let mut target = usize.ZERO
+        while target < listed.length {
+          let mut index = usize.ZERO
+          let merged = Vector.asMutSlice<u64>(&mut after)
+          while index < words {
+            merged[index] = u64.bitOr(merged[index], entries[listed[target] * words + index])
+            index = index + usize.ONE
+          }
+          target = target + usize.ONE
+        }
+        let resumed = run pack(extents, Vector.asSlice<u64>(&after), resided, base)
+        let Packed {state: saved, end: savedEnd} = move resumed
+        if savedEnd > end { end = savedEnd }
+        run Vector.append<State>(&mut states, move saved)
+        run Vector.append<usize>(&mut pointBlocks, block)
+      }
+      block = block + usize.ONE
+    }
+    local = usize.ZERO
+    while local < count {
+      if extents[local].alignment > alignment { alignment = extents[local].alignment }
+      local = local + usize.ONE
+    }
+    return Coroutine {
+      size: alignUp(end, alignment),
+      alignment: alignment,
+      resident: move residentSlots,
+      companions: move companionSlots,
+      states: move states,
+      points: move pointBlocks,
+    }
+  }
+
+  /// The frame offset of a resident local or companion owner, if any.
+  pub fn residentAt(self: &Self, local: usize) -> usize {
+    return slotAt(Vector.asSlice<FrameSlot>(&self.resident), local)
+  }
+
+  pub fn companionAt(self: &Self, local: usize) -> usize {
+    return slotAt(Vector.asSlice<FrameSlot>(&self.companions), local)
+  }
+
+  /// Where `$enter` stores parameter `local`: its resident slot, or its slot in state 0.
+  pub fn parameterAt(self: &Self, local: usize) -> usize {
+    let resident = Coroutine.residentAt(self, local)
+    if resident != usize.MAX { return resident }
+    let states = Vector.asSlice<State>(&self.states)
+    return slotAt(Vector.asSlice<FrameSlot>(&states[usize.ZERO].slots), local)
+  }
+
+  /// The resume state that follows the point ending `block`, or `usize.MAX` for another block.
+  pub fn stateAfter(self: &Self, block: usize) -> usize {
+    let listed = Vector.asSlice<usize>(&self.points)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if listed[at] == block { return at + usize.ONE }
+      at = at + usize.ONE
+    }
+    return usize.MAX
+  }
+}
+
+fn slotAt(slots: &[FrameSlot], local: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < slots.length {
+    if slots[at].local == local { return slots[at].offset }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
