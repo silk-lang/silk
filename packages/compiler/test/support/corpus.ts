@@ -5669,7 +5669,7 @@ effect fn retrying() -> i32 ! Problem {
     if counter < 3 { fail Problem { code: counter } }
     return counter
   }
-  let retried = move work |> Effect.retry(2)
+  let mut retried = move work |> Effect.retry(2)
   return run retried
 }
 effect fn recover(problem: Problem) -> i32 { return 99 }
