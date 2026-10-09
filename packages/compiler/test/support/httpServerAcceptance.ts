@@ -332,7 +332,7 @@ effect<'call> fn handleRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { return 34 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -404,7 +404,7 @@ effect<'call> fn rejectExpectation<
     valueLimits(),
   ) {
     Result.Failure {error} => { return 74 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   run reject(&mut request.*, &response, Option.none<Instant>())
   return 0
@@ -443,7 +443,7 @@ effect<'call> fn handleZeroBody<
     valueLimits(),
   ) {
     Result.Failure {error} => { return 84 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -636,7 +636,7 @@ effect<'call> fn fixedResponseRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 106 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -727,7 +727,7 @@ effect<'call> fn chunkedResponseRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 118 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -775,7 +775,7 @@ effect<'call> fn informationalRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 235 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let duplicateContinue = run Effect.result(sendInformational(
     &mut request.*,
@@ -803,7 +803,7 @@ effect<'call> fn informationalRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 128 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let invalid = run Effect.result(sendInformational(
     &mut request.*,
@@ -840,7 +840,7 @@ effect<'call> fn informationalRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 130 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let framed = run Effect.result(sendInformational(
     &mut request.*,
@@ -862,7 +862,7 @@ effect<'call> fn informationalRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 123 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   run sendInformational(&mut request.*, &informational, Option.none<Instant>())
   let repeated = run Effect.result(sendInformational(
@@ -943,7 +943,7 @@ effect<'call> fn recoverBeforeOutput<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 144 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let attempted = run Effect.result(respond(
     &mut request.*,
@@ -1026,7 +1026,7 @@ effect<'call> fn failAfterOutput<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 157 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -1121,7 +1121,7 @@ effect<'call> fn upgradeRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 165 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let code = run withUpgrade<i32, never>(
     &mut request.*,
@@ -1190,7 +1190,7 @@ effect<'call> fn tunnelRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 175 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let code = run withTunnel<i32, never>(
     &mut request.*,
@@ -1249,7 +1249,7 @@ effect<'call> fn http10Request<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 204 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -1295,7 +1295,7 @@ effect<'call> fn unreadBodyRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 214 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
@@ -1374,7 +1374,7 @@ effect<'call> fn closeDelimitedRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 225 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,

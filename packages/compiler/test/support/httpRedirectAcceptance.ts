@@ -947,7 +947,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
       drop error
       return 111
     }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let followPrevious = RedirectPolicy.previousResponse(&follow)
   match &followPrevious.* {
@@ -991,7 +991,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
       drop error
       return 120
     }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !redirectFailureIs(
     statusDecision(&zero, s301, usize.ZERO),

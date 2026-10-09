@@ -1220,7 +1220,7 @@ fn inspectHostAndHeads<'headers, 'reason>(
   if !requestSucceeded(RequestHead.make(Version.Http11, get, origin, headers)) { return false }
   let host = match move validateRequestHost(Version.Http11, &origin, &headers) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
-    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => value
+    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => move value
   }
   match move effectiveAuthority(origin, move host) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
@@ -1239,7 +1239,7 @@ fn inspectHostAndHeads<'headers, 'reason>(
   }
   let hostAgain = match move validateRequestHost(Version.Http11, &absolute, &headers) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
-    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => value
+    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => move value
   }
   match move effectiveAuthority(absolute, move hostAgain) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
@@ -1259,7 +1259,7 @@ fn inspectHostAndHeads<'headers, 'reason>(
   }
   let connectHost = match move validateRequestHost(Version.Http11, &connectTarget, &headers) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
-    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => value
+    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => move value
   }
   match move effectiveAuthority(connectTarget, move connectHost) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
@@ -1279,7 +1279,7 @@ fn inspectHostAndHeads<'headers, 'reason>(
   }
   let asteriskHost = match move validateRequestHost(Version.Http11, &asterisk, &headers) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
-    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => value
+    Result<Option<HttpAuthority<'headers>>, ValueError>.Success {value} => move value
   }
   match move effectiveAuthority(asterisk, move asteriskHost) {
     Result<Option<HttpAuthority<'headers>>, ValueError>.Failure {error} => { return false }
@@ -1866,7 +1866,7 @@ effect fn copyResponseMade<'value>(
     Result<ResponseHead<'value>, ValueError>.Failure {error} => {
       return Result.failResult<OwnedResponseHead, ValueError>(move error)
     }
-    Result<ResponseHead<'value>, ValueError>.Success {value} => value
+    Result<ResponseHead<'value>, ValueError>.Success {value} => move value
   }
   return run ResponseHead.copy(&head, configured)
 }
@@ -1982,7 +1982,7 @@ effect fn responseCopyFromHeaders<'headers>(
     Result<ResponseHead<'headers>, ValueError>.Failure {error} => {
       return Result.failResult<OwnedResponseHead, ValueError>(move error)
     }
-    Result<ResponseHead<'headers>, ValueError>.Success {value} => value
+    Result<ResponseHead<'headers>, ValueError>.Success {value} => move value
   }
   return run ResponseHead.copy(&head, copyLimits)
 }
