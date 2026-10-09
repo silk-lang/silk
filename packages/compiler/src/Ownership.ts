@@ -3866,7 +3866,7 @@ const checkFunction = (
       if (expression._tag === 'EffectBlock') return []
       return [
         ...(expression._tag === 'Run' ||
-        (expression._tag === 'BuiltinCall' && expression.operation === 'ExecutionWake')
+        (expression._tag === 'BuiltinCall' && expression.operation === 'ExecutionNotify')
           ? [expression]
           : []),
         ...Tir.expressionChildren(expression).flatMap(activeBoundaryOperations),
@@ -3879,7 +3879,7 @@ const checkFunction = (
       for (const operation of boundaryOperations)
         state.diagnostics.push(
           Diagnostic.localSharedAccessEscape(
-            operation._tag === 'BuiltinCall' && operation.operation === 'ExecutionWake'
+            operation._tag === 'BuiltinCall' && operation.operation === 'ExecutionNotify'
               ? 'Callback'
               : 'Suspension',
             operation.span,

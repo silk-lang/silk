@@ -73,9 +73,9 @@ pub fn main() -> () {
 
 it.effect('rejects parking through the default source runtime NonParking constraint', () =>
   Effect.gen(function* () {
-    const source = `import silk.execution { Execution }
+    const source = `import silk.execution { Execution, Wake }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { drop wake return Guard {} }
+fn register(wake: Wake) -> Guard { drop wake return Guard {} }
 pub fn main() -> () { return run Execution.park(register) }`
     const snapshot = yield* realized('pressure/independent-execution-unowned-entry', source)
     const diagnostics = Analysis.diagnostics(snapshot)

@@ -6,8 +6,9 @@ entry point. The provider owns the root and every child as independently resumab
 the root terminates.
 
 These APIs build on [independently resumable Effect executions](independent-execution.md). The
-compiler owns the target-neutral Execution and Wake lifecycle. Scheduler selection, ready order,
-task storage, Fiber observation, and structured cancellation remain standard-library policy.
+compiler owns only the target-neutral Execution activation lifecycle. Wake readiness, scheduler
+selection, ready order, task storage, Fiber observation, and structured cancellation remain
+standard-library policy.
 
 ## Terms
 
@@ -266,9 +267,10 @@ cooperative scope and does not promise fairness to outer siblings.
 cancellation are navigable Silk declarations. A renamed provider implementing the same service
 contract receives the same analysis, ownership, lowering, and execution behavior.
 
-The compiler recognizes only the sealed target-neutral Execution, Wake, parking, and initial
-readiness operations. `Execution.notifyInitial` changes a stored `Initial` Execution to
-`InitialReady` and invokes its fixed endpoint; it does not know which queue or scheduling policy
+The compiler recognizes only the sealed target-neutral Execution primitives listed in
+[EXEC-006](independent-execution.md#exec-006--scheduling-policy-remains-ordinary-source).
+`Execution.notifyInitial` is ordinary source: it changes a stored `Initial` Execution to
+`InitialReady` and invokes its fixed endpoint, without knowing which queue or scheduling policy
 that endpoint implements.
 
 **Boundary:** Importing no Fiber or scheduler module adds no service, task store, queue, Execution,

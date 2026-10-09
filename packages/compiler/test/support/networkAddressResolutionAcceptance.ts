@@ -446,14 +446,14 @@ fn fixtureDeadlineReached(now: &Instant, deadline: &Instant) -> bool {
   return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(deadline)
 }
 
-struct HeldRegistration { wake: Intrinsic.Wake }
+struct HeldRegistration { wake: Wake }
 impl Drop for HeldRegistration {
   fn drop(self: &mut HeldRegistration) -> () {
     unsafe { silk_deadline_stub_mark_registration_drop() }
     return ()
   }
 }
-fn holdRegistration(wake: Intrinsic.Wake) -> HeldRegistration {
+fn holdRegistration(wake: Wake) -> HeldRegistration {
   unsafe { silk_deadline_stub_mark_registration() }
   return HeldRegistration {wake: move wake}
 }
@@ -464,9 +464,9 @@ impl Drop for CompletedRegistration {
     return ()
   }
 }
-fn completeRegistration(wake: Intrinsic.Wake) -> CompletedRegistration {
+fn completeRegistration(wake: Wake) -> CompletedRegistration {
   unsafe { silk_deadline_stub_mark_registration() }
-  Intrinsic.wake(move wake)
+  Execution.wake(move wake)
   return CompletedRegistration {}
 }
 
@@ -651,7 +651,7 @@ effect fn deadlineCancellationProgram() -> i32 ! ResolverError | OutOfMemoryErro
 
 export const deadlineResolverFixtureSource = `
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution {Execution, Wake}
 
 ${deadlineResolverProviderSource}
 
@@ -862,7 +862,7 @@ void freeaddrinfo(struct addrinfo *result) {
 export const nativeResolverStubAcceptanceSource = `
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution {Execution, Wake}
 import silk.layout {Layout}
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_resolver {NativeSystemResolver}

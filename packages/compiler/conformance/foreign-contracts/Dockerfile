@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 # Freeze package indexes as well as versions so security updates cannot remove a pinned supply.
 RUN rm /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' \
