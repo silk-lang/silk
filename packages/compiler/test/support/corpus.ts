@@ -2524,6 +2524,117 @@ int32_t silk_finish_events(void) { puts(""); return 42; }
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // A consuming `if let` body or `match` arm owns the fields its `..` omits until it exits, after
+    // its bindings, on every exit: fall-through, return, break and failure propagation, in plain
+    // and effect functions alike. Each drop prints two digits and a comma through libc `putchar`.
+    name: 'moved-rest-pattern-omitted-field-cleanup',
+    source: `import silk.effect { Effect }
+unsafe extern "C" fn putchar(value: i32) -> i32
+fn mark(value: i32) -> () {
+  unsafe {
+    let tens = putchar(48 + value / 10)
+    let ones = putchar(48 + value % 10)
+    let comma = putchar(44)
+  }
+  return ()
+}
+struct Recorder { value: i32 }
+impl Drop for Recorder {
+  fn drop(self: &mut Recorder) -> () {
+    mark(self.value)
+    return ()
+  }
+}
+union Held { Pair { kept: Recorder, left: Recorder, right: Recorder }, Empty }
+fn make(base: i32) -> Held {
+  return Held.Pair { kept: Recorder { value: base + 1 }, left: Recorder { value: base + 2 }, right: Recorder { value: base + 3 } }
+}
+fn plainIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(16)
+  return ()
+}
+effect fn effectIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(26)
+  return ()
+}
+effect fn effectIfReturns(held: Held) -> i32 {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    return kept.value
+  }
+  return 0
+}
+effect fn effectMatch(held: Held) -> () {
+  match move held {
+    Held.Pair { kept, .. } => { mark(kept.value + 4) }
+    Held.Empty => {}
+  }
+  mark(46)
+  return ()
+}
+effect fn effectMatchReturns(held: Held) -> i32 {
+  match move held {
+    Held.Pair { kept, .. } => {
+      mark(kept.value + 4)
+      return kept.value
+    }
+    Held.Empty => {}
+  }
+  return 0
+}
+fn plainIfReturns(held: Held) -> i32 {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    return kept.value
+  }
+  return 0
+}
+fn loopBreaks(base: i32) -> () {
+  let mut n = 0
+  while n < 3 {
+    let held = make(base)
+    if let Held.Pair { kept, .. } = move held {
+      mark(kept.value + 4)
+      break
+    }
+    n = n + 1
+  }
+  mark(base + 6)
+  return ()
+}
+struct Stop {}
+effect fn stop() -> () ! Stop { fail Stop {} }
+effect fn effectIfFails(held: Held) -> i32 ! Stop {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    run stop()
+    return kept.value
+  }
+  return 0
+}
+effect fn stopped(problem: Stop) -> i32 { return 85 }
+pub fn main() -> i32 {
+  plainIf(make(10))
+  run effectIf(make(20))
+  let first = run effectIfReturns(make(30))
+  mark(first + 5)
+  run effectMatch(make(40))
+  let second = run effectMatchReturns(make(50))
+  mark(second + 5)
+  let third = plainIfReturns(make(60))
+  mark(third + 5)
+  loopBreaks(70)
+  let fourth = run Effect.catchAll(effectIfFails(make(80)), stopped)
+  mark(fourth + 1)
+  return 42
+}`,
+    nativeStdout:
+      '15,11,12,13,16,25,21,22,23,26,35,31,32,33,36,45,41,42,43,46,55,51,52,53,56,65,61,62,63,66,75,71,72,73,76,85,81,82,83,86,',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     // A generic item piped inside a generic owner: `U := T` is solved in the owner's terms.
     name: 'generic-item-pipeline-in-generic-owner',
     source: genericItemPipelineInGenericOwner,
