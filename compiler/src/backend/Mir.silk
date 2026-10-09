@@ -4,7 +4,7 @@ import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.CAbi
 import backend.Gap {Code as GapCode, Gap}
-import backend.InstanceKey {InstanceKey}
+import backend.InstanceKey {HelperRole, InstanceKey}
 import backend.RuntimeType
 import backend.UnionProjection
 import backend.RuntimeType {Projection as RuntimeProjection}
@@ -29,7 +29,7 @@ import semantic.Type {Argument, Binding, ArrayShape, CallableFieldInput, Require
 import semantic.Lifetime {Intersection, Member as Region}
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.SealedCore
-import semantic.SealedCore {Field as CoreField}
+import semantic.SealedCore {Field as CoreField, Lifecycle}
 import semantic.StorageOperation {StorageOperation}
 import semantic.Intrinsic {Member as IntrinsicMember, Primitive as IntrinsicPrimitive}
 import semantic.NativeAssembly
@@ -317,6 +317,13 @@ pub struct MirFunction {
   pub suspension: Option<Origin>
 }
 
+/// One lowered body and the erased helpers of the execution packages it adopts, lowered with it
+/// because they run its prepared invocations. Storing the function stores each helper after it.
+pub struct Lowered {
+  pub function: MirFunction
+  pub helpers: Vector<MirFunction>
+}
+
 /// The identity of each canonical member of a failure slot's type (one when it is not a union),
 /// selected by the runtime tag, and the site label `module.function (module:line:column)`.
 pub struct ContextText {
@@ -594,9 +601,12 @@ pub struct StoragePlan {
   pub externs: Vector<Shared<DeclarationId>>
   /// Whether `slotDrop`'s element runs cleanup.
   pub cleanup: bool
-  /// `sharedWithMut`'s prepared `use` and `onConflict` invocations and their result types.
+  /// `sharedWithMut`'s prepared `use` and `onConflict` invocations and their result types, or
+  /// `executionFromAllocation`'s readiness endpoint invoked with its readiness state.
   pub targets: Vector<CallTarget>
   pub results: Vector<Shared<Type>>
+  /// `executionFromAllocation`'s prepared run of the package body; its last step runs the whole body.
+  pub steps: Vector<RunPlan>
 }
 
 /// A staged anonymous target keeps its original environment as one capture field.
@@ -653,6 +663,8 @@ struct Builder {
   // The carrier invocations of checked scalar operations, each consumed by its call node.
   carriers: Vector<CarrierPlan>
   witnessIntrinsics: Vector<WitnessIntrinsic>
+  // The erased helpers of the execution packages this function adopts.
+  helpers: Vector<MirFunction>
   // This function's `Provider` locals in canonical requirement-key order.
   providers: Vector<usize>
   // The current observer and selected-cause addresses passed to Silk callees; absent unless the
@@ -5129,12 +5141,14 @@ effect fn lowerSharedAccess(builder: &mut Builder, body: &Shared<TypedBody>, nod
 }
 
 // Adopts a validated allocation as one `Initial` execution package: the transfer record is empty,
-// the drop function is the package's own glue, and the body, readiness state, endpoint and then the
-// allocation itself move into place. The handle addresses the package as erased bytes.
-effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNodeId, plan: &StoragePlan,
+// the start, drop and notification functions are the package's own erased helpers and glue, and
+// the body, readiness state, endpoint and then the allocation itself move into place. The handle
+// addresses the package as erased bytes.
+effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNodeId, prepared: StoragePlan,
   operands: Vector<Operand>, ty: &Shared<Type>, origin: Origin) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let owner = InstanceKey.identity(&builder.function.key)
+  let mut plan = move prepared
   let mut inputs = move operands
   let allocation = run operandPlace(&owner, Vector.remove<Operand>(&mut inputs, usize.ZERO), origin)
   let mut packaged = Vector.make<Shared<Type>>()
@@ -5187,11 +5201,28 @@ effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>,
   run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderFailed)]),
     Rvalue.Use {value: Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: run storagePrimitive(b"u8")}}, origin)
   run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderLifecycle)]),
-    Rvalue.Use {value: run wordOperand(usize.ZERO)}, origin)
+    Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(Lifecycle.Initial))}, origin)
   run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&glue), edge: Edge.Direct, origin: origin})
   run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderDrop)]),
     Rvalue.FunctionAddress {key: move glue}, origin)
-  let mut cleared = SealedCore.ordinal(CoreField.HeaderNotify)
+  // The helpers run this site's prepared invocations, so they are lowered here with this function.
+  let creator = run Shared.make<InstanceKey>(InstanceKey.copy(&builder.function.key))
+  if Vector.length<CallTarget>(&plan.targets) == usize.ZERO { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  let endpoint = Vector.remove<CallTarget>(&mut plan.targets, usize.ZERO)
+  let steps = Intrinsic.replace(plan.steps, Vector.make<RunPlan>())
+  let started = InstanceKey.ExecutionHelper {creator: Shared.clone<InstanceKey>(&creator), node: node.index, purpose: HelperRole.Start}
+  let notified = InstanceKey.ExecutionHelper {creator: move creator, node: node.index, purpose: HelperRole.Notify}
+  let start = run packageHelper(&builder.*, InstanceKey.copy(&started), &package, HelperWork.Start {steps: move steps}, origin)
+  let notify = run packageHelper(&builder.*, InstanceKey.copy(&notified), &package, HelperWork.Notify {target: move endpoint}, origin)
+  run Vector.append<MirFunction>(&mut builder.*.helpers, move start)
+  run Vector.append<MirFunction>(&mut builder.*.helpers, move notify)
+  run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&started), edge: Edge.Direct, origin: origin})
+  run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&notified), edge: Edge.Direct, origin: origin})
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderStart)]),
+    Rvalue.FunctionAddress {key: move started}, origin)
+  run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderNotify)]),
+    Rvalue.FunctionAddress {key: move notified}, origin)
+  let mut cleared = SealedCore.ordinal(CoreField.HeaderWakeCallback)
   while cleared <= SealedCore.ordinal(CoreField.HeaderWakeGuard) {
     run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, cleared]),
       Rvalue.Use {value: Operand.Null {ty: Shared.clone<Type>(&bytes)}}, origin)
@@ -5215,6 +5246,251 @@ effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>,
   return Operand.Move {place: place(output)}
 }
 
+// What one erased package helper runs: the prepared run of the body, or the endpoint invocation.
+union HelperWork {
+  Start {steps: Vector<RunPlan>},
+  Notify {target: CallTarget},
+}
+
+// Lowers one erased package helper. Its one parameter addresses the package as erased bytes; it
+// runs the creator's prepared invocation over the package's own storage, so it shares the
+// creator's bindings and diagnostics convention but none of its locals or providers.
+effect fn packageHelper(creator: &Builder, key: InstanceKey, package: &Shared<Type>, work: HelperWork, origin: Origin) -> MirFunction
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let unit = run Shared.make<Type>(Type.Unit)
+  let erased = run SealedCore.packageAddress()
+  let mut locals = Vector.make<Local>()
+  run Vector.append<Local>(&mut locals, Local {ty: Shared.clone<Type>(&unit), kind: LocalKind.Return, origin: origin})
+  run Vector.append<Local>(&mut locals, Local {ty: Shared.clone<Type>(&erased), kind: LocalKind.Parameter {index: usize.ZERO}, origin: origin})
+  let mut diagnostics = Option.none<DiagnosticPlaces>()
+  if let Option<DiagnosticPlaces>.Some {..} = &creator.diagnostics {
+    run Vector.append<Local>(&mut locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
+    run Vector.append<Local>(&mut locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+    diagnostics = Option.some<DiagnosticPlaces>(DiagnosticPlaces {observer: place(2), cause: place(3)})
+  }
+  let mut bindings = Vector.make<Binding>()
+  let supplied = Vector.asSlice<Binding>(&creator.bindings)
+  let mut at = usize.ZERO
+  while at < supplied.length {
+    run Vector.append<Binding>(&mut bindings, Binding {declaration: Shared.clone<DeclarationId>(&supplied[at].declaration),
+      ordinal: supplied[at].ordinal, value: Argument.copy(&supplied[at].value)})
+    at = at + usize.ONE
+  }
+  let mut projections = Vector.make<RuntimeProjection>()
+  let projected = Vector.asSlice<RuntimeProjection>(&creator.projections)
+  at = usize.ZERO
+  while at < projected.length {
+    run Vector.append<RuntimeProjection>(&mut projections, RuntimeProjection {source: Shared.clone<Type>(&projected[at].source),
+      storage: Shared.clone<Type>(&projected[at].storage)})
+    at = at + usize.ONE
+  }
+  let mut parameters = Vector.make<Shared<Type>>()
+  run Vector.append<Shared<Type>>(&mut parameters, Shared.clone<Type>(&erased))
+  let mut builder = Builder {
+    bindings: move bindings, projections: move projections, calls: Vector.make<CallTarget>(),
+    function: MirFunction {key: move key, safetyChecked: true, result: Shared.clone<Type>(&unit), parameters: move parameters,
+      locals: move locals, blocks: Vector.make<Block>(), references: Vector.make<Reference>(), externs: Vector.make<Shared<DeclarationId>>(),
+      observes: false, contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>()},
+    current: usize.ZERO, live: true, loops: Vector.make<LoopTargets>(), scrutinees: Vector.make<Scrutinee>(),
+    owners: Vector.make<Owner>(), cleanup: Vector.make<CleanupNode>(), scopes: Vector.make<usize>(), temporaries: Vector.make<Pending>(),
+    remainders: Vector.make<Remainder>(), needs: CleanupNeeds {locals: Vector.make<bool>(), nodes: Vector.make<bool>()},
+    failure: usize.MAX, plans: Vector.make<NodePlan>(), storage: Vector.make<StoragePlan>(), carriers: Vector.make<CarrierPlan>(),
+    providers: Vector.make<usize>(), diagnostics: move diagnostics, sites: Option.none<SiteText>(),
+    witnessIntrinsics: Vector.make<WitnessIntrinsic>(), helpers: Vector.make<MirFunction>(),
+  }
+  let first = run block(&mut builder, origin)
+  resume(&mut builder, first)
+  let owner = InstanceKey.identity(&builder.function.key)
+  let word = run storagePrimitive(b"usize")
+  let blockPointer = run SealedCore.address(package)
+  let integer = run storageValue(&mut builder, &word, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(usize.ONE)},
+    destinationType: Shared.clone<Type>(&word)}, origin)
+  let addressed = run storageValue(&mut builder, &blockPointer, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: place(integer)}, destinationType: Shared.clone<Type>(&blockPointer)}, origin)
+  let fields = match move run SealedCore.fields(package) {
+    Option<Vector<Shared<Type>>>.Some {value} => value
+    Option<Vector<Shared<Type>>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let listed = Vector.asSlice<Shared<Type>>(&fields)
+  let header = SealedCore.ordinal(CoreField.PackageHeader)
+  match move work {
+    HelperWork.Start {steps} => {
+      let ran = Vector.asSlice<RunPlan>(&steps)
+      if ran.length == usize.ZERO { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      let result = match move SealedCore.element(&listed[header]) {
+        Option<Shared<Type>>.Some {value} => value
+        Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+      }
+      let environment = run storageValue(&mut builder, &listed[SealedCore.ordinal(CoreField.PackageBody)], Rvalue.Use {value: Operand.Move {
+        place: run storagePlace(&place(addressed), true, &[SealedCore.ordinal(CoreField.PackageBody)])}}, origin)
+      let output = run temporary(&mut builder, &result, origin)
+      let mut bound = Vector.make<BoundPlace>()
+      run executePlan(&mut builder, ran, ran.length - usize.ONE, &place(environment), output, &FailureSink.Propagate, &mut bound, origin)
+      run assign(&mut builder, run storagePlace(&place(addressed), true, &[header, SealedCore.ordinal(CoreField.HeaderResult)]),
+        Rvalue.Use {value: Operand.Move {place: place(output)}}, origin)
+    }
+    HelperWork.Notify {target} => {
+      let lent = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(&listed[SealedCore.ordinal(CoreField.PackageReady)]),
+        access: Access.Shared, lifetime: run Shared.make<Lifetime>(Lifetime.Static)})
+      let state = run storageValue(&mut builder, &lent, Rvalue.Ref {access: Access.Shared,
+        place: run storagePlace(&place(addressed), true, &[SealedCore.ordinal(CoreField.PackageReady)])}, origin)
+      let output = run temporary(&mut builder, &unit, origin)
+      let never = run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+      let mut written = Vector.make<Operand>()
+      run Vector.append<Operand>(&mut written, Operand.Copy {place: place(state)})
+      let none = Vector.make<BoundPlace>()
+      let endpoint = run storagePlace(&place(addressed), true, &[SealedCore.ordinal(CoreField.PackageEndpoint)])
+      run planCall(&mut builder, &target, &endpoint,
+        move written, &unit, &never, output, &FailureSink.Propagate, Vector.asSlice<BoundPlace>(&none), origin)
+    }
+  }
+  if builder.live { terminate(&mut builder, Terminator.Return {origin: origin}) }
+  run MirFunction.sortReferences(&mut builder.function.references)
+  return move builder.function
+}
+
+// The erased address of the package an Execution handle at `handle` addresses, and a typed address
+// of its result-only header.
+struct PackageAccess {
+  package: usize
+  header: usize
+}
+
+effect fn packageAt(builder: &mut Builder, handle: &Place, execution: &Shared<Type>, origin: Origin) -> PackageAccess
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let anchor = match move run SealedCore.coreIdentity(execution) {
+    Option<DeclarationId>.Some {value} => value
+    Option<DeclarationId>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let result = match move SealedCore.element(execution) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let headerType = run SealedCore.headerBeside(&anchor, &result)
+  let headerPointer = run SealedCore.address(&headerType)
+  let word = run storagePrimitive(b"usize")
+  let erased = run SealedCore.packageAddress()
+  let package = run storageValue(&mut builder.*, &erased, Rvalue.Use {value: Operand.Copy {
+    place: run storagePlace(handle, false, &[SealedCore.ordinal(CoreField.ExecutionPackage)])}}, origin)
+  let integer = run storageValue(&mut builder.*, &word, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(package)},
+    destinationType: Shared.clone<Type>(&word)}, origin)
+  let header = run storageValue(&mut builder.*, &headerPointer, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: place(integer)}, destinationType: Shared.clone<Type>(&headerPointer)}, origin)
+  return PackageAccess {package: package, header: header}
+}
+
+// Traps unless the package's lifecycle is at most `latest`, then records `next`.
+effect fn advanceLifecycle(builder: &mut Builder, access: &PackageAccess, latest: Lifecycle, next: Lifecycle, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let recorded = run storagePlace(&place(access.header), true, &[SealedCore.ordinal(CoreField.HeaderLifecycle)])
+  let valid = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: run copyPlace(&recorded)},
+    run wordOperand(SealedCore.lifecycleWord(latest)), origin)
+  run trapUnless(&mut builder.*, move valid, origin)
+  return run assign(&mut builder.*, move recorded, Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(next))}, origin)
+}
+
+// Calls the erased package function the header records at `field` with the package's address.
+effect fn callErased(builder: &mut Builder, access: &PackageAccess, field: CoreField, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let bytes = run SealedCore.bytes()
+  let function = run storageValue(&mut builder.*, &bytes, Rvalue.Use {value: Operand.Copy {
+    place: run storagePlace(&place(access.header), true, &[SealedCore.ordinal(field)])}}, origin)
+  let unit = run Shared.make<Type>(Type.Unit)
+  let output = run temporary(&mut builder.*, &unit, origin)
+  let next = run block(&mut builder.*, origin)
+  let mut arguments = Vector.make<Operand>()
+  run Vector.append<Operand>(&mut arguments, Operand.Copy {place: place(access.package)})
+  let diagnostics = run currentDiagnostics(&builder.*)
+  terminate(&mut builder.*, Terminator.Call {callee: Callee.Indirect {address: Operand.Copy {place: place(function)}},
+    arguments: move arguments, providers: Vector.make<Operand>(), diagnostics: move diagnostics,
+    destination: place(output), normal: next, failure: Option.none<FailureEdge>(), origin: origin})
+  return resume(&mut builder.*, next)
+}
+
+// Notifies an `Initial` package's readiness endpoint once through its erased notification.
+effect fn lowerNotification(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNodeId, operands: Vector<Operand>,
+  origin: Origin) -> Operand ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let mut values = move operands
+  let loan = run operandPlace(&owner, Vector.remove<Operand>(&mut values, usize.ZERO), origin)
+  let loaned = localType(&builder.*, loan.local)
+  let execution = match move Shared.with<Type, Option<Shared<Type>>>(&loaned, referentOf) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let mut handle = run copyPlace(&loan)
+  run Vector.append<Projection>(&mut handle.projections, Projection.Deref)
+  let access = run packageAt(&mut builder.*, &handle, &execution, origin)
+  run advanceLifecycle(&mut builder.*, &access, Lifecycle.Initial, Lifecycle.InitialReady, origin)
+  run callErased(&mut builder.*, &access, CoreField.HeaderNotify, origin)
+  return Operand.Unit
+}
+
+// Runs one activation of an `Initial` or `InitialReady` package in place: the erased start runs the
+// body into the result slot, the completion callback receives the branch state and the result, and
+// the package is released through its erased drop. A body that parks externally is the suspension
+// gap at its park, so an activation here always completes.
+effect fn lowerDrive(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, node: BodyNodeId, origin: Origin) -> Operand
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let plan = match move takeStorage(&mut builder.*, node) {
+    Option<StoragePlan>.Some {value} => value
+    Option<StoragePlan>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let mut values = run storageOperands(&mut builder.*, body, hir, node, 4, origin)
+  if !builder.live { return Operand.Unit }
+  let targets = Vector.asSlice<CallTarget>(&plan.targets)
+  if targets.length != usize.ONE { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  let mut types = Vector.make<Shared<Type>>()
+  let mut children = Vector.make<BodyNodeId>()
+  let mut argument = usize.ZERO
+  while argument < 4 {
+    let child = match move childAt(body, node, argument) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+    }
+    run Vector.append<BodyNodeId>(&mut children, child)
+    let typed = match move run instanceNodeType(&builder.*, body, child) {
+      Option<Shared<Type>>.Some {value} => value
+      Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+    }
+    run Vector.append<Shared<Type>>(&mut types, move typed)
+    argument = argument + usize.ONE
+  }
+  let typed = Vector.asSlice<Shared<Type>>(&types)
+  let handle = run storageValue(&mut builder.*, &typed[usize.ZERO], Rvalue.Use {value: Vector.remove<Operand>(&mut values, usize.ZERO)}, origin)
+  let state = run storageValue(&mut builder.*, &typed[usize.ONE], Rvalue.Use {value: Vector.remove<Operand>(&mut values, usize.ZERO)}, origin)
+  let completion = run storageValue(&mut builder.*, &typed[2], Rvalue.Use {value: Vector.remove<Operand>(&mut values, usize.ZERO)}, origin)
+  let suspension = run storageValue(&mut builder.*, &typed[3], Rvalue.Use {value: Vector.remove<Operand>(&mut values, usize.ZERO)}, origin)
+  let result = match move SealedCore.element(&typed[usize.ZERO]) {
+    Option<Shared<Type>>.Some {value} => value
+    Option<Shared<Type>>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+  }
+  let access = run packageAt(&mut builder.*, &place(handle), &typed[usize.ZERO], origin)
+  run advanceLifecycle(&mut builder.*, &access, Lifecycle.InitialReady, Lifecycle.Running, origin)
+  run callErased(&mut builder.*, &access, CoreField.HeaderStart, origin)
+  run assign(&mut builder.*, run storagePlace(&place(access.header), true, &[SealedCore.ordinal(CoreField.HeaderLifecycle)]),
+    Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(Lifecycle.Completed))}, origin)
+  let completed = run storageValue(&mut builder.*, &result, Rvalue.Use {value: Operand.Move {
+    place: run storagePlace(&place(access.header), true, &[SealedCore.ordinal(CoreField.HeaderResult)])}}, origin)
+  let unit = run Shared.make<Type>(Type.Unit)
+  let never = run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()})
+  let output = run temporary(&mut builder.*, &unit, origin)
+  let mut written = Vector.make<Operand>()
+  run Vector.append<Operand>(&mut written, Operand.Move {place: place(state)})
+  run Vector.append<Operand>(&mut written, Operand.Move {place: place(completed)})
+  let none = Vector.make<BoundPlace>()
+  run planCall(&mut builder.*, &targets[usize.ZERO], &place(completion), move written, &unit, &never, output, &FailureSink.Propagate,
+    Vector.asSlice<BoundPlace>(&none), origin)
+  let arguments = Vector.asSlice<BodyNodeId>(&children)
+  if !consumesCallable(&targets[usize.ZERO]) { run releaseCallable(&mut builder.*, body, arguments[2], completion, origin) }
+  // Relinquishment never happens here, so the suspension callback is only released.
+  run releaseCallable(&mut builder.*, body, arguments[3], suspension, origin)
+  run callErased(&mut builder.*, &access, CoreField.HeaderDrop, origin)
+  return Operand.Unit
+}
+
 fn referentOf(value: &Type) -> Option<Shared<Type>> {
   return match &value.* {
     Type.Reference {referent, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&referent))
@@ -5231,8 +5507,8 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
   if operation == StorageOperation.Replace { return run lowerReplace(&mut builder.*, body, hir, node, ty, origin) }
   // Only a run executes the allocation boundary; a stored acquisition Effect has no runner.
   if operation == StorageOperation.SystemAllocationAcquire { return run unsupported(&owner, origin, GapCode.EffectForm) }
-  // The readiness endpoint's erased notification is not lowered yet.
-  if operation == StorageOperation.ExecutionNotifyInitial { return run unsupported(&owner, origin, GapCode.CoreType) }
+  // One activation is an Effect that only its run executes, in place.
+  if operation == StorageOperation.ExecutionDrive { return run unsupported(&owner, origin, GapCode.EffectForm) }
   let plan = match move takeStorage(&mut builder.*, node) {
     Option<StoragePlan>.Some {value} => value
     Option<StoragePlan>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
@@ -5257,7 +5533,10 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
     return run lowerSharedAccess(&mut builder.*, body, node, &plan, move operands, &element, ty, origin)
   }
   if operation == StorageOperation.ExecutionFromAllocation {
-    return run lowerExecutionPackage(&mut builder.*, body, node, &plan, move operands, ty, origin)
+    return run lowerExecutionPackage(&mut builder.*, body, node, move plan, move operands, ty, origin)
+  }
+  if operation == StorageOperation.ExecutionNotifyInitial {
+    return run lowerNotification(&mut builder.*, body, node, move operands, origin)
   }
   let first = run operandPlace(&owner, Vector.remove<Operand>(&mut operands, usize.ZERO), origin)
   match operation {
@@ -5487,6 +5766,9 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
   if let View.Storage {operation, node: storageNode, ..} = &construction {
     if operation == StorageOperation.SystemAllocationAcquire && TypedBody.immediateRun(body, runNode) {
       return run lowerAcquisition(&mut builder.*, body, hir, storageNode, ty, origin)
+    }
+    if operation == StorageOperation.ExecutionDrive && TypedBody.immediateRun(body, runNode) {
+      return run lowerDrive(&mut builder.*, body, hir, storageNode, origin)
     }
   }
   let mut node = value
@@ -7154,7 +7436,7 @@ impl MirFunction {
     projections: Vector<RuntimeProjection>,
     source: &[u8],
     observing: bool,
-  ) -> MirFunction ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  ) -> Lowered ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
     let supplied = Vector.asSlice<Binding>(&bindings)
@@ -7256,6 +7538,7 @@ impl MirFunction {
       storage: move storage,
       carriers: move carriers,
       witnessIntrinsics: move witnessIntrinsics,
+      helpers: Vector.make<MirFunction>(),
       providers: move providerLocals,
       diagnostics: move diagnostics,
       sites: move sites,
@@ -7278,7 +7561,7 @@ impl MirFunction {
       terminate(&mut builder, Terminator.Return {origin: origin})
     }
     run MirFunction.sortReferences(&mut builder.function.references)
-    return move builder.function
+    return Lowered {function: move builder.function, helpers: move builder.helpers}
   }
 }
 
