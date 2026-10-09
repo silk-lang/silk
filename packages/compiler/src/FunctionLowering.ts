@@ -287,6 +287,9 @@ export interface LoweringFailure {
         readonly _tag: 'WitnessEffectMissingSite'
       }
     | {
+        readonly _tag: 'OwnerProviderWitness'
+      }
+    | {
         readonly _tag: 'WitnessEffectMissingContract'
       }
     | {
