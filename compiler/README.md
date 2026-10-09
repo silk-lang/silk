@@ -372,7 +372,8 @@ reuses different bytes.
 Previously issued authored cursors expire on every revision selection. A body can also retain its
 checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
 validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
-queries can run again. `Semantic.eventLog` records queries actually run or hit; replaying a completed
+queries can run again. A store opened with `Semantic.traced` keeps `Semantic.eventLog`, the queries
+actually run or hit; `Semantic.make` records no events, so a build keeps no per-demand log. Replaying a completed
 answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
 reads and name observations. The focused source-written M1 checks use these records to prove
 avoided provider reads and semantic demands; they do not measure speed. The native `build`
