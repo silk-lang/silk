@@ -10121,7 +10121,7 @@ function analyzeExpressionDecision(
       }),
       captures
         .filter((capture) => capture.access === 'Shared' || capture.access === 'Exclusive')
-        .map((capture) => capture.expression?.origin.anchor ?? capture.reference.anchor),
+        .map((capture) => capture.anchor),
     )
     let inferred =
       success !== undefined && lifetimes !== undefined
