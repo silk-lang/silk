@@ -8493,6 +8493,34 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // A unit parameter has no runtime lane: direct calls, calls through a function value or a
+    // callable parameter, and Effect.map over a unit success all agree on the remaining arity.
+    name: 'unit-parameter-lanes',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+fn sink(first: i32, value: (), last: i32) -> i32 { return first * 10 + last }
+fn unit(value: ()) -> i32 { return 3 }
+fn twice(value: (), offset: i32) -> i32 { return offset * 2 }
+fn apply(f: fn<'static>(()) -> i32) -> i32 { return f(()) }
+fn applyAround(f: fn<'static>((), i32) -> i32, offset: i32) -> i32 { return f((), offset) }
+effect fn nothing() -> () { return () }
+fn finished(value: ()) -> i32 { return 41 }
+effect fn counted() -> i32 { return run nothing() |> Effect.map(finished) }
+effect fn program() -> i32 ! OutOfMemoryError {
+  if sink(4, (), 2) != 42 { return 1 }
+  if apply(unit) != 3 { return 2 }
+  let viaValue = unit
+  if viaValue(()) != 3 { return 3 }
+  if applyAround(twice, 5) != 10 { return 4 }
+  let mapped = run counted()
+  if mapped != 41 { return 5 }
+  return 42
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return -1 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'integer-operation-matrix',
     source: integerOperationMatrix,
     expected: { _tag: 'Completes', result: 42 },
