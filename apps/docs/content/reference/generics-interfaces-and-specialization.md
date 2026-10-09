@@ -38,7 +38,11 @@ Lifetime parameters use the same declaration list with a distinct argument names
 lifetimes follows [header elision](lifetimes.md); the explicit-prefix and inference rules below
 continue to govern ordinary arguments. `T: 'data` constrains borrowed contents, and
 `'long: 'short` constrains validity regions. These predicates never initiate implementation search.
-Lifetime arguments are erased from runtime specialization and physical layout identity.
+Lifetime arguments are erased from physical layout identity. They are also erased from runtime
+specialization identity, so every region pattern of one application shares one body, except where
+a lifetime-selective sealed `Drop` or `Copy` head can observe regions: a head that names `'static`
+or repeats a lifetime binder in its provider, or that bounds a region. Such a head selects cleanup
+by region, so a program that declares one keeps exact region identity for its specializations.
 
 ### GEN-001 — Each generic parameter has a declaration-local canonical identity
 

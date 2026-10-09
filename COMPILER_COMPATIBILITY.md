@@ -370,6 +370,13 @@ Each entry records:
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
   cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
+  Backend (code) identity erases regions unless the program declares a lifetime-selective sealed
+  `Drop` or `Copy` head (a provider head naming `'static` or repeating a lifetime binder, or a
+  region bound); such a program keeps exact region identity. Without such a head, a backend
+  instance publishes its finest region pattern (every free region distinct, none `'static`):
+  region proofs only gain from shared regions and `'static`, so that body proves every pattern.
+  A family whose finest pattern is refused falls back to checking each reached pattern's own
+  lowering (its Validity query) without publishing it.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
