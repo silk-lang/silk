@@ -716,7 +716,7 @@ export const resolveType = (
       result.actor === 'Intrinsic' &&
       (second?.spelling === 'SharedCore' ||
         second?.spelling === 'Execution' ||
-        second?.spelling === 'Wake' ||
+        second?.spelling === 'ExecutionRef' ||
         second?.spelling === 'StorageFailure' ||
         second?.spelling === 'Type' ||
         second?.spelling === 'Fields' ||
