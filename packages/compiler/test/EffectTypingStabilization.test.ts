@@ -335,6 +335,38 @@ pub fn main() -> i32 { return run f() }`,
   }),
 )
 
+// A borrowed parameter capture anchors its loan at the body use, not the parameter declaration.
+it.effect('types an inline effect block that borrows an enclosing parameter', () =>
+  Effect.gen(function* () {
+    const module = 'effect-typing/borrowed-parameter-capture'
+    const snapshot = yield* snapshotOf(
+      module,
+      `fn read(value: &i32) -> i32 { return value.* }
+effect fn ordered(value: i32) -> () {
+  run effect { let copied = read(&value) return () }
+  return ()
+}
+pub fn main() -> i32 { run ordered(1) return 42 }`,
+    )
+    assert.deepEqual(codesOf(snapshot), [])
+    const body =
+      snapshot.results
+        .get(module)
+        ?.bodies.find(
+          (candidate) =>
+            candidate.declaration.name._tag === 'Present' &&
+            candidate.declaration.name.spelling === 'ordered',
+        ) ?? unreachable('expected the effect function body')
+    const block =
+      body.function.statements
+        .flatMap(Tir.statementExpressions)
+        .flatMap(Tir.expressionTree)
+        .find((expression) => expression._tag === 'EffectBlock') ??
+      unreachable('expected the inline effect block')
+    assert.isTrue(Type.isEffect(block.type))
+  }),
+)
+
 // SUSP-005: a suspend wrapper keeps its failure and requirement channels and composes with
 // Effect.provide and Effect.catchAll in either order.
 const suspendComposition = (body: string) => `import silk.effect { Effect }
