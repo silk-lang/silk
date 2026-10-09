@@ -1418,7 +1418,13 @@ it.effect('diagnoses private exposure and inline recursive struct components can
         requiredSource.slice(diagnostic.span.start, diagnostic.span.end),
         diagnostic.span.start,
       ]),
-      [['SEM0019', 'Clock', requiredSource.indexOf('&Clock', requiredSource.indexOf('pub effect')) + 1]],
+      [
+        [
+          'SEM0019',
+          'Clock',
+          requiredSource.indexOf('&Clock', requiredSource.indexOf('pub effect')) + 1,
+        ],
+      ],
     )
 
     const exposedUnion = yield* collect('union-exposure', [
