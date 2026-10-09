@@ -1634,7 +1634,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   regions. Native fixes an inferred binder by its first evidence and shortens it when a later
   operand offers another region for a binder every parameter stores covariantly: to that region
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
-  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. A section's Effect
+  environment binder that an earlier operand fixed, as `'env` of `JsonObject.field("x", value)` piped
+  an Effect that borrows a declared region, shortens the same way to the regions that Effect retains. An inferred struct
   literal binder that the declaration stores covariantly shortens the same way at a later field,
   as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). A `T: 'binder` bound
   that the binder's evidence does not cover shortens a covariant inferred binder to the meet of the
@@ -1642,7 +1644,11 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   callback no longer fixes `'env` to `'static`; an invariant or written binder never moves. As in the
   bootstrap's type-outlives proof, a stored type parameter without a contents premise names no region
   there: the bound proves the named regions beside it, as for `Query.demand`'s `Reservation<'owner, K, A, R>`,
-  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). The bootstrap solves for the shortest region directly, so a binder
+  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). A bare type parameter without a contents premise
+  outlives only a region local to the checked body, so `T: 'binder` for a declared region stays
+  `Unsupported`. A binder that holds only `'static` evidence, such as the environment of a
+  capture-free `effect fn` passed as a callback (`failCompleted` in `Effect.result`), shortens to the
+  call's local region instead, where the bootstrap solves for `'call & 'env`. The bootstrap solves for the shortest region directly, so a binder
   an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
@@ -1698,18 +1704,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Evidence:** `plainCallableAffineArgumentClaims` in
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
-
-### Native member bodies without implementation head bounds
-
-- **Status:** native gap; retires when native checks an implementation member's body under its
-  implementation head's bounds.
-- **Compilers:** the bootstrap checks `impl<T: Printable> Printable for Box<T>` members with
-  `T: Printable` as a premise, so `value.value.print()` selects the bound operation. Native member
-  bodies receive only the member signature's bounds, so a receiver call on such an enclosing type
-  parameter finds no supplier. Native reports it as unsupported (the `typed-form` gap) instead of
-  `UnknownMember`, which it keeps for a function's own unbounded type parameter.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
 
 ### Native service operations with a `Self` operand
 
