@@ -1747,7 +1747,12 @@ export const emit = (context: Context, operation: Operation) => {
       if (region?._tag !== 'RunSuspendableEffectRegion')
         throw new RangeError('LLVM relinquish lost its suspension region')
       const tag = `relinquish${operation.destination.ordinal}`
-      runningPackage(context, operation.provenance.span, 'relinquish outside a running execution', tag)
+      runningPackage(
+        context,
+        operation.provenance.span,
+        'relinquish outside a running execution',
+        tag,
+      )
       NativeCall.retainRelay(context.call, region, tag)
       NativeSuspension.returnStep(context.call.returns, 2n, [], `${tag}_external`)
       const resumeBlock = context.suspension.resumeBlocks.get(suspensionPointKey(region.point))
@@ -1813,7 +1818,11 @@ export const emit = (context: Context, operation: Operation) => {
           body,
           'eq',
           state,
-          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Unstarted'))),
+          Emitter.integerUnsigned(
+            builder,
+            usizeType,
+            BigInt(ExecutionTransition.tagOf('Unstarted')),
+          ),
           `drive${operation.destination.ordinal}_direct_unstarted`,
         )
         const validPackage = Emitter.integerCompare(
@@ -2021,7 +2030,11 @@ export const emit = (context: Context, operation: Operation) => {
           body,
           'eq',
           state,
-          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Unstarted'))),
+          Emitter.integerUnsigned(
+            builder,
+            usizeType,
+            BigInt(ExecutionTransition.tagOf('Unstarted')),
+          ),
           `drive${operation.destination.ordinal}_unstarted`,
         )
         const relinquished = Emitter.integerCompare(

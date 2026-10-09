@@ -997,8 +997,7 @@ const lowerBuiltinOperation = (
     expression.operation === 'ExecutionLive'
   ) {
     const [reference, word, value] = argumentLocals
-    const referenceType =
-      reference === undefined ? undefined : fn.localTypes.at(reference.ordinal)
+    const referenceType = reference === undefined ? undefined : fn.localTypes.at(reference.ordinal)
     const type = fn.type(expression.type)
     if (
       reference === undefined ||

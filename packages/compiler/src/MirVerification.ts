@@ -1071,10 +1071,7 @@ const suspensionViolations = (
       descriptor.failure.restores.length !== 0
     )
       invalid('InvalidCoroutineFrame', 'resume path plan is incomplete')
-    if (
-      descriptor.success.loanEnds.length !== 0 ||
-      descriptor.success.releases.length !== 0
-    )
+    if (descriptor.success.loanEnds.length !== 0 || descriptor.success.releases.length !== 0)
       invalid('InvalidCoroutineFrame', 'success or failure cleanup plan diverges')
   }
   return violations
@@ -7053,7 +7050,8 @@ const computeVerify = Effect.fnUntraced(function* (
               SilkType.isExecutionRef(type.type.target)
             )
           }
-          const usize = (local: LocalId): boolean => fn.localTypes.at(local.ordinal)?._tag === 'usize'
+          const usize = (local: LocalId): boolean =>
+            fn.localTypes.at(local.ordinal)?._tag === 'usize'
           const unit =
             destination?._tag === 'Nominal' && SilkType.equals(destination.type, SilkType.unit)
           const reference =

@@ -893,8 +893,7 @@ export const make = (operations: Operations) => {
   ): ReadonlyArray<CallTarget> => {
     const walk = (expression: Tir.Expression): ReadonlyArray<CallTarget> => {
       const own =
-        expression._tag === 'BuiltinCall' &&
-        expression.operation === 'SlotDrop'
+        expression._tag === 'BuiltinCall' && expression.operation === 'SlotDrop'
           ? expression.typeArguments.flatMap((argument) =>
               (() => {
                 const specialized = Type.substituteGenericArgument(argument, substitution)
