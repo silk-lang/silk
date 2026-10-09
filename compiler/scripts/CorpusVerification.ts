@@ -7,12 +7,19 @@ import * as Path from 'effect/Path'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Schema from 'effect/Schema'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
-import { runCorpus } from './runSelfhostCorpus.js'
+import { defaultCCompiler, runCorpus } from './runSelfhostCorpus.js'
 
 export interface CorpusVerification {
   readonly repository: string
   readonly compiler: string
+  /** The C driver that compiles corpus C units, the one the compiler links with. */
+  readonly cCompiler: string
 }
+
+/** Reads the compiler's own C driver setting, so corpus objects match its link. */
+export const cCompiler = Config.NonEmptyString('SILKC_CLANG').pipe(
+  Config.withDefault(defaultCCompiler),
+)
 
 /** Ordered regular-corpus authority emitted before any full-corpus outcomes. */
 export const Manifest = Schema.Struct({
@@ -130,6 +137,7 @@ export const execute = Effect.fn('CorpusVerification.execute')(function* (
         required,
         selected,
         path.join(self.repository, 'packages/compiler/stdlib'),
+        self.cCompiler,
       ),
     catch: (cause) =>
       new VerificationError({
@@ -218,7 +226,7 @@ export const runConfigured = Effect.fn('CorpusVerification.runConfigured')(funct
       reason: { _tag: 'InvalidInput' },
     })
   const corpus = yield* materialize()
-  const self = { repository: path.resolve('.'), compiler }
+  const self = { repository: path.resolve('.'), compiler, cCompiler: yield* cCompiler }
   if (mode === 'corpus-full') return yield* runFull(self, corpus)
   return yield* run(self, corpus)
 })
