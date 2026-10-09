@@ -783,6 +783,7 @@ fn invalidBorrow(values: &[i32], value: Choice) -> &[i32] { return match value {
     [
       ['SEM0129', source.indexOf('true'), source.indexOf('true') + 4],
       ['OWN0019', source.lastIndexOf('match value'), source.lastIndexOf('} }') + 1],
+      ['OWN0019', source.indexOf('&local'), source.indexOf('&local') + 6],
       ['SEM0212', source.indexOf('&local'), source.indexOf('&local') + 6],
       ['OWN0019', source.lastIndexOf('values'), source.lastIndexOf('values') + 6],
     ],
