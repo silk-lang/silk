@@ -96,6 +96,8 @@ export type Rule =
       readonly typeParameters: ReadonlyArray<Type.Parameter>
       readonly parameters: ReadonlyArray<Type.Type>
       readonly result: ResultPolicy
+      /** Call preconditions: each stored type must outlive its template region. */
+      readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
     }
   | {
       readonly _tag: 'ContractRule'
@@ -285,6 +287,7 @@ const builtin = (options: {
   readonly callParameters?: ReadonlyArray<Type.Type>
   readonly result: string
   readonly semanticResult: ResultPolicy
+  readonly typeOutlives?: ReadonlyArray<Type.TypeOutlives>
   readonly unsafe?: boolean
   readonly targets?: ReadonlyArray<Target.Id>
 }): BuiltinOperation => {
@@ -334,6 +337,7 @@ const builtin = (options: {
       typeParameters: Array.from(options.semanticTypeParameters ?? []),
       parameters: Array.from(options.semanticParameters),
       result: options.semanticResult,
+      typeOutlives: Array.from(options.typeOutlives ?? []),
     },
   }
 }
@@ -557,10 +561,11 @@ const observationCallback = Type.parameter(
   observationCallbackBound,
   ['Intrinsic.NonParking'],
 )
+const observationEnvironment = contractLifetime('observeDiagnostics')
 const observedEffect = Type.effectWithRows(
   observationSuccess,
   RowAlgebra.concrete(Type.failureRowPolicy(), []),
-  { environment: contractLifetime('observeDiagnostics'), lifetimeBinders: [] },
+  { environment: observationEnvironment, lifetimeBinders: [] },
   'Take',
   RowAlgebra.parameter<Type.Requirement, Type.Parameter, Type.RequirementMemberShape>(
     observationRequirement,
@@ -1462,6 +1467,7 @@ const assemblyOperation: BuiltinOperation = {
     typeParameters: [assemblyResult],
     parameters: assemblyParameters,
     result: closedResult(assemblyResult),
+    typeOutlives: [],
   },
 }
 
@@ -2404,6 +2410,8 @@ const intrinsicOperations = [
     ],
     result: 'once Effect<A ? R>',
     semanticResult: closedResult(observedEffect),
+    // The observation stores its state for the whole returned Effect.
+    typeOutlives: [{ type: observationState, lifetime: observationEnvironment }],
   }),
   builtin({
     actor: 'Effect',
