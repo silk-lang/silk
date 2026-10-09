@@ -30918,11 +30918,13 @@ effect fn checkArmResult<'scope>(
 }
 
 // The joined result of the checked arms: equal results keep their type, no result is `never`,
-// distinct exact Effects join (EFF-013), and other distinct results are `IncompatibleMatchResults`
-// on the whole match.
+// distinct exact Effects join (EFF-013), and other distinct results join into the union of their
+// members. Results that form no valid union are `IncompatibleMatchResults` on the whole match.
 struct ArmJoin {
   joined: Option<Shared<Type>>
   incompatible: bool
+  // Whether a statement block arm completes, producing unit.
+  completingBlock: bool
   // Each arm that produced a value, by its position among the checked arms.
   produced: Vector<ArmResult>
 }
@@ -30933,11 +30935,14 @@ struct ArmResult {
 }
 
 fn emptyArmJoin() -> ArmJoin {
-  return ArmJoin {joined: Option.none<Shared<Type>>(), incompatible: false, produced: Vector.make<ArmResult>()}
+  return ArmJoin {joined: Option.none<Shared<Type>>(), incompatible: false, completingBlock: false,
+    produced: Vector.make<ArmResult>()}
 }
 
-effect fn joinArm(join: &mut ArmJoin, arm: usize, produced: &Option<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn joinArm(join: &mut ArmJoin, arm: usize, produced: &Option<Shared<Type>>, block: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
   if let Option<Shared<Type>>.Some {value} = &produced.* {
+    if block { join.completingBlock = true }
     run Vector.append<ArmResult>(&mut join.produced, ArmResult {arm: arm, ty: Shared.clone<Type>(&value)})
     let prior = match &join.joined {
       Option<Shared<Type>>.Some {value: earlier} => Option.some<Shared<Type>>(Shared.clone<Type>(&earlier))
@@ -30966,10 +30971,15 @@ effect fn joinedMatchType(resolver: &Resolver, module: &ModuleId, nodes: &mut Ve
   }
   let results = Vector.asSlice<ArmResult>(&join.produced)
   let mut types = Vector.make<Shared<Type>>()
+  let mut effects = true
   let mut at = usize.ZERO
   while at < results.length {
     run Vector.append<Shared<Type>>(&mut types, Shared.clone<Type>(&results[at].ty))
+    if !Shared.with<Type, bool>(&results[at].ty, joinableEffect) { effects = false }
     at = at + usize.ONE
+  }
+  if !effects {
+    return run unionMatchType(resolver, module, &mut nodes.*, &mut arms.*, results, move types, join.completingBlock, span)
   }
   let joined = match move run effectJoinType(Vector.asSlice<Shared<Type>>(&types)) {
     Option<Shared<Type>>.Some {value} => value
@@ -30984,6 +30994,57 @@ effect fn joinedMatchType(resolver: &Resolver, module: &ModuleId, nodes: &mut Ve
     }
     let mut listed = Vector.asMutSlice<BodyMatchArm>(&mut arms.*)
     listed[results[at].arm].result = injected
+    at = at + usize.ONE
+  }
+  return Result.succeed<Shared<Type>, Shared<Rejection>>(move joined)
+}
+
+// A string, reference or slice, whose region a later arm may shorten to the first one's.
+fn borrowedView(value: &Type) -> bool {
+  return match &value.* {
+    Type.String {..} => true
+    Type.Reference {..} => true
+    Type.Slice {..} => true
+    _ => false
+  }
+}
+
+// The union of distinct non-Effect arm results, with each arm's value stored as its member. A
+// completing statement block contributes unit, which never joins a value. A result that is itself
+// a union has no member injection into a wider union, and members that form no source union
+// (such as borrowed views) are incompatible.
+effect fn unionMatchType(resolver: &Resolver, module: &ModuleId, nodes: &mut Vector<BodyNode>, arms: &mut Vector<BodyMatchArm>,
+  results: &[ArmResult], types: Vector<Shared<Type>>, completingBlock: bool, span: Span)
+-> Result<Shared<Type>, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector.asSlice<Shared<Type>>(&types)
+  let mut effect = false
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if Shared.with<Type, bool>(&listed[at], joinableEffect) { effect = true }
+    at = at + usize.ONE
+  }
+  // An exact Effect joins only other Effects (EFF-013); it is never a union member.
+  if completingBlock || effect {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleMatchResults, span))
+  }
+  let joined = run joinedType(move types)
+  if !Shared.with<Type, bool>(&joined, sourceUnion) {
+    return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleMatchResults, span))
+  }
+  at = usize.ZERO
+  while at < results.length {
+    if !run Type.equalsShared(&results[at].ty, &joined) {
+      let previous = Vector.asSlice<BodyMatchArm>(&arms.*)[results[at].arm].result
+      let nested = Shared.with<Type, bool>(&results[at].ty, fn(ty: &Type) -> bool {
+        return match &ty.* { Type.Union {..} => true _ => false }
+      })
+      let injected = run unionArgument(&mut nodes.*, previous, &joined)
+      if nested || injected.index == previous.index {
+        return Result.failResult<Shared<Type>, Shared<Rejection>>(run reject(resolver, module, RejectionCode.IncompatibleMatchResults, span))
+      }
+      let mut listed = Vector.asMutSlice<BodyMatchArm>(&mut arms.*)
+      listed[results[at].arm].result = injected
+    }
     at = at + usize.ONE
   }
   return Result.succeed<Shared<Type>, Shared<Rejection>>(move joined)
@@ -31568,18 +31629,19 @@ effect fn checkRecordMatch<'scope>(
       }
     }
     let resultNode = armResult.node
-    // Only expression arms supply the expected type of later expression arms; a block never does.
+    // Without a context type, arms check independently and their results join. Only a borrowed
+    // view supplies the expected type of later expression arms, so a later view can take the
+    // shorter region the first one already names; a block never does.
     let unset = match &resultType {
       Option<Shared<Type>>.Some {..} => false
       Option<Shared<Type>>.None => true
     }
-    // Distinct exact Effects join instead (EFF-013), so an Effect arm does not fix later arms.
     if unset && !armResult.block {
       if let Option<Shared<Type>>.Some {value: produced} = &armResult.ty {
-        if !Shared.with<Type, bool>(&produced, joinableEffect) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
+        if Shared.with<Type, bool>(&produced, borrowedView) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
       }
     }
-    run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty)
+    run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty, armResult.block)
     run Vector.append<BodyMatchArm>(&mut checkedArms, BodyMatchArm {
       origin: BodyOrigin {syntax: armId, span: armSpan},
       pattern: move checkedPattern, tests: move armTests, guard: move checkedGuard, result: resultNode,
@@ -35763,17 +35825,17 @@ effect fn checkExpressionUnder<'scope>(
           }
         }
         let resultNode = armResult.node
-        // Only expression arms supply the expected type of later expression arms; a block never does.
+        // As in a record match, only a borrowed view supplies later arms' expected type.
         let unset = match &resultType {
           Option<Shared<Type>>.Some {..} => false
           Option<Shared<Type>>.None => true
         }
         if unset && !armResult.block {
           if let Option<Shared<Type>>.Some {value: produced} = &armResult.ty {
-            if !Shared.with<Type, bool>(&produced, joinableEffect) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
+            if Shared.with<Type, bool>(&produced, borrowedView) { resultType = Option.some<Shared<Type>>(Shared.clone<Type>(&produced)) }
           }
         }
-        run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty)
+        run joinArm(&mut join, Vector.length<BodyMatchArm>(&checkedArms), &armResult.ty, armResult.block)
         run Vector.append<BodyMatchArm>(&mut checkedArms, BodyMatchArm {
           origin: BodyOrigin {syntax: armId, span: armSpan},
           pattern: move checkedPattern, tests: Vector.make<BodyPatternTest>(), guard: move checkedGuard, result: resultNode,
