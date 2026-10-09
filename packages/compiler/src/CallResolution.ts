@@ -2396,19 +2396,36 @@ export const interfaceConstraints = (
   context: SemanticContext.SemanticContext,
   reference: CallReferenceFact,
   substitution: Type.Substitution | undefined,
-  index: DeclarationIndex.Index,
+  resolution: {
+    readonly index: DeclarationIndex.Index
+    readonly lifetimeCompatibility?: TypeCompatibility.Context
+  },
   caller: DeclarationFact,
   span: Location.Location,
 ): {
   readonly diagnostics: ReadonlyArray<Diagnostic.Located>
   readonly proofs: ReadonlyArray<ConformanceGoal.Proof>
 } => {
+  const index = resolution.index
   const proofs: Array<ConformanceGoal.Proof> = []
+  // A selected head's own outlives predicates are part of the contract the call relies on. They
+  // never steer selection; the caller proves them under its region assumptions (LIFE-002).
+  const selectedHeadDiagnostics = (): ReadonlyArray<Diagnostic.Located> =>
+    proofs.flatMap((proof) => {
+      const selected = ConformanceProof.selectedOutlives(index, proof)
+      return selectedLifetimeBoundDiagnostics(
+        selected.lifetimeBounds,
+        new Map(),
+        resolution.lifetimeCompatibility,
+        span,
+        selected.typeOutlives,
+      )
+    })
   if (reference._tag !== 'Resolved' || substitution === undefined) {
     proofs.push(...interfaceEvidence(reference, index))
-    return { diagnostics: [], proofs }
+    return { diagnostics: selectedHeadDiagnostics(), proofs }
   }
-  const diagnostics = reference.declaration.typeParameters.flatMap((parameter) => {
+  const boundDiagnostics = reference.declaration.typeParameters.flatMap((parameter) => {
     const provider = substitution.get(Type.key(parameter.type))
     if (provider === undefined || !Type.isTypeArgument(provider)) return []
     return parameter.bounds.flatMap((bound): ReadonlyArray<Diagnostic.Located> => {
@@ -2477,7 +2494,7 @@ export const interfaceConstraints = (
       return []
     })
   })
-  return { diagnostics, proofs }
+  return { diagnostics: [...boundDiagnostics, ...selectedHeadDiagnostics()], proofs }
 }
 
 /**
@@ -3237,7 +3254,7 @@ export const analyzeFunctionItem = (
     context,
     reference,
     contextual,
-    resolution.index,
+    resolution,
     caller,
     Location.at(node.anchor),
   )
@@ -4011,7 +4028,7 @@ export const finishCallableSection = (
     context,
     reference,
     contract.substitution,
-    resolution.index,
+    resolution,
     caller,
     Location.at(node.anchor),
   )
@@ -4312,7 +4329,7 @@ const contextualStoredInvocation = (
         context,
         { _tag: 'Resolved', spelling: targetName.spelling, anchor: targetName.anchor, declaration },
         adapted.callable.schema.substitution,
-        resolution.index,
+        resolution,
         caller,
         Location.at(fact.anchor),
       )
@@ -4498,7 +4515,7 @@ export const contextualInvocationSection = (
         context,
         fact.reference,
         substitution,
-        resolution.index,
+        resolution,
         caller,
         Location.at(fact.anchor),
       )
@@ -5055,7 +5072,7 @@ export const finishCallableApplication = (
           context,
           sourceTarget,
           inferred,
-          resolution.index,
+          resolution,
           caller,
           Location.at(node.anchor),
         )
