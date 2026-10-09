@@ -816,8 +816,7 @@ export const lowerCatchEffectRunner = (
   registry: SemanticContext.Registry,
 ): Mir.MirFunction | undefined => {
   const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
-  if (owned === undefined)
-    return undefined
+  if (owned === undefined) return undefined
   const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
@@ -934,8 +933,7 @@ export const lowerBuiltinEffectRunner = (
   )
   if (parameterTypes.length !== spec.expression.arguments.length) return undefined
   const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
-  if (owned === undefined)
-    return undefined
+  if (owned === undefined) return undefined
   const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
@@ -1061,8 +1059,7 @@ export const lowerWitnessEffectRunner = (
   )
   if (parameterTypes.length !== spec.type.environment.fields.length) return undefined
   const owned = ownerRequirements(index, calls, spec.owner.key, spec.providedRequirements)
-  if (owned === undefined)
-    return undefined
+  if (owned === undefined) return undefined
   const parameterizedRequirements = owned.filter(
     (requirement) => requirement.witness._tag === 'SourceConformanceWitness',
   )
