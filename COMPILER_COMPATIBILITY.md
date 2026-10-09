@@ -632,8 +632,8 @@ Each entry records:
 
 ### Interface `effect fn` operations in selfhost
 
-- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); narrower
-  remainders below.
+- **Status:** qualified calls run in place implemented in PR #1071 (2026-10-06); stored and
+  returned qualified constructions implemented in PR #1290 (2026-10-09); narrower remainders below.
 - **Rule:** [INTF-006](apps/docs/content/reference/generics-interfaces-and-specialization.md#intf-006--a-qualified-interface-call-requires-one-static-application)
   lets an unapplied qualified call `Interface.operation(value)` take its one application from the
   provider's conformances. Under
@@ -647,23 +647,26 @@ Each entry records:
   as one direct call of the selected witness; there is no adapter or runtime dispatch. The call's
   failure edge has the witness's own declared failure, which EFF-009 bounds by the promised one,
   and injects it into the promised failure's sink; a `never` witness gets no edge. Service
-  operations dispatched to a provider's witness lower the same way. Selfhost infers the provider
-  from the first operand only; the bootstrap uses the operand whose declared type is `Self` or
-  `&Self`.
-- **Diagnostics and limits:** an `effect fn` interface call that no `run` executes in place (bound
-  to a local or returned), a receiver-method call (`value.take()`), operator syntax and a callable
-  success report `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The
-  pipeline form `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  operations dispatched to a provider's witness lower the same way. A qualified call no `run`
+  executes in place, bound to a local or returned, is the selected witness's exact Effect: the
+  witness application with the call's arguments as stored fields, as a direct call of that witness
+  constructs it. Through a generic bound the witness resolves once the provider is concrete.
+  Selfhost infers the provider from the first operand only; the bootstrap uses the operand whose
+  declared type is `Self` or `&Self`.
+- **Diagnostics and limits:** a receiver-method call (`value.take()`), operator syntax, a callable
+  success, and a stored construction whose witness borrows an owned operand report
+  `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The pipeline form
+  `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
   failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
-  `never` witness of a fallible operation, and the ambiguous, missing, bound and returned
-  rejections at their call spans. `ownedProviderServesGenericBinding` asserts the same edges for
+  `never` witness of a fallible operation, the ambiguous and missing rejections at their call
+  spans, and a bound, a returned and a generic-bound returned construction that check and lower. `ownedProviderServesGenericBinding` asserts the same edges for
   service witnesses run directly and inside a bound section. `providersServeRowsInKeyOrder` lowers
-  `run Present.present(value)` to a witness call. The native corpus pins `borrowed-outcome-stream`,
-  `generic-inline-effect-conformance` and `scalar-display`.
-- **Owner:** stored constructions, receiver-method, operator and pipeline forms: #567 Step 9
-  follow-ups.
+  `run Present.present(value)` to a witness call and a stored, later run construction to MIR. The
+  native corpus pins `borrowed-outcome-stream`, `generic-inline-effect-conformance`,
+  `scalar-display` and the four `static-composition` programs.
+- **Owner:** receiver-method, operator and pipeline forms: #567 Step 9 follow-ups.
 
 ### Omitted Effect environments elaborated from inputs
 
