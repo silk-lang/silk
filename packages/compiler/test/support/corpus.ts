@@ -169,6 +169,16 @@ const sourceSection = (source: string, start: string, end: string): string => {
   return source.slice(startOffset, endOffset)
 }
 
+// Copies one complete top-level declaration, from its header through its closing brace, so later
+// private neighbors in the source module are never pulled into the program.
+const sourceDeclaration = (source: string, header: string): string => {
+  const startOffset = source.indexOf(header)
+  const endOffset = source.indexOf('\n}\n', startOffset)
+  if (startOffset < 0 || endOffset < 0)
+    throw new Error(`Cannot find test source declaration ${header}`)
+  return source.slice(startOffset, endOffset + 2)
+}
+
 const tlsHkdfSource = readFileSync(
   new URL('../../stdlib/silk/tls_hkdf.silk', import.meta.url),
   'utf8',
@@ -199,7 +209,9 @@ const sha2Source = readFileSync(new URL('../../stdlib/silk/sha2.silk', import.me
 
 const sha2LengthTestSource = `import silk.u64
 
-${sourceSection(sha2Source, 'struct Length64Transition {', 'fn makeState32')}
+${sourceDeclaration(sha2Source, 'struct Length64Transition {')}
+
+${sourceDeclaration(sha2Source, 'fn length64Transition(')}
 
 fn __testLength64Transition() -> bool {
   let carry = length64Transition(7, u64.MAX - 7, 1)
@@ -4712,17 +4724,17 @@ import silk.vector { Vector }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut values = Vector.make<i32>()
-  let pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  let mut pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
   let appended0 = run pending0
-  let pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
+  let mut pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
   let appended1 = run pending1
-  let pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
+  let mut pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
   let appended2 = run pending2
-  let pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
+  let mut pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
   let appended3 = run pending3
-  let pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
+  let mut pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
   let appended4 = run pending4
-  let pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
+  let mut pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
   let appended5 = run pending5
   if Vector.length<i32>(&values) == 6 {} else { return 0 }
   if Vector.capacity<i32>(&values) == 8 {} else { return 1 }
@@ -9771,7 +9783,7 @@ interface Decoder { effect fn decode(value: &mut Self) -> i32 ! Problem }
 struct Cell { code: i32 }
 effect fn decodeCell(value: &Cell) -> i32 ! Problem { fail Problem { code: 1 } }
 impl Decoder for Cell { decode: Cell.decodeCell }
-fn pending<T: Decoder>(value: &mut T) -> Effect<i32 ! Problem> { return Decoder.decode(value) }
+fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(value) }
 fn observe(result: Result<i32, Problem>) -> i32 {
   return match move result {
     Result<i32, Problem>.Success { value } => value

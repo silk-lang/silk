@@ -1084,19 +1084,21 @@ binary. `--no-cache` executes assertions even if a previous run stored passing r
 Linux workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
 Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
 named `selfhost-*`; pushing one does not start a second CI run before its pull request.
+The heaps match the cases matrix in `.github/workflows/selfhost.yml`: a semantic root peaks near
+11.3 GB, so run one at a time on a 15 GB machine.
 
 ```sh
 CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticSignatureCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticConformanceCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticLoweringCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCaptureCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCallableCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/CallableResultCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/TargetCases.silk --no-cache
-node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticSignatureCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticConformanceCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticLoweringCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCaptureCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCallableCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/CallableResultCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/TargetCases.silk --no-cache
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --no-cache
 ```
 
 The cases inspect query and source events, retained request evidence, and rejection codes and byte
