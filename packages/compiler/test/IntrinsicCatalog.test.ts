@@ -89,7 +89,7 @@ const operationKeys = (snapshot: Analysis.FrontendSnapshot): ReadonlyArray<strin
     ),
   )
 
-const observationWrapper = `fn observing<'env, S, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+const observationWrapper = `fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
   return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
 }`
 
@@ -542,6 +542,25 @@ pub fn main() -> i32 {
     assert.include(
       Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
       'SEM0052',
+    )
+  }),
+)
+
+it.effect('requires observed state to outlive the observation environment', () =>
+  Effect.gen(function* () {
+    const unbounded = observationWrapper.replace("S: 'env,", 'S,')
+    const wrapped = yield* Analysis.ofSource(
+      'intrinsic/observation-unbounded-state',
+      encoder.encode(`${unbounded}
+pub fn main() -> i32 { return 42 }`),
+    )
+    assert.deepEqual(
+      Analysis.diagnostics(wrapped).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        ['SEM0212', 0],
+        ['OWN0019', unbounded.indexOf('Intrinsic.observeDiagnostics')],
+        ['OWN0019', unbounded.indexOf('Intrinsic.observeDiagnostics')],
+      ],
     )
   }),
 )
