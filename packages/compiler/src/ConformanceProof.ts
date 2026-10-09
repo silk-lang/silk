@@ -12,7 +12,7 @@ import type {
   InterfaceOperationApplicationFact,
   UnionVariantFact,
 } from './DeclarationFacts.js'
-import { byCanonical, providerOperation } from './DeclarationFacts.js'
+import { byCanonical, declaredOutlives, providerOperation } from './DeclarationFacts.js'
 import type { Index } from './DeclarationIndex.js'
 import { declaredRequirements, memberByNominal } from './DeclarationResolution.js'
 import * as Intrinsic from './Intrinsic.js'
@@ -740,6 +740,55 @@ export const prove = (
   const memo = remembered ?? new Map<string, ConformanceGoal.Proof>()
   if (remembered === undefined) proofMemos.set(self, memo)
   return proveGoal(self, ConformanceGoal.make(capability, provider), memo, [])
+}
+
+/**
+ * Returns the outlives predicates a proved goal's selected declarations write on their own binders,
+ * instantiated with the arguments that selected them.
+ *
+ * Selection never consults these predicates (GEN, LIFE-002): a lifetime cannot choose a witness.
+ * They are the selected head's contract, so the call that relies on the proof checks them under its
+ * own region assumptions. Every requirement the proof followed contributes its declaration's
+ * predicates too.
+ */
+export const selectedOutlives = (
+  self: Index,
+  proof: ConformanceGoal.Proof,
+): {
+  readonly lifetimeBounds: ReadonlyArray<Lifetime.Outlives>
+  readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
+} => {
+  const lifetimeBounds: Array<Lifetime.Outlives> = []
+  const typeOutlives: Array<Type.TypeOutlives> = []
+  const visit = (step: ConformanceGoal.Proof): void => {
+    if (step._tag !== 'Proved') return
+    step.requirements.forEach(visit)
+    if (step.selection._tag !== 'SourceSelection') return
+    const conformance = selectedConformance(self, step.selection)
+    if (conformance === undefined) return
+    const parameters = conformance.typeParameters.filter(
+      (parameter) => parameter.duplicateOf === undefined,
+    )
+    const substitution: Type.Substitution = new Map(
+      parameters.flatMap((parameter, ordinal) => {
+        const argument = step.typeArguments.at(ordinal)
+        return argument === undefined ? [] : [[Type.key(parameter.type), argument] as const]
+      }),
+    )
+    const declared = declaredOutlives(parameters)
+    for (const bound of declared.lifetimeBounds)
+      lifetimeBounds.push({
+        longer: Type.substituteLifetime(bound.longer, substitution),
+        shorter: Type.substituteLifetime(bound.shorter, substitution),
+      })
+    for (const bound of declared.typeOutlives)
+      typeOutlives.push({
+        type: Type.substitute(bound.type, substitution),
+        lifetime: Type.substituteLifetime(bound.lifetime, substitution),
+      })
+  }
+  visit(proof)
+  return { lifetimeBounds, typeOutlives }
 }
 
 const interfaceConformance = (
