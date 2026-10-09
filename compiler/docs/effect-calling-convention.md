@@ -175,12 +175,9 @@ after the loan ends. Its `NonParking` bound rejects parking. This composition ne
 Execution nor an observer; full `silk/native_start` retains those separate dependencies. See
 [the source startup contract](source-synchronous-startup.md).
 
-Selfhost currently still emits the generated C entry for `fn main() -> i32`; other entry
-signatures report `entry-signature`. The generated adapter can be removed only after the
-synchronous Effect source contract and the ordinary plain-i32 source adaptation
-([#931](https://github.com/julia-script/silk/issues/931)) are integrated, validated, and selected
-through the ordinary source runtime mechanism. This source module's presence alone does not
-change native entry routing. Full suspension and observer support remain separate work.
+Selfhost has no generated C entry: a package without a composition takes the catalog runtime for
+its target and libc, `silk/native_start` on hosted targets, and every build roots at that
+runtime's C exports. Full suspension and observer support remain separate work.
 
 ### D6. Suspension stays a named gap
 
@@ -328,8 +325,8 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 
 - `load` and `middle` lower under D3. In `middle`, `load`'s failure edge targets `_f` directly
   because the types are equal, then `Fail`.
-- The program as a whole stays `entry-signature` until `native_start` compiles (Q1). Its expected
-  stderr prints a logical trace, which also needs the trace follow-up (Q2).
+- The program as a whole runs through `silk/native_start`. Its expected stderr prints a logical
+  trace, which also needs the trace follow-up (Q2).
 
 ## 4. Gap codes
 
@@ -337,7 +334,7 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 | -------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `suspension`               | **new** (named with Step 4) | MIR lowering reaches `suspendEffect` or `park`                                                                                  | suspension stage                                                                         |
 | `effect-instance`          | **deleted**                 | was: instance with a non-empty row, or an `effect fn` interface witness                                                         | Step 9 provider PR                                                                       |
-| `entry-signature`          | unchanged                   | `Entry { main }` with any signature except `fn main() -> i32`                                                                   | Q1                                                                                       |
+| `entry-signature`          | **deleted**                 | was: `Entry { main }` with any signature except `fn main() -> i32`                                                              | default runtime selection                                                                |
 | `intrinsic-member`         | narrower                    | `execution*`, `wake`; no longer `observeUnhandled` or `observeDiagnostics` ([the observer note](failure-observer-and-trace.md)) | suspension stage                                                                         |
 | `observer-callback`        | **new** (observer note)     | an `observeDiagnostics` callback that is not a direct function                                                                  | callback environments in the observer record                                             |
 | `failure-identity`         | **new** (observer note)     | an observed `fail` of a type other than a nominal, primitive or unit type                                                       | identity rendering for the remaining types                                               |
@@ -357,7 +354,7 @@ trap stub.
 | providers          | statically selected provider references appended after captures; runner specialized per provider witness (`effectRunner.providers`)                                                                                                 | the same idea: `providers` in the key, address `Provider` locals                                                                 | no                                |
 | failure return     | `EffectOutcome` sum returned by value (tag lane, widest payload's lanes)                                                                                                                                                            | status flag plus success and failure out-slots                                                                                   | no                                |
 | diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | origin-only identity and origin under an observer ([the observer note](failure-observer-and-trace.md)); frames and causes follow | yes, in unhandled-failure reports |
-| entry              | source runtime `silk/native_start` (ENTRY-001), no compiler adapter                                                                                                                                                                 | generated C `main` calling `fn main() -> i32` (Q1)                                                                               | yes: `effect fn main` unsupported |
+| entry              | source runtime `silk/native_start` (ENTRY-001), no compiler adapter                                                                                                                                                                 | the same source runtime, selected from the standard-library catalog by target and libc                                           | no                                |
 | suspension         | coroutine frames, `SuspendEffectRegion`                                                                                                                                                                                             | gap `suspension`                                                                                                                 | yes: unsupported                  |
 
 `EffectExecutionContract.matches`, which proves provider subtraction by row algebra, has no native
@@ -398,6 +395,8 @@ All three recommendations accepted on PR #708:
    until selfhost compiles `silk/native_start`. It is recorded in COMPILER_COMPATIBILITY.md as a
    temporary difference from the bootstrap and ENTRY-001. `pub effect fn main` stays
    `entry-signature` until then. No compiler entry adapter is added for `effect fn main`.
+   Done: selfhost now selects `silk/native_start` by default and the shim, `entry-signature` and
+   the compatibility entry are removed.
 2. **Failure context (Q2).** Origin-only context is carried by `Statement.FailureContext`, added
    with its first reader by the observer and trace work
    ([failure-observer-and-trace.md](failure-observer-and-trace.md), shipped in its §7 step 2), not
