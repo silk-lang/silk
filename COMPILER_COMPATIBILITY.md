@@ -1634,7 +1634,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   regions. Native fixes an inferred binder by its first evidence and shortens it when a later
   operand offers another region for a binder every parameter stores covariantly: to that region
   over `'static`, otherwise to the complete meet of both, as in `pair(left, right)` for
-  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. An inferred struct
+  `pair<'a>(&'a i32, &'a i32)`, including an `effect fn` environment binder. A section's Effect
+  environment binder that an earlier operand fixed, as `'env` of `JsonObject.field("x", value)` piped
+  an Effect that borrows a declared region, shortens the same way to the regions that Effect retains. An inferred struct
   literal binder that the declaration stores covariantly shortens the same way at a later field,
   as in `Scoped {count: &mut count.*, view: view}` (added 2026-10-08). A `T: 'binder` bound
   that the binder's evidence does not cover shortens a covariant inferred binder to the meet of the
