@@ -169,6 +169,16 @@ const sourceSection = (source: string, start: string, end: string): string => {
   return source.slice(startOffset, endOffset)
 }
 
+// Copies one complete top-level declaration, from its header through its closing brace, so later
+// private neighbors in the source module are never pulled into the program.
+const sourceDeclaration = (source: string, header: string): string => {
+  const startOffset = source.indexOf(header)
+  const endOffset = source.indexOf('\n}\n', startOffset)
+  if (startOffset < 0 || endOffset < 0)
+    throw new Error(`Cannot find test source declaration ${header}`)
+  return source.slice(startOffset, endOffset + 2)
+}
+
 const tlsHkdfSource = readFileSync(
   new URL('../../stdlib/silk/tls_hkdf.silk', import.meta.url),
   'utf8',
@@ -199,7 +209,9 @@ const sha2Source = readFileSync(new URL('../../stdlib/silk/sha2.silk', import.me
 
 const sha2LengthTestSource = `import silk.u64
 
-${sourceSection(sha2Source, 'struct Length64Transition {', 'fn makeState32')}
+${sourceDeclaration(sha2Source, 'struct Length64Transition {')}
+
+${sourceDeclaration(sha2Source, 'fn length64Transition(')}
 
 fn __testLength64Transition() -> bool {
   let carry = length64Transition(7, u64.MAX - 7, 1)
@@ -3567,9 +3579,9 @@ effect fn build() -> i32 ! OutOfMemoryError {
   if literal != "A\\u{a3}" {} else { return 2 }
 
   let mut allocator = Allocator.systemAllocatorProvider()
-  let copying = String.copy(literal) |> Effect.provideMut(&mut allocator)
+  let mut copying = String.copy(literal) |> Effect.provideMut(&mut allocator)
   let mut owned = run copying
-  let appending = String.append(&mut owned, "\\u{20ac}\\u{10348}")
+  let mut appending = String.append(&mut owned, "\\u{20ac}\\u{10348}")
     |> Effect.provideMut(&mut allocator)
   let appended = run appending
   let borrowed = String.view(&owned)
@@ -4712,17 +4724,17 @@ import silk.vector { Vector }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut values = Vector.make<i32>()
-  let pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  let mut pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
   let appended0 = run pending0
-  let pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
+  let mut pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
   let appended1 = run pending1
-  let pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
+  let mut pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
   let appended2 = run pending2
-  let pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
+  let mut pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
   let appended3 = run pending3
-  let pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
+  let mut pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
   let appended4 = run pending4
-  let pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
+  let mut pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
   let appended5 = run pending5
   if Vector.length<i32>(&values) == 6 {} else { return 0 }
   if Vector.capacity<i32>(&values) == 8 {} else { return 1 }
@@ -5296,10 +5308,10 @@ fn checksum(values: &[u8]) -> i32 {
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let source = [octet(0), octet(255), octet(128), octet(1)]
-  let copying = Bytes.copy(&source) |> Effect.provideMut(&mut allocator)
+  let mut copying = Bytes.copy(&source) |> Effect.provideMut(&mut allocator)
   let mut bytes = run copying
   let suffix = [octet(42), octet(7)]
-  let appending = Bytes.append(&mut bytes, &suffix) |> Effect.provideMut(&mut allocator)
+  let mut appending = Bytes.append(&mut bytes, &suffix) |> Effect.provideMut(&mut allocator)
   let appended = run appending
   let mut writable = Bytes.asMutSlice(&mut bytes)
   writable[1] = octet(2)
@@ -9771,7 +9783,7 @@ interface Decoder { effect fn decode(value: &mut Self) -> i32 ! Problem }
 struct Cell { code: i32 }
 effect fn decodeCell(value: &Cell) -> i32 ! Problem { fail Problem { code: 1 } }
 impl Decoder for Cell { decode: Cell.decodeCell }
-fn pending<T: Decoder>(value: &mut T) -> Effect<i32 ! Problem> { return Decoder.decode(value) }
+fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(value) }
 fn observe(result: Result<i32, Problem>) -> i32 {
   return match move result {
     Result<i32, Problem>.Success { value } => value
@@ -10138,6 +10150,109 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recoverAllocation) 
   {
     name: 'streaming-inflate',
     source: inflateAcceptanceSource,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Every suspension state shape keeps its value and its single owner. The borrowed referents
+  // (`counter` in main and `local` in `twice`) are borrowed across suspension points, so a frame
+  // that copied them instead of keeping them in place would update a dead copy.
+  {
+    name: 'suspension-borrowed-referent-frame',
+    source: `import silk.effect { Effect }
+struct Counter { value: i32 }
+effect fn bump(counter: &mut Counter, step: i32) -> i32 {
+  let before = counter.value
+  let next = run Effect.suspend(effect { return step })
+  counter.value = counter.value + next
+  return before
+}
+effect fn twice(counter: &mut Counter) -> i32 {
+  let mut local = Counter { value: 10 }
+  let view = &mut local
+  let first = run bump(&mut counter.*, 1)
+  let inner = run bump(&mut view.*, 5)
+  let second = run bump(&mut counter.*, 1)
+  return second - first + local.value - inner
+}
+pub fn main() -> i32 {
+  let mut counter = Counter { value: 34 }
+  let reference = &mut counter
+  let delta = run twice(&mut reference.*)
+  return counter.value + delta
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // An owner moved into a suspending callee, one created before and one after its suspension point,
+  // and one held by the caller across it, drop exactly once in source order: 3, 2, 1, then 4.
+  {
+    name: 'suspension-moved-owner-drop-order',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+struct Log { digits: i32 }
+struct Token { id: i32 log: Shared<Log> }
+fn append(log: &mut Log, id: i32) -> i32 {
+  log.digits = log.digits * 10 + id
+  return log.digits
+}
+fn digits(log: &Log) -> i32 { return log.digits }
+impl Drop for Token {
+  fn drop(self: &mut Token) -> () {
+    let id = self.id
+    let written = Shared.withMut<Log, i32>(&self.log, append(id))
+    return ()
+  }
+}
+fn token(id: i32, log: &Shared<Log>) -> Token { return Token { id: id, log: Shared.clone<Log>(log) } }
+effect fn hold(owned: Token, value: i32) -> i32 {
+  let kept = token(2, &owned.log)
+  let next = run Effect.suspend(effect { return value + 1 })
+  let early = token(3, &owned.log)
+  drop early
+  return next + owned.id + kept.id
+}
+effect fn relay(log: &Shared<Log>) -> i32 {
+  let first = token(1, log)
+  let outer = token(4, log)
+  let result = run hold(move first, 5)
+  return result
+}
+effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let log = run Shared.make<Log>(Log { digits: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run relay(&log)
+  let order = Shared.with<Log, i32>(&log, digits)
+  if result != 9 { return 1 }
+  if order != 3214 { return 2 }
+  return 42
+}
+effect fn recoverAllocation(error: OutOfMemoryError) -> i32 { return 3 }
+pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  // Copied scalars, an aggregate and a loop counter survive one suspension per iteration.
+  {
+    name: 'suspension-copied-state-loop',
+    source: `import silk.effect { Effect }
+struct Pair { left: i64 right: i64 }
+effect fn mix(seed: i64, count: i64) -> i64 {
+  let pair = Pair { left: seed, right: 7 }
+  let scale: i64 = 3
+  let flag = seed > 2
+  let mut total: i64 = 0
+  let mut at: i64 = 0
+  while at < count {
+    let step = run Effect.suspend(effect { return at })
+    total = total + step * scale + pair.right
+    at = at + 1
+  }
+  if flag { return total + pair.left }
+  return total
+}
+pub fn main() -> i32 {
+  let value = run mix(5, 3)
+  if value == 35 { return 42 }
+  return 1
+}`,
     expected: { _tag: 'Completes', result: 42 },
   },
   // One million suspended recursive frames must complete without growing the machine stack (an
