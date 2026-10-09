@@ -395,11 +395,10 @@ Until the suspension stage, this reports gap `suspension` at the `Effect.suspend
 
 ## 10. Gap codes
 
-| Code         | Reached when                                                                                                     | Exit             |
-| ------------ | ---------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `cleanup`    | an owned place needs a cleanup form the current step does not lower, or emission meets `Drop` before glue exists | Step 6           |
-| `capture`    | an anonymous callable, Effect block or section is constructed or called                                          | Step 8           |
-| `suspension` | `Intrinsic.suspendEffect` or `Intrinsic.park`, or a `Nested` run in a suspendable instance                       | suspension stage |
+| Code      | Reached when                                                                                                     | Exit   |
+| --------- | ---------------------------------------------------------------------------------------------------------------- | ------ |
+| `cleanup` | an owned place needs a cleanup form the current step does not lower, or emission meets `Drop` before glue exists | Step 6 |
+| `capture` | an anonymous callable, Effect block or section is constructed or called                                          | Step 8 |
 
 Existing codes stay: `intrinsic-member` (including the Execution primitives), `bound-method`,
 `generic-operation`, and the `borrow-check` summary until native borrow checking. The Step 9
@@ -452,4 +451,4 @@ The Step 4 and Step 5 authors agreed this text on 2026-10-02. It appears verbati
 - Added only by the suspension stage: `Terminator.Suspend { callee, arguments, providers, destination, mode: Transfer | Nested, resume: Block, failure: Option<FailureEdge>, cancel: Block, origin }` and `Terminator.Abandon { origin }`.
 - `Transfer` is the explicit `Intrinsic.suspendEffect` point (inside stdlib `Effect.suspend`); `Nested` is a `run` of a callee whose suspension summary is NestedTransfer, inside a suspendable instance. `resume` receives the success value in `destination`; `failure` is the ordinary failure edge; `cancel` is the explicit drop chain of every owner live at that point, reading flags from the frame, ending in `Abandon` (no outcome).
 - `Mir(Function)` demands the instance's suspension summary (an SCC-capable query; an engine addition), never a callee body, to choose `Call` or `Suspend`. Non-suspending instances contain no `Suspend` (SUSP-018). Providers, out-slots and drop flags are ordinary locals stored in the frame like any live place.
-- Until that stage, reaching `Intrinsic.suspendEffect` or `Intrinsic.park` reports gap `suspension`; callers fail through the callee's gap. The Execution primitives stay `intrinsic-member`.
+- `Intrinsic.suspendEffect` and `Intrinsic.relinquish` lower to resume points of the instance's coroutine frame. A relinquish ends its block with `Terminator.Relinquish { resume, origin }` and returns the frame to its Execution driver, which leaves the package Relinquished.
