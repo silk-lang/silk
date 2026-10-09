@@ -2215,6 +2215,51 @@ fn expired<'a>(value: &'a i32, marker: &'static i32) -> Holder<'static, &'a i32>
   }),
 )
 
+it.effect(
+  'requires a selected implementation head to prove its own outlives bounds at the call',
+  () =>
+    Effect.gen(function* () {
+      // Lifetimes never choose a witness, so the region-only provider still selects the bounded head;
+      // the call then owes that head's `'a: 'static` premise under its own assumptions. A local
+      // borrow that must satisfy the premise is reported at the borrow it cannot extend.
+      const source = `interface Label<A> {}
+struct Pinned<'a> { value: &'a i32 }
+struct Held<'a> { value: &'a i32 }
+impl<'a: 'static> Label<i32> for Pinned<'a> {}
+impl<'a> Label<i32> for Held<'a> {}
+fn select<C: Label<A>, A>(value: C) -> i32 { return 0 }
+fn unpinned<'a>(value: Pinned<'a>) -> i32 { return select(move value) }
+fn explicit<'a>(value: Pinned<'a>) -> i32 { return select<Pinned<'a>, i32>(move value) }
+fn pinned<'a: 'static>(value: Pinned<'a>) -> i32 { return select(move value) }
+fn fixed(value: Pinned<'static>) -> i32 { return select(move value) }
+fn held<'a>(value: Held<'a>) -> i32 { return select(move value) }
+pub fn main() -> i32 {
+  let x = 1
+  return select(Pinned {value: &x})
+}`
+      const snapshot = yield* Analysis.ofSource(
+        'lifetimes/implementation-head-outlives',
+        Uint8Array.from(source, (character) => character.charCodeAt(0)),
+      )
+      const call = (from: string, text: string) => {
+        const start = source.indexOf(text, source.indexOf(from))
+        return [Diagnostic.unsatisfiedLifetimeBoundCode, start, start + text.length]
+      }
+      assert.deepStrictEqual(
+        Analysis.diagnostics(snapshot).map((diagnostic) => [
+          diagnostic.code,
+          diagnostic.span.start,
+          diagnostic.span.end,
+        ]),
+        [
+          call('fn unpinned', 'select(move value)'),
+          call('fn explicit', "select<Pinned<'a>, i32>(move value)"),
+          call('pub fn main', '&x'),
+        ],
+      )
+    }),
+)
+
 it.effect('keeps a borrowed pattern field tied to the outer referent across match arms', () =>
   Effect.gen(function* () {
     const source = `struct Left { value: [i32; 1] }

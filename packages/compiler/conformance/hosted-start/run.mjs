@@ -290,7 +290,7 @@ pub effect fn main() -> () ! Problem { let value = run Effect.ensuring(failing()
           })
           if (
             artifact.nativeRuntimeSymbols.some(
-              (symbol) => symbol !== 'malloc' && symbol !== 'free',
+              (symbol) => symbol !== 'malloc' && symbol !== 'calloc' && symbol !== 'free',
             ) ||
             /@silk_main[ (]/.test(artifact.ir)
           )
