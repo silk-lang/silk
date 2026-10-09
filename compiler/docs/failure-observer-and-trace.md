@@ -282,7 +282,7 @@ callable-value follow-up owns it.
 | ------------------- | --------- | -------------------------------------------------------------------------- | ------------------------------------ |
 | `intrinsic-member`  | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage                     |
 | `observer-callback` | **new**   | an `observeDiagnostics` callback that is not a direct function             | callback environments in the record  |
-| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive or unit type  | identity rendering for the remainder |
+| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive, string or unit type | identity rendering for the remainder |
 | `entry-signature`   | removed   | no generated entry; every build roots at its runtime's C exports           | default runtime selection            |
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
