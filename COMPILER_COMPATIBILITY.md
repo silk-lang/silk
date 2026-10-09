@@ -114,16 +114,17 @@ Each entry records:
   only in covariant positions.
 - **Compilers:** the bootstrap checks every argument by subtyping over the complete variance
   summary. Selfhost call inference still unifies exactly. Only when an inferred argument fails with
-  `TypeMismatch`, and both the argument and the parameter are shared loans, does selfhost match one
-  shortened argument against the same inference state. In that argument, each referent lifetime in
-  a covariant position is shortened to the argument's loan region, but only where the parameter
-  writes its own loan lifetime. Every other lifetime keeps its evidence.
+  `TypeMismatch`, and the parameter is a shared loan, does selfhost match one shortened argument
+  against the same inference state. An exclusive argument loan is first given up as a shared one
+  (BORROW-005 never strengthens access); the operand keeps its exclusive type. In that argument,
+  each referent lifetime in a covariant position is shortened to the argument's loan region, but
+  only where the parameter writes its own loan lifetime. Every other lifetime keeps its evidence.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
   rows, callable and Effect positions, services, interfaces, recursive declarations still being
   summarized, and declarations whose member shape is unavailable are treated as invariant. Such
   calls keep the original `TypeMismatch` at the call.
-- **Evidence:** `sharedLoansShortenCovariantNominalArguments` in
+- **Evidence:** `sharedLoanParametersShortenAndGiveUpArguments` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
