@@ -985,6 +985,29 @@ export const effectLifetimes = (
   }
 }
 
+/** The outlives predicates written on a declaration's own generic parameters, over its binders. */
+export const declaredOutlives = (
+  typeParameters: ReadonlyArray<TypeParameterFact>,
+): {
+  readonly lifetimeBounds: ReadonlyArray<Lifetime.Outlives>
+  readonly typeOutlives: ReadonlyArray<Type.TypeOutlives>
+} => {
+  const lifetimeBounds: Array<Lifetime.Outlives> = []
+  const typeOutlives: Array<Type.TypeOutlives> = []
+  for (const parameter of typeParameters)
+    for (const shorter of parameter.lifetimeBounds ?? []) {
+      const argument = Type.parameterArgument(parameter.type)
+      if (Lifetime.isLifetime(argument)) lifetimeBounds.push({ longer: argument, shorter })
+      else if (Type.isTypeArgument(argument))
+        typeOutlives.push({ type: argument, lifetime: shorter })
+      else if (Type.isRepresentationArgument(argument)) {
+        const type = Type.representedType(argument)
+        if (type !== undefined) typeOutlives.push({ type, lifetime: shorter })
+      }
+    }
+  return { lifetimeBounds, typeOutlives }
+}
+
 const computeExecutableLifetimes = (
   declaration: DeclarationFact | ServiceOperationFact,
 ): Type.ExecutableLifetimes => {
@@ -1024,19 +1047,9 @@ const computeExecutableLifetimes = (
     !lifetimeBinders.some((binder) => Lifetime.equals(binder, invocationUse.lifetime))
   )
     lifetimeBinders.push(invocationUse.lifetime)
-  const lifetimeBounds: Array<Lifetime.Outlives> = []
-  const typeOutlives: Array<Type.TypeOutlives> = []
-  for (const parameter of declaration.typeParameters)
-    for (const shorter of parameter.lifetimeBounds ?? []) {
-      const argument = Type.parameterArgument(parameter.type)
-      if (Lifetime.isLifetime(argument)) lifetimeBounds.push({ longer: argument, shorter })
-      else if (Type.isTypeArgument(argument))
-        typeOutlives.push({ type: argument, lifetime: shorter })
-      else if (Type.isRepresentationArgument(argument)) {
-        const type = Type.representedType(argument)
-        if (type !== undefined) typeOutlives.push({ type, lifetime: shorter })
-      }
-    }
+  const declared = declaredOutlives(declaration.typeParameters)
+  const lifetimeBounds = [...declared.lifetimeBounds]
+  const typeOutlives = [...declared.typeOutlives]
   // An ordinary function retains nothing. An `effect fn` captures every input, so an omitted
   // environment is the intersection of the regions they retain. Unknown generic contents leave it
   // undetermined; `omittedEnvironmentDiagnostics` rejects that, and no obligation is invented.

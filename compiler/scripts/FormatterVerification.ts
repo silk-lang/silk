@@ -23,6 +23,7 @@ export interface FormatterVerification {
   readonly bootstrap: string
   readonly gate: string
   readonly compiler: string
+  readonly cCompiler: string
   readonly safetyLog: string
   readonly selected?: ReadonlyArray<string>
 }
@@ -161,6 +162,7 @@ export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(fu
       'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
     ),
     compiler,
+    cCompiler: yield* CorpusVerification.cCompiler,
     safetyLog: path.join(temporary, 'formatter-safety.log'),
     ...(selected.length === 0 ? {} : { selected }),
   })
