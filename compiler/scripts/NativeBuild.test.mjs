@@ -499,18 +499,18 @@ sleep 60`,
       }),
   )
 
-  it.effect('preserves native entry-signature refusal without smoke or recovery', () =>
+  it.effect('preserves a native backend-gap refusal without smoke or recovery', () =>
     fixture(function* ({ options }) {
       executable(
         options.seed,
-        'echo \'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"entry-signature","reason":"effect entry"}]}\' >&2\nexit 2',
+        'echo \'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"suspension","reason":"park"}]}\' >&2\nexit 2',
       )
       const result = yield* fixtureBuild(options)
       assert.strictEqual(result.status, 'failed')
       assert.strictEqual(result.failure.stage, 'native-build')
       assert.strictEqual(result.stages.length, 1)
       assert.strictEqual(result.stages[0].exitCode, 2)
-      assert.match(result.stages[0].stderr, /entry-signature/)
+      assert.match(result.stages[0].stderr, /suspension/)
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
     }),
   )
