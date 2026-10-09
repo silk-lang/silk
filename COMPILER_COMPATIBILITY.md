@@ -719,7 +719,10 @@ Each entry records:
     - An `effect fn` records a `'static`, single-region or two-member environment as above,
       `'a` for a `Held<'a, i32>` input, `'static` for `once Effect<'static; A ! E>` or
       `fn<'static>(A) -> A` inputs, and the pending region for `once Effect<A>`. A stored `T`
-      input rejects as `AmbiguousLifetime` at that parameter's type.
+      input rejects as `AmbiguousLifetime` at that parameter's type. An anonymous effect callable
+      literal, such as `Effect.mapError`'s `effect fn(error: E) -> never ! F` handler, does not:
+      its intersection comes from capture validity and the inputs it retains, and generic contents
+      keep their own outlives obligations, as the lifetimes reference states.
     - A representation parameter retains its contract's environment, looked up from the
       declaration's own `Represents` bounds: `F: fn<'a>(i32) -> i32` gives `'a`, and
       `F: once Effect<'static; A>` gives `'static`. An interface-bounded `T: Hash` stays unknown.
@@ -1639,7 +1642,8 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   callback no longer fixes `'env` to `'static`; an invariant or written binder never moves. As in the
   bootstrap's type-outlives proof, a stored type parameter without a contents premise names no region
   there: the bound proves the named regions beside it, as for `Query.demand`'s `Reservation<'owner, K, A, R>`,
-  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). The bootstrap solves for the shortest region directly, so a binder
+  and the bootstrap's deferred generic-storage obligation waits for native borrow checking (step 14). A bare type parameter bound by
+  `T: 'binder` still needs its own contents premise and stays `Unsupported` without one. The bootstrap solves for the shortest region directly, so a binder
   an earlier operand fixed to `'static` also relates a later loan of a declared lifetime, as in `Effect.provide<Clock>(work(), clock)` for a parameter `clock`. The
   relations a call's operands retain are outlives premises of that call's own bound proofs, so
   `program() |> Effect.provideMut<Allocator>(&mut allocator)` piped into a second provision section
