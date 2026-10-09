@@ -4795,6 +4795,7 @@ import {
   boundOperationReference,
   builtinSignature,
   instantiateBuiltinSignature,
+  selectedLifetimeBoundDiagnostics,
   callArityDiagnostic,
   captureAccess,
   copyAssumptionsOf,
@@ -6021,6 +6022,19 @@ export function analyzeBuiltinCall(
               resolution,
             ).type,
         )
+  // A builtin's stored inputs must outlive the region its result retains them for.
+  const outlivesDiagnostics =
+    signature === undefined ||
+    specializationDiagnostic !== undefined ||
+    inferenceDiagnostic !== undefined
+      ? []
+      : selectedLifetimeBoundDiagnostics(
+          [],
+          substitution,
+          resolution.lifetimeCompatibility,
+          Location.at(call.anchor),
+          signature.typeOutlives,
+        )
   const pointerSourceType = instantiatedParameters.at(0)
   let qualifierDiagnostic: Diagnostic.Located | undefined
   if (
@@ -6143,6 +6157,7 @@ export function analyzeBuiltinCall(
     inferenceDiagnostic === undefined &&
     unsafeDiagnostic === undefined &&
     qualifierDiagnostic === undefined &&
+    outlivesDiagnostics.length === 0 &&
     assemblyDiagnostics.length === 0
       ? availableExpressionType(reference.result)
       : unavailableExpressionType
@@ -6165,6 +6180,7 @@ export function analyzeBuiltinCall(
       ...(inferenceDiagnostic === undefined ? [] : [inferenceDiagnostic]),
       ...(unsafeDiagnostic === undefined ? [] : [unsafeDiagnostic]),
       ...(qualifierDiagnostic === undefined ? [] : [qualifierDiagnostic]),
+      ...outlivesDiagnostics,
       ...assemblyDiagnostics,
       ...argumentsResult.diagnostics,
       ...typeArguments.diagnostics,
