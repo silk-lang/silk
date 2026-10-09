@@ -4712,17 +4712,17 @@ import silk.vector { Vector }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut values = Vector.make<i32>()
-  let pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  let mut pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
   let appended0 = run pending0
-  let pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
+  let mut pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
   let appended1 = run pending1
-  let pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
+  let mut pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
   let appended2 = run pending2
-  let pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
+  let mut pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
   let appended3 = run pending3
-  let pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
+  let mut pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
   let appended4 = run pending4
-  let pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
+  let mut pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
   let appended5 = run pending5
   if Vector.length<i32>(&values) == 6 {} else { return 0 }
   if Vector.capacity<i32>(&values) == 8 {} else { return 1 }
