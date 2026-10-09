@@ -16,6 +16,7 @@ import {
   lowerWriteSelectors,
   lowerOwnershipPath,
   loanEndOperations,
+  matchCleanupKey,
   ownershipLocal,
   ownerFields,
   orderedCleanup,
@@ -202,6 +203,7 @@ export const lowerPatternSelection = (
   )
   const finalizedSelectedOperations = [...selectedOperations]
   const cleanup: Array<Mir.MatchArm['selected']['cleanup'][number]> = []
+  const cleanupBindings: Array<Mir.MatchArm['cleanupBindings'][number]> = []
   for (const release of ownedArm?.cleanup ?? []) {
     const plan = specializedCleanup(fn, release.cleanup)
     if (plan._tag === 'NoCleanup') continue
@@ -216,11 +218,15 @@ export const lowerPatternSelection = (
     }
     const type = fn.type(plan.type)
     if (type === undefined) return undefined
-    cleanup.push({
-      destination: fn.alloc(type),
-      path: release.path,
-      cleanup: plan,
-    })
+    const destination = fn.alloc(type)
+    // An `if let` body owns the omitted remainder: its exits release these locals after the
+    // bindings. Unconditional destructuring cleans the remainder at its initialization.
+    if (result === 'Bool') {
+      fn.matchCleanupLocals.set(matchCleanupKey(selection.arm, release.path), destination)
+      cleanupBindings.push({ destination, path: release.path, type })
+      continue
+    }
+    cleanup.push({ destination, path: release.path, cleanup: plan })
   }
   const selectedExecution = lowerExecution(fn, selection.span, () => {
     for (const binding of selection.bindings)
@@ -237,7 +243,7 @@ export const lowerPatternSelection = (
     before: members,
     after: selectedAfter,
     bindings: selectedBindings,
-    cleanupBindings: [],
+    cleanupBindings,
     selected: {
       access: selection.access,
       execution: selectedExecution,

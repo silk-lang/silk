@@ -2524,6 +2524,96 @@ int32_t silk_finish_events(void) { puts(""); return 42; }
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // A consuming `if let` body or `match` arm owns the fields its `..` omits until it exits, in
+    // plain and effect functions alike. Each case records its body, then `kept`, then the omitted
+    // fields in declaration order, then what follows; the exit code checks that sequence.
+    name: 'moved-rest-pattern-omitted-field-cleanup',
+    source: `unsafe extern "C" fn silk_record_event(value: i32) -> ()
+unsafe extern "C" fn silk_finish_events() -> i32
+struct Recorder { value: i32 }
+impl Drop for Recorder {
+  fn drop(self: &mut Recorder) -> () { unsafe { silk_record_event(self.value) } return () }
+}
+union Held { Pair { kept: Recorder, left: Recorder, right: Recorder }, Empty }
+fn make(base: i32) -> Held {
+  return Held.Pair {
+    kept: Recorder { value: base + 1 },
+    left: Recorder { value: base + 2 },
+    right: Recorder { value: base + 3 },
+  }
+}
+fn mark(value: i32) -> () { unsafe { silk_record_event(value) } return () }
+fn plainIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(16)
+  return ()
+}
+effect fn effectIf(held: Held) -> () {
+  if let Held.Pair { kept, .. } = move held { mark(kept.value + 4) }
+  mark(26)
+  return ()
+}
+effect fn effectIfReturns(held: Held) -> i32 {
+  if let Held.Pair { kept, .. } = move held {
+    mark(kept.value + 4)
+    return kept.value
+  }
+  return 0
+}
+effect fn effectMatch(held: Held) -> () {
+  match move held {
+    Held.Pair { kept, .. } => { mark(kept.value + 4) }
+    Held.Empty => {}
+  }
+  mark(46)
+  return ()
+}
+effect fn effectMatchReturns(held: Held) -> i32 {
+  match move held {
+    Held.Pair { kept, .. } => {
+      mark(kept.value + 4)
+      return kept.value
+    }
+    Held.Empty => {}
+  }
+  return 0
+}
+pub fn main() -> i32 {
+  plainIf(make(10))
+  run effectIf(make(20))
+  let first = run effectIfReturns(make(30))
+  mark(first + 5)
+  run effectMatch(make(40))
+  let second = run effectMatchReturns(make(50))
+  mark(second + 5)
+  unsafe { return silk_finish_events() }
+}`,
+    nativeCSources: {
+      events: `#include <stdint.h>
+#include <stdio.h>
+static const int32_t expected[] = {
+  15, 11, 12, 13, 16, 25, 21, 22, 23, 26, 35, 31, 32, 33, 36,
+  45, 41, 42, 43, 46, 55, 51, 52, 53, 56,
+};
+static const int32_t count = sizeof(expected) / sizeof(expected[0]);
+static int32_t seen = 0;
+static int32_t mismatch = 0;
+void silk_record_event(int32_t value) {
+  printf("%d,", value);
+  if (mismatch == 0 && (seen >= count || expected[seen] != value)) mismatch = seen + 1;
+  seen += 1;
+}
+int32_t silk_finish_events(void) {
+  puts("");
+  if (mismatch == 0 && seen != count) mismatch = seen + 1;
+  return mismatch == 0 ? 42 : mismatch;
+}
+`,
+    },
+    nativeStdout: '15,11,12,13,16,25,21,22,23,26,35,31,32,33,36,45,41,42,43,46,55,51,52,53,56,\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     // A generic item piped inside a generic owner: `U := T` is solved in the owner's terms.
     name: 'generic-item-pipeline-in-generic-owner',
     source: genericItemPipelineInGenericOwner,
