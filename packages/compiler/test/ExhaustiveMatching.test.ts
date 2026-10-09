@@ -557,13 +557,16 @@ fn assign(input: Slot, cell: &mut Payload) -> i32 {
   if let Slot.Full { payload } = move input { cell.* = payload }
   return 0
 }
+fn consume(payload: Payload) -> i32 { return payload.value }
+fn argument(input: Box) -> i32 { return match move input { Box { payload } => consume(payload) } }
 fn moved(input: Box) -> Payload { return match move input { Box { payload } => move payload } }`
   const result = analyze('consuming-pattern-move', source)
-  // Each use sits after the arm or branch that binds it; the explicit `move` stays accepted.
+  // Each bare use, including a by-value call argument, needs `move`; the explicit form stays accepted.
   const uses = [
     source.indexOf('=> payload') + '=> '.length,
     source.indexOf('return payload') + 'return '.length,
     source.indexOf('= payload') + '= '.length,
+    source.indexOf('consume(payload)') + 'consume('.length,
   ]
   assert.deepEqual(
     ownership(result).diagnostics.map(({ code, span }) => ({
