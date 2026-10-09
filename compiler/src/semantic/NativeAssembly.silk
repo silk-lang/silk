@@ -1,0 +1,350 @@
+//! Validated function-local machine text and its exact register and effect contract.
+//!
+//! # Details
+//! `Intrinsic.assembly<Result>(template, constraints, clobbers, memory, sideEffects, noReturn,
+//! inputs)` carries literal metadata (ASSEMBLY-001/002). The checker admits a use only when this
+//! actor accepts it, and lowering reads the same literals to print one LLVM inline-asm call.
+
+import semantic.Target {Id as TargetId}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.u8
+import silk.usize
+import silk.vector {Vector}
+
+/// The machine class of one assembly result or operand.
+pub enum Lane {
+  /// A unit result; never an operand.
+  Unit,
+  /// One `i64`, `u64`, `isize` or `usize` value.
+  Word,
+  /// One data pointer.
+  Pointer,
+  /// Any other type, which assembly does not admit.
+  Unavailable,
+}
+
+/// The declared memory access of one fragment.
+pub enum Memory {
+  None,
+  Read,
+  Write,
+  ReadWrite,
+}
+
+/// The lane a value of this type occupies.
+pub fn lane(value: &Type) -> Lane {
+  return match &value.* {
+    Type.Unit => Lane.Unit
+    Type.Pointer {..} => Lane.Pointer
+    Type.Primitive {name} => {
+      let spelled = Bytes.asSlice(&name)
+      if same(spelled, b"i64") || same(spelled, b"u64") || same(spelled, b"isize") || same(spelled, b"usize") {
+        return Lane.Word
+      }
+      return Lane.Unavailable
+    }
+    _ => Lane.Unavailable
+  }
+}
+
+/// The lane of a shared type.
+pub fn laneOf(value: &Shared<Type>) -> Lane {
+  return Shared.with<Type, Lane>(value, lane)
+}
+
+/// The written memory contract, if it is one of the four admitted spellings.
+pub fn memory(text: &[u8]) -> Option<Memory> {
+  if same(text, b"none") { return Option.some<Memory>(Memory.None) }
+  if same(text, b"read") { return Option.some<Memory>(Memory.Read) }
+  if same(text, b"write") { return Option.some<Memory>(Memory.Write) }
+  if same(text, b"readwrite") { return Option.some<Memory>(Memory.ReadWrite) }
+  return Option.none<Memory>()
+}
+
+/// Whether a concrete native target admits the source assembly facility.
+pub fn available(target: TargetId) -> bool {
+  return target == TargetId.X8664UnknownLinuxGnu || target == TargetId.Aarch64UnknownLinuxGnu
+}
+
+/// Whether one literal use satisfies the complete machine contract on `target`.
+pub effect fn admits(
+  target: TargetId,
+  template: &[u8],
+  constraints: &[u8],
+  clobbers: &[u8],
+  written: &[u8],
+  sideEffects: bool,
+  noReturn: bool,
+  result: Lane,
+  operands: &[Lane],
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !available(target) { return false }
+  if result == Lane.Unavailable { return false }
+  if operands.length > 7 { return false }
+  let mut at = usize.ZERO
+  while at < operands.length {
+    if operands[at] == Lane.Unit || operands[at] == Lane.Unavailable { return false }
+    at = at + usize.ONE
+  }
+  let access = match move memory(written) {
+    Option<Memory>.Some {value} => value
+    Option<Memory>.None => { return false }
+  }
+  if (access == Memory.Write || access == Memory.ReadWrite) && !sideEffects { return false }
+  if noReturn && (result != Lane.Unit || !sideEffects) { return false }
+  if !templateText(template) { return false }
+  let hasOutput = result != Lane.Unit
+  let parts = partCount(constraints)
+  let mut expected = operands.length
+  if hasOutput { expected = expected + usize.ONE }
+  if parts != expected { return false }
+  // Registers claimed by the output, fixed inputs and clobbers.
+  let mut occupied = Vector.make<Bytes>()
+  let mut part = usize.ZERO
+  let mut start = usize.ZERO
+  let mut tied = false
+  while part < parts {
+    let end = partEnd(constraints, start)
+    if hasOutput && part == usize.ZERO {
+      let mut open = start + usize.ONE
+      if end <= start || constraints[start] != 61 { return false }
+      if open < end && constraints[open] == 38 { open = open + usize.ONE }
+      if !braced(constraints, open, end) { return false }
+      if !register(target, constraints, open + usize.ONE, end - usize.ONE) { return false }
+      if !run occupy(&mut occupied, constraints, open + usize.ONE, end - usize.ONE) { return false }
+    } else {
+      let mut operand = part
+      if hasOutput { operand = part - usize.ONE }
+      if end == start + usize.ONE && constraints[start] == 48 {
+        if !hasOutput || tied || operands[operand] != result { return false }
+        tied = true
+      } else {
+        if !braced(constraints, start, end) { return false }
+        if !register(target, constraints, start + usize.ONE, end - usize.ONE) { return false }
+        if !run occupy(&mut occupied, constraints, start + usize.ONE, end - usize.ONE) { return false }
+      }
+    }
+    start = end + usize.ONE
+    part = part + usize.ONE
+  }
+  let clobberCount = partCount(clobbers)
+  let mut clobber = usize.ZERO
+  start = usize.ZERO
+  while clobber < clobberCount {
+    let end = partEnd(clobbers, start)
+    let flags = sameRange(clobbers, start, end, b"flags")
+    if !flags && !register(target, clobbers, start, end) { return false }
+    if !run occupy(&mut occupied, clobbers, start, end) { return false }
+    start = end + usize.ONE
+    clobber = clobber + usize.ONE
+  }
+  return references(template, parts)
+}
+
+/// The LLVM constraint string: written constraints, then each clobber and the memory clobber.
+pub effect fn llvmConstraints(target: TargetId, constraints: &[u8], clobbers: &[u8], access: Memory) -> Bytes
+! OutOfMemoryError
+? &mut Allocator {
+  let mut output = run Bytes.copy(constraints)
+  let clobberCount = partCount(clobbers)
+  let mut clobber = usize.ZERO
+  let mut start = usize.ZERO
+  while clobber < clobberCount {
+    let end = partEnd(clobbers, start)
+    if Bytes.length(&output) > usize.ZERO { run Bytes.append(&mut output, b",") }
+    run Bytes.append(&mut output, b"~{")
+    if target == TargetId.Aarch64UnknownLinuxGnu && sameRange(clobbers, start, end, b"flags") {
+      run Bytes.append(&mut output, b"cc")
+    } else {
+      run appendRange(&mut output, clobbers, start, end)
+    }
+    run Bytes.append(&mut output, b"}")
+    start = end + usize.ONE
+    clobber = clobber + usize.ONE
+  }
+  if access != Memory.None {
+    if Bytes.length(&output) > usize.ZERO { run Bytes.append(&mut output, b",") }
+    run Bytes.append(&mut output, b"~{memory}")
+  }
+  return move output
+}
+
+/// The call-site memory attribute for one admitted contract. Observable machine effects use
+/// LLVM's inaccessible-memory location even when the fragment accesses no data.
+pub fn effects(access: Memory, sideEffects: bool) -> &'static [u8] {
+  return match access {
+    Memory.None => {
+      if sideEffects { return b"memory(inaccessiblemem: readwrite)" }
+      return b"memory(none)"
+    }
+    Memory.Read => {
+      if sideEffects { return b"memory(read, inaccessiblemem: readwrite, target_mem0: none, target_mem1: none)" }
+      return b"memory(read, target_mem0: none, target_mem1: none)"
+    }
+    Memory.Write => b"memory(write, inaccessiblemem: readwrite, target_mem0: none, target_mem1: none)"
+    Memory.ReadWrite => b"memory(readwrite, target_mem0: none, target_mem1: none)"
+  }
+}
+
+// Claims the register `text[start..end]`, failing when it is already claimed.
+effect fn occupy(occupied: &mut Vector<Bytes>, text: &[u8], start: usize, end: usize) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  let claimed = Vector.asSlice<Bytes>(&occupied.*)
+  let mut at = usize.ZERO
+  while at < claimed.length {
+    if sameRange(text, start, end, Bytes.asSlice(&claimed[at])) { return false }
+    at = at + usize.ONE
+  }
+  let mut name = Bytes.make()
+  run appendRange(&mut name, text, start, end)
+  run Vector.append<Bytes>(&mut occupied.*, move name)
+  return true
+}
+
+// Whether `text[start..end]` is `{...}` with at least one character inside.
+fn braced(text: &[u8], start: usize, end: usize) -> bool {
+  return end >= start + 3 && text[start] == 123 && text[end - usize.ONE] == 125
+}
+
+// Whether `text[start..end]` names an admitted general register of `target`.
+fn register(target: TargetId, text: &[u8], start: usize, end: usize) -> bool {
+  if target == TargetId.X8664UnknownLinuxGnu {
+    return sameRange(text, start, end, b"rax") || sameRange(text, start, end, b"rdi") ||
+      sameRange(text, start, end, b"rsi") || sameRange(text, start, end, b"rdx") ||
+      sameRange(text, start, end, b"rcx") || sameRange(text, start, end, b"r8") ||
+      sameRange(text, start, end, b"r9") || sameRange(text, start, end, b"r10") ||
+      sameRange(text, start, end, b"r11")
+  }
+  // ARM64 admits x0 through x17.
+  if end <= start + usize.ONE || end > start + 3 || text[start] != 120 { return false }
+  let mut value = usize.ZERO
+  let mut at = start + usize.ONE
+  while at < end {
+    if text[at] < 48 || text[at] > 57 { return false }
+    value = value * 10 + u8.toUsize(text[at] - 48)
+    at = at + usize.ONE
+  }
+  if end == start + 3 && text[start + usize.ONE] == 48 { return false }
+  return value <= 17
+}
+
+// Printable ASCII plus tab, newline and carriage return, with no module directive.
+fn templateText(template: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  // Whether only whitespace has followed the template start or a `\n` or `;` separator.
+  let mut statementStart = true
+  while at < template.length {
+    let byte = template[at]
+    if byte != 9 && byte != 10 && byte != 13 && (byte < 32 || byte > 126) { return false }
+    if statementStart && byte == 46 && at + usize.ONE < template.length && identifierStart(template[at + usize.ONE]) {
+      let mut end = at + 2
+      while end < template.length && identifierPart(template[end]) { end = end + usize.ONE }
+      // A local label such as `.Lretry:` is not a directive.
+      if end >= template.length || template[end] != 58 { return false }
+    }
+    if byte == 10 || byte == 59 {
+      statementStart = true
+    } else if !whitespace(byte) {
+      statementStart = false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Every `$n` names an existing operand; `$$` is a literal dollar.
+fn references(template: &[u8], parts: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < template.length {
+    if template[at] == 36 {
+      if at + usize.ONE < template.length && template[at + usize.ONE] == 36 {
+        at = at + 2
+      } else {
+        let start = at + usize.ONE
+        let mut end = start
+        while end < template.length && template[end] >= 48 && template[end] <= 57 { end = end + usize.ONE }
+        if end == start { return false }
+        if end > start + usize.ONE && template[start] == 48 { return false }
+        let mut value = usize.ZERO
+        let mut digit = start
+        while digit < end {
+          value = value * 10 + u8.toUsize(template[digit] - 48)
+          if value >= parts { return false }
+          digit = digit + usize.ONE
+        }
+        at = end
+      }
+    } else {
+      at = at + usize.ONE
+    }
+  }
+  return true
+}
+
+// The number of comma-separated parts; empty text has none.
+fn partCount(text: &[u8]) -> usize {
+  if text.length == usize.ZERO { return usize.ZERO }
+  let mut count = usize.ONE
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == 44 { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+// The end of the comma-separated part that begins at `start`.
+fn partEnd(text: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < text.length && text[at] != 44 { at = at + usize.ONE }
+  return at
+}
+
+fn identifierStart(byte: u8) -> bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+
+fn identifierPart(byte: u8) -> bool {
+  return identifierStart(byte) || (byte >= 48 && byte <= 57)
+}
+
+fn whitespace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13
+}
+
+effect fn appendRange(output: &mut Bytes, text: &[u8], start: usize, end: usize) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let mut at = start
+  while at < end {
+    run Bytes.append(&mut output.*, &[text[at]])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether `text[start..end]` spells `wanted`.
+fn sameRange(text: &[u8], start: usize, end: usize, wanted: &[u8]) -> bool {
+  if end - start != wanted.length { return false }
+  let mut at = usize.ZERO
+  while at < wanted.length {
+    if text[start + at] != wanted[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
