@@ -260,11 +260,11 @@ Each entry records:
 - **Source migration:** none. `silk.reflect` keeps its source wrappers; selfhost checks
   `Reflect.typeOf` and `Reflect.typeKind` and leaves the others unchecked until demanded.
 - **Diagnostics and limits:** in selfhost, a reflection call outside static evaluation, a runtime
-  signature mentioning `Intrinsic.Type<Owner>`, and a descriptor reaching runtime code through a
-  selection pass are `StaticPhaseViolation`. A non-aggregate or occurrence-generated owner is an
-  `Unsupported` static evaluation failure for a missing intrinsic operation, reported as
-  `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An unlisted reflection
-  member remains `UnknownMember`.
+  signature mentioning `Intrinsic.Type<Owner>` (anchored at that authored type), and a descriptor
+  reaching runtime code through a selection pass are `StaticPhaseViolation`. A non-aggregate or
+  occurrence-generated owner is an `Unsupported` static evaluation failure for a missing intrinsic
+  operation, reported as `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An
+  unlisted reflection member remains `UnknownMember`.
 - **Evidence:** in `compiler/src/semantic/SemanticStaticCases.silk`,
   `selectedTypeSelectionReadsReflectedKinds` covers the two-type static selection,
   `reflectedKindCodesMatchTheLibrary` covers both kind codes and the unsupported owner, and
