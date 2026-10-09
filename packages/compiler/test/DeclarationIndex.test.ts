@@ -1407,6 +1407,20 @@ it.effect('diagnoses private exposure and inline recursive struct components can
       ['Hidden', 'Hidden', 'Hidden'],
     )
 
+    const requiredSource =
+      'service Clock { effect fn now() -> i32 ? &Clock }\n' +
+      'pub effect fn read() -> i32 ? &Clock { return 0 }\n' +
+      'effect fn quiet() -> i32 ? &Clock { return 0 }'
+    const required = yield* collect('required', [['required', requiredSource]])
+    assert.deepEqual(
+      required.published.map((diagnostic) => [
+        diagnostic.code,
+        requiredSource.slice(diagnostic.span.start, diagnostic.span.end),
+        diagnostic.span.start,
+      ]),
+      [['SEM0019', 'Clock', requiredSource.indexOf('&Clock', requiredSource.indexOf('pub effect')) + 1]],
+    )
+
     const exposedUnion = yield* collect('union-exposure', [
       [
         'union-exposure',
