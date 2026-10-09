@@ -1479,8 +1479,8 @@ repeated invocation and capture-only drop glue.
   this correction does not change them. General borrow safety remains Step 14.
 - **Boundary:** anonymous invocation schemas retain their original lifetime-to-declaration map.
   Ordinary named sections now use that same map when still-unsupplied operands can infer the
-  invocation lifetime, including staged sections and independent caller loans. Effect-valued
-  targets with deferred invocation lifetimes retain their separate source-recipe boundary; generic
+  invocation lifetime, including staged sections and independent caller loans. An `effect fn`
+  target, whose invocation constructs its Effect, defers its lifetime binders the same way; generic
   requirement rows now defer through the upstream Step 10 section recipe. The guard
   inspects substituted result representations, union members, and target/caller contract premises;
   an Effect hidden behind a generic result cannot enter the ordinary section lane. Explicitly
@@ -1544,8 +1544,8 @@ repeated invocation and capture-only drop glue.
   evidence, actual schema and capture storage remain unchanged. Fixed lifetimes, mode, unsafe
   authority, exclusive content and callable environments retain ordinary contract proof. Nested
   invocation quantifiers and deferred type/row bindings embedding private rigids retain explicit
-  `Unsupported` boundaries; explicitly quantified public section contracts and Effect-valued
-  lifetime deferral remain separate gaps.
+  `Unsupported` boundaries; explicitly quantified public section contracts and a section whose
+  result is itself an Effect value remain separate gaps.
 - **Quantified structural controls:** `quantifiedNamedCallbacksRetainTheirInvocationRecipes` in
   `CallableResultCases` demands concrete consumers and original callbacks, checks two independent
   invocation loans, original lifetime slots 0 and 1, and staged capture inputs/projections.
