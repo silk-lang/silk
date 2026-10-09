@@ -1,5 +1,6 @@
 import * as EffectExecutionContract from './internal/EffectExecutionContract.js'
 import * as Data from 'effect/Data'
+import * as ConformanceProof from './ConformanceProof.js'
 import { generated, indexExits, initializationFlagsOf } from './CleanupEmission.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
@@ -12,7 +13,7 @@ import * as Tir from './Tir.js'
 import * as Instances from './Instances.js'
 import * as TypeInference from './internal/TypeInference.js'
 import type * as Layout from './Layout.js'
-import type { ExecutableEffectType } from './Lower.js'
+import type { ExecutableEffectType, ProvidedRequirement } from './Lower.js'
 import { i32, local, mirType, patternKey } from './Lower.js'
 import type {} from './LowerExpression.js'
 import { lowerExpressionInner } from './LowerExpression.js'
@@ -617,6 +618,36 @@ const effectCaptureParameterTypes = (
     ]
   })
 
+// Generated runners share one physical body across callers whose proven providers differ only in
+// proof-only lifetimes. The body was checked in its owner instance, so it lowers against the
+// owner's own selection of each source provider; the runner's provider contract keeps the
+// caller's proof, which matches it at runtime.
+const ownerRequirement = (
+  index: DeclarationIndex.Index,
+  calls: ReadonlyArray<Instances.CallInstance>,
+  owner: Instances.InstanceKey,
+  requirement: ProvidedRequirement,
+): ProvidedRequirement => {
+  if (requirement.witness._tag !== 'SourceConformanceWitness') return requirement
+  const ownerKey = Instances.keyText(owner)
+  const runtimeProvider = Type.runtimeKey(requirement.providerType)
+  const selected = calls
+    .filter((call) => Instances.keyText(call.owner) === ownerKey)
+    .flatMap((call) => call.providers ?? [])
+    .find(
+      (provider) =>
+        provider.role === requirement.role &&
+        Type.equals(provider.capability, requirement.capability) &&
+        Type.runtimeKey(provider.providerType) === runtimeProvider,
+    )
+  if (selected === undefined || Type.equals(selected.providerType, requirement.providerType))
+    return requirement
+  const witness = ConformanceProof.witness(index, selected.providerType, requirement.capability)
+  return witness?._tag === 'SourceConformanceWitness'
+    ? { ...requirement, providerType: selected.providerType, witness }
+    : requirement
+}
+
 export const lowerEffectRunner = (
   spec: GeneratedBlockEffectRunner,
   ownership: Ownership.ModuleOwnership | undefined,
@@ -683,7 +714,7 @@ export const lowerEffectRunner = (
     spec.providedRequirements.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
-        ...requirement,
+        ...ownerRequirement(index, calls, spec.owner.key, requirement),
         ...(ordinal < 0 ? {} : { local: local(captureParameterTypes.length + ordinal) }),
       }
     }),
@@ -805,7 +836,7 @@ export const lowerCatchEffectRunner = (
     spec.providedRequirements.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
-        ...requirement,
+        ...ownerRequirement(index, calls, spec.owner.key, requirement),
         ...(ordinal < 0 ? {} : { local: local(captureParameterTypes.length + ordinal) }),
       }
     }),
@@ -918,7 +949,7 @@ export const lowerBuiltinEffectRunner = (
     spec.providedRequirements.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
-        ...requirement,
+        ...ownerRequirement(index, calls, spec.owner.key, requirement),
         ...(ordinal < 0 ? {} : { local: local(parameterTypes.length + ordinal) }),
       }
     }),
@@ -1043,7 +1074,7 @@ export const lowerWitnessEffectRunner = (
     spec.providedRequirements.map((requirement) => {
       const ordinal = parameterizedRequirements.indexOf(requirement)
       return {
-        ...requirement,
+        ...ownerRequirement(index, calls, spec.owner.key, requirement),
         ...(ordinal < 0 ? {} : { local: local(parameterTypes.length + ordinal) }),
       }
     }),
