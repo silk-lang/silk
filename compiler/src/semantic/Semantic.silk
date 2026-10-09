@@ -26,6 +26,7 @@ import hir.Hir {
 }
 import backend.CAbi
 import backend.CleanupNeeds {CleanupNeeds}
+import backend.Coroutine {Facts as CoroutineFacts}
 import backend.RuntimeType
 import backend.UnionProjection
 import backend.RuntimeType {Projection as RuntimeProjection}
@@ -82,6 +83,8 @@ import backend.Mir {
   CarrierPlan as MirCarrierPlan,
   WitnessIntrinsic as MirWitnessIntrinsic,
   Block as MirBlock,
+  Callee as MirCallee,
+  Terminator as MirTerminator,
   Local as MirLocal,
   MirFunction,
   Operand as MirOperand,
@@ -137,6 +140,7 @@ import semantic.Intrinsic {
 }
 import semantic.ScalarOperation {ScalarOperation}
 import semantic.Lifetime {CanonicalizationFailure, Intersection, Lifetime, Member as LifetimeMember}
+import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ParameterSchema {ParameterSchema}
 import semantic.TargetSchema {
@@ -1343,6 +1347,8 @@ struct Resolver {
   target: MachineTarget
   initialProfile: Option<FinalProfile>
   assemblyFacts: Option<InitialProfile>
+  /// The composition's execution-storage component, which suspendable frames use (SUSP-005).
+  executionStorage: Option<ExecutionStorage>
   profiles: Vector<FinalProfile>
   profileSlot: usize
   mirValues: Vector<MirFunction>
@@ -3513,26 +3519,57 @@ effect fn internLayoutType(resolver: &mut Resolver, ty: &Shared<Type>) -> usize
 }
 
 // One backend query subject: an instance, lowered for a program that does or does not observe
-// diagnostics (failure observer note N1). The program mode is not part of the instance's identity.
+// diagnostics (failure observer note N1), and emitted with its suspension facts when it is
+// suspendable. Neither the program mode nor the facts are part of the instance's identity; MIR is
+// lowered once per mode and shared by every suspension variant.
 struct BackendInstance {
   key: InstanceKey
   observing: bool
+  suspension: Option<CoroutineFacts>
+}
+
+effect fn sameSuspension(left: &Option<CoroutineFacts>, right: &Option<CoroutineFacts>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<CoroutineFacts>.Some {value: first} = &left.* {
+    if let Option<CoroutineFacts>.Some {value: second} = &right.* { return run CoroutineFacts.equals(&first, &second) }
+    return false
+  }
+  return match &right.* {
+    Option<CoroutineFacts>.Some {..} => false
+    Option<CoroutineFacts>.None => true
+  }
+}
+
+effect fn copySuspension(value: &Option<CoroutineFacts>) -> Option<CoroutineFacts> ! OutOfMemoryError ? &mut Allocator {
+  if let Option<CoroutineFacts>.Some {value: facts} = &value.* {
+    return Option.some<CoroutineFacts>(run CoroutineFacts.copy(&facts))
+  }
+  return Option.none<CoroutineFacts>()
 }
 
 effect fn internBackendInstance(resolver: &mut Resolver, instance: &InstanceKey, observing: bool) -> usize
+! OutOfMemoryError
+? &mut Allocator {
+  return run internBackendVariant(&mut resolver.*, instance, observing, &Option.none<CoroutineFacts>())
+}
+
+effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, observing: bool,
+  suspension: &Option<CoroutineFacts>) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
   let hashed = InstanceKey.runtimeHash(instance)
   let known = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
-    if known[at].observing == observing && run InstanceKey.sameApplication(&known[at].key, instance) {
+    let sameVariant = run sameSuspension(&known[at].suspension, suspension)
+    if sameVariant && known[at].observing == observing && run InstanceKey.sameApplication(&known[at].key, instance) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
-  run Vector.append<BackendInstance>(&mut resolver.*.backendInstances, BackendInstance {key: InstanceKey.copy(instance), observing: observing})
+  run Vector.append<BackendInstance>(&mut resolver.*.backendInstances,
+    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension)})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
 }
@@ -8868,6 +8905,10 @@ effect fn addOpaqueBound(
   if let Option<Shared<Type>>.Some {..} = &collected.contract {
     return Option.some<Shared<Rejection>>(run invalidOpaqueResult(&resolver.*, module, span))
   }
+  // The bound is a contract of its own rather than part of the output it sits in, so an omitted
+  // lifetime elides like a generic bound's: a fresh producer binder, not the result default.
+  let output = elision.output
+  elision.output = false
   let resolved = run resolveType(
     &mut resolver.*,
     &mut owner.*,
@@ -8877,6 +8918,7 @@ effect fn addOpaqueBound(
     binders,
     &mut elision.*,
   )
+  elision.output = output
   let selected = match move resolved {
     Result<Shared<Type>, Shared<Rejection>>.Success {value: selected} => move selected
     Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
@@ -50299,6 +50341,8 @@ struct EmissionInputs {
   /// input only.
   encoding: Bytes
   identities: Vector<InstanceIdentity>
+  /// The facts of a suspendable instance, which make its definition a coroutine.
+  suspension: Option<CoroutineFacts>
 }
 
 // Content subjects retain the latest validated preparation. Successful text answers are immutable;
@@ -50535,6 +50579,7 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
       Vector.asSlice<TypeLayout>(&input.layouts),
       Vector.asSlice<CAbi.Signature>(&input.foreign),
       Vector.asSlice<InstanceIdentity>(&input.identities),
+      &input.suspension,
     ),
   )
   let text = match move emitted {
@@ -50622,6 +50667,11 @@ effect fn resolveEmissionInputs(
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let module = run resolvedModule(&resolver.*, key.module)
   let mut dependencies = Vector.make<Dependency>()
+  let variants = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
+  let variantKey = InstanceKey.copy(&variants[key.name].key)
+  let variantObserving = variants[key.name].observing
+  let suspension = run copySuspension(&variants[key.name].suspension)
+  let lowered = run internBackendInstance(&mut resolver.*, &variantKey, variantObserving)
   let mir = run demandChild(
     &mut resolver.*,
     &mut owner.*,
@@ -50629,7 +50679,7 @@ effect fn resolveEmissionInputs(
     Key {
       family: Family.Mir,
       module: key.module,
-      name: key.name,
+      name: lowered,
       declaration: key.declaration,
       member: key.member,
       external: false,
@@ -50817,6 +50867,7 @@ effect fn resolveEmissionInputs(
     Vector.asSlice<CAbi.Signature>(&foreign),
     Bytes.asSlice(&signatures),
     Vector.asSlice<Bytes>(&encoded),
+    &suspension,
   )
   let encodedSlice = Vector.asSlice<Bytes>(&encoded)
   let own = run Bytes.copy(Bytes.asSlice(&encodedSlice[usize.ZERO]))
@@ -50829,6 +50880,7 @@ effect fn resolveEmissionInputs(
       llvm: usize.MAX,
       encoding: move own,
       identities: move identities,
+      suspension: move suspension,
     },
   )
   let llvm = run internLlvmInput(
@@ -56835,6 +56887,7 @@ impl Semantic {
         target: selectedTarget,
         initialProfile: move profile,
         assemblyFacts: Option.none<InitialProfile>(),
+        executionStorage: Option.none<ExecutionStorage>(),
         profiles: Vector.make<FinalProfile>(),
         profileSlot: profileSlot,
         mirValues: Vector.make<MirFunction>(),
@@ -56873,6 +56926,10 @@ impl Semantic {
   ///
   /// # Details
   ///
+  /// Selects the execution-storage component a build binds when a reached instance suspends.
+  pub fn selectExecutionStorage(self: &mut Self, storage: ExecutionStorage) -> () {
+    self.resolver.executionStorage = Option.some<ExecutionStorage>(move storage)
+  }
   /// Exact source observations keep unchanged answers reusable. A checked body can keep its typed
   /// payload across another declaration's edit after its own inputs and child results validate.
   /// Changed source positions or incomplete evidence force a new body check.
@@ -58485,7 +58542,8 @@ impl Semantic {
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
     }
-    return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&roots), selected.span, closureNodes, false)
+    return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&roots), selected.span, closureNodes, false,
+      &Option.none<FrameSelection>())
   }
   /// Builds an artifact whose roots are the active C exports of the selected runtime source. The
   /// request's application module is what `import Intrinsic.application` binds inside it.
@@ -58514,7 +58572,8 @@ impl Semantic {
     if Vector.length<BuildRoot>(&roots) == usize.ZERO {
       return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.UnknownName, origin))
     }
-    return run Semantic.buildFrom(&mut self.*, runtime, Vector.asSlice<BuildRoot>(&roots), origin, closureNodes, false)
+    return run Semantic.buildFrom(&mut self.*, runtime, Vector.asSlice<BuildRoot>(&roots), origin, closureNodes, false,
+      &Option.none<FrameSelection>())
   }
   // Roots every active C export `module` declares. Signature gaps are collected beside the roots;
   // any other refusal is returned.
@@ -58569,9 +58628,11 @@ impl Semantic {
     return Option.none<Shared<Rejection>>()
   }
   // Walks the instance graph from the roots. A program that runs any `observeDiagnostics` scope is
-  // walked again with every function observing diagnostics (failure observer note N1).
+  // walked again with every function observing diagnostics (failure observer note N1). A program
+  // that reaches a suspension boundary is walked again with its closed suspendable set and the
+  // selected execution-storage exports as further roots (SUSP private lowering model).
   effect fn buildFrom(self: &mut Self, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, closureNodes: usize,
-    observing: bool) -> BackendBuild
+    observing: bool, frames: &Option<FrameSelection>) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator {
     let mut pending = Vector.make<BackendVisit>()
@@ -58591,6 +58652,7 @@ impl Semantic {
       )
     }
     let mut observes = false
+    let mut summaries = Vector.make<SuspensionSummary>()
     let mut admission = Admission.make()
     // Applications admitted by a finite closure certificate during this build.
     let mut certified = Vector.make<Application>()
@@ -58736,7 +58798,32 @@ impl Semantic {
         }
       }
       let member = instanceMember(&instance)
-      let backendName = run internBackendInstance(&mut self.resolver, &instance, observing)
+      // MIR is lowered once per mode; a suspendable instance's emission adds its frame facts.
+      let lowered = run internBackendInstance(&mut self.resolver, &instance, observing)
+      let mir = run demandRaw(
+        &mut self.resolver,
+        &mut self.query,
+        Key {
+          family: Family.Mir,
+          module: location.module,
+          name: lowered,
+          declaration: location.declaration,
+          member: member,
+          external: false,
+        },
+        Span.make(usize.ZERO, usize.ZERO),
+      )
+      let mirIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&mir, answerMirIndex)
+      let mut suspension = Option.none<CoroutineFacts>()
+      if let Option<FrameSelection>.Some {value: selection} = &frames.* {
+        if let Option<usize>.Some {value: loweredIndex} = &mirIndex {
+          if run FrameSelection.contains(&selection, &instance) {
+            let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
+            suspension = Option.some<CoroutineFacts>(run FrameSelection.facts(&selection, &functions[loweredIndex]))
+          }
+        }
+      }
+      let backendName = run internBackendVariant(&mut self.resolver, &instance, observing, &suspension)
       let key = Key {
         family: Family.EmissionInputs,
         module: location.module,
@@ -58794,30 +58881,12 @@ impl Semantic {
           CollectedText {key: InstanceKey.copy(&instance), index: value},
         )
       }
-      let mir = run demandRaw(
-        &mut self.resolver,
-        &mut self.query,
-        Key {
-          family: Family.Mir,
-          module: location.module,
-          name: backendName,
-          declaration: location.declaration,
-          member: member,
-          external: false,
-        },
-        Span.make(usize.ZERO, usize.ZERO),
-      )
-      let mirIndex = Shared.with<Result<Answer, NoRejection>, Option<usize>>(&mir, answerMirIndex)
       if let Option<usize>.Some {value: selectedMir} = move mirIndex {
         let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
         if functions[selectedMir].observes { observes = true }
-        // A reached suspension origin needs the suspension trampoline, which this backend lacks.
-        if let Option<BodyOrigin>.Some {value: boundary} = &functions[selectedMir].suspension {
-          let identity = InstanceKey.identity(&instance)
-          run Vector.append<Shared<BackendGap>>(&mut gaps,
-            run Shared.make<BackendGap>(BackendGap.make(GapCode.Suspension, &identity, boundary.span)))
-        }
         let callerModule = run resolvedModule(&self.resolver, location.module)
+        run Vector.append<SuspensionSummary>(&mut summaries,
+          run SuspensionSummary.make(&functions[selectedMir], &instance, &callerModule))
         // Drop glue passes its root on to the child glue and Drop hook it reaches; a function's
         // own references start outside any cleanup.
         let mut passed = Option.none<Shared<Type>>()
@@ -58859,10 +58928,72 @@ impl Semantic {
       return BackendBuild.Rejected {first: move first, further: move refusals, gaps: move gaps}
     }
     if observes && !observing {
-      return run Semantic.buildFrom(&mut self.*, module, roots, entrySpan, closureNodes, true)
+      return run Semantic.buildFrom(&mut self.*, module, roots, entrySpan, closureNodes, true, frames)
     }
     if Vector.length<Shared<BackendGap>>(&gaps) > usize.ZERO {
       return BackendBuild.Unsupported {gaps: move gaps}
+    }
+    let selecting = match &frames.* {
+      Option<FrameSelection>.Some {..} => false
+      Option<FrameSelection>.None => true
+    }
+    if selecting {
+      let reached = Vector.asSlice<SuspensionSummary>(&summaries)
+      let suspendable = run closeSuspendable(reached)
+      let marked = Vector.asSlice<bool>(&suspendable)
+      let mut first = usize.MAX
+      let mut at = usize.ZERO
+      while at < marked.length && first == usize.MAX {
+        if marked[at] { first = at }
+        at = at + usize.ONE
+      }
+      if first != usize.MAX {
+        let mut origin = first
+        at = usize.ZERO
+        while at < reached.length {
+          if let Option<Span>.Some {..} = &reached[at].boundary {
+            origin = at
+            break
+          }
+          at = at + usize.ONE
+        }
+        let boundary = match &reached[origin].boundary {
+          Option<Span>.Some {value} => value
+          Option<Span>.None => entrySpan
+        }
+        let storage = match &self.resolver.executionStorage {
+          Option<ExecutionStorage>.Some {value} => run ExecutionStorage.copy(&value)
+          Option<ExecutionStorage>.None => {
+            return refusedBuild(run reject(&self.resolver, &reached[origin].module, RejectionCode.InvalidConfiguration, boundary))
+          }
+        }
+        let mut selection = FrameSelection.make()
+        at = usize.ZERO
+        while at < marked.length {
+          if marked[at] { run FrameSelection.include(&mut selection, &reached[at].key) }
+          at = at + usize.ONE
+        }
+        let mut extended = Vector.make<BuildRoot>()
+        at = usize.ZERO
+        while at < roots.length {
+          run Vector.append<BuildRoot>(&mut extended, BuildRoot {key: InstanceKey.copy(&roots[at].key), span: roots[at].span})
+          at = at + usize.ONE
+        }
+        let exports = run storageExports(&mut self.resolver, &mut self.query, &storage)
+        if Vector.length<StorageExport>(&exports) != 4 {
+          return refusedBuild(run reject(&self.resolver, &reached[origin].module, RejectionCode.InvalidConfiguration, boundary))
+        }
+        let selected = Vector.asSlice<StorageExport>(&exports)
+        at = usize.ZERO
+        while at < selected.length {
+          run FrameSelection.bind(&mut selection, run Bytes.copy(Bytes.asSlice(&selected[at].symbol)))
+          run Vector.append<BuildRoot>(&mut extended, BuildRoot {key: InstanceKey.copy(&selected[at].key), span: boundary})
+          at = at + usize.ONE
+        }
+        let chosen = Option.some<FrameSelection>(move selection)
+        return run Semantic.buildFrom(&mut self.*, module, Vector.asSlice<BuildRoot>(&extended), entrySpan, closureNodes,
+          observing, &chosen)
+      }
     }
     return run assembleEmission(
       &self.resolver,
@@ -59308,6 +59439,227 @@ union BackendVisit {
 struct BuildRoot {
   key: InstanceKey
   span: Span
+}
+
+// One reached instance's suspension summary: the boundary it runs, if any, and its direct Silk
+// callees.
+struct SuspensionSummary {
+  key: InstanceKey
+  module: ModuleId
+  boundary: Option<Span>
+  callees: Vector<InstanceKey>
+}
+
+impl SuspensionSummary {
+  effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId) -> SuspensionSummary
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut callees = Vector.make<InstanceKey>()
+    let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+    let mut at = usize.ZERO
+    while at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+        run Vector.append<InstanceKey>(&mut callees, InstanceKey.copy(&key))
+      }
+      at = at + usize.ONE
+    }
+    let mut boundary = Option.none<Span>()
+    if let Option<BodyOrigin>.Some {value: origin} = &function.suspension { boundary = Option.some<Span>(origin.span) }
+    return SuspensionSummary {
+      key: InstanceKey.copy(instance),
+      module: run ModuleId.copy(module),
+      boundary: move boundary,
+      callees: move callees,
+    }
+  }
+}
+
+// Marks the reached instances that can suspend: each one that runs a boundary, then each one
+// that calls a marked instance directly, to a fixed point. Fixed-linkage shims are never marked;
+// they call a suspendable instance's ordinary symbol, which drives its frames.
+effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut lookup = InternIndex.make()
+  let mut marked = Vector.make<bool>()
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&summaries[at].key))
+    let origin = match &summaries[at].boundary {
+      Option<Span>.Some {..} => true
+      Option<Span>.None => false
+    }
+    run Vector.append<bool>(&mut marked, origin && !InstanceKey.fixedLinkage(&summaries[at].key))
+    at = at + usize.ONE
+  }
+  // Each summary's callees as summary positions.
+  let mut edges = Vector.make<Vector<usize>>()
+  at = usize.ZERO
+  while at < summaries.length {
+    let mut targets = Vector.make<usize>()
+    let callees = Vector.asSlice<InstanceKey>(&summaries[at].callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
+      while found != usize.MAX {
+        if run InstanceKey.sameApplication(&summaries[found].key, &callees[callee]) {
+          run Vector.append<usize>(&mut targets, found)
+          break
+        }
+        found = InternIndex.after(&lookup, found)
+      }
+      callee = callee + usize.ONE
+    }
+    run Vector.append<Vector<usize>>(&mut edges, move targets)
+    at = at + usize.ONE
+  }
+  let following = Vector.asSlice<Vector<usize>>(&edges)
+  let mut changed = true
+  while changed {
+    changed = false
+    at = usize.ZERO
+    while at < summaries.length {
+      let current = Vector.asSlice<bool>(&marked)
+      if !current[at] && !InstanceKey.fixedLinkage(&summaries[at].key) {
+        let targets = Vector.asSlice<usize>(&following[at])
+        let mut edge = usize.ZERO
+        let mut reaches = false
+        while edge < targets.length {
+          if current[targets[edge]] { reaches = true }
+          edge = edge + usize.ONE
+        }
+        if reaches {
+          let updated = Vector.asMutSlice<bool>(&mut marked)
+          updated[at] = true
+          changed = true
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move marked
+}
+
+// The closed suspendable set of one build and the storage export symbols its frames use.
+struct FrameSelection {
+  suspendable: Vector<InstanceKey>
+  lookup: InternIndex
+  symbols: Vector<Bytes>
+}
+
+impl FrameSelection {
+  fn make() -> FrameSelection {
+    return FrameSelection {suspendable: Vector.make<InstanceKey>(), lookup: InternIndex.make(), symbols: Vector.make<Bytes>()}
+  }
+
+  effect fn include(self: &mut Self, key: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Vector.append<InstanceKey>(&mut self.suspendable, InstanceKey.copy(key))
+    run InternIndex.record(&mut self.lookup, InstanceKey.runtimeHash(key))
+  }
+
+  // Binds the next operation in create, acquire, release, destroy order.
+  effect fn bind(self: &mut Self, symbol: Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Vector.append<Bytes>(&mut self.symbols, move symbol)
+  }
+
+  effect fn contains(self: &Self, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let listed = Vector.asSlice<InstanceKey>(&self.suspendable)
+    let mut at = InternIndex.first(&self.lookup, InstanceKey.runtimeHash(key))
+    while at != usize.MAX {
+      if run InstanceKey.sameApplication(&listed[at], key) { return true }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    return false
+  }
+
+  // The emission facts of one suspendable instance: its suspendable direct callees in first-call
+  // order and the storage symbols.
+  effect fn facts(self: &Self, function: &MirFunction) -> CoroutineFacts ! OutOfMemoryError ? &mut Allocator {
+    let mut callees = Vector.make<InstanceKey>()
+    let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+    let mut at = usize.ZERO
+    while at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+        if run FrameSelection.contains(self, &key) {
+          let listed = Vector.asSlice<InstanceKey>(&callees)
+          let mut seen = false
+          let mut prior = usize.ZERO
+          while prior < listed.length && !seen {
+            seen = run InstanceKey.sameApplication(&listed[prior], &key)
+            prior = prior + usize.ONE
+          }
+          if !seen { run Vector.append<InstanceKey>(&mut callees, InstanceKey.copy(&key)) }
+        }
+      }
+      at = at + usize.ONE
+    }
+    let symbols = Vector.asSlice<Bytes>(&self.symbols)
+    return CoroutineFacts {
+      callees: move callees,
+      create: run Bytes.copy(Bytes.asSlice(&symbols[usize.ZERO])),
+      acquire: run Bytes.copy(Bytes.asSlice(&symbols[usize.ONE])),
+      release: run Bytes.copy(Bytes.asSlice(&symbols[2])),
+      destroy: run Bytes.copy(Bytes.asSlice(&symbols[3])),
+    }
+  }
+}
+
+// One selected storage operation's export root and its symbol.
+struct StorageExport {
+  key: InstanceKey
+  symbol: Bytes
+}
+
+// The exports of the four storage operations in create, acquire, release, destroy order, stopping
+// at the first binding that names no active C export.
+effect fn storageExports(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, storage: &ExecutionStorage)
+  -> Vector<StorageExport>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut found = Vector.make<StorageExport>()
+  let created = run storageExport(&mut resolver.*, &mut query.*, &storage.create)
+  if let Option<StorageExport>.Some {value} = move created { run Vector.append<StorageExport>(&mut found, move value) }
+  else { return move found }
+  let acquired = run storageExport(&mut resolver.*, &mut query.*, &storage.acquire)
+  if let Option<StorageExport>.Some {value} = move acquired { run Vector.append<StorageExport>(&mut found, move value) }
+  else { return move found }
+  let released = run storageExport(&mut resolver.*, &mut query.*, &storage.release)
+  if let Option<StorageExport>.Some {value} = move released { run Vector.append<StorageExport>(&mut found, move value) }
+  else { return move found }
+  let destroyed = run storageExport(&mut resolver.*, &mut query.*, &storage.destroy)
+  if let Option<StorageExport>.Some {value} = move destroyed { run Vector.append<StorageExport>(&mut found, move value) }
+  return move found
+}
+
+// Finds the active C export a storage binding names, without recognizing its module or name.
+effect fn storageExport(resolver: &mut Resolver, query: &mut Query<Word, Answer, NoRejection>, binding: &StorageBinding)
+  -> Option<StorageExport>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let exported = run exportCandidates(&mut resolver.*, &binding.module)
+  let listed = match move exported {
+    Option<Vector<ExportCandidate>>.Some {value} => move value
+    Option<Vector<ExportCandidate>>.None => { return Option.none<StorageExport>() }
+  }
+  let candidates = Vector.asSlice<ExportCandidate>(&listed)
+  let mut conditions = Vector.make<Dependency>()
+  let mut at = usize.ZERO
+  while at < candidates.length {
+    let candidate = &candidates[at]
+    at = at + usize.ONE
+    if !same(Bytes.asSlice(&candidate.name), Bytes.asSlice(&binding.declaration)) { continue }
+    let active = run available(&mut resolver.*, &mut query.*, &mut conditions, &binding.module, candidate.declaration, candidate.span)
+    let present = match move active {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {..} => false
+    }
+    if !present { continue }
+    let declared = run declarationAt(&mut resolver.*, &binding.module, candidate.declaration)
+    if let Option<DeclarationId>.Some {value} = move declared {
+      let function = run Shared.make<DeclarationId>(move value)
+      let symbol = run Shared.make<Bytes>(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
+      return Option.some<StorageExport>(StorageExport {
+        key: InstanceKey.Export {function: move function, symbol: move symbol},
+        symbol: run Bytes.copy(Bytes.asSlice(&candidate.symbol)),
+      })
+    }
+  }
+  return Option.none<StorageExport>()
 }
 
 // One module-level C export a runtime source declares, before its arms are evaluated.
