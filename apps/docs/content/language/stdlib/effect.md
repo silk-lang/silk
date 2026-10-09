@@ -566,7 +566,7 @@ raw-identifier form, so the declaration itself could not be spelled `if`.
 ### Associated function `Effect.retry`
 
 ```silk
-pub effect<'env> fn retry<'env, A, E, ?R>(self: mut Effect<'env; A ! E ? R>, retries: usize) -> A ! E ? R
+pub effect<'env> fn retry<'env, A, E, ?R>(mut self: mut Effect<'env; A ! E ? R>, retries: usize) -> A ! E ? R
 ```
 
 Runs a reusable Effect once, then repeats it after typed failure up to `retries` more times.

@@ -83,6 +83,7 @@ import {
   constructionExpressionAnchor,
   constructionExpressionType,
   expressionNode,
+  immutableRoot,
   lookupDeclaration,
   lookupParameter,
   referenceNames,
@@ -4794,6 +4795,7 @@ import {
   boundOperationReference,
   builtinSignature,
   instantiateBuiltinSignature,
+  selectedLifetimeBoundDiagnostics,
   callArityDiagnostic,
   captureAccess,
   copyAssumptionsOf,
@@ -6020,6 +6022,19 @@ export function analyzeBuiltinCall(
               resolution,
             ).type,
         )
+  // A builtin's stored inputs must outlive the region its result retains them for.
+  const outlivesDiagnostics =
+    signature === undefined ||
+    specializationDiagnostic !== undefined ||
+    inferenceDiagnostic !== undefined
+      ? []
+      : selectedLifetimeBoundDiagnostics(
+          [],
+          substitution,
+          resolution.lifetimeCompatibility,
+          Location.at(call.anchor),
+          signature.typeOutlives,
+        )
   const pointerSourceType = instantiatedParameters.at(0)
   let qualifierDiagnostic: Diagnostic.Located | undefined
   if (
@@ -6142,6 +6157,7 @@ export function analyzeBuiltinCall(
     inferenceDiagnostic === undefined &&
     unsafeDiagnostic === undefined &&
     qualifierDiagnostic === undefined &&
+    outlivesDiagnostics.length === 0 &&
     assemblyDiagnostics.length === 0
       ? availableExpressionType(reference.result)
       : unavailableExpressionType
@@ -6164,6 +6180,7 @@ export function analyzeBuiltinCall(
       ...(inferenceDiagnostic === undefined ? [] : [inferenceDiagnostic]),
       ...(unsafeDiagnostic === undefined ? [] : [unsafeDiagnostic]),
       ...(qualifierDiagnostic === undefined ? [] : [qualifierDiagnostic]),
+      ...outlivesDiagnostics,
       ...assemblyDiagnostics,
       ...argumentsResult.diagnostics,
       ...typeArguments.diagnostics,
@@ -10472,12 +10489,11 @@ function analyzeExpressionDecision(
         Diagnostic.runNonEffect(Type.display(subject.type), Location.at(node.anchor)),
       )
     // A `mut Effect` runs through exclusive access, which needs a mutable root (EFFECT-OWN-002,
-    // BORROW-002), exactly as invoking a `mut fn` binding does.
+    // BORROW-002), exactly as invoking a `mut fn` binding or parameter does.
     if (
       effect?.access === 'Exclusive' &&
       subject.fact._tag === 'Identifier' &&
-      subject.fact.reference._tag === 'ResolvedBinding' &&
-      subject.fact.reference.binding.mutability !== 'Mutable'
+      immutableRoot(subject.fact.reference)
     )
       diagnostics.push(
         Diagnostic.invalidCallableInvocationAccess('Exclusive', Location.at(subject.fact.anchor)),

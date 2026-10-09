@@ -3,6 +3,7 @@ import * as AuthoredIdentity from './AuthoredIdentity.js'
 import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import * as Lifetime from './Lifetime.js'
+import type * as Match from './Match.js'
 import type * as SourceSpan from './SourceSpan.js'
 import type * as Tir from './Tir.js'
 import * as TirModule from './Tir.js'
@@ -190,6 +191,7 @@ export type Expression =
     })
   | (Base & {
       readonly _tag: 'Match'
+      readonly access: Match.Access
       readonly scrutinee: Expression
       readonly arms: ReadonlyArray<{ readonly guard?: Expression; readonly body: ArmBody }>
     })
@@ -958,6 +960,7 @@ export const ofTir = (
         return {
           ...base,
           _tag: 'Match',
+          access: node.access,
           scrutinee: expression(node.scrutinee),
           arms: node.arms.map((arm) => ({
             ...(arm.guard === undefined ? {} : { guard: expression(arm.guard) }),
