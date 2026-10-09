@@ -3007,6 +3007,22 @@ const analyzeLoans = (
       ? 'Move'
       : 'Read'
 
+  // A borrowed match holds its own loan through the selected arm; only by-value forms consume.
+  const scrutineeAccess = (
+    expression: Extract<LoanView.Expression, { readonly _tag: 'Match' }>,
+  ): 'Read' | 'Write' | 'Move' => {
+    switch (expression.access) {
+      case 'Shared':
+      case 'Copy':
+        return 'Read'
+      case 'Exclusive':
+        return 'Write'
+      case 'Move':
+      case 'Place':
+        return naturalAccess(expression.scrutinee)
+    }
+  }
+
   const inspect = (
     expression: LoanView.Expression,
     region: Tir.RegionId,
@@ -3118,7 +3134,7 @@ const analyzeLoans = (
         }
         return
       case 'Match':
-        inspect(expression.scrutinee, region, active, naturalAccess(expression.scrutinee))
+        inspect(expression.scrutinee, region, active, scrutineeAccess(expression))
         for (const arm of expression.arms) {
           if (arm.guard !== undefined) inspect(arm.guard, region, active, 'Read')
           if (arm.body._tag === 'Expression') inspect(arm.body.expression, region, active, access)
