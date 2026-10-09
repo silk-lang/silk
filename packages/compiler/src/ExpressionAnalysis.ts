@@ -11223,7 +11223,7 @@ export const finishDeclarationCall = (
     context,
     reference,
     callContract.fact._tag === 'Compatible' ? callContract.fact.substitution : undefined,
-    resolution.index,
+    resolution,
     caller,
     Location.at(node.anchor),
   )

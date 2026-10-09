@@ -60,14 +60,25 @@ ${compiled}`,
         )
       },
     )
-    assert.deepStrictEqual(runCase(silkc, { ...literal, nativeDynamicLibraries: ['c', 'm'] }), {
-      name: 'literal',
-      status: 'pass',
-    })
-    assert.strictEqual(
-      runCase(silkc, { ...literal, nativeDynamicLibraries: ['custom'] }).status,
-      'unsupported',
-    )
+  })
+})
+
+void it('declares compiled corpus C units and libraries as manifest link inputs', () => {
+  const linked = {
+    ...literal,
+    nativeCSources: { fixture: 'int silk_fixture(void) { return 42; }\n' },
+    nativeDynamicLibraries: ['custom'],
+  }
+  withStub(
+    `[ -s fixture.o ] || exit 7
+grep -qxF 'native-link-inputs = [{ object = "fixture.o" }, { library = "custom", mode = "dynamic" }]' silk.toml || exit 8
+${compiled}`,
+    (silkc) => {
+      assert.deepStrictEqual(runCase(silkc, linked), { name: 'literal', status: 'pass' })
+    },
+  )
+  withStub(`grep -q native-link-inputs silk.toml && exit 9\n${compiled}`, (silkc) => {
+    assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
   })
 })
 
