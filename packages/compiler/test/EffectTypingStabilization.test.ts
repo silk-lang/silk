@@ -357,13 +357,15 @@ pub fn main() -> i32 { run ordered(1) return 42 }`,
             candidate.declaration.name._tag === 'Present' &&
             candidate.declaration.name.spelling === 'ordered',
         ) ?? unreachable('expected the effect function body')
-    const block =
+    const run =
       body.function.statements
         .flatMap(Tir.statementExpressions)
         .flatMap(Tir.expressionTree)
-        .find((expression) => expression._tag === 'EffectBlock') ??
-      unreachable('expected the inline effect block')
-    assert.isTrue(Type.isEffect(block.type))
+        .find((expression) => expression._tag === 'Run') ??
+      unreachable('expected the run of the inline effect block')
+    if (run._tag !== 'Run' || run.subject._tag !== 'EffectBlock')
+      return unreachable('expected the inline effect block as the run subject')
+    assert.isTrue(Type.isEffect(run.subject.type))
   }),
 )
 
