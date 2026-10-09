@@ -206,7 +206,7 @@ const program = Effect.gen(function* () {
                 (fixture.name !== 'observer-suspended' &&
                   fixture.name !== 'observer-cancel' &&
                   fixture.name !== 'context') ||
-                (symbol !== 'malloc' && symbol !== 'free'),
+                (symbol !== 'malloc' && symbol !== 'calloc' && symbol !== 'free'),
             ) ||
             /silk_coroutine_frame_(push|pop)_v1/.test(artifact.ir)
           )
