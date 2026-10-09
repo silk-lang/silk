@@ -372,11 +372,12 @@ Each entry records:
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
   Backend (code) identity erases regions unless the program declares a lifetime-selective sealed
   `Drop` or `Copy` head (a provider head naming `'static` or repeating a lifetime binder, or a
-  region bound); such a program keeps exact region identity. Without such a head, a backend
-  instance publishes its finest region pattern (every free region distinct, none `'static`):
-  region proofs only gain from shared regions and `'static`, so that body proves every pattern.
-  A family whose finest pattern is refused falls back to checking each reached pattern's own
-  lowering (its Validity query) without publishing it.
+  region bound); such a program keeps exact region identity. Without such a head, the first
+  region pattern reached publishes the backend instance's body. Region proofs only gain when
+  regions merge or become `'static`, so a later pattern that one substitution of a proven
+  pattern's caller regions produces needs no proof of its own; any other pattern checks its own
+  lowering (its Validity query) without publishing it, and takes over a representative that its
+  own proofs refused.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
