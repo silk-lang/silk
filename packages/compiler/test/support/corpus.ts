@@ -3567,9 +3567,9 @@ effect fn build() -> i32 ! OutOfMemoryError {
   if literal != "A\\u{a3}" {} else { return 2 }
 
   let mut allocator = Allocator.systemAllocatorProvider()
-  let copying = String.copy(literal) |> Effect.provideMut(&mut allocator)
+  let mut copying = String.copy(literal) |> Effect.provideMut(&mut allocator)
   let mut owned = run copying
-  let appending = String.append(&mut owned, "\\u{20ac}\\u{10348}")
+  let mut appending = String.append(&mut owned, "\\u{20ac}\\u{10348}")
     |> Effect.provideMut(&mut allocator)
   let appended = run appending
   let borrowed = String.view(&owned)
@@ -5296,10 +5296,10 @@ fn checksum(values: &[u8]) -> i32 {
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let source = [octet(0), octet(255), octet(128), octet(1)]
-  let copying = Bytes.copy(&source) |> Effect.provideMut(&mut allocator)
+  let mut copying = Bytes.copy(&source) |> Effect.provideMut(&mut allocator)
   let mut bytes = run copying
   let suffix = [octet(42), octet(7)]
-  let appending = Bytes.append(&mut bytes, &suffix) |> Effect.provideMut(&mut allocator)
+  let mut appending = Bytes.append(&mut bytes, &suffix) |> Effect.provideMut(&mut allocator)
   let appended = run appending
   let mut writable = Bytes.asMutSlice(&mut bytes)
   writable[1] = octet(2)
