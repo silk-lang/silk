@@ -373,6 +373,19 @@ Each entry records:
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
   cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
+  Backend (code) identity erases regions unless the application is region-sensitive: its
+  lowering consulted a lifetime-selective head (one naming `'static`, repeating a region, or
+  bounding a region), or it lends one of its own regions to a region-sensitive application. Each
+  build closes sensitivity over the instances it reaches and gives each region pattern of a
+  sensitive application its own instance; the argument is in
+  [region-sensitive identity](compiler/docs/region-sensitive-identity.md).
+- **N1 investigation:** a local rebuilt-bootstrap N0 at native `49a7cac747` produced fresh optimized
+  N1 LLVM text in approximately 207 seconds with 4.41 GiB observed peak RSS. GDB and an O0
+  AddressSanitizer CRC-32 control completed without the previously reported SIGABRT; nine of eleven
+  examples executed their expected results. The other two retain exact baseline N0 refusals:
+  omitted `Intrinsic.bindRequirementMut` selector arguments (`TypeArity`) and a formatting phase-only field (`core-type`).
+  [The investigation records every outcome and its generation](compiler/docs/region-sensitive-identity.md#n1-investigation-2026-10-10);
+  it is diagnostic evidence, not a later synchronized-head CI receipt.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
