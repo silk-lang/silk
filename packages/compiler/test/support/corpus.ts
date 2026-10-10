@@ -387,6 +387,25 @@ pub fn main() -> i32 {
   return run Effect.catchAll(render(), recover)
 }`
 
+/** Calls producing a referent place remain part of the executable instance closure. */
+export const dereferencedCallAcceptance = `fn view(owner: &i32) -> &i32 { return owner }
+pub fn main() -> i32 { let value = 42 return view(&value).* }`
+
+/** A public reflection wrapper specializes once for each sealed field descriptor. */
+export const reflectedBorrowWrapperAcceptance = `import silk.reflect { Reflect }
+struct Box { pub first: i32 pub second: i32 }
+fn read(owner: &Box) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Box>() {
+    total = total + Reflect.borrowField<Box, i32>(owner, field).*
+  }
+  return total
+}
+pub fn main() -> i32 {
+  let value = Box { first: 20, second: 22 }
+  return read(&value)
+}`
+
 /** Static template parsing and reflection erase before the shared engine differential. */
 export const templateFormattingAcceptance = `import silk.effect { Effect }
 import silk.format { Format }
@@ -8296,6 +8315,16 @@ const borrowedRecoveryStorageCorpus: ReadonlyArray<CorpusProgram> = [
 ]
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
+  {
+    name: 'dereferenced-call-target',
+    source: dereferencedCallAcceptance,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'reflected-borrow-wrapper',
+    source: reflectedBorrowWrapperAcceptance,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     name: 'owned-allocation-preflight-refusal',
     source: ordinaryStorageSource(`import silk.effect { Effect }
