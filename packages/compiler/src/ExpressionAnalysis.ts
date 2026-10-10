@@ -11626,6 +11626,8 @@ export interface StaticAnalysisContext {
   readonly observeResolved?: NonNullable<Evaluation.NodeContext['observeResolved']>
   readonly returnedTextSpan?: { value: Location.Location | undefined }
   readonly trace: Evaluation.Trace
+  /** Charges evaluator work needed to reach a static-control boundary in this function. */
+  readonly step?: NonNullable<Evaluation.NodeContext['step']>
   /** The nodes of what this body has analyzed so far, which is what the evaluator interprets. */
   readonly nodes: import('./BodyBuilder.js').StaticLowering
   readonly lookup: Evaluation.NodeContext['lookup']
