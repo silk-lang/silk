@@ -763,7 +763,8 @@ export const make = (operations: Operations) => {
       return [...visit(expression.left), ...visit(expression.right)]
     }
     if (expression._tag === 'UnionConvert') return visit(expression.source)
-    if (expression._tag === 'Project') return visit(expression.subject)
+    if (expression._tag === 'Project' || expression._tag === 'ReferentPlace')
+      return visit(expression.subject)
     if (expression._tag === 'IndexPlace') {
       return [...visit(expression.subject), ...visit(expression.index)]
     }

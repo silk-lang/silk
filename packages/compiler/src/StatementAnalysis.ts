@@ -1060,7 +1060,7 @@ export const analyzeStatements = (
         context.declarations,
         context.declaration,
         scope,
-        context.resolution,
+        { ...context.resolution, staticIterable: true },
       )
       if (iterable === undefined)
         throw new RangeError(`Semantic analysis cannot analyze ${iterableNode._tag}`)
