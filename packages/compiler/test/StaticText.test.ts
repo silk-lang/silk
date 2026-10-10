@@ -2251,6 +2251,155 @@ static fn computed() -> i32 {
   }),
 )
 
+it.effect('selects static control after preceding mutable evaluator work', () =>
+  Effect.gen(function* () {
+    const source = `import silk.static_sequence {StaticSequence}
+static fn changed(input: bool) -> i32 {
+  let mut chosen = false
+  chosen = input
+  static if chosen { return 42 } else { return 0 }
+}
+static fn branched(input: bool) -> i32 {
+  let mut chosen = false
+  if input { chosen = true }
+  static if chosen { return 42 } else { return 0 }
+}
+static fn counted(limit: i32) -> i32 {
+  let mut count = 0
+  while count < limit { count = count + 1 }
+  static if count == 2 { return 42 } else { return 0 }
+}
+static fn sequential() -> i32 {
+  let mut chosen = false
+  chosen = true
+  static if chosen { chosen = false }
+  static if chosen { return 0 } else { return 42 }
+}
+static fn early(input: bool) -> i32 {
+  if input { return 42 }
+  let mut count = 0
+  static if count == 0 { return 7 } else { return 1 }
+}
+static fn nested() -> i32 {
+  let mut count = 0
+  static if true {
+    count = count + 1
+    static if count == 1 { count = count + 1 }
+  }
+  static if count == 2 { return 42 } else { return 0 }
+}
+static fn initialized() -> i32 {
+  let mut chosen = false
+  chosen = true
+  let observed = chosen
+  static if observed { return 42 } else { return 0 }
+}
+static fn iterated() -> i32 {
+  let mut count = 0
+  static for part in StaticSequence.append<i32>(StaticSequence.append<i32>(StaticSequence.empty<i32>(), 20), 22) {
+    count = count + part
+    static if part == 20 && count == 20 { count = count + 1 }
+    static if part == 22 && count == 43 { count = count + 1 }
+  }
+  static if count == 44 { return 42 } else { return 0 }
+}
+pub fn main() -> i32 {
+  static if changed(true) == 42 && changed(false) == 0
+    && branched(true) == 42 && branched(false) == 0
+    && counted(2) == 42 && counted(0) == 0
+    && sequential() == 42 && nested() == 42 && initialized() == 42 && iterated() == 42
+    && early(true) == 42 && early(false) == 7 {
+    return 42
+  } else { compileError("mutable static control read stale values") }
+}`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/mutable-control-prefix',
+      encoder.encode(source),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+    assert.isDefined(
+      Analysis.instancesOf(snapshot).instances.find(
+        (instance) => instance.key.declaration.name === 'main',
+      ),
+    )
+  }),
+)
+
+it.effect('rejects static selections that change inside ordinary control', () =>
+  Effect.gen(function* () {
+    for (const condition of ['count == 1', 'count < 2']) {
+      const source = `static fn sum() -> i32 {
+  let mut count = 0
+  let mut total = 0
+  while count < 2 {
+    count = count + 1
+    static if ${condition} { total = total + 20 } else { total = total + 22 }
+  }
+  return total
+}
+pub fn main() -> i32 { return sum() }`
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'static/changed-loop-selection',
+        encoder.encode(source),
+        Target.x8664UnknownLinuxGnu.id,
+      )
+      assert.isTrue(
+        Analysis.diagnostics(snapshot).some(
+          (diagnostic) =>
+            diagnostic.code === 'SEM0176' &&
+            diagnostic.message.includes('changing a checked static selection') &&
+            diagnostic.span.start === source.indexOf(`static if ${condition}`) + 10,
+        ),
+      )
+    }
+  }),
+)
+
+it.effect('retains invariant static selections inside ordinary loops', () =>
+  Effect.gen(function* () {
+    const source = `static fn sum(input: bool) -> i32 {
+  let mut count = 0
+  let mut total = 0
+  while count < 2 {
+    count = count + 1
+    static if input { total = total + 21 } else { total = total + 20 }
+    static if true {} else { missingInactiveArm() }
+  }
+  return total
+}
+pub fn main() -> i32 {
+  static if sum(true) == 42 && sum(false) == 40 { return 42 }
+  else { compileError("invariant loop selection changed") }
+}`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/invariant-loop-selection',
+      encoder.encode(source),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+  }),
+)
+
+it.effect('bounds evaluator work before selecting static control', () =>
+  Effect.gen(function* () {
+    const source = `static fn stalled() -> i32 {
+  let mut count = 0
+  while true { count = count + 1 }
+  static if true { return 42 } else { return 0 }
+}
+pub fn main() -> i32 { return stalled() }`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/mutable-control-limit',
+      encoder.encode(source),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    assert.isTrue(
+      Analysis.diagnostics(snapshot).some((diagnostic) => diagnostic.code === 'SEM0179'),
+    )
+  }),
+)
+
 it.effect('evaluates statement arms and carries transfers through eager static expressions', () =>
   Effect.gen(function* () {
     const source = `struct Payload { value: i32 }

@@ -61,6 +61,7 @@ export type StatementDraft =
     }
   | {
       readonly _tag: 'ExpressionStatement'
+      readonly staticSelection?: boolean
       readonly expression: Tir.Expression
       readonly region: Tir.RegionId
       readonly anchor: AuthoredHir.Anchor
@@ -629,6 +630,9 @@ export const publishStatements = (
       if (statement._tag === 'ExpressionStatement')
         return {
           _tag: 'Evaluate',
+          ...(statement.staticSelection === undefined
+            ? {}
+            : { staticSelection: statement.staticSelection }),
           expression: tirExpression(statement.expression, options),
           region: statement.region,
           span: options.context.spanOf(statement.anchor),

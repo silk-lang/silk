@@ -115,18 +115,17 @@ Each entry records:
 - **Compilers:** the bootstrap checks every argument by subtyping over the complete variance
   summary. Selfhost call inference still unifies exactly. Only when an inferred argument fails with
   `TypeMismatch`, and the parameter is a shared loan, does selfhost match one shortened argument
-  against the same inference state. An exclusive argument loan is first given up as a shared one
-  (BORROW-005 never strengthens access); the operand keeps its exclusive type. In that argument,
-  each referent lifetime in a covariant position is shortened to the argument's loan region, but
-  only where the parameter writes its own loan lifetime. Every other lifetime keeps its evidence.
-  A binding annotated as a shared loan, named or elided, admits a moved exclusive loan the same
-  way, in covariant positions only.
+  against the same inference state. Both the argument and parameter must be shared loans; access
+  stays unchanged. In that argument, each referent lifetime in a covariant position is shortened
+  to the argument's loan region, but only where the parameter writes its own loan lifetime. Every
+  other lifetime keeps its evidence. Moved exclusive loans require a source-written shared
+  reborrow to satisfy a shared parameter or binding annotation.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
   rows, callable and Effect positions, services, interfaces, recursive declarations still being
   summarized, and declarations whose member shape is unavailable are treated as invariant. Such
   calls keep the original `TypeMismatch` at the call.
-- **Evidence:** `sharedLoanParametersShortenAndGiveUpArguments` in
+- **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
@@ -1769,6 +1768,17 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Bootstrap:** implementation active. `Effect.result` retains its unrestricted error contract. The two selected borrowed-recovery native corpus cases pass their exact synchronous cleanup and park/resume/cancel traces (`7231` and `75842175421`, both returning `42`). Source-owned executable input views preserve the actual closure and independently authenticate the original caller domain and complete invocation inputs. Immutable stored Identifier, ordinary staged and anonymous adaptation retain independently held original producer/input provenance. The four selected stored/staged borrowed-recovery variants also pass; these focused runtime passes do not establish the complete feature, native lifetime safety or N1.
 - **Native:** marker parsed, represented and checked. The parser accepts the contextual `use` only in a callable's outer `for` list; HIR lowering records it on the lifetime parameter, and `Type.Callable` carries the marked binder's canonical ordinal as contract identity (an unused marker vanishes with its binder). A second marker or authored bounds on the marked binder reject as `InvalidLifetime`. Opening a marked contract at a call adds `input: 'call` obligations for every opened input; a contextually checked callback and a callable compared against a marked promise receive the same conditions as premises, and a marked source requires a marked target at the same binder. Effect, `Effect.result` and the `'call & 'env` meets use the existing canonical-meet machinery. Executable input views, stored/staged adaptation provenance and the bootstrap's runtime recovery traces remain unimplemented natively. Strict census on the merged change: HP 42 to 33, UnknownMember 17 to 4 (`effect.silk` resolves again); the remaining `useReleaseNonParking` callers keep their pre-sync refusals. Integrated CI and N1 remain unproved.
 
+### Closed scalar native C callbacks
+
+The native compiler admits exported C-entry addresses under an expected `extern "C" fn` type with
+closed scalar or raw-data-pointer lanes and literal `memory`/`locality` contracts. Contract equality
+is exact after `memory: "none"` canonicalizes locality to external. Stronger export promises require
+`unsafe export "C" fn`; emitted memory effects stay conservative. Imported symbols and ordinary Silk callable values cannot form these addresses. All written
+C callback parameters require a complete synchronous `callbacks` tuple. Address formation checks the
+transitive execution graph for suspension. Indirect invocation requires `unsafe` and retains C ABI
+narrow-integer extension rules. Native imports, pointer invocations, and exported entries retain
+non-inline fatal-personality frames and invoke/landingpad edges. Returned-callback factories, reference
+lanes, and the broader callback loan/capture contracts remain unadmitted natively.
 
 ### Native sealed provision selectors infer one compatible key
 
@@ -1785,3 +1795,11 @@ insufficient capture access keep their typed rejections. The structured claim is
 `intrinsicProvisionInfersOneKeyAndKeepsResidualRequirements` in
 `compiler/src/semantic/SemanticLoweringCases.silk`; the file-system example exercises nested
 inferred exclusive bindings for independent filesystem and allocator providers.
+
+### Bootstrap static control inside ordinary loops
+
+- **Status:** known bootstrap evaluation gap, reproduced on 2026-10-10; repair remains open.
+- **Rule:** STATIC-005 and STATIC-006 admit evaluator-local mutation. A static condition must observe the local values at its execution point, including each iteration of an ordinary `while` in a static function.
+- **Compilers:** checked-prefix replay now updates a static condition after preceding assignments, ordinary branches and complete loops, including nested static arms and finite static iterations. Static control contained inside ordinary control still selects its arm while analyzing the deferred body, before that execution's local replacements occur. Evaluation retains the checked selection and rejects a condition that changes at execution; it does not elaborate the inactive arm. This entry does not claim native static-control coverage.
+- **Evidence:** a static function starts `count = 0`, `total = 0`, repeats twice, increments `count`, and uses `static if count == 1` to add 20, otherwise 22. Its required result is 42; the earlier bootstrap returned 44. The selection-consistency check now rejects this form with SEM0176 at the changed condition. Invariant loop selections remain accepted. The checked-prefix repair's separate positive controls and bounded-evaluation negative remain passing.
+- **Source migration:** none; the bootstrap compiler must repair per-iteration static selection. The bootstrap static-control task owns complete per-iteration selection.
