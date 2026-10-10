@@ -1959,7 +1959,7 @@ type StatementControl =
   | { readonly _tag: 'Return'; readonly value: StaticValue.Value }
   | { readonly _tag: 'Break' | 'Continue'; readonly target: Tir.LoopId | undefined }
 
-type ExecutionOutcome<A> =
+export type ExecutionOutcome<A> =
   | Outcome<A>
   | {
       readonly _tag: 'Transfer'
@@ -2057,7 +2057,8 @@ const writeRootKey = (root: Tir.OwnedWriteRoot): string => {
   return tirLocalKey(root.parameter)
 }
 
-const evaluateStatementSequence = (
+/** Interprets a checked statement sequence while retaining its lexical control transfer. */
+export const evaluateStatementSequence = (
   statements: ReadonlyArray<Tir.Statement>,
   context: NodeContext,
 ): ExecutionOutcome<StaticValue.Value> => {
