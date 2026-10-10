@@ -3387,6 +3387,19 @@ export const exactEffectIdentityOfExpression = (
     : undefined
 }
 
+/** The whole place a value borrow lends; a borrowed Effect argument runs that place's Effect. */
+const borrowedPlace = (
+  expression: ExpressionDecision | Tir.Expression,
+): ExpressionDecision | Tir.Expression | undefined => {
+  if ('origin' in expression)
+    return expression._tag === 'ValueBorrow' && expression.selectors.length === 0
+      ? expression.place
+      : undefined
+  return expression._tag === 'Borrow' && expression.formation._tag === 'ValueBorrow'
+    ? expression.subject
+    : undefined
+}
+
 export const hiddenEffectArguments = (
   context: SemanticContext.SemanticContext,
   declaration: DeclarationFact,
@@ -3398,13 +3411,12 @@ export const hiddenEffectArguments = (
     const declared = parameter.declaredType
     if (declared._tag !== 'Resolved') return []
     const specialized = Type.substitute(declared.type, substitution)
-    const contract = Type.isRepresented(specialized) ? specialized.contract : specialized
-    if (!Type.isEffect(contract)) return []
+    if (Type.parameterEffectContract(specialized) === undefined) return []
     const argument = argumentAt(ordinal)
+    const effect =
+      argument === undefined || !Type.isReference(specialized) ? argument : borrowedPlace(argument)
     const identity =
-      argument === undefined
-        ? undefined
-        : exactEffectIdentityOfExpression(context, argument, builder)
+      effect === undefined ? undefined : exactEffectIdentityOfExpression(context, effect, builder)
     return identity === undefined ? [] : [identity]
   })
 
