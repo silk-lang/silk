@@ -672,7 +672,7 @@ Each entry records:
 - **Diagnostics and limits:** a receiver-method call (`value.take()`), operator syntax, a callable
   success, and a stored construction whose witness borrows an owned operand report
   `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The pipeline form
-  `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  `run value |> Interface<Arguments>.operation` is checked as the direct qualified call.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
   failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
@@ -1727,18 +1727,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Evidence:** `plainCallableAffineArgumentClaims` in
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
-
-### Native service operations with a `Self` operand
-
-- **Status:** native gap; retires when native dispatches such an operation on its operand.
-- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
-  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
-  interface. Native serves a service operation from the run site's requirement row with no provider
-  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
-  `typed-form` gap) instead of a `TypeMismatch` at the operand.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
-
 
 ### Finite scalar StaticSequence iteration in the native frontend
 

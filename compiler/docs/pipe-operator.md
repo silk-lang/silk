@@ -24,8 +24,8 @@ remains a cleanup owner until invocation commits, so an early callee exit drops 
 constructed on the right side after the input, then append their stored suffix to the original
 target's direct call. Non-unary targets receive `CallArity` at the complete pipe.
 
-Interface-operation pipelines remain a `pipeline-interface` gap at the complete pipe expression,
-including the canonical owning declaration. Effect execution belongs to Step 9.
+An interface-operation target, such as `&value |> Interface<Arguments>.operation`, is checked as
+its direct qualified call with the input as the only argument, so it selects the same witness.
 
 ## Validation
 
