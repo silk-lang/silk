@@ -82,6 +82,30 @@ ${compiled}`,
   })
 })
 
+void it('supplies corpus runtime components as the host default composition', () => {
+  const composed: CorpusProgram = {
+    ...literal,
+    nativeImports: { 'test/refusing': 'pub fn refuse() -> i32 { return 0 }' },
+    nativeComponents: [
+      {
+        capability: 'execution-storage',
+        bindings: [{ operation: 'acquire', module: 'test/refusing', declaration: 'refuse' }],
+      },
+    ],
+  }
+  withStub(
+    `[ -f test/refusing.silk ] || exit 7
+grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/native_start" }], defaults = ["hosted"], retention = [], requirements = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
+${compiled}`,
+    (silkc) => {
+      assert.deepStrictEqual(runCase(silkc, composed), { name: 'literal', status: 'pass' })
+    },
+  )
+  withStub(`grep -q composition silk.toml && exit 9\n${compiled}`, (silkc) => {
+    assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+  })
+})
+
 void it('requires the full track in supplied materialized scenarios', () => {
   withStub(compiled, (silkc) => {
     assert.throws(

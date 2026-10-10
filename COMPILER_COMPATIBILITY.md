@@ -373,6 +373,19 @@ Each entry records:
 - **Rule:** semantic instances retain exact lifetime evidence for conditional conformance and
   cleanup. MIR remains layout-free, and emitted identities use the canonical selected graph
   described in [MIR core shape §2](compiler/docs/mir-core-shape.md#2-places-and-types-question-1).
+  Backend (code) identity erases regions unless the application is region-sensitive: its
+  lowering consulted a lifetime-selective head (one naming `'static`, repeating a region, or
+  bounding a region), or it lends one of its own regions to a region-sensitive application. Each
+  build closes sensitivity over the instances it reaches and gives each region pattern of a
+  sensitive application its own instance; the argument is in
+  [region-sensitive identity](compiler/docs/region-sensitive-identity.md).
+- **N1 investigation:** a local rebuilt-bootstrap N0 at native `49a7cac747` produced fresh optimized
+  N1 LLVM text in approximately 207 seconds with 4.41 GiB observed peak RSS. GDB and an O0
+  AddressSanitizer CRC-32 control completed without the previously reported SIGABRT; nine of eleven
+  examples executed their expected results. The other two retain exact baseline N0 refusals:
+  omitted `Intrinsic.bindRequirementMut` selector arguments (`TypeArity`) and a formatting phase-only field (`core-type`).
+  [The investigation records every outcome and its generation](compiler/docs/region-sensitive-identity.md#n1-investigation-2026-10-10);
+  it is diagnostic evidence, not a later synchronized-head CI receipt.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
@@ -659,7 +672,7 @@ Each entry records:
 - **Diagnostics and limits:** a receiver-method call (`value.take()`), operator syntax, a callable
   success, and a stored construction whose witness borrows an owned operand report
   `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The pipeline form
-  `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  `run value |> Interface<Arguments>.operation` is checked as the direct qualified call.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
   failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
@@ -992,27 +1005,6 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` signature and
   body and the refused parameterized entry.
 - **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
-
-### Runtime uses of structs holding phase-only fields
-
-- **Status:** divergence recorded by the coordinator on 2026-10-10. It is retired when the
-  bootstrap reports `StaticPhaseViolation` at these sites on main and the fix reaches selfhost.
-- **Rule:** [STATIC-009](apps/docs/content/reference/static-evaluation.md#static-009--static-sequences-are-immutable-compile-time-values)
-  gives a static sequence no runtime layout: it cannot appear in a residual signature, binding,
-  call or backend artifact. A struct or tuple may hold one as a field, and a type that holds one
-  at any depth stays static.
-- **Compilers:** selfhost admits the field and refuses a runtime parameter, result or failure of
-  such a type as `StaticPhaseViolation` (`SEM0176`) at its authored type, and a static value of it
-  at the runtime site that would embed it, such as `let held = make()`. The
-  bootstrap accepts the same programs semantically and reports `SEM0219` (unsupported native
-  lowering) where lowering reaches the value, which can be an unrelated span.
-- **Source migration:** none; keep such structs inside static functions, as `silk.format`'s
-  `TemplatePlan` does.
-- **Diagnostics and limits:** unions holding phase-only payloads are not yet treated as static by
-  selfhost; they follow once static evaluation admits union values.
-- **Evidence:** `phaseOnlyFieldsStayStatic` in `compiler/src/semantic/SemanticStaticCases.silk`
-  admits the field and a static function returning it, and asserts the violation at a runtime
-  parameter, result and nested-struct parameter, and at a static call embedded in a runtime body.
 
 ## Maintaining this file
 
@@ -1736,18 +1728,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
 
-### Native service operations with a `Self` operand
-
-- **Status:** native gap; retires when native dispatches such an operation on its operand.
-- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
-  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
-  interface. Native serves a service operation from the run site's requirement row with no provider
-  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
-  `typed-form` gap) instead of a `TypeMismatch` at the operand.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
-
-
 ### Finite scalar StaticSequence iteration in the native frontend
 
 - **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
@@ -1788,3 +1768,20 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Definition:** LIFE-004 now distinguishes marked `for<use 'call>` invocation extents from independently quantified data lifetimes and retained capture environments. Input validity covers returned-computation execution, suspension, cancellation and cleanup; retained computations cannot escape those loans. `Effect.result` gains no retained-error bound.
 - **Bootstrap:** implementation active. `Effect.result` retains its unrestricted error contract. The two selected borrowed-recovery native corpus cases pass their exact synchronous cleanup and park/resume/cancel traces (`7231` and `75842175421`, both returning `42`). Source-owned executable input views preserve the actual closure and independently authenticate the original caller domain and complete invocation inputs. Immutable stored Identifier, ordinary staged and anonymous adaptation retain independently held original producer/input provenance. The four selected stored/staged borrowed-recovery variants also pass; these focused runtime passes do not establish the complete feature, native lifetime safety or N1.
 - **Native:** marker parsed, represented and checked. The parser accepts the contextual `use` only in a callable's outer `for` list; HIR lowering records it on the lifetime parameter, and `Type.Callable` carries the marked binder's canonical ordinal as contract identity (an unused marker vanishes with its binder). A second marker or authored bounds on the marked binder reject as `InvalidLifetime`. Opening a marked contract at a call adds `input: 'call` obligations for every opened input; a contextually checked callback and a callable compared against a marked promise receive the same conditions as premises, and a marked source requires a marked target at the same binder. Effect, `Effect.result` and the `'call & 'env` meets use the existing canonical-meet machinery. Executable input views, stored/staged adaptation provenance and the bootstrap's runtime recovery traces remain unimplemented natively. Strict census on the merged change: HP 42 to 33, UnknownMember 17 to 4 (`effect.silk` resolves again); the remaining `useReleaseNonParking` callers keep their pre-sync refusals. Integrated CI and N1 remain unproved.
+
+
+### Native sealed provision selectors infer one compatible key
+
+SERV-007 also applies to `Intrinsic.bindRequirement`, `Intrinsic.bindRequirementMut` and
+`Intrinsic.bindRequirementOwned`: an omitted selector selects the unique service-role key that
+matches the provider and its capture access in the complete input requirement row. Explicit
+selectors retain their existing cardinality, conformance and access checks. Only the selected key
+is subtracted, and the exact composite stores that key for specialized MIR preparation.
+
+The native frontend previously rejected these calls before operand checking with `TypeArity`;
+the bootstrap already infers their selectors. The native implementation now uses the same
+`selectProvided` proof as ordinary `provides` bounds. Ambiguous keys, absent conformance and
+insufficient capture access keep their typed rejections. The structured claim is
+`intrinsicProvisionInfersOneKeyAndKeepsResidualRequirements` in
+`compiler/src/semantic/SemanticLoweringCases.silk`; the file-system example exercises nested
+inferred exclusive bindings for independent filesystem and allocator providers.
