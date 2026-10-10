@@ -1367,6 +1367,73 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('defers concrete sealed iterable calls in runtime static loops', () =>
+  Effect.gen(function* () {
+    const program = `import silk.reflect { Reflect }
+struct Box { pub first: i32 pub second: i32 }
+struct Empty {}
+fn read(owner: &Box) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Box>() {
+    total = total + Reflect.borrowField<Box, i32>(owner, field).*
+  }
+  static for field in Intrinsic.reflectFields<Empty>() { missing(field) }
+  return total
+}
+fn sequenceTotal() -> i32 {
+  let mut total = 0
+  static for value in Intrinsic.staticSequenceAppend<i32>(
+    Intrinsic.staticSequenceAppend<i32>(Intrinsic.staticSequenceEmpty<i32>(), 20), 22
+  ) { total = total + value }
+  return total
+}
+pub fn main() -> i32 {
+  let value = Box { first: 20, second: 22 }
+  return read(&value) + sequenceTotal()
+}`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/concrete-sealed-iterables',
+      encoder.encode(program),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+  }),
+)
+
+it.effect(
+  'refuses deferred sealed values outside static iterables and scalar static-only calls',
+  () =>
+    Effect.gen(function* () {
+      const program = `struct Box { pub value: i32 }
+fn exercise() -> () {
+  let fields = Intrinsic.reflectFields<Box>()
+  let values = Intrinsic.staticSequenceEmpty<i32>()
+  let tests = Intrinsic.tests()
+  static for value in Intrinsic.staticSequenceLength<i32>(Intrinsic.staticSequenceEmpty<i32>()) {}
+}
+pub fn main() -> () { exercise() }`
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'static/deferred-iterable-boundaries',
+        encoder.encode(program),
+        Target.x8664UnknownLinuxGnu.id,
+      )
+      const violations = Analysis.diagnostics(snapshot).filter(
+        (diagnostic) => diagnostic.code === 'SEM0176',
+      )
+      for (const spelling of [
+        'Intrinsic.reflectFields',
+        'Intrinsic.staticSequenceEmpty',
+        'Intrinsic.tests',
+        'Intrinsic.staticSequenceLength',
+      ]) {
+        assert.isTrue(
+          violations.some((diagnostic) => diagnostic.span.start === program.indexOf(spelling)),
+          spelling,
+        )
+      }
+    }),
+)
+
 it.effect('rejects phase-only descriptor types from runtime signatures, bindings, and calls', () =>
   Effect.gen(function* () {
     const sourceId = 'static/phase-only-types'
