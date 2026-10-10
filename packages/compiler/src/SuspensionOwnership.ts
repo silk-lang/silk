@@ -107,13 +107,11 @@ export interface ExecutionPackageOwnershipPlan {
   readonly package: ExecutionPackage.Plan
   readonly slots: ReadonlyArray<ExecutionPackageSlot>
   readonly logicalRoot: 'ExecutionOwnedPersistent'
-  readonly restoration: 'InitialOrEligibleDrive'
-  readonly wakeControl: 'Omitted' | 'StableGenerationCell'
-  readonly wakeAllocation: 'IndivisibleUntilFinalAuthority'
+  readonly restoration: 'UnstartedOrRelinquishedDrive'
+  readonly allocation: 'CountedUntilFinalAuthority'
   readonly completion: ExecutionPackageCleanup
-  readonly neverDriven: ExecutionPackageCleanup
-  readonly dormant: ExecutionPackageCleanup
-  readonly eligible: ExecutionPackageCleanup
+  readonly unstarted: ExecutionPackageCleanup
+  readonly relinquished: ExecutionPackageCleanup
 }
 
 const executionPackagePlan = (
@@ -148,13 +146,11 @@ const executionPackagePlan = (
     package: package_,
     slots,
     logicalRoot: 'ExecutionOwnedPersistent',
-    restoration: 'InitialOrEligibleDrive',
-    wakeControl: package_.readinessStorage ? 'StableGenerationCell' : 'Omitted',
-    wakeAllocation: 'IndivisibleUntilFinalAuthority',
+    restoration: 'UnstartedOrRelinquishedDrive',
+    allocation: 'CountedUntilFinalAuthority',
     completion,
-    neverDriven: retained,
-    dormant: retained,
-    eligible: retained,
+    unstarted: retained,
+    relinquished: retained,
   }
 }
 
@@ -163,7 +159,6 @@ const operationDefinitions = (operation: Mir.Operation): ReadonlySet<number> => 
   for (const nested of Mir.operationTree(operation)) {
     if ('destination' in nested && nested.destination !== undefined)
       definitions.add(nested.destination.ordinal)
-    if (nested._tag === 'ExecutionPark') definitions.add(nested.guard.ordinal)
     if (nested._tag === 'UnpackEffectComposite') definitions.add(nested.matched.ordinal)
     if (
       nested._tag === 'RunEffect' ||
@@ -576,7 +571,6 @@ const planFor = (
 ): Plan | undefined => {
   const definitions = definitionMap(fn)
   const operationDefined = operationDefinitions(operation)
-  const parkGuard = operation._tag === 'ExecutionPark' ? operation.guard.ordinal : undefined
   const states = MirVerification.initializationOf(fn, program.layout).before.get(operation)
   const flagsByRoot = new Map(
     (fn.initializationFlags ?? []).map((entry) => [entry.root.ordinal, entry.flags]),
@@ -596,7 +590,7 @@ const planFor = (
       ),
     }
   }
-  const retained = new Set([...live, ...(parkGuard === undefined ? [] : [parkGuard])])
+  const retained = new Set(live)
   const holders = [
     ...MirVerification.operationLocals(operation).filter(
       (local) => !operationDefined.has(local.ordinal),
@@ -661,19 +655,13 @@ const planFor = (
   for (const ordinal of retained)
     for (const flag of initializationOf(ordinal)?.flags ?? []) retained.add(flag.local.ordinal)
   const slots: ReadonlyArray<Slot> = [...retained]
-    .filter((ordinal) => !operationDefined.has(ordinal) || ordinal === parkGuard)
+    .filter((ordinal) => !operationDefined.has(ordinal))
     .sort((left, right) => left - right)
     .flatMap((ordinal) => {
       const type = fn.localTypes.at(ordinal)
       if (type === undefined) return []
       const local = { _tag: 'Local' as const, ordinal }
-      const access =
-        operation._tag === 'ExecutionPark' && ordinal === parkGuard
-          ? {
-              _tag: 'AffineTransfer' as const,
-              cleanup: operation.guardCleanup,
-            }
-          : accessOf(program, index, fn, definitions, local, type, opaqueRealizations)
+      const access = accessOf(program, index, fn, definitions, local, type, opaqueRealizations)
       const executionAffinity = affinityOf(index, fn, type, access)
       const localSharedObligations = obligationsOf(index, type)
       let runtimeLanes: ReturnType<typeof Layout.effectEnvironmentLanes>
@@ -748,14 +736,9 @@ const planFor = (
     slots,
     invocationUses,
     success: {
-      restores: slots
-        .filter((slot) => slot.local.ordinal !== parkGuard)
-        .map((slot) => slot.ordinal),
+      restores: slots.map((slot) => slot.ordinal),
       loanEnds: [],
-      releases:
-        parkGuard === undefined
-          ? []
-          : affineReleases.filter((release) => release.local.ordinal === parkGuard),
+      releases: [],
     },
     failure: { restores: [], loanEnds, releases: releaseOrder },
   }
@@ -785,7 +768,7 @@ export const plan = (
           operation._tag !== 'RunEffect' &&
           operation._tag !== 'RunEffectValue' &&
           operation._tag !== 'CatchEffect' &&
-          operation._tag !== 'ExecutionPark'
+          operation._tag !== 'ExecutionRelinquish'
         )
           continue
         if (
@@ -923,12 +906,12 @@ export const encode = (self: Module): string =>
       }),
     ]),
     ...self.executionPackages.flatMap((plan_) => [
-      `execution-package ${plan_.package.provenance} slots=${plan_.slots.length} allocation-releases=1 root=${plan_.logicalRoot.toLowerCase()} restore=${plan_.restoration.toLowerCase()} wake=${plan_.wakeControl.toLowerCase()} wake-allocation=${plan_.wakeAllocation.toLowerCase()}`,
+      `execution-package ${plan_.package.provenance} slots=${plan_.slots.length} allocation-releases=1 root=${plan_.logicalRoot.toLowerCase()} restore=${plan_.restoration.toLowerCase()} allocation=${plan_.allocation.toLowerCase()}`,
       ...plan_.slots.map(
         (slot) =>
           `  package-slot ${slot.ordinal} ${slot.role.toLowerCase()} move:${slot.access.cleanup._tag} ${Type.encode(slot.type)}`,
       ),
-      `  cleanup completion=${plan_.completion.releases.map((slot) => slot.role.toLowerCase()).join('>')} never-driven=${plan_.neverDriven.releases.map((slot) => slot.role.toLowerCase()).join('>')} dormant=${plan_.dormant.releases.map((slot) => slot.role.toLowerCase()).join('>')} eligible=${plan_.eligible.releases.map((slot) => slot.role.toLowerCase()).join('>')}`,
+      `  cleanup completion=${plan_.completion.releases.map((slot) => slot.role.toLowerCase()).join('>')} unstarted=${plan_.unstarted.releases.map((slot) => slot.role.toLowerCase()).join('>')} relinquished=${plan_.relinquished.releases.map((slot) => slot.role.toLowerCase()).join('>')}`,
     ]),
     ...self.violations.map(
       (violation) =>

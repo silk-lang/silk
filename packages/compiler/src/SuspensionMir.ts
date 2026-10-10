@@ -41,11 +41,11 @@ const runnerOf = (
   index: DeclarationIndex.Index,
   operation?: Extract<
     Mir.Operation,
-    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionPark' }
+    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionRelinquish' }
   >,
   functions: ReadonlyArray<Mir.MirFunction> = [],
 ): Mir.SuspensionRunner => {
-  const arguments_ = operation?._tag === 'ExecutionPark' ? [] : (operation?.arguments ?? [])
+  const arguments_ = operation?._tag === 'ExecutionRelinquish' ? [] : (operation?.arguments ?? [])
   const operationProviders = operation?._tag === 'RunEffectValue' ? operation.providers : []
   // One selection identity for both the dedup and the argument lookup below — two predicates
   // here previously let a provider count as "already selected" yet miss its runtime argument.
@@ -104,7 +104,7 @@ const runnerOf = (
       }
     })
   let declaration: typeof runner.declaration | undefined
-  if (operation === undefined || operation._tag === 'ExecutionPark') {
+  if (operation === undefined || operation._tag === 'ExecutionRelinquish') {
     declaration = runner.declaration
   } else if (operation._tag === 'RunEffect') {
     declaration = operation.target
@@ -112,7 +112,7 @@ const runnerOf = (
     declaration = operation.runner
   }
   let typeArguments: ReadonlyArray<Type.GenericArgument>
-  if (operation === undefined || operation._tag === 'ExecutionPark') {
+  if (operation === undefined || operation._tag === 'ExecutionRelinquish') {
     typeArguments = runner.typeArguments
   } else if (operation._tag === 'RunEffect') {
     typeArguments = operation.typeArguments
@@ -120,7 +120,7 @@ const runnerOf = (
     typeArguments = operation.runnerTypeArguments
   }
   let staticArguments: ReadonlyArray<StaticValue.Value>
-  if (operation === undefined || operation._tag === 'ExecutionPark')
+  if (operation === undefined || operation._tag === 'ExecutionRelinquish')
     staticArguments = runner.instance?.staticArguments ?? []
   else if (operation._tag === 'RunEffect') staticArguments = operation.staticArguments ?? []
   else if (operation._tag === 'RunEffectValue' || operation._tag === 'CatchEffect')
@@ -128,7 +128,7 @@ const runnerOf = (
   else staticArguments = []
   const exact = functions.find((fn) => {
     if (declaration === undefined) return false
-    if (operation === undefined || operation._tag === 'ExecutionPark')
+    if (operation === undefined || operation._tag === 'ExecutionRelinquish')
       return Mir.matchesInstance(fn, declaration, typeArguments, staticArguments)
     return Mir.matchesEffectInstance(
       fn,
@@ -155,7 +155,7 @@ const runnerOf = (
     ...(runner.effectIdentity === undefined ? {} : { effectIdentity: runner.effectIdentity }),
     typeArguments,
     outcome:
-      operation === undefined || operation._tag === 'ExecutionPark'
+      operation === undefined || operation._tag === 'ExecutionRelinquish'
         ? runner.outcome
         : operation.outcomeType.type,
     captures: runner.captures,
@@ -181,7 +181,7 @@ const completionOf = (
         failureValueShape: operation.failureValueShape,
       }
     if (
-      operation._tag !== 'ExecutionPark' &&
+      operation._tag !== 'ExecutionRelinquish' &&
       Type.failureMembers(operation.outcomeType.type).length === 0
     )
       return {
@@ -228,7 +228,7 @@ interface LocatedOperation {
   readonly region: Mir.RegionId
   readonly operation: Extract<
     Mir.Operation,
-    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionPark' }
+    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionRelinquish' }
   >
 }
 
@@ -248,7 +248,7 @@ const operationsOf = (fn: Mir.MirFunction): ReadonlyArray<LocatedOperation> =>
         operation._tag === 'RunEffect' ||
         operation._tag === 'RunEffectValue' ||
         operation._tag === 'CatchEffect' ||
-        operation._tag === 'ExecutionPark'
+        operation._tag === 'ExecutionRelinquish'
           ? [{ region: region.id, operation }]
           : [],
       )
@@ -284,7 +284,7 @@ const regionsOf = (
           entry.operation.provenance.span.start === outcome.span.start &&
           entry.operation.provenance.span.end === outcome.span.end,
       )
-      if (candidate === undefined || candidate.operation._tag === 'ExecutionPark') return []
+      if (candidate === undefined || candidate.operation._tag === 'ExecutionRelinquish') return []
       const deferred = runnerOf(outcome.deferred, index, candidate.operation, program.functions)
       return [
         {
@@ -304,10 +304,10 @@ const regionsOf = (
         sameSpan(entry.operation, outcome) &&
         (outcome.completion._tag === 'Reify'
           ? entry.operation._tag === 'CatchEffect' ||
-            (entry.operation._tag !== 'ExecutionPark' &&
+            (entry.operation._tag !== 'ExecutionRelinquish' &&
               Type.failureMembers(entry.operation.outcomeType.type).length === 0)
           : entry.operation._tag !== 'CatchEffect') &&
-        (entry.operation._tag === 'ExecutionPark'
+        (entry.operation._tag === 'ExecutionRelinquish'
           ? Type.equals(outcome.runner.outcome.success, Type.unit)
           : true),
     )
@@ -316,7 +316,7 @@ const regionsOf = (
       // Lowering a selected failure handler can produce a synchronous call at the same
       // source span as its protected suspendable recipe. Only the actual runner can relay.
       if (
-        candidate.operation._tag !== 'ExecutionPark' &&
+        candidate.operation._tag !== 'ExecutionRelinquish' &&
         runner.instance !== undefined &&
         ProvisionalMir.classificationOfExecution(provisional, runner.instance) === 'Synchronous'
       )
@@ -436,7 +436,7 @@ export const originReachableFunctions = (self: Mir.Module): ReadonlySet<string> 
           (region) =>
             region._tag === 'SuspendEffectRegion' ||
             (region._tag === 'RunSuspendableEffectRegion' &&
-              region.operation._tag === 'ExecutionPark'),
+              region.operation._tag === 'ExecutionRelinquish'),
         ),
       )
       .map((fn) => Instances.keyText(fn.instance)),
@@ -554,7 +554,7 @@ export const finalize = (
       const regions = fn.suspension.regions.filter(
         (region) =>
           region._tag === 'SuspendEffectRegion' ||
-          region.operation._tag === 'ExecutionPark' ||
+          region.operation._tag === 'ExecutionRelinquish' ||
           functions.some(
             (candidate) =>
               reachable.has(Instances.keyText(candidate.instance)) &&

@@ -4,6 +4,7 @@ import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
+import { relinquishedReleases } from './support/relinquishedFrames.js'
 
 const implementation = readFileSync(
   new URL('../stdlib/silk/native_socket.silk', import.meta.url),
@@ -16,7 +17,7 @@ const reference = readFileSync(
 const encoder = new TextEncoder()
 
 const symbolAndCleanupSource = `import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, ListenOptions, Listener, NativeSocketError, accept, listen, withListener}
 import silk.network_address {Endpoint}
@@ -24,12 +25,12 @@ import silk.option {Option}
 import silk.system_clock {Instant, SystemClock}
 import silk.u64
 
-struct ParkGuard {wake: Intrinsic.Wake}
+struct ParkGuard {wake: Wake}
 impl Drop for ParkGuard {
   fn drop(self: &mut ParkGuard) -> () { return () }
 }
 
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard {
+fn retainWake(wake: Wake) -> ParkGuard {
   return ParkGuard {wake: move wake}
 }
 
@@ -180,11 +181,10 @@ it.effect(
         assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [], target)
         if (snapshot.mir._tag === 'Available') {
           assert.deepEqual(
-            snapshot.mir.value.functions
-              .flatMap(MirVerification.operations)
-              .filter((operation) => operation._tag === 'ExecutionPark')
-              .map((operation) => ({ cleanup: operation.guardCleanup._tag })),
-            [{ cleanup: 'HookCleanup' }],
+            relinquishedReleases(snapshot.mir.value).map((releases) =>
+              releases.map((cleanup) => cleanup._tag),
+            ),
+            [['HookCleanup']],
             target,
           )
         }

@@ -24159,10 +24159,6 @@ effect fn intrinsicCallTarget(
       if intrinsicRuntimeMember(member) {
         code = RejectionCode.IntrinsicUnavailable
       }
-      // External parking belongs to the Execution stage (Effect note D6).
-      if same(member, b"park") {
-        code = RejectionCode.SuspensionUnavailable
-      }
       return Result.failResult<ResolvedTarget, Shared<Rejection>>(
         run reject(&resolver.*, module, code, memberSpan),
       )
@@ -29512,9 +29508,31 @@ effect fn flowsCovariantly(
       }
       return true
     }
+    // An Effect contract is covariant in its environment, success and failure: an Effect valid for a
+    // longer region also runs within a shorter one. A row with entries is conservatively invariant;
+    // a row of row parameters alone names no region.
+    Type.Effect {environment, success, failure, requirements, ..} => {
+      if !covariant {
+        let regions = run callableEnvironmentRegions(&environment)
+        let listed = Vector.asSlice<Shared<Lifetime>>(&regions)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if markedRegion(&listed[at], marker) { return false }
+          at = at + usize.ONE
+        }
+      }
+      if Shared.with<Row, bool>(&requirements, fn(row: &Row) -> bool {
+        return Vector.length<Requirement>(&row.entries) != usize.ZERO || Vector.length<RowSubtraction>(&row.subtractions) != usize.ZERO
+      }) { return false }
+      if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &success, marker, covariant, &mut active.*, span) {
+        return false
+      }
+      return run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &failure, marker, covariant, &mut active.*, span)
+    }
     _ => { return false }
   }
 }
+
 
 // A region a boundary admitted where it fixes another region without proof, before the body
 // retains the pair as a `RegionRelation` safety obligation.
@@ -29751,6 +29769,37 @@ effect fn binderMeet(
 // bound names it. An `effect fn` environment binder qualifies too: the Effect it returns is only
 // valid for a shorter region. On success the binding is replaced and the caller matches the operand
 // again.
+// Whether shortening inference binder `ordinal` keeps every bound of a signature provable on the
+// final bindings, which the caller proves again. A `provides` bound selects by access and provider
+// type, never by its loan's region. A representation bound admits a shorter binder when its
+// contract stores the binder only covariantly, as `once Effect<'env; A>` does: the operand's Effect
+// environment still outlives the meet.
+effect fn boundsAdmitShortening(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  signature: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId, ordinal: usize, span: Span,
+) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let marker = Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Parameter {declaration: run DeclarationId.copy(fresh), ordinal: ordinal})}
+  let count = Shared.with<Result<Answer, NoRejection>, usize>(signature, signatureConstraintCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let bound = Shared.with<Result<Answer, NoRejection>, Option<Constraint>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraint(answer, at) })
+    let mut admitted = false
+    match move bound {
+      Option<Constraint>.Some {value: Constraint.Provides {..}} => { admitted = true }
+      Option<Constraint>.Some {value: Constraint.Represents {contract, ..}} => {
+        let mut active = Vector.make<DeclarationId>()
+        admitted = run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &contract, &marker, true, &mut active, span)
+      }
+      _ => ()
+    }
+    if !admitted { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 effect fn shortenedBinder(
   resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
   parameter: &Shared<Type>, actual: &Shared<Type>, signature: &Shared<Result<Answer, NoRejection>>,
@@ -29758,7 +29807,6 @@ effect fn shortenedBinder(
   explicit: &[usize], span: Span,
 ) -> bool
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-  if Shared.with<Result<Answer, NoRejection>, usize>(signature, signatureConstraintCount) != usize.ZERO { return false }
   let parameters = run signatureParameterTypes(signature)
   let listed = Vector.asSlice<Shared<Type>>(&parameters)
   let count = Vector.length<Binding>(&inferred.*)
@@ -29770,7 +29818,8 @@ effect fn shortenedBinder(
     let ordinal = bindings[at].ordinal
     let region = run binderMeet(parameter, actual, variables, bindings, at, explicit)
     if let Option<Shared<Lifetime>>.Some {value: offered} = move region {
-      if run storedCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, listed, fresh, ordinal, span) {
+      let covariantStorage = run storedCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, listed, fresh, ordinal, span)
+      if covariantStorage && run boundsAdmitShortening(&mut resolver.*, &mut owner.*, &mut dependencies.*, signature, fresh, ordinal, span) {
         chosen = at
         shorter = Option.some<Shared<Lifetime>>(move offered)
       }
@@ -35087,6 +35136,14 @@ effect fn storageCallable(resolver: &mut Resolver, owner: &mut Query<Word, Answe
   return Option.none<Shared<Rejection>>()
 }
 
+// Whether a storage operand borrows an `Intrinsic.ExecutionRef`.
+effect fn executionRefView(subject: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match move run storageView(subject, false) {
+    Option<StorageView>.Some {value: view} => SealedCore.isCore(&view.target, SealedKind.ExecutionRef)
+    Option<StorageView>.None => false
+  }
+}
+
 // Checks one sealed storage primitive against its contract, instantiated from its type arguments.
 // Raw-buffer and slot contents stay owned by library code; only the operands' own types are checked.
 effect fn checkStorageCall<'scope>(
@@ -35201,6 +35258,16 @@ effect fn checkStorageCall<'scope>(
           run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&written[at])))
           at = at + usize.ONE
         }
+      }
+      // A control word is addressed and written as a word.
+      StorageOperation.ExecutionLoad => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+      }
+      StorageOperation.ExecutionStore => {
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.none<Shared<Type>>())
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
+        run Vector.append<Option<Shared<Type>>>(&mut contexts, Option.some<Shared<Type>>(Shared.clone<Type>(&word)))
       }
       // One activation takes the handle, then the branch state and both outcome callbacks as written.
       StorageOperation.ExecutionDrive => {
@@ -35345,13 +35412,43 @@ effect fn checkStorageCall<'scope>(
         }
       }
       StorageOperation.ExecutionFromAllocation => { ty = run SealedCore.applied(SealedKind.Execution, &element) }
-      StorageOperation.ExecutionNotifyInitial => {
+      StorageOperation.ExecutionRefOf => {
         let execution = run SealedCore.applied(SealedKind.Execution, &element)
         let accepted = match move run storageView(&subject, false) {
-          Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &execution)
+          Option<StorageView>.Some {value: view} => run Type.equalsShared(&view.target, &execution)
           Option<StorageView>.None => false
         }
         if !accepted { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = run SealedCore.make(SealedKind.ExecutionRef, Vector.make<Argument>())
+      }
+      // Every other reference operation reads its package through a borrowed ExecutionRef.
+      StorageOperation.ExecutionLoad => {
+        if !run executionRefView(&subject) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = Shared.clone<Type>(&word)
+      }
+      StorageOperation.ExecutionStore => {
+        if !run executionRefView(&subject) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+      }
+      StorageOperation.ExecutionNotify => {
+        if !run executionRefView(&subject) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+      }
+      StorageOperation.ExecutionLive => {
+        if !run executionRefView(&subject) { return Result.failResult<BodyNodeId, Shared<Rejection>>(move mismatch) }
+        ty = run primitiveType(b"bool")
+      }
+      // Relinquishing and naming the running package are Effects their run executes in place.
+      StorageOperation.Relinquish => {
+        ty = run Shared.make<Type>(Type.Effect {mode: CallableMode.Once,
+          environment: run Shared.make<Intersection>(Intersection {members: Vector.make<LifetimeMember>()}),
+          success: run Shared.make<Type>(Type.Unit), failure: run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()}),
+          requirements: run Shared.make<Row>(Row.empty())})
+      }
+      StorageOperation.ExecutionCurrent => {
+        ty = run Shared.make<Type>(Type.Effect {mode: CallableMode.Once,
+          environment: run Shared.make<Intersection>(Intersection {members: Vector.make<LifetimeMember>()}),
+          success: run SealedCore.make(SealedKind.ExecutionRef, Vector.make<Argument>()),
+          failure: run Shared.make<Type>(Type.Union {members: Vector.make<Shared<Type>>()}),
+          requirements: run Shared.make<Row>(Row.empty())})
       }
       StorageOperation.SharedClone => {
         let accepted = match move run storageView(&subject, false) {
@@ -35522,6 +35619,7 @@ fn immediateOperand(nodes: &[BodyNode], value: BodyNodeId) -> bool {
     // in place.
     if let BodyExpression.StorageCall {operation, ..} = &form {
       return operation == StorageOperation.SystemAllocationAcquire || operation == StorageOperation.ExecutionDrive
+        || operation == StorageOperation.Relinquish || operation == StorageOperation.ExecutionCurrent
     }
     // An `effect fn` interface operation runs as one call of its selected witness.
     if let BodyExpression.InterfaceCall {isEffect, ..} = &form { return isEffect }
@@ -46189,7 +46287,8 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Word, Answe
     return run storeMir(&mut resolver.*, move function, move tracked)
   }
   // A package drops its unstarted body, its readiness state and endpoint where they need cleanup,
-  // and then its own allocation, which holds the package; the header's result is always moved out.
+  // and then releases its handle's authority over its own allocation, which the header holds; the
+  // header's result is always moved out.
   if core == SealedKind.ExecutionBlock {
     let listed = match move run SealedCore.fields(ty) {
       Option<Vector<Shared<Type>>>.Some {value} => value
@@ -46198,13 +46297,10 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Word, Answe
     let entries = Vector.asSlice<Shared<Type>>(&listed)
     let mut children = Vector.make<Option<GlueChild>>()
     let mut field = SealedCore.ordinal(CoreField.PackageBody)
-    while field <= SealedCore.ordinal(CoreField.PackageAllocation) {
-      let mut needed = true
-      if field < SealedCore.ordinal(CoreField.PackageAllocation) {
-        needed = match move run glueNeeds(&mut resolver.*, &mut owner.*, &mut tracked, &entries[field]) {
-          Result<bool, PreparationFailure>.Success {value} => value
-          Result<bool, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(&identity, move error, move tracked) }
-        }
+    while field <= SealedCore.ordinal(CoreField.PackageEndpoint) {
+      let needed = match move run glueNeeds(&mut resolver.*, &mut owner.*, &mut tracked, &entries[field]) {
+        Result<bool, PreparationFailure>.Success {value} => value
+        Result<bool, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(&identity, move error, move tracked) }
       }
       let mut prepared = Option.none<GlueChild>()
       if needed {
@@ -46218,11 +46314,13 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Word, Answe
       run Vector.append<Option<GlueChild>>(&mut children, move prepared)
       field = field + usize.ONE
     }
-    let last = match move Vector.pop<Option<GlueChild>>(&mut children) {
-      Option<Option<GlueChild>>.Some {value} => value
-      Option<Option<GlueChild>>.None => { return memberSuccess(move gap, move tracked) }
+    let selected = match move run glueChild(SealedCore.ordinal(CoreField.HeaderAllocation), &allocationType, &anchor) {
+      Result<Option<GlueChild>, PreparationFailure>.Success {value} => value
+      Result<Option<GlueChild>, PreparationFailure>.Failure {error: failure} => {
+        return run preparationQueryAnswer(&identity, move failure, move tracked)
+      }
     }
-    let allocation = match move last {
+    let allocation = match move selected {
       Option<GlueChild>.Some {value: child} => child
       Option<GlueChild>.None => { return memberSuccess(move gap, move tracked) }
     }
@@ -46231,6 +46329,24 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Word, Answe
     let unstarted = Vector.remove<Option<GlueChild>>(&mut children, usize.ZERO)
     let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Package {body: move unstarted, ready: move ready,
       endpoint: move endpoint, allocation: move allocation}, observing)
+    return run storeMir(&mut resolver.*, move function, move tracked)
+  }
+  // A reference releases one unit of authority and, with the last, the package's allocation.
+  if core == SealedKind.ExecutionRef {
+    let selected = match move run glueChild(SealedCore.ordinal(CoreField.HeaderAllocation), &allocationType, &anchor) {
+      Result<Option<GlueChild>, PreparationFailure>.Success {value} => value
+      Result<Option<GlueChild>, PreparationFailure>.Failure {error: failure} => {
+        return run preparationQueryAnswer(&identity, move failure, move tracked)
+      }
+    }
+    let allocation = match move selected {
+      Option<GlueChild>.Some {value: child} => child
+      Option<GlueChild>.None => { return memberSuccess(move gap, move tracked) }
+    }
+    let unit = run Shared.make<Type>(Type.Unit)
+    let header = run SealedCore.headerBeside(&anchor, &unit)
+    let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Reference {header: move header, allocation: move allocation},
+      observing)
     return run storeMir(&mut resolver.*, move function, move tracked)
   }
   // An unstarted Execution releases its package through the package's own erased glue.
@@ -49283,7 +49399,17 @@ effect fn storagePlan(resolver: &mut Resolver, owner: &mut Query<Word, Answer, N
     let unit = run Shared.make<Type>(Type.Unit)
     let completed = run storageCallableTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, completion, caller,
       callerBindings, projections, identity, own, module, move passed, &unit, false, &mut targets, &mut results)
-    if let Option<PreparationFailure>.Some {value} = move completed { return Result.failResult<MirStoragePlan, PreparationFailure>(move value) }
+    if let Option<PreparationFailure>.Some {value} = move completed { return Result.failResult<MirStoragePlan, PreparationFailure>(move value) }    // A relinquished activation hands the branch state and the Execution back to `onSuspend`.
+    let suspension = match move TypedBody.storageArgument(body, node, 3) {
+      Option<BodyNodeId>.Some {value} => value
+      Option<BodyNodeId>.None => { fail RevisionMismatch {} }
+    }
+    let mut returned = Vector.make<Shared<Type>>()
+    run Vector.append<Shared<Type>>(&mut returned, run storageInstanceType(body, node, usize.ONE, callerBindings, projections))
+    run Vector.append<Shared<Type>>(&mut returned, run SealedCore.applied(SealedKind.Execution, &element))
+    let suspended = run storageCallableTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, suspension, caller,
+      callerBindings, projections, identity, own, module, move returned, &unit, false, &mut targets, &mut results)
+    if let Option<PreparationFailure>.Some {value} = move suspended { return Result.failResult<MirStoragePlan, PreparationFailure>(move value) }
   }
   let mut steps = Vector.make<MirRunPlan>()
   if operation == StorageOperation.ExecutionFromAllocation {
@@ -49740,8 +49866,7 @@ effect fn provideCall(resolver: &mut Resolver, owner: &mut Query<Word, Answer, N
   }
   // Lifetimes lent to the witness are erased at runtime; the caller's loans were already checked.
   let passes = Vector.asSlice<OperandPass>(&witness.operands)
-  // The witness's own binders are stated in the operation's binders; the call supplies those.
-  let mut lent = run Application.bindings(&application)
+  let mut lent = Vector.make<Binding>()
   let mut at = usize.ZERO
   while at < passes.length {
     if let OperandPass.Borrow {lifetimeOrdinal, ..} = &passes[at] {
@@ -57667,8 +57792,8 @@ effect fn proveAppliedBounds(
       premise = premise + usize.ONE
     }
     if assumed { at = at + usize.ONE continue }
-    // NonParking is a transitive suspension summary. Before the suspension stage, reaching parking
-    // is itself the `suspension` gap at that site, so every caller already fails through it (D6).
+    // NonParking is a transitive suspension summary that this checker does not prove yet: a bounded
+    // callable that relinquishes is accepted here, so only valid programs are lowered faithfully.
     if let Constraint.Property {subject, property} = &bounds[at] {
       if property == IntrinsicProperty.NonParking { at = at + usize.ONE continue }
       if !run provesDetached(assumptions, &subject, module) {

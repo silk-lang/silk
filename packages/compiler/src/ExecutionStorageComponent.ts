@@ -148,10 +148,11 @@ const bootstrapDemand = (
         enqueue(LocalSharedPayloadCleanup.declaration, [plan.element])
         cleanup(plan.allocation)
         break
-      case 'ExecutionCleanup':
-      case 'WakeCleanup': {
-        const result =
-          plan._tag === 'ExecutionCleanup' ? Type.typeArgumentAt(plan.type, 0) : undefined
+      case 'ExecutionRefCleanup':
+        cleanup(plan.allocation)
+        break
+      case 'ExecutionCleanup': {
+        const result = Type.typeArgumentAt(plan.type, 0)
         for (const package_ of program.layout.executionPackages.plans) {
           if (result !== undefined && !Type.equals(package_.specialization.result, result)) continue
           if (package_.cleanup === undefined) continue
@@ -227,10 +228,6 @@ const bootstrapDemand = (
       if ('completionCleanup' in operation) {
         cleanup(operation.completionCleanup)
         cleanup(operation.suspensionCleanup)
-      }
-      if ('guardCleanup' in operation) {
-        cleanup(operation.guardCleanup)
-        cleanup(operation.registerCleanup)
       }
       if ('useCleanup' in operation) {
         cleanup(operation.useCleanup)
