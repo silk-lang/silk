@@ -160,12 +160,12 @@ it.effect(
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
       assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
       if (snapshot.mir._tag !== 'Available') return
-      // The zero-sized completed registration needs no frame slot; the held one keeps its hook.
+      // Both registration guards, including the zero-sized completed one, keep their drop hooks.
       assert.deepEqual(
         relinquishedReleases(snapshot.mir.value).map((releases) =>
           releases.map((cleanup) => cleanup._tag),
         ),
-        [[], ['HookCleanup']],
+        [['HookCleanup'], ['HookCleanup']],
       )
     }),
   60000,
