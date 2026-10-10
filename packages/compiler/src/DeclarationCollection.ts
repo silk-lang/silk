@@ -3142,6 +3142,8 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
         header.target === undefined
           ? unavailable(header.anchor)
           : analyzeDeclaredType(context, header.target, environment).fact
+      const headConstraints = collectConstraints(context, header.constraints, environment)
+      diagnostics.push(...headConstraints.diagnostics)
       // A binder's bound is re-analyzed here rather than reused from the parameter collection,
       // because a conditional requirement may name any binder the header declares — including the
       // one it bounds — and only the completed environment can resolve those occurrences.
@@ -3292,6 +3294,8 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
         self: selfType,
         typeParameters: collected.facts,
         requirements: requirements,
+        constraints: headConstraints.facts,
+        constraintContracts: [],
         capability,
         provider,
         visibility: 'Public',
@@ -4191,6 +4195,8 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
                 built,
                 refinedBinders,
               ),
+              // The head's `where` clause is a premise of every inline body, like its binder bounds.
+              constraints: [...conformance.constraints, ...built.constraints],
               id,
               canonical: {
                 _tag: 'Canonical' as const,
@@ -4256,9 +4262,9 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
         (binder, index) =>
           binder.name._tag === 'Present' && argumentSpellings[index] === binder.name.spelling,
       )
-    const bounded = binders.some(
-      (binder) => binder.bounds.length > 0 || binder.representationBound !== undefined,
-    )
+    const bounded =
+      header.constraints.length > 0 ||
+      binders.some((binder) => binder.bounds.length > 0 || binder.representationBound !== undefined)
     let headDiagnostic: Diagnostic.Located | undefined
     if (ownerPath === undefined || ownerPath.segments.length !== 1) {
       headDiagnostic = Diagnostic.invalidInherentHead(
