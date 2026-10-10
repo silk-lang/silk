@@ -590,6 +590,11 @@ pub union RunPlan {
     pub innerFailure: Shared<Type>,
     pub finalizer: usize,
     pub finalizerSuccess: Shared<Type>,
+    /// Whether the finalizer is `NonParking`. Cancelling a parked protected part runs a nonparking
+    /// finalizer once and drops any other finalizer unrun.
+    pub nonParking: bool,
+    /// The finalizer part's type when it owns cleanup; a cancelled parking finalizer drops it.
+    pub finalizerDrop: Option<Shared<Type>>,
   },
   /// Owns the resource in part 0 and lends it exclusively to `use` (part 1), then to `release`
   /// (part 2) on both exits, and drops it before the outcome continues.
@@ -763,6 +768,21 @@ struct Builder {
   // handler of a caught failure, and the finalizer or release that holds one. A cancel exit
   // from those calls releases each, innermost first (N7).
   held: Vector<usize>
+  // The composed Effects whose pending cleanup a cancel exit inside them runs, innermost last.
+  cancelScopes: Vector<CancelScope>
+  // Set while a cancel landing is lowered: its calls run to completion, so they record no exit.
+  landing: bool
+}
+
+// A composed Effect whose cleanup is still pending while its protected part runs: a finalizer, a
+// release, an observer state or an unused handler. Each cancel exit recorded inside it sets
+// `selector` to its own continuation and enters `entry`, which runs that cleanup once and
+// dispatches on `selector`. Both are allocated by the first cancel exit, so a scope no exit
+// reaches adds nothing.
+struct CancelScope {
+  selector: usize
+  entry: usize
+  continuations: Vector<usize>
 }
 
 struct DiagnosticPlaces {
@@ -3135,7 +3155,7 @@ effect fn leaveFunction(builder: &mut Builder, kind: ExitKind, origin: Origin) -
 // frame. The point's own terminator is still to be written.
 effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  if !builder.live { return () }
+  if !builder.live || builder.landing { return () }
   let point = builder.current
   let entry = run block(&mut builder.*, origin)
   resume(&mut builder.*, entry)
@@ -3146,9 +3166,89 @@ effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
     let slot = Vector.asSlice<usize>(&builder.held)[at]
     run release(&mut builder.*, slot, origin)
   }
+  // Each enclosing composed Effect's pending cleanup runs, innermost first, before the point's
+  // own drops: finalizers before frame cleanup, as in an exit that completes.
+  at = Vector.length<CancelScope>(&builder.cancelScopes)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run enterLanding(&mut builder.*, at, origin)
+  }
   run leaveFunction(&mut builder.*, ExitKind.Abandons, origin)
   resume(&mut builder.*, point)
   return run Vector.append<Cancel>(&mut builder.*.function.cancels, Cancel {point: point, entry: entry})
+}
+
+// Continues a cancel exit through scope `at`'s landing, resuming where its dispatch returns.
+effect fn enterLanding(builder: &mut Builder, at: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if Vector.asSlice<CancelScope>(&builder.cancelScopes)[at].entry == usize.MAX {
+    let selector = run temporary(&mut builder.*, &run usizeType(), origin)
+    let entry = run block(&mut builder.*, origin)
+    let mut scopes = Vector.asMutSlice<CancelScope>(&mut builder.*.cancelScopes)
+    scopes[at].selector = selector
+    scopes[at].entry = entry
+  }
+  let selector = Vector.asSlice<CancelScope>(&builder.cancelScopes)[at].selector
+  let entry = Vector.asSlice<CancelScope>(&builder.cancelScopes)[at].entry
+  let index = Vector.length<usize>(&Vector.asSlice<CancelScope>(&builder.cancelScopes)[at].continuations)
+  run assign(&mut builder.*, place(selector), Rvalue.Use {value: run usizeOperand(usize.toU64(index))}, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: entry, origin: origin})
+  let continuation = run block(&mut builder.*, origin)
+  let mut scopes = Vector.asMutSlice<CancelScope>(&mut builder.*.cancelScopes)
+  run Vector.append<usize>(&mut scopes[at].continuations, continuation)
+  resume(&mut builder.*, continuation)
+  return ()
+}
+
+// Opens the cancel scope of a composed Effect whose protected part is about to run.
+effect fn openCancelScope(builder: &mut Builder) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Vector.append<CancelScope>(&mut builder.*.cancelScopes,
+    CancelScope {selector: usize.MAX, entry: usize.MAX, continuations: Vector.make<usize>()})
+}
+
+// Closes the innermost cancel scope once its protected part is lowered. When a cancel exit
+// entered it, lowering resumes in its landing for the caller to lower the pending cleanup into,
+// then `closeLanding` dispatches; the returned state restores ordinary lowering.
+fn closeCancelScope(builder: &mut Builder) -> Option<Landing> {
+  let scope = match Vector.pop<CancelScope>(&mut builder.*.cancelScopes) {
+    Option<CancelScope>.Some {value} => value
+    Option<CancelScope>.None => { return Option.none<Landing>() }
+  }
+  if scope.entry == usize.MAX { return Option.none<Landing>() }
+  let landing = Landing {scope: move scope, current: builder.current, live: builder.live, nested: builder.landing}
+  resume(&mut builder.*, landing.scope.entry)
+  builder.landing = true
+  return Option.some<Landing>(move landing)
+}
+
+// Ends a landing: dispatches to the continuation of the cancel exit that entered it.
+effect fn closeLanding(builder: &mut Builder, landing: Landing, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let continuations = Vector.asSlice<usize>(&landing.scope.continuations)
+  let mut cases = Vector.make<SwitchCase>()
+  let mut at = usize.ZERO
+  while at < continuations.length {
+    run Vector.append<SwitchCase>(&mut cases, SwitchCase {decimal: run Type.extentText(at), negative: false,
+      target: continuations[at]})
+    at = at + usize.ONE
+  }
+  let unreachable = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(landing.scope.selector)}, cases: move cases,
+    otherwise: unreachable, origin: origin})
+  resume(&mut builder.*, unreachable)
+  terminate(&mut builder.*, Terminator.Unreachable {origin: origin})
+  builder.landing = landing.nested
+  builder.current = landing.current
+  builder.live = landing.live
+  return ()
+}
+
+// The ordinary lowering state a cancel landing interrupts.
+struct Landing {
+  scope: CancelScope
+  current: usize
+  live: bool
+  nested: bool
 }
 
 // A call to a suspendable callee is a suspension point of the frame variant.
@@ -6145,6 +6245,8 @@ effect fn packageHelper(creator: &Builder, key: InstanceKey, package: &Shared<Ty
     exits: Vector.make<ExitStep>(), left: Vector.make<LeftExit>(), suspending: Option.none<Vector<InstanceKey>>(),
     cancelEveryCall: true,
     held: Vector.make<usize>(),
+    cancelScopes: Vector.make<CancelScope>(),
+    landing: false,
   }
   let first = run block(&mut builder, origin)
   resume(&mut builder, first)
@@ -7321,7 +7423,9 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let bodyPart = run projectedPart(environment, 2)
       let observing = match &builder.diagnostics { Option<DiagnosticPlaces>.Some {..} => true _ => false }
       if !observing {
+        run openCancelScope(&mut builder.*)
         run executePlan(&mut builder.*, steps, inner, &bodyPart, output, sink, &mut bound.*, origin)
+        run dropOnCancel(&mut builder.*, &statePart, &stateDrop, origin)
         return run dropUnused(&mut builder.*, &statePart, &stateDrop, origin)
       }
       let word = run addressType()
@@ -7340,10 +7444,13 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run assign(&mut builder.*, place(observer), Rvalue.AddressOf {access: Access.Shared, place: place(record)}, origin)
       let none = run temporary(&mut builder.*, &run causeType(), origin)
       run assign(&mut builder.*, place(none), Rvalue.Use {value: Operand.Null {ty: run causeType()}}, origin)
+      run openCancelScope(&mut builder.*)
       let outer = swapDiagnostics(&mut builder.*, Option.some<DiagnosticPlaces>(DiagnosticPlaces {observer: place(observer),
         cause: place(none)}))
       run executePlan(&mut builder.*, steps, inner, &bodyPart, output, sink, &mut bound.*, origin)
       drop swapDiagnostics(&mut builder.*, move outer)
+      // A cancelled body drops the state after its exits released their nodes, as a completed one does.
+      run dropOnCancel(&mut builder.*, &statePart, &stateDrop, origin)
       run dropUnused(&mut builder.*, &statePart, &stateDrop, origin)
     }
     RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop} => {
@@ -7354,7 +7461,9 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let protectedPart = run projectedPart(environment, usize.ZERO)
       let handlerPart = run projectedPart(environment, usize.ONE)
       let local = FailureSink.Catch {temp: caught, block: selecting}
+      run openCancelScope(&mut builder.*)
       run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &local, &mut bound.*, origin)
+      run dropOnCancel(&mut builder.*, &handlerPart, &handlerDrop, origin)
       run dropUnused(&mut builder.*, &handlerPart, &handlerDrop, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, selecting)
@@ -7426,18 +7535,24 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       }
       resume(&mut builder.*, joined)
     }
-    RunPlan.Finalize {inner, innerFailure, finalizer, finalizerSuccess} => {
+    RunPlan.Finalize {inner, innerFailure, finalizer, finalizerSuccess, nonParking, finalizerDrop} => {
       let protectedPart = run projectedPart(environment, usize.ZERO)
       let finalizerPart = run projectedPart(environment, usize.ONE)
       if Shared.with<Type, bool>(&innerFailure, neverType) {
+        run openCancelScope(&mut builder.*)
         run executePlan(&mut builder.*, steps, inner, &protectedPart, output, sink, &mut bound.*, origin)
+        run finalizeOnCancel(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, nonParking, &finalizerDrop,
+          &mut bound.*, origin)
         return run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       }
       // Both exits run the finalizer; a failure is held in `caught` until it has finished (D4).
       let caught = run temporary(&mut builder.*, &innerFailure, origin)
       let failing = run block(&mut builder.*, origin)
       let joined = run block(&mut builder.*, origin)
+      run openCancelScope(&mut builder.*)
       run executePlan(&mut builder.*, steps, inner, &protectedPart, output, &FailureSink.Catch {temp: caught, block: failing},
+        &mut bound.*, origin)
+      run finalizeOnCancel(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, nonParking, &finalizerDrop,
         &mut bound.*, origin)
       run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
@@ -7456,16 +7571,22 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run assign(&mut builder.*, place(borrowed), Rvalue.Ref {access: Access.Mutable, place: run copyPlace(&resource)}, origin)
       let used = run singleOperand(Operand.Copy {place: place(borrowed)})
       if Shared.with<Type, bool>(&useFailure, neverType) {
+        run openCancelScope(&mut builder.*)
         run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output, sink,
           Vector.asSlice<BoundPlace>(&bound.*), origin, usize.MAX)
+        run releaseOnCancel(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
+          &resourceDrop, Vector.asSlice<BoundPlace>(&bound.*), origin)
         return run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
           &resourceDrop, Vector.asSlice<BoundPlace>(&bound.*), origin)
       }
       let caught = run temporary(&mut builder.*, &useFailure, origin)
       let failing = run block(&mut builder.*, origin)
       let joined = run block(&mut builder.*, origin)
+      run openCancelScope(&mut builder.*)
       run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output,
         &FailureSink.Catch {temp: caught, block: failing}, Vector.asSlice<BoundPlace>(&bound.*), origin, usize.MAX)
+      run releaseOnCancel(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
+        &resourceDrop, Vector.asSlice<BoundPlace>(&bound.*), origin)
       run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
         Vector.asSlice<BoundPlace>(&bound.*), origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
@@ -7486,6 +7607,48 @@ effect fn finalizeOnce(builder: &mut Builder, steps: &[RunPlan], step: usize, pa
   bound: &mut Vector<BoundPlace>, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let done = run temporary(&mut builder.*, success, origin)
   return run executePlan(&mut builder.*, steps, step, part, done, &FailureSink.Propagate, &mut bound.*, origin)
+}
+
+// Closes the innermost cancel scope, dropping an unused part in its landing (E3b-2 cancel).
+effect fn dropOnCancel(builder: &mut Builder, part: &Place, ty: &Option<Shared<Type>>, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if let Option<Landing>.Some {value: landing} = closeCancelScope(&mut builder.*) {
+    run dropUnused(&mut builder.*, part, ty, origin)
+    run closeLanding(&mut builder.*, move landing, origin)
+  }
+  return ()
+}
+
+// Closes the innermost cancel scope. Its landing runs an armed nonparking finalizer once, before
+// the frame's own cleanup, and drops any other finalizer unrun.
+effect fn finalizeOnCancel(builder: &mut Builder, steps: &[RunPlan], step: usize, part: &Place, success: &Shared<Type>,
+  nonParking: bool, finalizerDrop: &Option<Shared<Type>>, bound: &mut Vector<BoundPlace>, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if let Option<Landing>.Some {value: landing} = closeCancelScope(&mut builder.*) {
+    if nonParking {
+      run finalizeOnce(&mut builder.*, steps, step, part, success, &mut bound.*, origin)
+    } else {
+      run dropUnused(&mut builder.*, part, finalizerDrop, origin)
+    }
+    run closeLanding(&mut builder.*, move landing, origin)
+  }
+  return ()
+}
+
+// Closes the innermost cancel scope, releasing and dropping the resource in its landing. A
+// release that can fail has nowhere to deliver its failure from a cancelled frame.
+effect fn releaseOnCancel(builder: &mut Builder, release: &CallTarget, part: &Place, resource: &Place, lent: &Shared<Type>,
+  success: &Shared<Type>, failure: &Shared<Type>, resourceDrop: &Option<Shared<Type>>, bound: &[BoundPlace], origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if let Option<Landing>.Some {value: landing} = closeCancelScope(&mut builder.*) {
+    if !Shared.with<Type, bool>(failure, neverType) {
+      let owner = InstanceKey.identity(&builder.function.key)
+      return run unsupported(&owner, origin, GapCode.Cleanup)
+    }
+    run releaseOnce(&mut builder.*, release, part, resource, lent, success, failure, resourceDrop, bound, origin)
+    run closeLanding(&mut builder.*, move landing, origin)
+  }
+  return ()
 }
 
 // Lends the resource afresh to `release`, runs the Effect it returns, then drops the resource.
@@ -8787,6 +8950,8 @@ impl MirFunction {
       suspending: move suspending,
       cancelEveryCall: false,
       held: Vector.make<usize>(),
+      cancelScopes: Vector.make<CancelScope>(),
+      landing: false,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
