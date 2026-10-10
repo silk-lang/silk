@@ -36,14 +36,16 @@ import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, Inval
 import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
 import driver.NativeToolchain
 import silk.toml_scanner {TomlError}
-import semantic.Semantic {BackendBuild, Request as SemanticRequest, Semantic, staticClosureNodes}
-import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile, Problem as FinalProfileProblem}
+import semantic.Semantic {BackendBuild, Request as SemanticRequest, Semantic, staticClosureNodes, RegistrationClosed, ConflictingPackageSource}
+import semantic.FinalProfile {FinalProfile}
 import semantic.InitialProfile {
   Input as ProfileInput,
   InitialProfile,
   Problem as InitialProfileProblem,
 }
-import semantic.ProfileBinding {RegisteredShape}
+import semantic.ProfileBinding {Supplied}
+import semantic.ProfileAssembly {AssemblyProblem, assemble as assembleProfile}
+import semantic.ProfileShape {Registered, Problem as ShapeProblem, registered as registeredShapes}
 import semantic.SourceIndex {RevisionMismatch}
 import semantic.Target {Id as TargetId, Target}
 import backend.Gap {Code as GapCode, Gap}
@@ -78,7 +80,7 @@ enum BuildOutput {
 /// One parsed command line: the source file to read and the requested artifact or dump.
 union Request {
   Dump {source: Bytes, hir: bool},
-  Build {source: Bytes, output: Bytes, kind: BuildOutput, standardLibrary: Option<Bytes>, profile: FinalProfile},
+  Build {source: Bytes, output: Bytes, kind: BuildOutput, standardLibrary: Option<Bytes>, profile: InitialProfile},
 }
 
 /// Reports whether `argument` spells the `hir` mode selector.
@@ -188,17 +190,9 @@ effect fn request() -> Request
       at = at + usize.add(0, 2)
     }
     let initial = run InitialProfile.freeze(&input)
-    let schemas = Vector.make<RegisteredShape>()
-    let published = run FinalProfile.publish(
-      move initial, Vector.asSlice<RegisteredShape>(&schemas), Vector.make<ProfileEntry>(),
-    )
-    let profile = match move published {
-      Result<FinalProfile, FinalProfileProblem>.Success {value} => move value
-      Result<FinalProfile, FinalProfileProblem>.Failure {error: _} => run invalidBuildProfile()
-    }
     return Request.Build {
       source: move source, output: move output, standardLibrary: move standardLibrary,
-      profile: move profile, kind: kind,
+      profile: move initial, kind: kind,
     }
   }
   if count != usize.add(0, 3) {
@@ -392,34 +386,66 @@ effect fn compileIr(ir: &Bytes, output: &Path, outputArgument: &[u8], optimizati
   return run Effect.useReleaseNonParking(move irPath, move use, move release)
 }
 
-effect fn build(sourcePath: &Path, output: &Path, outputArgument: &[u8], kind: BuildOutput, standardLibrary: Option<Path>, profile: FinalProfile) -> i32
-! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+effect fn build(sourcePath: &Path, output: &Path, outputArgument: &[u8], kind: BuildOutput, standardLibrary: Option<Path>, profile: InitialProfile) -> i32
+! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-  let target = FinalProfile.target(&profile)
-  let libc = match move FinalProfile.text(&profile, b"libc") {
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let libc = match move InitialProfile.text(&profile, b"libc") {
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => run invalidBuildProfile()
   }
   let mut sources = run ModuleSourceFiles.make(sourcePath, move standardLibrary, Target.name(&target), Bytes.asSlice(&libc))
   let identity = run ModuleId.copy(ModuleSourceFiles.entry(&sources))
   let runtime = run ModuleId.copy(ModuleSourceFiles.runtime(&sources))
-  let optimization = match move FinalProfile.text(&profile, b"optimization") {
+  let optimization = match move InitialProfile.text(&profile, b"optimization") {
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => run invalidBuildProfile()
   }
-  let debug = match move FinalProfile.flag(&profile, b"debug") {
+  let debug = match move InitialProfile.flag(&profile, b"debug") {
     Option<bool>.Some {value} => value
     Option<bool>.None => run invalidBuildProfile()
   }
-  let mut store = Semantic.make(run ModuleSourceFiles.revision(&sources), target, Option.some<FinalProfile>(move profile))
+  let mut store = Semantic.make(run ModuleSourceFiles.revision(&sources), target, Option.none<FinalProfile>())
   if let Option<&ExecutionStorage>.Some {value: storage} = move ModuleSourceFiles.executionStorage(&sources) {
     Semantic.selectExecutionStorage(&mut store, run ExecutionStorage.copy(storage))
   }
   let mut request = SemanticRequest.forApplication(run ModuleId.copy(&identity))
+  run SemanticRequest.registerSchemaModule(&mut request, &identity)
+  while true {
+    let shapes = run registeredShapes(&mut store, &mut request, &target)
+    let assembled = match move shapes {
+      Result<Registered, ShapeProblem>.Success {value} => run assembleProfile(
+        run InitialProfile.copy(&profile), &mut store, &mut request, &value, Vector.make<Supplied>())
+      Result<Registered, ShapeProblem>.Failure {error: _} => Result.failResult<FinalProfile, AssemblyProblem>(
+        AssemblyProblem.InputMismatch)
+    }
+    if run ModuleSourceFiles.publishObserved(&mut sources, Semantic.sourceEvents(&store)) {
+      Semantic.revise(&mut store, run ModuleSourceFiles.revision(&sources))
+      request = SemanticRequest.forApplication(run ModuleId.copy(&identity))
+      run SemanticRequest.registerSchemaModule(&mut request, &identity)
+      continue
+    }
+    match move assembled {
+      Result<FinalProfile, AssemblyProblem>.Success {value} => {
+        run Semantic.reviseProfile(&mut store, Option.some<FinalProfile>(move value))
+      }
+      Result<FinalProfile, AssemblyProblem>.Failure {error} => {
+        if let AssemblyProblem.Default {rejection} = move error {
+          let message = run rejectionSummary(&rejection)
+          run writeError(Bytes.asSlice(&message))
+        } else {
+          run writeError(b"silkc: invalid package parameter profile\n")
+        }
+        return 1
+      }
+    }
+    break
+  }
   let mut compiled = run Semantic.buildRuntime(&mut store, &mut request, &runtime, staticClosureNodes)
   while run ModuleSourceFiles.publishObserved(&mut sources, Semantic.sourceEvents(&store)) {
     Semantic.revise(&mut store, run ModuleSourceFiles.revision(&sources))
     request = SemanticRequest.forApplication(run ModuleId.copy(&identity))
+    run SemanticRequest.registerSchemaModule(&mut request, &identity)
     compiled = run Semantic.buildRuntime(&mut store, &mut request, &runtime, staticClosureNodes)
   }
   return match move compiled {
@@ -476,7 +502,7 @@ effect fn fileArgument(base: &Path, argument: &[u8]) -> Path
 }
 
 effect fn program() -> i32
-! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | Cycle | RevisionMismatch
+! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch
 ? &mut HostInput | &mut Allocator | &mut Writer {
   let captured = run Effect.result(HostInput.argument(usize.ONE))
   let selector = match move captured {
@@ -549,7 +575,7 @@ effect fn program() -> i32
 }
 
 pub effect fn main() -> i32
-! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | Cycle | RevisionMismatch
+! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch
 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut output = StdoutWriter.make()
