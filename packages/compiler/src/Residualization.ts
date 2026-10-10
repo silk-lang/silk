@@ -873,6 +873,9 @@ const evaluateStaticFunction = (
         )
       const semantic = SemanticContext.make(input.result.authored)
       const builder = BodyBuilder.make({ owner: declaration.owner, request: { _tag: 'Check' } })
+      const step: NonNullable<Evaluation.NodeContext['step']> = (_span, trace) =>
+        evaluation.stepAt(trace)
+      let nestedStaticFailure: Evaluation.StaticFailure | undefined
       const staticContext = {
         environment: self[stateSymbol].environment,
         ...(self[stateSymbol].testCatalog === undefined
@@ -892,6 +895,10 @@ const evaluateStaticFunction = (
         trace: evaluation.trace,
         call,
         chargeStaticIteration: (trace: Evaluation.Trace) => evaluation.stepAt(trace),
+        step,
+        recordFailure: (failure: Evaluation.StaticFailure) => {
+          nestedStaticFailure ??= failure
+        },
         reflect: (
           owner: Type.Type,
           kind: 'Type' | 'Fields',
@@ -919,7 +926,6 @@ const evaluateStaticFunction = (
       )
       publishGeneratedAggregates(self, analyzed.fact.generatedAggregates)
       self[stateSymbol].conditionDiagnostics?.push(...analyzed.diagnostics)
-      let nestedStaticFailure: Evaluation.StaticFailure | undefined
       Elaboration.visitStatements(analyzed.fact.statements, {
         expression: (expression) => {
           if (
@@ -956,7 +962,6 @@ const evaluateStaticFunction = (
         {
           ...staticContext,
           lookup: bodyLookup(staticContext.lookup, analyzed.fact.generatedAggregates),
-          step: () => evaluation.step(),
         },
       )
       if (value._tag === 'Complete') {
