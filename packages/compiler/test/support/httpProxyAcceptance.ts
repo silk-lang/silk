@@ -119,7 +119,7 @@ effect fn proxyClassifyConnect(
   if written != required { fail ProxyError.ProxyMetadataLimit }
   let parsed = match move run parseResponse(Bytes.asSlice(&encoded), proxyResponseParserLimits()) {
     Result.Failure {error} => { fail move error }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let ParsedResponse {parser, progress} = move parsed
   drop progress
@@ -212,7 +212,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let bypassEntries = [bypassOrigin]
   let bypass = match move run BypassPolicy.copy(&bypassEntries) {
     Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
-    Result<BypassPolicy, ProxyError>.Success {value} => value
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
   }
   let configId = ProxyConfigId.make(11)
   let authId = ProxyAuthContextId.make(21)
@@ -221,7 +221,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     b"QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
   ) {
     Result<ProxyAuth, ProxyError>.Failure {error} => { return false }
-    Result<ProxyAuth, ProxyError>.Success {value} => value
+    Result<ProxyAuth, ProxyError>.Success {value} => move value
   }
   let config = match move ProxyConfig.fromUri(
     configId,
@@ -231,7 +231,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     65536,
   ) {
     Result<ProxyConfig, ProxyError>.Failure {error} => { return false }
-    Result<ProxyConfig, ProxyError>.Success {value} => value
+    Result<ProxyConfig, ProxyError>.Success {value} => move value
   }
 
   let numericEquivalent = match move proxyCheckedOrigin("http://[2001:db8::1]:80") {
@@ -311,7 +311,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     128,
   )) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !proxyBytesEqual(
     PreparedRequest.bytes(&forwarded),
@@ -326,7 +326,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     128,
   )) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !proxyBytesEqual(
     PreparedRequest.bytes(&ipv6Connect),
@@ -351,7 +351,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     128,
   )) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !Origin.equals(&PreparedRequest.origin(&tunnelAdmission), &secure) { return false }
   if !Origin.equals(&PreparedRequest.physicalPeer(&tunnelAdmission), &expectedProxyPeer) { return false }
@@ -377,7 +377,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     proxyConnectInputLimits(),
   ) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   match move run Effect.result(proxyClassifyConnect(&successHead)) {
     Result.Failure {error} => { return false }
@@ -401,7 +401,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     proxyConnectInputLimits(),
   ) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   match move run Effect.result(proxyClassifyConnect(&upgradeHead)) {
     Result.Success {value} => { return false }
@@ -440,7 +440,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     proxyConnectInputLimits(),
   ) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   match move run Effect.result(proxyClassifyConnect(&authenticationHead)) {
     Result.Success {value} => { return false }
@@ -494,7 +494,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     proxyConnectInputLimits(),
   ) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   match move run Effect.result(proxyClassifyConnect(&rejectionHead)) {
     Result.Success {value} => { return false }
@@ -558,7 +558,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     proxyConnectInputLimits(),
   ) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   match move run Effect.result(proxyClassifyConnect(&overflowHead)) {
     Result.Success {value} => { return false }
@@ -590,7 +590,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     128,
   )) {
     Result.Failure {error} => { return false }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !proxyBytesEqual(
     PreparedRequest.bytes(&forwardedHttp10),
@@ -656,7 +656,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let emptyOrigins: [Origin; 0] = []
   let emptyForHttps = match move run BypassPolicy.copy(&emptyOrigins) {
     Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
-    Result<BypassPolicy, ProxyError>.Success {value} => value
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
   }
   match move ProxyConfig.fromUri(
     ProxyConfigId.make(12),
@@ -673,7 +673,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
 
   let emptyForPath = match move run BypassPolicy.copy(&emptyOrigins) {
     Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
-    Result<BypassPolicy, ProxyError>.Success {value} => value
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
   }
   match move ProxyConfig.fromUri(
     ProxyConfigId.make(13),
@@ -697,7 +697,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
 
   let emptyForCapacity = match move run BypassPolicy.copy(&emptyOrigins) {
     Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
-    Result<BypassPolicy, ProxyError>.Success {value} => value
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
   }
   match move ProxyConfig.fromUri(
     ProxyConfigId.make(14),
@@ -714,7 +714,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
 
   let emptyForRotated = match move run BypassPolicy.copy(&emptyOrigins) {
     Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
-    Result<BypassPolicy, ProxyError>.Success {value} => value
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
   }
   let rotated = match move ProxyConfig.fromUri(
     configId,
@@ -724,7 +724,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
     65536,
   ) {
     Result<ProxyConfig, ProxyError>.Failure {error} => { return false }
-    Result<ProxyConfig, ProxyError>.Success {value} => value
+    Result<ProxyConfig, ProxyError>.Success {value} => move value
   }
   let rotatedRoute = selectRoute(&rotated, insecure)
   let retainedRoute = Route.recompute(&forward, insecure)
