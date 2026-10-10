@@ -404,6 +404,19 @@ Each entry records:
   unused context parameters and unreachable terminal finalizers are omitted. This
   isolates inactive branch temporaries without changing allocation order, configured depth,
   diagnostic spans or language admission.
+- **Recursive-path storage:** the published `45e253dd` N0 reduces the checked-expression
+  dispatcher to 22,888 bytes and three effectful rejection sites. All fifteen native source
+  actors and all five required corpus programs pass, but selected, non-tail and
+  selected-under-ordinary-control recursion of eighty still overflow on the normal 8 MiB
+  stack. The same-source native-produced N1 passes all eight depth controls. Checked source
+  routing now separates the existing Prefix/Infix cases from the other twenty-five admitted
+  cases and the original unavailable refusal. Invocation, named-value and callable checks
+  finish before source-state initialization and dispatch. Static application setup finishes
+  before recursive body checking; answer/source/dependency ledger completion runs after
+  resolution; selected static-result handling and execution run after the body demand returns.
+  These named operations retain the original owned state, diagnostic and cache order, scoped
+  releases and configured depth of 64. They change which inactive temporaries remain live on
+  recursive paths, without extending language admission or changing evaluator budgets.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
