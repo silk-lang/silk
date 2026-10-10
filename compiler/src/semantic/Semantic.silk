@@ -21774,25 +21774,6 @@ fn contractProvider(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>
   }
 }
 
-effect fn inferenceArgumentOpen(argument: &Argument) -> bool ! OutOfMemoryError ? &mut Allocator {
-  return match & argument.* {
-    Argument.Type {value} => Type.hasOpenParameters(&value)
-    Argument.Lifetime {value} => Lifetime.anyAtom(
-      &value,
-      fn(region: &Lifetime) -> bool {
-        return match & region.* {
-          Lifetime.Parameter {..} => true
-          _ => false
-        }
-      },
-    )
-    Argument.Row {value} => {
-      let carrier = run rowCarrier(&value)
-      return Type.hasOpenParameters(&carrier)
-    }
-  }
-}
-
 // A caller's written bound is itself direct evidence even when its provider is an abstract type
 // parameter. It cannot choose a concrete conformance for an unknown provider.
 effect fn inferFromDeclaredBound(
@@ -21928,11 +21909,6 @@ effect fn adoptEvidenceEntry(
   }
   let prior = bindingArgumentAt(Vector.asSlice<Binding>(&inferred.*), entry.ordinal)
   if let Option<Argument>.None = move prior {
-    if run inferenceArgumentOpen(&entry.value) {
-      return Option.some<Shared<Rejection>>(
-        run reject(&resolver.*, module, RejectionCode.Unsupported, span),
-      )
-    }
     run Vector.append<Binding>(
       &mut inferred.*,
       Binding {
@@ -21968,6 +21944,34 @@ effect fn adoptEvidence(
     evidenceAt = evidenceAt + usize.ONE
   }
   return Option.none<Shared<Rejection>>()
+}
+
+// Selected-head assignments may retain rigid caller parameters. Close the acyclic assignment
+// graph and reject only owners this comparison opened; no pending impl or call slot may escape.
+effect fn closedHeadCallEvidence(evidence: &[Binding], variables: &[Shared<DeclarationId>],
+  callOwner: &Shared<DeclarationId>) -> Option<Vector<Binding>> ! OutOfMemoryError ? &mut Allocator {
+  let mut closed = run copyBindings(evidence)
+  let mut at = usize.ZERO
+  while at < evidence.length {
+    if sameDeclarationShared(&evidence[at].declaration, callOwner) {
+      let mut value = Argument.copy(&evidence[at].value)
+      let mut pass = usize.ZERO
+      while pass < evidence.length {
+        value = run Argument.applyBindings(&value, evidence, true)
+        pass = pass + usize.ONE
+      }
+      let mut ownerAt = usize.ZERO
+      while ownerAt < variables.length {
+        let opened = run DeclarationId.copyShared(&variables[ownerAt])
+        if run argumentMentionsOwner(&value, &opened) { return Option.none<Vector<Binding>>() }
+        ownerAt = ownerAt + usize.ONE
+      }
+      let entries = Vector.asMutSlice<Binding>(&mut closed)
+      entries[at].value = move value
+    }
+    at = at + usize.ONE
+  }
+  return Option.some<Vector<Binding>>(move closed)
 }
 
 // Unifies the candidate head at `candidateAt` with the known provider and open contract. A unique
@@ -22097,7 +22101,11 @@ effect fn unifyHeadCandidate(
           run reject(&resolver.*, module, RejectionCode.UninferredParameter, span),
         )
       }
-      selected.* = Option.some<Vector<Binding>>(move trial)
+      let closed = run closedHeadCallEvidence(Vector.asSlice<Binding>(&trial),
+        Vector.asSlice<Shared<DeclarationId>>(&variables), callOwner)
+      if let Option<Vector<Binding>>.Some {value} = move closed {
+        selected.* = Option.some<Vector<Binding>>(move value)
+      } else { undecided.* = true }
     }
     Unification.Undetermined {at: unresolved} => {
       drop unresolved
@@ -22108,7 +22116,13 @@ effect fn unifyHeadCandidate(
   return Option.none<Shared<Rejection>>()
 }
 
-// A closed provider selects the contract's implementation head by unification. Exactly one coherent
+// A provider constructor stays known when its arguments are rigid caller parameters; a bare type
+// parameter still needs a declared bound. Head unification only opens the impl and call owners.
+fn providerCanSelectHead(provider: &Shared<Type>) -> bool {
+  return !Type.hasOpenRuntimeParameters(provider) || Shared.with<Type, bool>(provider, isNominalType)
+}
+
+// A known provider selects the contract's implementation head by unification. Exactly one coherent
 // head may unify, and its evidence supplies the call owner's still-open parameters.
 effect fn inferFromKnownProvider(
   resolver: &mut Resolver,
@@ -22228,8 +22242,8 @@ effect fn inferFromConformance(
       knownProvider = move value
     }
   }
-  // Lifetimes never select an implementation head: a nominal provider whose only open arguments
-  // are regions is known, and head unification binds the impl's own lifetimes to them.
+  // Declared bounds may solve an open goal first. A nominal constructor then selects a head even
+  // with rigid caller arguments; head unification binds only the impl's own parameters to them.
   if Type.hasOpenRuntimeParameters(&knownProvider) && Type.hasOpenParameters(contract) {
     let failed = run inferFromDeclaredBound(
       &resolver.*,
@@ -22245,7 +22259,7 @@ effect fn inferFromConformance(
       return Option.some<Shared<Rejection>>(move value)
     }
   }
-  if !Type.hasOpenRuntimeParameters(&knownProvider) && Type.hasOpenParameters(contract) {
+  if providerCanSelectHead(&knownProvider) && Type.hasOpenParameters(contract) {
     return run inferFromKnownProvider(
       &mut resolver.*,
       &mut owner.*,
@@ -28549,11 +28563,20 @@ effect fn checkBorrowOperand<'scope>(
     Option<Shared<Lifetime>>.Some {..} => true
     Option<Shared<Lifetime>>.None => false
   }
-  let mut region = match move place {
+  let sourceValidity = match move place {
     Option<Shared<Lifetime>>.Some {value} => move value
     Option<Shared<Lifetime>>.None => run Shared.make<Lifetime>(
       Lifetime.Local {declaration: run DeclarationId.copy(caller), ordinal: loanOrdinal},
     )
+  }
+  // A reference reborrow gets its own body-local loan region. The descriptor's validity remains
+  // the source of the outlives obligation; it does not fix this new borrow's inferred lifetime.
+  // Slices retain their descriptor region as before.
+  let mut region = Shared.clone<Lifetime>(&sourceValidity)
+  if described && !sliceContext {
+    region = run Shared.make<Lifetime>(Lifetime.Local {
+      declaration: run DeclarationId.copy(caller), ordinal: loanOrdinal,
+    })
   }
   if !sliceContext {
     if let Option<Shared<Type>>.Some {value: context} = &expected.* {
@@ -28572,8 +28595,8 @@ effect fn checkBorrowOperand<'scope>(
         // as a relation.
         let mut deferred = Vector.make<RegionPair>()
         if !callerLocalRegion(&requested, caller) {
-          let mut admitted = run knownOutlives(constraints, &region, &requested)
-          if described { admitted = run admitsRegion(&region, &requested, caller, constraints, &mut deferred) }
+          let mut admitted = run knownOutlives(constraints, &sourceValidity, &requested)
+          if described { admitted = run admitsRegion(&sourceValidity, &requested, caller, constraints, &mut deferred) }
           if !admitted
             || !run retainRegionPairs(&mut resolver.*, BodyOrigin {syntax: expression, span: span},
               Vector.asSlice<RegionPair>(&deferred)) {
@@ -28583,6 +28606,14 @@ effect fn checkBorrowOperand<'scope>(
         }
         region = move requested
       }
+    }
+  }
+  if described && !sliceContext && callerLocalRegion(&region, caller)
+    && !Lifetime.equalsShared(&sourceValidity, &region) {
+    if !run retainRegionRelation(&mut resolver.*, BodyOrigin {syntax: expression, span: span},
+      &sourceValidity, &region) {
+      return Result.failResult<CheckedBorrow, Shared<Rejection>>(
+        run reject(&resolver.*, module, RejectionCode.TypeMismatch, span))
     }
   }
   let ty = run Shared.make<Type>(
@@ -29897,6 +29928,16 @@ effect fn flowsCovariantly(
   match move run Type.copy(value) {
     Type.Primitive {..} => { return true }
     Type.Unit => { return true }
+    Type.Union {members} => {
+      let listed = Vector.asSlice<Shared<Type>>(&members)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], marker,
+          covariant, &mut active.*, span) { return false }
+        at = at + usize.ONE
+      }
+      return true
+    }
     Type.Parameter {..} => { return true }
     Type.String {lifetime} => { return covariant || !markedRegion(&lifetime, marker) }
     Type.Reference {referent, access, lifetime} => {
@@ -29942,9 +29983,37 @@ effect fn flowsCovariantly(
       }
       return true
     }
+    // A callable's retained environment is covariant. Its inputs reverse variance, and written
+    // invocation bounds remain fixed; this query conservatively rejects either mentioning marker.
+    Type.Callable {environment, parameters, result, invocationBounds, ..} => {
+      if !covariant {
+        let regions = run callableEnvironmentRegions(&environment)
+        let listed = Vector.asSlice<Shared<Lifetime>>(&regions)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if markedRegion(&listed[at], marker) { return false }
+          at = at + usize.ONE
+        }
+      }
+      let bounds = Vector.asSlice<Outlives>(&invocationBounds)
+      let mut at = usize.ZERO
+      while at < bounds.length {
+        if markedRegion(&bounds[at].longer, marker) || markedRegion(&bounds[at].shorter, marker) { return false }
+        at = at + usize.ONE
+      }
+      let inputs = Vector.asSlice<Shared<Type>>(&parameters)
+      at = usize.ZERO
+      while at < inputs.length {
+        if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &inputs[at], marker, false,
+          &mut active.*, span) { return false }
+        at = at + usize.ONE
+      }
+      return run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &result, marker, covariant,
+        &mut active.*, span)
+    }
     // An Effect contract is covariant in its environment, success and failure: an Effect valid for a
-    // longer region also runs within a shorter one. A row with entries is conservatively invariant;
-    // a row of row parameters alone names no region.
+    // longer region also runs within a shorter one. Requirement keys are invariant and may not
+    // mention the marker; a row of row parameters alone names no region.
     Type.Effect {environment, success, failure, requirements, ..} => {
       if !covariant {
         let regions = run callableEnvironmentRegions(&environment)
@@ -29955,9 +30024,20 @@ effect fn flowsCovariantly(
           at = at + usize.ONE
         }
       }
-      if Shared.with<Row, bool>(&requirements, fn(row: &Row) -> bool {
-        return Vector.length<Requirement>(&row.entries) != usize.ZERO || Vector.length<RowSubtraction>(&row.subtractions) != usize.ZERO
-      }) { return false }
+      if Shared.with<Row, bool>(&requirements,
+        fn(row: &Row) -> bool { return Vector.length<RowSubtraction>(&row.subtractions) != usize.ZERO }) { return false }
+      let entries = run Row.entryList(&requirements)
+      let listed = Vector.asSlice<Requirement>(&entries)
+      let mut entryAt = usize.ZERO
+      while entryAt < listed.length {
+        if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[entryAt].capability,
+          marker, false, &mut active.*, span) { return false }
+        if let Option<Shared<Type>>.Some {value: roleType} = &listed[entryAt].roleType {
+          if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &roleType,
+            marker, false, &mut active.*, span) { return false }
+        }
+        entryAt = entryAt + usize.ONE
+      }
       if !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &success, marker, covariant, &mut active.*, span) {
         return false
       }
@@ -30487,14 +30567,43 @@ effect fn fixedRegionArgument(
     }
     Type.Reference {lifetime: boundRegion, ..} => {
       let mut ordinal = usize.MAX
-      if let Type.Reference {lifetime: binderRegion, ..} = move authored {
+      let mut writtenReferent = Option.none<Shared<Type>>()
+      if let Type.Reference {referent: binderReferent, lifetime: binderRegion, ..} = move authored {
         ordinal = freshLifetimeOrdinal(&binderRegion, fresh)
+        writtenReferent = Option.some<Shared<Type>>(move binderReferent)
       }
       if ordinal == usize.MAX || fixedOrdinal(explicit, ordinal) { return Option.none<RelatedArgument>() }
       if let Type.Reference {referent, access, lifetime: sourceRegion} = move actual {
-        if !run relatesToFixedRegion(&boundRegion, &sourceRegion, caller, &mut relations) { return Option.none<RelatedArgument>() }
+        // A binder no earlier operand fixed takes the region the referent itself fixes, as in
+        // `&'a mut Holder<'a>`: the loan's region then meets it like an earlier operand's.
+        let mut region = move boundRegion
+        if freshLifetimeOrdinal(&region, fresh) == ordinal {
+          let written = match move writtenReferent {
+            Option<Shared<Type>>.Some {value} => move value
+            Option<Shared<Type>>.None => { return Option.none<RelatedArgument>() }
+          }
+          let mut trial = Vector.make<Binding>()
+          let mut at = usize.ZERO
+          while at < bindings.length {
+            run Vector.append<Binding>(&mut trial, Binding {
+              declaration: Shared.clone<DeclarationId>(&bindings[at].declaration),
+              ordinal: bindings[at].ordinal, value: Argument.copy(&bindings[at].value),
+            })
+            at = at + usize.ONE
+          }
+          let unified = match move run Type.unify(&written, &referent, variables, Comparison.Exact, &mut trial) {
+            Unification.Unified => true
+            _ => false
+          }
+          if !unified { return Option.none<RelatedArgument>() }
+          region = match move bindingArgument(Vector.asSlice<Binding>(&trial), fresh, ordinal) {
+            Option<Argument>.Some {value: Argument.Lifetime {value}} => move value
+            _ => { return Option.none<RelatedArgument>() }
+          }
+        }
+        if !run relatesToFixedRegion(&region, &sourceRegion, caller, &mut relations) { return Option.none<RelatedArgument>() }
         candidate = Option.some<Type>(Type.Reference {
-          referent: move referent, access: access, lifetime: move boundRegion,
+          referent: move referent, access: access, lifetime: move region,
         })
       }
     }
@@ -54904,11 +55013,13 @@ effect fn matchConformanceHead(
     }
   }
   let mut left = Vector.make<Shared<Type>>()
-  run Vector.append<Shared<Type>>(&mut left, Shared.clone<Type>(&found.contract))
+  // Establish the selected head from its provider before deciding contract rows whose keys
+  // mention those arguments. An earlier undetermined set comparison cannot be proof evidence.
   run Vector.append<Shared<Type>>(&mut left, Shared.clone<Type>(&found.provider))
+  run Vector.append<Shared<Type>>(&mut left, Shared.clone<Type>(&found.contract))
   let mut right = Vector.make<Shared<Type>>()
-  run Vector.append<Shared<Type>>(&mut right, Shared.clone<Type>(&goal.contract))
   run Vector.append<Shared<Type>>(&mut right, Shared.clone<Type>(&goal.provider))
+  run Vector.append<Shared<Type>>(&mut right, Shared.clone<Type>(&goal.contract))
   let mut variables = Vector.make<Shared<DeclarationId>>()
   run Vector.append<Shared<DeclarationId>>(&mut variables, move found.declaration)
   let matched = run Type.unifyAll(
@@ -59325,8 +59436,9 @@ effect fn proveAppliedBounds(
         contract: Shared.clone<Type>(&contract),
         provider: Shared.clone<Type>(&provider),
       }
-      // As in inference, regions alone leave a goal provable from implementation heads.
-      if Type.hasOpenRuntimeParameters(&provider) || Type.hasOpenRuntimeParameters(&contract) {
+      // A known constructor can prove a conditional head using the caller's rigid arguments and
+      // premises. A bare unknown provider still requires a declared goal.
+      if !providerCanSelectHead(&provider) && (Type.hasOpenRuntimeParameters(&provider) || Type.hasOpenRuntimeParameters(&contract)) {
         let assumed = run declaredGoal(Vector.asSlice<Constraint>(declared), &goal)
         if let Option<Constraint>.None = move assumed {
           return Option.some<Shared<Rejection>>(
