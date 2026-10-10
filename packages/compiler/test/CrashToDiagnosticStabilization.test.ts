@@ -100,14 +100,15 @@ it.effect('parses a callable contract type argument on a generic call or literal
     assert.deepEqual(codes(literal), [Diagnostic.typeArgumentConflictCode])
     const validSource = `fn add(a: i32, b: i32) -> i32 { return a + b }\nfn makeAdder(base: i32) -> fn<'static>(i32) -> i32 { return add(base) }\nfn apply<A>(x: i32, f: once fn(i32) -> A) -> A { return f(x) }\npub fn main() -> i32 {\n  let f = apply<fn<'static>(i32) -> i32>(2, makeAdder)\n  return f(40)\n}\n`
     const valid = yield* realized('stabilization/generic-callable-valid', validSource)
-    // The contract type parses and checks; calling a callable-typed result has no native lowering yet.
+    // The applied parameter names its exact target, whose instance fixes the callable result.
     assert.deepEqual(
       Analysis.diagnostics(valid).map((diagnostic) => ({
         code: diagnostic.code,
         span: validSource.slice(diagnostic.span.start, diagnostic.span.end),
       })),
-      [{ code: Diagnostic.unsupportedLoweringCode, span: 'f(x)' }],
+      [],
     )
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(valid)), [])
   }),
 )
 

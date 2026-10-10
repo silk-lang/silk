@@ -2,7 +2,7 @@
 export const httpClientOwnershipAcceptanceSource = `import silk.allocator {Allocator, OutOfMemoryError}
 import silk.byte_duplex {ByteDuplex, ReadTransfer}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.shared {Shared}
 import silk.http {Method, Version, Header}
 import silk.http_body {Limits as BodyLimits}
@@ -196,10 +196,10 @@ impl HttpTransport for TestTransport {
 }
 
 struct CancellationWake {
-  wake: Intrinsic.Wake
+  wake: Wake
 }
 
-fn retainCancellationWake(wake: Intrinsic.Wake) -> CancellationWake {
+fn retainCancellationWake(wake: Wake) -> CancellationWake {
   return CancellationWake {wake: move wake}
 }
 

@@ -245,10 +245,10 @@ effect fn packaged() -> () ! OutOfMemoryError ? &mut Allocator {
   return run Execution.drive(move execution, (), complete, suspend)
 }
 pub fn main() -> i32 { return 42 }`,
-  `import silk.execution { Execution }
+  `import silk.execution { Execution, Wake }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard {
-  Intrinsic.wake(move wake)
+fn register(wake: Wake) -> Guard {
+  Execution.wake(move wake)
   return Guard {}
 }
 effect fn parking() -> () { return run Execution.park(register) }
@@ -1376,11 +1376,14 @@ it('matches the checked intrinsic inventory and records every unsafe invariant',
       },
     ],
   )
-  const externalParking = Intrinsic.inventory().filter(
-    (entry) => entry.consumer === 'language:external-wake-parking',
+  const parking = Intrinsic.inventory().filter(
+    (entry) =>
+      entry.consumer.startsWith('silk/execution.') &&
+      entry.consumer !== 'silk/execution.make' &&
+      entry.operation !== 'Intrinsic.executionDrive',
   )
   assert.deepEqual(
-    externalParking.map((entry) => ({
+    parking.map((entry) => ({
       operation: entry.operation,
       signature: entry.signature,
       unsafe: entry.unsafe,
@@ -1388,22 +1391,54 @@ it('matches the checked intrinsic inventory and records every unsafe invariant',
     })),
     [
       {
-        operation: 'Intrinsic.wake',
-        signature: 'fn Intrinsic.wake(wake: Wake) -> ()',
+        operation: 'Intrinsic.relinquish',
+        signature: 'fn Intrinsic.relinquish() -> Effect<()>',
         unsafe: false,
         targets: Intrinsic.runtimeTargets,
       },
       {
-        operation: 'Intrinsic.park',
-        signature: 'fn Intrinsic.park<G, F>(register: F) -> Effect<()>',
+        operation: 'Intrinsic.executionCurrent',
+        signature: 'fn Intrinsic.executionCurrent() -> Effect<ExecutionRef>',
+        unsafe: false,
+        targets: Intrinsic.runtimeTargets,
+      },
+      {
+        operation: 'Intrinsic.executionRefOf',
+        signature: 'fn Intrinsic.executionRefOf<A>(execution: &Execution<A>) -> ExecutionRef',
+        unsafe: false,
+        targets: Intrinsic.runtimeTargets,
+      },
+      {
+        operation: 'Intrinsic.executionLoad',
+        signature: 'fn Intrinsic.executionLoad(reference: &ExecutionRef, word: usize) -> usize',
+        unsafe: false,
+        targets: Intrinsic.runtimeTargets,
+      },
+      {
+        operation: 'Intrinsic.executionStore',
+        signature:
+          'fn Intrinsic.executionStore(reference: &ExecutionRef, word: usize, value: usize) -> ()',
+        unsafe: false,
+        targets: Intrinsic.runtimeTargets,
+      },
+      {
+        operation: 'Intrinsic.executionNotify',
+        signature: 'fn Intrinsic.executionNotify(reference: &ExecutionRef) -> ()',
+        unsafe: false,
+        targets: Intrinsic.runtimeTargets,
+      },
+      {
+        operation: 'Intrinsic.executionLive',
+        signature: 'fn Intrinsic.executionLive(reference: &ExecutionRef) -> bool',
         unsafe: false,
         targets: Intrinsic.runtimeTargets,
       },
     ],
   )
+  // Readiness phases, generations, and latching are source policy: no primitive names them.
   assert.isFalse(
-    externalParking.some((entry) =>
-      /cancel|destroy|scheduler|timer|payload|allocator/i.test(
+    parking.some((entry) =>
+      /wake|phase|generation|latch|cancel|destroy|scheduler|timer|payload|allocator/i.test(
         `${entry.operation} ${entry.signature} ${entry.tir}`,
       ),
     ),

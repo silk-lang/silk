@@ -10,7 +10,7 @@ import silk.http_head {Limits as HeadLimits}
 import silk.http_headers {Headers, Limits as ValueLimits}
 import silk.http_server {Connection as HttpConnection, ConnectionHandler, Limits as HttpLimits, Request, ServerError, reject, withRequest}
 import silk.http_server_native {serveNext}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.i32
 import silk.i64
 import silk.monotonic_clock {MonotonicClock}
@@ -75,14 +75,14 @@ impl MonotonicClock for ImmediateClock {
   }
 }
 
-struct ListenerParkGuard {wake: Intrinsic.Wake}
+struct ListenerParkGuard {wake: Wake}
 impl Drop for ListenerParkGuard {
   fn drop(self: &mut ListenerParkGuard) -> () {
     unsafe { silk_listener_stub_mark_wake_release() }
     return ()
   }
 }
-fn retainListenerWake(wake: Intrinsic.Wake) -> ListenerParkGuard {
+fn retainListenerWake(wake: Wake) -> ListenerParkGuard {
   unsafe { silk_listener_stub_mark_wait_registration() }
   return ListenerParkGuard {wake: move wake}
 }

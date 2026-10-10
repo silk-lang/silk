@@ -3,7 +3,7 @@
 import backend.CAbi
 import backend.CAbi {Extension as CExtension}
 import backend.Coroutine {Coroutine, Extent, Facts, FrameSlot, State}
-import backend.InstanceKey {InstanceKey}
+import backend.InstanceKey {HelperRole, InstanceKey}
 import backend.InstanceIdentity {InstanceIdentity}
 import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Tagged as TaggedFacts, TypeLayout}
 import backend.Gap {Code as GapCode, Gap}
@@ -31,6 +31,8 @@ import hir.Hir {InfixOperator, PrefixOperator}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.NativeAssembly
+import semantic.SealedCore
+import semantic.SealedCore {Lifecycle}
 import semantic.Target {Target}
 import semantic.Type {Type}
 import semantic.TypedBody {Origin}
@@ -1816,6 +1818,9 @@ effect fn emitScalarRvalue(
       let owner = InstanceKey.identity(&function.key)
       fail Gap.make(GapCode.TypedForm, &owner, span)
     }
+    // A frame-based instance's step reads its transfer record's package word.
+    Rvalue.RunningPackage => Value {scalar: pointerRepresentation(target),
+      text: run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferPackage(wordSize(target)))}
     // One admitted fragment is one inline-asm call: unit fragments return `void`, every operand
     // is one word or pointer lane, and the contract supplies the clobber and memory effects.
     Rvalue.Assembly {template, constraints, clobbers, memory, sideEffects, noReturn, inputs, ty} => {
@@ -2951,6 +2956,12 @@ effect fn emitBlock(
       Option<Suspended>.None => run emitFail(&mut writer.*, function, target, layouts, origin.span)
     }
     Terminator.Trap {origin: _} => run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
+    // An instance that relinquishes is a suspension origin, so the build emits it again with its
+    // frames; only the walk that selects the suspendable set emits it without them.
+    Terminator.Relinquish {..} => match &suspended.* {
+      Option<Suspended>.Some {value: stepping} => run emitRelinquish(&mut writer.*, target, &stepping, Coroutine.stateAfter(&stepping.coroutine, index))
+      Option<Suspended>.None => run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
+    }
     Terminator.Unreachable {origin: _} => run append(&mut writer.*, b"unreachable\n")
     Terminator.Switch {value, cases, otherwise, origin: _} => {
       let tested = run emitOperand(&mut writer.*, function, target, layouts, &value)
@@ -3259,6 +3270,7 @@ effect fn planFrame(function: &MirFunction, target: &Target, layouts: &[TypeLayo
     if let Terminator.Call {callee, ..} = &blocks[block].terminator {
       if let Callee.Instance {key} = &callee { point = run Facts.suspends(facts, &key) }
     }
+    if let Terminator.Relinquish {..} = &blocks[block].terminator { point = true }
     run Vector.append<bool>(&mut points, point)
     block = block + usize.ONE
   }
@@ -3375,12 +3387,14 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   let resultFacts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.span)
   let result = storageRepresentation(&function.result, target, resultFacts)
   let fallible = failureLocal(function) != usize.MAX
-  run append(&mut writer.*, b"entry:\n%transfer = alloca [3 x i")
+  if packageStart(function) { return run emitPackageDriver(&mut writer.*, function, target, layouts, stepping, symbol) }
+  run append(&mut writer.*, b"entry:\n%transfer = alloca [4 x i")
   run decimal(&mut writer.*, word * 8)
   run append(&mut writer.*, b"], align ")
   run decimal(&mut writer.*, word)
   run append(&mut writer.*, b"\nstore ptr null, ptr %transfer\n")
   run storeWordAt(&mut writer.*, b"null", b"%transfer", Coroutine.transferTop(word))
+  run storeWordAt(&mut writer.*, b"null", b"%transfer", Coroutine.transferPackage(word))
   let failed = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferFailed(word))
   run append(&mut writer.*, b"store i8 0, ptr ")
   run append(&mut writer.*, Bytes.asSlice(&failed))
@@ -3452,6 +3466,74 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   run append(&mut writer.*, b" ")
   run append(&mut writer.*, Bytes.asSlice(&value))
   return run append(&mut writer.*, b"\n}\n")
+}
+
+// Whether an instance is an execution package's erased start, whose frames live in the package.
+fn packageStart(function: &MirFunction) -> bool {
+  return match &function.key {
+    InstanceKey.ExecutionHelper {purpose, ..} => purpose == HelperRole.Start
+    _ => false
+  }
+}
+
+// An execution package's start drives the transfer record its header begins with: the first
+// activation pushes the start's own frame, a later one continues the frames a relinquishment left.
+// A step that relinquishes returns with the frames in place; the storage state is destroyed once,
+// when the last frame completes.
+effect fn emitPackageDriver(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
+  stepping: &Suspended, symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  run append(&mut writer.*, b"entry:\n%transfer = getelementptr i8, ptr %p0, i64 0\n")
+  let first = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferTop(word))
+  let fresh = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&fresh))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&first))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&fresh))
+  run append(&mut writer.*, b", label %enter, label %drive\nenter:\ncall void ")
+  run suffixedSymbol(&mut writer.*, symbol, b"$enter")
+  run append(&mut writer.*, b"(ptr %transfer")
+  run enterLanes(&mut writer.*, function, target, layouts, b"")
+  run append(&mut writer.*, b")\nbr label %drive\ndrive:\n")
+  let top = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferTop(word))
+  let empty = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&empty))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&top))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&empty))
+  run append(&mut writer.*, b", label %finish, label %step\nstep:\n")
+  let resume = run loadWordAt(&mut writer.*, Bytes.asSlice(&top), Coroutine.resumeOffset(word))
+  let code = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&code))
+  run append(&mut writer.*, b" = call i32 ")
+  run append(&mut writer.*, Bytes.asSlice(&resume))
+  run append(&mut writer.*, b"(ptr %transfer, ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&top))
+  run append(&mut writer.*, b")\n")
+  let relinquished = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&relinquished))
+  run append(&mut writer.*, b" = icmp eq i32 ")
+  run append(&mut writer.*, Bytes.asSlice(&code))
+  run append(&mut writer.*, b", 2\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&relinquished))
+  run append(&mut writer.*, b", label %parked, label %drive\nparked:\nret void\nfinish:\n")
+  let state = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b" = load ptr, ptr %transfer\n")
+  let absent = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&absent))
+  run append(&mut writer.*, b" = icmp eq ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&absent))
+  run append(&mut writer.*, b", label %exit, label %destroy\ndestroy:\ncall void @")
+  run quoted(&mut writer.*, Bytes.asSlice(&stepping.facts.destroy))
+  run append(&mut writer.*, b"(ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b")\nstore ptr null, ptr %transfer\nbr label %exit\nexit:\nret void\n}\n")
+  return ()
 }
 
 // `$enter` acquires the instance's frame from the transfer record's storage state, creating that
@@ -3642,6 +3724,11 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
     run decimal(&mut writer.*, resumed)
     run append(&mut writer.*, b":\n")
     run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[resumed].slots), false)
+    if let Terminator.Relinquish {resume, ..} = &blocks[points[resumed - usize.ONE]].terminator {
+      run append(&mut writer.*, b"br label %")
+      run label(&mut writer.*, resume)
+      run append(&mut writer.*, b"\n")
+    }
     if let Terminator.Call {normal, failure, ..} = &blocks[points[resumed - usize.ONE]].terminator {
       if let Option<FailureEdge>.Some {value: edge} = &failure {
         let failed = run byteOffset(&mut writer.*, b"%transfer", Coroutine.transferFailed(word))
@@ -3739,6 +3826,31 @@ effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Tar
     run storeValue(&mut writer.*, &output, &value)
   }
   return run emitPop(&mut writer.*, target, stepping, Option.some<bool>(true))
+}
+
+// A relinquishment saves the locals its resume state restores and returns 2: the frames stay in
+// the package's transfer record until the package's start continues them.
+effect fn emitRelinquish(writer: &mut Writer, target: &Target, stepping: &Suspended, state: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let resume = run byteOffset(&mut writer.*, b"%frame", Coroutine.stateOffset(word))
+  run append(&mut writer.*, b"store i32 ")
+  run decimal(&mut writer.*, state)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&resume))
+  run append(&mut writer.*, b"\n")
+  let states = Vector.asSlice<State>(&stepping.coroutine.states)
+  run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[state].slots), true)
+  // The package's activation records the relinquishment its drive reads (`Lifecycle.Relinquished`).
+  let package = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferPackage(word))
+  let activation = run byteOffset(&mut writer.*, Bytes.asSlice(&package), Coroutine.packageActivation(word))
+  run append(&mut writer.*, b"store i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b" ")
+  run decimal(&mut writer.*, SealedCore.lifecycleWord(Lifecycle.Relinquished))
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&activation))
+  return run append(&mut writer.*, b"\nret i32 2\n")
 }
 
 // A call at a suspension point saves the locals its resume state restores, pushes the callee's
