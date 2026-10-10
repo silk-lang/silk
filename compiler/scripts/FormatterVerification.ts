@@ -45,7 +45,10 @@ const capture = Effect.fnUntraced(function* (command: ChildProcess.Command) {
   return { output, code }
 }, Effect.scoped)
 
-/** Verifies the formatted checkout while preserving authored corpus templates as test inputs. */
+/**
+ * Verifies repository formatting without changing the checkout, then rebuilds the compiler and runs
+ * the corpus on the committed text, so reported source positions match the authored expectations.
+ */
 export const run = Effect.fn('FormatterVerification.run')(function* (
   self: FormatterVerification,
 ): Effect.fn.Return<
@@ -54,7 +57,7 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
   Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
   // Corpus construction uses literal whitespace replacements in authored fixtures.
-  // Materialize it once before formatting; its runner still reads the live stdlib.
+  // Materialize it once; its runner reads the live stdlib.
   const corpus = yield* CorpusVerification.materialize()
   const pins = yield* CorpusVerification.readPins(self, corpus)
   const fs = yield* FileSystem.FileSystem
@@ -95,19 +98,31 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
     .split('\0')
     .filter((source) => source.length > 0)
     .sort()
-  const formatted = yield* capture(
+  const verified = yield* capture(
     ChildProcess.make(self.gate, sources, {
       cwd: self.repository,
       stderr: 'inherit',
     }),
   )
-  yield* fs.writeFileString(self.safetyLog, formatted.output)
-  yield* Console.log(formatted.output)
-  if (formatted.code !== 0)
+  yield* fs.writeFileString(self.safetyLog, verified.output)
+  yield* Console.log(verified.output)
+  if (verified.code !== 0)
     return yield* new VerificationError({
-      message: `Native formatting safety gate exited with ${formatted.code}`,
+      message: `Native formatting safety gate exited with ${verified.code}`,
       operation: 'verify repository formatting',
-      reason: { _tag: 'Exit', code: formatted.code },
+      reason: { _tag: 'Exit', code: verified.code },
+    })
+  const changed = yield* capture(
+    ChildProcess.make('git', ['diff', '--name-only', '--', ...sources], {
+      cwd: self.repository,
+      stderr: 'inherit',
+    }),
+  )
+  if (changed.code !== 0 || changed.output.length > 0)
+    return yield* new VerificationError({
+      message: `Native formatting safety gate changed tracked sources:\n${changed.output}`,
+      operation: 'verify repository formatting',
+      reason: { _tag: 'InvalidInput' },
     })
   const rebuilt = yield* spawner.exitCode(
     ChildProcess.make(
@@ -125,8 +140,8 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
   )
   if (rebuilt !== 0)
     return yield* new VerificationError({
-      message: `Formatted compiler rebuild exited with ${rebuilt}`,
-      operation: 'rebuild formatted compiler',
+      message: `Compiler rebuild exited with ${rebuilt}`,
+      operation: 'rebuild compiler',
       reason: { _tag: 'Exit', code: rebuilt },
     })
   yield* CorpusVerification.execute(self, corpus, pins, self.selected)

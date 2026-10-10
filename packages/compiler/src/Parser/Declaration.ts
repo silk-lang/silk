@@ -961,6 +961,7 @@ export const parseImplDeclaration = (initial: State): NodeResult => {
       : undefined
   const capability = parseType(typeParameters?.state ?? keyword.state, [
     'ForKeyword',
+    'Identifier',
     'LeftBrace',
     ...topLevelFollowing,
   ])
@@ -970,8 +971,12 @@ export const parseImplDeclaration = (initial: State): NodeResult => {
     : expect(capability.state, 'ForKeyword', [...typeStarts, 'LeftBrace', ...topLevelFollowing])
   const target = inherent
     ? undefined
-    : parseType(forKeyword.state, ['LeftBrace', ...topLevelFollowing])
-  const bodyStart = target?.state ?? forKeyword.state
+    : parseType(forKeyword.state, ['Identifier', 'LeftBrace', ...topLevelFollowing])
+  const headEnd = target?.state ?? forKeyword.state
+  const whereClause = hasContextualSpelling(headEnd, 'where')
+    ? parseWhereClause(headEnd, ['LeftBrace', ...topLevelFollowing])
+    : undefined
+  const bodyStart = whereClause?.state ?? headEnd
   const hasBody = nextSignificantKind(bodyStart) === 'LeftBrace'
   const left = expect(bodyStart, 'LeftBrace', [
     'PubKeyword',
@@ -988,6 +993,7 @@ export const parseImplDeclaration = (initial: State): NodeResult => {
     capability.node,
     ...forKeyword.elements,
     ...(target === undefined ? [] : [target.node]),
+    ...(whereClause === undefined ? [] : [whereClause.node]),
     ...left.elements,
   ]
 

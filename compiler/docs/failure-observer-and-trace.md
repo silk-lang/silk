@@ -29,7 +29,7 @@ function two hidden addresses: the current observer and the failure the current 
 recovering from. Its fallible functions also return the failure's context.
 
 The first native step was origin only: identity and origin. N7 adds logical frames and `while
-handling` causes on the same `FailureContext` statements; observed traps (event 6) follow.
+handling` causes on the same `FailureContext` statements, and event 6 for observed arithmetic traps.
 
 ## 1. What the bootstrap does
 
@@ -259,7 +259,14 @@ by a non-null observer and calls the callback as an independent edge, like `obse
   handler has already retained it as its cause. No other path drops a failure slot, so the cleanup
   stack needs no companion owners.
 - `observeUnhandled` passes the cause's handle.
-- Observed traps call event 6 before `Trap` (follow-up).
+- An observed arithmetic trap (overflow, division by zero, shift count, conversion range) reports
+  event 6 before the machine trap. MIR records the site label of every statement whose emission may
+  trap (`MirFunction.traps`, keyed by origin, in observing programs only). The LLVM trap block
+  loads the observer and cause locals and calls one module-wide `noinline cold` helper,
+  `silk.diagnostic.fatal(observer, cause, reason, origin)`, which passes the cause's pool handle as
+  `first` when a cause is selected, the reason, and the site label. Division traps report zero and
+  overflow from separate blocks. Traps MIR lowers as a `Trap` terminator (bounds, layout,
+  execution, outcome tag) stay bare; they follow by giving the terminator a reason.
 
 Drop glue already takes the hidden pair in observing programs, so `Drop` hooks observe like any
 other function; N7 needs no drop-glue key change.
@@ -300,15 +307,15 @@ callable-value follow-up owns it.
 | observer reach                      | whole-program switch, every function, callback dispatch through a pointer                          | the same: whole-program switch, every function, callback called through the record's address     | no                                                 |
 | context content                     | pool handle plus fallback identity and origin                                                      | the same                                                                                         | no                                                 |
 | causes (TERM-006)                   | `while handling` chains                                                                            | the same                                                                                         | no                                                 |
-| fatal traps (TERM-008)              | observed traps report event 6                                                                      | bare trap                                                                                        | yes                                                |
+| fatal traps (TERM-008)              | observed traps report event 6                                                                      | arithmetic traps report event 6; MIR `Trap` terminators stay bare                                 | yes, for bounds, layout, execution and tag traps   |
 | SEM0216, SEM0217                    | executable-closure analysis                                                                        | not diagnosed; a context-free `observeUnhandled` returns `0`                                     | yes: missing compile-time diagnostics              |
 | `observeDiagnostics` type arguments | required (SEM0051 when omitted); a fallible body or misshapen callback is SEM0012 at that argument | inferred from the operands when omitted; the same mismatches are `TypeMismatch` at that argument | yes: selfhost accepts the omitted form             |
 
 **COMPILER_COMPATIBILITY.md:** the PR that first lowered `observeUnhandled` added the entry
-"Selfhost failure reports carry origin only". N7's frames and causes retired those rows; the entry
-is now "Selfhost observed traps stay bare and observation checks are partial" and lists the
-remaining rows with their exit conditions (N7's event 6 for fatal traps; the suspension-stage
-analysis pass for SEM0216 and SEM0217). The entry-shim entry is unchanged.
+"Selfhost failure reports carry origin only". N7's frames, causes and arithmetic event 6 retired
+those rows; the entry is now "Selfhost reports only arithmetic observed traps and checks
+observations partially" and lists the remaining rows with their exit conditions (event 6 for MIR
+`Trap` terminators; the suspension-stage analysis pass for SEM0216 and SEM0217). The entry-shim entry is unchanged.
 
 ## 6. Tests and corpus
 
@@ -333,7 +340,7 @@ CI must still show 0 FAIL and no lost PASS.
 2. **Origin-only context and both readers.** Typing of both intrinsics, `Composition.Observe`,
    `RunPlan.Observe`, the whole-program switch, hidden locals, `FailureContext`, companions, recipe
    and LLVM, the compatibility entry, and the Effect note's §4, §5 and §7 updated.
-3. **Frames and causes** (N7, done), then fatal traps.
+3. **Frames and causes** (N7, done), arithmetic fatal traps (done), then MIR `Trap` terminators.
 4. **SEM0216 and SEM0217**, with the suspension stage's executable-closure summary.
 
 ## 8. Privilege
