@@ -178,3 +178,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-10 · Concrete runtime static-for iterables using sealed reflection and sequence intrinsics were rejected before target selection by a tests-only spelling exception · Admit canonical phase-only results only while analyzing the deferred iterable, retaining runtime phase boundaries · Silk bootstrap
 
 2026-10-10 · Ordinary reference-returning calls immediately dereferenced with .* reached native emission without a declared target, including public reflection wrapper calls · Traverse the checked ReferentPlace subject during executable call-target discovery; retain each descriptor specialization and prove both paths in the shared native corpus · Silk compiler
+
+- 2026-10-10 · Generated Effect runner Run failures obscured missing shared-operation call edges for owned providers · Trace the selected service edge and derive its declared receiver access while retaining strict ordinary-reference inference · Silk bootstrap provider dispatch

@@ -77,6 +77,82 @@ const effectNames = (self: Analysis.Snapshot): ReadonlyArray<string> =>
       : [],
   )
 
+it.effect('selects shared and exclusive operation receivers from an owned service provider', () =>
+  Effect.gen(function* () {
+    const self = yield* snapshot(`import silk.effect { Effect }
+service Counter {
+  effect fn get() -> i32 ? &Counter
+  effect fn bump() -> () ? &mut Counter
+}
+struct Cell { value: i32 }
+effect fn get(self: &Cell) -> i32 { return self.value }
+effect fn bump(self: &mut Cell) -> () { self.value = self.value + 1 }
+impl Counter for Cell { get: Cell.get bump: Cell.bump }
+effect fn read() -> i32 ? &Counter { return run Counter.get() }
+effect fn both() -> i32 ? &mut Counter {
+  run Counter.bump()
+  return run Counter.get()
+}
+pub fn main() -> i32 {
+  let provider = Cell { value: 20 }
+  let shared = run read() |> Effect.provide(&provider)
+  let owned = run Effect.bindRequirementOwned<Counter>(both(), Cell { value: 21 })
+  return shared + owned
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(self)), [])
+    for (const [operation, access] of [
+      ['get', 'Shared'],
+      ['bump', 'Exclusive'],
+    ] as const) {
+      const selected = self.instances.instances.filter(
+        (instance) => instance.key.declaration.name === operation,
+      )
+      assert.isAbove(selected.length, 0, operation)
+      for (const implementation of selected) {
+        const receiver = implementation.specialization.parameters.at(0)
+        assert.isTrue(receiver !== undefined && Type.isReference(receiver), operation)
+        if (receiver === undefined || !Type.isReference(receiver)) continue
+        assert.strictEqual(receiver.access, access, operation)
+      }
+    }
+  }),
+)
+
+it.effect('keeps a mutable service operation unavailable through a shared provider', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+service Counter { effect fn bump() -> () ? &mut Counter }
+struct Cell { value: i32 }
+effect fn bump(self: &mut Cell) -> () { self.value = self.value + 1 }
+impl Counter for Cell { bump: Cell.bump }
+effect fn change() -> () ? &mut Counter { return run Counter.bump() }
+pub fn main() -> i32 {
+  let provider = Cell { value: 0 }
+  run change() |> Effect.provide(&provider)
+  return 42
+}`
+    const self = yield* snapshot(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map(({ code, span }) => ({
+        code,
+        start: span.start,
+        end: span.end,
+      })),
+      [
+        {
+          code: 'SEM0131',
+          start: source.indexOf('change() |> Effect.provide(&provider)'),
+          end:
+            source.indexOf('change() |> Effect.provide(&provider)') +
+            'change() |> Effect.provide(&provider)'.length,
+        },
+      ],
+    )
+    assert.strictEqual(Analysis.mirOf(self)._tag, 'Unavailable')
+  }),
+)
+
 const main = (recipe: string): string => `pub fn main() -> i32 { return run ${recipe} }`
 
 it('fails closed with the first generated-runner lowering provenance', () => {
