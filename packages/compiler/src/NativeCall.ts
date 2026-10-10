@@ -99,12 +99,10 @@ export const callSynchronous = (
 export const operationInputs = (
   operation: Extract<
     Mir.Operation,
-    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionPark' }
+    { readonly _tag: 'RunEffect' | 'RunEffectValue' | 'CatchEffect' | 'ExecutionRelinquish' }
   >,
 ): ReadonlyArray<Mir.LocalId> => {
-  if (operation._tag === 'ExecutionPark') {
-    return [operation.register]
-  }
+  if (operation._tag === 'ExecutionRelinquish') return []
   if (operation._tag === 'RunEffect') {
     return operation.arguments
   }

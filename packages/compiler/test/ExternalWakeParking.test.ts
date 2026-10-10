@@ -86,14 +86,14 @@ const replaceMirOperation = (
 const source = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.layout { Layout }
 import silk.shared { Shared }
 struct Empty {}
-struct Waiting { wake: Intrinsic.Wake }
+struct Waiting { wake: Wake }
 struct WaiterState { slot: Empty | Waiting }
 struct Guard { storage: Allocation state: Shared<WaiterState> }
-fn install(state: &mut WaiterState, wake: Intrinsic.Wake) -> () {
+fn install(state: &mut WaiterState, wake: Wake) -> () {
   let previous = Intrinsic.replace(state.slot, Waiting { wake: move wake })
   drop previous
   return ()
@@ -105,11 +105,11 @@ fn signal(state: &Shared<WaiterState>) -> () {
   let selected = Shared.withMut(state, extract)
   return match move selected {
     Empty {} => ()
-    Waiting { wake } => Intrinsic.wake(move wake)
+    Waiting { wake } => Execution.wake(move wake)
   }
 }
 fn register(
-  wake: Intrinsic.Wake,
+  wake: Wake,
   storage: Allocation,
   state: Shared<WaiterState>
 ) -> Guard {
@@ -152,13 +152,13 @@ it.effect('emits native never-driven package cleanup', () =>
     assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
     const artifact = yield* Analysis.codegen(snapshot, { mode: 'release' })
     // Dropping the never-driven Execution calls the module's out-of-line release helper, whose
-    // Initial/InitialReady branch drops the unstarted body instead of walking resumed frames: here it
-    // frees the guard allocation `parked` captured but never ran with.
+    // Unstarted branch drops the body instead of walking relinquished frames: here it frees the
+    // guard allocation `parked` captured but never ran with.
     const release =
       /^define [^\n]*@silk_execution_release\(ptr [^\n]*\{\n(.*?)^\}$/ms.exec(artifact.ir)?.[1] ??
       unreachable('expected the native Execution release helper')
     assert.match(artifact.ir.replace(release, ''), /^ {2}call void @silk_execution_release\(ptr /m)
-    assert.match(release, /^ {2}call void @free\(ptr %execution_release_initial_body_\w+\)$/m)
+    assert.match(release, /^ {2}call void @free\(ptr %execution_release_unstarted_body_\w+\)$/m)
   }),
 )
 
@@ -197,63 +197,46 @@ it.effect(
           }
         > => operation._tag === 'ExecutionDrive',
       )
-      const wake = operations.find(
+      const refOf = operations.find(
         (
           operation,
         ): operation is Extract<
           Mir.Operation,
           {
-            readonly _tag: 'ExecutionWake'
+            readonly _tag: 'ExecutionRefOf'
           }
-        > => operation._tag === 'ExecutionWake',
+        > => operation._tag === 'ExecutionRefOf',
       )
       const otherPlan = snapshot.layout.value.executionPackages.plans.find(
         (plan) => plan.provenance !== initialize?.plan.provenance,
       )
       assert.isDefined(initialize)
       assert.isDefined(drive)
-      assert.isDefined(wake)
+      assert.isDefined(refOf)
       assert.isDefined(otherPlan)
       if (
         initialize === undefined ||
         drive === undefined ||
-        wake === undefined ||
+        refOf === undefined ||
         otherPlan === undefined
       )
         return
       const authority = module.executionTransitions.at(0)
-      const registerEdge = authority?.edges.find((edge) => edge.event === 'Register')
-      const pendingEdge = authority?.edges.find((edge) => edge.after.execution === 'DestroyPending')
+      const cancelEdge = authority?.edges.find((edge) => edge.event === 'Cancel')
       assert.isDefined(authority)
-      assert.isDefined(registerEdge)
-      assert.isDefined(pendingEdge)
-      if (authority === undefined || registerEdge === undefined || pendingEdge === undefined) return
+      assert.isDefined(cancelEdge)
+      if (authority === undefined || cancelEdge === undefined) return
       const authorityForgeries: ReadonlyArray<ExecutionTransition.Authority> = [
         Object.freeze({ ...authority, edges: Object.freeze(authority.edges.slice(1)) }),
         Object.freeze({
           ...authority,
           edges: Object.freeze(
-            authority.edges.map((edge) => {
-              if (edge !== registerEdge || edge.after.wake === undefined) return edge
-              return Object.freeze({
-                ...edge,
-                after: Object.freeze({
-                  ...edge.after,
-                  wake: Object.freeze({
-                    ...edge.after.wake,
-                    generation: edge.after.wake.generation + 1,
-                  }),
-                }),
-              })
-            }),
-          ),
-        }),
-        Object.freeze({
-          ...authority,
-          edges: Object.freeze(
             authority.edges.map((edge) =>
-              edge === pendingEdge
-                ? Object.freeze({ ...edge, cleanup: Object.freeze(['Endpoint' as const]) })
+              edge === cancelEdge
+                ? Object.freeze({
+                    ...edge,
+                    cleanup: Object.freeze(['Authority' as const, 'Endpoint' as const]),
+                  })
                 : edge,
             ),
           ),
@@ -262,7 +245,11 @@ it.effect(
       const forgeries: ReadonlyArray<Mir.Module> = [
         replaceMirOperation(module, initialize, Object.freeze({ ...initialize, plan: otherPlan })),
         replaceMirOperation(module, drive, Object.freeze({ ...drive, completionAccess: 'Shared' })),
-        replaceMirOperation(module, wake, Object.freeze({ ...wake, wakeAccess: 'Shared' })),
+        replaceMirOperation(
+          module,
+          refOf,
+          Object.freeze({ ...refOf, execution: refOf.destination }),
+        ),
         ...authorityForgeries.map((forgedAuthority) =>
           Object.freeze({
             ...module,
@@ -281,19 +268,19 @@ it.effect(
     }),
 )
 
-it.effect('assigns only the sealed nominal Wake the local-execution affinity seed', () =>
+it.effect('assigns only the sealed nominal ExecutionRef the local-execution affinity seed', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'external-wake-parking/affinity',
       new TextEncoder().encode(`import silk.shared { Shared }
-struct Wake {}
+struct ExecutionRef {}
 struct Empty {}
-struct Holder { wake: Intrinsic.Wake }
-fn intrinsic(value: Intrinsic.Wake) -> () { drop value return () }
-fn ordinary(value: Wake) -> () { drop value return () }
+struct Holder { reference: Intrinsic.ExecutionRef }
+fn intrinsic(value: Intrinsic.ExecutionRef) -> () { drop value return () }
+fn ordinary(value: ExecutionRef) -> () { drop value return () }
 fn aggregate(value: Holder) -> () { drop value return () }
-fn unionValue(value: Intrinsic.Wake | Empty) -> () { drop value return () }
-fn array(value: [Intrinsic.Wake; 1]) -> () { drop value return () }
+fn unionValue(value: Intrinsic.ExecutionRef | Empty) -> () { drop value return () }
+fn array(value: [Intrinsic.ExecutionRef; 1]) -> () { drop value return () }
 fn shared(value: Shared<Holder>) -> () { drop value return () }
 pub fn main() -> i32 { return 42 }`),
     )
@@ -310,8 +297,8 @@ pub fn main() -> i32 { return 42 }`),
     }
     const intrinsic = parameter('intrinsic')
     const ordinary = parameter('ordinary')
-    assert.isTrue(intrinsic !== undefined && Type.isWake(intrinsic))
-    assert.strictEqual(Type.wake.sealed, 'Intrinsic.Wake')
+    assert.isTrue(intrinsic !== undefined && Type.isExecutionRef(intrinsic))
+    assert.strictEqual(Type.executionRef.sealed, 'Intrinsic.ExecutionRef')
     assert.strictEqual(
       intrinsic === undefined
         ? 'Unrestricted'
@@ -338,9 +325,9 @@ it.effect(
     Effect.gen(function* () {
       const snapshot = yield* AnalysisFixture.retainingMain(
         'external-wake-parking/unowned-entry',
-        new TextEncoder().encode(`import silk.execution { Execution }
+        new TextEncoder().encode(`import silk.execution { Execution, Wake }
 struct Guard {}
-fn register(wake: Intrinsic.Wake) -> Guard { drop wake return Guard {} }
+fn register(wake: Wake) -> Guard { drop wake return Guard {} }
 pub fn main() -> () { return run Execution.park(register) }`),
       )
       assert.deepEqual(
@@ -354,9 +341,10 @@ it.effect('rejects a second signal as an ordinary use after move', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'external-wake-parking/double-signal',
-      new TextEncoder().encode(`fn duplicate(wake: Intrinsic.Wake) -> () {
-  Intrinsic.wake(move wake)
-  Intrinsic.wake(move wake)
+      new TextEncoder().encode(`import silk.execution { Execution, Wake }
+fn duplicate(wake: Wake) -> () {
+  Execution.wake(move wake)
+  Execution.wake(move wake)
   return ()
 }
 pub fn main() -> i32 { return 42 }`),
@@ -372,11 +360,10 @@ it.effect('rejects a registration callback that transitively parks', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'external-wake-parking/non-parking-registration',
-      new TextEncoder().encode(`import silk.execution { Execution }
+      new TextEncoder().encode(`import silk.execution { Execution, Wake }
 struct Guard {}
-fn harmless(wake: Intrinsic.Wake) -> Guard { drop wake return Guard {} }
-effect fn nested() -> () { return run Execution.park(harmless) }
-fn invalid(wake: Intrinsic.Wake) -> Guard {
+effect fn nested() -> () { return run Intrinsic.relinquish() }
+fn invalid(wake: Wake) -> Guard {
   drop wake
   let parked = run nested()
   return Guard {}
@@ -390,7 +377,7 @@ pub fn main() -> () { return run Execution.park(invalid) }`),
   }),
 )
 
-it.effect('rejects wake and direct or transitive park while Shared source access is active', () =>
+it.effect('rejects notify and direct or transitive park while Shared source access is active', () =>
   Effect.gen(function* () {
     const variants = [
       {
@@ -420,11 +407,11 @@ fn selected(value: &mut Pair) -> i32 { return parks() }`,
     for (const [ordinal, variant] of variants.entries()) {
       const snapshot = yield* AnalysisFixture.retainingMain(
         `external-wake-parking/shared-access-${ordinal}`,
-        new TextEncoder().encode(`import silk.execution { Execution }
+        new TextEncoder().encode(`import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Guard {}
 struct Pair { value: i32 }
-fn register(wake: Intrinsic.Wake) -> Guard { drop wake return Guard {} }
+fn register(wake: Wake) -> Guard { drop wake return Guard {} }
 ${variant.callback}
 fn access(self: &Shared<Pair>) -> i32 { return Shared.${variant.access}(self, selected) }
 pub fn main() -> i32 { return 42 }`),
@@ -442,13 +429,13 @@ pub fn main() -> i32 { return 42 }`),
       'external-wake-parking/shared-access-wake',
       new TextEncoder().encode(`import silk.shared { Shared }
 struct Empty {}
-struct Armed { wake: Intrinsic.Wake }
+struct Armed { reference: Intrinsic.ExecutionRef }
 struct State { slot: Empty | Armed }
 fn signalInside(state: &mut State) -> () {
   let selected = Intrinsic.replace(state.slot, Empty {})
   return match move selected {
     Empty {} => ()
-    Armed { wake } => Intrinsic.wake(move wake)
+    Armed { reference } => Intrinsic.executionNotify(&reference)
   }
 }
 fn access(self: &Shared<State>) -> () {
@@ -463,16 +450,16 @@ pub fn main() -> i32 { return 42 }`),
   }),
 )
 
-it.effect('retains represented callable registration guards in ExecutionPark cleanup facts', () =>
+it.effect('retains represented callable registration guards in the relinquished park frame', () =>
   Effect.gen(function* () {
     const module = 'external-wake-parking/callable-guard'
     const source = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 import silk.layout { Layout }
 fn use(value: (), holder: &Allocation) -> () { return () }
-fn register(wake: Intrinsic.Wake, holder: &Allocation) -> once fn(()) -> () {
+fn register(wake: Wake, holder: &Allocation) -> once fn(()) -> () {
   drop wake
   return use(holder)
 }
@@ -510,9 +497,8 @@ pub fn main() -> () { return run Effect.catchAll(program(), recover) }`
     if (snapshot.mir._tag !== 'Available') return
     const parks = snapshot.mir.value.functions
       .flatMap(MirVerification.operations)
-      .filter((operation) => operation._tag === 'ExecutionPark')
+      .filter((operation) => operation._tag === 'ExecutionRelinquish')
     assert.lengthOf(parks, 1)
-    assert.strictEqual(parks.at(0)?.guardCleanup._tag, 'CallableCleanup')
     const parked = snapshot.mir.value.functions.find((fn) =>
       MirVerification.operations(fn).some((operation) => operation === parks.at(0)),
     )
@@ -570,13 +556,13 @@ it.effect(
     Effect.gen(function* () {
       const snapshot = yield* AnalysisFixture.retainingMain(
         'external-wake-parking/timer-shaped',
-        new TextEncoder().encode(`import silk.execution { Execution }
+        new TextEncoder().encode(`import silk.execution { Execution, Wake }
 import silk.shared { Shared }
 struct Empty {}
-struct Armed { wake: Intrinsic.Wake }
+struct Armed { wake: Wake }
 struct TimerState { registration: Empty | Armed }
 struct Unlink { state: Shared<TimerState> }
-fn install(state: &mut TimerState, wake: Intrinsic.Wake) -> () {
+fn install(state: &mut TimerState, wake: Wake) -> () {
   let previous = Intrinsic.replace(state.registration, Armed { wake: move wake })
   drop previous
   return ()
@@ -588,10 +574,10 @@ fn fire(state: &Shared<TimerState>) -> () {
   let selected = Shared.withMut(state, take)
   return match move selected {
     Empty {} => ()
-    Armed { wake } => Intrinsic.wake(move wake)
+    Armed { wake } => Execution.wake(move wake)
   }
 }
-fn register(wake: Intrinsic.Wake, state: Shared<TimerState>) -> Unlink {
+fn register(wake: Wake, state: Shared<TimerState>) -> Unlink {
   let installing = install(move wake)
   let installed = Shared.withMut(&state, move installing)
   return Unlink { state: move state }
