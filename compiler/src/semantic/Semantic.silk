@@ -616,6 +616,9 @@ pub struct ImplementationHead {
   pub boundSpans: Vector<Span>
   /// How many trailing type binders stand for use contracts written in the heads (REP-001).
   pub reified: usize
+  /// Whether the head can tell region patterns apart: its contract or provider names `'static`
+  /// or repeats a region, or a bound constrains a region. Derived from the fields above.
+  pub regionSelective: bool
 }
 
 /// One declared nominal member; tuple positions have no written name.
@@ -1382,6 +1385,13 @@ struct Resolver {
   layoutTypeLookup: InternIndex
   backendInstances: Vector<BackendInstance>
   backendInstanceLookup: InternIndex
+  // How many times a selection has consulted a lifetime-selective head. Lowering compares it
+  // around one body to learn whether a region pattern of that body can select differently.
+  regionSelections: usize
+  // The applications the current build found region-sensitive, one key per erased application.
+  // Their region patterns are distinct backend instances.
+  exactApplications: Vector<InstanceKey>
+  exactApplicationLookup: InternIndex
   // Semantic applications of selected bodies; a Body key's member is one plus this index.
   originEvidence: Vector<CallableOrigin.Producer>
   originPlans: Vector<CallableOrigin.Plan>
@@ -1661,6 +1671,7 @@ fn reusableTypeKind(value: &Type) -> usize {
     Type.EffectComposite {..} => 24
     Type.EffectJoin {..} => 25
     Type.Without {..} => 26
+    Type.ForeignFunction {..} => 27
   }
 }
 
@@ -1918,6 +1929,11 @@ fn sameReusableTypeWith(value: &Type, right: &Shared<Type>) -> bool {
           Type.OpaqueRepresentation {application: selected, contract: useContract, detached: otherDetached, nonParking: otherNonParking} =>
             sameReusableApplication(&application, &selected) && sameReusableType(&contract, &useContract)
               && detached == otherDetached && nonParking == otherNonParking
+          _ => false
+        }
+        Type.ForeignFunction {signature, behavior} => match &other.* {
+          Type.ForeignFunction {signature: selected, behavior: actual} =>
+            ForeignContract.same(behavior, actual) && sameReusableType(&signature, &selected)
           _ => false
         }
         Type.Callable {
@@ -2311,6 +2327,50 @@ fn sameHead(left: &Shared<ImplementationHead>, right: &Shared<ImplementationHead
       return sameHeadWith(first, right)
     },
   )
+}
+
+// A head's region selectivity: some region pattern of an application can match it, or satisfy its
+// bounds, while another pattern of the same application cannot. That needs `'static`, one region
+// standing at two positions, or a region bound; distinct region binders match every pattern.
+effect fn regionSelectiveHead(contract: &Option<Shared<Type>>, provider: &Shared<Type>, constraints: &[Constraint]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if regionConstraint(constraints) { return true }
+  let mut atoms = Vector.make<Shared<Lifetime>>()
+  if let Option<Shared<Type>>.Some {value} = &contract.* { run Type.regionAtoms(&value, &mut atoms) }
+  run Type.regionAtoms(provider, &mut atoms)
+  let listed = Vector.asSlice<Shared<Lifetime>>(&atoms)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let kind = Shared.with<Lifetime, usize>(&listed[at], fn(held: &Lifetime) -> usize {
+      return match &held.* { Lifetime.Static => 1 Lifetime.Invocation {..} => 2 _ => 0 }
+    })
+    if kind == 1 { return true }
+    if kind == 0 {
+      let mut other = at + usize.ONE
+      while other < listed.length {
+        if Lifetime.equalsShared(&listed[at], &listed[other]) { return true }
+        other = other + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn headRegionSelective(head: &ImplementationHead) -> bool { return head.regionSelective }
+
+// Whether a declared bound constrains a region: `'a: 'b` or `T: 'a`.
+fn regionConstraint(constraints: &[Constraint]) -> bool {
+  let mut at = usize.ZERO
+  while at < constraints.length {
+    match &constraints[at] {
+      Constraint.Outlives {..} => { return true }
+      Constraint.Contents {..} => { return true }
+      _ => {}
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 fn sameHeadWith(first: &ImplementationHead, right: &Shared<ImplementationHead>) -> bool {
@@ -3540,11 +3600,16 @@ effect fn internLayoutType(resolver: &mut Resolver, ty: &Shared<Type>) -> usize
 // One backend query subject: an instance, lowered for a program that does or does not observe
 // diagnostics (failure observer note N1), and emitted with its suspension facts when it is
 // suspendable. Neither the program mode nor the facts are part of the instance's identity; MIR is
-// lowered once per mode and shared by every suspension variant.
+// lowered once per mode and shared by every suspension variant. Every region pattern of an
+// application shares the subject and the body of the first pattern reached, unless `exact` because
+// a build found the application region-sensitive. `regionSensitive` records whether lowering the
+// key consulted a lifetime-selective head.
 struct BackendInstance {
   key: InstanceKey
   observing: bool
   suspension: Option<CoroutineFacts>
+  exact: bool
+  regionSensitive: bool
 }
 
 effect fn sameSuspension(left: &Option<CoroutineFacts>, right: &Option<CoroutineFacts>) -> bool
@@ -3576,21 +3641,56 @@ effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, 
   suspension: &Option<CoroutineFacts>) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
+  let exact = run exactApplication(&resolver.*, instance)
   let hashed = InstanceKey.runtimeHash(instance)
   let known = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
     let sameVariant = run sameSuspension(&known[at].suspension, suspension)
-    if sameVariant && known[at].observing == observing && run InstanceKey.sameApplication(&known[at].key, instance) {
+    if sameVariant && known[at].observing == observing && known[at].exact == exact
+      && run InstanceKey.sameInstance(&known[at].key, instance, exact) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
   run Vector.append<BackendInstance>(&mut resolver.*.backendInstances,
-    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension)})
+    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension),
+      exact: exact, regionSensitive: false})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
+}
+
+// The backend instance that answers one requested region pattern outside a build walk. When the
+// shared body another pattern published consulted a lifetime-selective head, the application's
+// patterns may lower differently, so it becomes exact and the requested pattern lowers itself.
+effect fn patternInstance(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, instance: &InstanceKey,
+  observing: bool, location: InstanceLocation, span: Span) -> usize
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let name = run internBackendInstance(&mut resolver.*, instance, observing)
+  let published = run demandRaw(&mut resolver.*, &mut owner.*, Key {
+    family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(instance),
+    external: false,
+  }, span)
+  drop published
+  let known = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
+  if known[name].exact || !known[name].regionSensitive { return name }
+  if run InstanceKey.sameApplication(&known[name].key, instance) { return name }
+  let representative = InstanceKey.copy(&known[name].key)
+  run InternIndex.record(&mut resolver.exactApplicationLookup, InstanceKey.runtimeHash(&representative))
+  run Vector.append<InstanceKey>(&mut resolver.*.exactApplications, move representative)
+  return run internBackendInstance(&mut resolver.*, instance, observing)
+}
+
+// Whether the current build found `instance`'s application region-sensitive.
+effect fn exactApplication(resolver: &Resolver, instance: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector.asSlice<InstanceKey>(&resolver.exactApplications)
+  let mut at = InternIndex.first(&resolver.exactApplicationLookup, InstanceKey.runtimeHash(instance))
+  while at != usize.MAX {
+    if run InstanceKey.sameInstance(&listed[at], instance, false) { return true }
+    at = InternIndex.after(&resolver.exactApplicationLookup, at)
+  }
+  return false
 }
 
 fn applicationLength(value: &Type) -> usize {
@@ -4836,6 +4936,20 @@ effect fn cycleAnswer(resolver: &mut Resolver, key: Key, span: Span) -> Shared<
 }
 
 effect fn resolve(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+  candidate: Option<BodyCandidate>,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  // A query's selections count for no other query, so whether a body's lowering consulted a
+  // lifetime-selective head never depends on which demand first resolved a shared child.
+  let selections = resolver.regionSelections
+  let answer = run resolveFamily(&mut resolver.*, &mut owner.*, key, move candidate)
+  resolver.regionSelections = selections
+  return move answer
+}
+
+effect fn resolveFamily(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
   key: Key,
@@ -13242,6 +13356,7 @@ effect fn resolveImplementationHead(
   if let Option<HeaderSyntax>.Some {value} = move subjectSyntax {
     contractSpan = value.span
   }
+  let regionSelective = run regionSelectiveHead(&headContract, &headProvider, Vector.asSlice<Constraint>(&constraints))
   let head = ImplementationHead {
     declaration: run Shared.make<DeclarationId>(move implementation),
     kind: move kind,
@@ -13261,6 +13376,7 @@ effect fn resolveImplementationHead(
     binderSpans: move anchors.binders,
     boundSpans: move anchors.bounds,
     reified: Vector.length<CallableParameter.RepresentationSlot>(&slots),
+    regionSelective: regionSelective,
   }
   return memberSuccess(
     Value.ImplementationHead {head: run Shared.make<ImplementationHead>(move head)},
@@ -23911,8 +24027,8 @@ effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Word, Ans
   if operation == Composition.Suspend { arity = usize.ZERO }
   let mut written = Vector.make<Argument>()
   if !generics.present {
-    // A finalizer and an observation infer their arguments from their operands.
-    if operation == Composition.CatchFailure || bindingComposition(operation) {
+    // Finalizers, observations and provision selectors infer from their operands.
+    if operation == Composition.CatchFailure {
       return Result.failResult<ResolvedTarget, Shared<Rejection>>(run rejectArity(&resolver.*, module, span, usize.ONE, usize.ZERO))
     }
     return Result.succeed<ResolvedTarget, Shared<Rejection>>(ResolvedTarget.Composition {operation: operation, written: move written})
@@ -35159,9 +35275,11 @@ effect fn checkComposition<'scope>(
   }
   let mut composed = Result.failResult<EffectChannels, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
   if bindingComposition(operation) {
-    if let Argument.Row {value: keys} = &listed[usize.ZERO] { selector = run selectorCarrier(&keys) }
+    if listed.length != usize.ZERO {
+      if let Argument.Row {value: keys} = &listed[usize.ZERO] { selector = run selectorCarrier(&keys) }
+    }
     composed = run bindingChannels(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, arguments, operation,
-      &selector, operands, constraints)
+      &mut selector, listed.length == usize.ZERO, operands, constraints)
   } else {
     composed = run compositionChannels(&resolver.*, module, cursor, arguments, operation, operands, listed, &selector,
       constraints, span)
@@ -35288,7 +35406,7 @@ fn bindingProviderShape(operation: Composition, provider: &Type) -> bool {
 // provide `S` from the inner row, which then loses the selected entry (SERV-008).
 effect fn bindingChannels(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
-  operation: Composition, selector: &Shared<Type>, operands: &[Shared<Type>], constraints: &[Constraint])
+  operation: Composition, selector: &mut Shared<Type>, inferSelector: bool, operands: &[Shared<Type>], constraints: &[Constraint])
   -> Result<EffectChannels, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let innerSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO))
@@ -35300,7 +35418,26 @@ effect fn bindingChannels(resolver: &mut Resolver, owner: &mut Query<Word, Answe
   if !Shared.with<Type, bool>(&operands[usize.ONE], fn(value: &Type) -> bool { return bindingProviderShape(operation, value) }) {
     return run channelRejection(&resolver.*, module, RejectionCode.TypeMismatch, providerSpan)
   }
-  let keys = match move Shared.with<Type, Option<Shared<Row>>>(selector, carriedRow) {
+  if inferSelector {
+    // A partial source row or unresolved provider cannot decide the complete candidate set.
+    // A written key remains available when the caller's provides premise proves it.
+    if Row.hasOpenRuntimeParameters(&inner.requirements) || Type.hasOpenRuntimeParameters(&operands[usize.ONE]) {
+      return run channelRejection(&resolver.*, module, RejectionCode.UninferredParameter, providerSpan)
+    }
+    let selected = run selectProvided(&mut resolver.*, &mut owner.*, &mut dependencies.*, &operands[usize.ONE],
+      &Option.none<Requirement>(), &inner.requirements, constraints, module, providerSpan)
+    let key = match move selected {
+      Result<Requirement, Shared<Rejection>>.Success {value} => move value
+      Result<Requirement, Shared<Rejection>>.Failure {error} => {
+        return Result.failResult<EffectChannels, Shared<Rejection>>(move error)
+      }
+    }
+    let mut inferred = Row.empty()
+    run Row.require(&mut inferred, move key)
+    let keys = run Shared.make<Row>(move inferred)
+    selector.* = run selectorCarrier(&keys)
+  }
+  let keys = match move Shared.with<Type, Option<Shared<Row>>>(&selector.*, carriedRow) {
     Option<Shared<Row>>.Some {value} => move value
     Option<Shared<Row>>.None => { return run channelRejection(&resolver.*, module, RejectionCode.Unsupported, providerSpan) }
   }
@@ -37789,6 +37926,7 @@ effect fn valueCallableContract(value: &Shared<Type>, constraints: &[Constraint]
 ! OutOfMemoryError ? &mut Allocator {
   let copied = run Type.copy(value)
   match move copied {
+    Type.ForeignFunction {signature, ..} => { return Option.some<Shared<Type>>(move signature) }
     Type.CallableValue {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
     Type.CallableView {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
     Type.CallableOrigin {contract, ..} => { return Option.some<Shared<Type>>(move contract) }
@@ -38008,6 +38146,9 @@ effect fn invokeCallableValue<'scope>(
     return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
   }
   if supplied > facts.parameters || (supplied == usize.ZERO && facts.parameters != usize.ZERO) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
+  }
+  if Shared.with<Type, bool>(&actual, nativeFunctionPointer) && supplied != facts.parameters {
     return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
   }
   let remaining = facts.parameters - supplied
@@ -41666,6 +41807,12 @@ effect fn sealedHeadMatchWithin(
     }
   })
   if !matchesProperty { return Result.succeed<Option<SealedMatch>, Shared<Rejection>>(Option.none<SealedMatch>()) }
+  let headProvider = Shared.with<ImplementationHead, Shared<Type>>(head, fn(value: &ImplementationHead) -> Shared<Type> {
+    return Shared.clone<Type>(&value.provider)
+  })
+  if Shared.with<ImplementationHead, bool>(head, headRegionSelective) && sameNominal(&headProvider, ty) {
+    resolver.regionSelections = resolver.regionSelections + usize.ONE
+  }
   // Every head requesting the property must be coherent before any of them may be selected.
   let incoherent = run sealedCoherence(&mut resolver.*, &mut owner.*, &mut dependencies.*, head, module, span)
   if let Option<Shared<Rejection>>.Some {value} = move incoherent {
@@ -42005,6 +42152,7 @@ fn sourceUnionMember(value: &Shared<Type>) -> bool {
     || Type.closedCallableStorage(value) || Shared.with<Type, bool>(value, fn(ty: &Type) -> bool {
       return match &ty.* {
         Type.Nominal {..} => true
+        Type.Array {element, ..} => sourceUnionMember(&element)
         // A text view is a Copy descriptor member (UNION-001).
         Type.String {..} => true
         Type.Parameter {..} => true
@@ -50712,7 +50860,21 @@ effect fn exportShim(
   return run storeMir(&mut resolver.*, move shim, move evidence)
 }
 
+// Lowers one backend instance and records whether the lowering consulted a lifetime-selective
+// head, directly or through a child lowering it demanded, whatever the outcome.
 effect fn resolveMir(
+  resolver: &mut Resolver,
+  owner: &mut Query<Word, Answer, NoRejection>,
+  key: Key,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let before = resolver.regionSelections
+  let answer = run lowerMir(&mut resolver.*, &mut owner.*, key)
+  let mut known = Vector.asMutSlice<BackendInstance>(&mut resolver.backendInstances)
+  known[key.name].regionSensitive = resolver.regionSelections != before
+  return move answer
+}
+
+effect fn lowerMir(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
   key: Key,
@@ -51145,6 +51307,10 @@ effect fn resolveMir(
     }
     let callable = TypedBody.callableCall(&typed, node)
     if let Option<CallableCallInputs>.Some {value: inputs} = move callable {
+      if Shared.with<Type, bool>(&inputs.receiver, nativeFunctionPointer) {
+        callAt = callAt + usize.ONE
+        continue
+      }
       let mut written = Vector.make<Shared<Type>>()
       let mut writtenAt = usize.ZERO
       while writtenAt < inputs.count {
@@ -51817,12 +51983,14 @@ effect fn copyMirLocalTypes(resolver: &Resolver, index: usize) -> Vector<LayoutD
   return run mirLayoutDemands(&functions[index])
 }
 
-// The admitted foreign-contract subset narrows only capture: one `Intrinsic.foreign(noCapture:
-// (...))` field naming distinct written raw-pointer parameters. It creates no loan, so lowering may
-// omit the hint. Every other property remains a foreign-contract gap.
+// Closed scalar native contracts retain memory/locality identity; the legacy noCapture hint creates
+// no loan. A synchronous callbacks tuple must name every written C pointer parameter exactly once.
 fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range) -> bool {
-  if let Option<ForeignContract>.Some {..} = move NativeForeign.contract(hir, properties) { return true }
+  if let Option<ForeignContract>.Some {..} = move NativeForeign.contract(hir, properties) {
+    return !hasCallbackParameter(hir, parameters)
+  }
   let mut fields = usize.ZERO
+  let mut callbacks = false
   let mut at = usize.ZERO
   while at < properties.length {
     if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, at)) {
@@ -51833,7 +52001,8 @@ fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range)
           if nameIs(hir, name, b"noCapture") {
             if !capturesPointerParameters(hir, value, parameters) { return false }
           } else if nameIs(hir, name, b"callbacks") {
-            if !capturesCallbackParameters(hir, value, parameters) { return false }
+            if callbacks || !capturesCallbackParameters(hir, value, parameters) { return false }
+            callbacks = true
           } else { return false }
         } else {
           return false
@@ -51846,7 +52015,7 @@ fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range)
     }
     at = at + usize.ONE
   }
-  return fields <= usize.ONE
+  return fields <= usize.ONE && (!hasCallbackParameter(hir, parameters) || callbacks)
 }
 
 // A callable header's admitted properties: none, or one field-free `Intrinsic.nonParking()`.
@@ -51892,6 +52061,17 @@ fn capturesPointerParameters(hir: &Module, value: HirId, parameters: Range) -> b
   return false
 }
 
+fn hasCallbackParameter(hir: &Module, parameters: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if let Node.Parameter {annotation, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
+      if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 fn capturesCallbackParameters(hir: &Module, value: HirId, parameters: Range) -> bool {
   if let Node.TupleExpression {elements} = Module.node(hir, value) {
     let mut at = usize.ZERO
@@ -51917,6 +52097,23 @@ fn capturesCallbackParameters(hir: &Module, value: HirId, parameters: Range) -> 
       }
       if !selected { return false }
       at = at + usize.ONE
+    }
+    let mut parameter = usize.ZERO
+    while parameter < parameters.length {
+      if let Node.Parameter {name, annotation, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
+        if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
+          let mut listed = false
+          let mut entry = usize.ZERO
+          while entry < elements.length {
+            if let Node.TextLiteral {value: spelling} = Module.node(hir, Module.child(hir, elements, entry)) {
+              if nameIs(hir, name, Module.text(hir, spelling)) { listed = true }
+            }
+            entry = entry + usize.ONE
+          }
+          if !listed { return false }
+        }
+      }
+      parameter = parameter + usize.ONE
     }
     return true
   }
@@ -51951,7 +52148,7 @@ struct ForeignHeader {
 
 // Classifies one linked function or static header. A function import must be `unsafe`; an export
 // is an ordinary definition whose C lanes are checked separately. Both admit only the C ABI, no
-// generic, effect or static contract, and no callback lane. Variadic imports have fixed parameters
+// generic, effect or static contract. Closed synchronous callback lanes retain their own C signatures. Variadic imports have fixed parameters
 // followed by integer-only call-local tails. A static admits no
 // linkage properties.
 effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> ForeignHeader
@@ -51988,7 +52185,12 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
             }
             let mut gap = Option.none<GapCode>()
             if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
-              if !admittedForeignProperties(hir, properties, parameters) { gap = Option.some<GapCode>(GapCode.ForeignContract) }
+              if !admittedForeignProperties(hir, properties, parameters) {
+                gap = Option.some<GapCode>(GapCode.ForeignContract)
+                if hasCallbackParameter(hir, parameters) { gap = Option.some<GapCode>(GapCode.CAbiCallback) }
+              }
+              // Returned function pointers still need a proved returned-callback contract.
+              if let Node.ForeignFunctionType {..} = Module.node(hir, result) { gap = Option.some<GapCode>(GapCode.CAbiCallback) }
               if variadic && (exported || parameters.length == usize.ZERO) { gap = Option.some<GapCode>(GapCode.CAbiVariadic) }
               if variadic {
                 if let Node.Declaration {body: definition, ..} = Module.node(hir, declarations[ordinal].local) {
@@ -52106,6 +52308,10 @@ effect fn foreignSignature(
 }
 
 // Classifies the C lanes of one linked function whose header admitted the C contract.
+fn nativeFunctionPointer(value: &Type) -> bool {
+  return match &value.* { Type.ForeignFunction {..} => true _ => false }
+}
+
 effect fn cSignature(
   resolver: &mut Resolver,
   owner: &mut Query<Word, Answer, NoRejection>,
@@ -52160,6 +52366,9 @@ effect fn cSignature(
     Option<Shared<Type>>.None => {
       fail BackendGap.make(GapCode.SignatureForm, declaration, written.span)
     }
+  }
+  if Shared.with<Type, bool>(&resultType, nativeFunctionPointer) {
+    fail BackendGap.make(GapCode.CAbiCallback, declaration, written.span)
   }
   let result = run foreignLane(
     &mut resolver.*,
@@ -52544,6 +52753,7 @@ effect fn resolveEmissionInputs(
   let variants = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
   let variantKey = InstanceKey.copy(&variants[key.name].key)
   let variantObserving = variants[key.name].observing
+  let exactIdentity = variants[key.name].exact
   let suspension = run copySuspension(&variants[key.name].suspension)
   // A suspendable instance emits its frame variant's MIR, which carries the cancel exits.
   let mut lowered = key.name
@@ -52724,8 +52934,17 @@ effect fn resolveEmissionInputs(
   let initialFunctions = Vector.asSlice<MirFunction>(&resolver.mirValues)
   let recipe = run InstanceRecipe.make(&initialFunctions[mirIndex])
   let callees = Vector.asSlice<InstanceKey>(&recipe.callees)
-  let collected = run InstanceText.encodings(&recipe, &mut coordinates)
+  // Each key's symbol follows its own application's identity mode.
+  let mut modes = Vector.make<bool>()
+  run Vector.append<bool>(&mut modes, exactIdentity)
+  let mut calleeAt = usize.ZERO
+  while calleeAt < callees.length {
+    run Vector.append<bool>(&mut modes, run exactApplication(&resolver.*, &callees[calleeAt]))
+    calleeAt = calleeAt + usize.ONE
+  }
+  let collected = run InstanceText.encodings(&recipe, &mut coordinates, Vector.asSlice<bool>(&modes))
   drop collected
+  coordinates.validity = exactIdentity
   // Signature facts can also contain local evidence; collect it before assigning coordinates.
   let collectedSignatures = run emissionSignatureContent(
     &mut resolver.*,
@@ -52737,6 +52956,7 @@ effect fn resolveEmissionInputs(
   drop collectedSignatures
   run resolveInstanceCoordinates(&mut resolver.*, &mut coordinates)
   let mut replay = Vector.make<Dependency>()
+  coordinates.validity = exactIdentity
   let signatures = run emissionSignatureContent(
     &mut resolver.*,
     &mut owner.*,
@@ -52744,7 +52964,7 @@ effect fn resolveEmissionInputs(
     callees,
     &mut coordinates,
   )
-  let encoded = run InstanceText.encodings(&recipe, &mut coordinates)
+  let encoded = run InstanceText.encodings(&recipe, &mut coordinates, Vector.asSlice<bool>(&modes))
   let identities = run InstanceText.identities(&recipe, Vector.asSlice<Bytes>(&encoded))
   let content = run InstanceText.contentWith(
     &recipe,
@@ -54527,6 +54747,9 @@ effect fn proveGoal(
       },
     )
     if let Option<Shared<ImplementationHead>>.Some {value: head} = move candidate {
+      if Shared.with<ImplementationHead, bool>(&head, headRegionSelective) {
+        resolver.regionSelections = resolver.regionSelections + usize.ONE
+      }
       let identity = Shared.with<ImplementationHead, Shared<DeclarationId>>(
         &head,
         fn(value: &ImplementationHead) -> Shared<DeclarationId> {
@@ -59047,6 +59270,9 @@ fn openStore(revision: Revision, target: MachineTarget, profile: Option<FinalPro
       layoutTypeLookup: InternIndex.make(),
       backendInstances: Vector.make<BackendInstance>(),
       backendInstanceLookup: InternIndex.make(),
+      regionSelections: usize.ZERO,
+      exactApplications: Vector.make<InstanceKey>(),
+      exactApplicationLookup: InternIndex.make(),
       originPlans: Vector.make<CallableOrigin.Plan>(),
       originEvidence: Vector.make<CallableOrigin.Producer>(),
       selectedApplications: Vector.make<Application>(),
@@ -60399,7 +60625,7 @@ impl Semantic {
           run reject(&self.resolver, &module, RejectionCode.UnknownMember, span), Vector.make<Dependency>())))
       }
     }
-    let name = run internBackendInstance(&mut self.resolver, &instance, false)
+    let name = run patternInstance(&mut self.resolver, &mut self.query, &instance, false, location, span)
     let answer = run demandRaw(&mut self.resolver, &mut self.query, Key {
       family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(&instance), external: false,
     }, span)
@@ -60474,7 +60700,7 @@ impl Semantic {
       _ => { return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(memberRejected(
         run reject(&self.resolver, &module, RejectionCode.UnknownMember, span), Vector.make<Dependency>()))) }
     }
-    let name = run internBackendInstance(&mut self.resolver, &instance, false)
+    let name = run patternInstance(&mut self.resolver, &mut self.query, &instance, false, location, span)
     let answer = run demandRaw(&mut self.resolver, &mut self.query, Key {
       family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: usize.ZERO, external: false,
     }, span)
@@ -60495,7 +60721,7 @@ impl Semantic {
       _ => { return run Shared.make<Result<Answer, NoRejection>>(Result.succeed<Answer, NoRejection>(memberRejected(
         run reject(&self.resolver, &module, RejectionCode.UnknownMember, querySpan), Vector.make<Dependency>()))) }
     }
-    let name = run internBackendInstance(&mut self.resolver, instance, observing)
+    let name = run patternInstance(&mut self.resolver, &mut self.query, instance, observing, location, querySpan)
     let answer = run demandRaw(&mut self.resolver, &mut self.query, Key {
       family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(instance), external: false,
     }, querySpan)
@@ -60535,7 +60761,7 @@ impl Semantic {
         )
       }
     }
-    let name = run internBackendInstance(&mut self.resolver, instance, observing)
+    let name = run patternInstance(&mut self.resolver, &mut self.query, instance, observing, location, querySpan)
     let key = Key {
       family: Family.EmissionInputs,
       module: location.module,
@@ -60645,6 +60871,10 @@ impl Semantic {
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator {
     run selectRequest(&mut self.resolver, &request.*)
+    // Region sensitivity is decided afresh by every build, so a build's output never depends on
+    // what an earlier build of this store found.
+    Vector.truncate<InstanceKey>(&mut self.resolver.exactApplications, usize.ZERO)
+    self.resolver.exactApplicationLookup = InternIndex.make()
     let origin = Span.make(usize.ZERO, usize.ZERO)
     let listed = match move run exportCandidates(&mut self.resolver, runtime) {
       Option<Vector<ExportCandidate>>.Some {value} => move value
@@ -60774,6 +61004,13 @@ impl Semantic {
     let mut refusals = Vector.make<Shared<Rejection>>()
     // Each cleanup root's owned-structure answers reached during this build.
     let mut cleanupAnswers = Vector.make<CleanupAnswer>()
+    // Backend instances published by this walk, in walk order, and the references through which
+    // one lends its own regions to another: the graph region sensitivity closes over.
+    let mut walked = Vector.make<bool>()
+    let mut published = Vector.make<usize>()
+    // The text each published backend instance emitted; every other pattern of it resolves there.
+    let mut texts = Vector.make<usize>()
+    let mut lending = Vector.make<LendingEdge>()
     while Vector.length<BackendVisit>(&pending) > usize.ZERO {
       let visit = match move Vector.pop<BackendVisit>(&mut pending) {
         Option<BackendVisit>.Some {value} => move value
@@ -60909,7 +61146,17 @@ impl Semantic {
       }
       let member = instanceMember(&instance)
       // MIR is lowered once per mode; a suspendable instance's emission adds its frame facts.
+      // Region patterns of one application share a backend instance unless it is exact, and the
+      // first pattern reached publishes its body.
       let lowered = run internBackendInstance(&mut self.resolver, &instance, observing)
+      if !run firstInWalk(&mut walked, lowered) {
+        let shared = textOf(Vector.asSlice<usize>(&texts), lowered)
+        if shared != usize.MAX {
+          run Vector.append<CollectedText>(&mut emitted, CollectedText {key: InstanceKey.copy(&instance), index: shared})
+        }
+        continue
+      }
+      run Vector.append<usize>(&mut published, lowered)
       let mir = run demandRaw(
         &mut self.resolver,
         &mut self.query,
@@ -61008,13 +61255,15 @@ impl Semantic {
           &mut emitted,
           CollectedText {key: InstanceKey.copy(&instance), index: value},
         )
+        run recordText(&mut texts, lowered, value)
       }
       if let Option<usize>.Some {value: selectedMir} = move mirIndex {
         let functions = Vector.asSlice<MirFunction>(&self.resolver.mirValues)
         if functions[selectedMir].observes { observes = true }
         let callerModule = run resolvedModule(&self.resolver, location.module)
+        let instances = Vector.asSlice<BackendInstance>(&self.resolver.backendInstances)
         run Vector.append<SuspensionSummary>(&mut summaries,
-          run SuspensionSummary.make(&functions[selectedMir], &instance, &callerModule))
+          run SuspensionSummary.make(&functions[selectedMir], &instance, &callerModule, instances[lowered].exact))
         // Drop glue passes its root on to the child glue and Drop hook it reaches; a function's
         // own references start outside any cleanup.
         let mut passed = Option.none<Shared<Type>>()
@@ -61047,9 +61296,17 @@ impl Semantic {
               cleanup: copyCleanupRoot(&passed),
             },
           )
+          if InstanceKey.lendsOwnRegions(&references[edge].key) {
+            run Vector.append<LendingEdge>(&mut lending, LendingEdge {from: lowered, to: InstanceKey.copy(&references[edge].key)})
+          }
           edge = edge + usize.ONE
         }
       }
+    }
+    // A region-sensitive application's patterns may lower, select and fail differently, so they
+    // become distinct instances and the walk restarts before any answer of this walk is reported.
+    if run markRegionSensitive(&mut self.resolver, Vector.asSlice<usize>(&published), Vector.asSlice<LendingEdge>(&lending), observing) {
+      return run Semantic.buildFrom(&mut self.*, module, roots, entrySpan, closureNodes, observing, frames)
     }
     if Vector.length<Shared<Rejection>>(&refusals) > usize.ZERO {
       let first = Vector.remove<Shared<Rejection>>(&mut refusals, usize.ZERO)
@@ -61069,6 +61326,19 @@ impl Semantic {
       let reached = Vector.asSlice<SuspensionSummary>(&summaries)
       let suspendable = run closeSuspendable(reached)
       let marked = Vector.asSlice<bool>(&suspendable)
+      let mut caller = usize.ZERO
+      while caller < reached.length {
+        let callbacks = Vector.asSlice<CallbackBoundary>(&reached[caller].callbacks)
+        let mut callback = usize.ZERO
+        while callback < callbacks.length {
+          if run callbackSuspends(reached, marked, &callbacks[callback].key) {
+            return refusedBuild(run reject(&self.resolver, &reached[caller].module,
+              RejectionCode.ForeignCallback, callbacks[callback].span))
+          }
+          callback = callback + usize.ONE
+        }
+        caller = caller + usize.ONE
+      }
       let mut first = usize.MAX
       let mut at = usize.ZERO
       while at < marked.length && first == usize.MAX {
@@ -61098,7 +61368,7 @@ impl Semantic {
         let mut selection = FrameSelection.make()
         at = usize.ZERO
         while at < marked.length {
-          if marked[at] { run FrameSelection.include(&mut selection, &reached[at].key) }
+          if marked[at] { run FrameSelection.include(&mut selection, &reached[at].key, reached[at].exact) }
           at = at + usize.ONE
         }
         let mut extended = Vector.make<BuildRoot>()
@@ -61130,6 +61400,100 @@ impl Semantic {
       entrySpan,
     )
   }
+}
+
+// A reference through which backend instance `from` lends its own regions to `to`: two region
+// patterns of `from` reach different patterns of `to`.
+struct LendingEdge {
+  from: usize
+  to: InstanceKey
+}
+
+// Records that a walk reached one backend instance; answers whether this is the first time.
+effect fn firstInWalk(walked: &mut Vector<bool>, name: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  while Vector.length<bool>(&walked.*) <= name {
+    run Vector.append<bool>(&mut walked.*, false)
+  }
+  let mut marks = Vector.asMutSlice<bool>(&mut walked.*)
+  if marks[name] { return false }
+  marks[name] = true
+  return true
+}
+
+fn textOf(texts: &[usize], name: usize) -> usize {
+  if name < texts.length { return texts[name] }
+  return usize.MAX
+}
+
+effect fn recordText(texts: &mut Vector<usize>, name: usize, text: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while Vector.length<usize>(&texts.*) <= name {
+    run Vector.append<usize>(&mut texts.*, usize.MAX)
+  }
+  let mut slots = Vector.asMutSlice<usize>(&mut texts.*)
+  slots[name] = text
+  return ()
+}
+
+// Closes region sensitivity over one walk: a published instance is sensitive when its lowering
+// consulted a lifetime-selective head, or when it lends its own regions to a sensitive instance.
+// The fixed point is reached by repeated passes in walk order, so the result does not depend on
+// cache state. Each sensitive instance not yet exact marks its application exact; answers whether
+// any did, so the walk restarts with those patterns apart.
+effect fn markRegionSensitive(resolver: &mut Resolver, published: &[usize], lending: &[LendingEdge], observing: bool) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut targets = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < lending.length {
+    run Vector.append<usize>(&mut targets, run internBackendInstance(&mut resolver.*, &lending[at].to, observing))
+    at = at + usize.ONE
+  }
+  let mut sensitive = Vector.make<bool>()
+  let known = Vector.asSlice<BackendInstance>(&resolver.backendInstances)
+  at = usize.ZERO
+  while at < known.length {
+    run Vector.append<bool>(&mut sensitive, false)
+    at = at + usize.ONE
+  }
+  let mut marks = Vector.asMutSlice<bool>(&mut sensitive)
+  at = usize.ZERO
+  while at < published.length {
+    if known[published[at]].regionSensitive { marks[published[at]] = true }
+    at = at + usize.ONE
+  }
+  let reached = Vector.asSlice<usize>(&targets)
+  let mut changed = true
+  while changed {
+    changed = false
+    at = usize.ZERO
+    while at < lending.length {
+      if marks[reached[at]] && !marks[lending[at].from] {
+        marks[lending[at].from] = true
+        changed = true
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut newlyExact = Vector.make<InstanceKey>()
+  at = usize.ZERO
+  while at < published.length {
+    let name = published[at]
+    if marks[name] && !known[name].exact {
+      run Vector.append<InstanceKey>(&mut newlyExact, InstanceKey.copy(&known[name].key))
+    }
+    at = at + usize.ONE
+  }
+  let mut added = false
+  let listed = Vector.asSlice<InstanceKey>(&newlyExact)
+  at = usize.ZERO
+  while at < listed.length {
+    if !run exactApplication(&resolver.*, &listed[at]) {
+      run InternIndex.record(&mut resolver.exactApplicationLookup, InstanceKey.runtimeHash(&listed[at]))
+      run Vector.append<InstanceKey>(&mut resolver.*.exactApplications, InstanceKey.copy(&listed[at]))
+      added = true
+    }
+    at = at + usize.ONE
+  }
+  return added
 }
 
 // Whether one candidate lies within one cleanup root's owned structure (GEN-006), answered once
@@ -61569,6 +61933,11 @@ struct BuildRoot {
   span: Span
 }
 
+struct CallbackBoundary {
+  key: InstanceKey
+  span: Span
+}
+
 // One reached instance's suspension summary: the boundary it runs, if any, and its direct Silk
 // callees.
 struct SuspensionSummary {
@@ -61576,17 +61945,31 @@ struct SuspensionSummary {
   module: ModuleId
   boundary: Option<Span>
   callees: Vector<InstanceKey>
+  callbacks: Vector<CallbackBoundary>
+  // The identity mode of `key`'s application; its region patterns are one instance unless exact.
+  exact: bool
 }
 
 impl SuspensionSummary {
-  effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId) -> SuspensionSummary
+  effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId, exact: bool) -> SuspensionSummary
   ! OutOfMemoryError ? &mut Allocator {
     let mut callees = Vector.make<InstanceKey>()
+    let mut callbacks = Vector.make<CallbackBoundary>()
     let blocks = Vector.asSlice<MirBlock>(&function.blocks)
     let mut at = usize.ZERO
     while at < blocks.length {
       if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
         run Vector.append<InstanceKey>(&mut callees, InstanceKey.copy(&key))
+      }
+      let statements = Vector.asSlice<MirStatement>(&blocks[at].statements)
+      let mut statement = usize.ZERO
+      while statement < statements.length {
+        if let MirStatement.Assign {value: MirRvalue.FunctionAddress {key}, origin, ..} = &statements[statement] {
+          if InstanceKey.fixedLinkage(&key) {
+            run Vector.append<CallbackBoundary>(&mut callbacks, CallbackBoundary {key: InstanceKey.copy(&key), span: origin.span})
+          }
+        }
+        statement = statement + usize.ONE
       }
       at = at + usize.ONE
     }
@@ -61597,8 +61980,33 @@ impl SuspensionSummary {
       module: run ModuleId.copy(module),
       boundary: move boundary,
       callees: move callees,
+      callbacks: move callbacks,
+      exact: exact,
     }
   }
+}
+
+// An address may select only a synchronous C export. Runtime roots may still drive frames;
+// the restriction belongs to the function pointer formation, after its transitive graph closes.
+effect fn callbackSuspends(summaries: &[SuspensionSummary], marked: &[bool], key: &InstanceKey) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    if run InstanceKey.sameApplication(&summaries[at].key, key) {
+      let callees = Vector.asSlice<InstanceKey>(&summaries[at].callees)
+      let mut callee = usize.ZERO
+      while callee < callees.length {
+        let mut target = usize.ZERO
+        while target < summaries.length {
+          if marked[target] && run InstanceKey.sameApplication(&summaries[target].key, &callees[callee]) { return true }
+          target = target + usize.ONE
+        }
+        callee = callee + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // Marks the reached instances that can suspend: each one that runs a boundary, then each one
@@ -61627,7 +62035,7 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     while callee < callees.length {
       let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
       while found != usize.MAX {
-        if run InstanceKey.sameApplication(&summaries[found].key, &callees[callee]) {
+        if run InstanceKey.sameInstance(&summaries[found].key, &callees[callee], summaries[found].exact) {
           run Vector.append<usize>(&mut targets, found)
           break
         }
@@ -61668,17 +62076,21 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
 // The closed suspendable set of one build and the storage export symbols its frames use.
 struct FrameSelection {
   suspendable: Vector<InstanceKey>
+  // The identity mode of each suspendable key's application.
+  exact: Vector<bool>
   lookup: InternIndex
   symbols: Vector<Bytes>
 }
 
 impl FrameSelection {
   fn make() -> FrameSelection {
-    return FrameSelection {suspendable: Vector.make<InstanceKey>(), lookup: InternIndex.make(), symbols: Vector.make<Bytes>()}
+    return FrameSelection {suspendable: Vector.make<InstanceKey>(), exact: Vector.make<bool>(), lookup: InternIndex.make(),
+      symbols: Vector.make<Bytes>()}
   }
 
-  effect fn include(self: &mut Self, key: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn include(self: &mut Self, key: &InstanceKey, exact: bool) -> () ! OutOfMemoryError ? &mut Allocator {
     run Vector.append<InstanceKey>(&mut self.suspendable, InstanceKey.copy(key))
+    run Vector.append<bool>(&mut self.exact, exact)
     run InternIndex.record(&mut self.lookup, InstanceKey.runtimeHash(key))
   }
 
@@ -61688,13 +62100,20 @@ impl FrameSelection {
   }
 
   effect fn contains(self: &Self, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let entry = run FrameSelection.position(self, key)
+    return entry != usize.MAX
+  }
+
+  // The suspendable entry that is `key`'s backend instance, or `usize.MAX`.
+  effect fn position(self: &Self, key: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
     let listed = Vector.asSlice<InstanceKey>(&self.suspendable)
+    let modes = Vector.asSlice<bool>(&self.exact)
     let mut at = InternIndex.first(&self.lookup, InstanceKey.runtimeHash(key))
     while at != usize.MAX {
-      if run InstanceKey.sameApplication(&listed[at], key) { return true }
+      if run InstanceKey.sameInstance(&listed[at], key, modes[at]) { return at }
       at = InternIndex.after(&self.lookup, at)
     }
-    return false
+    return usize.MAX
   }
 
   // The emission facts of one suspendable instance: its suspendable direct callees in first-call
@@ -61705,12 +62124,15 @@ impl FrameSelection {
     let mut at = usize.ZERO
     while at < blocks.length {
       if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
-        if run FrameSelection.contains(self, &key) {
+        let entry = run FrameSelection.position(self, &key)
+        if entry != usize.MAX {
+          let modes = Vector.asSlice<bool>(&self.exact)
+          let exact = modes[entry]
           let listed = Vector.asSlice<InstanceKey>(&callees)
           let mut seen = false
           let mut prior = usize.ZERO
           while prior < listed.length && !seen {
-            seen = run InstanceKey.sameApplication(&listed[prior], &key)
+            seen = run InstanceKey.sameInstance(&listed[prior], &key, exact)
             prior = prior + usize.ONE
           }
           if !seen { run Vector.append<InstanceKey>(&mut callees, InstanceKey.copy(&key)) }

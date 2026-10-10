@@ -142,7 +142,7 @@ fn endpoint(last: u8) -> Endpoint {
 effect fn exerciseConnection(connection: &mut Connection) -> i32
 ! ByteIoError
 ? &mut MonotonicClock {
-  if Connection.phase(connection) != ConnectionPhase.Open { return 1 }
+  if Connection.phase(&connection.*) != ConnectionPhase.Open { return 1 }
   let mut output: [u8; 4] = [0, 0, 0, 0]
   let first = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
@@ -173,7 +173,7 @@ effect fn exerciseConnection(connection: &mut Connection) -> i32
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   run ByteDuplex.shutdownWrite(Option.none<Instant>())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
-  if Connection.phase(connection) != ConnectionPhase.WriteClosed { return 7 }
+  if Connection.phase(&connection.*) != ConnectionPhase.WriteClosed { return 7 }
   let afterShutdown = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move afterShutdown {

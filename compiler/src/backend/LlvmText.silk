@@ -115,6 +115,8 @@ fn scalar(ty: &Shared<Type>, target: &Target) -> Representation {
           pointer: true,
           floating: false,
         }
+        Type.ForeignFunction {..} => Representation {aggregate: false, size: usize.ZERO,
+          bits: u32.toUsize(Target.pointerBits(target)), signed: false, unit: false, pointer: true, floating: false}
         Type.Pointer {..} => Representation {aggregate: false, size: usize.ZERO,
           bits: u32.toUsize(Target.pointerBits(target)),
           signed: false,
@@ -244,6 +246,17 @@ effect fn temp(writer: &mut Writer) -> Bytes ! OutOfMemoryError ? &mut Allocator
   let mut result = Writer {text: run Bytes.copy(b"%v"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option.none<TrapReport>()}
   run decimal(&mut result, index)
   return move result.text
+}
+
+// A temporary's block definition omits its operand prefix.
+effect fn tempLabel(writer: &mut Writer, name: &Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let spelled = Bytes.asSlice(name)
+  let mut at = usize.ONE
+  while at < spelled.length {
+    run append(&mut writer.*, &[spelled[at]])
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 // Defines one private constant holding `bytes` and returns its address.
@@ -381,6 +394,7 @@ pub effect fn declarations(target: &Target) -> Bytes ! OutOfMemoryError ? &mut A
   let mut writer = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option.none<TrapReport>()}
   run append(&mut writer, b"declare void @llvm.trap()\n")
   run defineFatalDispatch(&mut writer, target)
+  run append(&mut writer, b"define internal i32 @__silk_foreign_personality(i32 %version, i32 %actions, i64 %class, ptr %exception, ptr %context) noinline nounwind noreturn {\nentry:\ncall void @llvm.trap()\nunreachable\n}\n")
   run append(&mut writer, b"declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n")
   run declareWidth(&mut writer, 1)
   run declareWidth(&mut writer, 8)
@@ -2705,7 +2719,72 @@ effect fn variadicFunctionType(writer: &mut Writer, signature: &CAbi.Signature, 
   return ()
 }
 
+// Each admitted C call or exported entry retains a frame whose personality terminates during
+// either unwind phase. It must survive optimization; a nounwind assertion alone is insufficient.
+fn foreignGuard(function: &MirFunction) -> bool {
+  if InstanceKey.fixedLinkage(&function.key) { return true }
+  let blocks = Vector.asSlice<Block>(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let Terminator.Call {callee, ..} = &blocks[at].terminator {
+      if let Callee.Extern {..} = &callee { return true }
+      if let Callee.NativeIndirect {..} = &callee { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 effect fn emitCall(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &[TypeLayout],
+  foreign: &[CAbi.Signature],
+  identities: &[InstanceIdentity],
+  callee: &Callee,
+  arguments: &Vector<Operand>,
+  providers: &Vector<Operand>,
+  diagnostics: &Option<Diagnostics>,
+  destination: &Place,
+  normal: usize,
+  failure: &Option<FailureEdge>,
+  span: Span,
+) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
+  if let Callee.NativeIndirect {signature, ..} = &callee.* {
+    let owner = InstanceKey.identity(&function.key)
+    let copied = run Type.copy(&signature)
+    if let Type.Callable {parameters, result, ..} = move copied {
+      let mut native = Vector.make<CAbi.Signature>()
+      let mut lanes = Vector.make<CAbi.Lane>()
+      let listed = Vector.asSlice<Shared<Type>>(&parameters)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let facts = run layoutOf(layouts, &listed[at], function, span)
+        let lane = match move CAbi.classify(&listed[at], facts, target) {
+          Option<CAbi.Lane>.Some {value} => move value
+          _ => { fail Gap.make(GapCode.ForeignAbi, &owner, span) }
+        }
+        run Vector.append<CAbi.Lane>(&mut lanes, move lane)
+        at = at + usize.ONE
+      }
+      let resultFacts = run layoutOf(layouts, &result, function, span)
+      let returned = match move CAbi.classify(&result, resultFacts, target) {
+        Option<CAbi.Lane>.Some {value} => move value
+        _ => { fail Gap.make(GapCode.ForeignAbi, &owner, span) }
+      }
+      run Vector.append<CAbi.Signature>(&mut native, CAbi.Signature {declaration: move owner, symbol: Bytes.make(),
+        span: span, result: move returned, parameters: move lanes, global: false, variadic: false})
+      return run emitCallInner(&mut writer.*, function, target, layouts, Vector.asSlice<CAbi.Signature>(&native), identities,
+        callee, arguments, providers, diagnostics, destination, normal, failure, span)
+    }
+    fail Gap.make(GapCode.ForeignAbi, &owner, span)
+  }
+  return run emitCallInner(&mut writer.*, function, target, layouts, foreign, identities,
+    callee, arguments, providers, diagnostics, destination, normal, failure, span)
+}
+
+effect fn emitCallInner(
   writer: &mut Writer,
   function: &MirFunction,
   target: &Target,
@@ -2750,6 +2829,7 @@ effect fn emitCall(
       fail Gap.make(GapCode.ForeignAbi, &owner, span)
     }
   }
+  if let Callee.NativeIndirect {..} = &callee.* { foreignIndex = usize.ZERO }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
   if foreignIndex != usize.MAX {
@@ -2773,6 +2853,9 @@ effect fn emitCall(
   }
   let mut indirect = Option.none<Value>()
   if let Callee.Indirect {address} = &callee.* {
+    indirect = Option.some<Value>(run emitOperand(&mut writer.*, function, target, layouts, &address))
+  }
+  if let Callee.NativeIndirect {address, ..} = &callee.* {
     indirect = Option.some<Value>(run emitOperand(&mut writer.*, function, target, layouts, &address))
   }
   let fallible = handler != usize.MAX
@@ -2822,13 +2905,22 @@ effect fn emitCall(
     run append(&mut writer.*, Bytes.asSlice(&returned))
     run append(&mut writer.*, b" = ")
   }
-  run append(&mut writer.*, b"call ")
+  let guarded = foreignIndex != usize.MAX || InstanceKey.fixedLinkage(&function.key)
+  if guarded { run append(&mut writer.*, b"invoke ") }
+  else { run append(&mut writer.*, b"call ") }
   if foreignIndex != usize.MAX {
     run extension(&mut writer.*, foreign[foreignIndex].result.extension)
     run laneType(&mut writer.*, &foreign[foreignIndex].result, &foreign[foreignIndex].declaration, span)
     if foreign[foreignIndex].variadic { run variadicFunctionType(&mut writer.*, &foreign[foreignIndex], span) }
-    run append(&mut writer.*, b" @")
-    run quoted(&mut writer.*, Bytes.asSlice(&foreign[foreignIndex].symbol))
+    if let Callee.NativeIndirect {..} = &callee.* {
+      run append(&mut writer.*, b" ")
+      if let Option<Value>.Some {value: address} = &indirect {
+        run append(&mut writer.*, Bytes.asSlice(&address.text))
+      }
+    } else {
+      run append(&mut writer.*, b" @")
+      run quoted(&mut writer.*, Bytes.asSlice(&foreign[foreignIndex].symbol))
+    }
   } else if let Callee.Instance {key} = &callee.* {
     if fallible { run append(&mut writer.*, b"i1") }
     else if kind.aggregate { run append(&mut writer.*, b"void") }
@@ -2891,7 +2983,22 @@ effect fn emitCall(
       run append(&mut writer.*, Bytes.asSlice(&companion))
     }
   }
-  run append(&mut writer.*, b")\n")
+  if guarded {
+    let resumed = run temp(&mut writer.*)
+    let unwound = run temp(&mut writer.*)
+    let landing = run temp(&mut writer.*)
+    run append(&mut writer.*, b") to label ")
+    run append(&mut writer.*, Bytes.asSlice(&resumed))
+    run append(&mut writer.*, b" unwind label ")
+    run append(&mut writer.*, Bytes.asSlice(&unwound))
+    run append(&mut writer.*, b"\n")
+    run tempLabel(&mut writer.*, &unwound)
+    run append(&mut writer.*, b":\n")
+    run append(&mut writer.*, Bytes.asSlice(&landing))
+    run append(&mut writer.*, b" = landingpad { ptr, i32 } cleanup\ncall void @llvm.trap()\nunreachable\n")
+    run tempLabel(&mut writer.*, &resumed)
+    run append(&mut writer.*, b":\n")
+  } else { run append(&mut writer.*, b")\n") }
   if fallible {
     run append(&mut writer.*, b"br i1 ")
     run append(&mut writer.*, Bytes.asSlice(&returned))
@@ -3330,7 +3437,8 @@ pub effect fn emit(
     InstanceKey.DropGlue {..} => true
     _ => false
   }
-  if glue { run append(&mut writer, b") noinline {\n") }
+  if foreignGuard(function) { run append(&mut writer, b") noinline nounwind personality ptr @__silk_foreign_personality {\n") }
+  else if glue { run append(&mut writer, b") noinline {\n") }
   else { run append(&mut writer, b") {\n") }
   if let Option<Facts>.Some {value: facts} = &suspension.* {
     let suspended = Option.some<Suspended>(
@@ -3803,7 +3911,9 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   let word = wordSize(target)
   run append(&mut writer.*, b"define i32 ")
   run suffixedSymbol(&mut writer.*, symbol, b"$step")
-  run append(&mut writer.*, b"(ptr %transfer, ptr %frame) {\nentry:\n")
+  run append(&mut writer.*, b"(ptr %transfer, ptr %frame)")
+  if foreignGuard(function) { run append(&mut writer.*, b" noinline nounwind personality ptr @__silk_foreign_personality") }
+  run append(&mut writer.*, b" {\nentry:\n")
   run emitSlots(&mut writer.*, function, target, layouts, suspended)
   let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
   let fallible = failureLocal(function) != usize.MAX
