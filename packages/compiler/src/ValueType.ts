@@ -434,6 +434,8 @@ export const resultCallableValueType = (
   if (!Type.isCallable(contract)) return undefined
   // Complete arguments name one instance, hidden identities included: relays of two sections with
   // one closed callable type differ only there. Visible arguments alone must agree on one identity.
+  // Instances are keyed by runtime arguments, so two calls that differ only in a local lifetime
+  // share the instance the first call collected.
   const complete = typeArguments.some(Type.isHiddenExecutableArgument)
   const visible = (arguments_: ReadonlyArray<Type.GenericArgument>) =>
     arguments_.filter((argument) => !Type.isHiddenExecutableArgument(argument))
@@ -442,8 +444,8 @@ export const resultCallableValueType = (
     instance.key.declaration.name === target.name &&
     instance.resultCallable !== undefined &&
     (complete
-      ? sameArguments(instance.key.typeArguments, typeArguments)
-      : sameArguments(visible(instance.key.typeArguments), visible(typeArguments)))
+      ? sameRuntimeArguments(instance.key.typeArguments, typeArguments)
+      : sameRuntimeArguments(visible(instance.key.typeArguments), visible(typeArguments)))
       ? [instance.resultCallable]
       : [],
   )
@@ -452,6 +454,18 @@ export const resultCallableValueType = (
     identities.some((candidate) => !Type.equalsGenericArgument(candidate, identity))
     ? undefined
     : callableValueByIdentity(layout, identity, contract)
+}
+
+const sameRuntimeArguments = (
+  left: ReadonlyArray<Type.GenericArgument>,
+  right: ReadonlyArray<Type.GenericArgument>,
+): boolean => {
+  const leftKeys = Type.runtimeArgumentKeys(left)
+  const rightKeys = Type.runtimeArgumentKeys(right)
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key, ordinal) => key === rightKeys.at(ordinal))
+  )
 }
 
 export const sameArguments = (

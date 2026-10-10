@@ -121,7 +121,7 @@ it.effect(
         [
           'extra',
           prefix +
-            'service Extra { effect fn value() -> i32 ? &mut Extra }\npub effect fn main() -> i32 ! HostInputError ? &mut HostInput | &mut Extra { let count = run HostInput.argumentCount() return run Extra.value() }',
+            'pub service Extra { effect fn value() -> i32 ? &mut Extra }\npub effect fn main() -> i32 ! HostInputError ? &mut HostInput | &mut Extra { let count = run HostInput.argumentCount() return run Extra.value() }',
         ],
         [
           'owned',

@@ -850,7 +850,7 @@ pub fn main() -> i32 {
 it.effect('fails closed through unresolved finalizer Effect forwarding shapes', () =>
   Effect.gen(function* () {
     const prelude = `import silk.effect { Effect }
-service FinalizerSource {
+pub service FinalizerSource {
   effect fn acquire() -> once Effect<'static; ()> ? &FinalizerSource
 }
 effect fn protected() -> i32 { return 42 }`
@@ -1233,7 +1233,7 @@ pub fn main() -> i32 {
 const capturedScopedResourceSource = `import silk.effect { Effect }
 struct Resource { value: i32 }
 struct Config { value: i32 }
-service Probe { effect fn read() -> i32 ? &Probe }
+pub service Probe { effect fn read() -> i32 ? &Probe }
 effect fn release(resource: &mut Resource) -> () { return () }
 effect fn scoped<'env, A, E, ?R>(
   config: &'env Config,

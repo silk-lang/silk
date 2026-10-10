@@ -676,10 +676,12 @@ const planFor = (
       } else {
         runtimeLanes = Layout.callingShape(program.layout, Mir.semanticType(type))?.lanes ?? []
       }
+      // A zero-sized owner still needs a slot when cancellation must run its drop hook.
       if (
         runtimeLanes.length === 0 &&
         executionAffinity._tag === 'Unrestricted' &&
-        localSharedObligations._tag === 'NoLocalSharedObligation'
+        localSharedObligations._tag === 'NoLocalSharedObligation' &&
+        !('cleanup' in access && CleanupPlan.hasEffect(access.cleanup))
       )
         return []
       return [

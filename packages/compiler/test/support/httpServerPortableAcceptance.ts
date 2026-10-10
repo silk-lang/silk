@@ -204,7 +204,7 @@ effect<'call> fn handleRequest<
     valueLimits(),
   ) {
     Result.Failure {error} => { return 34 }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run respond(
     move request,
