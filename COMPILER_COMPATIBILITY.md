@@ -1841,3 +1841,5 @@ inferred exclusive bindings for independent filesystem and allocator providers.
 - **Coordinator fixtures:** the selected Effect environment-meet inspection uses named
   helpers between Shared views. Its exact two declaration regions and original representation
   checks remain intact; the bootstrap rejects nested anonymous callable bodies with SEM0199.
+  Lifetime.Meet payloads are private: fixture inspection uses the public atomCount/atomAt
+  interface, retains the explicit Meet shape check, and never widens payload visibility.
