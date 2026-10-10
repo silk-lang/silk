@@ -1635,6 +1635,19 @@ export const unpromisedWitnessBound = (
   return undefined
 }
 
+/**
+ * Finds the first `where` constraint of a witness that neither the conformance head nor the
+ * implemented operation promises. `substitution` maps the witness's binders onto the head.
+ */
+export const unpromisedWitnessConstraint = (
+  implementation: DeclarationFact,
+  substitution: Type.Substitution,
+  givens: ReadonlyArray<Constraint.Constraint>,
+): Constraint.Constraint | undefined =>
+  implementation.constraintContracts
+    .map((constraint) => Constraint.substitute(constraint, substitution))
+    .find((constraint) => !Constraint.isImplied(constraint, givens))
+
 /** Resolves one retained type fact through a supplied module resolver and complete index. */
 export const resolveTypeFact = (
   spanOf: SpanOf,
