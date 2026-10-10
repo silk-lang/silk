@@ -47,9 +47,13 @@ type Operation = Extract<
     readonly _tag:
       | 'ExecutionFromAllocation'
       | 'ExecutionDrive'
-      | 'ExecutionWake'
-      | 'ExecutionPark'
-      | 'ExecutionNotifyInitial'
+      | 'ExecutionRelinquish'
+      | 'ExecutionCurrent'
+      | 'ExecutionRefOf'
+      | 'ExecutionLoad'
+      | 'ExecutionStore'
+      | 'ExecutionNotify'
+      | 'ExecutionLive'
   }
 >
 
@@ -344,16 +348,15 @@ const notifyReady = (
   )
 }
 
-const releasePackage = (
+/** Drops the fixed readiness endpoint and its callback; allocation authority stays counted. */
+const releaseEndpoints = (
   context: Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
 ) => {
   const cleanup = package_.cleanup
-  const allocationOffset = componentOffset(package_, 'AllocationAuthority')
-  if (cleanup === undefined || allocationOffset === undefined)
-    throw new RangeError('LLVM execution cleanup lost package metadata')
+  if (cleanup === undefined) throw new RangeError('LLVM execution cleanup lost package metadata')
   const callbackOffset = componentOffset(package_, 'EndpointCallback')
   if (callbackOffset !== undefined && CleanupPlan.hasEffect(cleanup.callback))
     NativeAggregate.dropThroughPlan(
@@ -382,36 +385,102 @@ const releasePackage = (
       ),
       `${tag}_endpoint`,
     )
-  NativeAggregate.dropThroughPlan(
-    context.cleanup,
-    {
-      _tag: 'AllocationCleanup' as const,
-      type: SilkType.allocation,
-      ticket: 'ActiveReclaimTicket' as const,
-    },
-    packagePayload(context, base, SilkType.allocation, allocationOffset, `${tag}_allocation_load`),
-    `${tag}_allocation`,
-  )
 }
 
-const releaseAllocation = (
-  context: Context,
-  package_: ExecutionPackage.Plan,
+/** The notification flag while the readiness endpoint runs, and after a drop deferred by it. */
+const notifying = 1n
+const destroyPending = 2n
+
+const controlPointer = (
+  context: PackageReadContext,
   base: Value.Input,
+  word: number,
   tag: string,
-) => {
-  const allocationOffset = componentOffset(package_, 'AllocationAuthority')
-  if (allocationOffset === undefined)
-    throw new RangeError('LLVM execution lost allocation authority')
+) =>
+  NativeLanePointer.lanePointer(
+    context.lanePointers,
+    context.body,
+    base,
+    ExecutionPackage.controlOffset(context.program.layout.target.pointerSize) +
+      word * context.program.layout.target.pointerSize,
+    tag,
+  )
+
+const word = (context: NativeAggregate.Context, value: bigint) => {
+  if (context.usizeType === undefined) throw new RangeError('LLVM execution lost its word type')
+  return Emitter.integerUnsigned(context.builder, context.usizeType, value)
+}
+
+/**
+ * Releases one counted authority: the Execution handle's or one ExecutionRef's. The final release
+ * frees the package allocation, whose offset is fixed so no package selection is needed.
+ */
+const releaseAuthority = (context: NativeAggregate.Context, base: Value.Input, tag: string) => {
+  const { body, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution authority lost its word type')
+  const countPointer = controlPointer(
+    context,
+    base,
+    ExecutionPackage.authorityWord,
+    `${tag}_authority_ptr`,
+  )
+  const remaining = Emitter.binary(
+    body,
+    'sub',
+    Emitter.load(body, usizeType, countPointer, `${tag}_authority`),
+    word(context, 1n),
+    `${tag}_remaining`,
+  )
+  Emitter.store(body, remaining, countPointer)
+  const release = Emitter.block(body, `${tag}_final_authority`)
+  const done = Emitter.block(body, `${tag}_authority_done`)
+  Emitter.conditionalBranch(
+    body,
+    Emitter.integerCompare(body, 'eq', remaining, word(context, 0n), `${tag}_is_final`),
+    release,
+    done,
+  )
+  Emitter.setInsertionPoint(body, release)
   NativeAggregate.dropThroughPlan(
-    context.cleanup,
+    context,
     {
       _tag: 'AllocationCleanup' as const,
       type: SilkType.allocation,
       ticket: 'ActiveReclaimTicket' as const,
     },
-    packagePayload(context, base, SilkType.allocation, allocationOffset, `${tag}_load`),
-    tag,
+    packagePayload(
+      context,
+      base,
+      SilkType.allocation,
+      ExecutionPackage.allocationOffset(context.program.layout.target.pointerSize),
+      `${tag}_allocation_load`,
+    ),
+    `${tag}_allocation`,
+  )
+  Emitter.branch(body, done)
+  Emitter.setInsertionPoint(body, done)
+}
+
+/** Takes one counted authority for a new ExecutionRef over a live package. */
+const retainAuthority = (context: NativeAggregate.Context, base: Value.Input, tag: string) => {
+  const { body, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution authority lost its word type')
+  const countPointer = controlPointer(
+    context,
+    base,
+    ExecutionPackage.authorityWord,
+    `${tag}_authority_ptr`,
+  )
+  Emitter.store(
+    body,
+    Emitter.binary(
+      body,
+      'add',
+      Emitter.load(body, usizeType, countPointer, `${tag}_authority`),
+      word(context, 1n),
+      `${tag}_retained`,
+    ),
+    countPointer,
   )
 }
 
@@ -489,7 +558,7 @@ const dropStoredPackage = (
   options: {
     readonly body: boolean
     readonly endpoints: boolean
-    readonly allocation: boolean
+    readonly authority: boolean
   },
   tag: string,
 ) => {
@@ -507,27 +576,7 @@ const dropStoredPackage = (
       `${tag}_body`,
     )
   }
-  if (options.allocation) {
-    const allocationOffset = componentOffset(package_, 'AllocationAuthority')
-    if (allocationOffset === undefined)
-      throw new RangeError('LLVM execution drop lost allocation storage')
-    NativeAggregate.dropThroughPlan(
-      context,
-      {
-        _tag: 'AllocationCleanup' as const,
-        type: SilkType.allocation,
-        ticket: 'ActiveReclaimTicket' as const,
-      },
-      packagePayload(
-        context,
-        base,
-        SilkType.allocation,
-        allocationOffset,
-        `${tag}_allocation_load`,
-      ),
-      `${tag}_allocation`,
-    )
-  }
+  if (options.authority) releaseAuthority(context, base, `${tag}_handle`)
 }
 
 /** Runs one armed nonparking finalizer from its retained frame before consuming those fields. */
@@ -974,96 +1023,24 @@ const dropFrames = (
   )
 }
 
-// These physical phases hold allocation authority throughout emitted source cleanup.
-// A Wake consumed reentrantly records consumption without releasing the package.
-const cleanupWithWake = 7n
-const cleanupWithoutWake = 8n
-
-const dropActivatedPackage = (
+/** Cancels a Relinquished frame chain top-down, then drops the endpoint and handle authority. */
+const dropRelinquishedPackage = (
   context: NativeAggregate.Context,
   package_: ExecutionPackage.Plan,
   base: Value.Input,
   tag: string,
 ) => {
-  const { body, builder, usizeType, lanePointers } = context
+  const { body, usizeType, lanePointers } = context
   if (usizeType === undefined) throw new RangeError('Execution cleanup lost its word type')
   const endpoints = loadStoredEndpoints(context, package_, base, tag)
-  const controlOffset = componentOffset(package_, 'WakeControl')
-  const phasePointer =
-    controlOffset === undefined
-      ? undefined
-      : NativeLanePointer.lanePointer(
-          lanePointers,
-          body,
-          base,
-          controlOffset,
-          `${tag}_cleanup_phase_ptr`,
-        )
-  if (phasePointer !== undefined) {
-    const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_cleanup_phase`)
-    const registering = Emitter.integerCompare(
-      body,
-      'eq',
-      phase,
-      Emitter.integerUnsigned(builder, usizeType, 1n),
-      `${tag}_registering_wake`,
-    )
-    const dormant = Emitter.integerCompare(
-      body,
-      'eq',
-      phase,
-      Emitter.integerUnsigned(builder, usizeType, 3n),
-      `${tag}_dormant_wake`,
-    )
-    Emitter.store(
-      body,
-      Emitter.select(
-        body,
-        Emitter.binary(body, 'or', registering, dormant, `${tag}_owns_wake`),
-        Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
-        Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
-        `${tag}_held_phase`,
-      ),
-      phasePointer,
-    )
-  }
   Emitter.store(
     body,
-    Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Destroyed'))),
+    word(context, BigInt(ExecutionTransition.tagOf('Destroyed'))),
     NativeLanePointer.lanePointer(lanePointers, body, base, 0, `${tag}_cleanup_state_ptr`),
   )
   dropFrames(context, package_, base, tag)
   dropStoredEndpoints(context, package_, endpoints, tag)
-  const release = Emitter.block(body, `${tag}_release_package`)
-  const done = Emitter.block(body, `${tag}_cleanup_done`)
-  if (phasePointer === undefined) {
-    Emitter.branch(body, release)
-  } else {
-    const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_cleaned_phase`)
-    Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 6n), phasePointer)
-    Emitter.conditionalBranch(
-      body,
-      Emitter.integerCompare(
-        body,
-        'eq',
-        phase,
-        Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
-        `${tag}_wake_consumed`,
-      ),
-      release,
-      done,
-    )
-  }
-  Emitter.setInsertionPoint(body, release)
-  dropStoredPackage(
-    context,
-    package_,
-    base,
-    { body: false, endpoints: false, allocation: true },
-    `${tag}_allocation`,
-  )
-  Emitter.branch(body, done)
-  Emitter.setInsertionPoint(body, done)
+  releaseAuthority(context, base, `${tag}_handle`)
 }
 
 const selectPackage = (
@@ -1179,9 +1156,35 @@ const dropExecution = (
   tag: string,
 ) => {
   const base = values.at(0)
-  const { body, builder, usizeType } = context
+  const { body, usizeType } = context
   if (base === undefined || usizeType === undefined)
     throw new RangeError('LLVM Execution cleanup lost its package reference')
+  // A drop during readiness notification defers every cleanup until the endpoint returns.
+  const flagPointer = controlPointer(
+    context,
+    base,
+    ExecutionPackage.notificationWord,
+    `${tag}_notification_ptr`,
+  )
+  const deferred = Emitter.block(body, `${tag}_deferred`)
+  const immediate = Emitter.block(body, `${tag}_immediate`)
+  const finished = Emitter.block(body, `${tag}_finished`)
+  Emitter.conditionalBranch(
+    body,
+    Emitter.integerCompare(
+      body,
+      'ne',
+      Emitter.load(body, usizeType, flagPointer, `${tag}_notification`),
+      word(context, 0n),
+      `${tag}_notifying`,
+    ),
+    deferred,
+    immediate,
+  )
+  Emitter.setInsertionPoint(body, deferred)
+  Emitter.store(body, word(context, destroyPending), flagPointer)
+  Emitter.branch(body, finished)
+  Emitter.setInsertionPoint(body, immediate)
   selectPackage(context, base, tag, (package_) =>
     (() => {
       const statePointer = NativeLanePointer.lanePointer(
@@ -1192,114 +1195,61 @@ const dropExecution = (
         `${tag}_state_ptr`,
       )
       const state = Emitter.load(body, usizeType, statePointer, `${tag}_state`)
-      const initial = Emitter.block(body, `${tag}_initial`)
-      const notInitial = Emitter.block(body, `${tag}_not_initial`)
+      const unstarted = Emitter.block(body, `${tag}_unstarted`)
+      const started = Emitter.block(body, `${tag}_started`)
+      const relinquished = Emitter.block(body, `${tag}_relinquished`)
+      const invalid = Emitter.block(body, `${tag}_invalid_state`)
       const done = Emitter.block(body, `${tag}_state_done`)
-      const unpublished = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Initial'))),
-        `${tag}_is_initial`,
-      )
-      const initialReady = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('InitialReady')),
-        ),
-        `${tag}_is_initial_ready`,
-      )
       Emitter.conditionalBranch(
         body,
-        Emitter.binary(body, 'or', unpublished, initialReady, `${tag}_is_initial_any`),
-        initial,
-        notInitial,
+        Emitter.integerCompare(
+          body,
+          'eq',
+          state,
+          word(context, BigInt(ExecutionTransition.tagOf('Unstarted'))),
+          `${tag}_is_unstarted`,
+        ),
+        unstarted,
+        started,
       )
-      Emitter.setInsertionPoint(body, initial)
+      Emitter.setInsertionPoint(body, unstarted)
       Emitter.store(
         body,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Destroyed'))),
+        word(context, BigInt(ExecutionTransition.tagOf('Destroyed'))),
         statePointer,
       )
       dropStoredPackage(
         context,
         package_,
         base,
-        { body: true, endpoints: true, allocation: true },
-        `${tag}_initial`,
+        { body: true, endpoints: true, authority: true },
+        `${tag}_unstarted`,
       )
       Emitter.branch(body, done)
 
-      Emitter.setInsertionPoint(body, notInitial)
-      const pending = Emitter.block(body, `${tag}_pending`)
-      const inactive = Emitter.block(body, `${tag}_inactive`)
-      const running = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Running'))),
-        `${tag}_is_running`,
-      )
-      const notifying = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Notifying'))),
-        `${tag}_is_notifying`,
-      )
+      Emitter.setInsertionPoint(body, started)
       Emitter.conditionalBranch(
         body,
-        Emitter.binary(body, 'or', running, notifying, `${tag}_is_pending`),
-        pending,
-        inactive,
-      )
-      Emitter.setInsertionPoint(body, pending)
-      Emitter.store(
-        body,
-        Emitter.integerUnsigned(
-          builder,
-          usizeType,
-          BigInt(ExecutionTransition.tagOf('DestroyPending')),
+        Emitter.integerCompare(
+          body,
+          'eq',
+          state,
+          word(context, BigInt(ExecutionTransition.tagOf('Relinquished'))),
+          `${tag}_is_relinquished`,
         ),
-        statePointer,
-      )
-      Emitter.branch(body, done)
-
-      Emitter.setInsertionPoint(body, inactive)
-      const dormant = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Dormant'))),
-        `${tag}_is_dormant`,
-      )
-      const eligible = Emitter.integerCompare(
-        body,
-        'eq',
-        state,
-        Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Eligible'))),
-        `${tag}_is_eligible`,
-      )
-      const release = Emitter.block(body, `${tag}_release`)
-      const invalid = Emitter.block(body, `${tag}_invalid_state`)
-      Emitter.conditionalBranch(
-        body,
-        Emitter.binary(body, 'or', dormant, eligible, `${tag}_is_inactive`),
-        release,
+        relinquished,
         invalid,
       )
       Emitter.setInsertionPoint(body, invalid)
       Emitter.unreachable(body)
-      Emitter.setInsertionPoint(body, release)
-      dropActivatedPackage(context, package_, base, `${tag}_inactive`)
+      Emitter.setInsertionPoint(body, relinquished)
+      dropRelinquishedPackage(context, package_, base, `${tag}_relinquished`)
       Emitter.branch(body, done)
       Emitter.setInsertionPoint(body, done)
     })(),
   )
+  Emitter.branch(body, finished)
+  Emitter.setInsertionPoint(body, finished)
 }
 
 const releaseHelperSymbol = 'silk_execution_release'
@@ -1497,77 +1447,172 @@ export const emitReleaseHelper = (context: ReleaseHelperContext) => {
   })
 }
 
-/** Drops one affine Wake, cancelling or finally discharging its generation authority. */
-export const dropWake = (
+/** Drops one ExecutionRef, releasing its counted package authority without notification. */
+export const dropExecutionRef = (
   context: NativeAggregate.Context,
   values: ReadonlyArray<Value.Input>,
   tag: string,
 ) => {
   const base = values.at(0)
-  const { body, builder, usizeType } = context
-  if (base === undefined || usizeType === undefined)
-    throw new RangeError('LLVM Wake cleanup lost its package reference')
-  const packages = context.program.layout.executionPackages.plans.filter(
-    (candidate) => candidate.readinessStorage,
+  if (base === undefined) throw new RangeError('LLVM ExecutionRef cleanup lost its package')
+  releaseAuthority(context, base, tag)
+}
+
+/** Performs a drop that notification deferred, through the module's single release helper. */
+const releaseExecution = (context: Context, base: Value.Input, tag: string) => {
+  const release = context.cleanup.executionRelease
+  if (release === undefined) throw new RangeError('LLVM deferred Execution drop lost its helper')
+  NativeResult.sourceValues(
+    NativeResult.materialize(
+      context.storage,
+      NativeCall.callSynchronous(
+        context.call.synchronous,
+        {
+          handle: release,
+          resultLaneCount: 0,
+          suspendable: false,
+          ...(Mir.hasDiagnosticObservation(context.program) ? { diagnosticParameter: 1 } : {}),
+        },
+        NativeArgument.fromValues([base]),
+        `${tag}_release`,
+      ),
+      `${tag}_source_result`,
+    ),
   )
-  selectPackageFrom(context, base, packages, tag, (package_) =>
-    (() => {
-      const controlOffset = componentOffset(package_, 'WakeControl')
-      if (controlOffset === undefined) throw new RangeError('Wake package lacks control state')
-      const phasePointer = NativeLanePointer.lanePointer(
-        context.lanePointers,
-        body,
-        base,
-        controlOffset,
-        `${tag}_phase_ptr`,
-      )
-      const phase = Emitter.load(body, usizeType, phasePointer, `${tag}_phase`)
-      const late = Emitter.block(body, `${tag}_late`)
-      const cancel = Emitter.block(body, `${tag}_cancel`)
-      const done = Emitter.block(body, `${tag}_done`)
-      Emitter.conditionalBranch(
-        body,
-        Emitter.integerCompare(
-          body,
-          'eq',
-          phase,
-          Emitter.integerUnsigned(builder, usizeType, 6n),
-          `${tag}_is_late`,
-        ),
-        late,
-        cancel,
-      )
-      Emitter.setInsertionPoint(body, late)
-      dropStoredPackage(
-        context,
-        package_,
-        base,
-        { body: false, endpoints: false, allocation: true },
-        `${tag}_late`,
-      )
-      Emitter.branch(body, done)
-      Emitter.setInsertionPoint(body, cancel)
-      const held = Emitter.integerCompare(
-        body,
-        'eq',
-        phase,
-        Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
-        `${tag}_cleanup_active`,
-      )
-      Emitter.store(
-        body,
-        Emitter.select(
-          body,
-          held,
-          Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
-          Emitter.integerUnsigned(builder, usizeType, 6n),
-          `${tag}_consumed_phase`,
-        ),
-        phasePointer,
-      )
-      Emitter.branch(body, done)
-      Emitter.setInsertionPoint(body, done)
-    })(),
+}
+
+/**
+ * Loads the package of the currently Running body from this activation's transfer. Code that
+ * cannot be running inside a drive, or a transfer owned by no Execution, traps.
+ */
+const runningPackage = (
+  context: Context,
+  span: Mir.Provenance['span'],
+  reason: string,
+  tag: string,
+): Value.Input => {
+  const { body, builder, lanePointers, pointer, program, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution lowering requires usize')
+  const transfer = context.call.transferPointer
+  const trap = NativeTermination.trapBlock(context.termination, reason, span)
+  if (transfer === undefined) {
+    Emitter.branch(body, trap)
+    Emitter.setInsertionPoint(body, Emitter.block(body, `${tag}_unreachable`))
+    return Emitter.nullValue(builder, pointer)
+  }
+  const address = Emitter.load(
+    body,
+    usizeType,
+    NativeLanePointer.lanePointer(
+      lanePointers,
+      body,
+      transfer,
+      program.layout.target.pointerSize * 3,
+      `${tag}_active_ptr`,
+    ),
+    `${tag}_active`,
+  )
+  const running = Emitter.block(body, `${tag}_running`)
+  Emitter.conditionalBranch(
+    body,
+    Emitter.integerCompare(
+      body,
+      'eq',
+      address,
+      Emitter.integerUnsigned(builder, usizeType, 0n),
+      `${tag}_unowned`,
+    ),
+    trap,
+    running,
+  )
+  Emitter.setInsertionPoint(body, running)
+  return Emitter.cast(body, 'inttoptr', address, pointer, `${tag}_base`)
+}
+
+/** Loads the package base addressed by one borrowed Execution or ExecutionRef. */
+const borrowedPackage = (context: Context, reference: Mir.LocalId, tag: string): Value.Input => {
+  const { body, pointer, storage, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution lowering requires usize')
+  const slot = NativeStorage.materialize(storage, reference).at(0)
+  if (slot === undefined) throw new RangeError('LLVM execution reference lost its address')
+  return Emitter.cast(
+    body,
+    'inttoptr',
+    Emitter.load(body, usizeType, slot, `${tag}_address`),
+    pointer,
+    `${tag}_base`,
+  )
+}
+
+/** Whether the package's Execution handle still exists and no drop is deferred behind notify. */
+const handleLive = (context: Context, base: Value.Input, tag: string): Value.Input => {
+  const { body, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution lowering requires usize')
+  const state = Emitter.load(
+    body,
+    usizeType,
+    NativeLanePointer.lanePointer(context.lanePointers, body, base, 0, `${tag}_state_ptr`),
+    `${tag}_state`,
+  )
+  const active = Emitter.integerCompare(
+    body,
+    'ule',
+    state,
+    word(context.cleanup, BigInt(ExecutionTransition.tagOf('Relinquished'))),
+    `${tag}_active`,
+  )
+  const retained = Emitter.integerCompare(
+    body,
+    'ne',
+    Emitter.load(
+      body,
+      usizeType,
+      controlPointer(context, base, ExecutionPackage.notificationWord, `${tag}_flag_ptr`),
+      `${tag}_flag`,
+    ),
+    word(context.cleanup, destroyPending),
+    `${tag}_not_pending`,
+  )
+  return Emitter.binary(body, 'and', active, retained, `${tag}_live`)
+}
+
+/** Addresses one source control word after trapping on any index outside the source words. */
+const sourceControlWord = (
+  context: Context,
+  base: Value.Input,
+  index: Mir.LocalId,
+  span: Mir.Provenance['span'],
+  tag: string,
+): Value.Input => {
+  const { body, builder, storage, usizeType } = context
+  if (usizeType === undefined) throw new RangeError('LLVM execution lowering requires usize')
+  const selected = NativeStorage.readScalar(storage, index)
+  const accepted = Emitter.block(body, `${tag}_word_accepted`)
+  Emitter.conditionalBranch(
+    body,
+    Emitter.integerCompare(
+      body,
+      'ult',
+      selected,
+      Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionPackage.sourceControlWords)),
+      `${tag}_word_valid`,
+    ),
+    accepted,
+    NativeTermination.trapBlock(context.termination, 'invalid execution control word', span),
+  )
+  Emitter.setInsertionPoint(body, accepted)
+  return Emitter.select(
+    body,
+    Emitter.integerCompare(
+      body,
+      'eq',
+      selected,
+      Emitter.integerUnsigned(builder, usizeType, 0n),
+      `${tag}_word_first`,
+    ),
+    controlPointer(context, base, 0, `${tag}_word0_ptr`),
+    controlPointer(context, base, 1, `${tag}_word1_ptr`),
+    `${tag}_word_ptr`,
   )
 }
 
@@ -1577,7 +1622,6 @@ export const emit = (context: Context, operation: Operation) => {
   switch (operation._tag) {
     case 'ExecutionFromAllocation': {
       context.runtimeFeatures.add('ExecutionPackage')
-      if (operation.plan.readinessStorage) context.runtimeFeatures.add('ExternalWakeCell')
       const allocation = NativeStorage.materialize(storage, operation.allocation)
       const baseAddress = allocation.at(0)
       const bytes = allocation.at(1)
@@ -1642,16 +1686,18 @@ export const emit = (context: Context, operation: Operation) => {
         program.layout.target.pointerSize,
         Emitter.integerUnsigned(builder, usizeType, BigInt(packageOrdinal)),
       )
-      for (const role of ['WakeControl', 'InitialContinuationSegment'] as const) {
-        const offset = componentOffset(operation.plan, role)
-        if (offset === undefined) continue
-        for (
-          let word = 0;
-          word < (role === 'InitialContinuationSegment' ? ContinuationTransfer.headerWords : 4);
-          word += 1
+      const control = ExecutionPackage.controlOffset(program.layout.target.pointerSize)
+      for (let ordinal = 0; ordinal < ExecutionPackage.controlWords; ordinal += 1)
+        storeWord(
+          control + ordinal * program.layout.target.pointerSize,
+          ordinal === ExecutionPackage.authorityWord
+            ? Emitter.integerUnsigned(builder, usizeType, 1n)
+            : zero,
         )
-          storeWord(offset + word * program.layout.target.pointerSize, zero)
-      }
+      const continuation = componentOffset(operation.plan, 'InitialContinuationSegment')
+      if (continuation !== undefined)
+        for (let ordinal = 0; ordinal < ContinuationTransfer.headerWords; ordinal += 1)
+          storeWord(continuation + ordinal * program.layout.target.pointerSize, zero)
       const allocationOffset = componentOffset(operation.plan, 'AllocationAuthority')
       const bodyOffset = componentOffset(operation.plan, 'BodyEnvironment')
       if (allocationOffset === undefined || bodyOffset === undefined)
@@ -1695,193 +1741,25 @@ export const emit = (context: Context, operation: Operation) => {
       NativeStorage.writeLocal(storage, operation.destination.ordinal, [base])
       return
     }
-    case 'ExecutionPark': {
+    case 'ExecutionRelinquish': {
       context.runtimeFeatures.add('DormantContinuation')
-      context.runtimeFeatures.add('ExternalWakeCell')
-      const transfer = context.call.transferPointer
       const region = context.suspensionRegions.get(operation)
-      const packages = program.layout.executionPackages.plans.filter(
-        (candidate) => candidate.readinessStorage,
-      )
-      if (
-        transfer === undefined ||
-        region?._tag !== 'RunSuspendableEffectRegion' ||
-        packages.length === 0
-      )
-        throw new RangeError('LLVM park lost external transfer authority')
-      const baseAddress = Emitter.load(
-        body,
-        usizeType,
-        NativeLanePointer.lanePointer(
-          lanePointers,
-          body,
-          transfer,
-          program.layout.target.pointerSize * 3,
-          `park${operation.destination.ordinal}_active_ptr`,
-        ),
-        `park${operation.destination.ordinal}_active`,
-      )
-      const base = Emitter.cast(
-        body,
-        'inttoptr',
-        baseAddress,
-        pointer,
-        `park${operation.destination.ordinal}_base`,
-      )
-      const controlStorage = Emitter.alloca(
-        body,
-        pointer,
-        `park${operation.destination.ordinal}_control_slot`,
-      )
-      const storedPackage = Emitter.load(
-        body,
-        usizeType,
-        NativeLanePointer.lanePointer(
-          lanePointers,
-          body,
-          base,
-          program.layout.target.pointerSize,
-          `park${operation.destination.ordinal}_package_ptr`,
-        ),
-        `park${operation.destination.ordinal}_package`,
-      )
-      const packageSelected = Emitter.block(
-        body,
-        `park${operation.destination.ordinal}_package_selected`,
-      )
-      let packageOtherwise: LlvmBlock.Block | undefined
-      for (const package_ of packages) {
-        const ordinal = program.layout.executionPackages.plans.findIndex((candidate) =>
-          ExecutionPackage.equals(candidate, package_),
-        )
-        const control = componentOffset(package_, 'WakeControl')
-        if (ordinal < 0 || control === undefined)
-          throw new RangeError('LLVM park lost a wake-control package ordinal')
-        if (packageOtherwise !== undefined) Emitter.setInsertionPoint(body, packageOtherwise)
-        const selected = Emitter.block(
-          body,
-          `park${operation.destination.ordinal}_package_${ordinal}`,
-        )
-        const otherwise = Emitter.block(
-          body,
-          `park${operation.destination.ordinal}_package_${ordinal}_otherwise`,
-        )
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            storedPackage,
-            Emitter.integerUnsigned(builder, usizeType, BigInt(ordinal)),
-            `park${operation.destination.ordinal}_package_${ordinal}_matches`,
-          ),
-          selected,
-          otherwise,
-        )
-        Emitter.setInsertionPoint(body, selected)
-        Emitter.store(
-          body,
-          NativeLanePointer.lanePointer(
-            lanePointers,
-            body,
-            base,
-            control,
-            `park${operation.destination.ordinal}_package_${ordinal}_control`,
-          ),
-          controlStorage,
-        )
-        Emitter.branch(body, packageSelected)
-        packageOtherwise = otherwise
-      }
-      if (packageOtherwise === undefined)
-        throw new RangeError('LLVM park lost every wake-control package')
-      Emitter.setInsertionPoint(body, packageOtherwise)
-      Emitter.unreachable(body)
-      Emitter.setInsertionPoint(body, packageSelected)
-      const phasePointer = Emitter.load(
-        body,
-        pointer,
-        controlStorage,
-        `park${operation.destination.ordinal}_phase_ptr`,
-      )
-      const generationPointer = NativeLanePointer.lanePointer(
-        lanePointers,
-        body,
-        phasePointer,
-        program.layout.target.pointerSize,
-        `park${operation.destination.ordinal}_generation_ptr`,
-      )
-      const generation = Emitter.load(
-        body,
-        usizeType,
-        generationPointer,
-        `park${operation.destination.ordinal}_generation`,
-      )
-      Emitter.store(
-        body,
-        Emitter.binary(
-          body,
-          'add',
-          generation,
-          Emitter.integerUnsigned(builder, usizeType, 1n),
-          `park${operation.destination.ordinal}_next_generation`,
-        ),
-        generationPointer,
-      )
-      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 1n), phasePointer)
-      const guard = applyCallable(
+      if (region?._tag !== 'RunSuspendableEffectRegion')
+        throw new RangeError('LLVM relinquish lost its suspension region')
+      const tag = `relinquish${operation.destination.ordinal}`
+      runningPackage(
         context,
-        operation.register,
-        operation.registrationTypeArguments,
-        [[base]],
-        `park${operation.destination.ordinal}_register`,
+        operation.provenance.span,
+        'relinquish outside a running execution',
+        tag,
       )
-      NativeStorage.writeLocal(storage, operation.guard.ordinal, guard)
-      const phase = Emitter.load(
-        body,
-        usizeType,
-        phasePointer,
-        `park${operation.destination.ordinal}_phase`,
-      )
-      const latched = Emitter.integerCompare(
-        body,
-        'eq',
-        phase,
-        Emitter.integerUnsigned(builder, usizeType, 2n),
-        `park${operation.destination.ordinal}_latched`,
-      )
-      const keepLatched = Emitter.block(body, `park${operation.destination.ordinal}_keep_latched`)
-      const dormant = Emitter.block(body, `park${operation.destination.ordinal}_dormant`)
-      const relinquish = Emitter.block(body, `park${operation.destination.ordinal}_relinquish`)
-      Emitter.conditionalBranch(body, latched, keepLatched, dormant)
-      Emitter.setInsertionPoint(body, keepLatched)
-      Emitter.branch(body, relinquish)
-      Emitter.setInsertionPoint(body, dormant)
-      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), phasePointer)
-      Emitter.branch(body, relinquish)
-      Emitter.setInsertionPoint(body, relinquish)
-      NativeCall.retainRelay(context.call, region, `park${operation.destination.ordinal}`)
-      NativeSuspension.returnStep(
-        context.call.returns,
-        2n,
-        [],
-        `park${operation.destination.ordinal}_external`,
-      )
+      NativeCall.retainRelay(context.call, region, tag)
+      NativeSuspension.returnStep(context.call.returns, 2n, [], `${tag}_external`)
       const resumeBlock = context.suspension.resumeBlocks.get(suspensionPointKey(region.point))
       if (resumeBlock === undefined)
-        throw new RangeError('LLVM park lost its verified resume label')
+        throw new RangeError('LLVM relinquish lost its verified resume label')
       Emitter.setInsertionPoint(body, resumeBlock)
-      NativeSuspension.restoreRelayPayload(
-        context.suspension,
-        region,
-        `park${operation.destination.ordinal}`,
-      )
-      NativeAggregate.dropThroughPlan(
-        context.cleanup,
-        operation.guardCleanup,
-        NativePayload.local(storage, operation.guard),
-        `park${operation.destination.ordinal}_guard`,
-      )
+      NativeSuspension.restoreRelayPayload(context.suspension, region, tag)
       NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }
@@ -1936,30 +1814,16 @@ export const emit = (context: Context, operation: Operation) => {
           packagePointer,
           `drive${operation.destination.ordinal}_direct_package`,
         )
-        const unpublished = Emitter.integerCompare(
-          body,
-          'eq',
-          state,
-          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Initial'))),
-          `drive${operation.destination.ordinal}_direct_initial`,
-        )
-        const initialReady = Emitter.integerCompare(
+        const validState = Emitter.integerCompare(
           body,
           'eq',
           state,
           Emitter.integerUnsigned(
             builder,
             usizeType,
-            BigInt(ExecutionTransition.tagOf('InitialReady')),
+            BigInt(ExecutionTransition.tagOf('Unstarted')),
           ),
-          `drive${operation.destination.ordinal}_direct_initial_ready`,
-        )
-        const validState = Emitter.binary(
-          body,
-          'or',
-          unpublished,
-          initialReady,
-          `drive${operation.destination.ordinal}_direct_ready`,
+          `drive${operation.destination.ordinal}_direct_unstarted`,
         )
         const validPackage = Emitter.integerCompare(
           body,
@@ -2074,7 +1938,7 @@ export const emit = (context: Context, operation: Operation) => {
           ),
           statePointer,
         )
-        releasePackage(
+        releaseEndpoints(
           context,
           package_,
           base,
@@ -2090,6 +1954,11 @@ export const emit = (context: Context, operation: Operation) => {
             [NativeStorage.materialize(storage, operation.branch), resultValues],
             `drive${operation.destination.ordinal}_direct_on_complete`,
           ),
+        )
+        releaseAuthority(
+          context.cleanup,
+          base,
+          `drive${operation.destination.ordinal}_direct_handle`,
         )
       }
       const emitPackage = (package_: ExecutionPackage.Plan) => {
@@ -2157,43 +2026,33 @@ export const emit = (context: Context, operation: Operation) => {
           statePointer,
           `drive${operation.destination.ordinal}_state`,
         )
-        const unpublished = Emitter.integerCompare(
-          body,
-          'eq',
-          state,
-          Emitter.integerUnsigned(builder, usizeType, 0n),
-          `drive${operation.destination.ordinal}_initial`,
-        )
-        const initialReady = Emitter.integerCompare(
+        const initial = Emitter.integerCompare(
           body,
           'eq',
           state,
           Emitter.integerUnsigned(
             builder,
             usizeType,
-            BigInt(ExecutionTransition.tagOf('InitialReady')),
+            BigInt(ExecutionTransition.tagOf('Unstarted')),
           ),
-          `drive${operation.destination.ordinal}_initial_ready`,
+          `drive${operation.destination.ordinal}_unstarted`,
         )
-        const initial = Emitter.binary(
-          body,
-          'or',
-          unpublished,
-          initialReady,
-          `drive${operation.destination.ordinal}_initial_any`,
-        )
-        const eligible = Emitter.integerCompare(
+        const relinquished = Emitter.integerCompare(
           body,
           'eq',
           state,
-          Emitter.integerUnsigned(builder, usizeType, 4n),
-          `drive${operation.destination.ordinal}_eligible`,
+          Emitter.integerUnsigned(
+            builder,
+            usizeType,
+            BigInt(ExecutionTransition.tagOf('Relinquished')),
+          ),
+          `drive${operation.destination.ordinal}_relinquished`,
         )
         const validState = Emitter.binary(
           body,
           'or',
           initial,
-          eligible,
+          relinquished,
           `drive${operation.destination.ordinal}_valid_state`,
         )
         const validPackage = Emitter.integerCompare(
@@ -2261,7 +2120,11 @@ export const emit = (context: Context, operation: Operation) => {
             `drive${operation.destination.ordinal}_active`,
           ),
         )
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 1n), statePointer)
+        Emitter.store(
+          body,
+          Emitter.integerUnsigned(builder, usizeType, BigInt(ExecutionTransition.tagOf('Running'))),
+          statePointer,
+        )
         const statusStorage = Emitter.alloca(
           body,
           i32,
@@ -2604,8 +2467,16 @@ export const emit = (context: Context, operation: Operation) => {
           NativePayload.local(storage, operation.onSuspend),
           `drive${operation.destination.ordinal}_unused_suspend`,
         )
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), statePointer)
-        releasePackage(context, package_, base, `drive${operation.destination.ordinal}_complete`)
+        Emitter.store(
+          body,
+          Emitter.integerUnsigned(
+            builder,
+            usizeType,
+            BigInt(ExecutionTransition.tagOf('Completed')),
+          ),
+          statePointer,
+        )
+        releaseEndpoints(context, package_, base, `drive${operation.destination.ordinal}_complete`)
         NativeStorage.writeLocal(
           storage,
           operation.destination.ordinal,
@@ -2617,6 +2488,7 @@ export const emit = (context: Context, operation: Operation) => {
             `drive${operation.destination.ordinal}_on_complete`,
           ),
         )
+        releaseAuthority(context.cleanup, base, `drive${operation.destination.ordinal}_handle`)
         Emitter.branch(body, operationFollowing)
 
         Emitter.setInsertionPoint(body, external)
@@ -2664,6 +2536,15 @@ export const emit = (context: Context, operation: Operation) => {
             `drive${operation.destination.ordinal}_store_append`,
           ),
         )
+        Emitter.store(
+          body,
+          Emitter.integerUnsigned(
+            builder,
+            usizeType,
+            BigInt(ExecutionTransition.tagOf('Relinquished')),
+          ),
+          statePointer,
+        )
         NativeAggregate.dropThroughPlan(
           context.cleanup,
           operation.completionCleanup,
@@ -2677,123 +2558,6 @@ export const emit = (context: Context, operation: Operation) => {
           [NativeStorage.materialize(storage, operation.branch), [base]],
           `drive${operation.destination.ordinal}_on_suspend`,
         )
-        const controlOffset = componentOffset(package_, 'WakeControl')
-        if (controlOffset === undefined) {
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), statePointer)
-        } else {
-          const phasePointer = NativeLanePointer.lanePointer(
-            lanePointers,
-            body,
-            base,
-            controlOffset,
-            `drive${operation.destination.ordinal}_phase_ptr`,
-          )
-          const phase = Emitter.load(
-            body,
-            usizeType,
-            phasePointer,
-            `drive${operation.destination.ordinal}_phase`,
-          )
-          const following = Emitter.block(body, `drive${operation.destination.ordinal}_suspended`)
-          const destroyedAfterSuspend = Emitter.block(
-            body,
-            `drive${operation.destination.ordinal}_destroyed_after_suspend`,
-          )
-          const retainedAfterSuspend = Emitter.block(
-            body,
-            `drive${operation.destination.ordinal}_retained_after_suspend`,
-          )
-          const stateAfterSuspend = Emitter.load(
-            body,
-            usizeType,
-            statePointer,
-            `drive${operation.destination.ordinal}_state_after_suspend`,
-          )
-          Emitter.conditionalBranch(
-            body,
-            Emitter.integerCompare(
-              body,
-              'eq',
-              stateAfterSuspend,
-              Emitter.integerUnsigned(builder, usizeType, 7n),
-              `drive${operation.destination.ordinal}_destroy_pending_after_suspend`,
-            ),
-            destroyedAfterSuspend,
-            retainedAfterSuspend,
-          )
-          Emitter.setInsertionPoint(body, destroyedAfterSuspend)
-          dropActivatedPackage(
-            context.cleanup,
-            package_,
-            base,
-            `drive${operation.destination.ordinal}_destroyed_after_suspend`,
-          )
-          Emitter.branch(body, following)
-
-          Emitter.setInsertionPoint(body, retainedAfterSuspend)
-          const notify = Emitter.block(body, `drive${operation.destination.ordinal}_notify`)
-          const dormant = Emitter.block(body, `drive${operation.destination.ordinal}_dormant`)
-          Emitter.conditionalBranch(
-            body,
-            Emitter.integerCompare(
-              body,
-              'eq',
-              phase,
-              Emitter.integerUnsigned(builder, usizeType, 2n),
-              `drive${operation.destination.ordinal}_latched`,
-            ),
-            notify,
-            dormant,
-          )
-          Emitter.setInsertionPoint(body, dormant)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), phasePointer)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), statePointer)
-          Emitter.branch(body, following)
-          Emitter.setInsertionPoint(body, notify)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), statePointer)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), phasePointer)
-          notifyReady(context, package_, base, `drive${operation.destination.ordinal}_ready`)
-          const stateAfterNotify = Emitter.load(
-            body,
-            usizeType,
-            statePointer,
-            `drive${operation.destination.ordinal}_state_after_notify`,
-          )
-          const destroyedAfterNotify = Emitter.block(
-            body,
-            `drive${operation.destination.ordinal}_destroyed_after_notify`,
-          )
-          const eligibleAfterNotify = Emitter.block(
-            body,
-            `drive${operation.destination.ordinal}_eligible_after_notify`,
-          )
-          Emitter.conditionalBranch(
-            body,
-            Emitter.integerCompare(
-              body,
-              'eq',
-              stateAfterNotify,
-              Emitter.integerUnsigned(builder, usizeType, 7n),
-              `drive${operation.destination.ordinal}_destroy_pending_after_notify`,
-            ),
-            destroyedAfterNotify,
-            eligibleAfterNotify,
-          )
-          Emitter.setInsertionPoint(body, destroyedAfterNotify)
-          dropActivatedPackage(
-            context.cleanup,
-            package_,
-            base,
-            `drive${operation.destination.ordinal}_destroyed_after_notify`,
-          )
-
-          Emitter.branch(body, following)
-          Emitter.setInsertionPoint(body, eligibleAfterNotify)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), phasePointer)
-          Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), statePointer)
-          Emitter.branch(body, following)
-          Emitter.setInsertionPoint(body, following)
-        }
         NativeStorage.writeLocal(storage, operation.destination.ordinal, suspendedResult)
         Emitter.branch(body, operationFollowing)
         Emitter.setInsertionPoint(body, operationFollowing)
@@ -2813,259 +2577,130 @@ export const emit = (context: Context, operation: Operation) => {
       )
       return
     }
-    case 'ExecutionNotifyInitial': {
-      context.runtimeFeatures.add('ReadinessNotification')
-      const reference = NativeStorage.materialize(storage, operation.execution).at(0)
-      if (reference === undefined)
-        throw new RangeError('LLVM initial readiness lost its Execution reference')
-      const baseAddress = Emitter.load(
-        body,
-        usizeType,
-        reference,
-        `notify_initial${operation.destination.ordinal}_base_address`,
+    case 'ExecutionCurrent': {
+      context.runtimeFeatures.add('ExecutionReference')
+      const tag = `execution_current${operation.destination.ordinal}`
+      const base = runningPackage(
+        context,
+        operation.provenance.span,
+        'execution reference outside a running execution',
+        tag,
       )
-      const base = Emitter.cast(
-        body,
-        'inttoptr',
-        baseAddress,
-        context.pointer,
-        `notify_initial${operation.destination.ordinal}_base`,
-      )
-      selectPackage(
-        context.cleanup,
+      retainAuthority(context.cleanup, base, tag)
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [base])
+      return
+    }
+    case 'ExecutionRefOf': {
+      context.runtimeFeatures.add('ExecutionReference')
+      const tag = `execution_ref${operation.destination.ordinal}`
+      const base = borrowedPackage(context, operation.execution, tag)
+      retainAuthority(context.cleanup, base, tag)
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [base])
+      return
+    }
+    case 'ExecutionLoad': {
+      const tag = `execution_load${operation.destination.ordinal}`
+      const base = borrowedPackage(context, operation.reference, tag)
+      const selected = sourceControlWord(
+        context,
         base,
-        `notify_initial${operation.destination.ordinal}`,
-        (package_) =>
-          (() => {
-            const statePointer = NativeLanePointer.lanePointer(
-              lanePointers,
-              body,
-              base,
-              0,
-              `notify_initial${operation.destination.ordinal}_state_ptr`,
-            )
-            const current = Emitter.load(
-              body,
-              usizeType,
-              statePointer,
-              `notify_initial${operation.destination.ordinal}_state`,
-            )
-            const accepted = Emitter.block(
-              body,
-              `notify_initial${operation.destination.ordinal}_accepted`,
-            )
-            const rejected = Emitter.block(
-              body,
-              `notify_initial${operation.destination.ordinal}_rejected`,
-            )
-            Emitter.conditionalBranch(
-              body,
-              Emitter.integerCompare(
-                body,
-                'eq',
-                current,
-                Emitter.integerUnsigned(
-                  builder,
-                  usizeType,
-                  BigInt(ExecutionTransition.tagOf('Initial')),
-                ),
-                `notify_initial${operation.destination.ordinal}_is_initial`,
-              ),
-              accepted,
-              rejected,
-            )
-            Emitter.setInsertionPoint(body, rejected)
-            Emitter.unreachable(body)
-            Emitter.setInsertionPoint(body, accepted)
-            Emitter.store(
-              body,
-              Emitter.integerUnsigned(
-                builder,
-                usizeType,
-                BigInt(ExecutionTransition.tagOf('InitialReady')),
-              ),
-              statePointer,
-            )
-            notifyReady(
-              context,
-              package_,
-              base,
-              `notify_initial${operation.destination.ordinal}_ready`,
-            )
-          })(),
+        operation.word,
+        operation.provenance.span,
+        tag,
       )
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [
+        Emitter.load(body, usizeType, selected, `${tag}_value`),
+      ])
+      return
+    }
+    case 'ExecutionStore': {
+      const tag = `execution_store${operation.destination.ordinal}`
+      const base = borrowedPackage(context, operation.reference, tag)
+      const selected = sourceControlWord(
+        context,
+        base,
+        operation.word,
+        operation.provenance.span,
+        tag,
+      )
+      Emitter.store(body, NativeStorage.readScalar(storage, operation.value), selected)
       NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }
-    case 'ExecutionWake': {
-      context.runtimeFeatures.add('ExternalWakeCell')
-      const packages = program.layout.executionPackages.plans.filter(
-        (candidate) => candidate.readinessStorage,
+    case 'ExecutionLive': {
+      const tag = `execution_live${operation.destination.ordinal}`
+      const base = borrowedPackage(context, operation.reference, tag)
+      NativeStorage.writeLocal(storage, operation.destination.ordinal, [
+        Emitter.cast(body, 'zext', handleLive(context, base, tag), i32, `${tag}_flag`),
+      ])
+      return
+    }
+    case 'ExecutionNotify': {
+      context.runtimeFeatures.add('ReadinessNotification')
+      const tag = `execution_notify${operation.destination.ordinal}`
+      const base = borrowedPackage(context, operation.reference, tag)
+      if (program.layout.executionPackages.plans.length === 0) {
+        // No package exists in this program, so no reference can be live.
+        Emitter.branch(
+          body,
+          NativeTermination.trapBlock(
+            context.termination,
+            'execution notify after its handle was dropped',
+            operation.provenance.span,
+          ),
+        )
+        Emitter.setInsertionPoint(body, Emitter.block(body, `${tag}_unreachable`))
+        NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
+        return
+      }
+      const accepted = Emitter.block(body, `${tag}_accepted`)
+      Emitter.conditionalBranch(
+        body,
+        handleLive(context, base, tag),
+        accepted,
+        NativeTermination.trapBlock(
+          context.termination,
+          'execution notify after its handle was dropped',
+          operation.provenance.span,
+        ),
       )
-      const base = NativeStorage.materialize(storage, operation.wake).at(0)
-      if (packages.length === 0 || base === undefined)
-        throw new RangeError('LLVM Wake lost its exact package authority')
-      const emitPackage = (package_: ExecutionPackage.Plan) => {
-        const controlOffset = componentOffset(package_, 'WakeControl')
-        if (controlOffset === undefined)
-          throw new RangeError('LLVM Wake package lost its control authority')
-        const phasePointer = NativeLanePointer.lanePointer(
-          lanePointers,
-          body,
-          base,
-          controlOffset,
-          `wake${operation.destination.ordinal}_phase_ptr`,
-        )
-        const statePointer = NativeLanePointer.lanePointer(
-          lanePointers,
-          body,
-          base,
-          0,
-          `wake${operation.destination.ordinal}_state_ptr`,
-        )
-        const phase = Emitter.load(
-          body,
-          usizeType,
-          phasePointer,
-          `wake${operation.destination.ordinal}_phase`,
-        )
-        const registering = Emitter.block(body, `wake${operation.destination.ordinal}_registering`)
-        const notRegistering = Emitter.block(
-          body,
-          `wake${operation.destination.ordinal}_not_registering`,
-        )
-        const following = Emitter.block(body, `wake${operation.destination.ordinal}_following`)
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            phase,
-            Emitter.integerUnsigned(builder, usizeType, 1n),
-            `wake${operation.destination.ordinal}_is_registering`,
-          ),
-          registering,
-          notRegistering,
-        )
-        Emitter.setInsertionPoint(body, registering)
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 2n), phasePointer)
-        Emitter.branch(body, following)
-
-        Emitter.setInsertionPoint(body, notRegistering)
-        const dormant = Emitter.block(body, `wake${operation.destination.ordinal}_dormant`)
-        const notDormant = Emitter.block(body, `wake${operation.destination.ordinal}_not_dormant`)
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            phase,
-            Emitter.integerUnsigned(builder, usizeType, 3n),
-            `wake${operation.destination.ordinal}_is_dormant`,
-          ),
-          dormant,
-          notDormant,
-        )
-        Emitter.setInsertionPoint(body, dormant)
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 3n), statePointer)
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), phasePointer)
-        notifyReady(context, package_, base, `wake${operation.destination.ordinal}_ready`)
-        const stateAfterNotify = Emitter.load(
-          body,
-          usizeType,
-          statePointer,
-          `wake${operation.destination.ordinal}_state_after_notify`,
-        )
-        const destroyed = Emitter.block(body, `wake${operation.destination.ordinal}_destroyed`)
-        const eligibleBlock = Emitter.block(body, `wake${operation.destination.ordinal}_eligible`)
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            stateAfterNotify,
-            Emitter.integerUnsigned(builder, usizeType, 7n),
-            `wake${operation.destination.ordinal}_destroy_pending`,
-          ),
-          destroyed,
-          eligibleBlock,
-        )
-        Emitter.setInsertionPoint(body, destroyed)
-        dropActivatedPackage(
-          context.cleanup,
-          package_,
-          base,
-          `wake${operation.destination.ordinal}_destroy`,
-        )
-
-        Emitter.branch(body, following)
-        Emitter.setInsertionPoint(body, eligibleBlock)
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 5n), phasePointer)
-        Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 4n), statePointer)
-        Emitter.branch(body, following)
-
-        Emitter.setInsertionPoint(body, notDormant)
-        const cleanup = Emitter.block(body, `wake${operation.destination.ordinal}_during_cleanup`)
-        const settled = Emitter.block(body, `wake${operation.destination.ordinal}_settled`)
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            phase,
-            Emitter.integerUnsigned(builder, usizeType, cleanupWithWake),
-            `wake${operation.destination.ordinal}_cleanup_active`,
-          ),
-          cleanup,
-          settled,
-        )
-        Emitter.setInsertionPoint(body, cleanup)
-        Emitter.store(
-          body,
-          Emitter.integerUnsigned(builder, usizeType, cleanupWithoutWake),
-          phasePointer,
-        )
-        Emitter.branch(body, following)
-        Emitter.setInsertionPoint(body, settled)
-        const cancelled = Emitter.block(body, `wake${operation.destination.ordinal}_cancelled`)
-        const invalid = Emitter.block(body, `wake${operation.destination.ordinal}_invalid`)
-        Emitter.conditionalBranch(
-          body,
-          Emitter.integerCompare(
-            body,
-            'eq',
-            phase,
-            Emitter.integerUnsigned(builder, usizeType, 6n),
-            `wake${operation.destination.ordinal}_is_cancelled`,
-          ),
-          cancelled,
-          invalid,
-        )
-        Emitter.setInsertionPoint(body, cancelled)
-        releaseAllocation(
-          context,
-          package_,
-          base,
-          `wake${operation.destination.ordinal}_late_release`,
-        )
-        Emitter.branch(body, following)
-        Emitter.setInsertionPoint(body, invalid)
-        Emitter.unreachable(body)
-        Emitter.setInsertionPoint(body, following)
-      }
-      if (packages.length === 1) {
-        const selected = packages.at(0)
-        if (selected === undefined) throw new RangeError('LLVM Wake lost its package')
-        emitPackage(selected)
-      } else {
-        selectPackageFrom(
-          context.cleanup,
-          base,
-          packages,
-          `wake${operation.destination.ordinal}`,
-          emitPackage,
-        )
-      }
+      Emitter.setInsertionPoint(body, accepted)
+      // Only the outermost notification owns a drop deferred while its endpoint runs.
+      const flagPointer = controlPointer(
+        context,
+        base,
+        ExecutionPackage.notificationWord,
+        `${tag}_flag_ptr`,
+      )
+      const outermost = Emitter.integerCompare(
+        body,
+        'eq',
+        Emitter.load(body, usizeType, flagPointer, `${tag}_previous_flag`),
+        Emitter.integerUnsigned(builder, usizeType, 0n),
+        `${tag}_outermost`,
+      )
+      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, notifying), flagPointer)
+      selectPackage(context.cleanup, base, tag, (package_) =>
+        notifyReady(context, package_, base, `${tag}_ready`),
+      )
+      const settle = Emitter.block(body, `${tag}_settle`)
+      const following = Emitter.block(body, `${tag}_following`)
+      Emitter.conditionalBranch(body, outermost, settle, following)
+      Emitter.setInsertionPoint(body, settle)
+      const pending = Emitter.integerCompare(
+        body,
+        'eq',
+        Emitter.load(body, usizeType, flagPointer, `${tag}_returned_flag`),
+        Emitter.integerUnsigned(builder, usizeType, destroyPending),
+        `${tag}_destroy_pending`,
+      )
+      Emitter.store(body, Emitter.integerUnsigned(builder, usizeType, 0n), flagPointer)
+      const destroy = Emitter.block(body, `${tag}_deferred_destroy`)
+      Emitter.conditionalBranch(body, pending, destroy, following)
+      Emitter.setInsertionPoint(body, destroy)
+      releaseExecution(context, base, `${tag}_deferred`)
+      Emitter.branch(body, following)
+      Emitter.setInsertionPoint(body, following)
       NativeStorage.writeLocal(storage, operation.destination.ordinal, [])
       return
     }

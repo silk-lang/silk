@@ -193,8 +193,7 @@ const intrinsicSpelling = (family: string, operation: string): string => {
   if (family === 'Effect' && operation === 'observeUnhandled') return 'observeUnhandled'
   if (family === 'Effect' && operation.startsWith('bindRequirement')) return operation
   if (family === 'Effect' && operation === 'catchFailure') return operation
-  if (family === 'Wake' && operation === 'signal') return 'wake'
-  if (family === 'Parking' && operation === 'park') return 'park'
+  if (family === 'Execution' && operation === 'relinquish') return 'relinquish'
   if (family === 'Place' && operation === 'replace') return 'replace'
   if (family === 'Storage' && operation === 'acquire') return 'systemAllocationAcquire'
   if (family === 'Os') return `os${upperInitial(operation)}`
@@ -211,9 +210,7 @@ const admission = (family: string): AdmissionCategory => {
     family === 'Pointer' ||
     family === 'Slot' ||
     family === 'Shared' ||
-    family === 'Execution' ||
-    family === 'Wake' ||
-    family === 'Parking'
+    family === 'Execution'
   )
     return 'Ownership'
   return 'Language'
@@ -240,11 +237,13 @@ const consumer = (family: string, operation: string): string => {
     return operation === 'layout' || operation === 'fromAllocation'
       ? 'silk/shared.make'
       : `silk/shared.${operation}`
-  if (family === 'Execution')
-    return operation === 'layout' || operation === 'fromAllocation'
-      ? 'silk/execution.make'
-      : `silk/execution.${operation}`
-  if (family === 'Wake' || family === 'Parking') return 'language:external-wake-parking'
+  if (family === 'Execution') {
+    if (operation === 'layout' || operation === 'fromAllocation') return 'silk/execution.make'
+    if (operation === 'drive' || operation === 'refOf') return 'silk/execution.drive'
+    if (operation === 'notify') return 'silk/execution.notifyInitial'
+    if (operation === 'live') return 'silk/execution.wake'
+    return 'silk/execution.park'
+  }
   if (family === 'Storage') return 'silk/allocator.allocate'
   if (family === 'Os') return osConsumer(operation)
   if (family === 'Place') return 'language:place-replacement'
@@ -500,8 +499,6 @@ const executionDriveTypeParameters = [
   completionCallback,
   suspensionCallback,
 ]
-const executionNotifyOwner = { module: 'Intrinsic', name: '$ExecutionNotifyInitial' }
-const notifiedResult = Type.parameter(executionNotifyOwner, 0, 'A')
 const representedCompletion = Type.represented(
   completionBound,
   completionBound,
@@ -512,28 +509,10 @@ const representedSuspension = Type.represented(
   suspensionBound,
   Type.representationParameterArgument(suspensionCallback),
 )
-const parkingOwner = { module: 'Intrinsic', name: '$ExecutionPark' }
-const registrationGuard = Type.parameter(parkingOwner, 0, 'G')
-const registrationBound = Type.callable(
-  [Type.wake],
-  registrationGuard,
-  { environment: contractLifetime('registrationBound'), lifetimeBinders: [] },
-  'Take',
-)
-const registrationCallback = Type.parameter(
-  parkingOwner,
-  1,
-  'F',
-  'CallableRepresentation',
-  registrationBound,
-  ['Intrinsic.NonParking'],
-)
-const parkingTypeParameters = [registrationGuard, registrationCallback]
-const representedRegistration = Type.represented(
-  registrationBound,
-  registrationBound,
-  Type.representationParameterArgument(registrationCallback),
-)
+const executionReferenceOwner = { module: 'Intrinsic', name: '$ExecutionRefOf' }
+const referencedResult = Type.parameter(executionReferenceOwner, 0, 'A')
+const sharedExecutionRef = (name: string) =>
+  Type.reference('Shared', Type.executionRef, contractLifetime(name))
 const suspensionOwner = { module: 'silk/core', name: '$EffectSuspend' }
 const observationOwner = { module: 'Intrinsic', name: '$ObserveDiagnostics' }
 const observationState = Type.parameter(observationOwner, 0, 'S')
@@ -1597,47 +1576,88 @@ const intrinsicOperations = [
   }),
   builtin({
     actor: 'Execution',
-    name: 'notifyInitial',
-    operation: 'ExecutionNotifyInitial',
-    typeParameters: ['A'],
-    semanticTypeParameters: [notifiedResult],
-    parameters: [valueParameter('execution', '&mut Execution<A>')],
-    semanticParameters: [
-      Type.reference(
-        'Exclusive',
-        Type.execution(notifiedResult),
-        contractLifetime('notifyInitial'),
-      ),
-    ],
-    result: '()',
-    semanticResult: closedResult(Type.unit),
-  }),
-  builtin({
-    actor: 'Wake',
-    name: 'signal',
-    operation: 'ExecutionWake',
-    parameters: [valueParameter('wake', 'Wake')],
-    semanticParameters: [Type.wake],
-    result: '()',
-    semanticResult: closedResult(Type.unit),
-  }),
-  builtin({
-    actor: 'Parking',
-    name: 'park',
-    operation: 'ExecutionPark',
-    typeParameters: ['G', 'F'],
-    semanticTypeParameters: parkingTypeParameters,
-    parameters: [valueParameter('register', 'F')],
-    semanticParameters: [representedRegistration],
+    name: 'relinquish',
+    operation: 'ExecutionRelinquish',
+    parameters: [],
+    semanticParameters: [],
     result: 'Effect<()>',
     semanticResult: closedResult(
       Type.effect(
         Type.unit,
         [],
-        { environment: contractLifetime('park'), lifetimeBinders: [] },
+        { environment: contractLifetime('relinquish'), lifetimeBinders: [] },
         'Take',
       ),
     ),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'current',
+    operation: 'ExecutionCurrent',
+    parameters: [],
+    semanticParameters: [],
+    result: 'Effect<ExecutionRef>',
+    semanticResult: closedResult(
+      Type.effect(
+        Type.executionRef,
+        [],
+        { environment: contractLifetime('current'), lifetimeBinders: [] },
+        'Take',
+      ),
+    ),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'refOf',
+    operation: 'ExecutionRefOf',
+    typeParameters: ['A'],
+    semanticTypeParameters: [referencedResult],
+    parameters: [valueParameter('execution', '&Execution<A>')],
+    semanticParameters: [
+      Type.reference('Shared', Type.execution(referencedResult), contractLifetime('refOf')),
+    ],
+    result: 'ExecutionRef',
+    semanticResult: closedResult(Type.executionRef),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'load',
+    operation: 'ExecutionLoad',
+    parameters: [valueParameter('reference', '&ExecutionRef'), valueParameter('word', 'usize')],
+    semanticParameters: [sharedExecutionRef('load'), 'usize'],
+    result: 'usize',
+    semanticResult: closedResult('usize'),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'store',
+    operation: 'ExecutionStore',
+    parameters: [
+      valueParameter('reference', '&ExecutionRef'),
+      valueParameter('word', 'usize'),
+      valueParameter('value', 'usize'),
+    ],
+    semanticParameters: [sharedExecutionRef('store'), 'usize', 'usize'],
+    result: '()',
+    semanticResult: closedResult(Type.unit),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'notify',
+    operation: 'ExecutionNotify',
+    parameters: [valueParameter('reference', '&ExecutionRef')],
+    semanticParameters: [sharedExecutionRef('notify')],
+    result: '()',
+    semanticResult: closedResult(Type.unit),
+  }),
+  builtin({
+    actor: 'Execution',
+    name: 'live',
+    operation: 'ExecutionLive',
+    parameters: [valueParameter('reference', '&ExecutionRef')],
+    semanticParameters: [sharedExecutionRef('live')],
+    result: 'bool',
+    semanticResult: closedResult('bool'),
   }),
   builtin({
     actor: 'Shared',
