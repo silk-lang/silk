@@ -1777,6 +1777,10 @@ export interface ConformanceFact {
   readonly self: Type.Parameter
   readonly typeParameters: ReadonlyArray<TypeParameterFact>
   readonly requirements: ReadonlyArray<ConformanceRequirementFact>
+  /** The head's written `where` clause, premises of every witness and inline member. */
+  readonly constraints: ReadonlyArray<ConstraintFact>
+  /** The resolved form of `constraints`, empty until completion. */
+  readonly constraintContracts: ReadonlyArray<Constraint.Constraint>
   readonly capability: DeclaredTypeFact
   readonly provider: DeclaredTypeFact
   /**
