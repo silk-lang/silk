@@ -128,6 +128,10 @@ try {
 if [ "$6" != '${checkout}/packages/compiler/stdlib' ]; then exit 8; fi
 if ! grep -q 'consumer corpus stdlib witness' "$6/silk/i32.silk"; then exit 9; fi
 printf '%s:%s\\n' "$8" "\${10}" >> '${calls}'
+if grep -q 'import silk.json_reflect' "$2"; then
+  printf '%s\\n' 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"smoke-gap","reason":"fake compiler gap"}]}' >&2
+  exit 1
+fi
 printf '#!/bin/sh\\nexit 42\\n' > program
 chmod +x program
 `,
@@ -165,7 +169,8 @@ chmod +x program
   assert.strictEqual(invokeCorpus(undefined, { SILK_BOOTSTRAP: bootstrap }).status, 0)
   assert.strictEqual(existsSync(sentinel), false)
   // Full mode uses the same immutable artifact but executes every regular case. The fake
-  // compiler intentionally produces unpinned mismatches; those remain observations here.
+  // compiler intentionally produces unpinned mismatches and an explicit gap; those remain
+  // observations here, independently of which fixture inputs the harness supports.
   const full = invokeCorpus(['--mode', 'corpus-full'], { SILK_BOOTSTRAP: bootstrap })
   assert.strictEqual(full.status, 0, full.stdout + full.stderr)
   const prefix = 'SELFHOST_CORPUS_MANIFEST='
@@ -224,7 +229,7 @@ chmod +x program
     { _tag: 'Trap' },
   )
   assert.match(full.stdout, /^FAIL /m)
-  assert.match(full.stdout, /^UNSUPPORTED /m)
+  assert.match(full.stdout, /^UNSUPPORTED json-reflect: smoke-gap: fake compiler gap$/m)
   assert.deepStrictEqual(readFileSync(downloaded), readFileSync(bundle))
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
