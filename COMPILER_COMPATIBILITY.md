@@ -370,6 +370,17 @@ Each entry records:
   range reset also advance every previously failing scalar/prefix corpus front. The expanded
   actor suite retains earlier literal, helper, and empty-sequence initialization before a cold
   imported constant is needed during reflected iteration.
+- **Authored dispatch storage:** the published `1965c1ea` compiler exposed a generation-dependent
+  stack failure: its native-produced N1 passed the same eight default-depth probes, while its
+  bootstrap-produced N0 passed the three shallow probes and crashed on the other five. The N0
+  expression and statement dispatchers reserved 78,232 and 75,560 bytes before saved registers;
+  their wide authored-node wildcard arms emitted 117 and 121 separate effectful rejection sites.
+  Pure classifiers now map only the existing admitted payloads into compact evaluator inputs,
+  followed by one `Unavailable` rejection arm per dispatcher. Call recognition retains its
+  priority, and step charging, authored span lookup, variant helper calls, refusal codes and
+  configured depth remain unchanged. The exact classifiers were checked, compiled and executed
+  by the current bootstrap against thirty admitted, unavailable and call/pipeline controls using
+  the real HIR and call-input declarations, returning 42.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
