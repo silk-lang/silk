@@ -173,3 +173,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-10 · Private pnpm installation with --ignore-scripts left Oxlint unpatched and the CLI's workspace dist prerequisites absent · Run effect-tsgo patch --oxlint and build compiler, docgen, formatter, then CLI inside the isolated checkout · bootstrap static control
 
 2026-10-10 · A fresh corpus worktree lacked ignored toolchain identity inputs, so native fixture tests failed before discovery · Reused the current built bootstrap dependency graph and generated Unicode tables, then ran only the selected native cases · Silk
+2026-10-10 · Full native acceptance exposed timer and listener fixtures still passing exclusive references to shared parameters or returning affine pattern bindings without move after OWN-021 · Reborrow the referenced value explicitly and move the five owned success bindings in the fixtures · Silk native corpus
