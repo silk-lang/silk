@@ -988,6 +988,27 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   body and the refused parameterized entry.
 - **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
 
+### Runtime uses of structs holding phase-only fields
+
+- **Status:** divergence recorded by the coordinator on 2026-10-10. It is retired when the
+  bootstrap reports `StaticPhaseViolation` at these sites on main and the fix reaches selfhost.
+- **Rule:** [STATIC-009](apps/docs/content/reference/static-evaluation.md#static-009--static-sequences-are-immutable-compile-time-values)
+  gives a static sequence no runtime layout: it cannot appear in a residual signature, binding,
+  call or backend artifact. A struct or tuple may hold one as a field, and a type that holds one
+  at any depth stays static.
+- **Compilers:** selfhost admits the field and refuses a runtime parameter, result or failure of
+  such a type as `StaticPhaseViolation` (`SEM0176`) at its authored type, and a static value of it
+  at the runtime site that would embed it, such as `let held = make()`. The
+  bootstrap accepts the same programs semantically and reports `SEM0219` (unsupported native
+  lowering) where lowering reaches the value, which can be an unrelated span.
+- **Source migration:** none; keep such structs inside static functions, as `silk.format`'s
+  `TemplatePlan` does.
+- **Diagnostics and limits:** unions holding phase-only payloads are not yet treated as static by
+  selfhost; they follow once static evaluation admits union values.
+- **Evidence:** `phaseOnlyFieldsStayStatic` in `compiler/src/semantic/SemanticStaticCases.silk`
+  admits the field and a static function returning it, and asserts the violation at a runtime
+  parameter, result and nested-struct parameter, and at a static call embedded in a runtime body.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or
