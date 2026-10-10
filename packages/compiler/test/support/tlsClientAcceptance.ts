@@ -1707,7 +1707,7 @@ const tlsClientDemandDrivenHelper = `effect fn feedToDemand(
     let remaining = Slice.view<u8>(input, offset, input.length - offset)
     let fed = run Client.feedInput(&mut client.*, remaining)
     let progress = match move fed {
-      Result<Progress, TlsError>.Success {value} => value
+      Result<Progress, TlsError>.Success {value} => move value
       Result<Progress, TlsError>.Failure {error} => { return feedFailureCode(move error) }
     }
     if progress.consumed == usize.ZERO { return 21 }

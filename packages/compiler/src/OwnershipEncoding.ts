@@ -60,8 +60,8 @@ const cleanupText = (cleanup: CleanupPlan.CleanupPlan): string => {
     return `local-shared-core:${Type.encode(cleanup.type)} opaque-last(payload-helper=${Type.encode(cleanup.element)},allocation=${cleanupText(cleanup.allocation)})`
   if (cleanup._tag === 'ExecutionCleanup')
     return `execution:${Type.encode(cleanup.type)} metadata=package-owned allocation=${cleanupText(cleanup.allocation)}`
-  if (cleanup._tag === 'WakeCleanup')
-    return `wake:${Type.encode(cleanup.type)} authority=generation allocation=${cleanupText(cleanup.allocation)}`
+  if (cleanup._tag === 'ExecutionRefCleanup')
+    return `execution-ref:${Type.encode(cleanup.type)} authority=counted allocation=${cleanupText(cleanup.allocation)}`
   if (cleanup._tag === 'ArrayCleanup') {
     return `array:${Type.encode(cleanup.type)} length=${cleanup.length} element=(${cleanupText(cleanup.element)})`
   }

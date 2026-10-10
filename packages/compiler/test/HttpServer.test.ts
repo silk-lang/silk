@@ -128,7 +128,7 @@ fn retainOffer(mut parser: RequestParser) -> () {
   }
   let offer = match move inspect(&head, UpgradeLimits.default()) {
     Result.Failure {error} => { drop error return () }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   drop head
   let reset = RequestParser.reset(&mut parser)

@@ -454,7 +454,7 @@ pub fn main() -> i32 {
             operation._tag !== 'RunEffect' &&
             operation._tag !== 'RunEffectValue' &&
             operation._tag !== 'CatchEffect' &&
-            operation._tag !== 'ExecutionPark'
+            operation._tag !== 'ExecutionRelinquish'
           )
             continue
           const span = operation.provenance.span
@@ -467,10 +467,10 @@ pub fn main() -> i32 {
 it.effect('retains provider-specific parking through a generic interface handler', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.result {Result}
-struct ParkGuard {wake: Intrinsic.Wake}
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
 service Clock { effect fn wait() -> () ? &mut Clock }
 struct Fixed {}
 impl Clock for Fixed { effect fn wait(self: &mut Self) -> () { return () } }
@@ -482,7 +482,7 @@ effect fn flushIo() -> () ! Problem ? &mut Io | &mut Clock {
  let result = run Effect.result(Io.flush())
  match move result {
   Result.Success {value} => { drop value return () }
-  Result.Failure {error} => { fail error }
+  Result.Failure {error} => { fail move error }
  }
 }
 struct Inner {}

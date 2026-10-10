@@ -1,7 +1,7 @@
 /** Conditional cancellation and restoration use the same ownership flags across suspension. */
 export const partialSuspension = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 unsafe extern "C" fn silk_record_drop(value: i32) -> ()
 unsafe extern "C" fn silk_verify_drops() -> i32
 struct Token { value: i32 }
@@ -11,8 +11,8 @@ impl Drop for Token {
 struct Pair { left: Token right: Token }
 struct Endpoint {}
 fn ready(endpoint: &Endpoint) -> () { return () }
-struct Guard { wake: Intrinsic.Wake }
-fn register(wake: Intrinsic.Wake) -> Guard { return Guard { wake: move wake } }
+struct Guard { wake: Wake }
+fn register(wake: Wake) -> Guard { return Guard { wake: move wake } }
 effect fn parked(flag: bool) -> i32 {
   let mut pair = Pair { left: Token { value: 1 }, right: Token { value: 2 } }
   if flag { let extracted = move pair.left drop extracted }

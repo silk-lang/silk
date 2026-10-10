@@ -893,12 +893,8 @@ export const make = (operations: Operations) => {
   ): ReadonlyArray<CallTarget> => {
     const walk = (expression: Tir.Expression): ReadonlyArray<CallTarget> => {
       const own =
-        expression._tag === 'BuiltinCall' &&
-        (expression.operation === 'SlotDrop' || expression.operation === 'ExecutionPark')
-          ? (expression.operation === 'ExecutionPark'
-              ? expression.typeArguments.slice(0, 1)
-              : expression.typeArguments
-            ).flatMap((argument) =>
+        expression._tag === 'BuiltinCall' && expression.operation === 'SlotDrop'
+          ? expression.typeArguments.flatMap((argument) =>
               (() => {
                 const specialized = Type.substituteGenericArgument(argument, substitution)
                 return Type.isTypeArgument(specialized)
@@ -2338,6 +2334,12 @@ export const make = (operations: Operations) => {
       return initializer === undefined ? undefined : effectOriginOf(initializer, context)
     }
     if (expression._tag === 'Move') return effectOriginOf(expression.subject, context)
+    // A borrowed Effect runs its whole lent place, and its referent is the same Effect.
+    if (expression._tag === 'ValueBorrow')
+      return expression.place === undefined || expression.selectors.length > 0
+        ? undefined
+        : effectOriginOf(expression.place, context)
+    if (expression._tag === 'ReferentPlace') return effectOriginOf(expression.subject, context)
     // A return-site join has no single exact identity; its composite representation is read
     // from the expression type instead.
     if (expression._tag === 'UnionConvert')
@@ -3923,9 +3925,6 @@ export const make = (operations: Operations) => {
           case 'ExecutionDrive':
             ordinals = [2, 3]
             break
-          case 'ExecutionPark':
-            ordinals = [0]
-            break
           case 'SharedWithMut':
             ordinals = [1, 2]
             break
@@ -3941,12 +3940,7 @@ export const make = (operations: Operations) => {
           if (target === undefined) unresolvedDiagnosticExecutions.add(execution)
           else addDependency(execution, target)
         }
-        if (
-          expression.operation === 'ExecutionDrive' ||
-          expression.operation === 'ExecutionNotifyInitial' ||
-          expression.operation === 'ExecutionWake'
-        )
-          readinessExecutions.add(execution)
+        if (expression.operation === 'ExecutionNotify') readinessExecutions.add(execution)
         if (expression.operation === 'ExecutionFromAllocation') {
           const callback = expression.arguments.at(3)
           const target = callback === undefined ? undefined : callableApplicationTarget(callback)
@@ -4003,7 +3997,11 @@ export const make = (operations: Operations) => {
             effectIdentities.add(identity)
             addBuiltinCallbacks(expression, execution)
             if (expression.operation === 'EffectSuspend') nestedRoots.add(execution)
-            else if (expression.operation === 'ExecutionPark') externalRoots.add(execution)
+            else if (
+              expression.operation === 'ExecutionRelinquish' ||
+              expression.operation === 'ExecutionCurrent'
+            )
+              externalRoots.add(execution)
             else if (expression.operation === 'EffectObserveDiagnostics') {
               diagnosticObservations.add(execution)
               // Scope exit restores the enclosing context before either owner is dropped.
@@ -4156,7 +4154,12 @@ export const make = (operations: Operations) => {
       }
 
       const isExternalParkSubject = (expression: Tir.Expression): boolean => {
-        if (expression._tag === 'BuiltinCall' && expression.operation === 'ExecutionPark')
+        // Only a frame-based function can name its running package, so asking parks like relinquish.
+        if (
+          expression._tag === 'BuiltinCall' &&
+          (expression.operation === 'ExecutionRelinquish' ||
+            expression.operation === 'ExecutionCurrent')
+        )
           return true
         if (expression._tag === 'BindingReference') {
           const initializer = bindings.get(expression.binding.ordinal)
