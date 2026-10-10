@@ -1,15 +1,15 @@
 //! Authenticated field descriptors disappear into ordinary shared runtime projections.
 
 import hir.Hir {Access}
-import backend.Mir {MirFunction}
+import backend.Mir {Block, MirFunction, Operand, Terminator}
 import semantic.Intrinsic {Primitive, isPrimitive}
-import semantic.ModuleId {InvalidModulePath}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Query {Cycle}
 import semantic.Rejection {RejectionCode}
 import semantic.Semantic {Answer, Request, Semantic}
-import semantic.SemanticCaseSupport {checkedBody, makeSemantic, module, present, rejectionCode, rejectsSpan, selectedMirIndex, selectedApplicationOf, specializationWithArguments}
+import semantic.SemanticCaseSupport {checkedBody, makeSemantic, module, present, rejectionCode, rejectsSpan, selectedMirIndex, selectedApplicationOf, specializationWithArguments, namedMirApplication, succeeded}
 import semantic.SourceIndex {NoRejection, RevisionMismatch, SourceIndex}
-import semantic.Specialization {Application}
+import semantic.Specialization {Application, StaticSlot}
 import semantic.Type {Argument}
 import semantic.Lifetime {Lifetime}
 import semantic.DeclarationId {DeclarationId}
@@ -47,6 +47,212 @@ fn ordinaryReflectedProjections(body: &TypedBody) -> bool {
   return first && second && shared == 2
 }
 
+test effect fn ordinaryStaticFieldWrappersInferOnlyUnfixedParameters() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run ordinaryWrapperClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn ordinaryWrapperClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut Allocator {
+  let id = run module("ordinary-static-field-wrapper.silk")
+  let text = """
+struct Box {value: i32}
+struct Other {value: i32}
+struct Stored<'a> {value: &'a i32}
+fn project<'a, Owner, Value>(static field: Intrinsic.Field<Owner, Value>, owner: &'a Owner) -> &'a Value {
+  return Intrinsic.borrowField<Owner, Value>(owner, field)
+}
+fn inferProject<'a, Owner, Value>(static field: Intrinsic.Field<Owner, Value>, owner: &'a Owner) -> &'a Value {
+  return Intrinsic.borrowField(owner, field)
+}
+fn ownerFirst<'a, Owner, Value>(owner: &'a Owner, static field: Intrinsic.Field<Owner, Value>) -> &'a Value {
+  return Intrinsic.borrowField<Owner, Value>(owner, field)
+}
+fn relay<'a, Owner, Value>(owner: &'a Owner, static field: Intrinsic.Field<Owner, Value>) -> &'a Value {
+  return project(field, owner)
+}
+fn forwardRead(owner: &Box) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Box>() {total = total + relay(owner, field).*}
+  return total
+}
+fn read(owner: &Box) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Box>() {
+    total = total + project(field, owner).* + inferProject(field, owner).* + ownerFirst(owner, field).*
+  }
+  return total
+}
+fn readStored<'storage, 'loan>(owner: &'loan Stored<'storage>) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Stored<'storage>>() {
+    total = total + project(field, owner).*.*
+  }
+  return total
+}
+fn wrongOwner(owner: &Other) -> () {
+  static for field in Intrinsic.reflectFields<Box>() {let selected = project<Other, i32>(field, owner) drop selected}
+}
+fn wrongValue(owner: &Box) -> () {
+  static for field in Intrinsic.reflectFields<Box>() {let selected = project<Box, bool>(field, owner) drop selected}
+}
+fn wrongInferredOwner(owner: &Other) -> () {
+  static for field in Intrinsic.reflectFields<Box>() {let selected = ownerFirst(owner, field) drop selected}
+}
+fn escapingRelay<'a>(owner: &'a Box) -> () {
+  static for field in Intrinsic.reflectFields<Box>() {
+    let escaped: &'static i32 = ownerFirst(owner, field)
+    drop escaped
+  }
+}
+pub fn main() -> i32 {let value = Box {value: 14} return read(&value)}
+"""
+  let source = run present(text)
+  let revision = run Revision.publish(&Revision.make(), &id, &source)
+  let mut index = SourceIndex.make(run Revision.copy(&revision))
+  let mut store = makeSemantic(move revision)
+  let mut request = Request.make()
+  let read = run Semantic.demandMir(&mut store, &mut request, &id, b"read")
+  run Testing.expect(succeeded(&read), "a user wrapper infers Owner and Value from its static first operand")
+  run Testing.expect(singleRuntimeCallOperands(&store, &read), "each static-first call retains exactly its runtime owner operand")
+  let forwarded = run Semantic.demandMir(&mut store, &mut request, &id, b"forwardRead")
+  run Testing.expect(succeeded(&forwarded), "an outer caller retains its selected generic relay")
+  let relay = namedMirApplication(&store, &forwarded, b"relay")
+  if let Option<Shared<Application>>.Some {value: chosen} = move relay {
+    let applied = run Application.copyShared(&chosen)
+    let target = run Semantic.demandApplicationMir(&mut store, &mut request, &applied)
+    run Testing.expect(oneOwnerParameter(&store, &target),
+      "a selected generic relay matches its symbolic runtime owner after the static first operand fixes the nested call")
+  } else {run Testing.expect(false, "the generic relay retains its concrete application")}
+  return run wrapperTargetClaims(&mut store, &mut request, &mut index, &id, &read)
+}
+
+fn singleRuntimeCallOperands(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector.asSlice<Block>(&function.blocks)
+      let mut calls = usize.ZERO
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let Terminator.Call {arguments, ..} = &blocks[at].terminator {
+          if Vector.length<Operand>(&arguments) != usize.ONE {return false}
+          calls = calls + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      return calls == 3
+    }
+  }
+  return false
+}
+
+effect fn wrapperTargetClaims(store: &mut Semantic, request: &mut Request, index: &mut SourceIndex,
+  id: &ModuleId, caller: &Shared<Result<Answer, NoRejection>>) -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < 3 {
+    let mut name: &[u8] = b"project"
+    if at == usize.ONE {name = b"inferProject"}
+    if at == 2 {name = b"ownerFirst"}
+    let selected = namedMirApplication(&store.*, caller, name)
+    if let Option<Shared<Application>>.Some {value} = move selected {
+      let application = run Application.copyShared(&value)
+      let slots = Vector.asSlice<StaticSlot>(&application.statics)
+      let mut ordinal = usize.ZERO
+      if at == 2 {ordinal = usize.ONE}
+      run Testing.expect(slots.length == usize.ONE && slots[usize.ZERO].ordinal == ordinal,
+        "the descriptor remains an application side fact at its original formal ordinal")
+      let target = run Semantic.demandApplicationMir(&mut store.*, &mut request.*, &application)
+      run Testing.expect(oneOwnerParameter(&store.*, &target), "all explicit, inferred and owner-first intrinsic wrappers lower with only the owner parameter")
+    } else {run Testing.expect(false, "all ordinary generic wrapper applications are retained")}
+    at = at + usize.ONE
+  }
+  let stored = run selectedApplicationOf(&mut index.*, id, b"readStored")
+  let mut regions = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut regions, Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Static)})
+  run Vector.append<Argument>(&mut regions, Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Local {
+    declaration: run DeclarationId.copy(Application.bodyDeclaration(&stored)), ordinal: usize.ZERO,
+  })})
+  let application = run specializationWithArguments(Application.bodyDeclaration(&stored), move regions)
+  let storedMir = run Semantic.demandApplicationMir(&mut store.*, &mut request.*, &application)
+  run Testing.expect(succeeded(&storedMir), "a stored reference field retains its exact referent region independently of the owner's loan")
+  let projected = namedMirApplication(&store.*, &storedMir, b"project")
+  if let Option<Shared<Application>>.Some {value: chosen} = move projected {
+    let applied = run Application.copyShared(&chosen)
+    let result = run Semantic.demandApplicationMir(&mut store.*, &mut request.*, &applied)
+    run Testing.expect(storedReferenceResult(&store.*, &result), "the wrapper result preserves both the local owner loan and static stored referent")
+  } else {run Testing.expect(false, "the stored-reference wrapper has a concrete selected application")}
+  let wrongOwner = run selectedApplicationOf(&mut index.*, id, b"wrongOwner")
+  let ownerAnswer = run Semantic.demandSelectedBody(&mut store.*, &mut request.*, &wrongOwner)
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&ownerAnswer, rejectsType),
+    "a descriptor cannot rebind an explicitly fixed incompatible nominal owner")
+  let wrongValue = run selectedApplicationOf(&mut index.*, id, b"wrongValue")
+  let valueAnswer = run Semantic.demandSelectedBody(&mut store.*, &mut request.*, &wrongValue)
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&valueAnswer, rejectsType),
+    "a descriptor cannot rebind an explicitly fixed incompatible Value")
+  let wrongInferred = run selectedApplicationOf(&mut index.*, id, b"wrongInferredOwner")
+  let inferredAnswer = run Semantic.demandSelectedBody(&mut store.*, &mut request.*, &wrongInferred)
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&inferredAnswer, rejectsType),
+    "a descriptor cannot rebind the nominal Owner inferred from an earlier runtime operand")
+  let escaping = run selectedApplicationOf(&mut index.*, id, b"escapingRelay")
+  let mut loans = Vector.make<Argument>()
+  run Vector.append<Argument>(&mut loans, Argument.Lifetime {value: run Shared.make<Lifetime>(Lifetime.Local {
+    declaration: run DeclarationId.copy(Application.bodyDeclaration(&wrongOwner)), ordinal: usize.ZERO,
+  })})
+  let escapingApplication = run specializationWithArguments(Application.bodyDeclaration(&escaping), move loans)
+  let escapingAnswer = run Semantic.demandSelectedBody(&mut store.*, &mut request.*, &escapingApplication)
+  run Testing.expect(Shared.with<Result<Answer, NoRejection>, bool>(&escapingAnswer, rejectsType),
+    "selected call-result comparison cannot extend the owner loan to a static return reference")
+}
+
+fn oneOwnerParameter(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      return Vector.length<Shared<Type>>(&function.parameters) == usize.ONE
+    }
+  }
+  return false
+}
+
+fn storedReferenceResult(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      return Shared.with<Type, bool>(&function.result, storedReferenceType)
+    }
+  }
+  return false
+}
+
+fn storedReferenceType(result: &Type) -> bool {
+  if let Type.Reference {referent, access, lifetime} = &result.* {
+    if access != Access.Shared {return false}
+    if !Shared.with<Lifetime, bool>(&lifetime, callerRegion) {return false}
+    return Shared.with<Type, bool>(&referent, storedInnerReference)
+  }
+  return false
+}
+
+fn callerRegion(region: &Lifetime) -> bool {
+  return match &region.* {Lifetime.Local {..} => true Lifetime.Supplied {..} => true _ => false}
+}
+
+fn storedInnerReference(inner: &Type) -> bool {
+  if let Type.Reference {access, lifetime, ..} = &inner.* {
+    return access == Access.Shared && Shared.with<Lifetime, bool>(&lifetime, staticRegion)
+  }
+  return false
+}
+
+fn staticRegion(region: &Lifetime) -> bool {
+  return match &region.* {Lifetime.Static => true _ => false}
+}
+
 fn rejectsType(answer: &Result<Answer, NoRejection>) -> bool {
   return rejectionCode(answer, RejectionCode.TypeMismatch)
 }
@@ -57,7 +263,7 @@ test effect fn reflectedBorrowUsesOrdinaryProjectionsAndNoDescriptorParameter() 
   let id = run module("borrow-field.silk") |> Effect.provideMut<Allocator>(&mut allocator)
   let source = run present("""
 struct Box { first: i32 second: i32 }
-fn read(owner: &Box) -> i32 {
+fn read<'a>(owner: &'a Box) -> i32 {
   let mut total = 0
   static for field in Intrinsic.reflectFields<Box>() {
     total = total + Intrinsic.borrowField(owner, field).*
@@ -69,7 +275,11 @@ fn read(owner: &Box) -> i32 {
   let mut index = SourceIndex.make(run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator))
   let mut store = makeSemantic(move revision)
   let mut request = Request.make()
-  let application = run selectedApplicationOf(&mut index, &id, b"read") |> Effect.provideMut<Allocator>(&mut allocator)
+  let template = run selectedApplicationOf(&mut index, &id, b"read") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut arguments = Vector.make<Argument>()
+  let region = run Shared.make<Lifetime>(Lifetime.Static) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Vector.append<Argument>(&mut arguments, Argument.Lifetime {value: move region}) |> Effect.provideMut<Allocator>(&mut allocator)
+  let application = run specializationWithArguments(Application.bodyDeclaration(&template), move arguments) |> Effect.provideMut<Allocator>(&mut allocator)
   let answer = run Semantic.demandSelectedBody(&mut store, &mut request, &application) |> Effect.provideMut<Allocator>(&mut allocator)
   let body = Shared.with<Result<Answer, NoRejection>, Option<Shared<TypedBody>>>(&answer, checkedBody)
   let mut ordinary = false

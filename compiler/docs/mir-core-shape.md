@@ -400,7 +400,7 @@ Until the suspension stage, this reports gap `suspension` at the `Effect.suspend
 | `cleanup` | an owned place needs a cleanup form the current step does not lower, or emission meets `Drop` before glue exists | Step 6 |
 | `capture` | an anonymous callable, Effect block or section is constructed or called                                          | Step 8 |
 
-Existing codes stay: `intrinsic-member` (including the Execution primitives), `bound-method`,
+Existing codes stay: `intrinsic-member` (including the Execution primitives),
 `generic-operation`, and the `borrow-check` summary until native borrow checking. The Step 9
 provider PR deletes `effect-instance`.
 

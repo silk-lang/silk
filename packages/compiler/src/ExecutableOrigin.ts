@@ -763,7 +763,8 @@ export const make = (operations: Operations) => {
       return [...visit(expression.left), ...visit(expression.right)]
     }
     if (expression._tag === 'UnionConvert') return visit(expression.source)
-    if (expression._tag === 'Project') return visit(expression.subject)
+    if (expression._tag === 'Project' || expression._tag === 'ReferentPlace')
+      return visit(expression.subject)
     if (expression._tag === 'IndexPlace') {
       return [...visit(expression.subject), ...visit(expression.index)]
     }
@@ -2083,8 +2084,16 @@ export const make = (operations: Operations) => {
       )
         targetSubstitution.set(Type.key(parameter.type), specialized)
     }
+    // A witnessed service operation borrows its selected provider at the operation's access.
+    // An owned/exclusive binding lends a shared receiver without changing ordinary call inference.
+    const operationReceiver =
+      Type.isReference(receiver) &&
+      receiver.access === 'Exclusive' &&
+      expression.access === 'Shared'
+        ? Type.reference('Shared', receiver.target, receiver.lifetime)
+        : receiver
     const actualParameters = [
-      receiver,
+      operationReceiver,
       ...expression.arguments.flatMap((argument) =>
         argument._tag === 'Unavailable'
           ? []
