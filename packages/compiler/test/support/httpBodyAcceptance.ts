@@ -266,7 +266,7 @@ effect fn decoderFor(input: &[u8], limits: Limits) -> Option<Decoder> ! OutOfMem
   }
   let selection = match move selectRequest(head, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.none<Decoder>() }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
@@ -294,7 +294,7 @@ effect fn decoderForResponse(
   }
   let selection = match move selectResponse(head, &method, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.none<Decoder>() }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
@@ -318,7 +318,7 @@ effect fn decoderForHeadPolicy<'names>(
   }
   let selection = match move selectRequest(head, policy) {
     Result.Failure {error} => { return Option.none<Decoder>() }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, policy)
   return match move made {
@@ -338,7 +338,7 @@ effect fn encoderFor(input: &[u8]) -> Option<Encoder> ! OutOfMemoryError ? &mut 
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.none<Encoder>() }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let made = run Encoder.make(move selection, bodyLimits(), TrailerPolicy.defaultPolicy())
   return match move made {
@@ -361,7 +361,7 @@ effect fn encoderForLimits(
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.none<Encoder>() }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let made = run Encoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
@@ -419,7 +419,7 @@ effect fn encoderForResponse(
     TrailerPolicy.defaultPolicy(),
   ) {
     Result.Failure {error} => { return Result.failResult<Encoder, BodyError>(move error) }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return run Encoder.make(
     move selection,
@@ -442,7 +442,7 @@ effect fn decoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
   }
   let selection = match move selectRequest(head, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.some<BodyError>(move error) }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return match move (run Decoder.make(
     move selection,
@@ -468,7 +468,7 @@ effect fn encoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
     Result.Failure {error} => { return Option.some<BodyError>(move error) }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   return match move (run Encoder.make(
     move selection,
@@ -610,7 +610,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   wire.maxWireBytes = u64.toU64(2)
   let wireError = match move (run chunkStepError(wire, b"1\\r\\na\\r\\n0\\r\\n\\r\\n")) {
     Option.None => { return 141 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &wireError,
@@ -629,7 +629,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   line.maxChunkLineBytes = 2
   let lineError = match move (run chunkStepError(line, b"1\\r\\na\\r\\n0\\r\\n\\r\\n")) {
     Option.None => { return 143 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &lineError,
@@ -648,7 +648,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   chunk.maxChunkBytes = usize.ZERO
   let chunkError = match move (run chunkStepError(chunk, b"1\\r\\na\\r\\n0\\r\\n\\r\\n")) {
     Option.None => { return 145 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &chunkError,
@@ -667,7 +667,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   payload.maxPayloadBytes = u64.MIN
   let payloadError = match move (run chunkStepError(payload, b"1\\r\\na\\r\\n0\\r\\n\\r\\n")) {
     Option.None => { return 147 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &payloadError,
@@ -689,7 +689,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
     b"1;x\\r\\na\\r\\n0\\r\\n\\r\\n",
   )) {
     Option.None => { return 149 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &extensionError,
@@ -708,7 +708,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   trailerBytes.maxTrailerBytes = usize.ZERO
   let trailerByteError = match move (run chunkStepError(trailerBytes, b"0\\r\\n\\r\\n")) {
     Option.None => { return 151 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &trailerByteError,
@@ -730,7 +730,7 @@ effect fn independentLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
     b"0\\r\\nContent-Digest: abc\\r\\n\\r\\n",
   )) {
     Option.None => { return 153 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !bodyLimitIs(
     &trailerCountError,
@@ -752,7 +752,7 @@ effect fn acquisitionProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   decoderOwned.maxOwnedBytes = 447
   let decoderOwnedError = match move (run decoderMakeError(decoderOwned)) {
     Option.None => { return 181 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &decoderOwnedError,
@@ -769,7 +769,7 @@ effect fn acquisitionProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   decoderOverflow.maxTrailerFields = usize.MAX
   let decoderOverflowError = match move (run decoderMakeError(decoderOverflow)) {
     Option.None => { return 183 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   let decoderOverflowExact = match move decoderOverflowError.reason {
     BodyReason.SizeOverflow => decoderOverflowError.component == BodyComponent.Decoder
@@ -784,7 +784,7 @@ effect fn acquisitionProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   encoderOwned.maxOwnedBytes = 354
   let encoderOwnedError = match move (run encoderMakeError(encoderOwned)) {
     Option.None => { return 185 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &encoderOwnedError,
@@ -801,7 +801,7 @@ effect fn acquisitionProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   encoderOverflow.maxChunkBytes = usize.MAX
   let encoderOverflowError = match move (run encoderMakeError(encoderOverflow)) {
     Option.None => { return 187 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   let encoderOverflowExact = match move encoderOverflowError.reason {
     BodyReason.SizeOverflow => encoderOverflowError.component == BodyComponent.Encoder
@@ -845,7 +845,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ) { return 72 }
   let trailers = match move Decoder.trailers(&exactDecoder) {
     Option.None => { return 73 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if trailers.count() != usize.ONE { return 74 }
   let copied = match move (run trailers.copy(exact.trailerValues)) {
@@ -954,7 +954,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   nameSmall.trailerValues.maxNameBytes = 13
   let nameError = match move (run trailerStepError(nameSmall)) {
     Option.None => { return 79 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &nameError,
@@ -971,7 +971,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   valueSmall.trailerValues.maxValueBytes = 2
   let valueError = match move (run trailerStepError(valueSmall)) {
     Option.None => { return 81 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &valueError,
@@ -988,7 +988,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   fieldsSmall.trailerValues.maxFieldBytes = 16
   let fieldError = match move (run trailerStepError(fieldsSmall)) {
     Option.None => { return 83 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &fieldError,
@@ -1005,7 +1005,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   countSmall.trailerValues.maxFields = usize.ZERO
   let countError = match move (run trailerStepError(countSmall)) {
     Option.None => { return 85 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &countError,
@@ -1022,7 +1022,7 @@ effect fn trailerLimitProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ownedSmall.trailerValues.maxOwnedBytes = 54
   let ownedError = match move (run trailerStepError(ownedSmall)) {
     Option.None => { return 87 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &ownedError,
@@ -1079,7 +1079,7 @@ effect fn trailerPolicyProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ) { return 164 }
   let allowedTrailers = match move Decoder.trailers(&allowed) {
     Option.None => { return 165 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if allowedTrailers.count() != usize.ONE { return 166 }
 
@@ -1099,7 +1099,7 @@ effect fn trailerPolicyProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
     false,
   ) {
     Result.Success {value} => { return 168 }
-    Result.Failure {error} => error
+    Result.Failure {error} => move error
   }
   let exactExclusion = match move excludedError.reason {
     BodyReason.TrailerPolicy => excludedError.component == BodyComponent.TrailerPolicy
@@ -1169,7 +1169,7 @@ effect fn chunkProbe() -> bool ! OutOfMemoryError ? &mut Allocator {
   )
   let progress = match move decoded {
     Result<Progress, BodyError>.Failure {error} => { return false }
-    Result<Progress, BodyError>.Success {value} => value
+    Result<Progress, BodyError>.Success {value} => move value
   }
   if progress.written != 4
     || progress.consumed != 47
@@ -1186,7 +1186,7 @@ effect fn chunkProbe() -> bool ! OutOfMemoryError ? &mut Allocator {
     || output[7] != 165 { return false }
   let trailers = match move Decoder.trailers(&decoder) {
     Option.None => { return false }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if trailers.count() != usize.ONE { return false }
   let mut iterator = trailers.fields()
@@ -1280,7 +1280,7 @@ effect fn decoderModesProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ) || !equal(&closeOutput, b"Wiki") { return 35 }
   let closeCompletion = match move Decoder.completion(&close) {
     Option.None => { return 36 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if closeCompletion.kind() != CompletionKind.CloseDelimited { return 37 }
   drop closeCompletion
@@ -1312,7 +1312,7 @@ effect fn decoderModesProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ) || tunnelOutput[0] != 165 { return 40 }
   let tunnelCompletion = match move Decoder.completion(&tunnel) {
     Option.None => { return 41 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if tunnelCompletion.kind() != CompletionKind.Tunnel { return 206 }
 
@@ -1413,7 +1413,7 @@ effect fn failureProbe() -> bool ! OutOfMemoryError ? &mut Allocator {
 effect fn syntaxFailure(body: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
   let error = match move (run chunkStepError(bodyLimits(), body)) {
     Option.None => { return false }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   return match move error.reason {
     BodyReason.ChunkSyntax => true
@@ -1691,7 +1691,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   }
   let closeCompletion = match move Encoder.completion(&closeEncoder) {
     Option.None => { return 113 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if closeCompletion.kind() != CompletionKind.CloseDelimited { return 114 }
 
@@ -1754,7 +1754,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   nameSmall.trailerValues.maxNameBytes = 13
   let nameError = match move (run encoderFinishError(nameSmall)) {
     Option.None => { return 122 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &nameError,
@@ -1770,7 +1770,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   valueSmall.trailerValues.maxValueBytes = 2
   let valueError = match move (run encoderFinishError(valueSmall)) {
     Option.None => { return 124 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &valueError,
@@ -1786,7 +1786,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   fieldSmall.trailerValues.maxFieldBytes = 16
   let fieldError = match move (run encoderFinishError(fieldSmall)) {
     Option.None => { return 126 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &fieldError,
@@ -1802,7 +1802,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   countSmall.trailerValues.maxFields = usize.ZERO
   let countError = match move (run encoderFinishError(countSmall)) {
     Option.None => { return 128 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &countError,
@@ -1818,7 +1818,7 @@ effect fn encoderContractProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
   ownedSmall.trailerValues.maxOwnedBytes = 25
   let ownedError = match move (run encoderFinishError(ownedSmall)) {
     Option.None => { return 130 }
-    Option.Some {value} => value
+    Option.Some {value} => move value
   }
   if !nestedLimitIs(
     &ownedError,

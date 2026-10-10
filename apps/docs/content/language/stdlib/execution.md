@@ -17,7 +17,9 @@ Use [`drive`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e6
 Construction obtains one combined package from the selected `Allocator`
 and does not start the Effect. The body representation, continuation, and fixed readiness
 endpoint remain private. A nested `Effect.suspend` transfers execution
-immediately. In contrast, [`park`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e7061726b) relinquishes the Execution until one Wake makes it eligible.
+immediately. In contrast, [`park`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e7061726b) relinquishes the Execution until one [`Wake`](#declaration-73696c6b2f657865637574696f6e3a3a57616b65) makes it
+eligible. The readiness phase and the park generation are ordinary source policy kept in two
+package control words; the compiler only stores them.
 
 ## Gotchas
 
@@ -29,7 +31,27 @@ until the Wake is consumed or dropped. [`drive`](#declaration-73696c6b2f65786563
 
 Import as `Execution` with `import silk.execution { Execution }`.
 
-Public declarations: 1.
+Public declarations: 2.
+
+<a id="declaration-73696c6b2f657865637574696f6e3a3a57616b65"></a>
+
+## `Wake`
+
+```silk
+pub struct Wake
+```
+
+The affine readiness authority for one parked generation of one Execution.
+
+### Details
+
+[`Execution.park`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e7061726b) passes the generation's only Wake to its registration callback.
+[`Execution.wake`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e77616b65) consumes it and makes that generation eligible at most once.
+
+### Gotchas
+
+Dropping a Wake publishes nothing. A retained Wake keeps the inert package allocation alive
+after the Execution is dropped, until the Wake is consumed or dropped.
 
 <a id="declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e"></a>
 
@@ -118,11 +140,34 @@ Relinquishes the currently Running Execution until one external readiness signal
 
 #### Details
 
-The registration callback receives the generation's sole affine Wake. Its returned guard is
-retained while dormant and dropped immediately before source continues after this call. The Wake
-makes this Execution eligible and invokes its fixed readiness endpoint at most one time.
+The registration callback receives the generation's sole affine [`Wake`](#declaration-73696c6b2f657865637574696f6e3a3a57616b65). Its returned guard
+is retained while dormant and dropped immediately before source continues after this call.
+A Wake signaled during registration is latched until [`drive`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e6472697665) returns this Execution to its
+owner, which then notifies. The Wake invokes the fixed readiness endpoint at most one time.
 
 #### Gotchas
 
 A caller that keeps a cancelled Wake also keeps the complete inert Execution package alive.
 Consuming or dropping that Wake releases the final package authority.
+
+<a id="declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e77616b65"></a>
+
+### Associated function `Execution.wake`
+
+```silk
+pub fn wake(wake: Wake) -> ()
+```
+
+Consumes one Wake and makes its parked generation eligible.
+
+#### Details
+
+A Wake signaled while its generation is still registering is latched until the owner receives
+the Execution back from [`drive`](#declaration-73696c6b2f657865637574696f6e3a3a457865637574696f6e2e6472697665). A Wake signaled while its generation is dormant makes the
+Execution eligible and synchronously invokes its fixed readiness endpoint. Signaling never
+drives the Execution.
+
+#### Gotchas
+
+A Wake for a dropped or completed Execution, or for an earlier generation, publishes nothing
+and only releases its package authority.

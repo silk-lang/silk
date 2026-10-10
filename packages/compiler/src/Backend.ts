@@ -54,7 +54,7 @@ export type RuntimeFeature =
   | 'DormantContinuation'
   | 'ExecutionDrive'
   | 'ExecutionPackage'
-  | 'ExternalWakeCell'
+  | 'ExecutionReference'
   | 'NestedSuspensionRuntime'
   | 'ReadinessNotification'
 

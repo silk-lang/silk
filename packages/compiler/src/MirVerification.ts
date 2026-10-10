@@ -806,7 +806,7 @@ const suspensionViolations = (
     if (!operationPresent)
       invalid('InvalidSuspension', 'suspendable run references no operation in its owner region')
     const operationOutcome =
-      region.operation._tag === 'ExecutionPark'
+      region.operation._tag === 'ExecutionRelinquish'
         ? region.runner.outcome
         : region.operation.outcomeType.type
     if (
@@ -817,7 +817,7 @@ const suspensionViolations = (
         'InvalidSuspension',
         `runner, operation, and completion outcome contracts disagree: operation=${SilkType.encode(operationOutcome)} runner=${SilkType.encode(region.runner.outcome)} completion=${SilkType.encode(region.completion.outcome)}`,
       )
-    if (region.operation._tag !== 'ExecutionPark') {
+    if (region.operation._tag !== 'ExecutionRelinquish') {
       const effectOperation = region.operation
       const operationRunner =
         effectOperation._tag === 'RunEffect' ? effectOperation.target : effectOperation.runner
@@ -1066,28 +1066,12 @@ const suspensionViolations = (
           'cancellation loses a retained owner or its initializedness',
         )
     }
-    const parkGuardOrdinal =
-      region.operation._tag === 'ExecutionPark' ? region.operation.guard.ordinal : undefined
-    const expectedRestores =
-      parkGuardOrdinal === undefined
-        ? expectedOrdinals
-        : slots
-            .filter((slot) => slot.local.ordinal !== parkGuardOrdinal)
-            .map((slot) => slot.ordinal)
     if (
-      descriptor.success.restores.join(',') !== expectedRestores.join(',') ||
+      descriptor.success.restores.join(',') !== expectedOrdinals.join(',') ||
       descriptor.failure.restores.length !== 0
     )
       invalid('InvalidCoroutineFrame', 'resume path plan is incomplete')
-    if (
-      descriptor.success.loanEnds.length !== 0 ||
-      (parkGuardOrdinal !== undefined
-        ? descriptor.success.releases.length !==
-            (descriptor.slots.some((slot) => slot.local.ordinal === parkGuardOrdinal) ? 1 : 0) ||
-          (descriptor.success.releases.length === 1 &&
-            descriptor.success.releases.at(0)?.local.ordinal !== parkGuardOrdinal)
-        : descriptor.success.releases.length !== 0)
-    )
+    if (descriptor.success.loanEnds.length !== 0 || descriptor.success.releases.length !== 0)
       invalid('InvalidCoroutineFrame', 'success or failure cleanup plan diverges')
   }
   return violations
@@ -3078,12 +3062,18 @@ export const operationLocals = (operation: Operation): ReadonlyArray<LocalId> =>
         operation.onComplete,
         operation.onSuspend,
       ]
-    case 'ExecutionNotifyInitial':
+    case 'ExecutionRelinquish':
+    case 'ExecutionCurrent':
+      return [operation.destination]
+    case 'ExecutionRefOf':
       return [operation.destination, operation.execution]
-    case 'ExecutionWake':
-      return [operation.destination, operation.wake]
-    case 'ExecutionPark':
-      return [operation.destination, operation.guard, operation.register]
+    case 'ExecutionLoad':
+      return [operation.destination, operation.reference, operation.word]
+    case 'ExecutionStore':
+      return [operation.destination, operation.reference, operation.word, operation.value]
+    case 'ExecutionNotify':
+    case 'ExecutionLive':
+      return [operation.destination, operation.reference]
     case 'SharedClone':
       return [operation.destination, operation.self]
     case 'SharedWithMut':
@@ -3511,7 +3501,7 @@ const cleanupTypes = (cleanup: CleanupPlan.CleanupPlan): ReadonlyArray<SilkType.
       return [cleanup.type, cleanup.element, ...cleanupTypes(cleanup.allocation)]
     case 'ExecutionCleanup':
       return [cleanup.type, ...cleanupTypes(cleanup.allocation)]
-    case 'WakeCleanup':
+    case 'ExecutionRefCleanup':
       return [cleanup.type, ...cleanupTypes(cleanup.allocation)]
     case 'HookCleanup':
       return [cleanup.type, ...cleanupTypes(cleanup.inner)]
@@ -3770,8 +3760,8 @@ const cleanupMatchesSemanticType = (
   }
   if (SilkType.isExecution(type))
     return cleanup._tag === 'ExecutionCleanup' && cleanup.allocation._tag === 'AllocationCleanup'
-  if (SilkType.isWake(type))
-    return cleanup._tag === 'WakeCleanup' && cleanup.allocation._tag === 'AllocationCleanup'
+  if (SilkType.isExecutionRef(type))
+    return cleanup._tag === 'ExecutionRefCleanup' && cleanup.allocation._tag === 'AllocationCleanup'
   if (SilkType.isFixedArray(type))
     return (
       cleanup._tag === 'ArrayCleanup' &&
@@ -4183,17 +4173,17 @@ const operationTypes = (operation: Operation): ReadonlyArray<DeclarationFacts.Se
         ...cleanupTypes(operation.completionCleanup),
         ...cleanupTypes(operation.suspensionCleanup),
       ]
-    case 'ExecutionNotifyInitial':
+    case 'ExecutionRelinquish':
+    case 'ExecutionStore':
+    case 'ExecutionNotify':
       return [semanticType(operation.type)]
-    case 'ExecutionWake':
-      return [semanticType(operation.type), SilkType.wake]
-    case 'ExecutionPark':
-      return [
-        semanticType(operation.type),
-        ...cleanupTypes(operation.guardCleanup),
-        ...cleanupTypes(operation.registerCleanup),
-        ...operation.registrationTypeArguments.filter(SilkType.isTypeArgument),
-      ]
+    case 'ExecutionCurrent':
+    case 'ExecutionRefOf':
+      return [semanticType(operation.type), SilkType.executionRef]
+    case 'ExecutionLoad':
+      return ['usize']
+    case 'ExecutionLive':
+      return ['bool']
     case 'SharedClone':
       return [semanticType(operation.type), operation.element]
     case 'SharedWithMut':
@@ -4471,12 +4461,18 @@ const accessedOwnerLocals = (operation: Operation): ReadonlyArray<LocalId> => {
       return [operation.allocation, operation.body, operation.endpoint, operation.callback]
     case 'ExecutionDrive':
       return [operation.execution, operation.branch, operation.onComplete, operation.onSuspend]
-    case 'ExecutionNotifyInitial':
+    case 'ExecutionRelinquish':
+    case 'ExecutionCurrent':
+      return []
+    case 'ExecutionRefOf':
       return [operation.execution]
-    case 'ExecutionWake':
-      return [operation.wake]
-    case 'ExecutionPark':
-      return [operation.register]
+    case 'ExecutionLoad':
+      return [operation.reference, operation.word]
+    case 'ExecutionStore':
+      return [operation.reference, operation.word, operation.value]
+    case 'ExecutionNotify':
+    case 'ExecutionLive':
+      return [operation.reference]
     case 'SharedClone':
       return [operation.self]
     case 'SharedWithMut':
@@ -5548,8 +5544,6 @@ const computeVerify = Effect.fnUntraced(function* (
           (authority, ordinal) =>
             authority.package !== ordinal ||
             authority.root !== ordinal + 1 ||
-            authority.readiness !==
-              self.layout.executionPackages.plans.at(ordinal)?.readinessStorage ||
             ExecutionTransition.verifyAuthority(authority).length > 0,
         )
       ) {
@@ -5589,9 +5583,9 @@ const computeVerify = Effect.fnUntraced(function* (
           (fn.suspension?.regions ?? []).flatMap((region) => {
             if (
               region._tag !== 'RunSuspendableEffectRegion' ||
-              // Parking originates an external transfer in this execution. Its suspension region
+              // Relinquishment originates an external transfer in this execution. Its suspension region
               // carries continuation state, but it does not call a separate child runner.
-              region.operation._tag === 'ExecutionPark'
+              region.operation._tag === 'ExecutionRelinquish'
             )
               return []
             const declaration = region.runner.declaration
@@ -7038,123 +7032,74 @@ const computeVerify = Effect.fnUntraced(function* (
                 'Execution drive lost its affine Execution, branch state, or exact take-once outcome contracts',
             })
         }
-        if (operation._tag === 'ExecutionNotifyInitial') {
-          const executionType = fn.localTypes.at(operation.execution.ordinal)
+        if (
+          operation._tag === 'ExecutionRelinquish' ||
+          operation._tag === 'ExecutionCurrent' ||
+          operation._tag === 'ExecutionRefOf' ||
+          operation._tag === 'ExecutionLoad' ||
+          operation._tag === 'ExecutionStore' ||
+          operation._tag === 'ExecutionNotify' ||
+          operation._tag === 'ExecutionLive'
+        ) {
           const destination = fn.localTypes.at(operation.destination.ordinal)
-          if (
-            executionType?._tag !== 'Reference' ||
-            executionType.type.access !== 'Exclusive' ||
-            !SilkType.isExecution(executionType.type.target) ||
-            operation.type._tag !== 'Nominal' ||
-            !SilkType.equals(operation.type.type, SilkType.unit) ||
-            destination?._tag !== 'Nominal' ||
-            !SilkType.equals(destination.type, SilkType.unit) ||
-            !SilkType.equals(destination.type, operation.type.type) ||
-            operation.executionAccess !== 'Exclusive'
-          )
-            violations.push({
-              _tag: 'Violation',
-              rule: 'InvalidExecutionOperation',
-              function: fn.id,
-              region: region.id,
-              provenance: operation.provenance,
-              detail: 'initial readiness requires one exclusive Execution reference',
-            })
-        }
-        if (operation._tag === 'ExecutionWake') {
-          const wake = fn.localTypes.at(operation.wake.ordinal)
-          const destination = fn.localTypes.at(operation.destination.ordinal)
-          if (
-            wake?._tag !== 'Nominal' ||
-            !SilkType.isWake(wake.type) ||
-            destination?._tag !== 'Nominal' ||
-            !SilkType.equals(destination.type, SilkType.unit) ||
-            operation.wakeAccess !== 'Take' ||
-            localUseCounts.get(operation.wake.ordinal) !== 1
-          )
-            violations.push({
-              _tag: 'Violation',
-              rule: 'InvalidExecutionOperation',
-              function: fn.id,
-              region: region.id,
-              provenance: operation.provenance,
-              detail: 'Wake signal lost its sole affine generation authority or unit result',
-            })
-        }
-        if (operation._tag === 'ExecutionPark') {
-          const register = fn.localTypes.at(operation.register.ordinal)
-          const guard = fn.localTypes.at(operation.guard.ordinal)
-          const destination = fn.localTypes.at(operation.destination.ordinal)
-          const registerSemantic = register === undefined ? undefined : semanticType(register)
-          const registerActual =
-            registerSemantic !== undefined && SilkType.isRepresented(registerSemantic)
-              ? registerSemantic.contract
-              : registerSemantic
-          const expected =
-            guard === undefined ||
-            registerActual === undefined ||
-            !SilkType.isCallable(registerActual)
-              ? undefined
-              : SilkType.callable([SilkType.wake], semanticType(guard), registerActual, 'Take')
-          const callableCleanupValid = (
-            local: Extract<Type, { readonly _tag: 'CallableValue' }>,
-            cleanup: CleanupPlan.CleanupPlan,
-          ): boolean => {
-            const fields =
-              local.environment?.fields
-                .filter((field) => field.access === 'Take' && !isCopy(self.layout, field.type))
-                .reverse() ?? []
-            if (local.environment === undefined)
-              return cleanup._tag === 'NoCleanup' && SilkType.equals(cleanup.type, local.type)
+          const sharedRef = (local: LocalId): boolean => {
+            const type = fn.localTypes.at(local.ordinal)
             return (
-              cleanup._tag === 'CallableCleanup' &&
-              SilkType.equals(cleanup.type, local.type) &&
-              cleanup.environment._tag === 'CallableEnvironmentIdentity' &&
-              SilkType.equalsCallableEnvironmentIdentity(
-                cleanup.environment.identity,
-                Instances.callableEnvironmentIdentity(local.environment.callable),
-              ) &&
-              cleanup.slots.length === fields.length &&
-              cleanup.slots.every((slot, ordinal) => {
-                const field = fields.at(ordinal)
-                return (
-                  field !== undefined &&
-                  slot.ordinal === field.ordinal &&
-                  cleanupMatchesSemanticType(self.layout, slot.cleanup, field.type)
-                )
-              })
+              type?._tag === 'Reference' &&
+              type.type.access === 'Shared' &&
+              SilkType.isExecutionRef(type.type.target)
             )
           }
-          const registerCleanupValid =
-            register?._tag === 'CallableValue' &&
-            callableCleanupValid(register, operation.registerCleanup)
-          const guardCleanupValid =
-            guard?._tag === 'CallableValue'
-              ? callableCleanupValid(guard, operation.guardCleanup)
-              : guard !== undefined &&
-                cleanupMatchesSemanticType(self.layout, operation.guardCleanup, semanticType(guard))
-          if (
-            register?._tag !== 'CallableValue' ||
-            guard === undefined ||
-            guard._tag === 'EffectOutcome' ||
-            destination?._tag !== 'Nominal' ||
-            !SilkType.equals(destination.type, SilkType.unit) ||
-            registerActual === undefined ||
-            expected === undefined ||
-            !TypeCompatibility.isCompatible(TypeCompatibility.check(registerActual, expected)) ||
-            !guardCleanupValid ||
-            !registerCleanupValid ||
-            operation.registerAccess !== 'Take' ||
-            localUseCounts.get(operation.register.ordinal) !== 1
-          )
+          const usize = (local: LocalId): boolean =>
+            fn.localTypes.at(local.ordinal)?._tag === 'usize'
+          const unit =
+            destination?._tag === 'Nominal' && SilkType.equals(destination.type, SilkType.unit)
+          const reference =
+            destination?._tag === 'Nominal' && SilkType.isExecutionRef(destination.type)
+          let valid: boolean
+          switch (operation._tag) {
+            case 'ExecutionRelinquish':
+              valid = unit
+              break
+            case 'ExecutionCurrent':
+              valid = reference
+              break
+            case 'ExecutionRefOf': {
+              const execution = fn.localTypes.at(operation.execution.ordinal)
+              valid =
+                reference &&
+                execution?._tag === 'Reference' &&
+                SilkType.isExecution(execution.type.target)
+              break
+            }
+            case 'ExecutionLoad':
+              valid =
+                destination?._tag === 'usize' &&
+                sharedRef(operation.reference) &&
+                usize(operation.word)
+              break
+            case 'ExecutionStore':
+              valid =
+                unit &&
+                sharedRef(operation.reference) &&
+                usize(operation.word) &&
+                usize(operation.value)
+              break
+            case 'ExecutionNotify':
+              valid = unit && sharedRef(operation.reference)
+              break
+            case 'ExecutionLive':
+              valid = destination?._tag === 'bool' && sharedRef(operation.reference)
+              break
+          }
+          if (!valid)
             violations.push({
               _tag: 'Violation',
               rule: 'InvalidExecutionOperation',
               function: fn.id,
               region: region.id,
               provenance: operation.provenance,
-              detail:
-                'Execution park lost its take-once Wake registration, retained guard, or unit result',
+              detail: `${operation._tag} lost its ExecutionRef authority, word operands, or result`,
             })
         }
         if (operation._tag === 'SharedClone') {

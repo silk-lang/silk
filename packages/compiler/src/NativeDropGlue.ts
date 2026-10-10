@@ -72,7 +72,7 @@ const children = (self: CleanupPlan.CleanupPlan): ReadonlyArray<CleanupPlan.Clea
     case 'RawBufferCleanup':
     case 'LocalSharedCoreCleanup':
     case 'ExecutionCleanup':
-    case 'WakeCleanup':
+    case 'ExecutionRefCleanup':
       return [self.allocation]
     case 'HookCleanup':
       return [self.inner]
@@ -114,7 +114,7 @@ const weight = (self: CleanupPlan.CleanupPlan): number => {
     case 'HookCleanup':
       return 1 + weight(self.inner)
     case 'LocalSharedCoreCleanup':
-    case 'WakeCleanup':
+    case 'ExecutionRefCleanup':
       return 2
     default:
       return children(self).reduce((total, child) => total + weight(child), 0)
@@ -228,7 +228,7 @@ const request = (
         entry._tag === 'HookCleanup' ||
         entry._tag === 'LocalSharedCoreCleanup' ||
         entry._tag === 'ExecutionCleanup' ||
-        entry._tag === 'WakeCleanup',
+        entry._tag === 'ExecutionRefCleanup',
     ),
     declared: {
       fn,
