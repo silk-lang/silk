@@ -84,7 +84,7 @@ struct Pair { first: i32 second: i32 }
 struct Box<A> { value: A }
 fn direct(value: &Pair) -> &Pair { return value }
 fn directMut(value: &mut Pair) -> &mut Pair { return move value }
-fn narrowedMut(value: &mut Pair) -> &Pair { return move value }
+fn narrowedMut(value: &mut Pair) -> &Pair { return &value.* }
 fn generic<A>(value: A) -> A { return move value }
 fn viaGeneric(value: &Pair) -> &Pair { return generic<&Pair>(move value) }
 fn viaGenericMut(value: &mut Pair) -> &mut Pair { return generic<&mut Pair>(move value) }
@@ -101,8 +101,9 @@ fn failedMut(value: &mut Pair) -> Result<i32, &mut Pair> {
 fn delayed(value: &Pair) -> Effect<i32> { return effect { return value.first } }
 fn delayedMut(value: &mut Pair) -> Effect<i32> { return effect { return value.first } }
 fn readStored(input: i32, value: &Pair) -> i32 { return input + value.first }
+fn readStoredMut(input: i32, value: &mut Pair) -> i32 { return input + value.first }
 fn stored(value: &Pair) -> once fn(i32) -> i32 { return readStored(move value) }
-fn storedMut(value: &mut Pair) -> once fn(i32) -> i32 { return readStored(move value) }
+fn storedMut(value: &mut Pair) -> once fn(i32) -> i32 { return readStoredMut(move value) }
 effect fn read(value: &Pair) -> i32 { return value.first }
 effect fn readMut(value: &mut Pair) -> i32 { return value.first }
 fn suspended(value: &Pair) -> i32 { return run read(value) }

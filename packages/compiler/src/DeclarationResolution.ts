@@ -1334,12 +1334,28 @@ export const inferInterfaceWitnessTarget = (
         : `#${ordinal + 1}`
     // An owned operand can be lent to a source witness for this invocation. Its temporary borrow
     // is rigid: it cannot satisfy a static precondition or escape through the promised result.
-    const actual =
+    let actual =
       Type.isReference(pattern.type) &&
       !Type.isReference(operand.type.type) &&
       !Type.isSlice(operand.type.type)
         ? Type.reference(pattern.type.access, operand.type.type, witnessBorrow(implementation))
         : operand.type.type
+    // Source-witness lowering explicitly reborrows an exclusive operand for a weaker witness.
+    // Infer against that adapter's input without permitting implicit access conversion in calls.
+    if (
+      Type.isReference(pattern.type) &&
+      Type.isReference(actual) &&
+      pattern.type.access === 'Shared' &&
+      actual.access === 'Exclusive'
+    )
+      actual = Type.reference('Shared', actual.target, actual.lifetime)
+    else if (
+      Type.isSlice(pattern.type) &&
+      Type.isSlice(actual) &&
+      pattern.type.access === 'Shared' &&
+      actual.access === 'Exclusive'
+    )
+      actual = Type.slice('Shared', actual.element, actual.lifetime)
     constraints.push({
       label: Type.equals(
         Type.isReference(operand.type.type) ? operand.type.type.target : operand.type.type,
