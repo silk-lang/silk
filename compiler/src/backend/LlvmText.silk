@@ -3081,6 +3081,11 @@ effect fn emitBlock(
       Option<Suspended>.Some {value: stepping} => run emitRelinquish(&mut writer.*, target, &stepping, Coroutine.stateAfter(&stepping.coroutine, index))
       Option<Suspended>.None => run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
     }
+    // A cancelled frame's exit releases it without writing a result; its caller cancels next.
+    Terminator.Abandon {..} => match &suspended.* {
+      Option<Suspended>.Some {value: stepping} => run emitPop(&mut writer.*, target, &stepping, Option.none<bool>())
+      Option<Suspended>.None => run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
+    }
     Terminator.Unreachable {origin: _} => run append(&mut writer.*, b"unreachable\n")
     Terminator.Switch {value, cases, otherwise, origin: _} => {
       let tested = run emitOperand(&mut writer.*, function, target, layouts, &value)
@@ -3387,7 +3392,11 @@ effect fn planFrame(function: &MirFunction, target: &Target, layouts: &[TypeLayo
   while block < blocks.length {
     let mut point = false
     if let Terminator.Call {callee, ..} = &blocks[block].terminator {
-      if let Callee.Instance {key} = &callee { point = run Facts.suspends(facts, &key) }
+      // A cancel landing runs its nonparking cleanup to completion through an ordinary driver
+      // call. It records no cancel exit and must not push that call onto the destroyed package.
+      if Coroutine.cancelAfter(function, block) != usize.MAX {
+        if let Callee.Instance {key} = &callee { point = run Facts.suspends(facts, &key) }
+      }
     }
     if let Terminator.Relinquish {..} = &blocks[block].terminator { point = true }
     run Vector.append<bool>(&mut points, point)
@@ -3785,7 +3794,8 @@ effect fn transferState(writer: &mut Writer, slots: &[FrameSlot], saving: bool) 
 }
 
 // `$step` runs the frame on top from its resume state: state 0 starts the body, and state `k + 1`
-// restores what lives after point `k`, then continues at that call's normal or failure edge.
+// restores what lives after point `k`, then continues at that call's normal or failure edge, or,
+// when the frame's package was dropped while relinquished, at that point's cancel exit.
 effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &[TypeLayout],
   foreign: &[CAbi.Signature], identities: &[InstanceIdentity], suspended: &Option<Suspended>, stepping: &Suspended,
   symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator {
@@ -3817,10 +3827,49 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   run append(&mut writer.*, Bytes.asSlice(&state))
   run append(&mut writer.*, b" = load i32, ptr ")
   run append(&mut writer.*, Bytes.asSlice(&stateAddress))
-  run append(&mut writer.*, b"\nswitch i32 ")
+  run append(&mut writer.*, b"\n")
+  let states = Vector.asSlice<State>(&stepping.coroutine.states)
+  // A frame whose package was dropped while relinquished cancels from its point (`Destroyed`).
+  let package = run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferPackage(word))
+  let owned = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&owned))
+  run append(&mut writer.*, b" = icmp ne ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&package))
+  run append(&mut writer.*, b", null\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&owned))
+  run append(&mut writer.*, b", label %probe, label %dispatch\nprobe:\n")
+  let activation = run byteOffset(&mut writer.*, Bytes.asSlice(&package), Coroutine.packageActivation(word))
+  let lifecycle = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&lifecycle))
+  run append(&mut writer.*, b" = load i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&activation))
+  run append(&mut writer.*, b"\n")
+  let destroyed = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&destroyed))
+  run append(&mut writer.*, b" = icmp eq i")
+  run decimal(&mut writer.*, word * 8)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, Bytes.asSlice(&lifecycle))
+  run append(&mut writer.*, b", ")
+  run decimal(&mut writer.*, SealedCore.lifecycleWord(Lifecycle.Destroyed))
+  run append(&mut writer.*, b"\nbr i1 ")
+  run append(&mut writer.*, Bytes.asSlice(&destroyed))
+  run append(&mut writer.*, b", label %cancelling, label %dispatch\ncancelling:\nswitch i32 ")
+  run append(&mut writer.*, Bytes.asSlice(&state))
+  run append(&mut writer.*, b", label %invalid [")
+  let mut cancelled = usize.ONE
+  while cancelled < states.length {
+    run append(&mut writer.*, b" i32 ")
+    run decimal(&mut writer.*, cancelled)
+    run append(&mut writer.*, b", label %cancel")
+    run decimal(&mut writer.*, cancelled)
+    cancelled = cancelled + usize.ONE
+  }
+  run append(&mut writer.*, b" ]\ndispatch:\nswitch i32 ")
   run append(&mut writer.*, Bytes.asSlice(&state))
   run append(&mut writer.*, b", label %invalid [ i32 0, label %start")
-  let states = Vector.asSlice<State>(&stepping.coroutine.states)
   let mut resumed = usize.ONE
   while resumed < states.length {
     run append(&mut writer.*, b" i32 ")
@@ -3872,6 +3921,23 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
       run append(&mut writer.*, b"\n")
     }
     resumed = resumed + usize.ONE
+  }
+  // State `k + 1` cancels by restoring what lives after point `k` and entering its cancel exit.
+  cancelled = usize.ONE
+  while cancelled < states.length {
+    run append(&mut writer.*, b"cancel")
+    run decimal(&mut writer.*, cancelled)
+    run append(&mut writer.*, b":\n")
+    let entry = Coroutine.cancelAfter(function, points[cancelled - usize.ONE])
+    if entry == usize.MAX {
+      run append(&mut writer.*, b"call void @llvm.trap()\nunreachable\n")
+    } else {
+      run transferState(&mut writer.*, Vector.asSlice<FrameSlot>(&states[cancelled].slots), false)
+      run append(&mut writer.*, b"br label %")
+      run label(&mut writer.*, entry)
+      run append(&mut writer.*, b"\n")
+    }
+    cancelled = cancelled + usize.ONE
   }
   let mut at = usize.ZERO
   while at < blocks.length {
