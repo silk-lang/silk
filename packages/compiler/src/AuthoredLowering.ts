@@ -124,7 +124,9 @@ export const coverage = {
   RequirementRow: 'RequirementRow',
   Requirement: 'Requirement',
   RowWithout: 'RowWithout',
-  WhereClause: { container: 'CallableContract.constraints in authored order' },
+  WhereClause: {
+    container: 'CallableContract.constraints or ImplHeader.constraints in authored order',
+  },
   MembershipConstraint: 'MembershipConstraint',
   ProviderConstraint: 'ProviderConstraint',
   ParameterList: { container: 'CallableContract.parameters in authored order and variadic marker' },
@@ -3209,6 +3211,7 @@ const declarationParts = (
       }
     case 'ImplDeclaration': {
       const [subject, target] = typeChildren(syntax).filter((n) => n.kind !== 'Error')
+      const where = nodes(syntax).find((n) => n.kind === 'WhereClause')
       return {
         header: withCauses(
           {
@@ -3220,6 +3223,7 @@ const declarationParts = (
                 ? missingType(draft, child(header, 'subject'), spanOf(syntax))
                 : type(draft, child(header, 'subject'), subject),
             target: implTarget(draft, header, syntax, target),
+            constraints: where === undefined ? [] : constraints(draft, header, where),
           },
           causes(),
         ),
