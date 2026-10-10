@@ -1658,6 +1658,33 @@ export const lowerPlacePath = (
   return root === undefined ? undefined : { root: root.result, selectors: [] }
 }
 
+/** The concrete Effect a borrowed Effect parameter lends, named by its hidden identity. */
+const referentEffectValue = (
+  fn: FunctionLowering,
+  expression: Extract<
+    Tir.Expression,
+    { readonly _tag: 'ReferentPlace' | 'Project' | 'IndexPlace' | 'SliceIndexPlace' }
+  >,
+): Extract<Mir.Type, { readonly _tag: 'EffectValue' }> | undefined => {
+  if (expression._tag !== 'ReferentPlace' || expression.subject._tag !== 'ParameterReference')
+    return undefined
+  const contract = fn.semantic(expression.type)
+  if (!Type.isEffect(contract)) return undefined
+  const identity = Instances.parameterEffectIdentityArgument(
+    fn.owner.function,
+    fn.owner.key,
+    expression.subject.parameter.ordinal,
+  )
+  return identity === undefined
+    ? undefined
+    : effectValueByIdentity(
+        fn.layout,
+        identity.identity,
+        EffectExecutionContract.fromType(contract),
+        identity.owner,
+      )
+}
+
 export const lowerPlace = (
   fn: FunctionLowering,
   expression: Extract<
@@ -1670,7 +1697,7 @@ export const lowerPlace = (
   const path = lowerPlacePath(fn, expression, availableRequirements)
   if (path === 'Transferred') return path
   const place = path === undefined ? undefined : lowerReferencePlace(fn, path.root, path.selectors)
-  const type = fn.type(expression.type)
+  const type = referentEffectValue(fn, expression) ?? fn.type(expression.type)
   if (place === undefined || type === undefined) return undefined
   const destination = fn.alloc(type)
   fn.emit({

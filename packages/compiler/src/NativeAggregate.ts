@@ -444,8 +444,8 @@ export const expand = (
       )
       return
     }
-    case 'WakeCleanup':
-      return NativeExecutionOperation.dropWake(
+    case 'ExecutionRefCleanup':
+      return NativeExecutionOperation.dropExecutionRef(
         context,
         NativePayload.materialize(values, context, tag),
         tag,
