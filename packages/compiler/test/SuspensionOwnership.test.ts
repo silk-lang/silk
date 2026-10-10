@@ -247,6 +247,23 @@ it.layer(Layer.effect(Relayed, snapshot(source)))((it) => {
   )
 })
 
+it.effect('authenticates a suspending recovery handler section through its formed captures', () =>
+  Effect.gen(function* () {
+    const source = `struct Problem {}
+effect fn failing() -> i32 ! Problem { fail Problem {} }
+effect fn recover(error: Problem, mode: i32) -> i32 {
+  drop error
+  return run Intrinsic.suspendEffect(effect { return mode })
+}
+effect fn application(mode: i32) -> i32 {
+  return run Intrinsic.catchFailure<Problem>(failing(), recover(mode))
+}
+pub fn main() -> i32 { return run application(42) }`
+    const self = yield* snapshot(source)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
 it.effect('preserves partial owner state across suspension and cancellation', () =>
   Effect.gen(function* () {
     const source = `struct Token { value: i32 }

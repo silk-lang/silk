@@ -2334,6 +2334,12 @@ export const make = (operations: Operations) => {
       return initializer === undefined ? undefined : effectOriginOf(initializer, context)
     }
     if (expression._tag === 'Move') return effectOriginOf(expression.subject, context)
+    // A borrowed Effect runs its whole lent place, and its referent is the same Effect.
+    if (expression._tag === 'ValueBorrow')
+      return expression.place === undefined || expression.selectors.length > 0
+        ? undefined
+        : effectOriginOf(expression.place, context)
+    if (expression._tag === 'ReferentPlace') return effectOriginOf(expression.subject, context)
     // A return-site join has no single exact identity; its composite representation is read
     // from the expression type instead.
     if (expression._tag === 'UnionConvert')
