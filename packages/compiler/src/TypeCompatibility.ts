@@ -44,11 +44,6 @@ export type Compatibility =
       readonly target: Type.Effect
     }
   | {
-      readonly _tag: 'ReferenceAccess'
-      readonly source: Type.Reference
-      readonly target: Type.Reference
-    }
-  | {
       readonly _tag: 'PointerWeakening'
       readonly source: Type.Pointer
       readonly target: Type.Pointer
@@ -482,17 +477,17 @@ const compareSelected = (source: Type.Type, target: Type.Type, self: Context): C
   if (
     Type.isReference(source) &&
     Type.isReference(target) &&
-    Type.compareAccess(source.access, target.access) &&
+    source.access === target.access &&
     outlives(self, source.lifetime, target.lifetime) &&
     (target.access === 'Exclusive'
       ? equivalent(source.target, target.target, self)
       : isCompatible(check(source.target, target.target, self)))
   )
-    return { _tag: 'ReferenceAccess', source, target }
+    return { _tag: 'Lifetime', source, target }
   if (
     Type.isSlice(source) &&
     Type.isSlice(target) &&
-    Type.compareAccess(source.access, target.access) &&
+    source.access === target.access &&
     outlives(self, source.lifetime, target.lifetime) &&
     (target.access === 'Exclusive'
       ? equivalent(source.element, target.element, self)
