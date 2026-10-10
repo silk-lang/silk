@@ -393,6 +393,17 @@ Each entry records:
   Member construction still rejects a static body before reading its selector, and resolves its
   annotation before reading the member name. The complete classifiers and extractors compile
   and return 42 under the current bootstrap with thirty-two real-HIR payload and refusal controls.
+- **Checked branch storage:** the published `34807c66` N0 reduces the checked-expression
+  dispatcher to 38,248 bytes and 63 effectful rejection sites, but the same three selected,
+  non-tail and selected-under-ordinary-control depth probes still overflow. All five required
+  corpus programs and all eight same-source native-produced N1 depth probes pass. The checked
+  dispatcher now delegates its 27 admitted variants to separate effectful helpers. It retains
+  the original early paths and initializes the Unit type, expression form and divergence state
+  at their original point, then moves that owned state to the selected helper. Helpers retain
+  the exact original branch bodies, early-return results and reachable finalization; only
+  unused context parameters and unreachable terminal finalizers are omitted. This
+  isolates inactive branch temporaries without changing allocation order, configured depth,
+  diagnostic spans or language admission.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
