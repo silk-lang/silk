@@ -1715,18 +1715,6 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `compiler/src/semantic/SemanticCallableCases.silk` and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
 
-### Native service operations with a `Self` operand
-
-- **Status:** native gap; retires when native dispatches such an operation on its operand.
-- **Compilers:** the bootstrap dispatches `SchemaService.decode(value)` for
-  `service SchemaService { fn decode(value: &Self) -> i32 }` on the operand's conformance, as for an
-  interface. Native serves a service operation from the run site's requirement row with no provider
-  operand, so it reports a call of an operation whose parameters mention `Self` as unsupported (the
-  `typed-form` gap) instead of a `TypeMismatch` at the operand.
-- **Evidence:** `receiverSuppliersTieBeforeArgumentsOrResult` in
-  `compiler/src/semantic/SemanticSignatureCases.silk`.
-
-
 ### Finite scalar StaticSequence iteration in the native frontend
 
 - **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
