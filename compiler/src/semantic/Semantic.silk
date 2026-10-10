@@ -27975,6 +27975,10 @@ fn borrowedPlaceRegion(nodes: &[BodyNode], id: BodyNodeId) -> Option<Shared<Life
   }
 }
 
+fn exclusiveLoan(value: &Type) -> bool {
+  return match &value.* { Type.Reference {access, ..} => access == Access.Mutable _ => false }
+}
+
 // The conversion shape is separate from expected element/access/region evidence. Call inference
 // requests slice reborrowing here, then validates the actual loan through its persistent unifier.
 effect fn checkBorrowOperand<'scope>(
@@ -28074,6 +28078,13 @@ effect fn checkBorrowOperand<'scope>(
         }
       },
     )
+  }
+  // Without a reference context, `&mut x` still reborrows when `x` is an immutable binding holding
+  // an exclusive loan: borrowing the binding itself would need it to be `mut`, so the referent is
+  // the only valid place (BORROW-005), as when an inferred `&mut P` parameter supplies no context.
+  if !reborrow && access == Access.Mutable && Shared.with<Type, bool>(&referent, exclusiveLoan) {
+    reborrow = !mutablePlace(Vector.asSlice<BodyNode>(&nodes.*), Vector.asSlice<BodyLocal>(&statementScope.locals.*),
+      operandNode)
   }
   if reborrow {
     let pointee = Shared.with<Type, Option<Shared<Type>>>(
@@ -35625,8 +35636,24 @@ effect fn checkRun<'scope>(
       Option.some<Shared<Type>>(Shared.clone<Type>(&channels.failure)), Option.some<Shared<Row>>(Shared.clone<Row>(&channels.requirements)))
   } else {
     let enclosing = run currentBodyChannels(&resolver.*)
-    if !run Type.coversFailure(&enclosing.failure, &channels.failure) {
-      return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledFailure, span)
+    // A run failure member the enclosing channel does not name exactly is covered by the one
+    // declared member it meets by covariant region subtyping, as a `fail` payload is.
+    let uncovered = run Type.uncoveredFailures(&enclosing.failure, &channels.failure)
+    let declared = run Type.failureMembers(&enclosing.failure)
+    let pending = Vector.asSlice<Shared<Type>>(&uncovered)
+    let mut at = usize.ZERO
+    while at < pending.length {
+      let member = run regionAdmittedMember(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, constraints,
+        &pending[at], Vector.asSlice<Shared<Type>>(&declared), true, span)
+      let admitted = match move member {
+        Option<AdmittedMember>.Some {value: found} => found
+        Option<AdmittedMember>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledFailure, span) }
+      }
+      let origin = Vector.asSlice<BodyNode>(&nodes.*)[value.index].origin
+      if !run retainRegionPairs(&mut resolver.*, origin, Vector.asSlice<RegionPair>(&admitted.deferred)) {
+        return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledFailure, span)
+      }
+      at = at + usize.ONE
     }
     let coverage = run Row.covers(&enclosing.requirements, &channels.requirements)
     if coverage != RowCoverage.Covered {
@@ -37862,8 +37889,10 @@ effect fn invokeCallableValue<'scope>(
 // operands become the target's arguments in parameter order, with the target's channels and
 // the run access and regions those stored arguments decide, as a written construction's. A
 // generic section selects its target application from the operands exactly as lowering selects
-// the one a run calls. Absent for an anonymous target, an abstract representation, or a section
-// whose application its operands do not yet select: only an immediate `run` executes those.
+// the one a run calls. An anonymous target stores the invoked value as its environment input, as
+// staging it does: by value when the invocation consumes it, else as the invocation's loan.
+// Absent for an abstract representation or a section whose application its operands do not yet
+// select: only an immediate `run` executes those.
 effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, caller: &DeclarationId, callee: &Shared<Type>,
   nodes: &[BodyNode], operands: &[BodyNodeId], premises: &[Constraint], constraints: &[Constraint],
@@ -37873,17 +37902,37 @@ effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, A
   let mut application = Option.none<Shared<Application>>()
   let mut stored = Vector.make<Shared<Type>>()
   let mut inputs = Vector.make<CallableFieldInput>()
+  let mut promised = Option.none<EffectChannels>()
   match move run Type.copy(callee) {
-    Type.CallableValue {isPublic: visible, application: selected, captures, fieldInputs, ..} => {
-      let named = Shared.with<Application, bool>(&selected, fn(value: &Application) -> bool {
-        let kind = DeclarationId.kind(Application.bodyDeclaration(value))
-        return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock
+    Type.CallableValue {isPublic: visible, application: selected, contract: used, captures, fieldInputs, ..} => {
+      let invoked = Shared.with<Type, Option<Shared<Type>>>(&used, callableResult)
+      if let Option<Shared<Type>>.Some {value: result} = move invoked {
+        promised = Shared.with<Type, Option<EffectChannels>>(&result, effectChannels)
+      }
+      let kind = Shared.with<Application, OwnerKind>(&selected, fn(value: &Application) -> OwnerKind {
+        return DeclarationId.kind(Application.bodyDeclaration(value))
       })
-      if !named { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
       isPublic = visible
-      application = Option.some<Shared<Application>>(move selected)
       stored = move captures
       inputs = move fieldInputs
+      let literal = kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
+      if literal && Vector.length<CallableFieldInput>(&inputs) == usize.ZERO {
+        // The invocation consumes a once callee, so the Effect owns it; otherwise the Effect holds
+        // the invocation's loan of it, whose access its own run access follows (EFFECT-OWN-002).
+        let invocation = Shared.with<Type, CallableMode>(&used, callableInvocationMode)
+        let mut environment = Shared.clone<Type>(callee)
+        if invocation != CallableMode.Once {
+          let mut access = Access.Shared
+          if invocation == CallableMode.Mutable { access = Access.Mutable }
+          environment = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(callee), access: access,
+            lifetime: run Shared.make<Lifetime>(Lifetime.Local {declaration: run DeclarationId.copy(caller), ordinal: site})})
+        }
+        // The literal's captures are its own environment's fields, which the stored value holds.
+        stored = Vector.make<Shared<Type>>()
+        run Vector.append<Shared<Type>>(&mut stored, move environment)
+        run Vector.append<CallableFieldInput>(&mut inputs, CallableFieldInput.Environment)
+      }
+      application = Option.some<Shared<Application>>(move selected)
     }
     Type.CallableSchema {schema, captures, fieldInputs, ..} => {
       let mut supplied = Vector.make<Shared<Type>>()
@@ -37917,29 +37966,53 @@ effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, A
     Option<Shared<Application>>.Some {value} => value
     Option<Shared<Application>>.None => { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
   }
-  let channels = match move run applicationChannels(&mut resolver.*, &mut owner.*, &mut dependencies.*, &target) {
+  // An anonymous target has no declaration signature; its value's contract promises the channels.
+  let anonymous = Shared.with<Application, bool>(&target, fn(value: &Application) -> bool {
+    let kind = DeclarationId.kind(Application.bodyDeclaration(value))
+    return kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
+  })
+  let mut resolved = Option.none<EffectChannels>()
+  if anonymous { resolved = move promised } else { resolved = run applicationChannels(&mut resolver.*, &mut owner.*, &mut dependencies.*, &target) }
+  let channels = match move resolved {
     Option<EffectChannels>.Some {value} => value
     Option<EffectChannels>.None => { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
   }
   let fields = Vector.asSlice<Shared<Type>>(&stored)
   let slots = Vector.asSlice<CallableFieldInput>(&inputs)
   let mut arguments = Vector.make<StoredArgument>()
-  let count = operands.length + slots.length
+  // An original anonymous environment comes first, as the invocation passes it.
+  let mut environment = usize.ZERO
+  while environment < slots.length {
+    let original = match slots[environment] { CallableFieldInput.Environment => true _ => false }
+    if original {
+      // A stored loan is held, not moved: an exclusive one makes the Effect's run exclusive.
+      let held = Shared.with<Type, bool>(&fields[environment], fn(value: &Type) -> bool {
+        return match &value.* { Type.Reference {..} => true _ => false }
+      })
+      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[environment]), moved: !held,
+        input: CallableFieldInput.Environment})
+    }
+    environment = environment + usize.ONE
+  }
+  let mut hidden = usize.ZERO
+  if Vector.length<StoredArgument>(&arguments) != usize.ZERO { hidden = usize.ONE }
+  let count = operands.length + slots.length - hidden
   let mut parameter = usize.ZERO
   while parameter < count {
     if parameter < operands.length {
       match move bodyExpressionType(nodes, &operands[parameter]) {
         Option<Shared<Type>>.Some {value} => {
-          run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: move value, moved: movedBodyValue(nodes, operands[parameter])})
+          run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: move value, moved: movedBodyValue(nodes, operands[parameter]),
+            input: CallableFieldInput.Argument {parameter: parameter}})
         }
         Option<Shared<Type>>.None => { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
       }
     } else {
       let mut slot = usize.ZERO
       while slot < slots.length && !callableInputParameter(&slots[slot], parameter) { slot = slot + usize.ONE }
-      // A stored original environment is not an ordinary target argument.
       if slot == slots.length { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
-      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[slot]), moved: false})
+      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[slot]), moved: false,
+        input: CallableFieldInput.Argument {parameter: parameter}})
     }
     parameter = parameter + usize.ONE
   }
@@ -39571,7 +39644,8 @@ effect fn constructEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answe
       Option<Shared<Type>>.Some {value} => move value
       _ => { return Result.failResult<EffectConstruction, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
     }
-    run Vector.append<StoredArgument>(&mut stored, StoredArgument {ty: move ty, moved: movedBodyValue(nodes, arguments[at])})
+    run Vector.append<StoredArgument>(&mut stored, StoredArgument {ty: move ty, moved: movedBodyValue(nodes, arguments[at]),
+      input: CallableFieldInput.Argument {parameter: at}})
     at = at + usize.ONE
   }
   return run storedEffect(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
@@ -39582,6 +39656,7 @@ effect fn constructEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answe
 struct StoredArgument {
   ty: Shared<Type>
   moved: bool
+  input: CallableFieldInput
 }
 
 // The exact Effect contract over the target arguments a construction stores in parameter order:
@@ -39616,7 +39691,7 @@ effect fn storedEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answer, 
       return Result.failResult<EffectConstruction, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
     }
     run Vector.append<Shared<Type>>(&mut captures, move ty)
-    run Vector.append<CallableFieldInput>(&mut fieldInputs, CallableFieldInput.Argument {parameter: at})
+    run Vector.append<CallableFieldInput>(&mut fieldInputs, arguments[at].input)
     at = at + usize.ONE
   }
   let contract = run Shared.make<Type>(Type.Effect {mode: mode,
@@ -40230,6 +40305,20 @@ effect fn admitExpectedValue(
     if run Type.equalsShared(&offered, &wanted) { return Result.succeed<BodyNodeId, Shared<Rejection>>(node) }
     let injected = run unionArgument(&mut nodes.*, node, &value)
     if injected.index != node.index { return Result.succeed<BodyNodeId, Shared<Rejection>>(injected) }
+    // A value that differs from exactly one union member only in covariant regions meets that
+    // member by lifetime subtyping and is then injected as it, as it would meet the member alone.
+    let mut candidates = Vector.make<Shared<Type>>()
+    if Shared.with<Type, bool>(&value, unionType) { candidates = run Type.failureMembers(&value) }
+    let member = run regionAdmittedMember(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, constraints,
+      &offered, Vector.asSlice<Shared<Type>>(&candidates), relateUnowned, span)
+    if let Option<AdmittedMember>.Some {value: admitted} = move member {
+      let origin = Vector.asSlice<BodyNode>(&nodes.*)[node.index].origin
+      if run retainRegionPairs(&mut resolver.*, origin, Vector.asSlice<RegionPair>(&admitted.deferred)) {
+        run retypeNode(&mut nodes.*, node, move admitted.member)
+        let retyped = run unionArgument(&mut nodes.*, node, &value)
+        if retyped.index != node.index { return Result.succeed<BodyNodeId, Shared<Rejection>>(retyped) }
+      }
+    }
     let sliced = run sliceArgument(&mut nodes.*, node, &value)
     let variables = Vector.make<Shared<DeclarationId>>()
     let bindings = Vector.make<Binding>()
@@ -40264,6 +40353,39 @@ effect fn admitExpectedValue(
     return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span)
   }
   return Result.succeed<BodyNodeId, Shared<Rejection>>(node)
+}
+
+fn unionType(value: &Type) -> bool {
+  return match &value.* { Type.Union {..} => true _ => false }
+}
+
+struct AdmittedMember {
+  member: Shared<Type>
+  deferred: Vector<RegionPair>
+}
+
+// The one candidate member that `offered` meets by covariant region subtyping, with the relations
+// that leaves open; none when no candidate or several candidates admit it.
+effect fn regionAdmittedMember(
+  resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  caller: &DeclarationId, constraints: &[Constraint], offered: &Shared<Type>, listed: &[Shared<Type>],
+  relateUnowned: bool, span: Span,
+) -> Option<AdmittedMember> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let mut chosen = Option.none<AdmittedMember>()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let wanted = run originComparedType(&resolver.*, &listed[at])
+    let mut deferred = Vector.make<RegionPair>()
+    let mut active = Vector.make<DeclarationId>()
+    let admitted = run admitsRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, offered, &wanted, caller,
+      constraints, true, &mut deferred, &mut active, span)
+    if admitted && (relateUnowned || ownedRelations(Vector.asSlice<RegionPair>(&deferred), caller)) {
+      if let Option<AdmittedMember>.Some {..} = &chosen { return Option.none<AdmittedMember>() }
+      chosen = Option.some<AdmittedMember>(AdmittedMember {member: Shared.clone<Type>(&listed[at]), deferred: move deferred})
+    }
+    at = at + usize.ONE
+  }
+  return move chosen
 }
 
 // Whether every deferred pair relates two regions of the caller's own body.
@@ -40998,8 +41120,11 @@ effect fn copyTypeWithin(
   let node = run Type.copy(ty)
   // A closed producer's Effect family is Copy exactly when the storage it realizes to is: its
   // environment is Copy when every capture is (CAPTURE-002). The declared contract alone never is.
+  // Inside its own producer a family is not yet realized, so it is not proven Copy there; a
+  // capture of it is reported as an inline layout cycle where its layout is demanded.
   if let Type.OpaqueRepresentation {application, ..} = &node {
     if Type.hasOpenRuntimeParameters(ty) { return Result.succeed<bool, Shared<Rejection>>(false) }
+    if run activeOpaqueProducer(&mut resolver.*, &application) { return Result.succeed<bool, Shared<Rejection>>(false) }
     let storage = match move run realizedOpaqueStorage(&mut resolver.*, &mut owner.*, &mut dependencies.*, &application, ty, span) {
       Result<Shared<Type>, Shared<Rejection>>.Success {value} => value
       Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result.failResult<bool, Shared<Rejection>>(move error) }
@@ -47544,6 +47669,29 @@ effect fn collectRuntimeProjection(resolver: &mut Resolver, owner: &mut Query<Wo
   return move result
 }
 
+// Whether a producer's body is being checked on the current query path. Its family's realization
+// reads that body, so demanding it there would only rediscover the active query as a cycle.
+effect fn activeOpaqueProducer(resolver: &mut Resolver, application: &Shared<Application>) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let selected = run Application.copyShared(application)
+  let identity = run Shared.make<DeclarationId>(run DeclarationId.copy(Application.bodyDeclaration(&selected)))
+  let module = DeclarationId.moduleId(Application.bodyDeclaration(&selected))
+  let ordinal = match move run ordinalOfIdentity(&mut resolver.*, module, &identity) {
+    Option<usize>.Some {value: found} => found
+    _ => { return false }
+  }
+  let moduleOrdinal = knownModuleOrdinal(&resolver.*, module)
+  let active = Vector.asSlice<Word>(&resolver.active)
+  let keys = Vector.asSlice<ScopedKey>(&resolver.keys)
+  let mut at = usize.ZERO
+  while at < active.length {
+    let key = keys[u64.toUsize(active[at].value)].key
+    if key.family == Family.Body && key.module == moduleOrdinal && key.declaration == ordinal { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // The finite storage an opaque producer family realizes to (EFF-013), demanded once per family.
 effect fn realizedOpaqueStorage(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, application: &Shared<Application>, family: &Shared<Type>, span: Span)
@@ -48623,7 +48771,8 @@ effect fn sectionCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, A
   let mut operands = Vector.make<MirCallOperand>()
   let mut environment = Option.none<MirStoredEnvironment>()
   if environmentField != usize.MAX {
-    if DeclarationId.kind(Application.bodyDeclaration(&application)) != OwnerKind.Anonymous {
+    let original = DeclarationId.kind(Application.bodyDeclaration(&application))
+    if original != OwnerKind.Anonymous && original != OwnerKind.EffectBlock {
       return Result.failResult<MirCallTarget, PreparationFailure>(PreparationFailure.Coverage {code: GapCode.WitnessOperand})
     }
     let actual = Shared.clone<Type>(&fields[environmentField])
