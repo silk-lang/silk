@@ -279,8 +279,15 @@ their written type arguments. The unsafe members need an `unsafe` boundary or ca
 pointer arguments take the ordinary immediate weakening, `pointerFromSlice` takes a shared slice,
 requalification keeps one invariant pointee, and a read requires a `Copy` pointee. A foreign
 declaration may narrow capture with one `Intrinsic.foreign(noCapture: (...))` field naming distinct
-written raw-pointer parameters; the hint creates no loan and lowering may omit it. Other foreign
-properties remain `foreign-contract` gaps.
+written raw-pointer parameters; the hint creates no loan and lowering may omit it. Closed scalar
+C function pointers retain their scalar signature and literal `memory`/`locality` contract independently
+of Silk callable storage. `memory: "none"` canonicalizes locality to external; stronger exports
+require `unsafe export "C" fn`. Emission retains conservative memory effects. An address selects an exported C entry with the exact signature and contract;
+a transitive suspension rejects that address. Imported callback parameters must all appear exactly
+once in the synchronous `callbacks` tuple. Indirect C calls require `unsafe` and use the target's C
+lane extensions. C import calls, indirect C calls, and exported entries retain non-inline fatal
+personality frames: native unwinding terminates before crossing a Silk boundary. Returned callbacks,
+reference-shaped pointer signatures, and other foreign properties remain named coverage gaps.
 
 Module-level `static if` arms belong to the containing module namespace (MODULE-STATIC-001/002). The
 syntax index records the innermost arm that admits each declaration and keeps conditional groups
