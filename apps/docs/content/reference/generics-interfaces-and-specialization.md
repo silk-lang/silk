@@ -38,7 +38,15 @@ Lifetime parameters use the same declaration list with a distinct argument names
 lifetimes follows [header elision](lifetimes.md); the explicit-prefix and inference rules below
 continue to govern ordinary arguments. `T: 'data` constrains borrowed contents, and
 `'long: 'short` constrains validity regions. These predicates never initiate implementation search.
-Lifetime arguments are erased from runtime specialization and physical layout identity.
+Lifetime arguments are erased from physical layout identity. They are also erased from runtime
+specialization identity, so every region pattern of one application shares one body, unless the
+application is region-sensitive. A lifetime-selective head is an `impl` head that names `'static`,
+names one region at two positions of its contract or provider, or bounds a region; only such a
+head can accept one region pattern of an application and refuse another, or select a different
+`Drop` or `Copy` for it. An application is region-sensitive when selecting its body's
+conformances, cleanup or copies consults a lifetime-selective head, or when it lends one of its
+own regions to a region-sensitive application. Each region pattern of a region-sensitive
+application is its own specialization.
 
 ### GEN-001 — Each generic parameter has a declaration-local canonical identity
 

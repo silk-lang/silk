@@ -1415,6 +1415,71 @@ pub fn main() -> () { exercise() }`
   }),
 )
 
+it.effect('keeps descriptor and sequence fields static through nested aggregate contracts', () =>
+  Effect.gen(function* () {
+    const program = `struct Plan { parts: Intrinsic.StaticSequence<i32> }
+struct Outer { inner: Plan }
+struct GenericPlan<T> { parts: Intrinsic.StaticSequence<T> }
+tuple Described(Intrinsic.Type<i32>)
+struct Runtime { value: i32 }
+struct Recursive { next: &Recursive }
+
+static fn make() -> Plan { return Plan { parts: Intrinsic.staticSequenceEmpty<i32>() } }
+static fn staticParameter(value: Outer) -> i32 { return 1 }
+fn invalidParameter(input: Plan) -> i32 { return 1 }
+fn invalidResult() -> Outer { return Outer { inner: make() } }
+effect fn invalidFailure() -> i32 ! Plan { return 1 }
+fn invalidTuple(value: Described) -> i32 { return 1 }
+fn invalidGeneric<T>(generic: GenericPlan<T>) -> i32 { return 1 }
+fn consume<Value>(value: Value) -> () {}
+fn exercise() -> i32 {
+  let static plan = make()
+  let static accepted = staticParameter(Outer { inner: make() })
+  let leaked = plan
+  consume(plan)
+  return 0
+}
+fn ordinary(value: Runtime) -> i32 { return value.value }
+fn recursive(value: Recursive) -> i32 { return 1 }
+pub fn main() -> i32 { return exercise() }`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/phase-only-fields',
+      encoder.encode(program),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    const violations = Analysis.diagnostics(snapshot).filter(
+      (diagnostic) => diagnostic.code === 'SEM0176',
+    )
+    for (const [spelling, offset] of [
+      ['input: Plan', 0],
+      ['-> Outer', 3],
+      ['! Plan', 2],
+      ['value: Described', 0],
+      ['generic: GenericPlan', 0],
+      ['leaked', 0],
+      ['consume(plan)', 8],
+    ] as const) {
+      const position = program.indexOf(spelling) + offset
+      assert.isTrue(
+        violations.some(
+          (diagnostic) => diagnostic.span.start <= position && diagnostic.span.end >= position,
+        ),
+        spelling,
+      )
+    }
+    for (const name of ['make', 'staticParameter', 'ordinary', 'recursive']) {
+      const start = program.indexOf(`fn ${name}(`)
+      const end = program.indexOf('\n', start)
+      assert.isFalse(
+        violations.some(
+          (diagnostic) => diagnostic.span.start >= start && diagnostic.span.start < end,
+        ),
+        name,
+      )
+    }
+  }),
+)
+
 it.effect('caches real residual applications and enforces their growth budget', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
