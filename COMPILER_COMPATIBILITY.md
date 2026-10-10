@@ -379,6 +379,13 @@ Each entry records:
   build closes sensitivity over the instances it reaches and gives each region pattern of a
   sensitive application its own instance; the argument is in
   [region-sensitive identity](compiler/docs/region-sensitive-identity.md).
+- **N1 investigation:** a local rebuilt-bootstrap N0 at native `49a7cac747` produced fresh optimized
+  N1 LLVM text in approximately 207 seconds with 4.41 GiB observed peak RSS. GDB and an O0
+  AddressSanitizer CRC-32 control completed without the previously reported SIGABRT; nine of eleven
+  examples executed their expected results. The other two retain exact baseline N0 refusals:
+  omitted `Effect.provideMut` arguments (`TypeArity`) and a formatting phase-only field (`core-type`).
+  [The investigation records every outcome and its generation](compiler/docs/region-sensitive-identity.md#n1-investigation-2026-10-10);
+  it is diagnostic evidence, not a later synchronized-head CI receipt.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
   deciding whether its selected runtime recipe can be shared. Equal complete recipes share;
   incompatible recipes receive distinct symbols, including all transitive callers. The erased
@@ -859,14 +866,15 @@ Each entry records:
   arms, absent runtime sources, manifest default selection, and catalog selection by target and
   libc.
 
-### Selfhost observed traps stay bare and observation checks are partial
+### Selfhost reports only arithmetic observed traps and checks observations partially
 
 - **Status:** temporary divergence, roadmap [#567](https://github.com/julia-script/silk/issues/567)
   decision Q2, designed in
   [compiler/docs/failure-observer-and-trace.md](compiler/docs/failure-observer-and-trace.md)
-  (2026-10-05). Logical frames and `while handling` causes landed with that note's N7 (2026-10-09).
-  The remaining rows retire with N7's fatal-trap event and with the suspension stage's
-  executable-closure summary (SEM0216, SEM0217).
+  (2026-10-05). Logical frames and `while handling` causes landed with that note's N7 (2026-10-09),
+  and so did event 6 for arithmetic traps (2026-10-10). The remaining rows retire with event 6 for
+  the MIR-level traps and with the suspension stage's executable-closure summary (SEM0216,
+  SEM0217).
 - **Rule:** [TERM-004](apps/docs/content/reference/program-termination-and-reporting.md#term-004--a-failure-report-has-one-stable-minimum)
   to TERM-008 and
   [FAIL-006](apps/docs/content/reference/typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context):
@@ -876,8 +884,10 @@ Each entry records:
   included, once the program runs any observation, and nothing otherwise. Both record the origin,
   one logical frame per run site a failure crosses, and `while handling` causes in the observer's
   pool, so `observeUnhandled` prints the same trace. Selfhost differs in these rows:
-  - Observed traps stay bare traps (no event 6), so a fatal trap under an observer prints no
-    fatal line.
+  - Arithmetic traps (overflow, division by zero, shift count, integer and floating conversion
+    range) report event 6 with their reason and site, as the bootstrap's do. Traps that MIR lowers
+    as a `Trap` terminator (index and range bounds, shared counts, layout checks, execution
+    control, Effect outcome tags) stay bare, so they print no fatal line.
   - SEM0216 and SEM0217 are not diagnosed; a context-free `observeUnhandled` returns `0` at run
     time, as the bootstrap's null observer does.
   - A capturing callback reports `observer-callback`; an observed `fail` of a type that is not
@@ -886,13 +896,14 @@ Each entry records:
     requires all four (SEM0051). A fallible body or a misshapen callback is an argument type
     mismatch at that argument in both (bootstrap SEM0012).
 - **Source migration:** write the four type arguments, as `silk/native_diagnostics` does. Do not
-  rely on a fatal line from an observed trap under selfhost.
+  rely on a fatal line from an observed bounds, layout, execution or outcome-tag trap under
+  selfhost.
 - **Diagnostics and limits:** the missing fatal line is runtime presentation only; status and
   cleanup are unchanged.
 - **Evidence:** `observedFailuresCarryOriginContext`, `observationsCarryContextThroughExpansions`,
-  `nestedObservationsStartFresh` and `observedInstancesEmitTheContextAbi` in
-  `compiler/src/semantic/SemanticCallableCases.silk`; the `native-termination-*` corpus programs
-  other than `native-termination-fatal-trap`.
+  `nestedObservationsStartFresh`, `observedInstancesEmitTheContextAbi` and
+  `observedTrapsRecordTheirSites` in `compiler/src/semantic/SemanticCallableCases.silk`; the
+  `native-termination-*` corpus programs.
 
 ### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
 

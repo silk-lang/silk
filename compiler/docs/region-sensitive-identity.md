@@ -85,3 +85,39 @@ relowers that body only; its callers keep their answers unless the edit changes 
 consulted. Adding or changing a lifetime-selective head changes its bucket's answer, which
 invalidates exactly the lowerings that read that bucket. Marks are rebuilt by each build's
 closure, which costs one graph pass when nothing is sensitive.
+
+## N1 investigation (2026-10-10)
+
+A local N0 rebuilt with the published main bootstrap inputs at `4c269934` compiled the authored
+compiler at `49a7cac7472952e6bad9eeee7970dcb7c0ac8832` into N1 LLVM text in approximately 207 seconds.
+The observed kernel high-water RSS was 4,622,812 KiB (4.41 GiB). LLVM 22.1.8 linked a fresh optimized
+N1 executable. This is diagnostic evidence for that generation, not an exact-head CI receipt for
+the later bootstrap sync.
+
+The previously reported SIGABRT on every example did not reproduce with these rebuilt inputs.
+GDB ran N1 on the smallest example, CRC-32, and the compiler exited normally; the generated program
+returned its expected `7`. An independent O0 AddressSanitizer diagnostic build, with unwind tables
+and frame pointers added to the retained LLVM text, compiled CRC-32 without a sanitizer finding.
+No feature implementation change was needed to obtain these results; the earlier crash's precise
+cause was not isolated.
+
+All eleven examples were attempted with the optimized N1:
+
+| Example | Result |
+| --- | --- |
+| breadth-first-search | Compiled; expected exit `0` |
+| crc-32 | Compiled; expected exit `7` |
+| fft | Compiled; expected exit `208` |
+| game-of-life | Compiled; expected exit `7` |
+| matrix-multiplication | Compiled; expected exit `137` |
+| quicksort | Compiled; expected exit `50` |
+| sieve | Compiled; expected exit `77` |
+| language-pressure/lexer | Compiled; expected exit `0` |
+| language-pressure/local-shared-slp1 | Compiled; expected exit `42` |
+| file-system | `TypeArity`, `main.silk` bytes 3510–3538, at omitted `Effect.provideMut` arguments |
+| language-pressure/stack-vm | `core-type`, `silk/format.silk` bytes 23721–23751, at a phase-only field |
+
+The two refusals also occur, with identical codes and spans, using the fresh baseline N0 at
+`fed79ee8e` before the region-sensitivity change. The omitted-argument frontend work is owned by
+the stage1 coordinator; the formatting field refusal is owned by `selfhost-phase-only-fields`.
+None of the eleven compiler runs or nine executable runs terminated by signal.
