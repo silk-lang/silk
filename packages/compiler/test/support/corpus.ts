@@ -6704,6 +6704,122 @@ int32_t silk_scoped_verify(void) {
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    // A zero-sized guard keeps its drop hook across parking: cancelling a dormant or latched
+    // generation runs it once, and neither cancellation nor a late Wake reaches the endpoint.
+    name: 'independent-execution-zero-sized-guard-cancel',
+    source: `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution, Wake }
+import silk.shared { Shared }
+unsafe extern "C" fn silk_cancel_event(id: i32) -> ()
+unsafe extern "C" fn silk_cancel_verify() -> i32
+struct Empty {}
+struct Waiting { wake: Wake }
+struct Mailbox { slot: Empty | Waiting }
+struct DormantGuard {}
+struct LatchedGuard {}
+impl Drop for DormantGuard {
+  fn drop(self: &mut DormantGuard) -> () {
+    unsafe { silk_cancel_event(1) }
+    return ()
+  }
+}
+impl Drop for LatchedGuard {
+  fn drop(self: &mut LatchedGuard) -> () {
+    unsafe { silk_cancel_event(5) }
+    return ()
+  }
+}
+fn install(mailbox: &mut Mailbox, wake: Wake) -> () {
+  let previous = Intrinsic.replace(mailbox.slot, Waiting { wake: move wake })
+  drop previous
+  return ()
+}
+fn take(mailbox: &mut Mailbox) -> Empty | Waiting {
+  return Intrinsic.replace(mailbox.slot, Empty {})
+}
+fn registerDormant(wake: Wake, mailbox: Shared<Mailbox>) -> DormantGuard {
+  let installing = install(move wake)
+  Shared.withMut(&mailbox, move installing)
+  drop mailbox
+  return DormantGuard {}
+}
+fn registerLatched(wake: Wake) -> LatchedGuard {
+  Execution.wake(move wake)
+  return LatchedGuard {}
+}
+effect fn dormant(mailbox: Shared<Mailbox>) -> i32 {
+  unsafe { silk_cancel_event(2) }
+  let registration = registerDormant(move mailbox)
+  run Execution.park(move registration)
+  unsafe { silk_cancel_event(3) }
+  return 1
+}
+effect fn latched() -> i32 {
+  unsafe { silk_cancel_event(2) }
+  run Execution.park(registerLatched)
+  unsafe { silk_cancel_event(3) }
+  return 1
+}
+fn ready(state: &()) -> () {
+  unsafe { silk_cancel_event(4) }
+  return ()
+}
+fn completed(state: &mut (), result: i32) -> () { return () }
+fn cancel(state: &mut (), execution: Intrinsic.Execution<i32>) -> () {
+  drop execution
+  return ()
+}
+fn signal(selected: Empty | Waiting) -> () {
+  return match move selected {
+    Empty {} => ()
+    Waiting { wake } => Execution.wake(move wake)
+  }
+}
+effect fn driveOnce(execution: Intrinsic.Execution<i32>, state: &mut ()) -> () {
+  return run Execution.drive(move execution, move state, completed, cancel)
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mailbox = run Shared.make<Mailbox>(Mailbox { slot: Empty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let bodyMailbox = Shared.clone(&mailbox)
+  let parked = run Execution.make(dormant(move bodyMailbox), (), ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut state = ()
+  run driveOnce(move parked, &mut state)
+  let late = Shared.withMut(&mailbox, take)
+  drop mailbox
+  signal(move late)
+  let latching = run Execution.make(latched(), (), ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run driveOnce(move latching, &mut state)
+  unsafe { return silk_cancel_verify() }
+}
+effect fn allocationFailed(error: OutOfMemoryError) -> i32 { return 0 }
+pub fn main() -> i32 {
+  return run Effect.catchAll<i32, i32, OutOfMemoryError, never>(program(), allocationFailed)
+}`,
+    nativeCSources: {
+      cancel_events: `#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+static char events[32];
+static unsigned count;
+void silk_cancel_event(int32_t id) {
+  putchar('0' + id);
+  if (count < sizeof(events) - 1) events[count++] = (char)('0' + id);
+}
+int32_t silk_cancel_verify(void) {
+  puts("");
+  return strcmp(events, "2125") == 0 ? 42 : 0;
+}
+`,
+    },
+    nativeStdout: '2125\n',
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'effect-heterogeneous-failure-payload',
     source: heterogeneousFailurePayload,
     expected: { _tag: 'Completes', result: 42 },

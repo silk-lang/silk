@@ -2062,7 +2062,7 @@ effect<'call> fn exerciseProxyTunnel<'call, 'tunnel: 'call>(
   let original = match move first {
     Result.Success {value} => { return 173 }
     Result.Failure {error} => match move error {
-      CallbackFailure cause => cause
+      CallbackFailure cause => move cause
       ClientError cause => { return 175 }
     }
   }
