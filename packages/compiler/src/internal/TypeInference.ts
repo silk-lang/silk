@@ -1660,7 +1660,7 @@ const inferSelectedType = (
   }
   if (isReference(pattern) && isReference(actual)) {
     return (
-      compareAccess(actual.access, pattern.access) &&
+      pattern.access === actual.access &&
       inferLifetime(pattern.lifetime, actual.lifetime, inferred, context) &&
       inferType(
         pattern.target,
