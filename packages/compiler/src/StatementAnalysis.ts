@@ -764,7 +764,7 @@ export const analyzeStatements = (
       if (
         phase === 'Runtime' &&
         bindingType !== undefined &&
-        Type.containsStaticPhaseOnly(bindingType)
+        DeclarationFacts.containsStaticPhaseOnly(context.resolution.index, bindingType)
       )
         context.diagnostics.push(
           Diagnostic.staticPhaseViolation(
@@ -2142,7 +2142,10 @@ export const analyzeFunctionBody = (
       if (
         parameter.phase === 'Runtime' &&
         parameter.declaredType._tag === 'Resolved' &&
-        Type.containsStaticPhaseOnly(parameter.declaredType.type)
+        DeclarationFacts.containsStaticPhaseOnly(
+          context.resolution.index,
+          parameter.declaredType.type,
+        )
       )
         context.diagnostics.push(
           Diagnostic.staticPhaseViolation(
@@ -2155,7 +2158,10 @@ export const analyzeFunctionBody = (
     }
     if (
       declaration.returnType._tag === 'Resolved' &&
-      Type.containsStaticPhaseOnly(declaration.returnType.type)
+      DeclarationFacts.containsStaticPhaseOnly(
+        context.resolution.index,
+        declaration.returnType.type,
+      )
     )
       context.diagnostics.push(
         Diagnostic.staticPhaseViolation(
@@ -2165,6 +2171,20 @@ export const analyzeFunctionBody = (
           Location.at(declaration.returnType.anchor),
         ),
       )
+    for (const failure of declaration.failureRow.members) {
+      if (
+        failure._tag === 'Resolved' &&
+        DeclarationFacts.containsStaticPhaseOnly(context.resolution.index, failure.type)
+      )
+        context.diagnostics.push(
+          Diagnostic.staticPhaseViolation(
+            'runtime failure with a phase-only type',
+            target,
+            [],
+            Location.at(failure.anchor),
+          ),
+        )
+    }
   }
   const statements = analyzeStatements(
     context,
