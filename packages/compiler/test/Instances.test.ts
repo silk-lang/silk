@@ -31,6 +31,7 @@ import * as Preparation from '../src/Preparation.js'
 import * as Type from '../src/Type.js'
 import * as SuspensionMode from '../src/SuspensionMode.js'
 import { unreachable } from './support/raise.js'
+import { dereferencedCallAcceptance, reflectedBorrowWrapperAcceptance } from './support/corpus.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -47,6 +48,35 @@ const golden = (name: string): string =>
 
 const nestedSource = `pub fn identity(value: i32) -> i32 { return value }
 pub fn main() -> i32 { return identity(identity(42)) }`
+
+it.effect('discovers an ordinary call beneath a referent place', () =>
+  Effect.gen(function* () {
+    const result = yield* snapshot(dereferencedCallAcceptance)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    assert.isTrue(
+      result.instances.instances.some((instance) => instance.key.declaration.name === 'view'),
+    )
+  }),
+)
+
+it.effect('discovers each reflection wrapper call beneath a referent place', () =>
+  Effect.gen(function* () {
+    const result = yield* snapshot(reflectedBorrowWrapperAcceptance)
+    assert.deepEqual(Analysis.diagnostics(result), [])
+    const wrappers = result.instances.instances.filter(
+      (instance) => instance.key.declaration.name === 'Reflect.borrowField',
+    )
+    assert.deepEqual(
+      wrappers.map((instance) => {
+        const field = instance.key.staticArguments.at(0)
+        return field?._tag === 'FieldDescriptorValue'
+          ? field.declarationOrdinal
+          : unreachable('expected a sealed field descriptor specialization')
+      }),
+      [0, 1],
+    )
+  }),
+)
 
 it.effect('preserves all specialization matches and isolates discovery frontiers', () =>
   Effect.gen(function* () {
