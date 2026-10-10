@@ -2770,7 +2770,6 @@ export const tirExpectedExpression = (
     compatibility._tag === 'Lifetime' ||
     compatibility._tag === 'CallableMode' ||
     compatibility._tag === 'EffectAccess' ||
-    compatibility._tag === 'ReferenceAccess' ||
     compatibility._tag === 'PointerWeakening'
   )
     return source
