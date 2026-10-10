@@ -429,6 +429,24 @@ Each entry records:
   HIR payloads with pure helpers before the existing effectful checks. Branch bodies, call
   recognition priority, step charging, authored node/span reads, rejection sites and configured
   depth remain unchanged; no new runtime or static form is admitted.
+- **Ordinary control storage experiment:** the authored bootstrap-produced N0 for public
+  `04652e25` passes seven of the eight normal-stack depth controls. Selected and non-tail
+  recursion of eighty return the exact `SEM0180` refusal span, while selected recursion
+  nested inside an ordinary `if` still terminates with `SIGSEGV`. The local E4-bootstrap-produced
+  N0 from private `61993ade` compiled successfully but retained that same crash. Pure ordinary
+  conditional/block payload extraction increased its measured block prologue from 1,608 to
+  2,328 bytes and ordinary conditional prologue from 2,216 to 3,192 bytes. That failed storage
+  experiment is removed: the original direct authored-node paths and checking bodies remain.
+- **Static prefix preparation storage:** the current public `04652e25` authored N0 and the
+  local E4-bootstrap-produced N0 from private `61993ade` both still crash on
+  `selectedNestedOrdinary80` with the ordinary 8 MiB stack and configured depth of 64. The
+  actual public N0's `staticPrefixExpression` prologue reserves 15,176 bytes, excluding its
+  48 saved-register bytes, on the recursive path. Prefix preparation now completes before
+  evaluator construction and execution. Its owned application, checked checkpoint, argument
+  bindings, completed prefix and source-answer handle cross that boundary together; no
+  borrowed machine or port crosses it. The ordered preparation operations, evaluation retry
+  loop, failure handling, diagnostic spans and budgets remain unchanged. The new candidate's
+  production compilation and stack improvement remain unproved until fresh verification.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
