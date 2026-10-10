@@ -141,8 +141,9 @@ Running their results lowers as follows. "Run `x`" means D1 applied to `x`, recu
   whole `E` (`catchAll`), the switch disappears.
 - **`finalizeEffect(inner, finalizer)`**: run `inner`, with its failure edge into `t`. The normal
   target and the failure target both run `finalizer` (`E = never`, so no edge). The failure path
-  then moves `t` into `Failure` and does `Fail`. `finalizeEffectNonParking` lowers identically;
-  `NonParking` is a compile-time bound.
+  then moves `t` into `Failure` and does `Fail`. `finalizeEffectNonParking` follows the same
+  completion paths. On cancellation, its pending finalizer runs once; a parking finalizer is
+  dropped unrun.
 - **`useReleaseNonParking(resource, use, release)`**: own `resource`, call `use(&mut resource)`
   and run the Effect it returns, with a failure edge into `t`. Both targets then call
   `release(&mut resource)` and run its Effect (`E = never`), drop `resource`, and forward success,
@@ -232,6 +233,11 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 
 - Added only by the suspension stage: `Terminator.Suspend { callee, arguments, providers, destination, mode: Transfer | Nested, resume: Block, failure: Option<FailureEdge>, cancel: Block, origin }` and `Terminator.Abandon { origin }`.
 - `Transfer` is the explicit `Intrinsic.suspendEffect` point (inside stdlib `Effect.suspend`); `Nested` is a `run` of a callee whose suspension summary is NestedTransfer, inside a suspendable instance. `resume` receives the success value in `destination`; `failure` is the ordinary failure edge; `cancel` is the explicit drop chain of every owner live at that point, reading flags from the frame, ending in `Abandon` (no outcome).
+- A cancel exit first releases held failure contexts, then enters the pending composed-Effect
+  cleanup landings, innermost first. A landing runs a nonparking finalizer, releases and drops a
+  use-release resource, or drops an observer state or unused handler. Each scope shares one
+  landing and dispatches back to the cancel exit through a selector local. Cleanup calls finish
+  without recording another cancel exit, then ordinary live-owner cleanup abandons the frame.
 - `Mir(Function)` demands the instance's suspension summary (an SCC-capable query; an engine addition), never a callee body, to choose `Call` or `Suspend`. Non-suspending instances contain no `Suspend` (SUSP-018). Providers, out-slots and drop flags are ordinary locals stored in the frame like any live place.
 - `Intrinsic.suspendEffect` and `Intrinsic.relinquish` lower to resume points of the instance's coroutine frame. A relinquish ends its block with `Terminator.Relinquish { resume, origin }`.
 
@@ -351,7 +357,7 @@ trap stub.
 | runners            | generated per Effect site (`CatchEffectRunner`, ...), keyed by `EffectExecutionContract.key` (success, failure row, requirement row)                                                                                                | the construction site's own instance, keyed by application plus providers; intrinsic composites expanded at run sites            | no                                |
 | providers          | statically selected provider references appended after captures; runner specialized per provider witness (`effectRunner.providers`)                                                                                                 | the same idea: `providers` in the key, address `Provider` locals                                                                 | no                                |
 | failure return     | `EffectOutcome` sum returned by value (tag lane, widest payload's lanes)                                                                                                                                                            | status flag plus success and failure out-slots                                                                                   | no                                |
-| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | origin-only identity and origin under an observer ([the observer note](failure-observer-and-trace.md)); frames and causes follow | yes, in unhandled-failure reports |
+| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | identity, origin, logical frames and causes under an observer ([the observer note](failure-observer-and-trace.md)); observed traps follow | yes, in unhandled-failure reports |
 | entry              | source runtime `silk/native_start` (ENTRY-001), no compiler adapter                                                                                                                                                                 | the same source runtime, selected from the standard-library catalog by target and libc                                           | no                                |
 | suspension         | coroutine frames, `SuspendEffectRegion`                                                                                                                                                                                             | gap `suspension`                                                                                                                 | yes: unsupported                  |
 
@@ -395,9 +401,9 @@ All three recommendations accepted on PR #708:
    `entry-signature` until then. No compiler entry adapter is added for `effect fn main`.
    Done: selfhost now selects `silk/native_start` by default and the shim, `entry-signature` and
    the compatibility entry are removed.
-2. **Failure context (Q2).** Origin-only context is carried by `Statement.FailureContext`, added
+2. **Failure context (Q2).** Failure context is carried by `Statement.FailureContext`, added
    with its first reader by the observer and trace work
    ([failure-observer-and-trace.md](failure-observer-and-trace.md), shipped in its §7 step 2), not
-   in Step 9. The trace gap belongs to that work.
+   in Step 9. Logical frames and causes shipped in that note's N7; observed traps remain there.
 3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
    covers becomes either supported or `suspension`.
