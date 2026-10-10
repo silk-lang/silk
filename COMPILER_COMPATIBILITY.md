@@ -1768,6 +1768,17 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Bootstrap:** implementation active. `Effect.result` retains its unrestricted error contract. The two selected borrowed-recovery native corpus cases pass their exact synchronous cleanup and park/resume/cancel traces (`7231` and `75842175421`, both returning `42`). Source-owned executable input views preserve the actual closure and independently authenticate the original caller domain and complete invocation inputs. Immutable stored Identifier, ordinary staged and anonymous adaptation retain independently held original producer/input provenance. The four selected stored/staged borrowed-recovery variants also pass; these focused runtime passes do not establish the complete feature, native lifetime safety or N1.
 - **Native:** marker parsed, represented and checked. The parser accepts the contextual `use` only in a callable's outer `for` list; HIR lowering records it on the lifetime parameter, and `Type.Callable` carries the marked binder's canonical ordinal as contract identity (an unused marker vanishes with its binder). A second marker or authored bounds on the marked binder reject as `InvalidLifetime`. Opening a marked contract at a call adds `input: 'call` obligations for every opened input; a contextually checked callback and a callable compared against a marked promise receive the same conditions as premises, and a marked source requires a marked target at the same binder. Effect, `Effect.result` and the `'call & 'env` meets use the existing canonical-meet machinery. Executable input views, stored/staged adaptation provenance and the bootstrap's runtime recovery traces remain unimplemented natively. Strict census on the merged change: HP 42 to 33, UnknownMember 17 to 4 (`effect.silk` resolves again); the remaining `useReleaseNonParking` callers keep their pre-sync refusals. Integrated CI and N1 remain unproved.
 
+### Closed scalar native C callbacks
+
+The native compiler admits exported C-entry addresses under an expected `extern "C" fn` type with
+closed scalar or raw-data-pointer lanes and literal `memory`/`locality` contracts. Contract equality
+is exact after `memory: "none"` canonicalizes locality to external. Stronger export promises require
+`unsafe export "C" fn`; emitted memory effects stay conservative. Imported symbols and ordinary Silk callable values cannot form these addresses. All written
+C callback parameters require a complete synchronous `callbacks` tuple. Address formation checks the
+transitive execution graph for suspension. Indirect invocation requires `unsafe` and retains C ABI
+narrow-integer extension rules. Native imports, pointer invocations, and exported entries retain
+non-inline fatal-personality frames and invoke/landingpad edges. Returned-callback factories, reference
+lanes, and the broader callback loan/capture contracts remain unadmitted natively.
 
 ### Native sealed provision selectors infer one compatible key
 
