@@ -2345,6 +2345,16 @@ export const isEffect = (self: Type): self is Effect =>
 export const isRepresented = (self: Type): self is Represented =>
   typeof self !== 'string' && self._tag === 'RepresentedType'
 
+/**
+ * The Effect contract an executable parameter carries a hidden identity for: an Effect held by
+ * value, or the referent of a borrowed Effect, whose runner is the referent's runner.
+ */
+export const parameterEffectContract = (self: Type): Effect | undefined => {
+  const held = isReference(self) ? self.target : self
+  const contract = isRepresented(held) ? held.contract : held
+  return isEffect(contract) ? contract : undefined
+}
+
 /** Tests whether a semantic type is a normalized multi-member structural union. */
 export const isUnion = (self: Type): self is StructuralUnion =>
   typeof self !== 'string' && self._tag === 'StructuralUnionType'

@@ -8425,11 +8425,11 @@ const computeVerify = Effect.fnUntraced(function* (
                 candidate.callable?.ordinal === operation.destination.ordinal &&
                 (candidate.access === 'Shared' || candidate.access === 'Exclusive'),
             )
+          // A shared or exclusive Effect read only to run it views its stored field or referent.
           const effectViewProjection =
             operation._tag === 'ReadPlace' &&
             operation.consume !== true &&
             operation.type._tag === 'EffectValue' &&
-            operation.type.storage !== undefined &&
             (operation.type.type.access === 'Shared' ||
               operation.type.type.access === 'Exclusive') &&
             operations.filter((candidate) =>
