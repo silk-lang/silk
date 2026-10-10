@@ -503,3 +503,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-10 · The cloud GitHub CLI received Forbidden from api.github.com while Git transport worked · Use the connected GitHub fetch and workflow tools for PR metadata, CI evidence and mutations · Silk Stage 1
 
 2026-10-10 · Managed cloud image lacks gdb and has no configured apt package candidates; native Clang children use an empty environment and cannot locate ld · Download and extract Debian trixie gdb plus dependencies under /workspace/debug-tools, invoke with its LD_LIBRARY_PATH, and link the pinned LLVM toolchain bin/ld to /usr/bin/ld for native diagnostic builds · compiler selfhost N1 investigation
+- 2026-10-10 · Running the native formatter on a large pre-existing semantic source rewrote tens of thousands of unrelated lines · Restore the original files and retain formatting only for the newly edited functions and claims · Silk native body premises
