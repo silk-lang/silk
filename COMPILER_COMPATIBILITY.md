@@ -381,6 +381,18 @@ Each entry records:
   configured depth remain unchanged. The exact classifiers were checked, compiled and executed
   by the current bootstrap against thirty admitted, unavailable and call/pipeline controls using
   the real HIR and call-input declarations, returning 42.
+- **Checked expression dispatch storage:** the published `5e38f982` bootstrap-produced N0
+  reduces evaluator expression and statement frames to 12,856 and 8,360 bytes and one rejection
+  site each. Ordinary recursion of forty-eight succeeds and ordinary recursion of eighty now
+  reaches its normal depth refusal. Selected, non-tail and selected-under-ordinary-control
+  recursion of eighty still overflow in `checkExpressionUnder`, whose 47,016-byte frame contains
+  427 effectful rejection sites. Its 27 admitted expression variants now pass through a pure
+  compact classifier; member selectors and member names use pure optional payload extraction.
+  Omitted HIR variants share the original effectful refusal at each cut. Invocation, named-value
+  and anonymous-callable precedence, branch bodies, rejection codes and spans remain unchanged.
+  Member construction still rejects a static body before reading its selector, and resolves its
+  annotation before reading the member name. The complete classifiers and extractors compile
+  and return 42 under the current bootstrap with thirty-two real-HIR payload and refusal controls.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
