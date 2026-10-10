@@ -2363,6 +2363,44 @@ export const containsLexicalBorrow = (
   )
 }
 
+/** A struct or tuple holding a descriptor or static sequence has no runtime representation. */
+export const containsStaticPhaseOnly = (
+  self: Index,
+  type: Type.Type,
+  seen: ReadonlySet<string> = new Set(),
+): boolean => {
+  if (Type.containsStaticPhaseOnly(type)) return true
+  for (const nominal of Type.nominals(type)) {
+    const key = `${nominal.module}:${nominal.name}`
+    if (seen.has(key)) continue
+    const declaration = byCanonical(self, {
+      _tag: 'CanonicalDeclarationId',
+      module: nominal.module,
+      name: nominal.name,
+    })
+    if (declaration?._tag !== 'StructDeclaration') continue
+    const substitution =
+      TypeInference.substitution(
+        declaration.typeParameters.map((parameter) => parameter.type),
+        nominal.arguments,
+      ) ?? new Map()
+    const next = new Set(seen).add(key)
+    if (
+      declaration.fields.some(
+        (field) =>
+          field.declaredType._tag === 'Resolved' &&
+          containsStaticPhaseOnly(
+            self,
+            Type.substitute(field.declaredType.type, substitution),
+            next,
+          ),
+      )
+    )
+      return true
+  }
+  return false
+}
+
 /** One stored bare-callable occurrence that denies an aggregate type a target layout. */
 export interface StoredExecutable {
   readonly path: ReadonlyArray<string>
