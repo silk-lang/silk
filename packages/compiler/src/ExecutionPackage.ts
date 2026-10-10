@@ -4,10 +4,32 @@ import * as SuspensionMode from './SuspensionMode.js'
 import type * as Target from './Target.js'
 import * as Type from './Type.js'
 
+/**
+ * Words of the package control block: two source-owned control words, the counted allocation
+ * authority, and the compiler-private notification flag.
+ */
+export const controlWords = 4
+
+/** Source-owned control words addressable through `Intrinsic.executionLoad` and `executionStore`. */
+export const sourceControlWords = 2
+
+/** Word index of the counted authority (the Execution handle plus each live ExecutionRef). */
+export const authorityWord = 2
+
+/** Word index of the compiler-private notification flag. */
+export const notificationWord = 3
+
+/** Byte offset of the control block; fixed because only the owner record precedes it. */
+export const controlOffset = (pointerSize: number): number => pointerSize * 2
+
+/** Byte offset of the allocation authority; fixed because only fixed components precede it. */
+export const allocationOffset = (pointerSize: number): number => pointerSize * (2 + controlWords)
+
 /** One exact component retained by the compiler-private combined execution package. */
 export interface Component {
   readonly role:
     | 'OwnerRecord'
+    | 'Control'
     | 'AllocationAuthority'
     | 'BodyEnvironment'
     | 'InvokeMetadata'
@@ -15,7 +37,6 @@ export interface Component {
     | 'EndpointState'
     | 'EndpointCallback'
     | 'EndpointDropMetadata'
-    | 'WakeControl'
     | 'InitialContinuationSegment'
   readonly size: number
   readonly alignment: number
@@ -38,7 +59,6 @@ export interface Plan {
   readonly size: number
   readonly alignment: number
   readonly components: ReadonlyArray<Component>
-  readonly readinessStorage: boolean
   readonly initialContinuationSegment: boolean
   readonly provenance: string
   /** Exact hidden drop programs retained only after whole-program layout realization. */
@@ -132,24 +152,24 @@ export const planWithin = (
     return unavailable(target, specialization, 'InvalidComponent')
 
   const word = target.pointerSize
-  const readinessStorage = SuspensionMode.has(specialization.suspension, 'ExternalPark')
   const initialContinuationSegment = specialization.suspension.modes.length > 0
   const endpointIsZeroSized = layouts.endpoint.size === 0 && layouts.callback.size === 0
   const components: ReadonlyArray<Component> = [
     component('OwnerRecord', word * 2, word),
+    // Control precedes every specialization-sized component, so its offset is package-independent.
+    component('Control', word * controlWords, word),
     // Allocation is a self-contained six-word reclaim ticket in the current bootstrap ABI.
     component('AllocationAuthority', word * 6, word),
     component('BodyEnvironment', layouts.body.size, layouts.body.alignment),
     component('InvokeMetadata', word, word),
     component('BodyDropMetadata', word, word),
-    ...(readinessStorage || !endpointIsZeroSized
+    ...(!endpointIsZeroSized
       ? [
           component('EndpointState', layouts.endpoint.size, layouts.endpoint.alignment),
           component('EndpointCallback', layouts.callback.size, layouts.callback.alignment),
           component('EndpointDropMetadata', word * 2, word),
         ]
       : []),
-    ...(readinessStorage ? [component('WakeControl', word * 4, word)] : []),
     ...(initialContinuationSegment
       ? [component('InitialContinuationSegment', word * ContinuationTransfer.headerWords, word)]
       : []),
@@ -173,7 +193,6 @@ export const planWithin = (
     specializationKey(specialization),
     size,
     alignment,
-    readinessStorage ? 'wake' : 'no-wake',
     initialContinuationSegment ? 'segment' : 'no-segment',
   ].join(':')
   return {
@@ -183,7 +202,6 @@ export const planWithin = (
     size,
     alignment,
     components,
-    readinessStorage,
     initialContinuationSegment,
     provenance,
   }
@@ -201,7 +219,6 @@ export const equals = (left: Plan, right: Plan): boolean =>
   specializationKey(left.specialization) === specializationKey(right.specialization) &&
   left.size === right.size &&
   left.alignment === right.alignment &&
-  left.readinessStorage === right.readinessStorage &&
   left.initialContinuationSegment === right.initialContinuationSegment &&
   left.provenance === right.provenance
 
@@ -214,7 +231,7 @@ export interface AllocationProvenance {
 }
 
 export type InitializationVerdict =
-  | { readonly _tag: 'Accepted'; readonly state: 'Initial' }
+  | { readonly _tag: 'Accepted'; readonly state: 'Unstarted' }
   | {
       readonly _tag: 'Rejected'
       readonly reason: 'Target' | 'Size' | 'Alignment' | 'PackageProvenance'
@@ -230,7 +247,7 @@ export const validateInitialization = (
   if (allocation.alignment !== plan_.alignment) return { _tag: 'Rejected', reason: 'Alignment' }
   if (allocation.package !== plan_.provenance)
     return { _tag: 'Rejected', reason: 'PackageProvenance' }
-  return { _tag: 'Accepted', state: 'Initial' }
+  return { _tag: 'Accepted', state: 'Unstarted' }
 }
 
 /** Exact hidden cleanup metadata retained at the purpose-bound erasure seam. */
@@ -242,7 +259,7 @@ export interface CleanupMetadata {
 
 /** Canonical inspection form shared by Layout and target-neutral MIR artifacts. */
 export const encode = (self: Plan): string =>
-  `execution-package ${self.provenance} target=${self.target} size=${self.size} alignment=${self.alignment} body=${Type.encode(self.specialization.body)} endpoint=${Type.encode(self.specialization.endpoint)} callback=${Type.encode(self.specialization.callback)} suspension=${SuspensionMode.encode(self.specialization.suspension)} readiness=${self.readinessStorage ? 'stored' : 'omitted'} segment=${self.initialContinuationSegment ? 'initial' : 'none'}`
+  `execution-package ${self.provenance} target=${self.target} size=${self.size} alignment=${self.alignment} body=${Type.encode(self.specialization.body)} endpoint=${Type.encode(self.specialization.endpoint)} callback=${Type.encode(self.specialization.callback)} suspension=${SuspensionMode.encode(self.specialization.suspension)} segment=${self.initialContinuationSegment ? 'initial' : 'none'}`
 
 export const empty = (): Module => ({
   _tag: 'ExecutionPackageModule',

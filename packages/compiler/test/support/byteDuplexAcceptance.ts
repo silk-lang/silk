@@ -3,7 +3,7 @@ export const byteDuplexAcceptanceSource = `import silk.allocator {Allocator, Out
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.memory_byte_duplex {MemoryByteDuplex, MemoryByteDuplexPhase, MemoryReadEvent, MemoryWriteAction, MemoryWriteEvent}
 import silk.monotonic_clock {MonotonicClock}
 import silk.option {Option}
@@ -32,8 +32,8 @@ impl MonotonicClock for VirtualClock {
   }
 }
 
-struct ParkGuard {wake: Intrinsic.Wake}
-fn retainWake(wake: Intrinsic.Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
 struct ParkingClock {}
 impl MonotonicClock for ParkingClock {
   effect fn now(self: &mut Self) -> Instant { return SystemClock.make(0, 0) }

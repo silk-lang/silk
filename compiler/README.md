@@ -151,7 +151,7 @@ service-role key order (D2), and its key names each provider's type. Running
 `Intrinsic.bindRequirement*<S>` serves `S` from the stored provider to the inner run only; running
 `Svc.op(args)` calls the witness for the serving provider's type with the provider address as its
 receiver. Program entry is the selected runtime's C export (ENTRY-001): `silk/native_start` runs a `pub effect fn main` through its
-`EntryResult` adapters. `Intrinsic.suspendEffect` and `Intrinsic.park` report `suspension`.
+`EntryResult` adapters.
 Catalog `Intrinsic` type families outside the storage core, such as `Intrinsic.Execution`, report
 `core-type`.
 

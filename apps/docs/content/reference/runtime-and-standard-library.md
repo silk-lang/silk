@@ -780,8 +780,9 @@ foreign ABI boundary. A program gains additional facilities through its selected
 and by importing ordinary APIs and constructing or providing their implementations.
 
 `Effect.suspend` transfers one deferred child through the explicit stack-safe execution boundary.
-It does not park an unfinished execution or schedule another one. The sealed Execution and Wake
-identities provide a separate narrow seam for independently owned activation and external parking.
+It does not park an unfinished execution or schedule another one. The sealed Execution and
+ExecutionRef identities provide a separate narrow seam for independently owned activation and
+external parking.
 The ordinary `silk.execution` module exposes safe construction, drive, and park operations.
 Schedulers, executors, queues, timers, deferred values, and cancellation policies remain ordinary
 source. Programs that cannot reach these sealed operations acquire no scheduler or fiber cost.
