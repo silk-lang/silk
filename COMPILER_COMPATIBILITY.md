@@ -247,33 +247,222 @@ Each entry records:
   `compiler/src/semantic/SemanticLoweringCases.silk` and `cleanupReentryStaysWithinItsOwnedRoot` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
 
-### Static aggregate reflection subset in selfhost
+### Phase-only aggregate fields in both frontends
 
-- **Status:** implemented on 2026-10-02 on PR #664 (B12 c39, decision D2); verification is pending
-  that PR's exact-head CI.
-- **Rule:** `Intrinsic.reflectType<Owner>()` yields the phase-only `Intrinsic.Type<Owner>`
-  descriptor, and `Intrinsic.reflectTypeKind<Owner>(descriptor)` yields the stable `silk.reflect`
-  kind code. Both exist only during static evaluation; a descriptor has no runtime representation.
-- **Compilers:** the bootstrap implements the complete reflection family, including fields and
-  field metadata. Selfhost implements only `reflectType` and `reflectTypeKind`, and only for a
-  source-declared struct (kind 0) or tuple (kind 1), during static evaluation. It has no
-  `reflectFields`, `reflectFieldKind`, `reflectFieldLabel`, `reflectFieldOrdinal`, or
-  `borrowField`, and no occurrence-generated aggregate kinds (2 and 3).
-- **Source migration:** none. `silk.reflect` keeps its source wrappers; selfhost checks
-  `Reflect.typeOf` and `Reflect.typeKind` and leaves the others unchecked until demanded.
-- **Diagnostics and limits:** in selfhost, a reflection call outside static evaluation, a runtime
-  signature mentioning `Intrinsic.Type<Owner>` (anchored at that authored type), and a descriptor
-  reaching runtime code through a selection pass are `StaticPhaseViolation`. A non-aggregate or
-  occurrence-generated owner is an `Unsupported` static evaluation failure for a missing intrinsic
-  operation, reported as `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An
-  unlisted reflection member remains `UnknownMember`.
-- **Evidence:** in `compiler/src/semantic/SemanticStaticCases.silk`,
-  `selectedTypeSelectionReadsReflectedKinds` covers the two-type static selection,
-  `reflectedKindCodesMatchTheLibrary` covers both kind codes and the unsupported owner, and
-  `reflectedDescriptorsStayOutOfRuntimeCode` covers each runtime boundary. The shared corpus program
-  `static-type-selection` exercises the bootstrap natively.
-- **Open questions:** when selfhost needs fields, add the remaining members with the same
-  phase-only descriptor rules.
+- **Status:** implemented on 2026-10-10; both focused native claims passed in the coordinated
+  source-and-actor build. The matching bootstrap correction landed through PR #1375.
+- **Rule:** STATIC-009 permits a struct or tuple to contain a sealed static sequence or descriptor.
+  Its complete aggregate remains phase-only, including through nested and applied generic fields.
+  Such a declaration does not gain a runtime representation.
+- **Compilers:** both admit phase-only member shapes and classify their containing aggregates
+  transitively. Traversal retains exact applied declaration identity and bounds recursive member
+  visits. LIFE-003 treats the compiler's sealed descriptor and sequence families according to
+  their field-lifetime rules without attempting to resolve them as authored declarations.
+- **Diagnostics and limits:** runtime parameters, results, failures and embedded values containing
+  a phase-only aggregate reject with `StaticPhaseViolation` at the authored boundary. Accepting
+  the field declaration does not permit a runtime layout or descriptor construction.
+- **Evidence:** `phaseOnlyFieldsStayStatic` retains nested and generic field admission, exact
+  runtime rejection spans and selected-value embedding refusal; `sealedFamilyFieldLifetimes`
+  retains the sealed-family lifetime controls. Both passed in the combined native claim root.
+  The integrated private N1 built from frozen `69b179c4f` passes template-formatting,
+  logging-composition and language-pressure-stack-vm, as well as json-reflect and format-options,
+  with their authored results and exact output. These outcomes are distinct from the final public seed.
+- **Source migration:** none.
+
+### Static aggregate reflection and authenticated fields in selfhost
+
+- **Status:** focused native reflection and projection claims passed on 2026-10-10 in the
+  coordinated eleven-actor executable. The integrated private native-produced N1 also built
+  from frozen `69b179c4f` source on 2026-10-10. The combined implementation is tracked in PR #1402.
+- **Rule:** `Intrinsic.Type<Owner>`, `Intrinsic.Fields<Owner>`, and each exact heterogeneous
+  `Intrinsic.Field<Owner, Value>` are sealed phase-only families. Descriptors retain concrete
+  nominal or occurrence identity, declaration order, substituted member types, and the original
+  reflecting declaration's canonical visibility authority. Private fields are omitted outside
+  their declaring module. No descriptor has a runtime layout or can be embedded in runtime code.
+- **Compilers:** both implement `reflectType`, `reflectTypeKind`, `reflectFields`,
+  `reflectFieldKind`, `reflectFieldLabel`, and `reflectFieldOrdinal` for concrete struct, tuple,
+  record, and anonymous positional owners. Native field collections re-elaborate each static
+  iteration at that descriptor's exact `Field<Owner, Value>` type. Native `borrowField` consumes
+  the descriptor during specialization and emits an ordinary field projection and shared loan,
+  retaining the actual owner's lifetime. Omitted type arguments are inferred from the admitted
+  descriptor; explicit arguments must match its exact owner and substituted value type.
+- **Projected runtime leaves:** a field/ordinal chain rooted in a known static binder is checked
+  and charged as a whole projection before embedding its leaf. Text uses immutable program-lifetime
+  UTF-8 bytes; char preserves its Unicode scalar; fixed arrays recurse over admitted elements.
+  Whole nominal aggregates and sealed descriptors do not gain runtime embedding.
+- **Source migration:** none. `silk.reflect` remains ordinary source wrapping the sealed intrinsic
+  namespace. The compiler does not identify any standard-library declaration by spelling.
+- **Diagnostics and limits:** reflection outside static evaluation and descriptors reaching a
+  runtime parameter, result, or embedded value are `StaticPhaseViolation`. A non-aggregate owner,
+  asking a positional descriptor for a label, or asking a labeled descriptor for a positional
+  ordinal fails static evaluation. Descriptors participate in canonical static equality and region
+  numbering, retaining owner identity, ordinal, kind, label, and canonical authority; copied
+  descriptors preserve their private admission. Retained metadata and labels count toward the
+  static value budget, and aggregate/member queries retain source dependencies. Runtime projection
+  requires an actual shared reference, exact nominal or occurrence identity, and the descriptor's
+  original canonical visibility authority; owned and exclusive values do not gain shared access.
+- **Evidence:** `reflectedFieldCollectionsRetainExactCapabilities` in
+  `compiler/src/semantic/FieldReflectionCases.silk` checks applied generic value types, declaration
+  order, exact nominal identity, original authority, private-field filtering, positional members,
+  and the valid empty collection. Existing type-reflection claims in
+  `compiler/src/semantic/SemanticStaticCases.silk` retain their runtime-boundary assertions;
+  `staticFunctionControlUsesArgumentsAndCheckedLocals` includes heterogeneous and empty iteration.
+  `sealedFieldsCannotBeConstructedOrReturnedThroughAliases` rejects authored empty capabilities
+  and runtime aliases. `BorrowFieldCases.silk` retains ordinary projection/MIR erasure and strict
+  access, owner, and lifetime controls; the escape check pins the projected borrow initializer.
+- **Runtime evidence:** the corrected private N1 passed all seventeen original
+  runtime controls and fifteen additional controls, including the permanent reflected-borrow wrapper,
+  copied label handles, generic forwarding and stored references, inferred scalar parameters,
+  text/char scalars and arrays, and strict access/owner/value/escape negatives. The frozen source
+  was `69b179c4f`; all thirty-two controls passed on its native-produced N1. Four additional
+  immediate-loan controls pass: fresh shared, fresh exclusive, generic exclusive and preborrowed
+  outside storage. Whole nominal values
+  still refuse runtime embedding, and arrays of nominal values retain their static construction refusal.
+  The five required corpus programs and all eleven authored examples pass.
+
+### Checked local control in native static functions
+
+- **Status:** focused native control claims passed on 2026-10-10 in the coordinated eleven-actor
+  executable. The final combined implementation is tracked in PR #1402.
+- **Rule:** STATIC-005 evaluates a static function in its concrete argument and checked local-value
+  context. Its static condition and finite iterable use those values, including earlier mutation.
+  A selected failure retains its authored diagnostic and publishes no partial selected body.
+- **Compilers:** both use argument values and checked prefixes for local static selection. Native
+  static bodies are keyed by complete application and arguments; each static iteration retains
+  its concrete element type, fresh locals, and authenticated node range. Reached conditions resolve
+  their own calls without admitting inactive arms. Nested mixed static iterations retain their
+  enclosing contexts.
+- **Diagnostics and limits:** changing a checked static selection inside ordinary control is
+  diagnosed as `StaticPhaseViolation` instead of executing a stale arm. This remains an
+  implementation boundary in both compilers. Native selected-body checking shares the caller's
+  configured remaining recursion depth; `DepthLimit` retains code `SEM0180` and the authored call
+  span. Depth-dependent query refusals remain unpublished so a larger-budget retry can succeed on
+  the same semantic snapshot. Step and value budgets retain their existing policies.
+  Callable literals, authored effect-block
+  expressions, and return/fail/break/continue retain their explicit mixed-iteration refusal.
+  Ordinary borrow and immediate effect/service calls traverse the ordinary checker. Only a
+  recognized Effect construction consumed by an immediate run in that same iteration skips its
+  representation-internal environment scan; arguments, stored Effects and borrowed results retain
+  their checks. An argument loan rooted in already checked outside storage may retain only its
+  exact call extent when that argument is consumed by the recognized immediate construction in
+  the same iteration. Field and index places must reach that outside local; dereference must
+  follow an actual reference. Raw pointers, inside storage, stored captures, other retained
+  regions and borrowed results keep the original generated-loan checks. These boundaries do
+  not change the prescriptive language rule.
+- **Evidence:** `staticFunctionControlUsesArgumentsAndCheckedLocals` and
+  `nestedMixedLoopsRetainIndependentIterationContexts` in
+  `compiler/src/semantic/SemanticStaticCases.silk` retain opposite arguments, mutable and nested
+  local selections, early returns, phase-only locals, per-iteration mutation, zero-body silence,
+  selected CompileError spans, changing-selection refusal, and failure atomicity. Existing static
+  control and aggregate actors remain in the coordinated proof root. The permanent
+  `selectedStaticRecursionSharesConfiguredDepthBudget` actor retains selected and ordinary
+  recursion refusals, post-failure recovery, and depth-two refusal followed by depth-64 success
+  for the same selected application. The coordinated executable ran all eleven actors and returned
+  42. Rebuilding the same eleven actors with scoped reservation cleanup retained all passes,
+  including the larger-budget retry after refusal. Optimized compiler source probes are reported
+  below.
+- **Optimized evidence:** the corrected private native-produced N1 built from frozen source
+  `69b179c4f` and passed eight compiler source probes at configured depth 64 and the unchanged
+  Linux 8 MiB stack. Selected, ordinary, non-tail, and selected-under-ordinary-control recursion
+  of eighty all report normal `StaticDepthLimit` at the exact authored recursive call. Selected
+  and non-tail recursion of eight, ordinary recursion of forty-eight, and selected recursion of
+  eight under ordinary control all compile and return 42. The generic constant retry and checked
+  range reset also advance every previously failing scalar/prefix corpus front. The expanded
+  actor suite retains earlier literal, helper, and empty-sequence initialization before a cold
+  imported constant is needed during reflected iteration.
+- **Authored dispatch storage:** the published `1965c1ea` compiler exposed a generation-dependent
+  stack failure: its native-produced N1 passed the same eight default-depth probes, while its
+  bootstrap-produced N0 passed the three shallow probes and crashed on the other five. The N0
+  expression and statement dispatchers reserved 78,232 and 75,560 bytes before saved registers;
+  their wide authored-node wildcard arms emitted 117 and 121 separate effectful rejection sites.
+  Pure classifiers now map only the existing admitted payloads into compact evaluator inputs,
+  followed by one `Unavailable` rejection arm per dispatcher. Call recognition retains its
+  priority, and step charging, authored span lookup, variant helper calls, refusal codes and
+  configured depth remain unchanged. The exact classifiers were checked, compiled and executed
+  by the current bootstrap against thirty admitted, unavailable and call/pipeline controls using
+  the real HIR and call-input declarations, returning 42.
+- **Checked expression dispatch storage:** the published `5e38f982` bootstrap-produced N0
+  reduces evaluator expression and statement frames to 12,856 and 8,360 bytes and one rejection
+  site each. Ordinary recursion of forty-eight succeeds and ordinary recursion of eighty now
+  reaches its normal depth refusal. Selected, non-tail and selected-under-ordinary-control
+  recursion of eighty still overflow in `checkExpressionUnder`, whose 47,016-byte frame contains
+  427 effectful rejection sites. Its 27 admitted expression variants now pass through a pure
+  compact classifier; member selectors and member names use pure optional payload extraction.
+  Omitted HIR variants share the original effectful refusal at each cut. Invocation, named-value
+  and anonymous-callable precedence, branch bodies, rejection codes and spans remain unchanged.
+  Member construction still rejects a static body before reading its selector, and resolves its
+  annotation before reading the member name. The complete classifiers and extractors compile
+  and return 42 under the current bootstrap with thirty-two real-HIR payload and refusal controls.
+- **Checked branch storage:** the published `34807c66` N0 reduces the checked-expression
+  dispatcher to 38,248 bytes and 63 effectful rejection sites, but the same three selected,
+  non-tail and selected-under-ordinary-control depth probes still overflow. All five required
+  corpus programs and all eight same-source native-produced N1 depth probes pass. The checked
+  dispatcher now delegates its 27 admitted variants to separate effectful helpers. It retains
+  the original early paths and initializes the Unit type, expression form and divergence state
+  at their original point, then moves that owned state to the selected helper. Helpers retain
+  the exact original branch bodies, early-return results and reachable finalization; only
+  unused context parameters and unreachable terminal finalizers are omitted. This
+  isolates inactive branch temporaries without changing allocation order, configured depth,
+  diagnostic spans or language admission.
+- **Recursive-path storage:** the published `45e253dd` N0 reduces the checked-expression
+  dispatcher to 22,888 bytes and three effectful rejection sites. All fifteen native source
+  actors and all five required corpus programs pass, but selected, non-tail and
+  selected-under-ordinary-control recursion of eighty still overflow on the normal 8 MiB
+  stack. The same-source native-produced N1 passes all eight depth controls. Checked source
+  routing now separates the existing Prefix/Infix cases from the other twenty-five admitted
+  cases and the original unavailable refusal. Invocation, named-value and callable checks
+  finish before source-state initialization and dispatch. Static application setup finishes
+  before recursive body checking; answer/source/dependency ledger completion runs after
+  resolution; selected static-result handling and execution run after the body demand returns.
+  These named operations retain the original owned state, diagnostic and cache order, scoped
+  releases and configured depth of 64. They change which inactive temporaries remain live on
+  recursive paths, without extending language admission or changing evaluator budgets.
+- **Evaluator call and static-control storage:** the published `bb7eaec6` N0 reduces the
+  checked-expression entry to 3,784 bytes, prepared-body checking to 6,536 bytes and selected
+  static demand to 5,000 bytes. Its five required corpus programs pass, but selected, non-tail
+  and selected-under-ordinary-control recursion of eighty still overflow on the ordinary
+  8 MiB stack. The same-source native-produced N1 passes all eight depth controls. Measured
+  selected recursion retains 134,496 bytes per source-call cycle, compared with 157,600 bytes
+  in the earlier `45e253dd` N0. The evaluator now directly partitions its existing Call,
+  Prefix and Infix cases from the other admitted payloads before effectful dispatch. Callable
+  contract preparation and static-condition/selected-arm checking extract their exact admitted
+  HIR payloads with pure helpers before the existing effectful checks. Branch bodies, call
+  recognition priority, step charging, authored node/span reads, rejection sites and configured
+  depth remain unchanged; no new runtime or static form is admitted.
+- **Ordinary control storage experiment:** the authored bootstrap-produced N0 for public
+  `04652e25` passes seven of the eight normal-stack depth controls. Selected and non-tail
+  recursion of eighty return the exact `SEM0180` refusal span, while selected recursion
+  nested inside an ordinary `if` still terminates with `SIGSEGV`. The local E4-bootstrap-produced
+  N0 from private `61993ade` compiled successfully but retained that same crash. Pure ordinary
+  conditional/block payload extraction increased its measured block prologue from 1,608 to
+  2,328 bytes and ordinary conditional prologue from 2,216 to 3,192 bytes. That failed storage
+  experiment is removed: the original direct authored-node paths and checking bodies remain.
+- **Static prefix preparation storage:** the authored public `55a5655a` N0 passes seven of
+  the eight normal-stack depth controls but still crashes on `selectedNestedOrdinary80`
+  with the ordinary 8 MiB stack and configured depth of 64. Separating semantic prefix
+  preparation reduced the measured recursive period by 3,008 bytes, from 130,704 to
+  127,696 bytes, but did not retire that signal. Prefix preparation completes before
+  evaluator construction; its original owned application, checkpoint, argument bindings,
+  completed prefix and source-answer handle stay live across execution and retries.
+- **Evaluator prefix replay storage:** the actual authored `55a5655a` N0 reserves 8,984
+  bytes, excluding 48 saved-register bytes, in `StaticExecution.evaluatePrefix` across
+  the final recursive expression. Ordered source observation, cursor installation, checked
+  range setup, supplied bindings and completed-prefix replay now finish in one preparer.
+  Its original copied root module and resulting local vector remain owned through final
+  expression evaluation, in their original declaration order. No machine or port borrow
+  escapes preparation. Replay branches, authored reads, source checks, effects, mutation,
+  cleanup, rejection spans and budgets retain their original order. Fresh production and
+  depth verification must establish whether this additional split reduces actual storage.
+- **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
+  `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
+  reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
+  five required corpus programs and eleven authored examples pass. The corpus preserves its
+  exact results: template-formatting, logging-composition and format-options return 42;
+  json-reflect and language-pressure-stack-vm return 0. Logging and format-options match their
+  exact stdout. StackVM's authored example also returns 0.
+- **Evidence boundaries:** these runtime results were obtained from the private native-produced N1
+  identified above. Authored N0 and subsequent N1 builds are distinct artifacts. No historical
+  failure is counted as an accepted failure or removed from the required programs.
 
 ### Module static selection subset in selfhost
 
@@ -1742,8 +1931,8 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 ### Finite scalar StaticSequence iteration in the native frontend
 
 - **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
-- **Native subset:** focused locally verified on 2026-10-07. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or stored member types.
-- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; reflected collections, nested static-for, generated closures/Effects, authored return/fail/break/continue inside iterations and newly generated loans remain unsupported. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
+- **Native subset:** focused locally verified on 2026-10-07. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or runtime stored member types; static aggregate fields retain them as described above.
+- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; callable literals, authored effect-block expressions, authored return/fail/break/continue inside mixed iterations and loans rooted in newly generated iteration storage remain unsupported. Ordinary outside-storage borrows and immediate Effect/service calls traverse typing and the scoped environment checks described by the later control entry. Reflected collections, authenticated field projections, and nested iteration support are tracked by the control and reflection entries above. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
 - **Evidence:** the pre-repair optimized native reduction rejected the whole static-for as typed-form; the no-loop phase control rejected the sealed sequence type as core-type. The focused existing-actor run passed five tests in 50 ms, including distinct iteration locals, exact selected callee/MIR arguments, empty-body non-elaboration, borrowed outside storage and exact refusal codes/spans. Its timing gate passed; production pinned-bootstrap checking also passed. After integrating canonical finite lifetime meets, the same five focused tests passed in 8 ms on 2026-10-08. Sealed static sequences participate in the complete numbering transaction, including retained types and charged child traversal. This entry claims no optimized N0, SHA2 lowering, gap removal, N1 artifact or smoke success.
 
 ### Selfhost preserves unchanged inexact capture-loop availability
