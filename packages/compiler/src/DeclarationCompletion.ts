@@ -3,6 +3,7 @@ import * as ForeignContract from './ForeignContract.js'
 import * as CAbi from './CAbi.js'
 import * as CLayout from './CLayout.js'
 import * as ConformanceHead from './ConformanceHead.js'
+import * as Constraint from './Constraint.js'
 import { copyAssumptions, copyProof } from './ConformanceProof.js'
 import type {
   ConformanceFact,
@@ -55,6 +56,7 @@ import {
   semanticConstraints,
   stronglyConnected,
   unpromisedWitnessBound,
+  unpromisedWitnessConstraint,
   witnessBinding,
 } from './DeclarationResolution.js'
 import * as Diagnostic from './Diagnostic.js'
@@ -845,9 +847,19 @@ export const complete = (
         diagnostics.push(...resolved.diagnostics)
         return { ...requirement, capability: resolved.fact }
       })
+      const headConstraints = resolveConstraintFacts(
+        spanOf,
+        module.module,
+        conformance.constraints,
+        resolvers,
+        headers,
+      )
+      diagnostics.push(...headConstraints.diagnostics)
       return {
         ...conformance,
         requirements: requirements,
+        constraints: headConstraints.facts,
+        constraintContracts: semanticConstraints(spanOf, headConstraints.facts),
         capability: capability.fact,
         provider: provider.fact,
         ...(hook === undefined ? {} : { hook }),
@@ -1666,6 +1678,33 @@ export const complete = (
               diagnostics.push(
                 invalidDiagnostic(
                   `${target.spelling} requires ${unpromisedBound.bound.spelling} for ${unpromisedBound.binder.type.name}, which ${capability.name} for ${Type.encode(provider)} does not require`,
+                  Location.at(mapping.anchor),
+                ),
+              )
+              continue
+            }
+            // Its `where` constraints follow the same rule: each must be a premise of the header or
+            // of the implemented operation, read over the header's own binders.
+            const operationSubstitution = TypeInference.substitution(
+              [
+                sourceContract.self,
+                ...sourceContract.typeParameters.map((parameter) => parameter.type),
+              ],
+              [provider, ...capability.arguments],
+            )
+            const unpromisedConstraint =
+              operationSubstitution === undefined || mapping.contract === undefined
+                ? undefined
+                : unpromisedWitnessConstraint(implementation, inference.substitution, [
+                    ...conformance.constraintContracts,
+                    ...mapping.contract.declaration.constraintContracts.map((constraint) =>
+                      Constraint.substitute(constraint, operationSubstitution),
+                    ),
+                  ])
+            if (unpromisedConstraint !== undefined) {
+              diagnostics.push(
+                invalidDiagnostic(
+                  `${target.spelling} requires a where constraint on ${unpromisedConstraint._tag === 'ProviderSelectionConstraint' ? Type.encode(unpromisedConstraint.provider) : 'its rows'}, which ${capability.name} for ${Type.encode(provider)} does not require`,
                   Location.at(mapping.anchor),
                 ),
               )

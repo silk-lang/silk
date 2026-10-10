@@ -599,6 +599,7 @@ export type DeclarationHeader =
             readonly generics: ReadonlyArray<GenericParameter>
             readonly subject: Type
             readonly target: Type | undefined
+            readonly constraints: ReadonlyArray<Constraint>
           }
         | { readonly _tag: 'MissingDeclarationHeader'; readonly causes: RecoveryCauses }
         | {
@@ -890,7 +891,7 @@ export const fields = freezeFieldRegistry({
   ConditionalHeader: [...nodeFields, 'condition'],
   GroupHeader: [...nodeFields, 'branch'],
   ModulePropertyHeader: [...nodeFields, 'properties'],
-  ImplHeader: [...nodeFields, 'generics', 'subject', 'target'],
+  ImplHeader: [...nodeFields, 'generics', 'subject', 'target', 'constraints'],
   MissingDeclarationHeader: nodeFields,
   InvalidDeclarationHeader: [...nodeFields, 'retained'],
   FunctionHeader: [...namedFields, 'contract', 'linkage', 'properties'],

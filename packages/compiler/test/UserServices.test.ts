@@ -194,6 +194,55 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
+it.effect('admits a witness provides constraint only when its header promises it', () =>
+  Effect.gen(function* () {
+    const source = (head: string) => `service Source { effect fn get() -> i32 ? &Source }
+service Port { effect fn value() -> i32 ? &mut Port }
+struct Wrap<P> { provider: P }
+impl<P> Wrap<P> {
+  effect fn read(self: &mut Self) -> i32 where &mut P provides &Source from &mut Source {
+    return 42
+  }
+}
+impl<P> Port for Wrap<P>${head} { value: Wrap.read }
+pub fn main() -> i32 { return 0 }`
+    const promised = yield* snapshot(source(' where &mut P provides &Source from &mut Source'))
+    const unpromised = yield* snapshot(source(''))
+    const invalid = Analysis.diagnostics(unpromised).filter(
+      (diagnostic) => diagnostic.code === 'SEM0083',
+    )
+    assert.deepEqual(Analysis.diagnostics(promised), [])
+    assert.strictEqual(invalid.length, 1)
+    assert.include(invalid.at(0)?.message ?? '', 'requires a where constraint on P')
+    const inline = yield* snapshot(`service Source { effect fn get() -> i32 ? &Source }
+service Port { effect fn value() -> i32 ? &mut Port }
+struct Wrap<P> { provider: P }
+impl<P> Wrap<P> {
+  effect fn read(self: &mut Self) -> i32 where &mut P provides &Source from &mut Source {
+    return 42
+  }
+}
+impl<P> Port for Wrap<P> where &mut P provides &Source from &mut Source {
+  effect fn value(self: &mut Self) -> i32 { return run Wrap.read(move self) }
+}
+pub fn main() -> i32 { return 0 }`)
+    assert.deepEqual(Analysis.diagnostics(inline), [])
+  }),
+)
+
+it.effect('rejects a where clause on an inherent implementation head', () =>
+  Effect.gen(function* () {
+    const self = yield* snapshot(`service Source { effect fn get() -> i32 ? &Source }
+struct Wrap<P> { provider: P }
+impl<P> Wrap<P> where &mut P provides &Source from &mut Source {}
+pub fn main() -> i32 { return 0 }`)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => diagnostic.code),
+      ['SEM0194'],
+    )
+  }),
+)
+
 it.effect('accepts failure and requirement rows promised by a generic service header', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`interface Marker<T> { fn mark(value: T) -> i32 }
