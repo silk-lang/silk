@@ -1755,3 +1755,20 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 - **Definition:** LIFE-004 now distinguishes marked `for<use 'call>` invocation extents from independently quantified data lifetimes and retained capture environments. Input validity covers returned-computation execution, suspension, cancellation and cleanup; retained computations cannot escape those loans. `Effect.result` gains no retained-error bound.
 - **Bootstrap:** implementation active. `Effect.result` retains its unrestricted error contract. The two selected borrowed-recovery native corpus cases pass their exact synchronous cleanup and park/resume/cancel traces (`7231` and `75842175421`, both returning `42`). Source-owned executable input views preserve the actual closure and independently authenticate the original caller domain and complete invocation inputs. Immutable stored Identifier, ordinary staged and anonymous adaptation retain independently held original producer/input provenance. The four selected stored/staged borrowed-recovery variants also pass; these focused runtime passes do not establish the complete feature, native lifetime safety or N1.
 - **Native:** marker parsed, represented and checked. The parser accepts the contextual `use` only in a callable's outer `for` list; HIR lowering records it on the lifetime parameter, and `Type.Callable` carries the marked binder's canonical ordinal as contract identity (an unused marker vanishes with its binder). A second marker or authored bounds on the marked binder reject as `InvalidLifetime`. Opening a marked contract at a call adds `input: 'call` obligations for every opened input; a contextually checked callback and a callable compared against a marked promise receive the same conditions as premises, and a marked source requires a marked target at the same binder. Effect, `Effect.result` and the `'call & 'env` meets use the existing canonical-meet machinery. Executable input views, stored/staged adaptation provenance and the bootstrap's runtime recovery traces remain unimplemented natively. Strict census on the merged change: HP 42 to 33, UnknownMember 17 to 4 (`effect.silk` resolves again); the remaining `useReleaseNonParking` callers keep their pre-sync refusals. Integrated CI and N1 remain unproved.
+
+
+### Native sealed provision selectors infer one compatible key
+
+SERV-007 also applies to `Intrinsic.bindRequirement`, `Intrinsic.bindRequirementMut` and
+`Intrinsic.bindRequirementOwned`: an omitted selector selects the unique service-role key that
+matches the provider and its capture access in the complete input requirement row. Explicit
+selectors retain their existing cardinality, conformance and access checks. Only the selected key
+is subtracted, and the exact composite stores that key for specialized MIR preparation.
+
+The native frontend previously rejected these calls before operand checking with `TypeArity`;
+the bootstrap already infers their selectors. The native implementation now uses the same
+`selectProvided` proof as ordinary `provides` bounds. Ambiguous keys, absent conformance and
+insufficient capture access keep their typed rejections. The structured claim is
+`intrinsicProvisionInfersOneKeyAndKeepsResidualRequirements` in
+`compiler/src/semantic/SemanticLoweringCases.silk`; the file-system example exercises nested
+inferred exclusive bindings for independent filesystem and allocator providers.
