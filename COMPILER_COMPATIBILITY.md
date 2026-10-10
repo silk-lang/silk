@@ -2032,3 +2032,9 @@ inferred exclusive bindings for independent filesystem and allocator providers.
   checks remain intact; the bootstrap rejects nested anonymous callable bodies with SEM0199.
   Lifetime.Meet payloads are private: fixture inspection uses the public atomCount/atomAt
   interface, retains the explicit Meet shape check, and never widens payload visibility.
+
+### Selected static helper applications retain generic identity
+
+- **Rule:** STATIC-012 reuses equal target, generic arguments, evidence and canonical static arguments. Distinct generic arguments retain distinct checked helper applications even when their current scalar results happen to agree.
+- **Coordinator fixture:** `selectedBodiesRouteStaticWorkAndEmbedValues` demands `scaled<i32>` and `scaled<bool>`, each calling `tagged<T>`. It checks one selected caller and one checked helper body for each distinct application, both exact embedded results of 42, and no new body demands when either equal application is repeated. Abstract-body rejection, other selected shapes, selected caller reuse and MIR's absence of runtime static-helper references remain checked.
+- **Evidence:** canonical selfhost 522d020d CI executed 69 of 70 static cases successfully; the single failure expected the bool application to reuse the i32 helper's checked body. An unchanged-actor C7 diagnostic reproduced that exact assertion failure with stable full source inputs. This fixture change preserves the compiler implementation and does not implement per-declaration invalidation in #1359.
