@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -163,16 +163,6 @@ export const parseBuildDiagnostics = (
   return diagnostics
 }
 
-const unsupportedFixture = (program: CorpusProgram): ReadonlyArray<Gap> => {
-  const gaps: Gap[] = []
-  if (program.nativeComponents !== undefined)
-    gaps.push({
-      code: 'CORPUS_COMPONENT_INPUT',
-      reason: 'the build CLI cannot supply native runtime components yet',
-    })
-  return gaps
-}
-
 const safeName = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 
 /** The C driver the self-hosted compiler links with when `SILKC_CLANG` names none. */
@@ -206,20 +196,79 @@ const nativeLinkInputs = (
   return [...objects, ...libraries]
 }
 
+interface CatalogRuntime {
+  readonly targets: ReadonlyArray<string>
+  readonly libc: string
+  readonly name: string
+  readonly module: string
+}
+
+// The native host the harness builds for, with the libc its catalog runtime is keyed by.
+const hostTargets: Readonly<Record<string, { readonly target: string; readonly libc: string }>> = {
+  'linux-x64': { target: 'x86_64-unknown-linux-gnu', libc: 'gnu' },
+  'linux-arm64': { target: 'aarch64-unknown-linux-gnu', libc: 'gnu' },
+  'darwin-arm64': { target: 'aarch64-apple-darwin', libc: 'system' },
+}
+
+const toml = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(toml).join(', ')}]`
+  if (typeof value === 'object' && value !== null) {
+    const fields = Object.entries(value).map(([key, field]) => `${key} = ${toml(field)}`)
+    return `{ ${fields.join(', ')} }`
+  }
+  return JSON.stringify(value)
+}
+
+/**
+ * The `[build].composition` the bootstrap acceptance harness compiles with: the standard library's
+ * default runtime for the host, as `ArtifactComposition.defaults` selects it, with the program's
+ * runtime components replacing the catalog's.
+ */
+const componentComposition = (program: CorpusProgram, stdlib: string): string | undefined => {
+  if (program.nativeComponents === undefined) return undefined
+  const host = hostTargets[`${process.platform}-${process.arch}`]
+  if (host === undefined)
+    throw new Error(`no native corpus target for ${process.platform}-${process.arch}`)
+  const catalog = JSON.parse(readFileSync(join(stdlib, 'compositions.json'), 'utf8')) as {
+    readonly runtimes: ReadonlyArray<CatalogRuntime>
+  }
+  const runtime = catalog.runtimes.find(
+    (candidate) => candidate.targets.includes(host.target) && candidate.libc === host.libc,
+  )
+  if (runtime === undefined) throw new Error(`no catalog runtime for ${host.target}`)
+  return toml({
+    runtimes: [{ name: runtime.name, module: runtime.module }],
+    defaults: [runtime.name],
+    retention: [],
+    requirements: [],
+    components: program.nativeComponents,
+  })
+}
+
 // The program is the module `memory/driver`, the root the bootstrap harness compiles, so reported
 // identities and labels name the same module under both compilers. The manifest's root keeps the
 // package directory as the module directory, where the program's imports resolve.
 const programModule = 'memory/driver.silk'
 
-const writeProgram = (directory: string, program: CorpusProgram, cCompiler: string): void => {
+const writeProgram = (
+  directory: string,
+  program: CorpusProgram,
+  cCompiler: string,
+  stdlib: string,
+): void => {
   const source = join(directory, programModule)
   mkdirSync(dirname(source), { recursive: true })
   writeFileSync(source, program.nativeSource ?? program.source)
   const linkInputs = nativeLinkInputs(directory, program, cCompiler)
+  const composition = componentComposition(program, stdlib)
+  const build = [
+    ...(linkInputs.length === 0 ? [] : [`native-link-inputs = [${linkInputs.join(', ')}]`]),
+    ...(composition === undefined ? [] : [`composition = ${composition}`]),
+  ]
   writeFileSync(
     join(directory, 'silk.toml'),
     `[package]\nname = "corpus"\nroot = "main.silk"\n${
-      linkInputs.length === 0 ? '' : `\n[build]\nnative-link-inputs = [${linkInputs.join(', ')}]\n`
+      build.length === 0 ? '' : `\n[build]\n${build.join('\n')}\n`
     }`,
   )
   for (const [module, contents] of Object.entries(program.nativeImports ?? {})) {
@@ -280,13 +329,9 @@ export const runCase = (
   stdlib = fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
   cCompiler = defaultCCompiler,
 ): CaseResult => {
-  const fixtureGaps = unsupportedFixture(program)
-  if (fixtureGaps.length > 0)
-    return { name: program.name, status: 'unsupported', gaps: fixtureGaps }
-
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
   try {
-    writeProgram(directory, program, cCompiler)
+    writeProgram(directory, program, cCompiler, stdlib)
     const executable = join(directory, 'program')
     const profiles = program.nativeProfiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
