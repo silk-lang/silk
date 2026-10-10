@@ -1837,3 +1837,7 @@ inferred exclusive bindings for independent filesystem and allocator providers.
 - **Compilers:** checked-prefix replay now updates a static condition after preceding assignments, ordinary branches and complete loops, including nested static arms and finite static iterations. Static control contained inside ordinary control still selects its arm while analyzing the deferred body, before that execution's local replacements occur. Evaluation retains the checked selection and rejects a condition that changes at execution; it does not elaborate the inactive arm. This entry does not claim native static-control coverage.
 - **Evidence:** a static function starts `count = 0`, `total = 0`, repeats twice, increments `count`, and uses `static if count == 1` to add 20, otherwise 22. Its required result is 42; the earlier bootstrap returned 44. The selection-consistency check now rejects this form with SEM0176 at the changed condition. Invariant loop selections remain accepted. The checked-prefix repair's separate positive controls and bounded-evaluation negative remain passing.
 - **Source migration:** none; the bootstrap compiler must repair per-iteration static selection. The bootstrap static-control task owns complete per-iteration selection.
+
+- **Coordinator fixtures:** the selected Effect environment-meet inspection uses named
+  helpers between Shared views. Its exact two declaration regions and original representation
+  checks remain intact; the bootstrap rejects nested anonymous callable bodies with SEM0199.
