@@ -39,7 +39,7 @@ pub fn main() -> i32 {
 /** Backing owners share ordinary local evaluation, cleanup, and cancellation paths. */
 export const borrowedTemporaryLifecycle = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.execution { Execution }
+import silk.execution { Execution, Wake }
 unsafe extern "C" fn silk_record_event(value: i32) -> ()
 unsafe extern "C" fn silk_finish_events() -> i32
 struct Token { value: i32 }
@@ -124,8 +124,8 @@ effect fn loopFailure() -> () ! Failed {
 effect fn recoverLoop(error: Failed) -> () { return () }
 struct Endpoint {}
 fn ready(endpoint: &Endpoint) -> () { return () }
-struct Guard { wake: Intrinsic.Wake }
-fn register(wake: Intrinsic.Wake) -> Guard { return Guard { wake: move wake } }
+struct Guard { wake: Wake }
+fn register(wake: Wake) -> Guard { return Guard { wake: move wake } }
 effect fn parked() -> i32 {
   let holder = Holder.make(before(), &[make(5)])
   run Execution.park(register)

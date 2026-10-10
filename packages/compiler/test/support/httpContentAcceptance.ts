@@ -5,7 +5,7 @@ import silk.buffered_input {BufferError}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.http {Header, LimitKind, Method, ValueComponent, ValueError, ValueReason}
 import silk.http_body {
   Anomaly,
@@ -64,7 +64,7 @@ struct CancellationState { ownerDrops: usize auditEntries: usize closeAttempts: 
 
 struct CancellationOwner { source: MemoryByteDuplex state: Shared<CancellationState> }
 
-struct CancellationParkGuard { wake: Intrinsic.Wake }
+struct CancellationParkGuard { wake: Wake }
 
 struct CallbackFailure { code: i32 }
 
@@ -107,7 +107,7 @@ fn cancellationCode(state: &CancellationState) -> i32 {
   return 0
 }
 
-fn retainCancellationWake(wake: Intrinsic.Wake) -> CancellationParkGuard {
+fn retainCancellationWake(wake: Wake) -> CancellationParkGuard {
   return CancellationParkGuard {wake: move wake}
 }
 

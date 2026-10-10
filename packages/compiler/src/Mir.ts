@@ -740,35 +740,65 @@ export type Operation =
       readonly provenance: Provenance
     }
   | {
-      /** Publishes one Initial package exactly once and invokes its fixed readiness endpoint. */
-      readonly _tag: 'ExecutionNotifyInitial'
+      /** Saves the running frame chain and returns the current drive through its suspension callback. */
+      readonly _tag: 'ExecutionRelinquish'
+      readonly destination: LocalId
+      readonly type: Extract<Type, { readonly _tag: 'Nominal' }>
+      readonly provenance: Provenance
+    }
+  | {
+      /** Takes one counted package authority over the Running execution. */
+      readonly _tag: 'ExecutionCurrent'
+      readonly destination: LocalId
+      readonly type: Extract<Type, { readonly _tag: 'Nominal' }>
+      readonly provenance: Provenance
+    }
+  | {
+      /** Takes one counted package authority over a borrowed execution handle. */
+      readonly _tag: 'ExecutionRefOf'
       readonly destination: LocalId
       readonly execution: LocalId
-      readonly executionAccess: 'Exclusive'
+      readonly executionAccess: 'Shared'
       readonly type: Extract<Type, { readonly _tag: 'Nominal' }>
       readonly provenance: Provenance
     }
   | {
-      /** Consumes the generation's sole affine Wake readiness authority. */
-      readonly _tag: 'ExecutionWake'
+      /** Reads one source-owned package control word. */
+      readonly _tag: 'ExecutionLoad'
       readonly destination: LocalId
-      readonly wake: LocalId
-      readonly wakeAccess: 'Take'
+      readonly reference: LocalId
+      readonly word: LocalId
+      readonly referenceAccess: 'Shared'
+      readonly type: Extract<Type, { readonly _tag: 'usize' }>
+      readonly provenance: Provenance
+    }
+  | {
+      /** Writes one source-owned package control word. */
+      readonly _tag: 'ExecutionStore'
+      readonly destination: LocalId
+      readonly reference: LocalId
+      readonly word: LocalId
+      readonly value: LocalId
+      readonly referenceAccess: 'Shared'
       readonly type: Extract<Type, { readonly _tag: 'Nominal' }>
       readonly provenance: Provenance
     }
   | {
-      /** Registers one Wake and retains the returned guard before relinquishing this execution. */
-      readonly _tag: 'ExecutionPark'
+      /** Synchronously invokes the package's fixed readiness endpoint. */
+      readonly _tag: 'ExecutionNotify'
       readonly destination: LocalId
-      /** Private guard slot retained by the execution-owned suspension state. */
-      readonly guard: LocalId
-      readonly register: LocalId
-      readonly registerAccess: 'Take'
-      readonly guardCleanup: CleanupPlan.CleanupPlan
-      readonly registerCleanup: CleanupPlan.CleanupPlan
-      readonly registrationTypeArguments: ReadonlyArray<SilkType.GenericArgument>
+      readonly reference: LocalId
+      readonly referenceAccess: 'Shared'
       readonly type: Extract<Type, { readonly _tag: 'Nominal' }>
+      readonly provenance: Provenance
+    }
+  | {
+      /** Reports whether the package's Execution handle still exists. */
+      readonly _tag: 'ExecutionLive'
+      readonly destination: LocalId
+      readonly reference: LocalId
+      readonly referenceAccess: 'Shared'
+      readonly type: Extract<Type, { readonly _tag: 'bool' }>
       readonly provenance: Provenance
     }
   | {
