@@ -37860,8 +37860,10 @@ effect fn invokeCallableValue<'scope>(
 // operands become the target's arguments in parameter order, with the target's channels and
 // the run access and regions those stored arguments decide, as a written construction's. A
 // generic section selects its target application from the operands exactly as lowering selects
-// the one a run calls. Absent for an anonymous target, an abstract representation, or a section
-// whose application its operands do not yet select: only an immediate `run` executes those.
+// the one a run calls. An anonymous target stores the invoked value as its environment input, as
+// staging it does: by value when the invocation consumes it, else as the invocation's loan.
+// Absent for an abstract representation or a section whose application its operands do not yet
+// select: only an immediate `run` executes those.
 effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, caller: &DeclarationId, callee: &Shared<Type>,
   nodes: &[BodyNode], operands: &[BodyNodeId], premises: &[Constraint], constraints: &[Constraint],
@@ -37871,17 +37873,37 @@ effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, A
   let mut application = Option.none<Shared<Application>>()
   let mut stored = Vector.make<Shared<Type>>()
   let mut inputs = Vector.make<CallableFieldInput>()
+  let mut promised = Option.none<EffectChannels>()
   match move run Type.copy(callee) {
-    Type.CallableValue {isPublic: visible, application: selected, captures, fieldInputs, ..} => {
-      let named = Shared.with<Application, bool>(&selected, fn(value: &Application) -> bool {
-        let kind = DeclarationId.kind(Application.bodyDeclaration(value))
-        return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock
+    Type.CallableValue {isPublic: visible, application: selected, contract: used, captures, fieldInputs, ..} => {
+      let invoked = Shared.with<Type, Option<Shared<Type>>>(&used, callableResult)
+      if let Option<Shared<Type>>.Some {value: result} = move invoked {
+        promised = Shared.with<Type, Option<EffectChannels>>(&result, effectChannels)
+      }
+      let kind = Shared.with<Application, OwnerKind>(&selected, fn(value: &Application) -> OwnerKind {
+        return DeclarationId.kind(Application.bodyDeclaration(value))
       })
-      if !named { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
       isPublic = visible
-      application = Option.some<Shared<Application>>(move selected)
       stored = move captures
       inputs = move fieldInputs
+      let literal = kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
+      if literal && Vector.length<CallableFieldInput>(&inputs) == usize.ZERO {
+        // The invocation consumes a once callee, so the Effect owns it; otherwise the Effect holds
+        // the invocation's loan of it, whose access its own run access follows (EFFECT-OWN-002).
+        let invocation = Shared.with<Type, CallableMode>(&used, callableInvocationMode)
+        let mut environment = Shared.clone<Type>(callee)
+        if invocation != CallableMode.Once {
+          let mut access = Access.Shared
+          if invocation == CallableMode.Mutable { access = Access.Mutable }
+          environment = run Shared.make<Type>(Type.Reference {referent: Shared.clone<Type>(callee), access: access,
+            lifetime: run Shared.make<Lifetime>(Lifetime.Local {declaration: run DeclarationId.copy(caller), ordinal: site})})
+        }
+        // The literal's captures are its own environment's fields, which the stored value holds.
+        stored = Vector.make<Shared<Type>>()
+        run Vector.append<Shared<Type>>(&mut stored, move environment)
+        run Vector.append<CallableFieldInput>(&mut inputs, CallableFieldInput.Environment)
+      }
+      application = Option.some<Shared<Application>>(move selected)
     }
     Type.CallableSchema {schema, captures, fieldInputs, ..} => {
       let mut supplied = Vector.make<Shared<Type>>()
@@ -37915,29 +37937,53 @@ effect fn invokedConstruction(resolver: &mut Resolver, owner: &mut Query<Word, A
     Option<Shared<Application>>.Some {value} => value
     Option<Shared<Application>>.None => { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
   }
-  let channels = match move run applicationChannels(&mut resolver.*, &mut owner.*, &mut dependencies.*, &target) {
+  // An anonymous target has no declaration signature; its value's contract promises the channels.
+  let anonymous = Shared.with<Application, bool>(&target, fn(value: &Application) -> bool {
+    let kind = DeclarationId.kind(Application.bodyDeclaration(value))
+    return kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
+  })
+  let mut resolved = Option.none<EffectChannels>()
+  if anonymous { resolved = move promised } else { resolved = run applicationChannels(&mut resolver.*, &mut owner.*, &mut dependencies.*, &target) }
+  let channels = match move resolved {
     Option<EffectChannels>.Some {value} => value
     Option<EffectChannels>.None => { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
   }
   let fields = Vector.asSlice<Shared<Type>>(&stored)
   let slots = Vector.asSlice<CallableFieldInput>(&inputs)
   let mut arguments = Vector.make<StoredArgument>()
-  let count = operands.length + slots.length
+  // An original anonymous environment comes first, as the invocation passes it.
+  let mut environment = usize.ZERO
+  while environment < slots.length {
+    let original = match slots[environment] { CallableFieldInput.Environment => true _ => false }
+    if original {
+      // A stored loan is held, not moved: an exclusive one makes the Effect's run exclusive.
+      let held = Shared.with<Type, bool>(&fields[environment], fn(value: &Type) -> bool {
+        return match &value.* { Type.Reference {..} => true _ => false }
+      })
+      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[environment]), moved: !held,
+        input: CallableFieldInput.Environment})
+    }
+    environment = environment + usize.ONE
+  }
+  let mut hidden = usize.ZERO
+  if Vector.length<StoredArgument>(&arguments) != usize.ZERO { hidden = usize.ONE }
+  let count = operands.length + slots.length - hidden
   let mut parameter = usize.ZERO
   while parameter < count {
     if parameter < operands.length {
       match move bodyExpressionType(nodes, &operands[parameter]) {
         Option<Shared<Type>>.Some {value} => {
-          run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: move value, moved: movedBodyValue(nodes, operands[parameter])})
+          run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: move value, moved: movedBodyValue(nodes, operands[parameter]),
+            input: CallableFieldInput.Argument {parameter: parameter}})
         }
         Option<Shared<Type>>.None => { return Result.failResult<Option<Shared<Type>>, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
       }
     } else {
       let mut slot = usize.ZERO
       while slot < slots.length && !callableInputParameter(&slots[slot], parameter) { slot = slot + usize.ONE }
-      // A stored original environment is not an ordinary target argument.
       if slot == slots.length { return Result.succeed<Option<Shared<Type>>, Shared<Rejection>>(Option.none<Shared<Type>>()) }
-      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[slot]), moved: false})
+      run Vector.append<StoredArgument>(&mut arguments, StoredArgument {ty: Shared.clone<Type>(&fields[slot]), moved: false,
+        input: CallableFieldInput.Argument {parameter: parameter}})
     }
     parameter = parameter + usize.ONE
   }
@@ -39569,7 +39615,8 @@ effect fn constructEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answe
       Option<Shared<Type>>.Some {value} => move value
       _ => { return Result.failResult<EffectConstruction, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
     }
-    run Vector.append<StoredArgument>(&mut stored, StoredArgument {ty: move ty, moved: movedBodyValue(nodes, arguments[at])})
+    run Vector.append<StoredArgument>(&mut stored, StoredArgument {ty: move ty, moved: movedBodyValue(nodes, arguments[at]),
+      input: CallableFieldInput.Argument {parameter: at}})
     at = at + usize.ONE
   }
   return run storedEffect(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
@@ -39580,6 +39627,7 @@ effect fn constructEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answe
 struct StoredArgument {
   ty: Shared<Type>
   moved: bool
+  input: CallableFieldInput
 }
 
 // The exact Effect contract over the target arguments a construction stores in parameter order:
@@ -39614,7 +39662,7 @@ effect fn storedEffect(resolver: &mut Resolver, owner: &mut Query<Word, Answer, 
       return Result.failResult<EffectConstruction, Shared<Rejection>>(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
     }
     run Vector.append<Shared<Type>>(&mut captures, move ty)
-    run Vector.append<CallableFieldInput>(&mut fieldInputs, CallableFieldInput.Argument {parameter: at})
+    run Vector.append<CallableFieldInput>(&mut fieldInputs, arguments[at].input)
     at = at + usize.ONE
   }
   let contract = run Shared.make<Type>(Type.Effect {mode: mode,
@@ -48694,7 +48742,8 @@ effect fn sectionCallableCall(resolver: &mut Resolver, owner: &mut Query<Word, A
   let mut operands = Vector.make<MirCallOperand>()
   let mut environment = Option.none<MirStoredEnvironment>()
   if environmentField != usize.MAX {
-    if DeclarationId.kind(Application.bodyDeclaration(&application)) != OwnerKind.Anonymous {
+    let original = DeclarationId.kind(Application.bodyDeclaration(&application))
+    if original != OwnerKind.Anonymous && original != OwnerKind.EffectBlock {
       return Result.failResult<MirCallTarget, PreparationFailure>(PreparationFailure.Coverage {code: GapCode.WitnessOperand})
     }
     let actual = Shared.clone<Type>(&fields[environmentField])
