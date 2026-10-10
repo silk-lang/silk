@@ -2326,6 +2326,61 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('rejects static selections that change inside ordinary control', () =>
+  Effect.gen(function* () {
+    for (const condition of ['count == 1', 'count < 2']) {
+      const source = `static fn sum() -> i32 {
+  let mut count = 0
+  let mut total = 0
+  while count < 2 {
+    count = count + 1
+    static if ${condition} { total = total + 20 } else { total = total + 22 }
+  }
+  return total
+}
+pub fn main() -> i32 { return sum() }`
+      const snapshot = yield* AnalysisFixture.retainingMain(
+        'static/changed-loop-selection',
+        encoder.encode(source),
+        Target.x8664UnknownLinuxGnu.id,
+      )
+      assert.isTrue(
+        Analysis.diagnostics(snapshot).some(
+          (diagnostic) =>
+            diagnostic.code === 'SEM0176' &&
+            diagnostic.message.includes('changing a checked static selection') &&
+            diagnostic.span.start === source.indexOf(`static if ${condition}`) + 10,
+        ),
+      )
+    }
+  }),
+)
+
+it.effect('retains invariant static selections inside ordinary loops', () =>
+  Effect.gen(function* () {
+    const source = `static fn sum(input: bool) -> i32 {
+  let mut count = 0
+  let mut total = 0
+  while count < 2 {
+    count = count + 1
+    static if input { total = total + 21 } else { total = total + 20 }
+    static if true {} else { missingInactiveArm() }
+  }
+  return total
+}
+pub fn main() -> i32 {
+  static if sum(true) == 42 && sum(false) == 40 { return 42 }
+  else { compileError("invariant loop selection changed") }
+}`
+    const snapshot = yield* AnalysisFixture.retainingMain(
+      'static/invariant-loop-selection',
+      encoder.encode(source),
+      Target.x8664UnknownLinuxGnu.id,
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+  }),
+)
+
 it.effect('bounds evaluator work before selecting static control', () =>
   Effect.gen(function* () {
     const source = `static fn stalled() -> i32 {
