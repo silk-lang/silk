@@ -1803,6 +1803,9 @@ inferred exclusive bindings for independent filesystem and allocator providers.
   arguments inside service and role keys before closed requirement-row equality is decided. The
   comparison opens only its selected implementation and call owners; foreign seeds remain rigid,
   and key normalization preserves access and role identity.
+  Selected-head evidence is closed through its acyclic assignments before adoption. Rigid caller
+  type, row and lifetime parameters are valid evidence; a remaining implementation or call slot
+  remains unresolved.
 - **Compilers:** the bootstrap already substitutes these arguments. Native row unification now uses
   the same established-assignment comparison view as union unification, so a selected
   `Provider<never, never>` head containing `&mut Selected<P, R>` compares with
