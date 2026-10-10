@@ -1,0 +1,338 @@
+//! Effective package defaults, final-map validation, and failed-request isolation.
+
+import lexer.Span { Span }
+import semantic.DeclarationId { DeclarationId }
+import semantic.FinalProfile { FinalProfile }
+import semantic.InitialProfile { InitialProfile, Input, Problem as InputProblem }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ProfileAssembly { AssemblyProblem, assemble }
+import semantic.ProfileBinding { Input as BindingInput, Provenance, Supplied, Tier }
+import semantic.ProfileShape { Problem as ShapeProblem, Registered, registered }
+import semantic.Query { Cycle }
+import semantic.Rejection { Rejection, RejectionCode }
+import semantic.Semantic {
+  Answer,
+  ConflictingPackageSource,
+  Outcome,
+  RegistrationClosed,
+  Request,
+  Semantic,
+  Value
+}
+import semantic.SourceIndex { NoRejection, RevisionMismatch }
+import semantic.SourceRevision { Revision }
+import semantic.StaticValue { Value as StaticData }
+import semantic.Target { Id as TargetId, Target }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import silk.shared { Shared }
+import silk.string { String }
+import silk.testing { AssertionError, Testing }
+import silk.u64
+import silk.usize
+import silk.vector { Vector }
+
+fn parameterIs(profile: &FinalProfile, name: &[u8], expected: u64) -> bool {
+  let entries = FinalProfile.entries(profile)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if DeclarationId.named(&entries[at].declaration, name) {
+      return Shared.with<StaticData, bool>(
+        &entries[at].value,
+        fn(value: &StaticData) -> bool {
+          return match &value.* {
+            StaticData.Integer { magnitude, .. } => magnitude == expected
+            _ => false
+          }
+        }
+      )
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn assemblyRejected(result: &Result<FinalProfile, AssemblyProblem>, code: RejectionCode) -> bool {
+  return match &result.* {
+    Result<FinalProfile, AssemblyProblem>.Failure {
+      error: AssemblyProblem.Default { rejection }
+    } => Shared.with<Rejection, bool>(
+      &rejection,
+      fn(value: &Rejection) -> bool {
+        return value.code == code
+      }
+    )
+    _ => false
+  }
+}
+
+effect fn binding(name: &[u8], value: &[u8]) -> Vector<Supplied>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = Vector.make<Supplied>()
+  run Vector.append<
+    Supplied
+  >(
+    &mut result,
+    Supplied {
+      package: run Bytes.copy(b"example"),
+      module: run Bytes.copy(b"registered-parameters.silk"),
+      parameter: run Bytes.copy(name),
+      value: BindingInput.Integer { decimal: run Bytes.copy(value) },
+      provenance: Provenance.Literal,
+      tier: Tier.Override,
+    }
+  )
+  return move result
+}
+
+effect fn facts() -> InitialProfile
+  ! InputProblem | OutOfMemoryError
+  ? &mut Allocator {
+  let mut input = Input.make()
+  input.target = Option.some<Bytes>(run Bytes.copy(b"x86_64-unknown-linux-gnu"))
+  return run InitialProfile.freeze(&input)
+}
+
+fn initializerIs(answer: &Result<Answer, NoRejection>, expected: u64) -> bool {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {
+      value: Answer { outcome: Outcome.Success { value: Value.Initializer { value: data } }, .. }
+    } => Shared.with<StaticData, bool>(
+      &data,
+      fn(value: &StaticData) -> bool {
+        return match &value.* {
+          StaticData.Integer { magnitude, .. } => magnitude == expected
+          _ => false
+        }
+      }
+    )
+    _ => false
+  }
+}
+
+fn overriddenReadIsCurrent(answer: &Result<Answer, NoRejection>) -> bool {
+  return initializerIs(answer, 16)
+}
+
+fn defaultReadIsCurrent(answer: &Result<Answer, NoRejection>) -> bool {
+  return initializerIs(answer, 6)
+}
+
+fn runtimeBodyAccepted(answer: &Result<Answer, NoRejection>) -> bool {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {
+      value: Answer { outcome: Outcome.Success { value: Value.Body { .. } }, .. }
+    } => true
+    _ => false
+  }
+}
+
+test effect fn effectiveDefaultsAndPredicatesUseCurrentFinalValues() -> ()
+  ! InvalidModulePath
+    | OutOfMemoryError
+    | Cycle
+    | RevisionMismatch
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | InputProblem
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let check = effect fn() -> ()
+    ! InvalidModulePath
+      | OutOfMemoryError
+      | Cycle
+      | RevisionMismatch
+      | RegistrationClosed
+      | ConflictingPackageSource
+      | InputProblem
+      | AssertionError<'static>
+    ? &mut Allocator {
+    let entry = run ModuleId.make(b"memory", b"example", b"registered-parameters.silk")
+    let source = Option.some<Bytes>(
+      run Bytes.copy(
+        String.utf8Bytes(
+          """
+pub param first: u32 = second + 1
+pub param second: u32 = 2
+pub param checked: u32 = first where valid(checked, second)
+pub param pointer: u32 = Intrinsic.targetPointerBits()
+pub param debug: bool = Intrinsic.profileFlag("debug") where debug == Intrinsic.profileFlag("debug")
+static fn valid(value: u32, floor: u32) -> bool { return value > floor }
+const read: u32 = first + checked
+fn runtimeRead() -> u32 { return first + checked }
+"""
+        )
+      )
+    )
+    let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    let target = Target.forId(TargetId.X8664UnknownLinuxGnu)
+    let mut semantic = Semantic.traced(move revision, target, Option.none<FinalProfile>())
+    let mut request = Request.make()
+    run Request.registerSchemaModule(&mut request, &entry)
+    let shapes = run registered(&mut semantic, &mut request, &target)
+    if let Result<Registered, ShapeProblem>.Success { value: schemas } = move shapes {
+      let defaults = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        Vector.make<Supplied>()
+      )
+      let overridden = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        run binding(b"second", b"7")
+      )
+      let invalid = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        run binding(b"checked", b"0")
+      )
+      let restored = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        Vector.make<Supplied>()
+      )
+      run Testing.expect(
+        assemblyRejected(&invalid, RejectionCode.ParameterValidationFailed),
+        "overrides are validated against the complete effective map"
+      )
+      if let Result<FinalProfile, AssemblyProblem>.Success { value: first } = move defaults {
+        run Testing.expect(
+          parameterIs(&first, b"first", 3) && parameterIs(&first, b"checked", 3),
+          "forward defaults and static predicate helpers see final values"
+        )
+      } else {
+        run Testing.expect(false, "default profile completes")
+      }
+      if let Result<FinalProfile, AssemblyProblem>.Success { value: second } = move overridden {
+        run Testing.expect(
+          parameterIs(&second, b"first", 8) && parameterIs(&second, b"checked", 8),
+          "dependent defaults see the selected override"
+        )
+        run Semantic.reviseProfile(&mut semantic, Option.some<FinalProfile>(move second))
+        let read = run Semantic.demandInitializer(&mut semantic, &mut request, &entry, b"read")
+        run Testing.expect(
+          Shared.with<Result<Answer, NoRejection>, bool>(&read, overriddenReadIsCurrent),
+          "ordinary reads see the current overriding profile"
+        )
+      } else {
+        run Testing.expect(false, "override profile completes")
+      }
+      if let Result<FinalProfile, AssemblyProblem>.Success { value: current } = move restored {
+        run Testing.expect(
+          parameterIs(&current, b"first", 3),
+          "a failed or changed request does not contaminate later defaults"
+        )
+        run Semantic.reviseProfile(&mut semantic, Option.some<FinalProfile>(move current))
+        let read = run Semantic.demandInitializer(&mut semantic, &mut request, &entry, b"read")
+        run Testing.expect(
+          Shared.with<Result<Answer, NoRejection>, bool>(&read, defaultReadIsCurrent),
+          "ordinary static reads use the published profile"
+        )
+        let body = run Semantic.demandBody(&mut semantic, &mut request, &entry, b"runtimeRead")
+        let accepted = Shared.with<Result<Answer, NoRejection>, bool>(&body, runtimeBodyAccepted)
+        run Testing.expect(accepted, "ordinary runtime reads embed the published values")
+      } else {
+        run Testing.expect(false, "retry after failed validation completes")
+      }
+    } else {
+      run Testing.expect(false, "registered scalar shapes resolve")
+    }
+    return ()
+  }
+  return run check() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn overridesBreakDefaultCyclesAndFailuresRestoreTheGraph() -> ()
+  ! InvalidModulePath
+    | OutOfMemoryError
+    | Cycle
+    | RevisionMismatch
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | InputProblem
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let check = effect fn() -> ()
+    ! InvalidModulePath
+      | OutOfMemoryError
+      | Cycle
+      | RevisionMismatch
+      | RegistrationClosed
+      | ConflictingPackageSource
+      | InputProblem
+      | AssertionError<'static>
+    ? &mut Allocator {
+    let entry = run ModuleId.make(b"memory", b"example", b"registered-parameters.silk")
+    let source = Option.some<Bytes>(
+      run Bytes.copy(
+        String.utf8Bytes(
+          """
+pub param first: u32 = second
+pub param second: u32 = first
+"""
+        )
+      )
+    )
+    let revision = run Revision.publish(&Revision.make(), &entry, &source)
+    let target = Target.forId(TargetId.X8664UnknownLinuxGnu)
+    let mut semantic = Semantic.traced(move revision, target, Option.none<FinalProfile>())
+    let mut request = Request.make()
+    run Request.registerSchemaModule(&mut request, &entry)
+    let shapes = run registered(&mut semantic, &mut request, &target)
+    if let Result<Registered, ShapeProblem>.Success { value: schemas } = move shapes {
+      let cycle = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        Vector.make<Supplied>()
+      )
+      run Testing.expect(
+        assemblyRejected(&cycle, RejectionCode.Cycle),
+        "a revisited effective default is a semantic cycle"
+      )
+      let broken = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        run binding(b"first", b"5")
+      )
+      if let Result<FinalProfile, AssemblyProblem>.Success { value } = move broken {
+        run Testing.expect(
+          parameterIs(&value, b"first", 5) && parameterIs(&value, b"second", 5),
+          "an override stops traversal of its cyclic default"
+        )
+      } else {
+        run Testing.expect(false, "an explicit value breaks the default cycle")
+      }
+      let again = run assemble(
+        run facts(),
+        &mut semantic,
+        &mut request,
+        &schemas,
+        Vector.make<Supplied>()
+      )
+      run Testing.expect(
+        assemblyRejected(&again, RejectionCode.Cycle),
+        "removing the override restores the cycle without stale bindings"
+      )
+    } else {
+      run Testing.expect(false, "cyclic defaults do not prevent schema registration")
+    }
+    return ()
+  }
+  return run check() |> Effect.provideMut<Allocator>(&mut allocator)
+}
