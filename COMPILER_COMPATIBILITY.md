@@ -417,6 +417,18 @@ Each entry records:
   These named operations retain the original owned state, diagnostic and cache order, scoped
   releases and configured depth of 64. They change which inactive temporaries remain live on
   recursive paths, without extending language admission or changing evaluator budgets.
+- **Evaluator call and static-control storage:** the published `bb7eaec6` N0 reduces the
+  checked-expression entry to 3,784 bytes, prepared-body checking to 6,536 bytes and selected
+  static demand to 5,000 bytes. Its five required corpus programs pass, but selected, non-tail
+  and selected-under-ordinary-control recursion of eighty still overflow on the ordinary
+  8 MiB stack. The same-source native-produced N1 passes all eight depth controls. Measured
+  selected recursion retains 134,496 bytes per source-call cycle, compared with 157,600 bytes
+  in the earlier `45e253dd` N0. The evaluator now directly partitions its existing Call,
+  Prefix and Infix cases from the other admitted payloads before effectful dispatch. Callable
+  contract preparation and static-condition/selected-arm checking extract their exact admitted
+  HIR payloads with pure helpers before the existing effectful checks. Branch bodies, call
+  recognition priority, step charging, authored node/span reads, rejection sites and configured
+  depth remain unchanged; no new runtime or static form is admitted.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
