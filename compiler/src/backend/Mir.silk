@@ -266,6 +266,9 @@ pub union Terminator {
   /// Leaves the running package's frames in the package and returns its activation to the drive;
   /// the next drive continues at `resume`. Only a frame-based instance lowers it, inside a package.
   Relinquish {pub resume: usize, pub origin: Origin},
+  /// Ends a cancelled frame after the drops of its cancel exit: the frame is released and its
+  /// caller's frame cancels in turn. No result or failure is written.
+  Abandon {pub origin: Origin},
 }
 
 /// Where a fallible callee writes its failure value, typed by the callee's failure type, and the
@@ -321,7 +324,18 @@ pub struct MirFunction {
   /// The first explicit suspension boundary this function runs, which makes it a suspension
   /// origin (SUSP-001); absent for an instance that runs none.
   pub suspension: Option<Origin>
+  /// The cancel exit of each suspension point, in a suspendable instance's frame variant only.
+  pub cancels: Vector<Cancel>
 }
+
+/// The block whose terminator is a suspension point, and the block that drops every owner live
+/// there and abandons the frame when its package is dropped while suspended.
+pub struct Cancel {
+  pub point: usize
+  pub entry: usize
+}
+
+impl Copy for Cancel {}
 
 /// One lowered body and the erased helpers of the execution packages it adopts, lowered with it
 /// because they run its prepared invocations. Storing the function stores each helper after it.
@@ -362,14 +376,21 @@ struct ExitDrop {
 
 impl Copy for ExitDrop {}
 
+// How an exit path ends: returning, failing, or abandoning a cancelled frame.
+enum ExitKind {
+  Returns,
+  Fails,
+  Abandons,
+}
+
 // One node of the function-exit drop trie. Each exit's drops, read outermost first, form a path
-// from a root (`next` is usize.MAX) that returns or fails; exits whose remaining drops agree share
+// from a root (`next` is usize.MAX) that returns, fails or abandons the frame; exits whose remaining drops agree share
 // the end of that path. `count` exits pass through the step, and `block` is its shared block once
 // one is needed.
 struct ExitStep {
   next: usize
   released: ExitDrop
-  fails: bool
+  kind: ExitKind
   count: usize
   entries: usize
   block: usize
@@ -728,6 +749,12 @@ struct Builder {
   diagnostics: Option<DiagnosticPlaces>
   // Renders this function's site labels; absent unless the program observes diagnostics.
   sites: Option<SiteText>
+  // The suspendable direct callees of a suspendable instance's frame variant, whose calls and
+  // relinquishments each record a cancel exit; absent in every other lowering.
+  suspending: Option<Vector<InstanceKey>>
+  // An erased package helper is lowered before the suspendable set is known, so each of its
+  // instance calls records a cancel exit; its frame uses those at its suspension points.
+  cancelEveryCall: bool
 }
 
 struct DiagnosticPlaces {
@@ -2987,15 +3014,16 @@ fn sameExitDrop(left: ExitDrop, right: ExitDrop) -> bool {
   return left.node == right.node && left.guarded == right.guarded && left.temporary == right.temporary
 }
 
-fn exitTerminator(fails: bool, origin: Origin) -> Terminator {
-  if fails { return Terminator.Fail {origin: origin} }
+fn exitTerminator(kind: ExitKind, origin: Origin) -> Terminator {
+  if kind == ExitKind.Fails { return Terminator.Fail {origin: origin} }
+  if kind == ExitKind.Abandons { return Terminator.Abandon {origin: origin} }
   return Terminator.Return {origin: origin}
 }
 
-effect fn exitStep(builder: &mut Builder, next: usize, released: ExitDrop, fails: bool, origin: Origin) -> usize
+effect fn exitStep(builder: &mut Builder, next: usize, released: ExitDrop, kind: ExitKind, origin: Origin) -> usize
 ! OutOfMemoryError ? &mut Allocator {
   let index = Vector.length<ExitStep>(&builder.exits)
-  run Vector.append<ExitStep>(&mut builder.*.exits, ExitStep {next: next, released: released, fails: fails,
+  run Vector.append<ExitStep>(&mut builder.*.exits, ExitStep {next: next, released: released, kind: kind,
     count: usize.ZERO, entries: usize.ZERO, block: usize.MAX, origin: origin, children: Vector.make<usize>()})
   if next != usize.MAX {
     let mut steps = Vector.asMutSlice<ExitStep>(&mut builder.*.exits)
@@ -3004,15 +3032,15 @@ effect fn exitStep(builder: &mut Builder, next: usize, released: ExitDrop, fails
   return index
 }
 
-// The root step that returns or fails, created once per function and kind.
-effect fn exitRoot(builder: &mut Builder, fails: bool, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+// The root step that returns, fails or abandons, created once per function and kind.
+effect fn exitRoot(builder: &mut Builder, kind: ExitKind, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
   let steps = Vector.asSlice<ExitStep>(&builder.exits)
   let mut at = usize.ZERO
   while at < steps.length {
-    if steps[at].next == usize.MAX && steps[at].fails == fails { return at }
+    if steps[at].next == usize.MAX && steps[at].kind == kind { return at }
     at = at + usize.ONE
   }
-  return run exitStep(&mut builder.*, usize.MAX, ExitDrop {node: usize.MAX, guarded: false, temporary: usize.MAX}, fails, origin)
+  return run exitStep(&mut builder.*, usize.MAX, ExitDrop {node: usize.MAX, guarded: false, temporary: usize.MAX}, kind, origin)
 }
 
 // The existing step after `parent` that performs `wanted`, or usize.MAX.
@@ -3055,16 +3083,16 @@ effect fn emitExitDrop(builder: &mut Builder, wanted: ExitDrop, origin: Origin) 
   return ()
 }
 
-// Leaves the function from the current block, then returns or fails, dropping exactly what
+// Leaves the function from the current block, then returns, fails or abandons, dropping exactly what
 // `exitTo(builder, 0, 0, ..)` would, in the same order. The drops are only recorded here, as a
 // path through the exit trie; `closeExits` emits them once every exit is known.
-effect fn leaveFunction(builder: &mut Builder, fails: bool, origin: Origin) -> ()
+effect fn leaveFunction(builder: &mut Builder, kind: ExitKind, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   if !builder.live { return () }
   let drops = run exitDrops(&builder.*)
   let listed = Vector.asSlice<ExitDrop>(&drops)
   if listed.length == usize.ZERO {
-    terminate(&mut builder.*, exitTerminator(fails, origin))
+    terminate(&mut builder.*, exitTerminator(kind, origin))
     return ()
   }
   // A cleanup gap is reported at the exit that needs the drop, as inline cleanup would.
@@ -3079,18 +3107,51 @@ effect fn leaveFunction(builder: &mut Builder, fails: bool, origin: Origin) -> (
     at = at + usize.ONE
   }
   // The outermost drops run last, so exits share the end of `listed`.
-  let mut reached = run exitRoot(&mut builder.*, fails, origin)
+  let mut reached = run exitRoot(&mut builder.*, kind, origin)
   at = listed.length
   while at > usize.ZERO {
     at = at - usize.ONE
     let mut child = exitChild(&builder.*, reached, listed[at])
-    if child == usize.MAX { child = run exitStep(&mut builder.*, reached, listed[at], fails, origin) }
+    if child == usize.MAX { child = run exitStep(&mut builder.*, reached, listed[at], kind, origin) }
     let mut steps = Vector.asMutSlice<ExitStep>(&mut builder.*.exits)
     steps[child].count = steps[child].count + usize.ONE
     reached = child
   }
   run Vector.append<LeftExit>(&mut builder.*.left, LeftExit {block: builder.current, step: reached, origin: origin})
   builder.live = false
+  return ()
+}
+
+// Records the cancel exit of the suspension point that ends the current block: a fresh block that
+// drops every owner and pending temporary live here, as an exit from here would, and abandons the
+// frame. The point's own terminator is still to be written.
+effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if !builder.live { return () }
+  let point = builder.current
+  let entry = run block(&mut builder.*, origin)
+  resume(&mut builder.*, entry)
+  run leaveFunction(&mut builder.*, ExitKind.Abandons, origin)
+  resume(&mut builder.*, point)
+  return run Vector.append<Cancel>(&mut builder.*.function.cancels, Cancel {point: point, entry: entry})
+}
+
+// A call to a suspendable callee is a suspension point of the frame variant.
+effect fn noteCancel(builder: &mut Builder, callee: &Callee, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let mut suspends = false
+  if let Callee.Instance {..} = &callee.* { suspends = builder.cancelEveryCall }
+  if let Option<Vector<InstanceKey>>.Some {value: callees} = &builder.suspending {
+    if let Callee.Instance {key} = &callee.* {
+      let listed = Vector.asSlice<InstanceKey>(&callees)
+      let mut at = usize.ZERO
+      while at < listed.length && !suspends {
+        suspends = run InstanceKey.sameApplication(&listed[at], &key)
+        at = at + usize.ONE
+      }
+    }
+  }
+  if suspends { run recordCancel(&mut builder.*, origin) }
   return ()
 }
 
@@ -3110,7 +3171,7 @@ effect fn exitBlock(builder: &mut Builder, step: usize, queue: &mut Vector<usize
 // Emits the drops along the trie from `start` into the current block. A drop only one exit
 // performs stays inline in that exit, and a shared step entered from a single path is inlined into
 // that path; the walk stops at a shared step entered from elsewhere and continues into its block,
-// or returns or fails at the root. `owned` says the current block is `start`'s own shared block.
+// or returns, fails or abandons at the root. `owned` says the current block is `start`'s own shared block.
 // Every trie step is emitted once, so cleanup grows with the distinct live sets of the function's
 // exits rather than with live set times exit count.
 effect fn walkExit(builder: &mut Builder, start: usize, owned: bool, queue: &mut Vector<usize>, origin: Origin) -> ()
@@ -3120,11 +3181,11 @@ effect fn walkExit(builder: &mut Builder, start: usize, owned: bool, queue: &mut
   while true {
     let steps = Vector.asSlice<ExitStep>(&builder.exits)
     let next = steps[step].next
-    let fails = steps[step].fails
+    let kind = steps[step].kind
     let shared = steps[step].count > usize.ONE
     let released = steps[step].released
     if next == usize.MAX {
-      terminate(&mut builder.*, exitTerminator(fails, origin))
+      terminate(&mut builder.*, exitTerminator(kind, origin))
       return ()
     }
     if !inline && shared {
@@ -4324,6 +4385,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       let target = run callCallee(&mut builder.*, move foreign, move variadicArguments, callNode, &owner, origin)
       let providers = run targetProviders(&mut builder.*, callNode, origin)
       let diagnostics = run calleeDiagnostics(&builder.*, &target, origin)
+      run noteCancel(&mut builder.*, &target, origin)
       terminate(
         &mut builder.*,
         Terminator.Call {
@@ -5976,14 +6038,15 @@ effect fn packageHelper(creator: &Builder, key: InstanceKey, package: &Shared<Ty
     bindings: move bindings, projections: move projections, calls: Vector.make<CallTarget>(),
     function: MirFunction {key: move key, safetyChecked: true, result: Shared.clone<Type>(&unit), parameters: move parameters,
       locals: move locals, blocks: Vector.make<Block>(), references: Vector.make<Reference>(), externs: Vector.make<Shared<DeclarationId>>(),
-      observes: false, contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>()},
+      observes: false, contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(), cancels: Vector.make<Cancel>()},
     current: usize.ZERO, live: true, loops: Vector.make<LoopTargets>(), scrutinees: Vector.make<Scrutinee>(),
     owners: Vector.make<Owner>(), cleanup: Vector.make<CleanupNode>(), scopes: Vector.make<usize>(), temporaries: Vector.make<Pending>(),
     remainders: Vector.make<Remainder>(), needs: CleanupNeeds {locals: Vector.make<bool>(), nodes: Vector.make<bool>()},
     failure: usize.MAX, plans: Vector.make<NodePlan>(), storage: Vector.make<StoragePlan>(), carriers: Vector.make<CarrierPlan>(),
     providers: Vector.make<usize>(), diagnostics: move diagnostics, sites: Option.none<SiteText>(),
     witnessIntrinsics: Vector.make<WitnessIntrinsic>(), helpers: Vector.make<MirFunction>(),
-    exits: Vector.make<ExitStep>(), left: Vector.make<LeftExit>(),
+    exits: Vector.make<ExitStep>(), left: Vector.make<LeftExit>(), suspending: Option.none<Vector<InstanceKey>>(),
+    cancelEveryCall: true,
   }
   let first = run block(&mut builder, origin)
   resume(&mut builder, first)
@@ -6230,7 +6293,8 @@ effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, ope
 // `run Intrinsic.relinquish()` leaves the running package's frames in the package, records the
 // activation as relinquished and returns it to the drive; outside any package it traps. The
 // instance is frame-based from here on (SUSP private lowering).
-effect fn lowerRelinquish(builder: &mut Builder, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator {
+effect fn lowerRelinquish(builder: &mut Builder, origin: Origin) -> Operand
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   run markSuspension(&mut builder.*, origin)
   let bytes = run SealedCore.bytes()
   let running = run storageValue(&mut builder.*, &bytes, Rvalue.RunningPackage, origin)
@@ -6238,6 +6302,8 @@ effect fn lowerRelinquish(builder: &mut Builder, origin: Origin) -> Operand ! Ou
     Operand.Null {ty: Shared.clone<Type>(&bytes)}, origin)
   run trapUnless(&mut builder.*, move present, origin)
   let resumed = run block(&mut builder.*, origin)
+  let cancellable = match &builder.suspending { Option<Vector<InstanceKey>>.Some {..} => true _ => builder.cancelEveryCall }
+  if cancellable { run recordCancel(&mut builder.*, origin) }
   terminate(&mut builder.*, Terminator.Relinquish {resume: resumed, origin: origin})
   resume(&mut builder.*, resumed)
   return Operand.Unit
@@ -6715,6 +6781,7 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
   }
   let providers = run targetProviders(&mut builder.*, node, origin)
   let diagnostics = run calleeDiagnostics(&builder.*, &target, origin)
+  run noteCancel(&mut builder.*, &target, origin)
   terminate(&mut builder.*, Terminator.Call {
     callee: move target, arguments: move values, providers: move providers, diagnostics: move diagnostics,
     destination: place(output), normal: continuation, failure: move edge, origin: origin,
@@ -6744,7 +6811,7 @@ effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Shared<T
   let destination = builder.failure
   run widenInto(&mut builder.*, caught, from, destination, origin)
   run carry(&mut builder.*, caught, destination, origin)
-  return run leaveFunction(&mut builder.*, true, origin)
+  return run leaveFunction(&mut builder.*, ExitKind.Fails, origin)
 }
 
 // Moves a failure of type `from` into `destination`, injecting it into a wider failure union.
@@ -7044,6 +7111,7 @@ effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Pla
   }
   let callee = Callee.Instance {key: InstanceKey.copy(&target.key)}
   let diagnostics = run calleeDiagnostics(&builder.*, &callee, origin)
+  run noteCancel(&mut builder.*, &callee, origin)
   terminate(&mut builder.*, Terminator.Call {callee: move callee,
     arguments: move values, providers: move providers, diagnostics: move diagnostics, destination: place(destination),
     normal: continuation, failure: move edge, origin: origin})
@@ -7886,7 +7954,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let destination = builder.failure
       run assign(&mut builder.*, place(destination), Rvalue.Use {value: move failed}, origin)
       run raise(&mut builder.*, origin)
-      run leaveFunction(&mut builder.*, true, origin)
+      run leaveFunction(&mut builder.*, ExitKind.Fails, origin)
     }
     View.Binding {index, initializer, origin} => {
       let value = run expression(&mut builder.*, body, hir, initializer)
@@ -7916,7 +7984,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
         if !builder.live { return () }
         run assign(&mut builder.*, place(usize.ZERO), Rvalue.Use {value: move result}, origin)
       }
-      run leaveFunction(&mut builder.*, false, origin)
+      run leaveFunction(&mut builder.*, ExitKind.Returns, origin)
     }
     View.Branch {condition, thenBranch, elseBranch, origin} => {
       let evaluated = run expression(&mut builder.*, body, hir, condition)
@@ -8309,7 +8377,7 @@ impl MirFunction {
       references: move references,
       externs: Vector.make<Shared<DeclarationId>>(),
       observes: false,
-      contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(),
+      contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(), cancels: Vector.make<Cancel>(),
     }
   }
   /// Lowers a closed body while preserving its unfinished safety status, without reading a callee body.
@@ -8331,6 +8399,7 @@ impl MirFunction {
     projections: Vector<RuntimeProjection>,
     source: &[u8],
     observing: bool,
+    suspending: Option<Vector<InstanceKey>>,
   ) -> Lowered ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
@@ -8416,7 +8485,7 @@ impl MirFunction {
         references: Vector.make<Reference>(),
         externs: Vector.make<Shared<DeclarationId>>(),
         observes: false,
-        contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(),
+        contexts: Vector.make<ContextText>(), suspension: Option.none<Origin>(), cancels: Vector.make<Cancel>(),
       },
       current: usize.ZERO,
       live: true,
@@ -8439,6 +8508,8 @@ impl MirFunction {
       providers: move providerLocals,
       diagnostics: move diagnostics,
       sites: move sites,
+      suspending: move suspending,
+      cancelEveryCall: false,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
