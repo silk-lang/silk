@@ -659,7 +659,7 @@ Each entry records:
 - **Diagnostics and limits:** a receiver-method call (`value.take()`), operator syntax, a callable
   success, and a stored construction whose witness borrows an owned operand report
   `InterfaceEffectUnavailable` (gap `interface-effect-witness`) at the call. The pipeline form
-  `run value |> Interface<Arguments>.operation` remains the pipeline-interface gap.
+  `run value |> Interface<Arguments>.operation` is checked as the direct qualified call.
 - **Evidence:** `qualifiedEffectCallsInferTheirApplication` asserts the operation signature's `E`
   and `?R` binders, the inferred contract and selected witness, one witness reference in MIR, a
   failure edge on a fallible witness call, `UnhandledFailure` for an uncovered run, no edge on a
