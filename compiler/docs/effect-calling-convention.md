@@ -141,8 +141,9 @@ Running their results lowers as follows. "Run `x`" means D1 applied to `x`, recu
   whole `E` (`catchAll`), the switch disappears.
 - **`finalizeEffect(inner, finalizer)`**: run `inner`, with its failure edge into `t`. The normal
   target and the failure target both run `finalizer` (`E = never`, so no edge). The failure path
-  then moves `t` into `Failure` and does `Fail`. `finalizeEffectNonParking` lowers identically;
-  `NonParking` is a compile-time bound.
+  then moves `t` into `Failure` and does `Fail`. `finalizeEffectNonParking` follows the same
+  completion paths. On cancellation, its pending finalizer runs once; a parking finalizer is
+  dropped unrun.
 - **`useReleaseNonParking(resource, use, release)`**: own `resource`, call `use(&mut resource)`
   and run the Effect it returns, with a failure edge into `t`. Both targets then call
   `release(&mut resource)` and run its Effect (`E = never`), drop `resource`, and forward success,
@@ -232,6 +233,11 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 
 - Added only by the suspension stage: `Terminator.Suspend { callee, arguments, providers, destination, mode: Transfer | Nested, resume: Block, failure: Option<FailureEdge>, cancel: Block, origin }` and `Terminator.Abandon { origin }`.
 - `Transfer` is the explicit `Intrinsic.suspendEffect` point (inside stdlib `Effect.suspend`); `Nested` is a `run` of a callee whose suspension summary is NestedTransfer, inside a suspendable instance. `resume` receives the success value in `destination`; `failure` is the ordinary failure edge; `cancel` is the explicit drop chain of every owner live at that point, reading flags from the frame, ending in `Abandon` (no outcome).
+- A cancel exit first releases held failure contexts, then enters the pending composed-Effect
+  cleanup landings, innermost first. A landing runs a nonparking finalizer, releases and drops a
+  use-release resource, or drops an observer state or unused handler. Each scope shares one
+  landing and dispatches back to the cancel exit through a selector local. Cleanup calls finish
+  without recording another cancel exit, then ordinary live-owner cleanup abandons the frame.
 - `Mir(Function)` demands the instance's suspension summary (an SCC-capable query; an engine addition), never a callee body, to choose `Call` or `Suspend`. Non-suspending instances contain no `Suspend` (SUSP-018). Providers, out-slots and drop flags are ordinary locals stored in the frame like any live place.
 - `Intrinsic.suspendEffect` and `Intrinsic.relinquish` lower to resume points of the instance's coroutine frame. A relinquish ends its block with `Terminator.Relinquish { resume, origin }`.
 
