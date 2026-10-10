@@ -114,7 +114,7 @@ All eleven examples were attempted with the optimized N1:
 | sieve | Compiled; expected exit `77` |
 | language-pressure/lexer | Compiled; expected exit `0` |
 | language-pressure/local-shared-slp1 | Compiled; expected exit `42` |
-| file-system | `TypeArity`, `main.silk` bytes 3510–3538, at omitted `Effect.provideMut` arguments |
+| file-system | `TypeArity`, `main.silk` bytes 3510–3538, at omitted `Intrinsic.bindRequirementMut` selector arguments |
 | language-pressure/stack-vm | `core-type`, `silk/format.silk` bytes 23721–23751, at a phase-only field |
 
 The two refusals also occur, with identical codes and spans, using the fresh baseline N0 at

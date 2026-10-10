@@ -383,7 +383,7 @@ Each entry records:
   N1 LLVM text in approximately 207 seconds with 4.41 GiB observed peak RSS. GDB and an O0
   AddressSanitizer CRC-32 control completed without the previously reported SIGABRT; nine of eleven
   examples executed their expected results. The other two retain exact baseline N0 refusals:
-  omitted `Effect.provideMut` arguments (`TypeArity`) and a formatting phase-only field (`core-type`).
+  omitted `Intrinsic.bindRequirementMut` selector arguments (`TypeArity`) and a formatting phase-only field (`core-type`).
   [The investigation records every outcome and its generation](compiler/docs/region-sensitive-identity.md#n1-investigation-2026-10-10);
   it is diagnostic evidence, not a later synchronized-head CI receipt.
 - **Compilers:** selfhost resolves every exact semantic glue and function application before
