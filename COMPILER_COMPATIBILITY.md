@@ -1683,6 +1683,9 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   The body retains the source `'a` outliving that fresh region; the initializer of
   `Session {value: &mut value.*}` therefore does not fix an invariant callback binder to `'a`.
   Explicit expectations still prove against source validity, and access never strengthens.
+  A callable environment is covariant, so an inferred call region also meets independently
+  borrowed operands when a callback stores that region only in its environment. Callable inputs,
+  invocation bounds and requirement keys remain invariant in this covariance check.
 - **Source migration:** none.
 - **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
   widened to another, and owner, access, element, pointee, extent, type-argument and
@@ -1696,7 +1699,8 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `compiler/src/semantic/SemanticCallableCases.silk`, `providedCallPrefixesMapLifetimesSeparately`
   in `compiler/src/semantic/SemanticLoweringCases.silk`,
   `sliceConversionsRetainRegionAccessAndDiagnostics` and
-  `genericEffectCallbackUsesAFreshDescriptorReborrow` in
+  `genericEffectCallbackUsesAFreshDescriptorReborrow` and
+  `callbackEnvironmentAdmitsIndependentOperandRegions` in
   `compiler/src/semantic/SemanticCaptureCases.silk`, and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
 
