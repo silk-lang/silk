@@ -17,6 +17,7 @@ import type {
   MemberFact,
   ModuleHeaders,
   ParameterFact,
+  RequirementRowFact,
   ReturnTypeFact,
   ServiceFact,
   StructFact,
@@ -1953,6 +1954,15 @@ export const complete = (
   }
 
   modules = modules.map((module): ModuleHeaders => {
+    // A published requirement row is part of the public contract: its importer provides each
+    // capability, so each must be nameable there (SEM0019).
+    const exposeRequirements = (row: RequirementRowFact): RequirementRowFact => ({
+      ...row,
+      entries: row.entries.map((entry) => ({
+        ...entry,
+        capability: attachExposure(spanOf, entry.capability, modules, diagnostics),
+      })),
+    })
     const members = module.members.map((member): MemberFact => {
       if (member.visibility !== 'Public') return member
       // The alias resolver attached exposure when it erased the target.
@@ -1978,6 +1988,7 @@ export const complete = (
               attachExposure(spanOf, failure, modules, diagnostics),
             ),
           },
+          requirementRow: exposeRequirements(member.requirementRow),
         }
       }
       if (member._tag === 'ServiceDeclaration' || member._tag === 'InterfaceDeclaration') {
@@ -1994,6 +2005,7 @@ export const complete = (
               attachExposure(spanOf, failure, modules, diagnostics),
             ),
           },
+          requirementRow: exposeRequirements(operation.requirementRow),
         }))
         const exposed = { ...member, operations: operations }
         return {
