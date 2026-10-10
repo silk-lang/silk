@@ -1,6 +1,6 @@
 //! MIR and LLVM lowering, foreign calls, generic records and unions, copy, and cleanup.
 
-import hir.Hir {Access, Module, OwnerKind}
+import hir.Hir {Access, CallableMode, Module, OwnerKind}
 import backend.InstanceKey {InstanceKey, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.InstanceText
@@ -97,7 +97,8 @@ import semantic.StaticValue {
   Value as StaticData,
 }
 import semantic.Specialization {Application as SpecializationApplication, ScopeBinding}
-import semantic.Type {AnonymousOccurrence, Argument, Requirement, Row, Type}
+import semantic.CallableSchema {CallableSchema as SectionSchema}
+import semantic.Type {AnonymousOccurrence, Argument, CallableFieldInput, Requirement, Row, Type}
 import semantic.Target {Id as TargetId, Target as MachineTarget}
 import semantic.TypedBody {
   Expression as BodyExpression,
@@ -196,6 +197,7 @@ import semantic.SemanticCaseSupport {
   requiredCanonicalKey,
   reused,
   sameBytes,
+  sectionCaptureOperand,
   selectedBackendGap,
   selectedLayoutIndex,
   selectedMirIndex,
@@ -6909,11 +6911,116 @@ fn invalidMember(value: &Counter) -> i32 { let read = value.absent return 42 }
     "an absent enum member remains an unknown member",
   )
   run Testing.expect(
-    rejectsSpan(&bound, RejectionCode.BoundMethodUnavailable, text, "value.read", 0) &&
+    succeeded(&bound) &&
     rejectsSpan(&invalidMember, RejectionCode.UnknownMember, text, "absent", 0),
-    "published bound methods and invalid members keep specific diagnostics",
+    "published bound methods form callable values while invalid members remain diagnostic",
   )
   return ()
+}
+
+// CALL-003: bound methods store parameter zero and invoke the original member directly.
+test effect fn boundMethodsCaptureReceiverAtItsOriginalParameter() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run module("bound-method-values.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+struct Counter { value: i32 }
+impl Counter {
+  fn read(self: &Self) -> i32 { return self.value }
+  fn bump(self: &mut Self) -> i32 { self.value = self.value + 1 return self.value }
+  fn take(self: Self) -> i32 { return self.value }
+  fn add(self: &Self, other: &Self) -> i32 { return self.value + other.value }
+}
+fn shared() -> i32 { let value = Counter { value: 10 } let read = value.read return read() + read() }
+fn mutable() -> i32 { let mut value = Counter { value: 0 } let mut bump = value.bump return bump() + bump() }
+fn owned() -> i32 { let value = Counter { value: 20 } let take = value.take return take() }
+fn applied(value: &Counter, other: &Counter) -> i32 { let add = value.add return add(other) }
+fn temporary() -> i32 { let read = Counter { value: 1 }.read return read() }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let shared = run Semantic.demandMir(&mut store, &mut request, &id, b"shared") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mutable = run Semantic.demandMir(&mut store, &mut request, &id, b"mutable") |> Effect.provideMut<Allocator>(&mut allocator)
+  let owned = run Semantic.demandMir(&mut store, &mut request, &id, b"owned") |> Effect.provideMut<Allocator>(&mut allocator)
+  let applied = run Semantic.demandMir(&mut store, &mut request, &id, b"applied") |> Effect.provideMut<Allocator>(&mut allocator)
+  let temporary = run Semantic.demandBody(&mut store, &mut request, &id, b"temporary") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(boundMethodMir(&store, &shared, b"read", CallableMode.Shared, usize.ONE, 2),
+    "a shared receiver-only bound value remains reusable and directly calls the original member")
+  run Testing.expect(boundMethodMir(&store, &mutable, b"bump", CallableMode.Mutable, usize.ONE, 2),
+    "an exclusive receiver produces a reusable mutable callable")
+  run Testing.expect(boundMethodMir(&store, &owned, b"take", CallableMode.Once, usize.ONE, usize.ONE),
+    "a by-value receiver moves from the capture into its original member parameter")
+  run Testing.expect(boundMethodMir(&store, &applied, b"add", CallableMode.Shared, 2, usize.ONE),
+    "the captured receiver is parameter zero before the remaining written operand")
+  run Testing.expect(rejectsSpan(&temporary, RejectionCode.TemporaryBoundReceiver, text, "Counter { value: 1 }", usize.ZERO),
+    "a bound value cannot retain a borrowed temporary receiver")
+  return ()
+}
+
+fn boundMethodSignature(contract: &Shared<Type>, mode: CallableMode, parameters: usize) -> bool {
+  return Shared.with<Type, bool>(contract, fn(callable: &Type) -> bool {
+    return match &callable.* {
+      Type.Callable {mode: found, parameters: open, ..} => found == mode && Vector.length<Shared<Type>>(&open) + usize.ONE == parameters
+      _ => false
+    }
+  })
+}
+
+fn boundMethodFields(captures: &Vector<Shared<Type>>, inputs: &Vector<CallableFieldInput>) -> bool {
+  if Vector.length<Shared<Type>>(captures) != usize.ONE || Vector.length<CallableFieldInput>(inputs) != usize.ONE {
+    return false
+  }
+  return match Vector.asSlice<CallableFieldInput>(inputs)[usize.ZERO] {
+    CallableFieldInput.Argument {parameter} => parameter == usize.ZERO
+    _ => false
+  }
+}
+
+fn boundMethodSchemaSignature(schema: &Shared<SectionSchema>, mode: CallableMode, parameters: usize) -> bool {
+  return Shared.with<SectionSchema, bool>(schema, fn(value: &SectionSchema) -> bool {
+    return Vector.length<usize>(&value.deferred) > usize.ZERO && boundMethodSignature(&value.contract, mode, parameters)
+  })
+}
+
+fn boundMethodMir(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>, target: &[u8],
+  mode: CallableMode, parameters: usize, calls: usize) -> bool {
+  let selected = Shared.with<Result<Answer, NoRejection>, Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let locals = Vector.asSlice<MirLocal>(&function.locals)
+      let mut typed = false
+      let mut at = usize.ZERO
+      while at < locals.length {
+        if Shared.with<Type, bool>(&locals[at].ty, fn(value: &Type) -> bool {
+          if let Type.CallableValue {contract, captures, fieldInputs, ..} = &value.* {
+            return boundMethodFields(&captures, &fieldInputs) && boundMethodSignature(&contract, mode, parameters)
+          }
+          if let Type.CallableSchema {schema, captures, fieldInputs, ..} = &value.* {
+            return boundMethodFields(&captures, &fieldInputs) && boundMethodSchemaSignature(&schema, mode, parameters)
+          }
+          return false
+        }) { typed = true }
+        at = at + usize.ONE
+      }
+      let blocks = Vector.asSlice<MirBlock>(&function.blocks)
+      let mut selectedCalls = usize.ZERO
+      at = usize.ZERO
+      while at < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, arguments, ..} = &blocks[at].terminator {
+          let identity = InstanceKey.identity(&key)
+          if Shared.with<DeclarationId, bool>(&identity, fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, target) }) {
+            let operands = Vector.asSlice<MirOperand>(&arguments)
+            if operands.length != parameters || !sectionCaptureOperand(&operands[usize.ZERO], mode == CallableMode.Once) { return false }
+            selectedCalls = selectedCalls + usize.ONE
+          }
+        }
+        at = at + usize.ONE
+      }
+      return typed && selectedCalls == calls
+    }
+  }
+  return false
 }
 
 fn enumMatchArmsKeepPatternsAndGuards(body: &TypedBody) -> bool {
