@@ -941,7 +941,7 @@ const layoutNominal = Effect.fn('Layout.layoutNominal')(function* (
   const key = Type.runtimeKey(type)
   const existing = completed.get(key)
   if (existing !== undefined) return existing
-  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isWake(type)) {
+  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isExecutionRef(type)) {
     const result: Entry = {
       _tag: 'LayoutEntry',
       type,
@@ -4018,7 +4018,7 @@ const shapeNode = Effect.fnUntraced(function* (
       laneCount: 1,
     }
   }
-  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isWake(type)) {
+  if (Type.isSharedCore(type) || Type.isExecution(type) || Type.isExecutionRef(type)) {
     return {
       _tag: 'AddressShape',
       type,

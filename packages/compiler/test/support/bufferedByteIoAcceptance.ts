@@ -7,7 +7,7 @@ import silk.buffered_transfer {BufferedTransfer, TransferOutcome}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.execution {Execution}
+import silk.execution { Execution, Wake }
 import silk.layout {Layout}
 import silk.memory_byte_duplex {MemoryByteDuplex, MemoryByteDuplexPhase, MemoryReadEvent, MemoryWriteAction, MemoryWriteEvent}
 import silk.monotonic_clock {MonotonicClock}
@@ -52,7 +52,7 @@ struct PairParkingDuplex {
   shutdownMode: i32
 }
 
-struct PairParkGuard { wake: Intrinsic.Wake }
+struct PairParkGuard { wake: Wake }
 
 struct ParkingClock {}
 
@@ -101,7 +101,7 @@ effect fn allocateUntilFailure(
 
 impl Allocator for FailingAllocator { allocate: FailingAllocator.allocateUntilFailure }
 
-fn retainPairWake(wake: Intrinsic.Wake) -> PairParkGuard {
+fn retainPairWake(wake: Wake) -> PairParkGuard {
   return PairParkGuard {wake: move wake}
 }
 

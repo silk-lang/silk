@@ -172,7 +172,7 @@ A parent is parked until the Scheduler processes one publication request.
 ### Field `wake`
 
 ```silk
-pub wake: Intrinsic.Wake
+pub wake: Wake
 ```
 
 The Wake consumed after the publication response has been stored.
