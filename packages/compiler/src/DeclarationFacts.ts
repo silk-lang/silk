@@ -2364,15 +2364,24 @@ export const containsLexicalBorrow = (
 }
 
 /** A struct or tuple holding a descriptor or static sequence has no runtime representation. */
-export const containsStaticPhaseOnly = (
+export const containsStaticPhaseOnly = (self: Index, type: Type.Type): boolean =>
+  staticPhaseWithin(self, type, new Set(), new Set())
+
+const staticPhaseWithin = (
   self: Index,
   type: Type.Type,
-  seen: ReadonlySet<string> = new Set(),
+  seen: ReadonlySet<string>,
+  inspected: Set<string>,
 ): boolean => {
   if (Type.containsStaticPhaseOnly(type)) return true
   for (const nominal of Type.nominals(type)) {
     const key = `${nominal.module}:${nominal.name}`
     if (seen.has(key)) continue
+    // A generic field and its written type argument often reach the same application. Inspect
+    // that application once across the whole search, while guarding growth on the current path.
+    const application = Type.key(nominal)
+    if (inspected.has(application)) continue
+    inspected.add(application)
     const declaration = byCanonical(self, {
       _tag: 'CanonicalDeclarationId',
       module: nominal.module,
@@ -2389,10 +2398,11 @@ export const containsStaticPhaseOnly = (
       declaration.fields.some(
         (field) =>
           field.declaredType._tag === 'Resolved' &&
-          containsStaticPhaseOnly(
+          staticPhaseWithin(
             self,
             Type.substitute(field.declaredType.type, substitution),
             next,
+            inspected,
           ),
       )
     )
