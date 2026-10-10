@@ -437,16 +437,22 @@ Each entry records:
   conditional/block payload extraction increased its measured block prologue from 1,608 to
   2,328 bytes and ordinary conditional prologue from 2,216 to 3,192 bytes. That failed storage
   experiment is removed: the original direct authored-node paths and checking bodies remain.
-- **Static prefix preparation storage:** the current public `04652e25` authored N0 and the
-  local E4-bootstrap-produced N0 from private `61993ade` both still crash on
-  `selectedNestedOrdinary80` with the ordinary 8 MiB stack and configured depth of 64. The
-  actual public N0's `staticPrefixExpression` prologue reserves 15,176 bytes, excluding its
-  48 saved-register bytes, on the recursive path. Prefix preparation now completes before
-  evaluator construction and execution. Its owned application, checked checkpoint, argument
-  bindings, completed prefix and source-answer handle cross that boundary together; no
-  borrowed machine or port crosses it. The ordered preparation operations, evaluation retry
-  loop, failure handling, diagnostic spans and budgets remain unchanged. The new candidate's
-  production compilation and stack improvement remain unproved until fresh verification.
+- **Static prefix preparation storage:** the authored public `55a5655a` N0 passes seven of
+  the eight normal-stack depth controls but still crashes on `selectedNestedOrdinary80`
+  with the ordinary 8 MiB stack and configured depth of 64. Separating semantic prefix
+  preparation reduced the measured recursive period by 3,008 bytes, from 130,704 to
+  127,696 bytes, but did not retire that signal. Prefix preparation completes before
+  evaluator construction; its original owned application, checkpoint, argument bindings,
+  completed prefix and source-answer handle stay live across execution and retries.
+- **Evaluator prefix replay storage:** the actual authored `55a5655a` N0 reserves 8,984
+  bytes, excluding 48 saved-register bytes, in `StaticExecution.evaluatePrefix` across
+  the final recursive expression. Ordered source observation, cursor installation, checked
+  range setup, supplied bindings and completed-prefix replay now finish in one preparer.
+  Its original copied root module and resulting local vector remain owned through final
+  expression evaluation, in their original declaration order. No machine or port borrow
+  escapes preparation. Replay branches, authored reads, source checks, effects, mutation,
+  cleanup, rejection spans and budgets retain their original order. Fresh production and
+  depth verification must establish whether this additional split reduces actual storage.
 - **Integrated runtime evidence:** the true private N1 from frozen `69b179c4f` source is SHA-256
   `0d9e21b7d344af7187a2e9dfa90d963b9a45edf25f91ce7fe8ec8816181fd776`. All thirty-two
   reflection/projection controls, four fresh/outside-loan controls, eight default-depth probes,
