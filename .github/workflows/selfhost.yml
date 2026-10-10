@@ -1,0 +1,437 @@
+name: Selfhost Silk
+
+on:
+  push:
+    branches:
+      - selfhost
+  pull_request:
+    branches:
+      - selfhost
+      # A native stack's upper PRs target another compiler feature branch. Check their complete
+      # heads as well; stack merge requires the top head, not each intermediate layer, to pass.
+      - selfhost-*
+      - julia/step*
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: selfhost-${{ github.event.pull_request.number || github.ref }}
+  # A newer PR head supersedes the old one. Pushes to a branch finish instead, so the branch's
+  # full shard run completes; GitHub keeps only the newest pending run behind the running one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Authored N0 is independent of the corpus compiler.
+  native-seed:
+    name: Authored native seed (N0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-linux-llvm
+      - uses: ./.github/actions/download-bootstrap
+        id: bootstrap
+      - name: Check snapshot and seed receipt contracts
+        uses: ./.github/actions/check-native-contracts
+      - name: Export exact committed authored inputs
+        run: node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/authored-inputs" HEAD
+      - name: Build N0 from authored inputs
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          SILK_BOOTSTRAP: ${{ steps.bootstrap.outputs.path }}
+          BOOTSTRAP_SHA: ${{ steps.bootstrap.outputs.sha }}
+          BOOTSTRAP_RUN: ${{ steps.bootstrap.outputs.run-id }}
+        run: |
+          set -euo pipefail
+          # The verified CLI embeds the stdlib at its exact main SHA. Reject byte divergence.
+          git fetch --no-tags origin "$BOOTSTRAP_SHA"
+          node compiler/scripts/NativeSeed.mjs build "$RUNNER_TEMP/authored-inputs" "$RUNNER_TEMP/native-seed" 2>&1 | tee "$RUNNER_TEMP/native-seed-build.log"
+      - name: Publish successful seed and input snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-native-seed
+          path: ${{ runner.temp }}/native-seed/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve seed build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-native-seed-logs
+          path: ${{ runner.temp }}/native-seed-build.log
+          retention-days: 7
+
+  native-seed-restore:
+    name: Restore authored native seed
+    needs: native-seed
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: selfhost-native-seed
+          path: ${{ runner.temp }}/native-seed-download
+      - name: Restore exact source paths and executable N0
+        run: node compiler/scripts/NativeSeed.mjs restore "$RUNNER_TEMP/native-seed-download" "$RUNNER_TEMP/restored-native-seed"
+
+  # This checkpoint stays red on a native refusal. It is deliberately outside the required
+  # aggregator until the real N1 build/smoke proof is established by #897.
+  native-self-build:
+    name: Experimental native self-build (N1)
+    needs: native-seed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-linux-llvm
+      - name: Install GNU time for native process receipts
+        run: sudo apt-get install -y time
+      - uses: actions/download-artifact@v4
+        with:
+          name: selfhost-native-seed
+          path: ${{ runner.temp }}/native-seed-download
+      - name: Verify published N0 and exact checkout inputs before compiler execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - "$RUNNER_TEMP/native-seed-download" "$RUNNER_TEMP/restored-native-seed" "$GITHUB_SHA" <<'JS' 2>&1 | tee "$RUNNER_TEMP/native-seed-preflight.log"
+          import { createRequire } from 'node:module'
+          import { join, resolve } from 'node:path'
+          import { pathToFileURL } from 'node:url'
+          import * as Effect from 'effect/Effect'
+          import * as FileSystem from 'effect/FileSystem'
+          import * as NativeSeed from './compiler/scripts/NativeSeed.mjs'
+          import * as SourceSnapshot from './compiler/scripts/SourceSnapshot.mjs'
+          const [artifact, directory, expectedSourceCommit] = process.argv.slice(2)
+          const require = createRequire(resolve('packages/cli/package.json'))
+          const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+          await Effect.runPromise(Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem
+            const seed = yield* NativeSeed.restoreSeed({ artifact, directory })
+            const inputs = yield* SourceSnapshot.verifySnapshot({ directory })
+            const checkout = (yield* SourceSnapshot.committedFiles('.', 'HEAD')).map(({ object, ...file }) => file)
+            if (seed.sourceCommit !== expectedSourceCommit || inputs.sourceCommit !== expectedSourceCommit ||
+                SourceSnapshot.fileDigest(checkout) !== inputs.normalizedDigest) {
+              return yield* Effect.fail(new NativeSeed.NativeSeedError({ message: 'N0 source snapshot does not match this exact checkout' }))
+            }
+            for (const file of checkout) {
+              const path = join(process.cwd(), file.path)
+              const info = yield* fs.stat(path)
+              if (info.type !== 'File' || ((info.mode & 0o111) === 0 ? '100644' : '100755') !== file.mode ||
+                  SourceSnapshot.hash(yield* fs.readFile(path)) !== file.sha256) {
+                return yield* Effect.fail(new NativeSeed.NativeSeedError({ message: `Checkout input bytes or executable mode changed: ${file.path}` }))
+              }
+            }
+          }).pipe(Effect.provide(NodeServices.layer)))
+          JS
+      - name: Build one N1 with N0 and smoke only its new executable
+        uses: ./.github/actions/native-self-build
+        with:
+          seed: ${{ runner.temp }}/restored-native-seed/N0
+          seed-receipt: ${{ runner.temp }}/restored-native-seed/seed-receipt.json
+          snapshot: ${{ runner.temp }}/restored-native-seed
+          output: ${{ runner.temp }}/native-generation
+          clang: ${{ env.SILK_TEST_CLANG }}
+          corpus-source: ${{ github.workspace }}/packages/compiler/test/support/corpus.ts
+      - name: Publish successful N1, input manifest and producer/smoke receipt
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-native-build
+          path: ${{ runner.temp }}/native-generation/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve native checkpoint outcome and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-native-build-diagnostics
+          path: |
+            ${{ runner.temp }}/native-seed-preflight.log
+            ${{ runner.temp }}/native-self-build.log
+            ${{ runner.temp }}/native-generation/build-receipt.json
+          retention-days: 7
+
+  corpus:
+    name: Selfhost native corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check main-first bootstrap provenance
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          node .github/scripts/check-selfhost-bootstrap.mjs "$BASE_SHA" "$HEAD_SHA" origin/main
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: ./.github/actions/setup-linux-llvm
+      - uses: ./.github/actions/download-bootstrap
+        id: bootstrap
+        with:
+          verification: 'true'
+      - name: Record bootstrap provenance
+        env:
+          BOOTSTRAP_SHA: ${{ steps.bootstrap.outputs.sha }}
+          BOOTSTRAP_RUN: ${{ steps.bootstrap.outputs.run-id }}
+          SILK_BOOTSTRAP: ${{ steps.bootstrap.outputs.path }}
+        run: |
+          echo "SILK_BOOTSTRAP=$SILK_BOOTSTRAP" >> "$GITHUB_ENV"
+          {
+            echo "Bootstrap main commit: $BOOTSTRAP_SHA"
+            echo "Bootstrap CI run: $BOOTSTRAP_RUN"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The harness verifies repository formatting without writing (AST-preserving, idempotent), then
+      # builds the compiler CLI it runs the corpus with from the committed text.
+      # The native corpus itself is ~40 s of case time: not worth sharding.
+      - name: Build native formatter safety gate
+        run: node "$SILK_BOOTSTRAP" build --manifest-path compiler/format-gate.toml --optimization release-with-debug
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+      - name: Verify repository formatting, rebuild and run native corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          node "$SELFHOST_VERIFICATION" | tee "$RUNNER_TEMP/selfhost-corpus.log"
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          SELFHOST_VERIFICATION: ${{ steps.bootstrap.outputs.verification-path }}
+          SILKC: ${{ github.workspace }}/compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-compiler
+      - name: Capture formatted repository samples
+        run: |
+          python3 - "$RUNNER_TEMP/formatter-samples.md" <<'PYTHON'
+          import pathlib, sys
+          samples = ['compiler/src/lexer/Span.silk', 'compiler/src/format/ExpressionLayout.silk', 'packages/compiler/stdlib/silk/option.silk']
+          with open(sys.argv[1], 'w') as output:
+              for name in samples:
+                  lines = pathlib.Path(name).read_text().splitlines()[:65]
+                  output.write(f'### {name}\n\n```silk\n' + '\n'.join(lines) + '\n```\n\n')
+          PYTHON
+      - name: Check native format command on canonical repository source
+        working-directory: compiler
+        run: build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-compiler format src/lexer/Span.silk --check
+      - name: Check B11 parsed-source retention baseline
+        run: |
+          node --input-type=module - "$RUNNER_TEMP/selfhost-corpus.log" <<'JS'
+          import { readFileSync } from 'node:fs'
+          const lines = readFileSync(process.argv[2], 'utf8').split('\n')
+          // Preserve merged #615's baseline and exact-head verified Step 8 callable passes.
+          const baselinePasses = [
+            'trivial-features',
+            'foreign-libc-pointer-roundtrip',
+            'foreign-libc-floating',
+            'else-if-chain',
+            'scalar-reference-read',
+            'scalar-reference-write-through',
+            'operator-precedence',
+            'operator-negation-overflow-trap',
+            'mutable-scalar-loop',
+            'nested-loops',
+            'foreign-libc-abs',
+            'retained-if-let-match-binding',
+            'scalar-enum-equality-from-borrowed-variant',
+            'while-entry-backedge',
+            'generic-record-instances',
+            'generic-union-instances',
+            'generic-lifetime-selected-cleanup',
+            'anonymous-callable-capture-modes',
+            'captured-exclusive-reference-parameters',
+            'staged-callable-bindings',
+            'staged-callable-parameter',
+            'operator-pipeline',
+            'staged-callable-section',
+            'native-descriptor-write',
+            'callable-return-and-borrow-contracts',
+            'borrowed-capture-section',
+            'relayed-section',
+            'generic-item-pipeline-in-generic-owner',
+            'constrained-section-generic-owner',
+            'owner-typed-direct-section',
+            'option-result-combinators',
+            'opaque-callable',
+            'effect-nested-failure-propagation',
+            'effect-selective-catch-direct-stored',
+            'effect-ensuring-fallible-finalizer',
+            'role-keyed-service-provider-selection',
+            'owned-provider-shared-dispatch',
+            'constrained-callable-forwarding',
+            'constrained-section-two-applications',
+            'stdout-writer-hello',
+            'effect-higher-order-values',
+            'effect-return-site-join-once',
+            'finite-effect-join-capture-arity',
+            'match-statement-arm-control',
+            'effect-access-forwarding',
+            'opaque-effect',
+            'ordinary-union-executable-members',
+            'static-byte-view-bounds',
+          ]
+          const acceptedFailures = new Set([
+            'ecdsa-p256-verification',
+            'http-client-request',
+            'json-scanner',
+            'toml-scanner',
+            'borrowed-temporary-stream-suspension',
+            'integer-operation-matrix',
+            'float-operation-matrix',
+            'chacha20-poly1305',
+            'aes-gcm',
+            'rsa-verification',
+            'fixed-output-sha',
+            'pointer-parameter-write',
+            'foreign-libc-qsort-callback',
+            'foreign-libc-environ-static',
+            'secure-random-provider',
+          ])
+          const passes = new Set(lines.filter((line) => line.startsWith('PASS ')).map((line) => line.slice(5)))
+          for (const name of baselinePasses) {
+            if (!passes.has(name)) throw new Error(`Baseline PASS lost: ${name}`)
+          }
+          for (const line of lines.filter((line) => line.startsWith('FAIL '))) {
+            const name = line.slice(5).split(':', 1)[0]
+            if (!acceptedFailures.has(name)) throw new Error(`New corpus failure: ${line}`)
+          }
+          if (lines.some((line) => /(?:code=RUNTIME_MISMATCH|code=CORPUS_RUNNER_FAILURE|module-source:)/.test(line))) {
+            throw new Error('Corpus has a runtime mismatch, runner failure, or module-source gap')
+          }
+          const timings = lines.filter((line) => line.startsWith('SELFHOST_CASE_TIMING='))
+          const outcomes = lines.filter((line) => /^(?:PASS|FAIL|UNSUPPORTED) /.test(line))
+          if (timings.length !== outcomes.length || outcomes.length === 0) throw new Error('Incomplete corpus timing receipt')
+          console.log(`Preserved ${baselinePasses.length} baseline passes; remaining failures are accepted baseline programs`)
+          JS
+      - name: Upload corpus build timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-corpus-timings
+          path: ${{ runner.temp }}/selfhost-corpus.log
+          retention-days: 7
+
+      - name: Upload native formatter safety and samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-formatter-safety
+          path: |
+            ${{ runner.temp }}/formatter-safety.log
+            ${{ runner.temp }}/formatter-samples.md
+          retention-days: 7
+
+  # The shards run after merge, on branch pushes. A PR is gated on N0 and also reports N1 and the
+  # corpus; the shards would repeat the base branch's results while starving the runner queue.
+  cases:
+    name: Selfhost cases (${{ matrix.shard }})
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Measured CI time (2026-10-08), almost all of it compiling each test binary: the six
+          # semantic roots, split by topic over SemanticCaseSupport.silk, take 7-12 min each
+          # (static ~7, signatures ~11, conformance ~12, lowering ~11, captures ~10, callables
+          # ~11) where the single SemanticCases root took ~29 min and a 14 GiB heap. Callable
+          # ~10 min; target ~9 min; format-m1-hir ~3 min. Local peak RSS of a semantic root stays
+          # under 11.3 GB, so each keeps a 12 GiB heap.
+          - shard: semantic-static
+            roots: src/semantic/SemanticStaticCases.silk
+            heap: 12288
+          - shard: semantic-signatures
+            roots: src/semantic/SemanticSignatureCases.silk
+            heap: 12288
+          - shard: semantic-conformance
+            roots: src/semantic/SemanticConformanceCases.silk
+            heap: 12288
+          - shard: semantic-lowering
+            roots: src/semantic/SemanticLoweringCases.silk
+            heap: 12288
+          - shard: semantic-captures
+            roots: src/semantic/SemanticCaptureCases.silk
+            heap: 12288
+          - shard: semantic-callables
+            roots: src/semantic/SemanticCallableCases.silk
+            heap: 12288
+          - shard: callable
+            roots: src/semantic/CallableResultCases.silk
+            heap: 8192
+          - shard: target
+            roots: src/semantic/TargetCases.silk
+            heap: 8192
+          - shard: format-m1-hir
+            roots: src/format/FormatCases.silk src/M1Cases.silk src/hir/LoweringCases.silk
+            heap: 8192
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: ./.github/actions/setup-linux-llvm
+      - uses: ./.github/actions/download-bootstrap
+        id: bootstrap
+      # Source tests run on the checkout as written; the corpus job verifies formatter safety.
+      - name: Run ${{ matrix.shard }} source tests
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=${{ matrix.heap }}
+          SILK_BOOTSTRAP: ${{ steps.bootstrap.outputs.path }}
+          ROOTS: ${{ matrix.roots }}
+        run: |
+          set -euo pipefail
+          for root in $ROOTS; do
+            log="$RUNNER_TEMP/$(basename "$root" .silk).log"
+            echo "::group::$root"
+            node "$SILK_BOOTSTRAP" test --manifest-path compiler/silk.toml --root "$root" --no-cache | tee "$log"
+            node .github/scripts/check-selfhost-test-times.mjs "$log"
+            echo "::endgroup::"
+          done
+
+  # The required check: green only when every shard is green. A PR skips the shards.
+  silk:
+    name: Focused Linux Silk
+    if: always()
+    needs: [corpus, cases, native-seed-restore]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every shard
+        env:
+          CORPUS: ${{ needs.corpus.result }}
+          CASES: ${{ needs.cases.result }}
+          SEED: ${{ needs.native-seed-restore.result }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "corpus=$CORPUS cases=$CASES seed=$SEED event=$EVENT"
+          test "$CORPUS" = success && test "$SEED" = success
+          test "$CASES" = success || { test "$EVENT" = pull_request && test "$CASES" = skipped; }
