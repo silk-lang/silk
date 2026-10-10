@@ -117,7 +117,8 @@ readiness event.
 The readiness phase and the park generation are ordinary source policy in `silk.execution`. They
 live in two package control words that the compiler zeroes and never reads. A Wake carries its
 generation; signaling a Wake whose Execution was dropped, completed, or parked again publishes
-nothing.
+nothing. A cancelled generation's Wake is therefore inert: it can only release its package
+authority.
 
 **Diagnostics:** Reusing a consumed Wake reports the ordinary affine `OWN0001` diagnostic. Parking
 while an incompatible local-shared access loan is live reports `OWN0016` before lowering.
@@ -154,8 +155,12 @@ park-capable Effect reports `SEM0140`.
 **Status:** Confirmed
 
 Completion cleans the consumed outcome callback, fixed endpoint, body or continuation-owned values,
-and package allocation in their canonical ownership order. Dropping a dormant Execution cancels
-its Wake authority and cleans suspended state exactly once.
+and package allocation in their canonical ownership order. Dropping a parked Execution cancels it
+whether its generation is registering, latched, or dormant. Cancellation releases the parked frames
+from the innermost outward. Each frame drops every owner live at its suspension point, including
+the registration guard and borrowed-temporary holders, then releases its storage. A zero-sized
+owner with a drop hook is retained in its frame like any other, so its hook runs exactly once. The
+readiness endpoint is not invoked.
 
 If external source still owns the cancelled Wake, that Wake retains only the complete inert package
 allocation through its `Intrinsic.ExecutionRef`. Signaling or dropping it performs no notification
@@ -168,7 +173,9 @@ guard, endpoint, or suspended payload logically active, and it cannot resurrect 
 contract and do not promise post-trap cleanup.
 
 **Evidence:** [cleanup ownership model](../../../../packages/compiler/src/SuspensionOwnership.ts),
-[separation pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts).
+[separation pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts),
+[native corpus](../../../../packages/compiler/test/support/corpus.ts)
+(`independent-execution-zero-sized-guard-cancel`, `effect-borrowed-recovery-park-resume-cancel`).
 
 ### EXEC-006 — Scheduling policy remains ordinary source
 
