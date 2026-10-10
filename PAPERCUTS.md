@@ -515,3 +515,8 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-10 · A fresh corpus worktree lacked ignored toolchain identity inputs, so native fixture tests failed before discovery · Reused the current built bootstrap dependency graph and generated Unicode tables, then ran only the selected native cases · Silk
 2026-10-10 · A shared root checkout remained on an old selfhost commit while origin/selfhost advanced, making execution-notification probes use stale stdlib sources · Materialize a detached worktree at the exact canonical ref and pass its stdlib explicitly · Silk stage1 execution notification
+
+Native requirement-key probes need semantic acceptance assertions: a native typed-form gap at
+the original call can also represent a frontend Unsupported refusal. The exact actor exposed
+contract-first conformance proof returning Undetermined before the provider established the
+service-key arguments; final proof must compare the provider before its contract.

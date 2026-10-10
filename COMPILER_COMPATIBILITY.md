@@ -1813,6 +1813,8 @@ inferred exclusive bindings for independent filesystem and allocator providers.
   arguments inside service and role keys before closed requirement-row equality is decided. The
   comparison opens only its selected implementation and call owners; foreign seeds remain rigid,
   and key normalization preserves access and role identity.
+  Exact proof establishes the provider arguments before comparing its contract row; an
+  undetermined contract comparison made before those assignments cannot become evidence.
   Selected-head evidence is closed through its acyclic assignments before adoption. Rigid caller
   type, row and lifetime parameters are valid evidence; a remaining implementation or call slot
   remains unresolved.
