@@ -247,33 +247,67 @@ Each entry records:
   `compiler/src/semantic/SemanticLoweringCases.silk` and `cleanupReentryStaysWithinItsOwnedRoot` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
 
-### Static aggregate reflection subset in selfhost
+### Static aggregate reflection and authenticated fields in selfhost
 
-- **Status:** implemented on 2026-10-02 on PR #664 (B12 c39, decision D2); verification is pending
-  that PR's exact-head CI.
-- **Rule:** `Intrinsic.reflectType<Owner>()` yields the phase-only `Intrinsic.Type<Owner>`
-  descriptor, and `Intrinsic.reflectTypeKind<Owner>(descriptor)` yields the stable `silk.reflect`
-  kind code. Both exist only during static evaluation; a descriptor has no runtime representation.
-- **Compilers:** the bootstrap implements the complete reflection family, including fields and
-  field metadata. Selfhost implements only `reflectType` and `reflectTypeKind`, and only for a
-  source-declared struct (kind 0) or tuple (kind 1), during static evaluation. It has no
-  `reflectFields`, `reflectFieldKind`, `reflectFieldLabel`, `reflectFieldOrdinal`, or
-  `borrowField`, and no occurrence-generated aggregate kinds (2 and 3).
-- **Source migration:** none. `silk.reflect` keeps its source wrappers; selfhost checks
-  `Reflect.typeOf` and `Reflect.typeKind` and leaves the others unchecked until demanded.
-- **Diagnostics and limits:** in selfhost, a reflection call outside static evaluation, a runtime
-  signature mentioning `Intrinsic.Type<Owner>` (anchored at that authored type), and a descriptor
-  reaching runtime code through a selection pass are `StaticPhaseViolation`. A non-aggregate or
-  occurrence-generated owner is an `Unsupported` static evaluation failure for a missing intrinsic
-  operation, reported as `StaticViolation` at the `reflectTypeKind` call, never a fallback code. An
-  unlisted reflection member remains `UnknownMember`.
-- **Evidence:** in `compiler/src/semantic/SemanticStaticCases.silk`,
-  `selectedTypeSelectionReadsReflectedKinds` covers the two-type static selection,
-  `reflectedKindCodesMatchTheLibrary` covers both kind codes and the unsupported owner, and
-  `reflectedDescriptorsStayOutOfRuntimeCode` covers each runtime boundary. The shared corpus program
-  `static-type-selection` exercises the bootstrap natively.
-- **Open questions:** when selfhost needs fields, add the remaining members with the same
-  phase-only descriptor rules.
+- **Status:** static field reflection and authenticated runtime projection were added on
+  2026-10-10; focused source and behavioral verification is pending the combined change.
+- **Rule:** `Intrinsic.Type<Owner>`, `Intrinsic.Fields<Owner>`, and each exact heterogeneous
+  `Intrinsic.Field<Owner, Value>` are sealed phase-only families. Descriptors retain concrete
+  nominal or occurrence identity, declaration order, substituted member types, and the original
+  reflecting declaration's canonical visibility authority. Private fields are omitted outside
+  their declaring module. No descriptor has a runtime layout or can be embedded in runtime code.
+- **Compilers:** both implement `reflectType`, `reflectTypeKind`, `reflectFields`,
+  `reflectFieldKind`, `reflectFieldLabel`, and `reflectFieldOrdinal` for concrete struct, tuple,
+  record, and anonymous positional owners. Native field collections re-elaborate each static
+  iteration at that descriptor's exact `Field<Owner, Value>` type. Native `borrowField` consumes
+  the descriptor during specialization and emits an ordinary field projection and shared loan,
+  retaining the actual owner's lifetime. Omitted type arguments are inferred from the admitted
+  descriptor; explicit arguments must match its exact owner and substituted value type.
+- **Source migration:** none. `silk.reflect` remains ordinary source wrapping the sealed intrinsic
+  namespace. The compiler does not identify any standard-library declaration by spelling.
+- **Diagnostics and limits:** reflection outside static evaluation and descriptors reaching a
+  runtime parameter, result, or embedded value are `StaticPhaseViolation`. A non-aggregate owner,
+  asking a positional descriptor for a label, or asking a labeled descriptor for a positional
+  ordinal fails static evaluation. Descriptors participate in canonical static equality and region
+  numbering, retaining owner identity, ordinal, kind, label, and canonical authority; copied
+  descriptors preserve their private admission. Retained metadata and labels count toward the
+  static value budget, and aggregate/member queries retain source dependencies. Runtime projection
+  requires an actual shared reference, exact nominal or occurrence identity, and the descriptor's
+  original canonical visibility authority; owned and exclusive values do not gain shared access.
+- **Evidence:** `reflectedFieldCollectionsRetainExactCapabilities` in
+  `compiler/src/semantic/FieldReflectionCases.silk` checks applied generic value types, declaration
+  order, exact nominal identity, original authority, private-field filtering, positional members,
+  and the valid empty collection. Existing type-reflection claims in
+  `compiler/src/semantic/SemanticStaticCases.silk` retain their runtime-boundary assertions;
+  `staticFunctionControlUsesArgumentsAndCheckedLocals` includes heterogeneous and empty iteration.
+  `sealedFieldsCannotBeConstructedOrReturnedThroughAliases` rejects authored empty capabilities
+  and runtime aliases. `BorrowFieldCases.silk` retains ordinary projection/MIR erasure and strict
+  access, owner, and lifetime controls; the escape check pins the projected borrow initializer.
+- **Remaining work:** complete the focused actor execution and runtime controls, then prove the
+  requested formatting and JSON corpus on the integrated native seed.
+
+### Checked local control in native static functions
+
+- **Status:** added on 2026-10-10; focused behavioral verification is pending PR #1396.
+- **Rule:** STATIC-005 evaluates a static function in its concrete argument and checked local-value
+  context. Its static condition and finite iterable use those values, including earlier mutation.
+  A selected failure retains its authored diagnostic and publishes no partial selected body.
+- **Compilers:** both use argument values and checked prefixes for local static selection. Native
+  static bodies are keyed by complete application and arguments; each static iteration retains
+  its concrete element type, fresh locals, and authenticated node range. Reached conditions resolve
+  their own calls without admitting inactive arms. Nested mixed static iterations retain their
+  enclosing contexts.
+- **Diagnostics and limits:** changing a checked static selection inside ordinary control is
+  diagnosed as `StaticPhaseViolation` instead of executing a stale arm. This remains an
+  implementation boundary in both compilers. Native mixed iterations still refuse generated
+  return/fail/break/continue, closures and Effects where their existing residual contracts do not
+  admit them. These refusals do not change the prescriptive language rule.
+- **Evidence:** `staticFunctionControlUsesArgumentsAndCheckedLocals` and
+  `nestedMixedLoopsRetainIndependentIterationContexts` in
+  `compiler/src/semantic/SemanticStaticCases.silk` retain opposite arguments, mutable and nested
+  local selections, early returns, phase-only locals, per-iteration mutation, zero-body silence,
+  selected CompileError spans, changing-selection refusal, and failure atomicity. Existing static
+  control and aggregate actors remain in the coordinated proof root.
 
 ### Module static selection subset in selfhost
 
@@ -1731,7 +1765,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 
 - **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
 - **Native subset:** focused locally verified on 2026-10-07. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or stored member types.
-- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; reflected collections, nested static-for, generated closures/Effects, authored return/fail/break/continue inside iterations and newly generated loans remain unsupported. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
+- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; generated closures/Effects, authored return/fail/break/continue inside mixed iterations and authored generated borrows remain unsupported. Reflected collections, authenticated field projections, and nested iteration support are tracked by the control and reflection entries above. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
 - **Evidence:** the pre-repair optimized native reduction rejected the whole static-for as typed-form; the no-loop phase control rejected the sealed sequence type as core-type. The focused existing-actor run passed five tests in 50 ms, including distinct iteration locals, exact selected callee/MIR arguments, empty-body non-elaboration, borrowed outside storage and exact refusal codes/spans. Its timing gate passed; production pinned-bootstrap checking also passed. After integrating canonical finite lifetime meets, the same five focused tests passed in 8 ms on 2026-10-08. Sealed static sequences participate in the complete numbering transaction, including retained types and charged child traversal. This entry claims no optimized N0, SHA2 lowering, gap removal, N1 artifact or smoke success.
 
 ### Selfhost preserves unchanged inexact capture-loop availability
