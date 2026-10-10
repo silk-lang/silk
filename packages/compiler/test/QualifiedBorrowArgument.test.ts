@@ -10,6 +10,30 @@ const ascii = (value: string): Uint8Array =>
 const codes = (snapshot: Analysis.Snapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code)
 
+it.effect('requires an explicit shared reborrow of an exclusive reference', () =>
+  Effect.gen(function* () {
+    const source = `fn read(value: &i32) -> i32 { return value.* }
+fn rejected(value: &mut i32) -> i32 { return read(move value) }
+fn accepted(value: &mut i32) -> i32 { return read(&value.*) }
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* AnalysisFixture.retainingMain('borrow/access-mode', ascii(source))
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map(({ code, span }) => ({
+        code,
+        start: span.start,
+        end: span.end,
+      })),
+      [
+        {
+          code: 'SEM0052',
+          start: source.indexOf('read(move value)'),
+          end: source.indexOf('read(move value)') + 'read(move value)'.length,
+        },
+      ],
+    )
+  }),
+)
+
 /** A qualified member call accepts a shared borrow argument. */
 const shared = `import silk.vector { Vector }
 

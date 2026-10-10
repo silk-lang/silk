@@ -2363,6 +2363,54 @@ export const containsLexicalBorrow = (
   )
 }
 
+/** A struct or tuple holding a descriptor or static sequence has no runtime representation. */
+export const containsStaticPhaseOnly = (self: Index, type: Type.Type): boolean =>
+  staticPhaseWithin(self, type, new Set(), new Set())
+
+const staticPhaseWithin = (
+  self: Index,
+  type: Type.Type,
+  seen: ReadonlySet<string>,
+  inspected: Set<string>,
+): boolean => {
+  if (Type.containsStaticPhaseOnly(type)) return true
+  for (const nominal of Type.nominals(type)) {
+    const key = `${nominal.module}:${nominal.name}`
+    if (seen.has(key)) continue
+    // A generic field and its written type argument often reach the same application. Inspect
+    // that application once across the whole search, while guarding growth on the current path.
+    const application = Type.key(nominal)
+    if (inspected.has(application)) continue
+    inspected.add(application)
+    const declaration = byCanonical(self, {
+      _tag: 'CanonicalDeclarationId',
+      module: nominal.module,
+      name: nominal.name,
+    })
+    if (declaration?._tag !== 'StructDeclaration') continue
+    const substitution =
+      TypeInference.substitution(
+        declaration.typeParameters.map((parameter) => parameter.type),
+        nominal.arguments,
+      ) ?? new Map()
+    const next = new Set(seen).add(key)
+    if (
+      declaration.fields.some(
+        (field) =>
+          field.declaredType._tag === 'Resolved' &&
+          staticPhaseWithin(
+            self,
+            Type.substitute(field.declaredType.type, substitution),
+            next,
+            inspected,
+          ),
+      )
+    )
+      return true
+  }
+  return false
+}
+
 /** One stored bare-callable occurrence that denies an aggregate type a target layout. */
 export interface StoredExecutable {
   readonly path: ReadonlyArray<string>
