@@ -412,6 +412,70 @@ export const analyzeStatements = (
   const staticDiagnostic = (failure: Evaluation.StaticFailure): Diagnostic.Located =>
     Evaluation.diagnostic(failure, context.staticContext?.environment.target ?? 'unselected-target')
 
+  const staticEntry =
+    context.declaration.phase === 'Static' &&
+    context.staticContext !== undefined &&
+    context.resolution.deferStaticCalls !== true
+      ? {
+          values: new Map(context.staticContext.values),
+          valueSpans: new Map(context.staticContext.valueSpans),
+          valueOrigins: new Map(context.staticContext.valueOrigins),
+        }
+      : undefined
+  const reachStaticControl = (expanded: ReadonlyArray<Tir.Statement> = []): boolean => {
+    if (staticEntry === undefined || context.staticContext === undefined) return true
+    const staticContext = context.staticContext
+    // Selected arms flatten into their parent and can already have evaluated their own prefix.
+    // Replay from this block's entry so those local replacements are applied exactly once.
+    const values = new Map(staticEntry.values)
+    for (const binding of context.bindings) {
+      if (binding.staticIteration !== true || binding.staticValue === undefined) continue
+      values.set(Evaluation.localValueKey(binding), binding.staticValue)
+      values.set(
+        Evaluation.tirLocalKey(BodyBuilder.localId(construction(context), binding.id)),
+        binding.staticValue,
+      )
+    }
+    const valueSpans = new Map(staticEntry.valueSpans)
+    const valueOrigins = new Map(staticEntry.valueOrigins)
+    const completed = Evaluation.evaluateStatementSequence(
+      staticContext.nodes.statements([...facts, ...expanded]),
+      {
+        ...staticContext,
+        values,
+        valueSpans,
+        valueOrigins,
+        lookup: (id) =>
+          context.resolution.generatedAggregates?.get(`${id.module}:${id.name}`) ??
+          staticContext.lookup(id),
+      },
+    )
+    if (completed._tag === 'Failed') {
+      staticContext.recordFailure?.(completed.failure)
+      context.diagnostics.push(staticDiagnostic(completed.failure))
+      return false
+    }
+    if (completed._tag === 'Transfer') {
+      // This boundary is unreachable after a return; its prefix has not initialized later locals.
+      if (completed.control._tag === 'Return') return true
+      context.diagnostics.push(
+        staticDiagnostic(
+          Evaluation.phaseViolation(
+            'Evaluation.evaluateStatements',
+            'loop transfer escaped its lexical loop',
+            completed.span,
+            staticContext.trace,
+          ),
+        ),
+      )
+      return false
+    }
+    replaceMap(staticContext.values, values)
+    replaceMap(staticContext.valueSpans, valueSpans)
+    replaceMap(staticContext.valueOrigins, valueOrigins)
+    return true
+  }
+
   const analyzePatternSelection = (
     element: Extract<
       AuthoredHir.Statement,
@@ -987,6 +1051,7 @@ export const analyzeStatements = (
     }
 
     if (element._tag === 'StaticForStatement') {
+      if (!reachStaticControl()) continue
       const checkpoint = staticExpansionCheckpoint()
       const iterableNode = element.iterable
       const iterable = analyzeExpression(
@@ -1048,6 +1113,10 @@ export const analyzeStatements = (
       const scopes: Array<StaticIterationFact['scopes'][number]> = []
       let failed = false
       for (const [ordinal, current] of elements.entries()) {
+        if (ordinal > 0 && !reachStaticControl(scopes.flatMap((scope) => scope.statements))) {
+          failed = true
+          break
+        }
         const iterationTrace = Evaluation.appendTrace(
           context.staticContext.trace,
           Evaluation.staticIterationFrame(ordinal, current.value, Location.at(element.anchor)),
@@ -1158,6 +1227,7 @@ export const analyzeStatements = (
 
     if (element._tag === 'StaticConditionalStatement') {
       if (context.staticContext === undefined) continue
+      if (!reachStaticControl()) continue
       const conditionNode = element.condition
       const condition = analyzeExpression(
         context.context,
@@ -1187,6 +1257,14 @@ export const analyzeStatements = (
         )
         continue
       }
+      if (context.declaration.phase === 'Static' && context.resolution.deferStaticCalls === true)
+        append({
+          _tag: 'ExpressionStatement',
+          expression: expressionNode(condition),
+          staticSelection: evaluated.value.value,
+          region: nextRegion(),
+          anchor: element.condition.anchor,
+        })
       // Both authored arms are present; selection picks one and the other is not elaborated.
       const branch = evaluated.value.value ? element.thenBranch : element.elseBranch
       // `else static if …` chains the next conditional where a block would be: it is analyzed as

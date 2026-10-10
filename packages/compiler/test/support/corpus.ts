@@ -94,6 +94,12 @@ import {
   affineBorrowedStream,
 } from './borrowedOutcomes.js'
 import { storedCatchSuspension } from './storedCatchSuspension.js'
+import {
+  foreignUnwindFixture,
+  foreignDirectUnwind,
+  foreignCallbackUnwind,
+  foreignIndirectUnwind,
+} from './foreignUnwind.js'
 
 // Folded from Transcendental.test.ts: every runtime bit pattern is committed independently of the
 // compiler implementation. `referenceBits` records the high-precision oracle; `acceptedBits`
@@ -10968,6 +10974,27 @@ pub fn main() -> i32 {
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'foreign-direct-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignDirectUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
+  },
+  {
+    name: 'foreign-callback-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignCallbackUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
+  },
+  {
+    name: 'foreign-indirect-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignIndirectUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
   },
   {
     name: 'foreign-libc-environ-static',

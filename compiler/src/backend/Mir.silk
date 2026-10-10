@@ -36,6 +36,7 @@ import semantic.NativeAssembly
 import semantic.NativeAssembly {Memory as AssemblyMemory}
 import semantic.ScalarOperation {Code as ScalarCode, Scalar, ScalarOperation}
 import semantic.TypedBody {
+  CallableCallInputs,
   ConsumedPlace as BodyConsumedPlace,
   Expression as BodyExpression,
   PlaceRoot as BodyPlaceRoot,
@@ -302,6 +303,8 @@ pub union Callee {
   Extern {pub declaration: Shared<DeclarationId>, pub variadicArguments: Vector<CAbi.VariadicArgument>},
   /// A Silk function reached through its address: an observer callback (N4).
   Indirect {pub address: Operand},
+  /// A synchronous native C pointer, retaining its closed scalar ABI signature.
+  NativeIndirect {pub address: Operand, pub signature: Shared<Type>},
 }
 
 pub struct Block {
@@ -824,6 +827,7 @@ union View {
   Integer {ty: Shared<Type>, literal: HirId, origin: Origin},
   Embedded {value: Shared<StaticData>, ty: Shared<Type>, origin: Origin},
   ForeignStatic {declaration: Shared<DeclarationId>, ty: Shared<Type>, origin: Origin},
+  ForeignAddress {declaration: Shared<DeclarationId>, symbol: Shared<Bytes>, ty: Shared<Type>, origin: Origin},
   Float {ty: Shared<Type>, literal: HirId, origin: Origin},
   Text {ty: Shared<Type>, literal: HirId, origin: Origin},
   Boolean {value: bool, origin: Origin},
@@ -1245,6 +1249,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
               }
             }
             return View.Unsupported {origin: origin}
+          }
+          BodyExpression.ForeignAddress {declaration, symbol} => View.ForeignAddress {
+            declaration: Shared.clone<DeclarationId>(&declaration), symbol: Shared.clone<Bytes>(&symbol),
+            ty: Shared.clone<Type>(&ty), origin: origin,
           }
           BodyExpression.ForeignStatic {declaration} => View.ForeignStatic {
             declaration: Shared.clone<DeclarationId>(&declaration), ty: Shared.clone<Type>(&ty), origin: origin,
@@ -3605,6 +3613,40 @@ effect fn expressionPlace(
   }
 }
 
+fn nativePointerSignature(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.ForeignFunction {signature, ..} => Option.some<Shared<Type>>(Shared.clone<Type>(&signature))
+    _ => Option.none<Shared<Type>>()
+  }
+}
+
+effect fn nativeIndirectCall(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
+  callNode: BodyNodeId, callee: BodyNodeId, count: usize, result: &Shared<Type>, signature: Shared<Type>, origin: Origin) -> Operand
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let address = run expression(&mut builder.*, body, hir, callee)
+  if !builder.live { return Operand.Unit }
+  let mut arguments = Vector.make<Operand>()
+  let mut at = usize.ONE
+  while at < count {
+    let child = match move childAt(body, callNode, at) {
+      Option<BodyNodeId>.Some {value} => value
+      _ => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
+    }
+    let argument = run expression(&mut builder.*, body, hir, child)
+    if !builder.live { return Operand.Unit }
+    run Vector.append<Operand>(&mut arguments, move argument)
+    at = at + usize.ONE
+  }
+  let output = run temporary(&mut builder.*, result, origin)
+  let continuation = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Call {callee: Callee.NativeIndirect {address: move address, signature: move signature},
+    arguments: move arguments, providers: Vector.make<Operand>(), diagnostics: Option.none<Diagnostics>(),
+    destination: place(output), normal: continuation, failure: Option.none<FailureEdge>(), origin: origin})
+  resume(&mut builder.*, continuation)
+  return Operand.Copy {place: place(output)}
+}
+
 effect fn callCallee(builder: &mut Builder, foreign: Option<Shared<DeclarationId>>, variadicArguments: Option<Shared<Vector<CAbi.VariadicArgument>>>, node: BodyNodeId,
   owner: &Shared<DeclarationId>, origin: Origin) -> Callee
 ! Gap | CanonicalizationFailure | OutOfMemoryError
@@ -4376,6 +4418,13 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       }
     }
     // One read of a foreign C object lands in a temporary; its symbol is a separate C edge.
+    View.ForeignAddress {declaration, symbol, ty, origin} => {
+      let key = InstanceKey.Export {function: move declaration, symbol: move symbol}
+      run Vector.append<Reference>(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&key), edge: Edge.Direct, origin: origin})
+      let output = run temporary(&mut builder.*, &ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.FunctionAddress {key: move key}, origin)
+      return Operand.Copy {place: place(output)}
+    }
     View.ForeignStatic {declaration, ty, origin} => {
       run Vector.append<Shared<DeclarationId>>(&mut builder.*.function.externs, Shared.clone<DeclarationId>(&declaration))
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -4587,6 +4636,17 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Call {environment, foreign, variadicArguments, count, node: callNode, ty, origin} => {
+      if environment {
+        if let Option<CallableCallInputs>.Some {value: input} = move TypedBody.callableCall(body, callNode) {
+          let receiver = run instanceNodeType(&builder.*, body, input.callee)
+          if let Option<Shared<Type>>.Some {value: pointer} = move receiver {
+            let signature = Shared.with<Type, Option<Shared<Type>>>(&pointer, nativePointerSignature)
+            if let Option<Shared<Type>>.Some {value: contract} = move signature {
+              return run nativeIndirectCall(&mut builder.*, body, hir, callNode, input.callee, count, &ty, move contract, origin)
+            }
+          }
+        }
+      }
       // An interface operation a scalar intrinsic implements runs that operation in place.
       if let Option<IntrinsicMember>.Some {value: witnessed} = move witnessIntrinsic(&builder.*, callNode) {
         let operation = run intrinsicRvalue(&mut builder.*, body, hir, callNode, witnessed, &ty, origin)
@@ -8369,6 +8429,9 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     View.Embedded {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
+    View.ForeignAddress {..} => {
+      run discard(&mut builder.*, body, hir, id)
+    }
     View.ForeignStatic {..} => {
       run discard(&mut builder.*, body, hir, id)
     }
@@ -9210,6 +9273,10 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     View.Unit {origin} => View.Unit {origin: origin}
     View.Embedded {value, ty, origin} => View.Embedded {
       value: move value, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
+    }
+    View.ForeignAddress {declaration, symbol, ty, origin} => View.ForeignAddress {
+      declaration: Shared.clone<DeclarationId>(&declaration), symbol: Shared.clone<Bytes>(&symbol),
+      ty: Shared.clone<Type>(&ty), origin: origin,
     }
     View.ForeignStatic {declaration, ty, origin} => View.ForeignStatic {
       declaration: move declaration, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,

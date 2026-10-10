@@ -1474,6 +1474,8 @@ type StatementNode =
     }
   | {
       readonly _tag: 'Evaluate'
+      /** The arm selected while checking a deferred static condition. */
+      readonly staticSelection?: boolean
       readonly expression: Expression
       readonly region: RegionId
       readonly span: SourceSpan.SourceSpan
@@ -2752,7 +2754,7 @@ const encodeStatement = (statement: Statement, depth: number): string => {
       return `${indent}pattern-bind ${statement.selection.access.toLowerCase()} members=${statement.selection.members.map(Match.encodeIdentity).join(',')} r${statement.region.ordinal} ${originText(statement.origin)}`
     case 'Evaluate':
       return [
-        `${indent}evaluate r${statement.region.ordinal} ${originText(statement.origin)}`,
+        `${indent}evaluate${statement.staticSelection === undefined ? '' : ` static-selection=${statement.staticSelection}`} r${statement.region.ordinal} ${originText(statement.origin)}`,
         encodeExpression(statement.expression, depth + 1),
       ].join('\n')
     case 'Write': {
