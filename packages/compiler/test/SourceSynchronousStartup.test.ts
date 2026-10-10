@@ -130,7 +130,7 @@ it.effect(
         [
           'parking',
           prefix +
-            'import silk.execution { Execution }\nfn register(wake: Intrinsic.Wake) -> () { drop wake }\npub effect fn main() -> i32 ! HostInputError ? &mut HostInput { let count = run HostInput.argumentCount() run Execution.park(register) return 17 }',
+            'import silk.execution { Execution, Wake }\nfn register(wake: Wake) -> () { drop wake }\npub effect fn main() -> i32 ! HostInputError ? &mut HostInput { let count = run HostInput.argumentCount() run Execution.park(register) return 17 }',
         ],
       ] as const
       const observed = []

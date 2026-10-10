@@ -15,6 +15,7 @@ import {
   nativeSocketDarwinWitnessSource,
   nativeSocketGnuWitnessSource,
 } from './support/nativeSocketAcceptance.js'
+import { relinquishedReleases } from './support/relinquishedFrames.js'
 
 const implementation = readFileSync(
   new URL('../stdlib/silk/native_socket.silk', import.meta.url),
@@ -67,11 +68,9 @@ it.effect(
         'socket',
       ])
       if (snapshot.mir._tag === 'Available') {
-        const parks = snapshot.mir.value.functions
-          .flatMap(MirVerification.operations)
-          .filter((operation) => operation._tag === 'ExecutionPark')
+        const parks = relinquishedReleases(snapshot.mir.value)
         assert.isAtLeast(parks.length, 1)
-        assert.isTrue(parks.some((park) => park.guardCleanup._tag !== 'NoCleanup'))
+        assert.isTrue(parks.some((releases) => releases.length > 0))
       }
     }),
   120000,
