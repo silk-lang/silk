@@ -28,8 +28,8 @@ Observation is a whole-program switch, as in the bootstrap and Zig. A program th
 function two hidden addresses: the current observer and the failure the current handler is
 recovering from. Its fallible functions also return the failure's context.
 
-The first native step is origin only: identity and origin, no logical frames and no `while
-handling` causes. Frames and causes follow (N7) on the same `FailureContext` statements.
+The first native step was origin only: identity and origin. N7 adds logical frames and `while
+handling` causes on the same `FailureContext` statements; observed traps (event 6) follow.
 
 ## 1. What the bootstrap does
 
@@ -176,11 +176,11 @@ origin }`, then the drop chain and `Fail`. The texts it stores live in the funct
   out-address, so a call edge needs no statement.
 - **Selection.** `Rvalue.ContextOf(slot)` is the address of a slot's companion, passed as a handler's
   cause.
-- **Discard.** A handler that succeeds simply stops using the caught companion. Origin-only context
-  owns no resource.
+- **Discard.** A handler that succeeds simply stops using the caught companion; N7 releases its
+  pool node.
 
-Layout gives every failure slot a fixed-size companion of four words, laid out as
-`[string<'static>; 2]` (identity, label). The `Failure` local's companion is the caller's
+Layout gives every failure slot a fixed-size companion of five words: `[string<'static>; 2]`
+(identity, label), then the observer pool handle (N7). The `Failure` local's companion is the caller's
 `%context` out-address; every other failure slot that a statement, a `ContextOf` or an observing
 call edge names gets its own companion in the frame. Identity is the canonical type name
 (`module.Name<Arguments>`, primitives by spelling, `()`); other failure types report the
@@ -203,15 +203,15 @@ f(arguments..., providers..., observer, cause, success: address, failure: addres
 
   ```text
   Branch(observer != null & cause != null) -> bb1, bb2
-  bb1: Call (*observer)[0]((*observer)[1], 5u8, 0, 0, (*cause)[0], (*cause)[1])
+  bb1: Call (*observer)[0]((*observer)[1], 5u8, (*cause).handle, 0, (*cause)[0], (*cause)[1])
          diagnostics (null, null) -> _r
   bb2: _r = 0
   ```
 
   Without observation it is the constant `0`, which is what the bootstrap's null observer returns.
-  Origin-only context passes handle `0`, so `native_diagnostics` prints the identity and origin
-  followed by `  [trace truncated]`. The trace marker is the honest TERM-004 presentation of
-  missing frames.
+  The cause's pool handle (N7) lets `native_diagnostics` print the logical frames and causes. A
+  handle `0` (a refused node) prints the identity and origin followed by `  [trace truncated]`,
+  the honest TERM-004 presentation of missing frames.
 
 Both readers stay sealed `Intrinsic` members. The compiler knows only the callback's event
 protocol, never `NativeDiagnostics`, `NativeReport` or the report policy.
@@ -239,19 +239,27 @@ protocol, never `NativeDiagnostics`, `NativeReport` or the report policy.
   modes' MIR in the query cache. Dropping the unobserving answers after the switch is a memory
   follow-up.
 
-### N7. Logical frames and causes (follow-up)
+### N7. Logical frames and causes
 
-The follow-up attaches to the same `FailureContext` statements and hidden operands.
+N7 attaches to the same `FailureContext` statements and hidden operands. Every event call is guarded
+by a non-null observer and calls the callback as an independent edge, like `observeUnhandled`.
 
-- The companion gains a `handle` (a node of the observer's pool, `0` when refused).
-- An originating statement calls the callback with event 0, then event 2 with the selected cause's
-  handle when one is selected, and releases the plain node, matching the bootstrap order.
-- A carrying statement on a `run` site's failure edge calls event 1 with the propagating caller's
-  label. Carries inside one expansion do not.
-- A selected handler that succeeds, an overwritten companion and a dropped temporary call event 4.
-- `observeUnhandled` passes the cause's handle. Observed traps call event 6 before `Trap`.
-- Releasing on every exit makes the companion a cleanup owner. That is the one real change to
-  Step 6's cleanup stack.
+- The companion's fifth word is a `handle`: a node of the current observer's pool, `0` when refused
+  or unobserved. `Rvalue.ContextHandle` reads it through a companion address and
+  `Statement.SetContextHandle` writes it.
+- An originating `fail` (and an allocation refusal, which now originates like `fail`) calls event 0
+  with the companion's identity and label. When a cause is selected it then calls event 2 with that
+  cause's handle and releases the plain node (event 4), matching the bootstrap order.
+- `propagateFailure`, the one place a failure leaves its function, calls event 1 with the run site's
+  label, then releases the previous node; the new node holds the reference. A catch sink, a residual
+  member and a finalizer hold carry the handle without an event, so a failure caught inside an
+  expansion gains no frame.
+- A failure's node dies only when a selected handler finishes, on success or failure. The handler's
+  plan call releases the caught companion's node on both continuations; a failure raised in the
+  handler has already retained it as its cause. No other path drops a failure slot, so the cleanup
+  stack needs no companion owners.
+- `observeUnhandled` passes the cause's handle.
+- Observed traps call event 6 before `Trap` (follow-up).
 
 Drop glue already takes the hidden pair in observing programs, so `Drop` hooks observe like any
 other function; N7 needs no drop-glue key change.
@@ -287,19 +295,20 @@ callable-value follow-up owns it.
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
-| Area                                | Bootstrap                                                                                          | Native after the origin-only step                                                                | Observable?                                        |
+| Area                                | Bootstrap                                                                                          | Native after N7 frames and causes                                                                | Observable?                                        |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------- |
 | observer reach                      | whole-program switch, every function, callback dispatch through a pointer                          | the same: whole-program switch, every function, callback called through the record's address     | no                                                 |
-| context content                     | pool handle plus fallback identity and origin                                                      | identity and origin                                                                              | yes: no frames, report ends in `[trace truncated]` |
-| causes (TERM-006)                   | `while handling` chains                                                                            | none                                                                                             | yes                                                |
+| context content                     | pool handle plus fallback identity and origin                                                      | the same                                                                                         | no                                                 |
+| causes (TERM-006)                   | `while handling` chains                                                                            | the same                                                                                         | no                                                 |
 | fatal traps (TERM-008)              | observed traps report event 6                                                                      | bare trap                                                                                        | yes                                                |
 | SEM0216, SEM0217                    | executable-closure analysis                                                                        | not diagnosed; a context-free `observeUnhandled` returns `0`                                     | yes: missing compile-time diagnostics              |
 | `observeDiagnostics` type arguments | required (SEM0051 when omitted); a fallible body or misshapen callback is SEM0012 at that argument | inferred from the operands when omitted; the same mismatches are `TypeMismatch` at that argument | yes: selfhost accepts the omitted form             |
 
-**COMPILER_COMPATIBILITY.md:** the PR that first lowers `observeUnhandled` adds one entry, "Selfhost
-failure reports carry origin only", listing the rows above with their exit conditions (N7 for
-frames, causes and fatal traps; the suspension-stage analysis pass for SEM0216 and SEM0217).
-It is not added before then, as the Effect note §5 requires. The entry-shim entry is unchanged.
+**COMPILER_COMPATIBILITY.md:** the PR that first lowered `observeUnhandled` added the entry
+"Selfhost failure reports carry origin only". N7's frames and causes retired those rows; the entry
+is now "Selfhost observed traps stay bare and observation checks are partial" and lists the
+remaining rows with their exit conditions (N7's event 6 for fatal traps; the suspension-stage
+analysis pass for SEM0216 and SEM0217). The entry-shim entry is unchanged.
 
 ## 6. Tests and corpus
 
@@ -324,7 +333,7 @@ CI must still show 0 FAIL and no lost PASS.
 2. **Origin-only context and both readers.** Typing of both intrinsics, `Composition.Observe`,
    `RunPlan.Observe`, the whole-program switch, hidden locals, `FailureContext`, companions, recipe
    and LLVM, the compatibility entry, and the Effect note's §4, §5 and §7 updated.
-3. **Frames and causes** (N7), then fatal traps.
+3. **Frames and causes** (N7, done), then fatal traps.
 4. **SEM0216 and SEM0217**, with the suspension stage's executable-closure summary.
 
 ## 8. Privilege
