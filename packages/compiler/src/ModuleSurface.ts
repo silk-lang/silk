@@ -2559,6 +2559,7 @@ const conformance = (value: DeclarationFacts.ConformanceFact): string =>
         ]),
       ),
     ),
+    array(value.constraints.map(constraint)),
     array(
       value.operations.map((operation) =>
         record('ConformanceOperation', [
