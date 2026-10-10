@@ -177,12 +177,12 @@ enum RedirectProducerFailure { Failed }
 enum RedirectCallbackFailure { Failed }
 enum RedirectAcquisitionFailure { Rejected }
 
-service RedirectFactoryRequirement {}
-service RedirectProducerRequirement {}
-service RedirectCallbackRequirement {
+pub service RedirectFactoryRequirement {}
+pub service RedirectProducerRequirement {}
+pub service RedirectCallbackRequirement {
   effect fn accepted() -> bool ? &mut RedirectCallbackRequirement
 }
-service RedirectAcquisitionRequirement {
+pub service RedirectAcquisitionRequirement {
   effect fn accepted() -> bool ? &mut RedirectAcquisitionRequirement
 }
 
