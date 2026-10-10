@@ -2429,7 +2429,7 @@ pub effect fn main() -> i32 { return run risky() }`
 
 it.effect('offers compiling requirement propagation and provision actions', () =>
   Effect.gen(function* () {
-    const source = `service Clock { effect fn read() -> i32 ? &Clock }
+    const source = `pub service Clock { effect fn read() -> i32 ? &Clock }
 struct FixedClock {}
 effect fn read(self: &FixedClock) -> i32 { return 42 }
 impl Clock for FixedClock { read: FixedClock.read }
