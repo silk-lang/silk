@@ -7326,6 +7326,114 @@ const independentExecutionLatchedDestroy = readFileSync(
   new URL('../../conformance/execution-storage/latched-destroy.silk', import.meta.url),
   'utf8',
 )
+/**
+ * A failure caught again after its handler rethrows, and one caught in a loop, under an observer
+ * that counts live diagnostics: each handler runs while its failure is live, every node produced is
+ * released, and none is live when the observer state drops.
+ */
+const diagnosticReleaseBalance = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+
+struct State {
+  live: i32
+  produced: i32
+  released: i32
+  handled: i32
+  bad: i32
+  closed: i32
+}
+struct Observer { state: Shared<State> }
+fn closeObserver(state: &mut State) -> () {
+  if state.live != 0 { state.bad = state.bad + 1 }
+  state.closed = state.closed + 1
+  return ()
+}
+impl Drop for Observer {
+  fn drop(self: &mut Observer) -> () { Shared.withMut(&self.state, closeObserver) return () }
+}
+fn event(state: &mut State, event: u8, first: usize) -> usize {
+  if event == 0 || event == 1 || event == 2 {
+    state.live = state.live + 1
+    state.produced = state.produced + 1
+    return 1
+  }
+  if event == 4 && first != 0 {
+    state.live = state.live - 1
+    state.released = state.released + 1
+  }
+  return 0
+}
+fn observe(state: &mut Observer, operation: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize {
+  return Shared.withMut(&state.state, event(operation, first))
+}
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+  return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
+}
+// A handler runs while the failure it handles is still a live diagnostic.
+fn handling(state: &mut State) -> () {
+  if state.live <= 0 { state.bad = state.bad + 1 }
+  state.handled = state.handled + 1
+  return ()
+}
+struct First { state: Shared<State> }
+struct Second { state: Shared<State> }
+effect fn deep(state: Shared<State>) -> i32 ! First { fail First { state: move state } }
+effect fn middle(state: Shared<State>) -> i32 ! First { return run deep(move state) }
+effect fn rethrow(error: First) -> i32 ! Second {
+  Shared.withMut(&error.state, handling)
+  let First { state } = move error
+  fail Second { state: move state }
+}
+effect fn settle(error: Second) -> i32 {
+  Shared.withMut(&error.state, handling)
+  drop move error
+  return 7
+}
+effect fn settleFirst(error: First) -> i32 {
+  Shared.withMut(&error.state, handling)
+  drop move error
+  return 3
+}
+effect fn caughtAgain(state: Shared<State>) -> i32 {
+  let inner = Effect.catchAll(middle(move state), rethrow)
+  return run Effect.catchAll(move inner, settle)
+}
+effect fn caughtInLoop(state: Shared<State>) -> i32 {
+  let mut total = 0
+  let mut at = 0
+  while at < 3 {
+    total = total + run Effect.catchAll(middle(Shared.clone(&state)), settleFirst)
+    at = at + 1
+  }
+  return total
+}
+fn balanced(state: &mut State) -> i32 {
+  if state.bad != 0 || state.closed != 1 || state.live != 0 { return -1 }
+  if state.produced == 0 || state.released != state.produced { return -1 }
+  return state.handled
+}
+effect fn exercise(again: bool) -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let state = run Shared.make<State>(State { live: 0, produced: 0, released: 0, handled: 0, bad: 0, closed: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if again {
+    let value = run observing(Observer { state: Shared.clone(&state) }, observe, caughtAgain(Shared.clone(&state)))
+    if value != 7 { return -1 }
+  } else {
+    let value = run observing(Observer { state: Shared.clone(&state) }, observe, caughtInLoop(Shared.clone(&state)))
+    if value != 9 { return -1 }
+  }
+  return Shared.withMut(&state, balanced)
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  if (run exercise(true)) != 2 { return 1 }
+  if (run exercise(false)) != 3 { return 2 }
+  return 42
+}
+effect fn noMemory(error: OutOfMemoryError) -> i32 { return 3 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), noMemory) }`
+
 export const independentExecutionFinalizedDestroy = readFileSync(
   new URL('../../conformance/execution-storage/finalized-destroy.silk', import.meta.url),
   'utf8',
@@ -10854,6 +10962,11 @@ pub effect fn main() -> () ! SomeError { return () }`,
     nativeStderr: '',
     nativeRuns: [{}, { arguments: ['one', 'two'] }],
     expected: { _tag: 'Completes', result: 0 },
+  },
+  {
+    name: 'diagnostic-observer-release-balance',
+    source: diagnosticReleaseBalance,
+    expected: { _tag: 'Completes', result: 42 },
   },
   {
     name: 'native-termination-logical-path',
