@@ -1751,8 +1751,10 @@ repeated invocation and capture-only drop glue.
   invocation ordinal 0; once transport retains shared actual storage through concrete MIR.
   Its source-written negatives distinguish fixed Static, unproved/reversed bounds, exclusive
   content and fixed inner-lifetime preservation, unsafe authority, once storage, retained environments,
-  and embedded proof rigids. Missing or reversed invocation premises retain the existing
-  `Unsupported` result from bound proof; these cases are not admitted. The named-result control in
+  and embedded proof rigids. The scalar bound-proof control retains `Unsupported`.
+  The missing/reversed-premise controls return a view of the first input at the second input's
+  region, making the directed bound observable in the result; both reject as
+  `IncompatibleCallableSignature`, while the matching directed promise succeeds. The named-result control in
   `callableParameterKeepsInvocationRigidsAndBorrowedOwnersOutOfInference` preserves the outer
   inferred-result escape boundary and a cheap unused nested-metadata quantifier barrier. Source
   canonicalization still erases unused authored binders. Existing authored nested-quantifier
