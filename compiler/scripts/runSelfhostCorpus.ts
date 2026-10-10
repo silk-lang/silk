@@ -18,7 +18,7 @@ export interface Gap {
 export interface BuildDiagnostic {
   readonly code: string
   readonly span: { readonly start: number; readonly end: number }
-  /** The logical module the span indexes, such as `main.silk` or a standard-library module. */
+  /** The logical module the span indexes, such as `memory/driver.silk` or a standard-library module. */
   readonly module: string
 }
 
@@ -206,8 +206,14 @@ const nativeLinkInputs = (
   return [...objects, ...libraries]
 }
 
+// The program is the module `memory/driver`, the root the bootstrap harness compiles, so reported
+// identities and labels name the same module under both compilers. The manifest's root keeps the
+// package directory as the module directory, where the program's imports resolve.
+const programModule = 'memory/driver.silk'
+
 const writeProgram = (directory: string, program: CorpusProgram, cCompiler: string): void => {
-  const source = join(directory, 'main.silk')
+  const source = join(directory, programModule)
+  mkdirSync(dirname(source), { recursive: true })
   writeFileSync(source, program.nativeSource ?? program.source)
   const linkInputs = nativeLinkInputs(directory, program, cCompiler)
   writeFileSync(
@@ -290,7 +296,7 @@ export const runCase = (
         silkc,
         [
           'build',
-          'main.silk',
+          programModule,
           '-o',
           'program',
           '--stdlib',
