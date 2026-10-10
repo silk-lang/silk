@@ -1239,9 +1239,12 @@ export const lowerRecoveryInvocationInputs = (
             !Type.equals(Mir.semanticType(descriptor), field.type)
           )
             return undefined
+          // The handler applies this callable, so a stored input is its capture slot, which
+          // verification authenticates through this exact MakeCallable producer.
           inputs.push({
             parameter: capture.parameterOrdinal,
-            argument: retained.source,
+            capture: capture.ordinal,
+            argument: callable,
             type: field.type,
             source: retained.sourceOrigin,
           })

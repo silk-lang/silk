@@ -12,7 +12,7 @@ effect fn writeNative(bytes: &[u8]) -> () ! WriterError {
 
 pub struct RecoveredWriterError {}
 
-service RecoveredWriter {
+pub service RecoveredWriter {
   effect fn writeAll(bytes: &[u8]) -> () ! RecoveredWriterError ? &mut RecoveredWriter
 }
 
