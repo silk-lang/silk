@@ -177,12 +177,12 @@ enum RedirectProducerFailure { Failed }
 enum RedirectCallbackFailure { Failed }
 enum RedirectAcquisitionFailure { Rejected }
 
-service RedirectFactoryRequirement {}
-service RedirectProducerRequirement {}
-service RedirectCallbackRequirement {
+pub service RedirectFactoryRequirement {}
+pub service RedirectProducerRequirement {}
+pub service RedirectCallbackRequirement {
   effect fn accepted() -> bool ? &mut RedirectCallbackRequirement
 }
-service RedirectAcquisitionRequirement {
+pub service RedirectAcquisitionRequirement {
   effect fn accepted() -> bool ? &mut RedirectAcquisitionRequirement
 }
 
@@ -947,7 +947,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
       drop error
       return 111
     }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   let followPrevious = RedirectPolicy.previousResponse(&follow)
   match &followPrevious.* {
@@ -991,7 +991,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
       drop error
       return 120
     }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   if !redirectFailureIs(
     statusDecision(&zero, s301, usize.ZERO),

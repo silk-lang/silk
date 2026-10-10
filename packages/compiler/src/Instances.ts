@@ -901,8 +901,7 @@ const executableParameters = (
   if (fn.contract._tag === 'Contract') {
     for (const [ordinal, parameter] of fn.contract.parameters.entries()) {
       const specialized = Type.substitute(parameter, substitution)
-      const contract = Type.isRepresented(specialized) ? specialized.contract : specialized
-      if (Type.isEffect(contract)) effects.push(ordinal)
+      if (Type.parameterEffectContract(specialized) !== undefined) effects.push(ordinal)
       if (Type.isCallable(specialized)) callables.push(ordinal)
     }
   }

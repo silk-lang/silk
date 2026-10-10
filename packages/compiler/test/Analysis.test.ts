@@ -1187,7 +1187,7 @@ unsafe extern "C" fn hidden(value: i32) -> i32`),
 
 it.effect('retains valid plain and Effect test contracts without changing their channels', () =>
   Effect.gen(function* () {
-    const source = `service Clock { fn now() -> i32 }
+    const source = `pub service Clock { fn now() -> i32 }
 test fn plain() {}
 pub test effect fn effectful() -> () ! i32 ? &Clock { fail 1 }
 fn test() {}`
