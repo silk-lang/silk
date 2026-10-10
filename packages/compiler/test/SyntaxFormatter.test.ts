@@ -929,6 +929,23 @@ it.effect('preserves nested row-difference precedence and selected-row call pref
   }),
 )
 
+it.effect('prints an implementation head where clause before its members', () =>
+  Effect.gen(function* () {
+    const source = `impl<'p,P> Port for Wrap<'p,P> where &mut P provides &Source from &mut Source{value:Wrap.value}`
+    const first = yield* SyntaxFormatter.format(parse('memory://impl-where-format.silk', source))
+    const text = formattedText(first)
+    assert.strictEqual(
+      text,
+      `impl<'p, P> Port for Wrap<'p, P> where &mut P provides &Source from &mut Source {
+  value: Wrap.value
+}
+`,
+    )
+    const second = yield* SyntaxFormatter.format(parse('memory://impl-where-format.silk', text))
+    assert.strictEqual(formattedText(second), text)
+  }),
+)
+
 it.effect('breaks long constraint lists after where with one constraint per line', () =>
   Effect.gen(function* () {
     const source = `effect fn transform<S,P,A,E,?R>(self:once Effect<A!E?R>,provider:&mut P)->A!E?R where SelectedCapability in ExtremelyLongRequirementRowParameter,&mut ExtremelyLongProviderImplementation provides SelectedCapability from ExtremelyLongRequirementRowParameter,&ExtremelyLongSharedProviderImplementation provides SelectedCapability from ExtremelyLongRequirementRowParameter,ExtremelyLongOwnedProviderImplementation provides SelectedCapability from ExtremelyLongRequirementRowParameter,AnotherSelectedCapability in ExtremelyLongRequirementRowParameter{return run self}`

@@ -3590,6 +3590,27 @@ fn keywords(where: i32, provides: i32, from: i32, in: i32) -> i32 {
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })
 
+it('parses a where clause on an implementation head', () => {
+  const source = `impl<'p, P> Port for Wrap<'p, P>
+where &mut P provides &Source from &mut Source, S in R {
+  value: Wrap.value
+}
+
+impl<P> Wrap<P> where &mut P provides &Source from &mut Source {}`
+  const result = parseText('memory/impl-where', source)
+  const kinds = descendants(result.root).flatMap((element) =>
+    SyntaxTree.isNode(element) ? [element.kind] : [],
+  )
+
+  assert.deepEqual(result.parserDiagnostics, [])
+  assert.strictEqual(kinds.filter((kind) => kind === 'WhereClause').length, 2)
+  assert.strictEqual(kinds.filter((kind) => kind === 'ProviderConstraint').length, 2)
+  assert.strictEqual(kinds.filter((kind) => kind === 'MembershipConstraint').length, 1)
+  assert.strictEqual(kinds.filter((kind) => kind === 'ImplOperation').length, 1)
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('parses nested failure and requirement differences with union operands', () => {
   const source = `effect fn transform<S, P, A, E, ?R>(
   self: once Effect<A ! E ? R>,
