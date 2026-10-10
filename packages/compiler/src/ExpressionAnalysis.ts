@@ -11297,7 +11297,7 @@ export const finishDeclarationCall = (
           if (parameter.phase !== 'Runtime') return []
           const argument = argumentsResult.facts.at(parameter.id.ordinal)
           return argument?.type._tag === 'Available' &&
-            Type.containsStaticPhaseOnly(argument.type.type)
+            DeclarationFacts.containsStaticPhaseOnly(resolution.index, argument.type.type)
             ? [
                 Diagnostic.staticPhaseViolation(
                   'runtime call argument with a phase-only type',
