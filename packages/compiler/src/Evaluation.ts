@@ -2111,6 +2111,19 @@ export const evaluateStatementSequence = (
       case 'Drop': {
         const value = evaluateExpression(statement.expression, contextual)
         if (value._tag !== 'Complete') return value
+        if (
+          statement._tag === 'Evaluate' &&
+          statement.staticSelection !== undefined &&
+          (value.value._tag !== 'BooleanValue' || value.value.value !== statement.staticSelection)
+        )
+          return failed(
+            phaseViolation(
+              'changing a checked static selection inside ordinary control',
+              'per-execution static arm elaboration is not implemented',
+              at(statement),
+              context.trace,
+            ),
+          )
         continue
       }
       case 'Return': {

@@ -1257,6 +1257,14 @@ export const analyzeStatements = (
         )
         continue
       }
+      if (context.declaration.phase === 'Static' && context.resolution.deferStaticCalls === true)
+        append({
+          _tag: 'ExpressionStatement',
+          expression: expressionNode(condition),
+          staticSelection: evaluated.value.value,
+          region: nextRegion(),
+          anchor: element.condition.anchor,
+        })
       // Both authored arms are present; selection picks one and the other is not elaborated.
       const branch = evaluated.value.value ? element.thenBranch : element.elseBranch
       // `else static if …` chains the next conditional where a block would be: it is analyzed as
