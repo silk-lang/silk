@@ -115,18 +115,17 @@ Each entry records:
 - **Compilers:** the bootstrap checks every argument by subtyping over the complete variance
   summary. Selfhost call inference still unifies exactly. Only when an inferred argument fails with
   `TypeMismatch`, and the parameter is a shared loan, does selfhost match one shortened argument
-  against the same inference state. An exclusive argument loan is first given up as a shared one
-  (BORROW-005 never strengthens access); the operand keeps its exclusive type. In that argument,
-  each referent lifetime in a covariant position is shortened to the argument's loan region, but
-  only where the parameter writes its own loan lifetime. Every other lifetime keeps its evidence.
-  A binding annotated as a shared loan, named or elided, admits a moved exclusive loan the same
-  way, in covariant positions only.
+  against the same inference state. Both the argument and parameter must be shared loans; access
+  stays unchanged. In that argument, each referent lifetime in a covariant position is shortened
+  to the argument's loan region, but only where the parameter writes its own loan lifetime. Every
+  other lifetime keeps its evidence. Moved exclusive loans require a source-written shared
+  reborrow to satisfy a shared parameter or binding annotation.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
   rows, callable and Effect positions, services, interfaces, recursive declarations still being
   summarized, and declarations whose member shape is unavailable are treated as invariant. Such
   calls keep the original `TypeMismatch` at the call.
-- **Evidence:** `sharedLoanParametersShortenAndGiveUpArguments` in
+- **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
@@ -1773,7 +1772,8 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 
 The native compiler admits exported C-entry addresses under an expected `extern "C" fn` type with
 closed scalar or raw-data-pointer lanes and literal `memory`/`locality` contracts. Contract equality
-is exact; imported symbols and ordinary Silk callable values cannot form these addresses. All written
+is exact after `memory: "none"` canonicalizes locality to external. Stronger export promises require
+`unsafe export "C" fn`; emitted memory effects stay conservative. Imported symbols and ordinary Silk callable values cannot form these addresses. All written
 C callback parameters require a complete synchronous `callbacks` tuple. Address formation checks the
 transitive execution graph for suspension. Indirect invocation requires `unsafe` and retains C ABI
 narrow-integer extension rules. Native imports, pointer invocations, and exported entries retain
