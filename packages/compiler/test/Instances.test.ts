@@ -522,7 +522,7 @@ service Sink {
 struct FixedSink {}
 
 impl Sink for FixedSink {
-  effect fn value(self: &Self) -> i32 ? &mut Sink { return 42 }
+  effect fn value(self: &mut Self) -> i32 ? &mut Sink { return 42 }
 }
 
 effect fn forward<A, E, ?R>(marker: i32, protected: once Effect<A ! E ? R>) -> A ! E ? R {
