@@ -351,7 +351,7 @@ trap stub.
 | runners            | generated per Effect site (`CatchEffectRunner`, ...), keyed by `EffectExecutionContract.key` (success, failure row, requirement row)                                                                                                | the construction site's own instance, keyed by application plus providers; intrinsic composites expanded at run sites            | no                                |
 | providers          | statically selected provider references appended after captures; runner specialized per provider witness (`effectRunner.providers`)                                                                                                 | the same idea: `providers` in the key, address `Provider` locals                                                                 | no                                |
 | failure return     | `EffectOutcome` sum returned by value (tag lane, widest payload's lanes)                                                                                                                                                            | status flag plus success and failure out-slots                                                                                   | no                                |
-| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | origin-only identity and origin under an observer ([the observer note](failure-observer-and-trace.md)); frames and causes follow | yes, in unhandled-failure reports |
+| diagnostic context | hidden per-invocation observer and cause parameters; full logical trace                                                                                                                                                             | identity, origin, logical frames and causes under an observer ([the observer note](failure-observer-and-trace.md)); observed arithmetic traps report a fatal line, MIR `Trap` terminators follow | yes, in unhandled-failure and fatal reports |
 | entry              | source runtime `silk/native_start` (ENTRY-001), no compiler adapter                                                                                                                                                                 | the same source runtime, selected from the standard-library catalog by target and libc                                           | no                                |
 | suspension         | coroutine frames, `SuspendEffectRegion`                                                                                                                                                                                             | gap `suspension`                                                                                                                 | yes: unsupported                  |
 
@@ -395,9 +395,9 @@ All three recommendations accepted on PR #708:
    `entry-signature` until then. No compiler entry adapter is added for `effect fn main`.
    Done: selfhost now selects `silk/native_start` by default and the shim, `entry-signature` and
    the compatibility entry are removed.
-2. **Failure context (Q2).** Origin-only context is carried by `Statement.FailureContext`, added
+2. **Failure context (Q2).** Failure context is carried by `Statement.FailureContext`, added
    with its first reader by the observer and trace work
    ([failure-observer-and-trace.md](failure-observer-and-trace.md), shipped in its §7 step 2), not
-   in Step 9. The trace gap belongs to that work.
+   in Step 9. Logical frames and causes shipped in that note's N7; observed traps remain there.
 3. **`effect-instance` (Q3).** Deleted in Step 9 PR 4 (providers), not renamed. Everything it
    covers becomes either supported or `suspension`.
