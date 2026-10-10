@@ -1678,6 +1678,11 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   proves its representation bound once. Such bodies are `ContractTyped` and counted by the
   `SILK_GAP borrow-check` summary, so a program the bootstrap would reject for that relation still
   compiles natively until step 14.
+  A reference reborrow through a descriptor, such as `&mut value.*` for a declared
+  `value: &'a mut P`, receives a fresh caller-local loan region when no expected region fixes it.
+  The body retains the source `'a` outliving that fresh region; the initializer of
+  `Session {value: &mut value.*}` therefore does not fix an invariant callback binder to `'a`.
+  Explicit expectations still prove against source validity, and access never strengthens.
 - **Source migration:** none.
 - **Diagnostics and limits:** a fixed `'static` expectation of a shorter region, a declared region
   widened to another, and owner, access, element, pointee, extent, type-argument and
@@ -1690,7 +1695,8 @@ elided lifetime is reached only through an alias remain separate unsupported lan
   `callerLocalRegionsRelateAtFixedBoundaries` in
   `compiler/src/semantic/SemanticCallableCases.silk`, `providedCallPrefixesMapLifetimesSeparately`
   in `compiler/src/semantic/SemanticLoweringCases.silk`,
-  `sliceConversionsRetainRegionAccessAndDiagnostics` in
+  `sliceConversionsRetainRegionAccessAndDiagnostics` and
+  `genericEffectCallbackUsesAFreshDescriptorReborrow` in
   `compiler/src/semantic/SemanticCaptureCases.silk`, and `effectSectionDeferralClaims` in
   `compiler/src/semantic/CallableResultCases.silk`.
 
@@ -1785,3 +1791,20 @@ insufficient capture access keep their typed rejections. The structured claim is
 `intrinsicProvisionInfersOneKeyAndKeepsResidualRequirements` in
 `compiler/src/semantic/SemanticLoweringCases.silk`; the file-system example exercises nested
 inferred exclusive bindings for independent filesystem and allocator providers.
+
+### Native selected-head inference normalizes established requirement keys
+
+- **Status:** implemented for native conformance inference on 2026-10-10.
+- **Rule:** an implementation selected by a known nominal provider supplies its already established
+  arguments inside service and role keys before closed requirement-row equality is decided. The
+  comparison opens only its selected implementation and call owners; foreign seeds remain rigid,
+  and key normalization preserves access and role identity.
+- **Compilers:** the bootstrap already substitutes these arguments. Native row unification now uses
+  the same established-assignment comparison view as union unification, so a selected
+  `Provider<never, never>` head containing `&mut Selected<P, R>` compares with
+  `&mut Selected<never, never>` after binding `P` and `R` from the provider.
+- **Source migration:** none.
+- **Evidence:** `knownHeadNormalizesEstablishedRequirementKeys` in
+  `compiler/src/semantic/SemanticCaptureCases.silk` checks selected-head inference and rejects a
+  requirement with different access. The prior native seed rejects the positive call with
+  `UninferredParameter`.
