@@ -378,8 +378,8 @@ const cleanupText = (cleanup: CleanupPlan.CleanupPlan): string => {
       return `${typeText(cleanup.type)} · opaque decrement or last ${typeText(cleanup.element)} cleanup`
     case 'ExecutionCleanup':
       return `${typeText(cleanup.type)} · opaque package cleanup · ${cleanupText(cleanup.allocation)}`
-    case 'WakeCleanup':
-      return `${typeText(cleanup.type)} · generation readiness cleanup · ${cleanupText(cleanup.allocation)}`
+    case 'ExecutionRefCleanup':
+      return `${typeText(cleanup.type)} · package authority release · ${cleanupText(cleanup.allocation)}`
     case 'HookCleanup':
       return `${typeText(cleanup.type)} · drop hook ${cleanup.hook.module}.${cleanup.hook.name} · ${cleanupText(cleanup.inner)}`
     case 'StructCleanup':
@@ -922,12 +922,20 @@ const operationLabel = (operation: Mir.Operation): string => {
       return `${localText(operation.destination)} = execution from ${localText(operation.allocation)} with ${localText(operation.body)}`
     case 'ExecutionDrive':
       return `${localText(operation.destination)} = drive ${localText(operation.execution)} with ${localText(operation.branch)}`
-    case 'ExecutionNotifyInitial':
-      return `${localText(operation.destination)} = notify initial ${localText(operation.execution)}`
-    case 'ExecutionWake':
-      return `${localText(operation.destination)} = wake ${localText(operation.wake)} · take`
-    case 'ExecutionPark':
-      return `${localText(operation.destination)} = park with ${localText(operation.register)} · guard ${localText(operation.guard)}`
+    case 'ExecutionRelinquish':
+      return `${localText(operation.destination)} = relinquish`
+    case 'ExecutionCurrent':
+      return `${localText(operation.destination)} = current execution`
+    case 'ExecutionRefOf':
+      return `${localText(operation.destination)} = execution ref of ${localText(operation.execution)}`
+    case 'ExecutionLoad':
+      return `${localText(operation.destination)} = load control ${localText(operation.reference)}[${localText(operation.word)}]`
+    case 'ExecutionStore':
+      return `${localText(operation.destination)} = store control ${localText(operation.reference)}[${localText(operation.word)}] = ${localText(operation.value)}`
+    case 'ExecutionNotify':
+      return `${localText(operation.destination)} = notify ${localText(operation.reference)}`
+    case 'ExecutionLive':
+      return `${localText(operation.destination)} = live ${localText(operation.reference)}`
     case 'SharedClone':
       return `${localText(operation.destination)} = clone shared core ${localText(operation.self)}`
     case 'SharedWithMut':

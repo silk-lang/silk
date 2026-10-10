@@ -43,7 +43,7 @@ export type CleanupPlan =
     }
   | {
       /** Discharges one affine generation authority retained by an opaque Wake. */
-      readonly _tag: 'WakeCleanup'
+      readonly _tag: 'ExecutionRefCleanup'
       readonly type: Type.Nominal
       readonly allocation: Extract<CleanupPlan, { readonly _tag: 'AllocationCleanup' }>
     }
@@ -158,7 +158,7 @@ export const reclaims = (self: CleanupPlan): boolean =>
   self._tag === 'RawBufferCleanup' ||
   self._tag === 'LocalSharedCoreCleanup' ||
   self._tag === 'ExecutionCleanup' ||
-  self._tag === 'WakeCleanup' ||
+  self._tag === 'ExecutionRefCleanup' ||
   (self._tag === 'HookCleanup' && reclaims(self.inner)) ||
   (self._tag === 'StructCleanup' && self.fields.some((field) => reclaims(field.cleanup))) ||
   (self._tag === 'NominalUnionCleanup' &&
@@ -295,9 +295,9 @@ const deriveCleanup = (
         ticket: 'ActiveReclaimTicket',
       },
     }
-  if (Type.isWake(type))
+  if (Type.isExecutionRef(type))
     return {
-      _tag: 'WakeCleanup',
+      _tag: 'ExecutionRefCleanup',
       type,
       allocation: {
         _tag: 'AllocationCleanup',
@@ -506,9 +506,9 @@ export const specializeCleanup = (
       return Type.isExecution(type)
         ? { _tag: 'ExecutionCleanup', type, allocation: cleanup.allocation }
         : { _tag: 'NoCleanup', type }
-    case 'WakeCleanup':
-      return Type.isWake(type)
-        ? { _tag: 'WakeCleanup', type, allocation: cleanup.allocation }
+    case 'ExecutionRefCleanup':
+      return Type.isExecutionRef(type)
+        ? { _tag: 'ExecutionRefCleanup', type, allocation: cleanup.allocation }
         : { _tag: 'NoCleanup', type }
     case 'HookCleanup':
       if (!Type.isNominal(type)) return { _tag: 'NoCleanup', type }

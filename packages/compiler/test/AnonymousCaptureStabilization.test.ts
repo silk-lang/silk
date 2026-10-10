@@ -141,8 +141,8 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const source = `import silk.effect { Effect }
-service ByteDuplex { effect fn read() -> i32 ? &ByteDuplex }
-service Probe { effect fn read() -> i32 ? &Probe }
+pub service ByteDuplex { effect fn read() -> i32 ? &ByteDuplex }
+pub service Probe { effect fn read() -> i32 ? &Probe }
 effect fn allowed<'env, A, E, ?R>(body: once Effect<'env; A ! E ? R>) -> A ! E ? R
 where R in Without<R, ByteDuplex> { return run body }
 effect fn outer<'env, A, E, ?R>(body: once Effect<'env; A ! E ? R>) -> A ! E ? R

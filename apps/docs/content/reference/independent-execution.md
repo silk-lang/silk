@@ -15,7 +15,8 @@ returns control to an owner outside the body.
   fixed readiness endpoint.
 - An **activation** is one legal call to `Execution.drive`.
 - The **branch state** is owner data transferred to exactly one drive-outcome callback.
-- A **Wake** is the affine readiness authority for one parked generation.
+- A **Wake** is the affine readiness authority for one parked generation. It is the ordinary
+  source struct `Wake` exported by `silk.execution`.
 - The **registration guard** is the value returned by `Execution.park`'s registration callback and
   retained until that generation resumes or is destroyed.
 
@@ -86,7 +87,7 @@ supplied branch state to exactly one take-once outcome callback:
 Nested `Effect.suspend` transfer may finish within the same activation. External parking
 relinquishes the Execution instead.
 
-**Boundary:** `Running`, `Dormant`, `Notifying`, `DestroyPending`, `Completed`, and `Destroyed`
+**Boundary:** `Running`, registering, `Dormant`, notifying, `Completed`, and `Destroyed`
 executions are not driveable. Attempting to drive one is a fatal state trap before either outcome
 callback runs. There is no recoverable “not ready” result.
 
@@ -100,7 +101,7 @@ Lifecycle admission failure occurs at runtime as a fatal trap outside Effect fai
 
 **Status:** Confirmed
 
-`Execution.park(register)` transfers one Wake to `register`. If the Wake is signaled before
+`Execution.park(register)` transfers one source `Wake` to `register`. If the Wake is signaled before
 registration returns, readiness is latched until the registration handoff is complete. Otherwise
 the Execution becomes `Dormant`. A successful signal makes that generation `Eligible` and invokes
 the fixed readiness endpoint at most once.
@@ -109,20 +110,28 @@ The registration callback's return value is retained as the generation guard. Th
 immediately before the body continues after `park`, or during destruction if the generation never
 continues.
 
-**Boundary:** Wake signaling publishes readiness; it never drives the Execution inline. Signaling
-or dropping a Wake consumes it. A stale or duplicate Wake cannot publish a second readiness event.
+**Boundary:** `Execution.wake` publishes readiness; it never drives the Execution inline.
+Signaling or dropping a Wake consumes it. A stale or duplicate Wake cannot publish a second
+readiness event.
+
+The readiness phase and the park generation are ordinary source policy in `silk.execution`. They
+live in two package control words that the compiler zeroes and never reads. A Wake carries its
+generation; signaling a Wake whose Execution was dropped, completed, or parked again publishes
+nothing. A cancelled generation's Wake is therefore inert: it can only release its package
+authority.
 
 **Diagnostics:** Reusing a consumed Wake reports the ordinary affine `OWN0001` diagnostic. Parking
 while an incompatible local-shared access loan is live reports `OWN0016` before lowering.
 
-**Evidence:** [wake transition actor](../../../../packages/compiler/src/WakeCell.ts),
+**Evidence:** [ordinary source policy](../../../../packages/compiler/stdlib/silk/execution.silk),
 [external parking tests](../../../../packages/compiler/test/ExternalWakeParking.test.ts).
 
 ### EXEC-004 — Executions are local affine owners
 
 **Status:** Confirmed
 
-`Intrinsic.Execution<A>` and `Intrinsic.Wake` are affine and `LocalExecution`. They may move among
+`Intrinsic.Execution<A>` and `Intrinsic.ExecutionRef` are affine and `LocalExecution`, and so is
+every aggregate that contains one, including the source `Wake`. They may move among
 ordinary values, Effects, callbacks, and independently resumable frames in one local execution
 domain. They are not Copy and have no thread-transfer operation.
 
@@ -146,12 +155,16 @@ park-capable Effect reports `SEM0140`.
 **Status:** Confirmed
 
 Completion cleans the consumed outcome callback, fixed endpoint, body or continuation-owned values,
-and package allocation in their canonical ownership order. Dropping a dormant Execution cancels
-its Wake authority and cleans suspended state exactly once.
+and package allocation in their canonical ownership order. Dropping a parked Execution cancels it
+whether its generation is registering, latched, or dormant. Cancellation releases the parked frames
+from the innermost outward. Each frame drops every owner live at its suspension point, including
+the registration guard and borrowed-temporary holders, then releases its storage. A zero-sized
+owner with a drop hook is retained in its frame like any other, so its hook runs exactly once. The
+readiness endpoint is not invoked.
 
 If external source still owns the cancelled Wake, that Wake retains only the complete inert package
-allocation. Signaling or dropping it performs no notification or redrive and releases the final
-authority.
+allocation through its `Intrinsic.ExecutionRef`. Signaling or dropping it performs no notification
+or redrive and releases the final authority.
 
 **Boundary:** A retained cancelled Wake can extend allocation lifetime. It cannot keep the body,
 guard, endpoint, or suspended payload logically active, and it cannot resurrect the Execution.
@@ -160,13 +173,28 @@ guard, endpoint, or suspended payload logically active, and it cannot resurrect 
 contract and do not promise post-trap cleanup.
 
 **Evidence:** [cleanup ownership model](../../../../packages/compiler/src/SuspensionOwnership.ts),
-[separation pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts).
+[separation pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts),
+[native corpus](../../../../packages/compiler/test/support/corpus.ts)
+(`independent-execution-zero-sized-guard-cancel`, `effect-borrowed-recovery-park-resume-cancel`).
 
 ### EXEC-006 — Scheduling policy remains ordinary source
 
 **Status:** Confirmed
 
-The compiler recognizes only the sealed target-neutral Execution, Wake, and parking primitives.
+The compiler recognizes only these sealed target-neutral Execution primitives:
+
+- `Intrinsic.Execution<A>`, `Intrinsic.executionLayout`, and `Intrinsic.executionFromAllocation`
+  construct a package.
+- `Intrinsic.executionDrive` starts an unstarted body or resumes a relinquished frame chain.
+- `Intrinsic.relinquish` saves the running frame chain and returns the drive through `onSuspend`.
+- `Intrinsic.ExecutionRef` is counted authority over one package allocation. It is obtained with
+  `Intrinsic.executionCurrent` or `Intrinsic.executionRefOf`.
+- `Intrinsic.executionLoad` and `Intrinsic.executionStore` access the two source control words.
+- `Intrinsic.executionNotify` invokes the fixed readiness endpoint.
+- `Intrinsic.executionLive` reports whether the Execution handle still exists.
+
+`Wake`, `Execution.park`, `Execution.wake`, `Execution.notifyInitial`, and the drive admission
+check are ordinary source in `silk.execution`.
 Schedulers, fibers, deferred values, timers, reactors, ready queues, fairness, cancellation policy,
 and structured concurrency are ordinary source concepts built over those primitives and
 [`Shared`](local-shared-ownership.md).
@@ -178,6 +206,7 @@ application entry still requires an explicit owner such as `LocalScheduler.execu
 inferred by `Execution.make`, `drive`, or `park`.
 
 **Evidence:** [minimal compiler privilege](runtime-and-standard-library.md#stdlib-001--public-standard-library-declarations-receive-no-compiler-privilege),
+[intrinsic catalog tests](../../../../packages/compiler/test/IntrinsicCatalog.test.ts),
 [actor-neutrality pressure tests](../../../../packages/compiler/test/LocalSharedPressure.test.ts).
 
 ### EXEC-007 — Initial readiness can be notified after owner publication

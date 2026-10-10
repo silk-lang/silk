@@ -9,6 +9,7 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Stdlib from '../src/Stdlib.js'
 import { unreachable } from './support/raise.js'
+import { relinquishedReleases } from './support/relinquishedFrames.js'
 import {
   networkAddressValueAcceptanceSource,
   nativeResolverAcceptanceSource,
@@ -159,11 +160,13 @@ it.effect(
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
       assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(snapshot)), [])
       if (snapshot.mir._tag !== 'Available') return
-      const parks = snapshot.mir.value.functions
-        .flatMap(MirVerification.operations)
-        .filter((operation) => operation._tag === 'ExecutionPark')
-      assert.lengthOf(parks, 2)
-      assert.isTrue(parks.every((park) => park.guardCleanup._tag !== 'NoCleanup'))
+      // Both registration guards, including the zero-sized completed one, keep their drop hooks.
+      assert.deepEqual(
+        relinquishedReleases(snapshot.mir.value).map((releases) =>
+          releases.map((cleanup) => cleanup._tag),
+        ),
+        [['HookCleanup'], ['HookCleanup']],
+      )
     }),
   60000,
 )

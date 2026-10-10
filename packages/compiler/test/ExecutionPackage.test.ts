@@ -53,12 +53,18 @@ it('plans exact direct, nested, and externally parkable combined packages', () =
     external._tag !== 'ExecutionPackagePlan'
   )
     return
-  assert.isFalse(direct.readinessStorage)
   assert.isFalse(direct.initialContinuationSegment)
-  assert.isFalse(nested.readinessStorage)
   assert.isTrue(nested.initialContinuationSegment)
-  assert.isTrue(external.readinessStorage)
   assert.isTrue(external.initialContinuationSegment)
+  // Every package carries one control block at the same offset, so references need no dispatch.
+  for (const plan of [direct, nested, external])
+    assert.deepEqual(
+      plan.components.slice(0, 2).map((component) => [component.role, component.size]),
+      [
+        ['OwnerRecord', target.pointerSize * 2],
+        ['Control', target.pointerSize * ExecutionPackage.controlWords],
+      ],
+    )
   assert.notStrictEqual(direct.provenance, nested.provenance)
   assert.notStrictEqual(nested.provenance, external.provenance)
   assert.isFalse(direct.components.some((component) => component.role === 'EndpointState'))
@@ -86,7 +92,7 @@ it('rejects overflow and every mismatched initializer provenance dimension', () 
   })
   assert.deepEqual(ExecutionPackage.validateInitialization(selected, accepted), {
     _tag: 'Accepted',
-    state: 'Initial',
+    state: 'Unstarted',
   })
   assert.strictEqual(
     ExecutionPackage.validateInitialization(selected, {

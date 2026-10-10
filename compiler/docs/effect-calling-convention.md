@@ -150,7 +150,7 @@ Running their results lowers as follows. "Run `x`" means D1 applied to `x`, recu
   callables.
 - **`bindRequirement`, `bindRequirementMut`, `bindRequirementOwned`**: D2 rule 2. The owned form
   drops the provider with the environment.
-- **`suspendEffect`**: gap `suspension` (D6).
+- **`suspendEffect`**, **`relinquish`**: frame resume points (D6).
 
 Because the representation is exact, the expansion is a finite structural recursion over the
 value's type. `Effect.catchAll` is itself `return run Intrinsic.catchFailure<E>(...)`, so the
@@ -179,14 +179,13 @@ Selfhost has no generated C entry: a package without a composition takes the cat
 its target and libc, `silk/native_start` on hosted targets, and every build roots at that
 runtime's C exports. Full suspension and observer support remain separate work.
 
-### D6. Suspension stays a named gap
+### D6. Suspension lowers to frame resume points
 
-Agreed with Step 4 (quoted in §2). Reaching `Intrinsic.suspendEffect` or `Intrinsic.park` while
-building MIR reports gap `suspension` at that site. Every caller fails through that gap, so no
-transitive summary is needed before the suspension stage. `executionDrive`,
-`executionFromAllocation`, `executionLayout`, `executionNotifyInitial` and `wake` keep reporting
-`intrinsic-member`. Nothing in D1–D4 blocks the later frame transform: providers, out-slots and
-drop flags are ordinary locals the frame stores like any live place.
+`Intrinsic.suspendEffect` and `Intrinsic.relinquish` lower to resume points of the instance's
+coroutine frame, so no `suspension` gap remains. A relinquish returns step code 2 to the package
+driver, which marks the package Relinquished; `executionDrive` then hands the package to its
+suspension callback. Providers, out-slots and drop flags are ordinary locals the frame stores like
+any live place.
 
 ### D7. Cleanup on failure edges (Step 6)
 
@@ -234,7 +233,7 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 - Added only by the suspension stage: `Terminator.Suspend { callee, arguments, providers, destination, mode: Transfer | Nested, resume: Block, failure: Option<FailureEdge>, cancel: Block, origin }` and `Terminator.Abandon { origin }`.
 - `Transfer` is the explicit `Intrinsic.suspendEffect` point (inside stdlib `Effect.suspend`); `Nested` is a `run` of a callee whose suspension summary is NestedTransfer, inside a suspendable instance. `resume` receives the success value in `destination`; `failure` is the ordinary failure edge; `cancel` is the explicit drop chain of every owner live at that point, reading flags from the frame, ending in `Abandon` (no outcome).
 - `Mir(Function)` demands the instance's suspension summary (an SCC-capable query; an engine addition), never a callee body, to choose `Call` or `Suspend`. Non-suspending instances contain no `Suspend` (SUSP-018). Providers, out-slots and drop flags are ordinary locals stored in the frame like any live place.
-- Until that stage, reaching `Intrinsic.suspendEffect` or `Intrinsic.park` reports gap `suspension`; callers fail through the callee's gap. The Execution primitives stay `intrinsic-member`.
+- `Intrinsic.suspendEffect` and `Intrinsic.relinquish` lower to resume points of the instance's coroutine frame. A relinquish ends its block with `Terminator.Relinquish { resume, origin }`.
 
 ## 3. Worked examples
 
@@ -292,7 +291,7 @@ pub fn main() -> i32 {
 - In `total`, `run Values.left()` is `Call(Fixed.left, [Copy(_p0)])`, and `Values.right()` uses
   `_p1`.
 - In `main`, `selected` is `{inner: {inner: total-site, provider: &leftProvider}, provider:
-&rightProvider}`. `run selected` resolves `Right` from the outer binding and `Left` from the
+  &rightProvider}`. `run selected` resolves `Right` from the outer binding and `Left` from the
   inner one: `Call(total, [], providers [Copy(selected.0.1), Copy(selected.1)])`.
 
 ### `owned-provider-shared-dispatch` (owned provider, `&mut` access)
@@ -330,17 +329,16 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 
 ## 4. Gap codes
 
-| Code                       | Change                      | Raised where                                                                                                                    | Exit condition                                                                           |
-| -------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `suspension`               | **new** (named with Step 4) | MIR lowering reaches `suspendEffect` or `park`                                                                                  | suspension stage                                                                         |
-| `effect-instance`          | **deleted**                 | was: instance with a non-empty row, or an `effect fn` interface witness                                                         | Step 9 provider PR                                                                       |
-| `entry-signature`          | **deleted**                 | was: `Entry { main }` with any signature except `fn main() -> i32`                                                              | default runtime selection                                                                |
-| `intrinsic-member`         | narrower                    | `execution*`, `wake`; no longer `observeUnhandled` or `observeDiagnostics` ([the observer note](failure-observer-and-trace.md)) | suspension stage                                                                         |
-| `observer-callback`        | **new** (observer note)     | an `observeDiagnostics` callback that is not a direct function                                                                  | callback environments in the observer record                                             |
-| `failure-identity`         | **new** (observer note)     | an observed `fail` of a type other than a nominal, primitive, string or unit type                                               | identity rendering for the remaining types                                               |
-| `typed-form`               | narrower                    | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land                                                              | per PR                                                                                   |
-| `interface-effect-witness` | narrower                    | an `effect fn` interface call that no `run` executes in place                                                                   | lowering stored interface Effect constructions; owner: Step 9 follow-up                  |
-| `cleanup` (owned provider) | extended (Step 9d)          | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run)                                | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up                                 |
+| Code                       | Change                  | Raised where                                                                                                                                                         | Exit condition                                                          |
+| -------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `effect-instance`          | **deleted**             | was: instance with a non-empty row, or an `effect fn` interface witness                                                                                              | Step 9 provider PR                                                      |
+| `entry-signature`          | **deleted**             | was: `Entry { main }` with any signature except `fn main() -> i32`                                                                                                   | default runtime selection                                               |
+| `intrinsic-member`         | narrower                | catalog members the selfhost does not lower; no longer `execution*`, `observeUnhandled` or `observeDiagnostics` ([the observer note](failure-observer-and-trace.md)) | suspension stage                                                        |
+| `observer-callback`        | **new** (observer note) | an `observeDiagnostics` callback that is not a direct function                                                                                                       | callback environments in the observer record                            |
+| `failure-identity`         | **new** (observer note) | an observed `fail` of a type other than a nominal, primitive, string or unit type                                                                                    | identity rendering for the remaining types                              |
+| `typed-form`               | narrower                | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land                                                                                                   | per PR                                                                  |
+| `interface-effect-witness` | narrower                | an `effect fn` interface call that no `run` executes in place                                                                                                        | lowering stored interface Effect constructions; owner: Step 9 follow-up |
+| `cleanup` (owned provider) | extended (Step 9d)      | `bindRequirementOwned` whose provider owns cleanup (needs a drop on both exits of the inner run)                                                                     | provider drop in `RunPlan.Bind`; owner: Step 9 follow-up                |
 
 Every gap is a structured `Unsupported` result naming the owner instance and span. None becomes a
 trap stub.

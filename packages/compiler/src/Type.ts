@@ -33,7 +33,7 @@ export interface Nominal {
   readonly sealed?:
     | 'Intrinsic.SharedCore'
     | 'Intrinsic.Execution'
-    | 'Intrinsic.Wake'
+    | 'Intrinsic.ExecutionRef'
     | 'Intrinsic.StorageFailure'
     | 'Intrinsic.Type'
     | 'Intrinsic.Fields'
@@ -477,9 +477,13 @@ const nonScalarBuiltinOperations = [
   'ExecutionLayout',
   'ExecutionFromAllocation',
   'ExecutionDrive',
-  'ExecutionNotifyInitial',
-  'ExecutionWake',
-  'ExecutionPark',
+  'ExecutionRelinquish',
+  'ExecutionCurrent',
+  'ExecutionRefOf',
+  'ExecutionLoad',
+  'ExecutionStore',
+  'ExecutionNotify',
+  'ExecutionLive',
   'EffectSuspend',
   'EffectFinalize',
   'EffectFinalizeNonParking',
@@ -735,12 +739,12 @@ const sealedExecution = (arguments_: ReadonlyArray<GenericArgument>): Nominal =>
   sealed: 'Intrinsic.Execution',
 })
 
-const sealedWake = (): Nominal => ({
+const sealedExecutionRef = (): Nominal => ({
   _tag: 'NominalType',
   module: 'Intrinsic',
-  name: 'Wake',
+  name: 'ExecutionRef',
   arguments: [],
-  sealed: 'Intrinsic.Wake',
+  sealed: 'Intrinsic.ExecutionRef',
 })
 
 const sealedStorageFailure = (): Nominal => ({
@@ -817,8 +821,8 @@ export const specializeNominal = (
       return sealedSharedCore(arguments_)
     case 'Intrinsic.Execution':
       return sealedExecution(arguments_)
-    case 'Intrinsic.Wake':
-      return sealedWake()
+    case 'Intrinsic.ExecutionRef':
+      return sealedExecutionRef()
     case 'Intrinsic.StorageFailure':
       return sealedStorageFailure()
     case 'Intrinsic.Type':
@@ -862,7 +866,7 @@ export const sharedCore = (element: Type): Nominal => sealedSharedCore([element]
 /** Opaque affine owner-neutral execution identity. Runtime layout belongs to the packaging slice. */
 export const execution = (result: Type): Nominal => sealedExecution([result])
 /** Opaque affine readiness authority for one local Execution park generation. */
-export const wake: Nominal = sealedWake()
+export const executionRef: Nominal = sealedExecutionRef()
 /** Sealed host-storage refusal carried only by the primitive allocation boundary. */
 export const storageFailure: Nominal = sealedStorageFailure()
 /** Static-only aggregate type metadata with no runtime representation. */
@@ -957,18 +961,18 @@ export const isExecution = (
   return self.arguments.length === 1 && argument !== undefined && isTypeArgument(argument)
 }
 
-/** Tests the canonical sealed Wake identity without consulting source spelling. */
-export const isWake = (
+/** Tests the canonical sealed ExecutionRef identity without consulting source spelling. */
+export const isExecutionRef = (
   self: Type,
 ): self is Nominal & {
   readonly module: 'Intrinsic'
-  readonly name: 'Wake'
+  readonly name: 'ExecutionRef'
   readonly arguments: readonly []
 } =>
   isNominal(self) &&
   self.module === 'Intrinsic' &&
-  self.name === 'Wake' &&
-  self.sealed === 'Intrinsic.Wake' &&
+  self.name === 'ExecutionRef' &&
+  self.sealed === 'Intrinsic.ExecutionRef' &&
   self.arguments.length === 0
 
 /** Tests whether a type is one of the sealed values erased before runtime TIR. */
@@ -1016,7 +1020,7 @@ export const intrinsicNominals: ReadonlyMap<string, Nominal> = new Map([
   ['Slot', nominal('silk/core', 'Slot')],
   ['Intrinsic.SharedCore', sealedSharedCore([])],
   ['Intrinsic.Execution', sealedExecution([])],
-  ['Intrinsic.Wake', sealedWake()],
+  ['Intrinsic.ExecutionRef', sealedExecutionRef()],
   ['Intrinsic.StorageFailure', sealedStorageFailure()],
   ['Intrinsic.Type', sealedTypeDescriptor([])],
   ['Intrinsic.Fields', sealedFieldsDescriptor([])],
@@ -2340,6 +2344,16 @@ export const isEffect = (self: Type): self is Effect =>
 /** Tests whether a value type carries a statically known executable representation. */
 export const isRepresented = (self: Type): self is Represented =>
   typeof self !== 'string' && self._tag === 'RepresentedType'
+
+/**
+ * The Effect contract an executable parameter carries a hidden identity for: an Effect held by
+ * value, or the referent of a borrowed Effect, whose runner is the referent's runner.
+ */
+export const parameterEffectContract = (self: Type): Effect | undefined => {
+  const held = isReference(self) ? self.target : self
+  const contract = isRepresented(held) ? held.contract : held
+  return isEffect(contract) ? contract : undefined
+}
 
 /** Tests whether a semantic type is a normalized multi-member structural union. */
 export const isUnion = (self: Type): self is StructuralUnion =>

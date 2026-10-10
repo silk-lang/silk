@@ -1010,23 +1010,18 @@ pub fn main() -> i32 { return 42 }`,
     assert.isTrue(fact.fact.affine)
     assert.isFalse(fact.fact.copy)
     assert.isFalse(fact.fact.threadTransfer)
-    assert.strictEqual(fact.fact.initial, 'Initial')
+    assert.strictEqual(fact.fact.initial, 'Unstarted')
     assert.strictEqual(
       ExecutionLifecycle.encode(fact.fact),
-      'Intrinsic.Execution<i32> affine=yes copy=no transfer=no affinity=LocalExecution initial=Initial states=Initial,InitialReady,Running,Dormant,Notifying,Eligible,Completed,Destroyed loans=Rejected/MayCrossParking/LoanBeforeReferent/Rejected shared=PreservedAcrossParking/RejectParking',
+      'Intrinsic.Execution<i32> affine=yes copy=no transfer=no affinity=LocalExecution initial=Unstarted states=Unstarted,Running,Relinquished,Completed,Destroyed loans=Rejected/MayCrossParking/LoanBeforeReferent/Rejected shared=PreservedAcrossParking/RejectParking',
     )
-    assert.deepEqual(ExecutionLifecycle.transition('Initial', 'Drive'), {
+    assert.deepEqual(ExecutionLifecycle.transition('Relinquished', 'Drive'), {
       _tag: 'Transition',
       state: 'Running',
     })
-    assert.deepEqual(ExecutionLifecycle.transition('Dormant', 'Drive'), {
+    assert.deepEqual(ExecutionLifecycle.transition('Running', 'Drive'), {
       _tag: 'FatalIntrinsicStateTrap',
-      state: 'Dormant',
-      event: 'Drive',
-    })
-    assert.deepEqual(ExecutionLifecycle.transition('Notifying', 'Drive'), {
-      _tag: 'FatalIntrinsicStateTrap',
-      state: 'Notifying',
+      state: 'Running',
       event: 'Drive',
     })
     assert.strictEqual(ordinary?._tag === 'Resolved' && Type.isExecution(ordinary.type), false)
@@ -1192,7 +1187,7 @@ unsafe extern "C" fn hidden(value: i32) -> i32`),
 
 it.effect('retains valid plain and Effect test contracts without changing their channels', () =>
   Effect.gen(function* () {
-    const source = `service Clock { fn now() -> i32 }
+    const source = `pub service Clock { fn now() -> i32 }
 test fn plain() {}
 pub test effect fn effectful() -> () ! i32 ? &Clock { fail 1 }
 fn test() {}`
