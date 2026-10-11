@@ -1514,8 +1514,6 @@ export const intrinsicStruct = (
       ['name', Type.string(Lifetime.staticLifetime)] as const,
       ['module', Type.string(Lifetime.staticLifetime)] as const,
       ['path', Type.string(Lifetime.staticLifetime)] as const,
-      ['line', 'usize'] as const,
-      ['column', 'usize'] as const,
       ['fingerprint', Type.string(Lifetime.staticLifetime)] as const,
     ]
   } else {
