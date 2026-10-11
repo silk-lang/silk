@@ -152,13 +152,14 @@ when no discovery root is present.
 
 ### Intrinsic catalog types and values
 
-The three catalog families `Intrinsic.Tests`, `Intrinsic.Test<F>` and `Intrinsic.TestInfo` are
-already listed as known names and currently refused with `CoreTypeUnavailable`. They become
-checked intrinsic types next to `Fields` and `Field`:
+The three catalog families `Intrinsic.Tests`, `Intrinsic.Test<F>` and `Intrinsic.TestInfo` were
+listed as known names and refused with `CoreTypeUnavailable`. They are checked intrinsic types next
+to `Fields` and `Field`:
 
 - `Type.TestCatalog` for `Tests` and `Type.TestDescriptor {callable}` for `Test<F>`, both phase-only
   with no runtime representation.
-- `TestInfo` is a compiler-generated struct with the bootstrap's fields in order: `identity`,
+- `TestInfo` is a compiler-generated struct, not phase-only (as in the bootstrap's
+  `isStaticPhaseOnly`), with the bootstrap's fields in order: `identity`,
   `name`, `module`, `path` (all `string<'static>`), `line`, `column` (`usize`), and `fingerprint`
   (`string<'static>`).
 
