@@ -8,11 +8,11 @@ the explicit bootstrap re-seed described below.
 
 ## Generations
 
-| Name | Built by | From |
-| --- | --- | --- |
-| seed | an earlier `selfhost` push run (or, on re-seed, the TypeScript bootstrap) | the pin |
-| N1 | the seed | this checkout's `compiler/` and `packages/compiler/stdlib` |
-| N2 | N1 | the same inputs |
+| Name | Built by                                                                  | From                                                       |
+| ---- | ------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| seed | an earlier `selfhost` push run (or, on re-seed, the TypeScript bootstrap) | the pin                                                    |
+| N1   | the seed                                                                  | this checkout's `compiler/` and `packages/compiler/stdlib` |
+| N2   | N1                                                                        | the same inputs                                            |
 
 Every generation compiles the exact committed inputs exported by `SourceSnapshot.mjs` from Git
 objects, never the working tree. Each compiler build passes `--stdlib` pointing at the snapshot's
@@ -64,15 +64,16 @@ verification instead of executing.
 Jobs in `.github/workflows/selfhost.yml`:
 
 1. **Native N1 from pinned seed** obtains and verifies the seed, exports the snapshot, builds N1
-   with it (`NativeBuild.ts generation`), smoke-tests N1 with the corpus program
-   `trivial-features` (exit 42), and runs the native contract tests.
+   with it (`NativeBuild.ts`), smoke-tests N1 with the corpus program
+   `trivial-features` (exit 42), and runs the native contract tests. On pull requests it also runs
+   the main-first bootstrap provenance check.
 2. **Native seed chain (N2 fixpoint)** builds N2 with N1, emits the compiler's LLVM IR with both N1
    and N2, requires the two IR files to be byte-identical, and smoke-tests N2
-   (`NativeBuild.ts fixpoint`). The N2 build and N1's IR emission run concurrently; each peaks near
+   (`NativeBuild.ts --fixpoint`). The N2 build and N1's IR emission run concurrently; each peaks near
    5 GiB, inside the 16 GB ubuntu-24.04 runner. This job is the required check that replaces
    **Authored native seed (N0)**.
-3. **Selfhost native corpus** runs the full corpus (`selfhost-verification.mjs --mode
-   corpus-full`) with N1 and keeps the baseline-pass and accepted-failure checks.
+3. **Selfhost native corpus** runs the full corpus with N1 (the verification harness's
+   `--mode corpus-full`) and keeps the baseline-pass and accepted-failure checks.
 4. **Native formatter safety** builds the formatter gate and verifies repository formatting.
 5. **Selfhost cases** shards are unchanged (milestone 2 moves them off the bootstrap).
 

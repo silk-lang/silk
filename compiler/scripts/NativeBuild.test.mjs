@@ -20,7 +20,6 @@ const require = createRequire(new URL('../../packages/cli/package.json', import.
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 import * as NativeBuild from './NativeBuild.ts'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
-import * as NativeSeed from './NativeSeed.mjs'
 
 const executable = (path, contents, mode = 0o555) => {
   writeFileSync(path, `#!/bin/sh\n${contents}\n`)
@@ -87,8 +86,10 @@ exit "$status"`,
         const clang = join(root, 'clang-22')
         executable(clang, "printf 'fixture clang version 22\\n'")
         const options = {
-          seed,
-          seedReceipt: join(root, 'seed-receipt.json'),
+          producer: seed,
+          producerSha256: '0'.repeat(64),
+          producerGeneration: 'seed',
+          generation: 'N1',
           clang,
           snapshot,
           outputDirectory: join(root, 'run'),
@@ -100,61 +101,25 @@ exit "$status"`,
   },
 )
 
-const bindSeed = Effect.fnUntraced(
-  /** @param {import('./NativeBuild.ts').BuildOptions} options */ function* (options) {
-    const manifest = yield* Schema.decodeEffect(
-      Schema.fromJsonString(SourceSnapshot.InputSnapshotSchema),
-    )(readFileSync(join(options.snapshot, 'input-snapshot.json'), 'utf8'))
-    const receipt = {
-      schemaVersion: 1,
-      stage: 'N0',
-      sourceCommit: manifest.sourceCommit,
-      binary: { path: 'N0', sha256: SourceSnapshot.hash(readFileSync(options.seed)), mode: '0555' },
-      inputSnapshot: {
-        archiveSha256: manifest.archiveSha256,
-        normalizedDigest: manifest.normalizedDigest,
-        compilerDigest: manifest.compilerDigest,
-        stdlibDigest: manifest.stdlibDigest,
-      },
-      bootstrap: {
-        commit: 'b'.repeat(40),
-        runId: '1',
-        sha256: 'c'.repeat(64),
-        stdlib: { authority: 'embedded-verified-main', normalizedDigest: manifest.stdlibDigest },
-      },
-      toolchain: {
-        clang: {
-          sha256: SourceSnapshot.hash(readFileSync(join(dirname(options.seed), 'clang-22'))),
-          version: 'fixture clang version 22',
-        },
-        llvmAr: { sha256: 'd'.repeat(64), version: 'fixture llvm-ar version 22' },
-      },
-      profile: {
-        target: process.arch === 'arm64' ? 'aarch64-unknown-linux-gnu' : 'x86_64-unknown-linux-gnu',
-        name: 'release-with-debug',
-        optimization: 'speed',
-        debug: true,
-      },
-      command: ['fixture bootstrap'],
-    }
-    const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(receipt)
-    writeFileSync(options.seedReceipt, encoded)
-  },
-)
+/** Binds the producer's exact bytes, as the pin or the previous generation's receipt does. */
 const fixtureBuild = Effect.fnUntraced(
   /** @param {import('./NativeBuild.ts').BuildOptions} options */ function* (options) {
-    yield* bindSeed(options)
-    return yield* NativeBuild.buildAndSmoke(options)
+    return yield* NativeBuild.buildAndSmoke({
+      ...options,
+      producerSha256: SourceSnapshot.hash(readFileSync(options.producer)),
+    })
   },
 )
 
-const producer = (smokeBody = 'exit 42') => `
-test "$1" = build && test "$3" = -o && test "$5" = --stdlib || exit 91
-test -f "$2" && test -f "$6/silk/i32.silk" || exit 92
+const producer = (smokeBody = 'exit 42', ir = 'compiler IR') => `
+test "$1" = build && test "$3" = -o && test "$5" = --emit && test "$7" = --stdlib || exit 91
+test -f "$2" && test -f "$8/silk/i32.silk" || exit 92
 printf 'N0 %s\\n' "$*" >> "$0.invocations"
+if test "$6" = llvm-ir; then printf '${ir}' > "$4"; exit 0; fi
 cat > "$4" <<'N1'
 #!/bin/sh
 test "$1" = build && test "$3" = -o || exit 93
+if test "$6" = llvm-ir; then printf '${ir}' > "$4"; exit 0; fi
 printf 'N1 %s\\n' "$*" >> "$0.invocations"
 cat > "$4" <<'SMOKE'
 #!/bin/sh
@@ -173,7 +138,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         symlinkSync('clang-22', alias)
         const check = `test "$SILKC_CLANG" = '${options.clang}' || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
         executable(
-          options.seed,
+          options.producer,
           `${check}\n${producer(check + '\nexit 42').replace(
             'test "$1" = build && test "$3" = -o || exit 93',
             check + '\ntest "$1" = build && test "$3" = -o || exit 93',
@@ -192,122 +157,61 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.strictEqual(result.status, 'passed')
         assert.strictEqual(result.linker.path, options.clang)
         assert.strictEqual(result.linker.requestedPath, alias)
-        assert.strictEqual(result.linker.matchesSeed, true)
         assert.strictEqual(result.linker.version, 'fixture clang version 22')
-        assert.strictEqual(result.linker.seedProfile.debug, true)
-        assert.strictEqual(result.linker.linkProfile.debug, false)
+        assert.strictEqual(result.linker.sha256, SourceSnapshot.hash(readFileSync(options.clang)))
         for (const stage of result.stages)
           assert.deepStrictEqual(stage.linkerEnvironment, { SILKC_CLANG: options.clang })
         assert.strictEqual(JSON.stringify(result).includes('unrecorded-private-value'), false)
       }),
   )
 
-  it.effect(
-    'refuses missing/dangling/nonexecutable clang and mismatched seed tool or source before a native child',
-    () =>
-      Effect.gen(function* () {
-        for (const fault of [
-          'missing',
-          'dangling',
-          'nonexecutable',
-          'directory',
-          'digest',
-          'version',
-          'seed',
-          'source',
-          'profile-name',
-          'profile-optimization',
-          'profile-debug',
-        ]) {
-          yield* fixture(function* ({ root, options }) {
-            executable(options.seed, producer())
-            yield* bindSeed(options)
-            let clang = options.clang
-            if (fault === 'missing') clang = join(root, 'missing')
-            if (fault === 'dangling') {
-              clang = join(root, 'dangling')
-              symlinkSync('absent-target', clang)
-            }
-            if (fault === 'nonexecutable') chmodSync(clang, 0o444)
-            if (fault === 'directory') clang = options.snapshot
-            if (
-              [
-                'digest',
-                'version',
-                'seed',
-                'source',
-                'profile-name',
-                'profile-optimization',
-                'profile-debug',
-              ].includes(fault)
-            ) {
-              const seed = yield* Schema.decodeEffect(Schema.fromJsonString(NativeSeed.SeedSchema))(
-                readFileSync(options.seedReceipt, 'utf8'),
-              )
-              const changed = {
-                ...seed,
-                profile: {
-                  ...seed.profile,
-                  name: fault === 'profile-name' ? 'invented-profile' : seed.profile.name,
-                  optimization:
-                    fault === 'profile-optimization' ? 'none' : seed.profile.optimization,
-                  debug: fault === 'profile-debug' ? false : seed.profile.debug,
-                },
-                toolchain: {
-                  ...seed.toolchain,
-                  clang: {
-                    ...seed.toolchain.clang,
-                    sha256: fault === 'digest' ? 'f'.repeat(64) : seed.toolchain.clang.sha256,
-                    version:
-                      fault === 'version'
-                        ? 'different clang version'
-                        : seed.toolchain.clang.version,
-                  },
-                },
-                binary: {
-                  ...seed.binary,
-                  sha256: fault === 'seed' ? 'f'.repeat(64) : seed.binary.sha256,
-                },
-                inputSnapshot: {
-                  ...seed.inputSnapshot,
-                  compilerDigest:
-                    fault === 'source' ? 'f'.repeat(64) : seed.inputSnapshot.compilerDigest,
-                },
-              }
-              writeFileSync(
-                options.seedReceipt,
-                yield* Schema.encodeEffect(Schema.fromJsonString(NativeSeed.SeedSchema))(changed),
-              )
-            }
-            const result = yield* NativeBuild.buildAndSmoke({ ...options, clang })
-            assert.strictEqual(result.status, 'failed', fault)
-            assert.strictEqual(result.failure.stage, 'linker-preflight', fault)
-            assert.strictEqual(result.stages.length, 0, fault)
-            assert.strictEqual(result.output.sha256, null, fault)
-            assert.strictEqual(existsSync(`${options.seed}.invocations`), false, fault)
-            if (fault === 'digest' || fault === 'version') {
-              assert.strictEqual(result.linker.matchesSeed, false)
-              assert.strictEqual(result.linker.path, options.clang)
-              assert.strictEqual(result.linker.version, 'fixture clang version 22')
-            }
+  it.effect('refuses an unverified producer and unusable clang before a native child', () =>
+    Effect.gen(function* () {
+      for (const fault of ['producer', 'missing', 'dangling', 'nonexecutable', 'directory']) {
+        yield* fixture(function* ({ root, options }) {
+          executable(options.producer, producer())
+          let clang = options.clang
+          if (fault === 'missing') clang = join(root, 'missing')
+          if (fault === 'dangling') {
+            clang = join(root, 'dangling')
+            symlinkSync('absent-target', clang)
+          }
+          if (fault === 'nonexecutable') chmodSync(clang, 0o444)
+          if (fault === 'directory') clang = options.snapshot
+          const result = yield* NativeBuild.buildAndSmoke({
+            ...options,
+            clang,
+            producerSha256:
+              fault === 'producer'
+                ? 'f'.repeat(64)
+                : SourceSnapshot.hash(readFileSync(options.producer)),
           })
-        }
-      }),
+          assert.strictEqual(result.status, 'failed', fault)
+          assert.strictEqual(
+            result.failure.stage,
+            fault === 'producer' ? 'inputs' : 'linker-preflight',
+            fault,
+          )
+          assert.strictEqual(result.stages.length, 0, fault)
+          assert.strictEqual(result.output.sha256, null, fault)
+          assert.strictEqual(existsSync(`${options.producer}.invocations`), false, fault)
+        })
+      }
+    }),
   )
 
   it.effect(
-    'fails closed if verified clang bytes, alias binding or seed receipt change during the native build',
+    'fails closed if verified clang bytes or alias binding change during the native build',
     () =>
       Effect.gen(function* () {
-        for (const fault of ['bytes', 'alias', 'receipt']) {
+        for (const fault of ['bytes', 'alias']) {
           yield* fixture(function* ({ root, options }) {
             const alias = join(root, 'clang')
             symlinkSync('clang-22', alias)
             let mutate = `cp '${options.clang}' '${join(root, 'other-clang')}'\nrm '${alias}'\nln -s other-clang '${alias}'`
             if (fault === 'bytes')
               mutate = `chmod u+w '${options.clang}'\nprintf '# changed\\n' >> '${options.clang}'`
-            if (fault === 'receipt') mutate = `printf ' ' >> '${options.seedReceipt}'`
-            executable(options.seed, producer() + '\n' + mutate)
+            executable(options.producer, producer() + '\n' + mutate)
             const result = yield* fixtureBuild({ ...options, clang: alias })
             assert.strictEqual(result.status, 'failed')
             assert.strictEqual(result.failure.stage, 'native-build')
@@ -321,18 +225,21 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
   )
 
   it.effect(
-    'records N0 inputs and proves the distinct newly produced N1 ran trivial-features',
+    'records exact inputs and proves the distinct newly produced N1 ran trivial-features',
     () =>
       fixture(function* ({ options, manifest }) {
-        executable(options.seed, producer())
+        executable(options.producer, producer())
         const result = yield* fixtureBuild(options)
         assert.strictEqual(result.status, 'passed')
-        assert.strictEqual(result.seed.sha256, SourceSnapshot.hash(readFileSync(options.seed)))
+        assert.strictEqual(
+          result.producer.sha256,
+          SourceSnapshot.hash(readFileSync(options.producer)),
+        )
         assert.strictEqual(
           result.output.sha256,
           SourceSnapshot.hash(readFileSync(result.output.path)),
         )
-        assert.notStrictEqual(result.output.sha256, result.seed.sha256)
+        assert.notStrictEqual(result.output.sha256, result.producer.sha256)
         assert.strictEqual(result.inputs.compiler.sha256, manifest.compilerDigest)
         assert.strictEqual(result.inputs.stdlib.sha256, manifest.stdlibDigest)
         assert.deepStrictEqual(result.inputs.compiler.files, manifest.files.slice(0, 2))
@@ -340,10 +247,11 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
           result.stages.map(({ name }) => name),
           ['native-build', 'smoke-build', 'smoke-run'],
         )
-        assert.strictEqual(result.stages[0].command[0], options.seed)
+        assert.strictEqual(result.stages[0].command[0], options.producer)
         assert.strictEqual(result.stages[1].command[0], result.output.path)
         assert.strictEqual(
-          readFileSync(`${options.seed}.invocations`, 'utf8').split('\n').filter(Boolean).length,
+          readFileSync(`${options.producer}.invocations`, 'utf8').split('\n').filter(Boolean)
+            .length,
           1,
         )
         assert.strictEqual(
@@ -369,7 +277,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
   it.effect('persists exact partial native bytes on deadline without N1 or smoke fallback', () =>
     fixture(function* ({ options }) {
       executable(
-        options.seed,
+        options.producer,
         `printf '\\377out'
 printf '\\376err' >&2
 sleep 60`,
@@ -385,11 +293,13 @@ sleep 60`,
       assert.strictEqual(existsSync(result.output.path), false)
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
       assert.deepStrictEqual(stage.command, [
-        options.seed,
+        options.producer,
         'build',
         join(options.snapshot, 'compiler/src/main.silk'),
         '-o',
         result.output.path,
+        '--emit',
+        'executable',
         '--stdlib',
         join(options.snapshot, 'packages/compiler/stdlib'),
         '--optimization',
@@ -429,7 +339,7 @@ sleep 60`,
             `if test -f '${marker}'; then sleep 60; fi\nprintf 'fixture clang version 22\\n'`,
           )
           if (point === 'linker-preflight') writeFileSync(marker, 'block')
-          executable(options.seed, producer() + `\nprintf block > '${marker}'`)
+          executable(options.producer, producer() + `\nprintf block > '${marker}'`)
           const result = yield* fixtureBuild({ ...options, timeoutMs: 150 })
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, point)
@@ -445,7 +355,7 @@ sleep 60`,
   it.effect('retains actual stage facts when completed evidence cannot be written', () =>
     fixture(function* ({ options }) {
       executable(
-        options.seed,
+        options.producer,
         `mkdir '${join(options.outputDirectory, 'native-build-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
       )
       const result = yield* fixtureBuild(options)
@@ -472,7 +382,7 @@ sleep 60`,
     'retains unexpired deadlines and completed evidence for all three successful stages',
     () =>
       fixture(function* ({ options }) {
-        executable(options.seed, producer())
+        executable(options.producer, producer())
         const result = yield* fixtureBuild({ ...options, timeoutMs: 300 })
         assert.strictEqual(result.status, 'passed')
         for (const stage of result.stages) {
@@ -502,7 +412,7 @@ sleep 60`,
   it.effect('preserves a native backend-gap refusal without smoke or recovery', () =>
     fixture(function* ({ options }) {
       executable(
-        options.seed,
+        options.producer,
         'echo \'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"suspension","reason":"park"}]}\' >&2\nexit 2',
       )
       const result = yield* fixtureBuild(options)
@@ -519,7 +429,7 @@ sleep 60`,
     Effect.gen(function* () {
       for (const body of ['exit 0', 'kill -TERM $$']) {
         yield* fixture(function* ({ options }) {
-          executable(options.seed, body)
+          executable(options.producer, body)
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.stages.length, 1)
@@ -541,7 +451,7 @@ sleep 60`,
       ]
       for (const [index, body] of bodies.entries()) {
         yield* fixture(function* ({ options }) {
-          executable(options.seed, body)
+          executable(options.producer, body)
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, index < 2 ? 'smoke-build' : 'smoke-run')
@@ -554,7 +464,7 @@ sleep 60`,
   it.effect('forbids stale output directories and N0 reuse by link', () =>
     Effect.gen(function* () {
       yield* fixture(function* ({ options }) {
-        executable(options.seed, producer())
+        executable(options.producer, producer())
         mkdirSync(options.outputDirectory)
         writeFileSync(join(options.outputDirectory, 'N1'), 'stale output')
         const error = yield* fixtureBuild(options).pipe(Effect.flip)
@@ -563,11 +473,11 @@ sleep 60`,
           readFileSync(join(options.outputDirectory, 'N1'), 'utf8'),
           'stale output',
         )
-        assert.strictEqual(existsSync(`${options.seed}.invocations`), false)
+        assert.strictEqual(existsSync(`${options.producer}.invocations`), false)
       })
       for (const command of ['ln', 'ln -s']) {
         yield* fixture(function* ({ options }) {
-          executable(options.seed, `${command} "$0" "$4"`)
+          executable(options.producer, `${command} "$0" "$4"`)
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.stages.length, 1)
@@ -579,12 +489,12 @@ sleep 60`,
   it.effect('rejects writable seeds, changed consumed bytes and unavailable RSS measurement', () =>
     Effect.gen(function* () {
       yield* fixture(function* ({ options }) {
-        executable(options.seed, producer(), 0o755)
+        executable(options.producer, producer(), 0o755)
         const result = yield* fixtureBuild(options)
         assert.match(result.failure.message, /no write permission/)
       })
       yield* fixture(function* ({ options }) {
-        executable(options.seed, `printf 'changed' >> "$2"\n${producer()}`)
+        executable(options.producer, `printf 'changed' >> "$2"\n${producer()}`)
         const result = yield* fixtureBuild(options)
         assert.strictEqual(result.status, 'failed')
         assert.strictEqual(result.failure.stage, 'native-build')
@@ -592,7 +502,7 @@ sleep 60`,
         assert.strictEqual(result.stages.length, 1)
       })
       yield* fixture(function* ({ options, root }) {
-        executable(options.seed, producer())
+        executable(options.producer, producer())
         const result = yield* fixtureBuild({
           ...options,
           timeCommand: join(root, 'missing-time'),
@@ -600,6 +510,50 @@ sleep 60`,
         assert.strictEqual(result.status, 'failed')
         assert.match(result.stages[0].error, /ENOENT/)
         assert.strictEqual(result.stages[0].peakRss.value, null)
+      })
+    }),
+  )
+
+  it.effect('requires byte-identical compiler IR from both generations at a fixpoint', () =>
+    Effect.gen(function* () {
+      yield* fixture(function* ({ options }) {
+        executable(options.producer, producer())
+        const result = yield* fixtureBuild({
+          ...options,
+          producerGeneration: 'N1',
+          generation: 'N2',
+          fixpoint: true,
+        })
+        assert.strictEqual(result.status, 'passed')
+        assert.deepStrictEqual(result.stages.map(({ name }) => name).sort(), [
+          'N1-ir',
+          'N2-ir',
+          'native-build',
+          'smoke-build',
+          'smoke-run',
+        ])
+        assert.strictEqual(result.stages.at(-1)?.command[0], result.output.path)
+        assert.strictEqual(result.fixpoint?.producerIrSha256, SourceSnapshot.hash('compiler IR'))
+        assert.strictEqual(result.fixpoint?.outputIrSha256, result.fixpoint?.producerIrSha256)
+      })
+      yield* fixture(function* ({ options }) {
+        executable(
+          options.producer,
+          producer().replace(
+            'if test "$6" = llvm-ir; then printf \'compiler IR\' > "$4"; exit 0; fi\ncat',
+            'if test "$6" = llvm-ir; then printf \'older IR\' > "$4"; exit 0; fi\ncat',
+          ),
+        )
+        const result = yield* fixtureBuild({
+          ...options,
+          producerGeneration: 'N1',
+          generation: 'N2',
+          fixpoint: true,
+        })
+        assert.strictEqual(result.status, 'failed')
+        assert.strictEqual(result.failure.stage, 'fixpoint')
+        assert.strictEqual(result.fixpoint?.producerIrSha256, SourceSnapshot.hash('older IR'))
+        assert.strictEqual(result.fixpoint?.outputIrSha256, SourceSnapshot.hash('compiler IR'))
       })
     }),
   )
