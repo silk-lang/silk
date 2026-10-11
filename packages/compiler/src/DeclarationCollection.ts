@@ -3710,6 +3710,10 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
               detail = 'operator operations cannot declare operation-local value or row parameters'
             } else if (selectedOperator === undefined) {
               detail = `${operatorSpelling ?? 'the marker'} is not an eligible ${parameterFacts.length}-operand operator`
+            } else if (
+              !parameterFacts.some((parameter) => isSelfOperand(parameter.declaredType, selfType))
+            ) {
+              detail = 'an operator operation needs an operand of type Self, &Self, or &mut Self'
             } else {
               detail = undefined
             }
@@ -4608,6 +4612,16 @@ const headerGenerics = (
  * The authored marker keeps the written spelling rather than a token, so selection matches on
  * the operator table's own canonical spellings instead of a lexer token kind.
  */
+/**
+ * Whether one declared operand is the provider itself, by value or by reference. Operator use
+ * searches only the conformances of its operand types (OP-009), so every operator operation needs
+ * an operand through which its provider is found.
+ */
+const isSelfOperand = (declared: DeclaredTypeFact, self: Type.Parameter): boolean => {
+  const operand = declared._tag === 'Reference' ? declared.target : declared
+  return operand._tag === 'Resolved' && Type.equals(operand.type, self)
+}
+
 const eligibleOperator = (spelling: string, arity: number): Operator.Eligible | undefined => {
   const unary: ReadonlyArray<Operator.Eligible> = ['Negate', 'Not', 'BitNot']
   const binary: ReadonlyArray<Operator.Eligible> = [
