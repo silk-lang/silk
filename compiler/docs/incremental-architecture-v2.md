@@ -1,8 +1,8 @@
 # Incremental architecture v2
 
-**Status:** design note for Julia's review. Nothing here is implemented. It replaces the
-per-declaration invalidation of #1359, which was closed as superseded after it failed the
-cold-build gate.
+**Status:** approved by Julia on 2026-10-11, with the decisions recorded in §8 and §11. Nothing
+here is implemented yet. It replaces the per-declaration invalidation of #1359, which was closed
+as superseded after it failed the cold-build gate.
 
 **Inputs:** the Zig source audit in
 [research/zig-incremental-verification.md](research/zig-incremental-verification.md) (cited as
@@ -31,16 +31,16 @@ cold-build gate.
   Modules are read before or during the build, never by revising it, so a build runs once instead
   of 81 rounds. Three quarters of the round cost was the instance walk repeating itself (§1.4).
 - The first build of an incremental session is estimated at under 1% time and about 1.1% RSS over
-  one-shot, against a proposed budget of 3% and 5% (§9).
-- Nine ranked language proposals (§8): Julia accepted seven, among them scoping results by the
-  profile entries they read and removing the three build-wide fixed points (failure observation,
-  region sensitivity, suspension), and deferred two. The three safety-model options are still
-  open.
+  one-shot, against the accepted budget of 3% and 5% (§9).
+- Nine ranked language proposals (§8): Julia accepted eight, P5 in part, among them scoping
+  results by the profile entries they read and removing the three build-wide fixed points (failure
+  observation, region sensitivity, suspension). P5(b) and P8 are deferred.
 - The work starts with two changes that need no new design and land first: one build round instead
   of 81, and no recording in one-shot builds, worth the measured 34% together. Six slices then
   build the graph, its precision and cutoff, backend reuse and the session driver (§10).
-- Checking units are incremental units with their own cutoff, keyed like the body they prove, so
-  native borrow checking can start now (§8.3).
+- Borrow checking follows S1, Julia's choice: it runs on the typed body inside the `Body` unit,
+  keyed by declaration and selection, and reads only that body, callee signatures and type
+  summaries. Native borrow checking can start now (§8.3).
 
 ## 1. Current state
 
@@ -211,21 +211,20 @@ dependee. Reads inside one unit are never recorded.
 ### 2.1 Analysis units
 
 A unit is `(kind, subject)`, where the subject is an interned handle (§3.4). Today's query
-families (`Semantic.silk:304`) map onto ten unit kinds. Families that only project one
+families (`Semantic.silk:304`) map onto nine unit kinds. Families that only project one
 declaration's own syntax stop being separately tracked; they run inside the unit that needs them.
 
-| Unit            | Subject                       | Today's families folded in                                                                                                                                                                                                                                 | Result others consume                   |
-| --------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| `Header(D)`     | declaration                   | `Signature`, `Alias`, `Identity`, `Contract`, `Members`, `MemberShape`, `Operations`, `FieldLifetimes`, `Constant`, `ImplementationHead`, `ImplementationMembers`, `Witnesses`, `ParameterSchema`, `OperationUnder`, `AppliedOperation`, `AppliedInherent` | the interned header record              |
-| `Value(D)`      | declaration                   | `Initializer`, `Condition`, `ParameterDefault`                                                                                                                                                                                                             | the interned static value               |
-| `Body(D, s)`    | declaration, static selection | `Body`; anonymous functions and `effect {}` blocks inside it                                                                                                                                                                                               | its realization (§2.2), and its own MIR |
-| `Borrow(D, s)`  | same key as `Body`            | the `BorrowCheck` family of #1421                                                                                                                                                                                                                          | `Checked` or the rejections             |
-| `Coherence(I)`  | `impl` declaration            | `Coherence`, `ProofBounds`                                                                                                                                                                                                                                 | accepted or rejected                    |
-| `Layout(T)`     | interned type application     | `Layout`                                                                                                                                                                                                                                                   | size, alignment, offsets, ABI class     |
-| `Mir(k)`        | interned instance key         | `Mir`                                                                                                                                                                                                                                                      | its direct callees and boundary flags   |
-| `Suspension(k)` | interned instance key         | none today; replaces the `closeSuspendable` pass (§8.2 P4)                                                                                                                                                                                                 | `{transfer, park}`                      |
-| `Emit(k)`       | interned instance key         | `EmissionInputs`, `LlvmText`                                                                                                                                                                                                                               | the content subject of its LLVM text    |
-| `Catalog(root)` | discovery root                | `Tests`                                                                                                                                                                                                                                                    | the test catalog                        |
+| Unit            | Subject                                                                                                                                                                          | Today's families folded in                                                                                                                                                                                                                                 | Result others consume                 |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `Header(D)`     | declaration                                                                                                                                                                      | `Signature`, `Alias`, `Identity`, `Contract`, `Members`, `MemberShape`, `Operations`, `FieldLifetimes`, `Constant`, `ImplementationHead`, `ImplementationMembers`, `Witnesses`, `ParameterSchema`, `OperationUnder`, `AppliedOperation`, `AppliedInherent` | the interned header record            |
+| `Value(D)`      | declaration                                                                                                                                                                      | `Initializer`, `Condition`, `ParameterDefault`                                                                                                                                                                                                             | the interned static value             |
+| `Body(D, s)`    | the typed body: none, a rerun body always reruns its own `Mir` and `Emit` units; the checking answer: `Checked`, or rejection codes with relative spans, or `NotChecked{reason}` | comparing typed bodies costs more than it saves, and trivia-only edits never reach a body (§3.1); only the build verdict reads the checking answer                                                                                                         |
+| `Coherence(I)`  | `impl` declaration                                                                                                                                                               | `Coherence`, `ProofBounds`                                                                                                                                                                                                                                 | accepted or rejected                  |
+| `Layout(T)`     | interned type application                                                                                                                                                        | `Layout`                                                                                                                                                                                                                                                   | size, alignment, offsets, ABI class   |
+| `Mir(k)`        | interned instance key                                                                                                                                                            | `Mir`                                                                                                                                                                                                                                                      | its direct callees and boundary flags |
+| `Suspension(k)` | interned instance key                                                                                                                                                            | none today; replaces the `closeSuspendable` pass (§8.2 P4)                                                                                                                                                                                                 | `{transfer, park}`                    |
+| `Emit(k)`       | interned instance key                                                                                                                                                            | `EmissionInputs`, `LlvmText`                                                                                                                                                                                                                               | the content subject of its LLVM text  |
+| `Catalog(root)` | discovery root                                                                                                                                                                   | `Tests`                                                                                                                                                                                                                                                    | the test catalog                      |
 
 **[source]** for the family list; the grouping is the proposal. Two choices need justification.
 
@@ -238,6 +237,11 @@ declaration's own syntax stop being separately tracked; they run inside the unit
   so they consume the same dependees. One unit records each consumed dependee once. The price is
   coarser cutoff inside one declaration: a caller that reads only a struct's member names reruns
   when a field type changes. That is the same precision Zig accepts for `nav_ty` (audit §3).
+
+**Borrow checking runs inside `Body`.** Julia chose S1 (§8.3): the `Body(D, s)` unit types the
+body and then proves its loans and regions on the typed body. The checking answer, `Checked`,
+rejections or `NotChecked{reason}`, is part of the `Body` result. There is no separate checking
+unit and no second lowering.
 
 The remaining families stop being cached answers with their own evidence. `Name` and `Import`
 run inside their consumer, which records `Name(M, n)`. `Implementations`, `ConformanceHeads` and
@@ -578,7 +582,6 @@ A session revision is a `u32` counter, advanced once per update. Each unit store
 | `Realization(D, s)`           | interned realization: opaque representation, callable origin              | same                                                                                                                               |
 | `LayoutOf(T)`                 | size, alignment, field offsets, enum encoding, ABI class                  | that is the whole `BackendLayout`; Zig skips this comparison (audit §5) and Silk should not, because layout records are small      |
 | `Body(D, s)`                  | none: a rerun body always reruns its own `Mir`, `Emit` and `Borrow` units | comparing typed bodies costs more than it saves; trivia-only edits never reach a body (§3.1)                                       |
-| `Borrow(D, s)`                | `Checked`, or rejection codes with relative spans                         | nothing downstream reads more                                                                                                      |
 | `Coherence(I)`                | accepted, or rejection code with relative span                            | same                                                                                                                               |
 | `Mir(k)`                      | none: its only readers are its own `Suspension` and `Emit` units          | as for `Body`                                                                                                                      |
 | `Suspension(k)`               | `{transfer, park}`; a recursive group compares its shared summary         | it is the whole summary callers and emission read                                                                                  |
@@ -629,7 +632,7 @@ What a long-running session retains between updates:
 - the parsed and indexed sources of every module in the build, with fingerprints and location
   tables;
 - unit results that others consume: headers, values, realizations, layouts, catalogs (small);
-- typed bodies, because a `Mir` or `Borrow` unit reruns when a callee signature changes even
+- typed bodies, because a `Mir` unit reruns when a callee signature changes even
   though its body did not. **[assumption]** Evicting typed bodies and rechecking on demand is a
   later memory option, measured before it is built;
 - per instance, the content subject and its LLVM text or object code (§7.2);
@@ -650,14 +653,14 @@ walk are whole-program; P3 and P4 remove them, and without those proposals they 
 end. An incremental front end that reruns one body in milliseconds still pays 88 s if the backend
 recompiles one LLVM module. The backend therefore needs its own cutoff:
 
-- partition definitions into codegen units by a stable key (for example the defining module, or a
-  hash of the symbol into a fixed number of buckets);
+- partition definitions into codegen units by their defining module (decided by Julia,
+  2026-10-11);
 - a codegen unit's identity is the sorted set of content subjects of its definitions;
 - an unchanged set reuses the previous object file; a changed set recompiles only that unit;
 - link the objects.
 
 This changes output only in partitioning, which LLVM's semantics do not observe; the fixpoint gate
-compares IR text per unit instead of one file. The partitioning scheme is an open question (§11).
+compares the IR text of every codegen unit instead of one file.
 
 ### 7.3 On disk
 
@@ -674,9 +677,8 @@ considering later, each only after a measurement shows it pays:
 
 Julia decided the proposals on 2026-10-11: P1, P2(c), P3(a), P4 (inferred summaries), P5(a), P6,
 P7 and P9 are accepted; P5(b) and P8 are deferred. Each proposal below records its decision. The
-safety-model options of §8.3 are still open. Before the decision, every item was a proposal for
-Julia, and none is assumed by §2 to §7: the design works
-on today's language, and each proposal makes it cheaper or more precise. Each states the reference
+safety-model choice is S1 (§8.3). Before the decision, every item was a proposal for Julia, and
+none is assumed by §2 to §7: the design works on today's language, and each proposal makes it cheaper or more precise. Each states the reference
 change, what it buys, and why memory safety still holds. They are ranked by benefit, highest first.
 The survey behind them read the reference and the native implementation; its citations were
 spot-checked.
@@ -953,7 +955,7 @@ signatures and type properties. That makes the checking unit local, as #1421 ass
    body's locations. Cost grows with body size times region count, per body. This is local but is
    the main cold cost of checking.
 
-**Simpler sound alternatives for Julia:**
+**Simpler sound alternatives.** **Decision (Julia, 2026-10-11): S1.**
 
 - _S1. Check on the typed body, inside the `Body` unit._ The bootstrap checks typed TIR, not MIR
   (#1421 §1.2). Checking the `TypedBody` inside its own unit adds no unit, no edges and no second
@@ -978,11 +980,11 @@ signatures and type properties. That makes the checking unit local, as #1421 ass
 
 **The checking-unit rule.** A checking unit is an incremental unit with its own cutoff:
 
-- it is keyed by `(DeclIndex, selection)`, the key of the `Body` it proves, never by an instance
-  or by a declaration ordinal;
-- it reads only that body (through its own `Body` unit), the `HeaderOf` of every callee and bound
-  operation it calls, and the type summaries of the types it touches (P5a). It never reads a
-  callee's body, MIR or checking answer;
+- it is keyed by `(DeclIndex, selection)`, never by an instance or by a declaration ordinal. Under
+  S1 it is the `Body` unit itself;
+- it reads only that body, the `HeaderOf` of every callee and bound operation it calls, and the
+  type summaries of the types it touches (P5a). It never reads a callee's body, MIR or checking
+  answer;
 - its result is `Checked`, `Rejected` with codes and relative anchors, or `NotChecked{reason}`, and
   §6.3 compares exactly that;
 - a body edit reruns the edited declaration's checking units; a signature edit reruns the checking
@@ -996,8 +998,8 @@ set are what matter, and v2 slice 3 attaches edges to them without changing the 
 (Q5), and native names printed with bootstrap codes (Q7). This design answers or reframes:
 
 - _Q1 (MIR or typed body)._ Reframed: incremental compilation does not require MIR. S1 and S2 are
-  both checking units under the rule above. The choice is cold cost against one representation:
-  S1 adds no second lowering of generic bodies, S2 keeps emission and checking on one shape.
+  both checking units under the rule above. The choice was cold cost against one representation,
+  and Julia chose S1: no second lowering of generic bodies.
 - _Q2 (span parity)._ Compatible with code plus primary-span parity, with one requirement: checking
   answers store spans relative to their declaration (§3.5), because cutoff compares them. Parity
   then compares rendered spans, and an edit elsewhere in the file never changes a cached answer.
@@ -1057,7 +1059,7 @@ measurement in slice 3.
 
 **[assumption]** Targets for watch mode on the compiler itself, to be confirmed by slice 8:
 
-- a body edit with an unchanged signature: one `Body`, `Borrow`, `Mir` and `Emit` unit rerun, one
+- a body edit with an unchanged signature: one `Body` (typing and checking), `Mir` and `Emit` unit rerun, one
   codegen unit recompiled, front end under 100 ms;
 - a signature edit: its callers' `Body` units at most; front end proportional to the callers;
 - an edit that changes nothing but trivia: no unit reruns.
@@ -1154,7 +1156,13 @@ accepted P1, P5(a), P6 and P9. The other accepted proposals land as their own sl
 5, each with its reference change where it has one: P2(c) and P3(a) in lowering, P4 with the
 SCC-capable query, P7 in test discovery and the runner.
 
-**Slice 7, backend reuse.** Codegen units keyed by content subjects, object reuse, linking.
+**Slice 7, backend reuse.** One codegen unit per defining module, identified by the content
+subjects of its definitions; object reuse; linking.
+
+**Borrow checking (S1) runs beside these slices.** It needs no slice of its own here: it is part of
+the `Body` unit, keyed by `(DeclIndex, selection)` once slice 0 lands and by today's body key
+before that, and it reads only the body, callee headers and type summaries (P5a). Slice 3 then
+records its edges like any other `Body` read. The borrow-checking note (#1421) owns its own slices.
 
 **Slice 8, the session driver.** `silkc build --watch` first, then the LSP entry points.
 
@@ -1165,25 +1173,27 @@ answer. They become cases of slice 3.
 Each slice's tests follow the cost rules in `AGENTS.md`: structural assertions on unit start
 counts and results in existing case files, no timing assertions, no per-feature native builds.
 
-## 11. Open questions for Julia
+## 11. Decisions
 
-1. **Reuse between slices 3 and 4.** Slice 3 replaces body reuse with module-granularity
-   invalidation, so a revised store reruns every unit of an edited module until slice 4 restores
-   declaration precision. Acceptable, given that only tests use revision today?
-2. **Fingerprint hash.** A 128-bit non-cryptographic word-at-a-time hash (proposed), or BLAKE3
-   truncated to 128 bits as Zig uses, for resistance to deliberate collisions at several times the
-   cost per byte?
-3. **Trivia.** Fingerprints over tokens without comments and whitespace (proposed), so comment
-   edits rerun nothing. Do doc comments carry meaning the compiler must track (for example in test
-   descriptors)?
-4. **Unit granularity.** One `Header` unit per declaration (proposed), accepting that a caller
-   reading only member names reruns when a field type changes?
-5. **Safety model.** Borrow checking on the typed body inside the `Body` unit (S1), or a separate
-   unit over checking MIR as #1421 proposes (S2)? Both are incremental units with their own cutoff.
-6. **Backend partitioning.** Codegen units by defining module, or by a fixed number of symbol-hash
-   buckets? And should the fixpoint gate compare IR per codegen unit?
-7. **Session order.** Watch mode before the LSP (proposed)?
-8. **Disk caches.** None in v2 (proposed), with object code per codegen unit as the first candidate
-   after measurement?
-9. **Budgets.** One-shot within 1% of a recorder-free build, first incremental build within 3%
-   time and 5% RSS (proposed)?
+Julia decided the remaining questions on 2026-10-11 and approved the note. Every proposed default
+was accepted:
+
+1. **Reuse between slices 3 and 4.** Accepted: slice 3 invalidates at module granularity, and a
+   revised store reruns every unit of an edited module until slice 4 restores declaration
+   precision.
+2. **Fingerprint hash.** A 128-bit non-cryptographic hash that processes a word per step.
+   Adversarial collision resistance is out of scope.
+3. **Trivia.** Fingerprints cover tokens without comments and whitespace, doc comments included.
+   If a doc comment ever gains compiler meaning, it becomes a token input of the fingerprint.
+4. **Unit granularity.** One `Header` unit per declaration.
+5. **Safety model.** S1: borrow checking on the typed body inside the `Body` unit (§8.3).
+6. **Backend partitioning.** One codegen unit per defining module; the fixpoint gate compares the
+   IR of every codegen unit.
+7. **Session order.** Watch mode before the LSP.
+8. **Disk caches.** None in v2. Object code per codegen unit is the first candidate, after a
+   measurement shows it pays.
+9. **Budgets.** One-shot within 1% of a recorder-free build; the first incremental build within 3%
+   time and 5% peak RSS.
+
+Language proposals: §8.2. Earlier decisions folded in: mode-gated recording (§5.1), preloading and
+one-shot no-record landing first (§10 slices 1 and 2).
