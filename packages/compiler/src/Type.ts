@@ -4186,6 +4186,17 @@ export const freeLifetimes = (self: Type): ReadonlyArray<Lifetime.Lifetime> => [
   ).values(),
 ]
 
+/** Lists every free region atom once per position it occupies, in deterministic preorder. */
+export const regionOccurrences = (self: Type): ReadonlyArray<Lifetime.Atom> =>
+  fold(self, {
+    argument: (argument, inBinderScope) =>
+      Lifetime.isLifetime(argument) &&
+      argument._tag !== 'IntersectionLifetime' &&
+      !inBinderScope(Lifetime.key(argument))
+        ? argument
+        : undefined,
+  })
+
 /** Facts guaranteed when an executable value is formed, independent of its invocation binders. */
 export const executableFormationRequirements = (
   self: Callable | Effect,

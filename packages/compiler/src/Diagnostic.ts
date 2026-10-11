@@ -441,6 +441,8 @@ export const unsatisfiedTypeOutlivesCode = 'SEM0213' as const
 export const invalidTestDeclarationCode = 'SEM0218' as const
 /** Emitted code references a function instance whose valid body native lowering does not support yet. */
 export const unsupportedLoweringCode = 'SEM0219' as const
+/** A conformance head names `'static`, repeats one region, or bounds a region. */
+export const regionSelectiveConformanceCode = 'SEM0220' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -484,6 +486,7 @@ export type Code =
   | typeof unsatisfiedTypeOutlivesCode
   | typeof invalidTestDeclarationCode
   | typeof unsupportedLoweringCode
+  | typeof regionSelectiveConformanceCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -975,6 +978,11 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly _tag: 'NonTerminatingConformance'
       readonly head: string
       readonly failures: ReadonlyArray<string>
+    }
+  | {
+      readonly _tag: 'RegionSelectiveConformance'
+      readonly head: string
+      readonly selection: string
     }
   | {
       readonly _tag: 'UnprovenConformance'
@@ -4722,6 +4730,29 @@ export const nonTerminatingConformance = <L>(
   },
   span,
   notes: [...failures],
+})
+
+/**
+ * Creates the diagnostic for a conformance head that would select its witness by region.
+ *
+ * Lifetimes select no code: every region pattern of a goal must reach the same witness, so a head
+ * may give each region position its own binder and nothing more.
+ */
+export const regionSelectiveConformance = <L>(
+  head: string,
+  selection: string,
+  span: L,
+): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: regionSelectiveConformanceCode,
+  severity: 'error',
+  message: `${head} selects by region: it ${selection}`,
+  reason: { _tag: 'RegionSelectiveConformance' as const, head, selection },
+  span,
+  notes: [
+    'A conformance head gives every region position its own unbounded binder, because lifetimes never select a witness.',
+  ],
 })
 
 /**

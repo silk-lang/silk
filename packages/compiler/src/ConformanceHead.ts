@@ -21,6 +21,7 @@
  * rewrite a ground argument the interface already fixed. Those three conditions make the provider
  * term a well-founded measure, so proof search needs no fuel and no depth limit.
  */
+import * as Lifetime from './Lifetime.js'
 import * as Type from './Type.js'
 
 /** The canonical owner every normalized head parameter is renumbered under. */
@@ -73,6 +74,16 @@ export type TerminationFailure =
       readonly declared: string
       readonly required: string
     }
+
+/**
+ * Why a head would let a region choose its witness. Coherence erases lifetimes, so a head may only
+ * give every region position its own unbounded binder; then each region pattern of a goal matches
+ * it alike, and a specialization never depends on which regions a caller supplied.
+ */
+export type RegionSelection =
+  | { readonly _tag: 'StaticRegion' }
+  | { readonly _tag: 'RepeatedRegion'; readonly region: string }
+  | { readonly _tag: 'BoundedRegion'; readonly parameter: string }
 
 /**
  * Returns every parameter reachable from the supplied terms in first-occurrence order.
@@ -564,5 +575,44 @@ export const describeTermination = (self: TerminationFailure): string => {
       return `requirement ${self.requirement} repeats ${self.variable} ${self.required} times where the header uses it ${self.declared}`
     case 'ChangedGroundArgument':
       return `requirement ${self.requirement} rewrites ground argument ${self.ordinal} from ${self.declared} to ${self.required}`
+  }
+}
+
+/**
+ * Returns how a written head selects by region, if it does. `bounded` names the head binders that
+ * carry an outlives bound (`'a: 'b`) or a contents bound (`T: 'a`).
+ */
+export const regionSelection = (
+  capability: Type.Nominal,
+  provider: Type.Type,
+  bounded: ReadonlyArray<string>,
+): RegionSelection | undefined => {
+  const seen = new Set<string>()
+  for (const region of [
+    ...Type.regionOccurrences(capability),
+    ...Type.regionOccurrences(provider),
+  ]) {
+    if (region._tag === 'StaticLifetime') return { _tag: 'StaticRegion' }
+    const regionKey = Lifetime.key(region)
+    if (seen.has(regionKey))
+      return {
+        _tag: 'RepeatedRegion',
+        region: region._tag === 'BoundLifetime' ? `'${region.name}` : regionKey,
+      }
+    seen.add(regionKey)
+  }
+  const parameter = bounded.at(0)
+  return parameter === undefined ? undefined : { _tag: 'BoundedRegion', parameter }
+}
+
+/** Renders one region selection as the clause a diagnostic completes. */
+export const describeRegionSelection = (self: RegionSelection): string => {
+  switch (self._tag) {
+    case 'StaticRegion':
+      return "names 'static"
+    case 'RepeatedRegion':
+      return `names ${self.region} at two positions`
+    case 'BoundedRegion':
+      return `bounds ${self.parameter} by a region`
   }
 }

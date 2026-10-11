@@ -174,3 +174,53 @@ pub fn main() -> i32 { return 0 }`,
     assert.deepEqual(reported(snapshot, 'SEM0083'), [])
   }),
 )
+
+it.effect('rejects conformance heads that select by region', () =>
+  Effect.gen(function* () {
+    // Lifetimes never select a witness, so a conformance or sealed Drop head may not name
+    // `'static`, repeat one region, or bound a region. Distinct unbounded binders and inherent
+    // blocks are unaffected.
+    const source = `interface Mark {}
+struct Lasting<'a> { value: &'a i32 }
+struct Pair<'a, 'b> { left: &'a i32 right: &'b i32 }
+struct Ordered<'a, 'b> { left: &'a i32 right: &'b i32 }
+struct Held<'a, T> { value: &'a T }
+struct Free<'a, 'b> { left: &'a i32 right: &'b i32 }
+struct Guard<'a> { value: &'a i32 }
+
+impl Mark for Lasting<'static> {}
+impl<'a> Mark for Pair<'a, 'a> {}
+impl<'a: 'b, 'b> Mark for Ordered<'a, 'b> {}
+impl<'a, T: 'a> Mark for Held<'a, T> {}
+impl<'a, 'b> Mark for Free<'a, 'b> {}
+impl Drop for Guard<'static> {
+  fn drop(self: &mut Guard<'static>) -> () { return () }
+}
+impl<'a, T: 'static> Held<'a, T> {
+  fn read(self: &Held<'a, T>) -> &'a T { return self.value }
+}
+
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* analyze('conditional-conformance-rejection/region-selective', source)
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot)
+        .filter((diagnostic) => diagnostic.code === 'SEM0220')
+        .map((diagnostic) =>
+          source.slice(diagnostic.span.start, diagnostic.span.end).split('\n').at(0),
+        ),
+      [
+        'impl Mark for Lasting<\'static> {}',
+        "impl<'a> Mark for Pair<'a, 'a> {}",
+        "impl<'a: 'b, 'b> Mark for Ordered<'a, 'b> {}",
+        "impl<'a, T: 'a> Mark for Held<'a, T> {}",
+        'impl Drop for Guard<\'static> {',
+      ],
+    )
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot)
+        .filter((diagnostic) => diagnostic.code !== 'SEM0220')
+        .map((diagnostic) => diagnostic.code),
+      [],
+    )
+  }),
+)

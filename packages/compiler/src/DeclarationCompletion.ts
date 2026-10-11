@@ -1317,6 +1317,23 @@ export const complete = (
         ).includes(module.module)
       )
         return { ...conformance, head }
+      const regionSelection = ConformanceHead.regionSelection(
+        conformance.capability.type,
+        conformance.provider.type,
+        conformance.typeParameters.flatMap((parameter) =>
+          (parameter.lifetimeBounds?.length ?? 0) > 0 && parameter.name._tag === 'Present'
+            ? [parameter.name.spelling]
+            : [],
+        ),
+      )
+      if (regionSelection !== undefined)
+        diagnostics.push(
+          Diagnostic.regionSelectiveConformance(
+            ConformanceHead.encode(head),
+            ConformanceHead.describeRegionSelection(regionSelection),
+            Location.at(conformance.anchor),
+          ),
+        )
       const failures = ConformanceHead.terminationFailures(head)
       if (failures.length > 0)
         diagnostics.push(
