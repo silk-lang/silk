@@ -8446,8 +8446,9 @@ int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expec
     expected: { _tag: 'Completes', result: 1 },
   },
   {
-    // Same erased Guard layout, distinct selected hooks. Counters also reject omitted cleanup.
-    // Separate callers isolate generic glue from the bootstrap's lifetime-erased caller reuse.
+    // One Guard hook serves every region pattern (IMPL-007: heads never select by region). The
+    // 'static and local patterns each run the outer hook before the nested Token hook, and the
+    // counters reject omitted or repeated cleanup.
     name: 'generic-lifetime-selected-cleanup',
     source: `struct Token<'data> { value: i32 counter: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
@@ -8459,14 +8460,14 @@ impl<'data> Drop for Token<'data> {
   }
 }
 struct Guard<'a, 'data> { token: Token<'data> }
-impl<'data> Drop for Guard<'static, 'data> {
-  fn drop(self: &mut Guard<'static, 'data>) -> () {
+impl<'a, 'data> Drop for Guard<'a, 'data> {
+  fn drop(self: &mut Guard<'a, 'data>) -> () {
     self.token.value = self.token.value + 1
     return ()
   }
 }
 fn localGuard<'a, 'data>(value: &'a i32, counter: &'data mut i32) -> Guard<'a, 'data> {
-  return Guard<'a, 'data> { token: Token { value: 2, counter: move counter } }
+  return Guard<'a, 'data> { token: Token { value: 1, counter: move counter } }
 }
 fn consume<'a, 'data>(value: Guard<'a, 'data>) -> () { drop value return () }
 fn consumeStatic<'data>(value: Guard<'static, 'data>) -> () { drop value return () }
