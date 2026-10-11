@@ -153,7 +153,7 @@ when no discovery root is present.
 ### Intrinsic catalog types and values
 
 The three catalog families `Intrinsic.Tests`, `Intrinsic.Test<F>` and `Intrinsic.TestInfo` were
-listed as known names and refused with `CoreTypeUnavailable`. They are checked intrinsic types next
+listed as known names and refused as deferred core types. They are checked intrinsic types next
 to `Fields` and `Field`:
 
 - `Type.TestCatalog` for `Tests` and `Type.TestDescriptor {callable}` for `Test<F>`, both phase-only
