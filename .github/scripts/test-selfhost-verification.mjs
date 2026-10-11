@@ -55,42 +55,34 @@ try {
   writeFileSync(gate, verifyingGate)
   chmodSync(gate, 0o755)
   const bootstrap = join(temporary, 'bootstrap.mjs')
-  writeFileSync(
-    bootstrap,
-    `import assert from 'node:assert/strict'; assert.deepEqual(process.argv.slice(2), ['build', '--manifest-path', 'compiler/silk.toml', '--optimization', 'release-with-debug']); console.log('rebuilt committed checkout');`,
-  )
   const compiler = join(temporary, 'silkc')
-  writeFileSync(
-    compiler,
-    '#!/bin/sh\nprintf "#!/bin/sh\\nexit 42\\n" > program\nchmod +x program\n',
-  )
-  chmodSync(compiler, 0o755)
   const downloaded = join(temporary, 'verification.mjs')
   copyFileSync(bundle, downloaded)
-  const invoke = () =>
+  // Formatter mode verifies the checkout only: it receives no compiler, bootstrap or corpus input.
+  const invoke = (environment = { SILK_FORMAT_GATE: gate }) =>
     spawnSync(process.execPath, [downloaded], {
       cwd: checkout,
       env: {
         ...process.env,
+        SILKC: '',
+        SILK_BOOTSTRAP: '',
         RUNNER_TEMP: temporary,
-        SILKC: compiler,
-        SILK_BOOTSTRAP: bootstrap,
-        SILK_SELFHOST_CORPUS_CASES: 'trivial-features',
         NODE_PATH: '',
         NODE_OPTIONS: '',
+        ...environment,
       },
       encoding: 'utf8',
       timeout: 30_000,
     })
   const result = invoke()
   assert.strictEqual(result.status, 0, result.stderr)
-  assert.match(result.stdout, /rebuilt committed checkout/)
-  assert.match(result.stdout, /PASS trivial-features/)
+  assert.doesNotMatch(result.stdout, /PASS |SELFHOST_CASE_TIMING=/)
   assert.match(
     readFileSync(join(temporary, 'formatter-safety.log'), 'utf8'),
     /FORMAT_SAFETY checked=1/,
   )
-  // The gate verifies only: a gate that rewrites a tracked source fails before the rebuild.
+  assert.notStrictEqual(invoke({}).status, 0)
+  // The gate verifies only: a gate that rewrites a tracked source fails.
   writeFileSync(
     gate,
     '#!/bin/sh\nprintf "\\n// formatted witness\\n" >> packages/compiler/stdlib/silk/i32.silk\n',
@@ -102,10 +94,6 @@ try {
     cwd: checkout,
   })
   writeFileSync(gate, verifyingGate)
-  // The downloaded tooling must validate consumer data, rather than embed main's track.
-  writeFileSync(track, JSON.stringify(['trivial-features', 'trivial-features']))
-  assert.notStrictEqual(invoke().status, 0)
-  writeFileSync(track, JSON.stringify(['trivial-features']))
   writeFileSync(catalog, 'let members = b"invalid"')
   const invalid = invoke()
   assert.notStrictEqual(invalid.status, 0)
@@ -136,6 +124,7 @@ printf '#!/bin/sh\\nexit 42\\n' > program
 chmod +x program
 `,
   )
+  chmodSync(compiler, 0o755)
   const expectedCompiler = readFileSync(compiler)
   const expectedSources = sourceDigests(checkout)
   const corpusEnvironment = {
