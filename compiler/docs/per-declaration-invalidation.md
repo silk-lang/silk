@@ -1,7 +1,9 @@
 # Per-declaration invalidation
 
 **Status:** proposal. Nothing here is implemented, and implementation waits for Julia's approval.
-Measured on `selfhost` `e1022f2`; line numbers refer to `31fc6e3`.
+Original measurements were reported on `selfhost` `e1022f2`; the baseline behavior and line
+numbers in §§1–2 refer to `31fc6e3`. The region-identity discussion below also covers the current
+`selfhost` design documented in `region-sensitive-identity.md`.
 
 ## Summary
 
@@ -230,8 +232,8 @@ entry, and only those. Two changes keep it that way:
   headers. An unrelated runtime body edit therefore need not disturb them. Scans still inspect
   unused declaration headers where resolution or coherence requires them; this does not require
   checking every unused runtime body.
-- Instance families keep keying on the instance. An approved region-erasure design could change
-  that key to code identity (see §4).
+- Instance families keep keying on the instance, respecting the current split between
+  region-erased and region-sensitive applications (see §4).
 
 ## 4. Cost, risks and the region-sensitivity work
 
@@ -281,7 +283,17 @@ coherence, cycle diagnostics, nested captures, current diagnostic spans, and tar
 changes against fresh results. Assert query-event counts structurally; measure time and memory
 in opt-in benchmarks.
 
-**Interaction with 01DLG's region-sensitivity work (#1242).**
+**Interaction with the current region-sensitivity design.**
+
+`region-sensitive-identity.md` describes the shipped rule: applications normally share one
+region-erased backend instance, but consulting lifetime-selective heads or lending their own
+regions to a sensitive application makes their patterns distinct. Sensitivity is recorded with
+MIR and implementation heads; builds reconstruct its transitive closure and may restart their
+walk. A MIR result fingerprint must include sensitivity and lending-reference evidence as well
+as instructions. Equal instructions with changed sensitivity are not an equal result for these
+consumers. Preserve the build's closure and fresh-build equivalence when adding cutoff.
+
+**Historical alternative (#1242).**
 
 As of 2026-10-10 (America/Sao_Paulo), #1242 is closed without merging. Its draft reported that
 per-pattern validation still expanded combinatorially and required language decisions. Treat it
@@ -296,7 +308,7 @@ as a design reference, not an implemented prerequisite or an approved validity a
   including conformance and cleanup selection. Signature and Body fingerprints alone are not a
   demonstrated complete dependency set. Equal code may allow emission reuse while validity checks
   re-run; semantic validity does not follow from that code equality.
-- The designs can compose, but canonical instance encodings and validation dependencies must be
-  agreed with #1242 before implementation. Region-pattern obligations remain separate inputs;
-  equal emitted code does not prove equal validity. An approved identity split may shrink the
-  number of answers to fingerprint and revalidate.
+- The proposed per-pattern validity family is not the shipped sensitivity mechanism. Do not
+  introduce it as a prerequisite for invalidation. The current identity and sensitivity evidence
+  must participate in direct-dependency validation; equal emitted code does not prove equal
+  validity.
