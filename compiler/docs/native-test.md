@@ -216,10 +216,20 @@ loop. The native checker refused both:
    the borrow's syntax, which every occurrence shares. Sharing the key is sound while the loan
    stays inside its occurrence: an occurrence's nodes are checked together, regions select no code,
    and a place declared outside the iteration keeps the region its declaration gave it. The check
-   now refuses only a write of such a loan to an outside local or through a dereference.
+   now refuses only a write that carries such a loan out: a value written to a local declared
+   before the iteration, or to a place reached through a dereference, that retains a region the
+   occurrence minted, borrows storage the occurrence declares, or copies a reference held by a
+   local the occurrence declares. A written value is checked against its place's type, so the
+   check walks the value's operands rather than trusting its type.
 5. An authored `return` or `fail` inside an occurrence was refused. Both leave the function as they
    do anywhere else; the expansion completes only when every occurrence can. `break` and
    `continue` stay refused: a `static for` is not a runtime loop.
+
+A root with more than 106 tests found one more limit:
+
+6. Static selection capped one specialization at 4,096 residual nodes against the bootstrap's
+   100,000 (STATIC-013 policy). Each runner loop occurrence is about 38 nodes, so the catalog loops
+   stopped expanding at 107 tests. The native limit now matches the bootstrap's.
 
 The test bodies of the compiler's Cases roots are compiler source the native compiler already
 builds. As a check, `semantic/TargetCases.silk` with its
