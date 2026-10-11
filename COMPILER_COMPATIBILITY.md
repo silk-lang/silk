@@ -1177,22 +1177,33 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `sliceConversionsRetainRegionAccessAndDiagnostics` asserts `TypeMismatch` at
   `&local` and `&[42]`. The bootstrap's `RuntimeSliceOwnership.test.ts` asserts `OWN0019`.
 
-### Selfhost test declaration diagnostics
+### Test declaration diagnostics and discovery
 
-- **Status:** recorded on 2026-10-08 with the Stage 1 census tail.
+- **Status:** recorded on 2026-10-08 with the Stage 1 census tail; native discovery and TEST-001
+  implemented on 2026-10-11 (#1422).
 - **Rule:** [TEST-001](apps/docs/content/reference/testing.md#test-001--test-marks-a-parameterless-unit-function)
   admits a module-level, safe, non-static function with a body, no generic or value parameters and
-  unit success as a test entry; [TEST-002](apps/docs/content/reference/testing.md#test-002--ordinary-builds-do-not-execute-or-retain-tests)
-  analyzes an active test entry like any other function in an ordinary build.
-- **Compilers:** both analyze a valid test entry as an ordinary function. The bootstrap reports an
-  invalid entry as `InvalidTestDeclaration`; selfhost has no test declaration diagnostic yet and
-  refuses that signature as `Unsupported`.
+  unit success as a test entry, and reports an invalid entry at the conflicting qualifier,
+  parameter, binder or success type. [TEST-003](apps/docs/content/reference/testing.md#test-003--one-explicit-root-and-its-active-imports-define-discovery)
+  and [TEST-004](apps/docs/content/reference/testing.md#test-004--discovery-exposes-sealed-static-descriptors-and-exact-callables)
+  define the catalog of one root's active import closure.
+- **Compilers:** both analyze a valid test entry as an ordinary function and catalog the same
+  tests in the same order. The bootstrap reports every invalid entry as `SEM0218` at the `test`
+  qualifier. Selfhost reports `InvalidTestDeclaration` at the span the reference names: `static`,
+  `unsafe` or the linkage for those qualifiers, the first binder, the first parameter, or the
+  written success type; an associated member is reported at `test`. Native test identities use the
+  bootstrap's spelling; native fingerprints frame the native HIR encoding, so they differ from the
+  bootstrap's (TEST-005 does not fix the bytes).
 - **Source migration:** none.
-- **Diagnostics and limits:** selfhost does not discover, describe or run tests.
+- **Diagnostics and limits:** native `silkc test` requires `--no-cache`; test-result reuse
+  (TEST-008) needs execution identities the native compiler does not publish yet and reports
+  `SILK_GAP test-result-cache` otherwise.
 - **Evidence:** `callableAndEffectSignatureContracts` in
-  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` signature and
-  body and the refused parameterized entry.
-- **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
+  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` and each
+  TEST-001 span; `compiler/src/semantic/TestDiscoveryCases.silk` checks the catalog, its refusals
+  and a body iterating it. The native Cases shards in `selfhost.yml` run the bundled runner built
+  by `silkc test`.
+- **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
 ## Maintaining this file
 
@@ -1932,7 +1943,7 @@ elided lifetime is reached only through an alias remain separate unsupported lan
 
 - **Definition:** Confirmed STATIC-009/STATIC-010 retain immutable phase-only sealed sequences, fresh ordered iteration scopes, exact element types, empty-body non-elaboration and atomic selected-body publication. Ordinary arrays are not static iterables.
 - **Native subset:** focused locally verified on 2026-10-07. The genuine sealed `Intrinsic.StaticSequence<Element>` nominal and immutable admitted sequence value support empty/append and homogeneous complete scalar elements. Mixed selection retains a separate context per original for+ordinal; ordinary elaboration emits sequential blocks with distinct local/node ranges and authored spans. One evaluator and residual budget cover the whole expansion. Phase-only sequences/descriptors cannot occur in runtime contracts or runtime stored member types; static aggregate fields retain them as described above.
-- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; callable literals, authored effect-block expressions, authored return/fail/break/continue inside mixed iterations and loans rooted in newly generated iteration storage remain unsupported. Ordinary outside-storage borrows and immediate Effect/service calls traverse typing and the scoped environment checks described by the later control entry. Reflected collections, authenticated field projections, and nested iteration support are tracked by the control and reflection entries above. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
+- **Remaining native boundaries:** concat/length/at keep explicit Unsupported; callable literals, authored effect-block expressions, authored break/continue inside mixed iterations, and a write that carries occurrence storage to a place outside that occurrence (an outside local, or any place reached through a dereference, given a value that retains an occurrence-minted region, borrows occurrence-declared storage, or copies a reference held by an occurrence-declared local), remain unsupported. Loans of generated storage that stay inside their occurrence are admitted: an occurrence's nodes are checked together, regions select no code, and outside places keep their declared regions. Authored return and fail inside an occurrence leave the function as anywhere else; the expansion completes only when every occurrence can (#1422). Ordinary outside-storage borrows and immediate Effect/service calls traverse typing and the scoped environment checks described by the later control entry. Reflected collections, authenticated field projections, and nested iteration support are tracked by the control and reflection entries above. Existing outside loans and ordinary scalar reads are retained. No HIR cloning, static lifetime default, runtime iterator, library spelling privilege, or language-definition change is introduced.
 - **Evidence:** the pre-repair optimized native reduction rejected the whole static-for as typed-form; the no-loop phase control rejected the sealed sequence type as core-type. The focused existing-actor run passed five tests in 50 ms, including distinct iteration locals, exact selected callee/MIR arguments, empty-body non-elaboration, borrowed outside storage and exact refusal codes/spans. Its timing gate passed; production pinned-bootstrap checking also passed. After integrating canonical finite lifetime meets, the same five focused tests passed in 8 ms on 2026-10-08. Sealed static sequences participate in the complete numbering transaction, including retained types and charged child traversal. This entry claims no optimized N0, SHA2 lowering, gap removal, N1 artifact or smoke success.
 
 ### Selfhost preserves unchanged inexact capture-loop availability
