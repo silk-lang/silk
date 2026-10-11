@@ -1,0 +1,1064 @@
+//! Loan conflicts in one typed body, the first slice of native borrow checking.
+//!
+//! # When to use
+//! Call [`check`] on a successfully typed, non-generic, unselected body before it is published.
+//! A [`Outcome.Conflict`] rejects the body with `LoanConflict` (the bootstrap's `OWN0010`) or
+//! `AccessDuringLoan` (`OWN0011`) at the later access, relating the earlier loan.
+//!
+//! # Details
+//! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
+//! numbers evaluation points in evaluation order and links them into a control-flow graph. A loan
+//! comes from a written borrow or from a shared or mutable receiver pass. A loan carried by a value
+//! stays live until the node that consumes that value, so a call argument's loan lasts for the
+//! whole call (BORROW-004). A loan bound by `let` to a reference local stays live while that local
+//! is live, by backward liveness over the graph, so loans end at their last use. An access that
+//! overlaps a live loan conflicts as in the bootstrap: a shared borrow conflicts with an exclusive
+//! loan, an exclusive borrow with any loan, a read with an exclusive loan, and a write or move with
+//! any loan.
+//!
+//! # Gotchas
+//! This slice proves only plain bodies. A body that matches, builds or calls a callable, runs an
+//! Effect, uses a storage primitive, reborrows through a reference, stores a loan anywhere but an
+//! immutable `let`, or lets a loan reach a call result, a return or a branch result answers
+//! [`Outcome.NotChecked`]: it is neither accepted nor rejected here. Two places whose overlap
+//! depends on an unknown index make the body `NotChecked` rather than a conflict, so the stage
+//! never rejects a body the bootstrap accepts.
+
+import hir.Hir {Access}
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime}
+import semantic.Rejection {RejectionCode}
+import semantic.Type {Type}
+import semantic.TypedBody {
+  AggregateField,
+  ConsumedPlace,
+  Expression,
+  Local,
+  Node,
+  NodeId,
+  NodeKind,
+  ReceiverPass,
+}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+/// What checking one body's loans established.
+pub enum Outcome {
+  /// Every loan in the body is free of conflicts.
+  Clear,
+  /// An access conflicts with a live loan.
+  Conflict,
+  /// The body uses a form outside this slice; nothing is proved or rejected.
+  NotChecked,
+}
+
+/// The outcome of checking one body's loans. For a conflict, `access` is the later access and
+/// `loan` the earlier borrow it conflicts with; otherwise `code` and both spans are unused.
+pub struct Verdict {
+  pub outcome: Outcome
+  pub code: RejectionCode
+  pub access: Span
+  pub loan: Span
+}
+
+fn verdict(outcome: Outcome) -> Verdict {
+  return Verdict {outcome: outcome, code: RejectionCode.Unsupported, access: Span.make(usize.ZERO, usize.ZERO),
+    loan: Span.make(usize.ZERO, usize.ZERO)}
+}
+
+// An index step whose value is unknown overlaps every element step.
+fn anyElement() -> usize {
+  return usize.MAX
+}
+
+// A body local and its static projection path: field ordinals, or `anyElement` for an index.
+struct Place {
+  root: usize
+  steps: Vector<usize>
+}
+
+struct Interval {
+  from: usize
+  to: usize
+}
+
+impl Copy for Interval {}
+
+struct Loan {
+  place: Place
+  exclusive: bool
+  origin: Span
+  // Evaluation-point ranges in which a value carrying this loan is in flight.
+  intervals: Vector<Interval>
+  // The `let` locals that hold this loan.
+  holders: Vector<usize>
+}
+
+enum Kind {
+  Read,
+  Write,
+  SharedBorrow,
+  ExclusiveBorrow,
+}
+
+struct Event {
+  point: usize
+  place: Place
+  kind: Kind
+  span: Span
+  // The loan this access creates, or `usize.MAX`.
+  loan: usize
+}
+
+struct Point {
+  next: Vector<usize>
+  // A holder local read here, or `usize.MAX`.
+  uses: usize
+  // A holder local bound here, or `usize.MAX`.
+  defines: usize
+}
+
+struct Frame {
+  header: usize
+  exit: usize
+}
+
+impl Copy for Frame {}
+
+// A loan carried by a value, and the point from which it is in flight.
+struct Carry {
+  loan: usize
+  since: usize
+}
+
+impl Copy for Carry {}
+
+struct Flow {
+  at: usize
+  carried: Vector<Carry>
+}
+
+// The written place a node names: its root local, whether it is reached through a reference
+// local, its projection path, and the index operands to evaluate first, in order.
+struct Path {
+  root: usize
+  through: bool
+  steps: Vector<usize>
+  indexes: Vector<NodeId>
+}
+
+struct Walker {
+  points: Vector<Point>
+  loans: Vector<Loan>
+  events: Vector<Event>
+  frames: Vector<Frame>
+  // Per local, the loans it holds; empty for a local that holds none.
+  held: Vector<Vector<usize>>
+  exit: usize
+  outside: bool
+}
+
+fn flowAt(at: usize) -> Flow {
+  return Flow {at: at, carried: Vector.make<Carry>()}
+}
+
+effect fn copySteps(steps: &[usize]) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector.make<usize>()
+  let mut at = usize.ZERO
+  while at < steps.length {
+    run Vector.append<usize>(&mut copied, steps[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn newPoint(walker: &mut Walker, from: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let created = Vector.length<Point>(&walker.points)
+  run Vector.append<Point>(&mut walker.points, Point {next: Vector.make<usize>(), uses: usize.MAX, defines: usize.MAX})
+  run edge(&mut walker.*, from, created)
+  return created
+}
+
+effect fn edge(walker: &mut Walker, from: usize, to: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX || to == usize.MAX {
+    return ()
+  }
+  let mut points = Vector.asMutSlice<Point>(&mut walker.points)
+  run Vector.append<usize>(&mut points[from].next, to)
+  return ()
+}
+
+// Ends the flight of carried loans at `at`, where their value is consumed.
+effect fn consume(walker: &mut Walker, carried: &[Carry], at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index = usize.ZERO
+  while index < carried.length {
+    let carry = carried[index]
+    let mut loans = Vector.asMutSlice<Loan>(&mut walker.loans)
+    run Vector.append<Interval>(&mut loans[carry.loan].intervals, Interval {from: carry.since, to: at})
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendCarried(target: &mut Vector<Carry>, source: &[Carry]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < source.length {
+    run Vector.append<Carry>(&mut target.*, source[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether a value of `ty` can retain a non-static region; unknown retention counts as retained.
+effect fn retains(ty: &Shared<Type>, owner: &DeclarationId) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut regions = Vector.make<Shared<Lifetime>>()
+  let representations = Vector.make<Option<Shared<Type>>>()
+  let known = run Type.retainedRegions(ty, owner, Vector.asSlice<Option<Shared<Type>>>(&representations), &mut regions)
+  return !known || Vector.length<Shared<Lifetime>>(&regions) > usize.ZERO
+}
+
+fn expressionType(nodes: &[Node], id: NodeId) -> Option<Shared<Type>> {
+  if let NodeKind.Expression {ty, ..} = &nodes[id.index].kind {
+    return Option.some<Shared<Type>>(Shared.clone<Type>(&ty))
+  }
+  return Option.none<Shared<Type>>()
+}
+
+// Whether `id`'s value can retain a non-static region; a statement node retains nothing.
+effect fn nodeRetains(nodes: &[Node], id: NodeId, owner: &DeclarationId) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let found = expressionType(nodes, id)
+  if let Option<Shared<Type>>.Some {value} = move found {
+    let retained = run retains(&value, owner)
+    return retained
+  }
+  return false
+}
+
+// Reads the written place of `id`, or a path with root `usize.MAX` when it names no place.
+effect fn pathOf(nodes: &[Node], id: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut path = Path {root: usize.MAX, through: false, steps: Vector.make<usize>(), indexes: Vector.make<NodeId>()}
+  run extendPath(nodes, id, &mut path)
+  return move path
+}
+
+effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    match &form {
+      Expression.Local {local} => {
+        path.root = local.index
+        return ()
+      }
+      Expression.Field {value, index} => {
+        run extendPath(nodes, value, &mut path.*)
+        if path.root != usize.MAX && !path.through {
+          run Vector.append<usize>(&mut path.steps, index)
+        }
+        return ()
+      }
+      Expression.Index {value, index} => {
+        run extendPath(nodes, value, &mut path.*)
+        if path.root != usize.MAX {
+          if !path.through {
+            run Vector.append<usize>(&mut path.steps, anyElement())
+          }
+          run Vector.append<NodeId>(&mut path.indexes, index)
+        }
+        return ()
+      }
+      Expression.Dereference {value} => {
+        if let NodeKind.Expression {form: inner, ..} = &nodes[value.index].kind {
+          if let Expression.Local {local} = &inner {
+            path.root = local.index
+            path.through = true
+            return ()
+          }
+        }
+        return ()
+      }
+      _ => {}
+    }
+  }
+  return ()
+}
+
+// The overlap of two places: 0 disjoint, 1 overlapping, 2 decided only by an unknown index.
+fn overlap(left: &Place, right: &Place) -> usize {
+  if left.root != right.root {
+    return usize.ZERO
+  }
+  let first = Vector.asSlice<usize>(&left.steps)
+  let second = Vector.asSlice<usize>(&right.steps)
+  let mut unknown = false
+  let mut at = usize.ZERO
+  while at < first.length && at < second.length {
+    if first[at] == anyElement() || second[at] == anyElement() {
+      unknown = true
+    } else if first[at] != second[at] {
+      return usize.ZERO
+    }
+    at = at + usize.ONE
+  }
+  if unknown {
+    return 2
+  }
+  return usize.ONE
+}
+
+fn conflictCode(kind: Kind, exclusive: bool) -> Option<RejectionCode> {
+  if kind == Kind.ExclusiveBorrow || (kind == Kind.SharedBorrow && exclusive) {
+    return Option.some<RejectionCode>(RejectionCode.LoanConflict)
+  }
+  if kind == Kind.Write || (kind == Kind.Read && exclusive) {
+    return Option.some<RejectionCode>(RejectionCode.AccessDuringLoan)
+  }
+  return Option.none<RejectionCode>()
+}
+
+// Records an access to a written place at a fresh point after `at`.
+effect fn access(walker: &mut Walker, path: &Path, kind: Kind, span: Span, at: usize, loan: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let point = run newPoint(&mut walker.*, at)
+  run Vector.append<Event>(
+    &mut walker.events,
+    Event {
+      point: point,
+      place: Place {root: path.root, steps: run copySteps(Vector.asSlice<usize>(&path.steps))},
+      kind: kind,
+      span: span,
+      loan: loan,
+    },
+  )
+  return point
+}
+
+// A read of a holder local at a fresh point: the value carries the loans it holds.
+effect fn useHolder(walker: &mut Walker, local: usize, at: usize) -> Flow ! OutOfMemoryError ? &mut Allocator {
+  let point = run newPoint(&mut walker.*, at)
+  let mut points = Vector.asMutSlice<Point>(&mut walker.points)
+  points[point].uses = local
+  let mut carried = Vector.make<Carry>()
+  let held = Vector.asSlice<Vector<usize>>(&walker.held)
+  let loans = Vector.asSlice<usize>(&held[local])
+  let mut at = usize.ZERO
+  while at < loans.length {
+    run Vector.append<Carry>(&mut carried, Carry {loan: loans[at], since: point})
+    at = at + usize.ONE
+  }
+  return Flow {at: point, carried: move carried}
+}
+
+fn holds(walker: &Walker, local: usize) -> bool {
+  let held = Vector.asSlice<Vector<usize>>(&walker.held)
+  return local < held.length && Vector.length<usize>(&held[local]) > usize.ZERO
+}
+
+// Evaluates a place's index operands in order; each index value is consumed when it is read.
+effect fn indexes(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, path: &Path, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let operands = Vector.asSlice<NodeId>(&path.indexes)
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < operands.length {
+    let flow = run visit(nodes, locals, owner, &mut walker.*, operands[index], current)
+    let point = run newPoint(&mut walker.*, flow.at)
+    run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+    current = point
+    index = index + usize.ONE
+  }
+  return current
+}
+
+// Creates a loan of a written place at a fresh point, carried by the borrowing value.
+effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, place: NodeId, exclusive: bool, span: Span, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let path = run pathOf(nodes, place)
+  if path.root == usize.MAX || path.through {
+    walker.outside = true
+    return flowAt(at)
+  }
+  let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+  let created = Vector.length<Loan>(&walker.loans)
+  run Vector.append<Loan>(
+    &mut walker.loans,
+    Loan {
+      place: Place {root: path.root, steps: run copySteps(Vector.asSlice<usize>(&path.steps))},
+      exclusive: exclusive,
+      origin: span,
+      intervals: Vector.make<Interval>(),
+      holders: Vector.make<usize>(),
+    },
+  )
+  let mut kind = Kind.SharedBorrow
+  if exclusive {
+    kind = Kind.ExclusiveBorrow
+  }
+  let point = run access(&mut walker.*, &path, kind, span, evaluated, created)
+  let mut carried = Vector.make<Carry>()
+  run Vector.append<Carry>(&mut carried, Carry {loan: created, since: point})
+  return Flow {at: point, carried: move carried}
+}
+
+// Reads or moves a written place. A move of a whole holder carries its loans to the new owner.
+effect fn place(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, path: &Path, kind: Kind, span: Span, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let evaluated = run indexes(nodes, locals, owner, &mut walker.*, path, at)
+  if path.through {
+    let used = run useHolder(&mut walker.*, path.root, evaluated)
+    return flowAt(used.at)
+  }
+  let whole = Vector.length<usize>(&path.steps) == usize.ZERO
+  if whole && holds(&walker.*, path.root) {
+    return run useHolder(&mut walker.*, path.root, evaluated)
+  }
+  let point = run access(&mut walker.*, path, kind, span, evaluated, usize.MAX)
+  return flowAt(point)
+}
+
+// Evaluates operands in order and consumes everything they carry at one fresh point.
+effect fn operands(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, values: &[NodeId], result: NodeId, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector.make<Carry>()
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < values.length {
+    let flow = run visit(nodes, locals, owner, &mut walker.*, values[index], current)
+    run appendCarried(&mut carried, Vector.asSlice<Carry>(&flow.carried))
+    current = flow.at
+    index = index + usize.ONE
+  }
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried)
+}
+
+// Consumes carried loans at a fresh point for `result`. A result that may retain a region while
+// operands carried a loan needs region checking, which this slice does not do.
+effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, result: NodeId, at: usize, carried: &Vector<Carry>) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let point = run newPoint(&mut walker.*, at)
+  if Vector.length<Carry>(carried) > usize.ZERO {
+    run consume(&mut walker.*, Vector.asSlice<Carry>(carried), point)
+    let retained = run nodeRetains(nodes, result, owner)
+    if retained {
+      walker.outside = true
+    }
+  }
+  return flowAt(point)
+}
+
+effect fn fieldValues(fields: &[AggregateField]) -> Vector<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<NodeId>()
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run Vector.append<NodeId>(&mut values, fields[at].value)
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+effect fn single(value: NodeId) -> Vector<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<NodeId>()
+  run Vector.append<NodeId>(&mut values, value)
+  return move values
+}
+
+effect fn copyIds(values: &[NodeId]) -> Vector<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector.make<NodeId>()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Vector.append<NodeId>(&mut copied, values[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// A call's arguments in order. A shared or mutable receiver pass borrows the receiver place for the
+// whole call; a taking receiver pass moves it.
+effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, arguments: &[NodeId], receiver: usize, result: NodeId, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector.make<Carry>()
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < arguments.length {
+    let argument = arguments[index]
+    let mut handled = false
+    if index == usize.ZERO && receiver != usize.ZERO {
+      let path = run pathOf(nodes, argument)
+      if path.root != usize.MAX && !isBorrow(nodes, argument) {
+        let span = nodes[argument.index].origin.span
+        let mut flow = flowAt(current)
+        if receiver == 3 {
+          flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Write, span, current)
+        } else if path.through {
+          let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, current)
+          flow = run useHolder(&mut walker.*, path.root, evaluated)
+        } else {
+          flow = run borrow(nodes, locals, owner, &mut walker.*, argument, receiver == 2, span, current)
+        }
+        run appendCarried(&mut carried, Vector.asSlice<Carry>(&flow.carried))
+        current = flow.at
+        handled = true
+      }
+    }
+    if !handled {
+      let flow = run visit(nodes, locals, owner, &mut walker.*, argument, current)
+      run appendCarried(&mut carried, Vector.asSlice<Carry>(&flow.carried))
+      current = flow.at
+    }
+    index = index + usize.ONE
+  }
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried)
+}
+
+fn isBorrow(nodes: &[Node], id: NodeId) -> bool {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    if let Expression.Borrow {..} = &form {
+      return true
+    }
+  }
+  return false
+}
+
+fn localType(locals: &[Local], local: usize) -> Shared<Type> {
+  return Shared.clone<Type>(&locals[local].ty)
+}
+
+// The node shape `visit` dispatches on, read without holding a borrow of the node across calls.
+union Shape {
+  Leaf,
+  Outside,
+  ReadPlace,
+  Borrow {access: Access, value: NodeId},
+  Move {value: NodeId, consumed: bool},
+  Operands {values: Vector<NodeId>},
+  PassThrough {value: NodeId},
+  Call {arguments: Vector<NodeId>, receiver: usize},
+  Binding {local: usize, initializer: NodeId, mutable: bool},
+  Assignment {local: usize, value: NodeId},
+  PlaceAssignment {target: NodeId, value: NodeId},
+  Exit {value: Option<NodeId>},
+  Drop {value: NodeId, consumed: bool},
+  Branch {condition: NodeId, thenBranch: NodeId, elseBranch: Option<NodeId>},
+  While {condition: NodeId, body: NodeId},
+  Break,
+  Continue,
+  Block {statements: Vector<NodeId>},
+}
+
+effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form, ..} => run expressionShape(&form)
+    NodeKind.LocalBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: false}
+    NodeKind.MutableBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: true}
+    NodeKind.Assignment {local, value} => Shape.Assignment {local: local.index, value: value}
+    NodeKind.PlaceAssignment {target, value} => Shape.PlaceAssignment {target: target, value: value}
+    NodeKind.Return {value} => Shape.Exit {value: copyNode(&value)}
+    NodeKind.Fail {value} => Shape.Exit {value: Option.some<NodeId>(value)}
+    NodeKind.Drop {value, consumed} => Shape.Drop {value: value, consumed: hasPlace(&consumed)}
+    NodeKind.Branch {condition, thenBranch, elseBranch, ..} => Shape.Branch {condition: condition, thenBranch: thenBranch, elseBranch: copyNode(&elseBranch)}
+    NodeKind.While {condition, body} => Shape.While {condition: condition, body: body}
+    NodeKind.Break => Shape.Break
+    NodeKind.Continue => Shape.Continue
+    NodeKind.Block {statements, ..} => Shape.Block {statements: run copyIds(Vector.asSlice<NodeId>(&statements))}
+  }
+}
+
+fn copyNode(value: &Option<NodeId>) -> Option<NodeId> {
+  if let Option<NodeId>.Some {value: node} = &value.* {
+    return Option.some<NodeId>(node)
+  }
+  return Option.none<NodeId>()
+}
+
+// The receiver pass of a call: 0 none, 1 shared, 2 mutable, 3 taking.
+fn receiverOf(value: &Option<ReceiverPass>) -> usize {
+  if let Option<ReceiverPass>.Some {value: pass} = &value.* {
+    if pass == ReceiverPass.Shared {
+      return usize.ONE
+    }
+    if pass == ReceiverPass.Mutable {
+      return 2
+    }
+    return 3
+  }
+  return usize.ZERO
+}
+
+fn hasPlace(consumed: &Option<ConsumedPlace>) -> bool {
+  return match &consumed.* {
+    Option<ConsumedPlace>.Some {..} => true
+    Option<ConsumedPlace>.None => false
+  }
+}
+
+effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  return match &form.* {
+    Expression.Local {..} => Shape.ReadPlace
+    Expression.Field {..} => Shape.ReadPlace
+    Expression.Index {..} => Shape.ReadPlace
+    Expression.Dereference {..} => Shape.ReadPlace
+    Expression.Borrow {access, value} => Shape.Borrow {access: access, value: value}
+    Expression.Move {value, consumed} => Shape.Move {value: value, consumed: hasPlace(&consumed)}
+    Expression.PointerWeaken {value} => Shape.PassThrough {value: value}
+    Expression.ArraySlice {value, ..} => Shape.PassThrough {value: value}
+    Expression.SliceLength {value} => Shape.Operands {values: run single(value)}
+    Expression.ArrayLength {value, ..} => Shape.Operands {values: run single(value)}
+    Expression.EnumValue {value} => Shape.Operands {values: run single(value)}
+    Expression.UnionInject {value, ..} => Shape.Operands {values: run single(value)}
+    Expression.UnionWiden {value} => Shape.Operands {values: run single(value)}
+    Expression.ConcretePrefix {operand, ..} => Shape.Operands {values: run single(operand)}
+    Expression.CompileError {message} => Shape.Operands {values: run single(message)}
+    Expression.ConcreteInfix {left, right, ..} => {
+      let mut values = run single(left)
+      run Vector.append<NodeId>(&mut values, right)
+      return Shape.Operands {values: move values}
+    }
+    Expression.Aggregate {fields} => Shape.Operands {values: run fieldValues(Vector.asSlice<AggregateField>(&fields))}
+    Expression.VariantConstruct {fields, ..} => Shape.Operands {values: run fieldValues(Vector.asSlice<AggregateField>(&fields))}
+    Expression.DirectCall {arguments, receiverPass, ..} => Shape.Call {
+      arguments: run copyIds(Vector.asSlice<NodeId>(&arguments)), receiver: receiverOf(&receiverPass),
+    }
+    Expression.InterfaceCall {arguments, receiverPass, ..} => Shape.Call {
+      arguments: run copyIds(Vector.asSlice<NodeId>(&arguments)), receiver: receiverOf(&receiverPass),
+    }
+    Expression.ForeignCall {arguments, ..} => Shape.Call {
+      arguments: run copyIds(Vector.asSlice<NodeId>(&arguments)), receiver: usize.ZERO,
+    }
+    Expression.IntrinsicCall {arguments, ..} => Shape.Call {
+      arguments: run copyIds(Vector.asSlice<NodeId>(&arguments)), receiver: usize.ZERO,
+    }
+    Expression.Integer {..} => Shape.Leaf
+    Expression.Float {..} => Shape.Leaf
+    Expression.Text {..} => Shape.Leaf
+    Expression.Boolean {..} => Shape.Leaf
+    Expression.Unit => Shape.Leaf
+    Expression.Embedded {..} => Shape.Leaf
+    Expression.EnumMember {..} => Shape.Leaf
+    Expression.Constant {..} => Shape.Leaf
+    Expression.ForeignStatic {..} => Shape.Leaf
+    Expression.ForeignAddress {..} => Shape.Leaf
+    _ => Shape.Outside
+  }
+}
+
+// Visits one node from point `at` and returns the point after it, or `usize.MAX` when no path
+// continues, with the loans its value carries.
+effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, id: NodeId, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  if walker.outside {
+    return flowAt(at)
+  }
+  let span = nodes[id.index].origin.span
+  let shape = run shapeOf(nodes, id)
+  match move shape {
+    Shape.Leaf => {
+      return flowAt(at)
+    }
+    Shape.Outside => {
+      walker.outside = true
+      return flowAt(at)
+    }
+    Shape.ReadPlace => {
+      let path = run pathOf(nodes, id)
+      if path.root == usize.MAX {
+        return run readValue(nodes, locals, owner, &mut walker.*, id, at)
+      }
+      let flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Read, span, at)
+      if path.through || Vector.length<usize>(&path.steps) > usize.ZERO {
+        // A read through or out of a holder copies a value; one that retains a region would carry
+        // the holder's loan onward.
+        if Vector.length<Carry>(&flow.carried) > usize.ZERO || (path.through && holds(&walker.*, path.root)) {
+          let retained = run nodeRetains(nodes, id, owner)
+          if retained {
+            walker.outside = true
+          }
+        }
+        let point = run newPoint(&mut walker.*, flow.at)
+        run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+        return flowAt(point)
+      }
+      return move flow
+    }
+    Shape.Borrow {access, value} => {
+      return run borrow(nodes, locals, owner, &mut walker.*, value, access == Access.Mutable, span, at)
+    }
+    Shape.Move {value, consumed} => {
+      if consumed {
+        let path = run pathOf(nodes, value)
+        if path.root == usize.MAX || path.through {
+          walker.outside = true
+          return flowAt(at)
+        }
+        return run place(nodes, locals, owner, &mut walker.*, &path, Kind.Write, span, at)
+      }
+      return run visit(nodes, locals, owner, &mut walker.*, value, at)
+    }
+    Shape.Operands {values} => {
+      return run operands(nodes, locals, owner, &mut walker.*, Vector.asSlice<NodeId>(&values), id, at)
+    }
+    Shape.PassThrough {value} => {
+      return run visit(nodes, locals, owner, &mut walker.*, value, at)
+    }
+    Shape.Call {arguments, receiver} => {
+      return run call(nodes, locals, owner, &mut walker.*, Vector.asSlice<NodeId>(&arguments), receiver, id, at)
+    }
+    Shape.Binding {local, initializer, mutable} => {
+      let flow = run visit(nodes, locals, owner, &mut walker.*, initializer, at)
+      let point = run newPoint(&mut walker.*, flow.at)
+      if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+        run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+        let ty = localType(locals, local)
+        let retained = run retains(&ty, owner)
+        if retained {
+          if mutable {
+            walker.outside = true
+            return flowAt(point)
+          }
+          run hold(&mut walker.*, local, Vector.asSlice<Carry>(&flow.carried), point)
+        }
+      }
+      return flowAt(point)
+    }
+    Shape.Assignment {local, value} => {
+      let flow = run visit(nodes, locals, owner, &mut walker.*, value, at)
+      if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+        let ty = localType(locals, local)
+        let retained = run retains(&ty, owner)
+        if retained {
+          walker.outside = true
+          return flowAt(flow.at)
+        }
+      }
+      let path = Path {root: local, through: false, steps: Vector.make<usize>(), indexes: Vector.make<NodeId>()}
+      let point = run access(&mut walker.*, &path, Kind.Write, span, flow.at, usize.MAX)
+      run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+      return flowAt(point)
+    }
+    Shape.PlaceAssignment {target, value} => {
+      let path = run pathOf(nodes, target)
+      if path.root == usize.MAX {
+        walker.outside = true
+        return flowAt(at)
+      }
+      let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+      let flow = run visit(nodes, locals, owner, &mut walker.*, value, evaluated)
+      if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+        let retained = run nodeRetains(nodes, target, owner)
+        if retained {
+          walker.outside = true
+          return flowAt(flow.at)
+        }
+      }
+      let targetSpan = nodes[target.index].origin.span
+      let mut point = usize.MAX
+      if path.through {
+        let used = run useHolder(&mut walker.*, path.root, flow.at)
+        point = used.at
+      } else {
+        point = run access(&mut walker.*, &path, Kind.Write, targetSpan, flow.at, usize.MAX)
+      }
+      run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+      return flowAt(point)
+    }
+    Shape.Exit {value} => {
+      let mut current = at
+      if let Option<NodeId>.Some {value: operand} = &value {
+        let flow = run visit(nodes, locals, owner, &mut walker.*, operand, at)
+        if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+          walker.outside = true
+          return flowAt(usize.MAX)
+        }
+        current = flow.at
+      }
+      run edge(&mut walker.*, current, walker.exit)
+      return flowAt(usize.MAX)
+    }
+    Shape.Drop {value, consumed} => {
+      if consumed {
+        let path = run pathOf(nodes, value)
+        if path.root == usize.MAX || path.through {
+          walker.outside = true
+          return flowAt(at)
+        }
+        let flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Write, span, at)
+        let point = run newPoint(&mut walker.*, flow.at)
+        run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+        return flowAt(point)
+      }
+      let flow = run visit(nodes, locals, owner, &mut walker.*, value, at)
+      let point = run newPoint(&mut walker.*, flow.at)
+      run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+      return flowAt(point)
+    }
+    Shape.Branch {condition, thenBranch, elseBranch} => {
+      let tested = run visit(nodes, locals, owner, &mut walker.*, condition, at)
+      let split = run newPoint(&mut walker.*, tested.at)
+      run consume(&mut walker.*, Vector.asSlice<Carry>(&tested.carried), split)
+      let taken = run visit(nodes, locals, owner, &mut walker.*, thenBranch, split)
+      let mut other = flowAt(split)
+      if let Option<NodeId>.Some {value: alternative} = &elseBranch {
+        other = run visit(nodes, locals, owner, &mut walker.*, alternative, split)
+      }
+      if Vector.length<Carry>(&taken.carried) > usize.ZERO || Vector.length<Carry>(&other.carried) > usize.ZERO {
+        walker.outside = true
+        return flowAt(usize.MAX)
+      }
+      let joined = run newPoint(&mut walker.*, taken.at)
+      run edge(&mut walker.*, other.at, joined)
+      return flowAt(joined)
+    }
+    Shape.While {condition, body} => {
+      let header = run newPoint(&mut walker.*, at)
+      let exit = run newPoint(&mut walker.*, usize.MAX)
+      run Vector.append<Frame>(&mut walker.frames, Frame {header: header, exit: exit})
+      let tested = run visit(nodes, locals, owner, &mut walker.*, condition, header)
+      let split = run newPoint(&mut walker.*, tested.at)
+      run consume(&mut walker.*, Vector.asSlice<Carry>(&tested.carried), split)
+      run edge(&mut walker.*, split, exit)
+      let repeated = run visit(nodes, locals, owner, &mut walker.*, body, split)
+      run edge(&mut walker.*, repeated.at, header)
+      Vector.truncate<Frame>(&mut walker.frames, Vector.length<Frame>(&walker.frames) - usize.ONE)
+      if Vector.length<Carry>(&repeated.carried) > usize.ZERO {
+        walker.outside = true
+      }
+      return flowAt(exit)
+    }
+    Shape.Break => {
+      let frames = Vector.asSlice<Frame>(&walker.frames)
+      if frames.length == usize.ZERO {
+        walker.outside = true
+        return flowAt(usize.MAX)
+      }
+      let frame = frames[frames.length - usize.ONE]
+      run edge(&mut walker.*, at, frame.exit)
+      return flowAt(usize.MAX)
+    }
+    Shape.Continue => {
+      let frames = Vector.asSlice<Frame>(&walker.frames)
+      if frames.length == usize.ZERO {
+        walker.outside = true
+        return flowAt(usize.MAX)
+      }
+      let frame = frames[frames.length - usize.ONE]
+      run edge(&mut walker.*, at, frame.header)
+      return flowAt(usize.MAX)
+    }
+    Shape.Block {statements} => {
+      let list = Vector.asSlice<NodeId>(&statements)
+      let mut current = at
+      let mut index = usize.ZERO
+      while index < list.length {
+        let flow = run visit(nodes, locals, owner, &mut walker.*, list[index], current)
+        if index + usize.ONE == list.length {
+          return move flow
+        }
+        current = flow.at
+        if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+          let point = run newPoint(&mut walker.*, flow.at)
+          run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
+          current = point
+        }
+        index = index + usize.ONE
+      }
+      return flowAt(current)
+    }
+  }
+}
+
+// A field, index or dereference of a value that is not a written place: its operand is evaluated
+// and consumed by the projection.
+effect fn readValue(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, id: NodeId, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut values = Vector.make<NodeId>()
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    match &form {
+      Expression.Field {value, ..} => { run Vector.append<NodeId>(&mut values, value) }
+      Expression.Dereference {value} => { run Vector.append<NodeId>(&mut values, value) }
+      Expression.Index {value, index} => {
+        run Vector.append<NodeId>(&mut values, value)
+        run Vector.append<NodeId>(&mut values, index)
+      }
+      _ => {}
+    }
+  }
+  return run operands(nodes, locals, owner, &mut walker.*, Vector.asSlice<NodeId>(&values), id, at)
+}
+
+// Makes `local` hold the loans its initializer carries from point `at`.
+effect fn hold(walker: &mut Walker, local: usize, carried: &[Carry], at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while Vector.length<Vector<usize>>(&walker.held) <= local {
+    run Vector.append<Vector<usize>>(&mut walker.held, Vector.make<usize>())
+  }
+  let mut held = Vector.asMutSlice<Vector<usize>>(&mut walker.held)
+  let mut index = usize.ZERO
+  while index < carried.length {
+    run Vector.append<usize>(&mut held[local], carried[index].loan)
+    let mut loans = Vector.asMutSlice<Loan>(&mut walker.loans)
+    run Vector.append<usize>(&mut loans[carried[index].loan].holders, local)
+    index = index + usize.ONE
+  }
+  let mut points = Vector.asMutSlice<Point>(&mut walker.points)
+  points[at].defines = local
+  return ()
+}
+
+fn inFlight(loan: &Loan, point: usize) -> bool {
+  let intervals = Vector.asSlice<Interval>(&loan.intervals)
+  let mut at = usize.ZERO
+  while at < intervals.length {
+    if intervals[at].from < point && point < intervals[at].to {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn wordOf(bit: usize) -> usize { return bit / 64 }
+
+fn maskOf(bit: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(bit % 64)) }
+
+// Backward liveness of holder locals: bit `h` of `out[p]` is set when holder `h` is read on some
+// path after point `p` before it is bound again.
+effect fn liveness(walker: &Walker, bits: &[usize], width: usize) -> Vector<u64> ! OutOfMemoryError ? &mut Allocator {
+  let points = Vector.asSlice<Point>(&walker.points)
+  let mut liveIn = Vector.make<u64>()
+  let mut liveOut = Vector.make<u64>()
+  let mut at = usize.ZERO
+  while at < points.length * width {
+    run Vector.append<u64>(&mut liveIn, 0)
+    run Vector.append<u64>(&mut liveOut, 0)
+    at = at + usize.ONE
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut point = points.length
+    while point > usize.ZERO {
+      point = point - usize.ONE
+      let next = Vector.asSlice<usize>(&points[point].next)
+      let mut word = usize.ZERO
+      while word < width {
+        let mut out = u64.MIN
+        let mut successor = usize.ZERO
+        while successor < next.length {
+          out = u64.bitOr(out, Vector.asSlice<u64>(&liveIn)[next[successor] * width + word])
+          successor = successor + usize.ONE
+        }
+        let mut entry = out
+        if points[point].defines != usize.MAX {
+          let bit = bits[points[point].defines]
+          if wordOf(bit) == word { entry = u64.bitAnd(entry, u64.bitNot(maskOf(bit))) }
+        }
+        if points[point].uses != usize.MAX {
+          let bit = bits[points[point].uses]
+          if wordOf(bit) == word { entry = u64.bitOr(entry, maskOf(bit)) }
+        }
+        let slot = point * width + word
+        let mut outs = Vector.asMutSlice<u64>(&mut liveOut)
+        outs[slot] = out
+        if Vector.asSlice<u64>(&liveIn)[slot] != entry {
+          let mut ins = Vector.asMutSlice<u64>(&mut liveIn)
+          ins[slot] = entry
+          changed = true
+        }
+        word = word + usize.ONE
+      }
+    }
+  }
+  return move liveOut
+}
+
+fn heldLive(loan: &Loan, bits: &[usize], liveOut: &[u64], width: usize, point: usize) -> bool {
+  let holders = Vector.asSlice<usize>(&loan.holders)
+  let mut at = usize.ZERO
+  while at < holders.length {
+    let bit = bits[holders[at]]
+    if u64.bitAnd(liveOut[point * width + wordOf(bit)], maskOf(bit)) != 0 {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Checks the loans of one typed body.
+///
+/// # Details
+///
+/// `owner` is the body's declaration, `locals` and `nodes` its typed locals and nodes, and `root`
+/// its root node. Conflicts are reported in evaluation order; the first one is returned.
+pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], root: NodeId) -> Verdict
+! OutOfMemoryError ? &mut Allocator {
+  let mut walker = Walker {
+    points: Vector.make<Point>(),
+    loans: Vector.make<Loan>(),
+    events: Vector.make<Event>(),
+    frames: Vector.make<Frame>(),
+    held: Vector.make<Vector<usize>>(),
+    exit: usize.ZERO,
+    outside: false,
+  }
+  walker.exit = run newPoint(&mut walker, usize.MAX)
+  let entry = run newPoint(&mut walker, usize.MAX)
+  let flow = run visit(nodes, locals, owner, &mut walker, root, entry)
+  if walker.outside {
+    return verdict(Outcome.NotChecked)
+  }
+  if Vector.length<Carry>(&flow.carried) > usize.ZERO {
+    return verdict(Outcome.NotChecked)
+  }
+  run edge(&mut walker, flow.at, walker.exit)
+  let mut bits = Vector.make<usize>()
+  let mut count = usize.ZERO
+  let mut local = usize.ZERO
+  while local < locals.length {
+    run Vector.append<usize>(&mut bits, count)
+    if holds(&walker, local) {
+      count = count + usize.ONE
+    }
+    local = local + usize.ONE
+  }
+  let width = (count + 63) / 64
+  let mut liveOut = Vector.make<u64>()
+  if width > usize.ZERO {
+    liveOut = run liveness(&walker, Vector.asSlice<usize>(&bits), width)
+  }
+  let events = Vector.asSlice<Event>(&walker.events)
+  let loans = Vector.asSlice<Loan>(&walker.loans)
+  let mut unknown = false
+  let mut at = usize.ZERO
+  while at < events.length {
+    let event = &events[at]
+    let mut index = usize.ZERO
+    while index < loans.length {
+      if index != event.loan {
+        let code = conflictCode(event.kind, loans[index].exclusive)
+        if let Option<RejectionCode>.Some {value} = move code {
+          let shared = overlap(&loans[index].place, &event.place)
+          if shared != usize.ZERO {
+            let mut live = inFlight(&loans[index], event.point)
+            if !live && width > usize.ZERO {
+              live = heldLive(&loans[index], Vector.asSlice<usize>(&bits), Vector.asSlice<u64>(&liveOut), width, event.point)
+            }
+            if live {
+              if shared == usize.ONE {
+                return Verdict {outcome: Outcome.Conflict, code: value, access: event.span, loan: loans[index].origin}
+              }
+              unknown = true
+            }
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if unknown {
+    return verdict(Outcome.NotChecked)
+  }
+  return verdict(Outcome.Clear)
+}
