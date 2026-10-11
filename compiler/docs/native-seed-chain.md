@@ -69,8 +69,8 @@ Jobs in `.github/workflows/selfhost.yml`:
    the main-first bootstrap provenance check.
 2. **Native seed chain (N2 fixpoint)** builds N2 with N1, emits the compiler's LLVM IR with both N1
    and N2, requires the two IR files to be byte-identical, and smoke-tests N2
-   (`NativeBuild.ts --fixpoint`). The N2 build and N1's IR emission run concurrently; each peaks near
-   5 GiB, inside the 16 GB ubuntu-24.04 runner. This job is the required check that replaces
+   (`NativeBuild.ts --fixpoint`). The N2 build and N1's IR emission run concurrently; on the runner
+   each peaked at 4.74 GB, at most 9.5 GB together, inside the 16 GB ubuntu-24.04 runner. This job is the required check that replaces
    **Authored native seed (N0)**.
 3. **Selfhost native corpus** runs the full corpus with N1 (the verification harness's
    `--mode corpus-full`) and keeps the baseline-pass and accepted-failure checks.
@@ -97,6 +97,14 @@ that replaces `compiler/native-seed.json` with a candidate's `native-seed.json`.
 To verify publication after a push run: open the run's **Publish native seed candidate** job, then
 the release `native-seed-<commit>`; `sha256sum` of the downloaded compiler must equal the `sha256`
 in its `native-seed.json` and `output.sha256` of N2 in `chain-receipt.json`.
+
+### Retention
+
+One prerelease per green push accumulates. Proposed rule, not automated yet: keep the release
+named by the pin on `selfhost`, every release named by a pin in the last 30 days of `selfhost`
+history (so a revert can return to it), and the 20 newest candidates; delete the rest. Deletion,
+when added, must read the current pin first and never touch its tag. Until then candidates are
+pruned by hand.
 
 ## Advancing the pin
 
