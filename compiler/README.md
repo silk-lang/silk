@@ -202,8 +202,10 @@ builds and runs every declared profile variant. Clang receives `-O0` or `-O2` an
 root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
 takes its runtime from the library's `compositions.json` for the target and libc, so such a build
 needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
-is the root for local module paths. Without a manifest, the entry file's directory is the module
-root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
+is the root for local module paths. Every module identity names the package by its logical
+identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
+directory, so one package built from two directories emits identical bytes. An entry with no
+manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
 Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filter <text>]
