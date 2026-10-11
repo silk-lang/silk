@@ -210,7 +210,7 @@ dependee. Reads inside one unit are never recorded.
 ### 2.1 Analysis units
 
 A unit is `(kind, subject)`, where the subject is an interned handle (§3.4). Today's query
-families (`Semantic.silk:304`) map onto eight unit kinds. Families that only project one
+families (`Semantic.silk:304`) map onto ten unit kinds. Families that only project one
 declaration's own syntax stop being separately tracked; they run inside the unit that needs them.
 
 | Unit            | Subject                       | Today's families folded in                                                                                                                                                                                                                                 | Result others consume                   |
@@ -221,7 +221,9 @@ declaration's own syntax stop being separately tracked; they run inside the unit
 | `Borrow(D, s)`  | same key as `Body`            | the `BorrowCheck` family of #1421                                                                                                                                                                                                                          | `Checked` or the rejections             |
 | `Coherence(I)`  | `impl` declaration            | `Coherence`, `ProofBounds`                                                                                                                                                                                                                                 | accepted or rejected                    |
 | `Layout(T)`     | interned type application     | `Layout`                                                                                                                                                                                                                                                   | size, alignment, offsets, ABI class     |
-| `Instance(k)`   | interned instance key         | `Mir`, `EmissionInputs`, `LlvmText`                                                                                                                                                                                                                        | the content subject of its LLVM text    |
+| `Mir(k)`        | interned instance key         | `Mir`                                                                                                                                                                                                                                                      | its direct callees and boundary flags   |
+| `Suspension(k)` | interned instance key         | none today; replaces the `closeSuspendable` pass (§8.2 P4)                                                                                                                                                                                                 | `{transfer, park}`                      |
+| `Emit(k)`       | interned instance key         | `EmissionInputs`, `LlvmText`                                                                                                                                                                                                                               | the content subject of its LLVM text    |
 | `Catalog(root)` | discovery root                | `Tests`                                                                                                                                                                                                                                                    | the test catalog                        |
 
 **[source]** for the family list; the grouping is the proposal. Two choices need justification.
@@ -253,23 +255,24 @@ incremental unit with its own cutoff (§8.3).
 
 ### 2.2 Dependee kinds
 
-Twelve kinds. Each one exists because it stops a specific fan-out. A kind that cannot be justified
+Thirteen kinds. Each one exists because it stops a specific fan-out. A kind that cannot be justified
 this way is dropped and its readers consume a coarser kind.
 
-| Dependee            | Key                              | Changes when                                                                                 | Fan-out it prevents                                                                                                                                      |
-| ------------------- | -------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SourceFile(M)`     | module                           | the module path appears, disappears or loses its root identity                               | an import of an absent module reruns only when that file appears, not on every other file event                                                          |
-| `DeclSource(D)`     | declaration                      | the whole-declaration fingerprint changes (§3)                                               | a body edit reruns only that body; it is the only kind `Body(D)` and `Value(D)` read for their own text                                                  |
-| `DeclPrototype(D)`  | declaration                      | the prototype fingerprint changes                                                            | a body edit does not rerun `Header(D)`; body edits are the most common edit                                                                              |
-| `Name(M, n)`        | module, interned name            | the candidate set for `n` in `M` changes, including absence and visibility                   | adding an unrelated declaration to `M` does not rerun every importer of `M`; only users of that spelling rerun. Absence is tracked, as in Zig (audit §3) |
-| `Namespace(M)`      | module                           | the set of names in `M`, with visibility, changes                                            | only whole-module readers (operator discovery, test discovery) pay for additions; name lookups use `Name`                                                |
-| `ImplSet(C, O)`     | contract, provider owner         | the set of conformance `impl` declarations for that bucket changes                           | adding an `impl` reruns only goals and coherence checks for its bucket, not every proof that read its module's `Implementations` list                    |
-| `InherentSet(O)`    | nominal owner                    | the set of inherent `impl` members of `O` changes                                            | inherent member lookup on `O` stops depending on every inherent `impl` in the module                                                                     |
-| `HeaderOf(D)`       | declaration                      | `Header(D)` produced an unequal result                                                       | callers depend on signatures, never bodies (G3 to G5, #567)                                                                                              |
-| `ValueOf(D)`        | declaration                      | `Value(D)` produced an unequal result                                                        | an initializer edit that yields the same value stops at the value                                                                                        |
-| `Realization(D, s)` | declaration, selection           | the body's externally visible inferred facts changed: opaque realization and callable origin | a body edit that keeps its opaque representation does not rerun its consumers' layout and MIR. This is the analogue of Zig's `func_ies` (audit §3)       |
-| `LayoutOf(T)`       | type application                 | `Layout(T)` produced an unequal layout                                                       | a field edit that keeps size, alignment and offsets stops at the layout                                                                                  |
-| `ProfileEntry(p)`   | profile parameter or target fact | that one value changes                                                                       | changing one package parameter reruns only its readers (§8, proposal P1)                                                                                 |
+| Dependee            | Key                              | Changes when                                                                                 | Fan-out it prevents                                                                                                                                                     |
+| ------------------- | -------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SourceFile(M)`     | module                           | the module path appears, disappears or loses its root identity                               | an import of an absent module reruns only when that file appears, not on every other file event                                                                         |
+| `DeclSource(D)`     | declaration                      | the whole-declaration fingerprint changes (§3)                                               | a body edit reruns only that body; it is the only kind `Body(D)` and `Value(D)` read for their own text                                                                 |
+| `DeclPrototype(D)`  | declaration                      | the prototype fingerprint changes                                                            | a body edit does not rerun `Header(D)`; body edits are the most common edit                                                                                             |
+| `Name(M, n)`        | module, interned name            | the candidate set for `n` in `M` changes, including absence and visibility                   | adding an unrelated declaration to `M` does not rerun every importer of `M`; only users of that spelling rerun. Absence is tracked, as in Zig (audit §3)                |
+| `Namespace(M)`      | module                           | the set of names in `M`, with visibility, changes                                            | only whole-module readers (operator discovery, test discovery) pay for additions; name lookups use `Name`                                                               |
+| `ImplSet(C, O)`     | contract, provider owner         | the set of conformance `impl` declarations for that bucket changes                           | adding an `impl` reruns only goals and coherence checks for its bucket, not every proof that read its module's `Implementations` list                                   |
+| `InherentSet(O)`    | nominal owner                    | the set of inherent `impl` members of `O` changes                                            | inherent member lookup on `O` stops depending on every inherent `impl` in the module                                                                                    |
+| `HeaderOf(D)`       | declaration                      | `Header(D)` produced an unequal result                                                       | callers depend on signatures, never bodies (G3 to G5, #567)                                                                                                             |
+| `ValueOf(D)`        | declaration                      | `Value(D)` produced an unequal result                                                        | an initializer edit that yields the same value stops at the value                                                                                                       |
+| `Realization(D, s)` | declaration, selection           | the body's externally visible inferred facts changed: opaque realization and callable origin | a body edit that keeps its opaque representation does not rerun its consumers' layout and MIR. This is the analogue of Zig's `func_ies` (audit §3)                      |
+| `SuspensionOf(k)`   | instance                         | `Suspension(k)` produced an unequal summary                                                  | adding `Effect.suspend` or parking in a callee reruns callers' summaries only until one already had the mode, and their emission only where a summary changed (§8.2 P4) |
+| `LayoutOf(T)`       | type application                 | `Layout(T)` produced an unequal layout                                                       | a field edit that keeps size, alignment and offsets stops at the layout                                                                                                 |
+| `ProfileEntry(p)`   | profile parameter or target fact | that one value changes                                                                       | changing one package parameter reruns only its readers (§8, proposal P1)                                                                                                |
 
 Two more are needed only in an incremental session that emits debug information or embeds files:
 `DeclLocation(D)` (the declaration's line and column, read only by emission with `--debug true`,
@@ -560,24 +563,26 @@ A session revision is a `u32` counter, advanced once per update. Each unit store
 
 ### 6.3 Every cutoff point
 
-| Point                         | Compared                                                               | Enough because                                                                                                                     |
-| ----------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| File                          | length and 128-bit hash                                                | covers the whole input                                                                                                             |
-| `DeclSource`, `DeclPrototype` | 128-bit fingerprints                                                   | the fingerprint covers every token the unit reads (§3.1)                                                                           |
-| `Name(M, n)`                  | set of `(DeclIndex, candidate kind, import ordinal, public)`           | it is the complete bucket `NameObservation` already models (`ModuleIndex.silk:156-172`), absence included                          |
-| `Namespace(M)`                | set of `(NameIndex, public)`                                           | whole-module readers consume only names and visibility; they read members through `Name` or `HeaderOf`                             |
-| `ImplSet`, `InherentSet`      | set of `DeclIndex`                                                     | the heads themselves are read through `HeaderOf(impl)`                                                                             |
-| `SourceFile(M)`               | presence                                                               | content is covered per declaration                                                                                                 |
-| `ProfileEntry(p)`             | the interned static value                                              | one entry is the whole consumed input                                                                                              |
-| `HeaderOf(D)`                 | interned header record, including success or rejection                 | only if the record holds everything a reader consumes; see the conditions below                                                    |
-| `ValueOf(D)`                  | interned static value, including success or rejection                  | same                                                                                                                               |
-| `Realization(D, s)`           | interned realization: opaque representation, callable origin           | same                                                                                                                               |
-| `LayoutOf(T)`                 | size, alignment, field offsets, enum encoding, ABI class               | that is the whole `BackendLayout`; Zig skips this comparison (audit §5) and Silk should not, because layout records are small      |
-| `Body(D, s)`                  | none: a rerun body always reruns its own `Instance` and `Borrow` units | comparing typed bodies costs more than it saves; trivia-only edits never reach a body (§3.1)                                       |
-| `Borrow(D, s)`                | `Checked`, or rejection codes with relative spans                      | nothing downstream reads more                                                                                                      |
-| `Coherence(I)`                | accepted, or rejection code with relative span                         | same                                                                                                                               |
-| `Instance(k)`                 | the interned content subject of the LLVM definition                    | it is already the `LlvmText` key (`mir-core-shape.md` §2): equal content is the same answer, and object code keyed by it is reused |
-| `Catalog(root)`               | the ordered catalog                                                    | §8 P7 narrows what it contains                                                                                                     |
+| Point                         | Compared                                                                  | Enough because                                                                                                                     |
+| ----------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| File                          | length and 128-bit hash                                                   | covers the whole input                                                                                                             |
+| `DeclSource`, `DeclPrototype` | 128-bit fingerprints                                                      | the fingerprint covers every token the unit reads (§3.1)                                                                           |
+| `Name(M, n)`                  | set of `(DeclIndex, candidate kind, import ordinal, public)`              | it is the complete bucket `NameObservation` already models (`ModuleIndex.silk:156-172`), absence included                          |
+| `Namespace(M)`                | set of `(NameIndex, public)`                                              | whole-module readers consume only names and visibility; they read members through `Name` or `HeaderOf`                             |
+| `ImplSet`, `InherentSet`      | set of `DeclIndex`                                                        | the heads themselves are read through `HeaderOf(impl)`                                                                             |
+| `SourceFile(M)`               | presence                                                                  | content is covered per declaration                                                                                                 |
+| `ProfileEntry(p)`             | the interned static value                                                 | one entry is the whole consumed input                                                                                              |
+| `HeaderOf(D)`                 | interned header record, including success or rejection                    | only if the record holds everything a reader consumes; see the conditions below                                                    |
+| `ValueOf(D)`                  | interned static value, including success or rejection                     | same                                                                                                                               |
+| `Realization(D, s)`           | interned realization: opaque representation, callable origin              | same                                                                                                                               |
+| `LayoutOf(T)`                 | size, alignment, field offsets, enum encoding, ABI class                  | that is the whole `BackendLayout`; Zig skips this comparison (audit §5) and Silk should not, because layout records are small      |
+| `Body(D, s)`                  | none: a rerun body always reruns its own `Mir`, `Emit` and `Borrow` units | comparing typed bodies costs more than it saves; trivia-only edits never reach a body (§3.1)                                       |
+| `Borrow(D, s)`                | `Checked`, or rejection codes with relative spans                         | nothing downstream reads more                                                                                                      |
+| `Coherence(I)`                | accepted, or rejection code with relative span                            | same                                                                                                                               |
+| `Mir(k)`                      | none: its only readers are its own `Suspension` and `Emit` units          | as for `Body`                                                                                                                      |
+| `Suspension(k)`               | `{transfer, park}`; a recursive group compares its shared summary         | it is the whole summary callers and emission read                                                                                  |
+| `Emit(k)`                     | the interned content subject of the LLVM definition                       | it is already the `LlvmText` key (`mir-core-shape.md` §2): equal content is the same answer, and object code keyed by it is reused |
+| `Catalog(root)`               | the ordered catalog                                                       | §8 P7 narrows what it contains                                                                                                     |
 
 **Where interned equality is not enough.** Interned equality is sound only when the interned value
 is the entire consumed result (audit §5). Four conditions follow:
@@ -623,7 +628,7 @@ What a long-running session retains between updates:
 - the parsed and indexed sources of every module in the build, with fingerprints and location
   tables;
 - unit results that others consume: headers, values, realizations, layouts, catalogs (small);
-- typed bodies, because an `Instance` or `Borrow` unit reruns when a callee signature changes even
+- typed bodies, because a `Mir` or `Borrow` unit reruns when a callee signature changes even
   though its body did not. **[assumption]** Evicting typed bodies and rechecking on demand is a
   later memory option, measured before it is built;
 - per instance, the content subject and its LLVM text or object code (§7.2);
@@ -634,7 +639,7 @@ What it drops: static machines, MIR after its LLVM text is produced, request-loc
 **The instance walk must not rerun in full.** `buildFrom` walks every reached instance outside the
 query engine; with one round that is 4.1% of a cold build (§1.4). In a session, each instance's
 outgoing references, cleanup admission and variant become a unit result keyed by the instance, so
-an update walks only from instances whose `Instance` unit reran. Zig caches its reference
+an update walks only from instances whose `Mir` unit reran. Zig caches its reference
 traversal for the same reason (audit §7). The region-sensitivity and suspension closures in the
 walk are whole-program; P3 and P4 remove them, and without those proposals they rerun per update.
 
@@ -674,20 +679,20 @@ spot-checked.
 
 ### 8.1 Features that make tracking global
 
-| Feature                                                                         | What a use reads                                                             | Reach today              |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------ |
-| Profile, application and condition scoping of every query key                   | the whole profile identity                                                   | whole program            |
-| Failure observation switch (`failure-observer-and-trace.md` N1)                 | whether any reached function observes                                        | whole program            |
-| Suspension closure (`closeSuspendable`, `Semantic.silk:66095`)                  | the reverse call graph                                                       | whole program            |
-| Region-sensitive identity (`markRegionSensitive`, `Semantic.silk:65520`)        | which lifetime-selective heads lowering consulted, closed over lending edges | whole program, per build |
-| Polymorphic-recursion admission (GEN-006)                                       | the path from the roots                                                      | whole program            |
-| Module `static if` (MODULE-STATIC-001 to 005)                                   | static helper bodies, constants, profile                                     | import closure           |
-| Test discovery (TEST-003, TEST-004)                                             | every test in the root's import closure, with line and column                | package                  |
-| Generated field lifetimes, variance, `Drop` and `Copy` classification           | the owned structure of every field type, transitively                        | type graph               |
-| Opaque realization and callable origin (REP-004, REP-005, EFF-013)              | producer bodies, transitively, as a fixed point                              | producer graph           |
-| Operator discovery (OP-009, `collectOperatorInterfaces`, `Semantic.silk:60658`) | every operator interface of every namespace-imported module                  | module and its imports   |
-| Conformance and coherence (IMPL-004 to IMPL-009)                                | the `impl` lists of at most two modules (orphan rule)                        | module pair              |
-| Effect contracts, captures, name lookup                                         | own body and callee signatures; one name bucket                              | local                    |
+| Feature                                                                         | What a use reads                                                             | Reach today                                 |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------- |
+| Profile, application and condition scoping of every query key                   | the whole profile identity                                                   | whole program                               |
+| Failure observation switch (`failure-observer-and-trace.md` N1)                 | whether any reached function observes                                        | whole program                               |
+| Suspension closure (`closeSuspendable`, `Semantic.silk:66095`)                  | the reverse call graph                                                       | whole program; one recursive group under P4 |
+| Region-sensitive identity (`markRegionSensitive`, `Semantic.silk:65520`)        | which lifetime-selective heads lowering consulted, closed over lending edges | whole program, per build                    |
+| Polymorphic-recursion admission (GEN-006)                                       | the path from the roots                                                      | whole program                               |
+| Module `static if` (MODULE-STATIC-001 to 005)                                   | static helper bodies, constants, profile                                     | import closure                              |
+| Test discovery (TEST-003, TEST-004)                                             | every test in the root's import closure, with line and column                | package                                     |
+| Generated field lifetimes, variance, `Drop` and `Copy` classification           | the owned structure of every field type, transitively                        | type graph                                  |
+| Opaque realization and callable origin (REP-004, REP-005, EFF-013)              | producer bodies, transitively, as a fixed point                              | producer graph                              |
+| Operator discovery (OP-009, `collectOperatorInterfaces`, `Semantic.silk:60658`) | every operator interface of every namespace-imported module                  | module and its imports                      |
+| Conformance and coherence (IMPL-004 to IMPL-009)                                | the `impl` lists of at most two modules (orphan rule)                        | module pair                                 |
+| Effect contracts, captures, name lookup                                         | own body and callee signatures; one name bucket                              | local                                       |
 
 The last two rows need no language change: the orphan rule already bounds coherence to two modules
 (IMPL-004, `generics-interfaces-and-specialization.md:1317`), and `ImplSet` makes it per bucket.
@@ -757,23 +762,85 @@ largest reason this design can be precise.
 Guard<'static, 'data>`, `packages/compiler/test/support/corpus.ts:8439`), and compiler test cases
   have about a dozen, which exist to test this feature.
 
-**P4. Suspension declared in contracts.**
+**P4. Suspension summaries inferred per instance, with cutoff (no language change).**
 
-- _Today._ Whether an instance suspends is a transitive fixed point over the reverse call graph
-  (`closeSuspendable`), so that non-suspending code pays nothing (SUSP-018,
-  `effect-suspension.md:463`). Adding `Effect.suspend` in a leaf changes the lowering of every
-  transitive caller, found only by a whole-program pass.
-- _Option._ A function whose execution can park says so in its contract, for example through the
-  existing execution modes (`Intrinsic.NonParking` and its counterpart). A call to a parking
-  callee from a non-parking contract is rejected. Lowering reads only callee headers.
-- _Reference change._ `effect-suspension.md` SUSP-003 and the execution modes; EFF rules for the
-  contract syntax.
-- _Buys._ Incremental: a new suspension point changes one signature and propagates through
-  `HeaderOf`, with cutoff. Cold: removes the closure pass (**[measured]** `closeSuspendable` is
-  0.7% of the one-round self-build profile, 815 samples, §1.4) and the extra walk with suspendable
-  roots (`Semantic.silk:65470`). It also makes `NonParking` checkable, which the native compiler accepts
-  unchecked today (survey, `Semantic.silk:62607`).
-- _Safety._ Unchanged; parking is about scheduling, and frames keep the same ownership rules.
+Julia's direction (2026-10-11): keep Effect uncolored. This is the recommended option; declared
+modes are kept only as a fallback.
+
+_Two facts, not one._ The reference records one normalized suspension summary per reachable exact
+executable, with two independent modes (`effect-suspension.md`, "Static execution facts"):
+
+- **Nested transfer** (`NestedTransfer`): the selected call graph can reach `Effect.suspend`. It
+  decides lowering: such an instance needs a coroutine frame and calls its suspending callees with
+  `Suspend` instead of `Call` (`mir-core-shape.md` §6). An instance that cannot reach it pays
+  nothing (SUSP-018). It never involves an external wakeup.
+- **External parking** (`ExternalPark`): the graph can reach the sealed external-wake primitive
+  behind `Execution.park`. It decides no lowering. It matters only for the `Intrinsic.NonParking`
+  property, which "proves that the specialized transitive graph cannot reach external parking"
+  while allowing nested transfer. An `Execution` construction delimits it: the erased body keeps
+  its summary, and an owner-side drive caller does not inherit `ExternalPark`.
+
+Then:
+
+- _Today._ Only nested transfer is computed, after the fact and for the whole build. The walk
+  lowers every reached instance, `SuspensionSummary.make` lists each instance's direct callees and
+  whether it runs a boundary, `closeSuspendable` (`Semantic.silk:66095`) marks callers to a global
+  fixed point, and when anything is marked the walk runs again with the closed set as frame
+  selection (`Semantic.silk:65470`). Function-address formation checks `callbackSuspends`, which
+  scans every summary for every callee. **[source]** No parking summary exists: `compiler/src`
+  has no `ExternalPark` mode, `NonParking` is only a property flag on representations
+  (`Semantic.silk:520`), and `NonParking` bounds are accepted unchecked (`Semantic.silk:62607`).
+- _Variant._ Split the instance unit in two and put a summary unit between them (§2.1):
+  - `Mir(k)` lowers the instance without any suspension fact, as the first walk does today, and
+    lists its direct callees and whether it runs `Effect.suspend` or the park primitive;
+  - `Suspension(k)` is `{transfer, park}`: its own flags joined with the summaries of its direct
+    callees, where `park` does not cross an `Execution` construction;
+  - `Emit(k)` applies the frame transform when `transfer` holds, chooses `Suspend` for each callee
+    whose summary has `transfer`, and produces the LLVM text.
+
+  Callers consume `SuspensionOf(callee)`, a two-bit summary, never the callee's body or MIR. That
+  is the role Zig gives a function's inferred error set (`func_ies`, audit §3): an inferred
+  per-function fact that callers depend on, compared after reanalysis and cut off when equal
+  (audit §5).
+
+- _Recursion._ Instances that call each other form a strongly connected group whose members share
+  one summary: the join of the members' own flags and the summaries of the group's external
+  callees. The group is found during demand by Tarjan's algorithm over `Suspension` demands: a
+  demand that reaches an active `Suspension` key records a back edge instead of failing (today the
+  engine reports `Cycle`, `Query.silk:107`), and the group closes when its root's demand finishes.
+  This is the SCC-capable query the MIR note already asks for (`mir-core-shape.md` §6), and the
+  same engine addition `Realization` groups need (§2.1). In a session, a group with a member whose
+  `Mir` reran with a different callee list is dissolved and its members are demanded again, so
+  groups split and merge locally. A group costs time linear in its members and edges; there is no
+  pass over the whole build.
+- _Checking `NonParking`._ At each application that supplies an Effect or callable for a
+  `NonParking`-bounded parameter, typing records the obligation it cannot prove from the body (it
+  skips it today, `Semantic.silk:62607`), as a retained safety obligation like `SafetyObligation`.
+  The obligation is discharged once the instance is concrete: the applying instance's `Mir(k)`
+  demands `SuspensionOf` of the supplied executable and rejects at the application span when `park`
+  holds, with the reachability path the reference requires. An edit that makes a supplied
+  executable park changes its summary and reruns exactly the instances whose obligations read it.
+- _Reference change._ None. The reference already specifies per-executable summaries, the two
+  modes, the `Execution` delimiter and `NonParking`; this implements them.
+- _Keeps._ Uncolored Effect: no function is annotated. SUSP-008 suspension-transparent combinators:
+  `Effect.map` and its kin are generic, each specialization is its own instance, and its summary is
+  the join of its child's, so `Effect.map` over a suspending child transfers and over a direct child
+  does not. SUSP-018 pay-for-use: an instance whose summary has no `transfer` is lowered exactly as
+  today.
+- _Buys._ Cold: the global closure and the second walk with suspendable roots disappear; each
+  instance computes its summary once, when demanded. **[measured]** `closeSuspendable` alone is
+  0.7% of the one-round self-build profile (815 of 117,570 samples, §1.4), and the
+  `callbackSuspends` scan, which is quadratic in reached instances, goes with it. **[assumption]**
+  Per-instance summaries cost less than the closure they replace, because they are linear in call
+  edges and run beside lowering, which already visits every callee. Incremental: adding
+  `Effect.suspend` in a leaf reruns `Suspension` of its transitive callers only until a caller
+  already had `transfer`, and reruns `Emit` only where a summary changed. Nothing is whole-program.
+- _Safety._ Unchanged. Summaries decide lowering and a scheduling property, not ownership: SUSP-011
+  and SUSP-013 keep ordinary loans and cleanup across suspension either way.
+- _Fallback._ If inferred summaries prove too expensive, declared modes: a function whose graph can
+  park or transfer says so in its contract through the execution modes, and lowering reads only
+  callee headers. That is a language change (`effect-suspension.md` and the EFF contract rules) and
+  colors Effect, so it stays a fallback.
 
 **P5. Type summaries instead of transitive walks, and optionally explicit lifetimes on types.**
 
@@ -968,7 +1035,7 @@ measurement in slice 3.
 
 **[assumption]** Targets for watch mode on the compiler itself, to be confirmed by slice 8:
 
-- a body edit with an unchanged signature: one `Body`, `Borrow` and `Instance` unit rerun, one
+- a body edit with an unchanged signature: one `Body`, `Borrow`, `Mir` and `Emit` unit rerun, one
   codegen unit recompiled, front end under 100 ms;
 - a signature edit: its callers' `Body` units at most; front end proportional to the callers;
 - an edit that changes nothing but trivia: no unit reruns.
@@ -1088,8 +1155,8 @@ counts and results in existing case files, no timing assertions, no per-feature 
 4. **Unit granularity.** One `Header` unit per declaration (proposed), accepting that a caller
    reading only member names reruns when a field type changes?
 5. **Language proposals.** For each of P1 to P9 in §8.2: accept, reject, or defer. The ranking is
-   P1 (profile entries), P2 (failure observation), P3 (lifetime-selective heads), P4 (suspension in
-   contracts), P5 (type summaries; explicit field lifetimes), P6 (operators through operand
+   P1 (profile entries), P2 (failure observation), P3 (lifetime-selective heads), P4 (inferred suspension
+   summaries, Julia's direction), P5 (type summaries; explicit field lifetimes), P6 (operators through operand
    buckets, tied to the open OP-009 question), P7 (test positions), P8 (local recursion admission),
    P9 (`impl` identity by head).
 6. **Safety model.** Borrow checking on the typed body inside the `Body` unit (S1), or a separate
