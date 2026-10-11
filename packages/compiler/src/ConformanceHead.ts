@@ -84,6 +84,7 @@ export type RegionSelection =
   | { readonly _tag: 'StaticRegion' }
   | { readonly _tag: 'RepeatedRegion'; readonly region: string }
   | { readonly _tag: 'BoundedRegion'; readonly parameter: string }
+  | { readonly _tag: 'InterfaceBound'; readonly bound: string }
 
 /**
  * Returns every parameter reachable from the supplied terms in first-occurrence order.
@@ -579,13 +580,15 @@ export const describeTermination = (self: TerminationFailure): string => {
 }
 
 /**
- * Returns how a written head selects by region, if it does. `bounded` names the head binders that
- * carry an outlives bound (`'a: 'b`) or a contents bound (`T: 'a`).
+ * Returns how a written head selects by region, if it does. `bounded` names the head binders whose
+ * region bound the provider's declaration does not imply, and `interfaceBounded` the interface
+ * bounds it does not imply, spelled `T: Interface`.
  */
 export const regionSelection = (
   capability: Type.Nominal,
   provider: Type.Type,
   bounded: ReadonlyArray<string>,
+  interfaceBounded: ReadonlyArray<string>,
 ): RegionSelection | undefined => {
   const seen = new Set<string>()
   for (const region of [
@@ -602,7 +605,9 @@ export const regionSelection = (
     seen.add(regionKey)
   }
   const parameter = bounded.at(0)
-  return parameter === undefined ? undefined : { _tag: 'BoundedRegion', parameter }
+  if (parameter !== undefined) return { _tag: 'BoundedRegion', parameter }
+  const bound = interfaceBounded.at(0)
+  return bound === undefined ? undefined : { _tag: 'InterfaceBound', bound }
 }
 
 /** Renders one region selection as the clause a diagnostic completes. */
@@ -614,5 +619,7 @@ export const describeRegionSelection = (self: RegionSelection): string => {
       return `names ${self.region} at two positions`
     case 'BoundedRegion':
       return `bounds ${self.parameter} by a region`
+    case 'InterfaceBound':
+      return `requires ${self.bound}, which a conformance can satisfy for some regions only`
   }
 }
