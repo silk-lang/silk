@@ -1,7 +1,8 @@
 # PR #1359 handoff
 
 Updated 2026-10-11. PR: https://github.com/silk-lang/silk/pull/1359
-Branch: `selfhost-per-declaration-invalidation-note`, merged with `selfhost` at `9834e15`.
+Branch: `selfhost-per-declaration-invalidation-note`, merged with `selfhost` at `74637a1` (the gate
+numbers below were measured against base `9834e15`).
 Status: **parked as draft**. Focused correctness checks pass; the cold-build gate fails. The
 design decision recorded in #567 must be made before more implementation work.
 
