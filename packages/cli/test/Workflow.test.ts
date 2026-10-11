@@ -105,8 +105,6 @@ const testInfo = (
   name: `test${ordinal}`,
   module: 'tests/Cases',
   path: 'tests/Cases.silk',
-  line: ordinal + 1,
-  column: 1,
   fingerprint: `silk-test-v1:${ordinal}`,
 })
 
