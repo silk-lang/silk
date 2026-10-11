@@ -1,9 +1,21 @@
 # Native borrow checking
 
-Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). This is a
-design note for Julia's review. Nothing here is implemented. It extends
-[`mir-core-shape.md`](mir-core-shape.md) §5 ("Room for borrow regions") and relies on
-[`region-sensitive-identity.md`](region-sensitive-identity.md).
+Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). Nothing here is
+implemented yet. It relies on [`region-sensitive-identity.md`](region-sensitive-identity.md) and
+follows [`incremental-architecture-v2.md`](incremental-architecture-v2.md) (§8.3, the
+checking-unit rule).
+
+**Status.** Revised after the joint review with the incremental architecture v2 note (#1433),
+which Julia approved on 2026-10-11. Her decisions are recorded in §11:
+
+- checking runs on the typed body inside the `Body` unit (option S1 of the v2 note), not on a
+  separate checking MIR;
+- no two-phase borrows; OWN0017 is dropped; native names are printed together with the bootstrap
+  codes during the transition;
+- the remaining questions take the answers the v2 note gave.
+
+The first version of this note proposed a separate `BorrowCheck` family over a new
+`Mir(Abstract)` lowering. That design is superseded and removed here.
 
 ## Summary
 
@@ -11,19 +23,22 @@ design note for Julia's review. Nothing here is implemented. It extends
   (`ownership-and-borrowing.md`, `lifetimes.md`, `local-shared-ownership.md`) and reports the same
   diagnostics as the TypeScript bootstrap: OWN0010, OWN0011, OWN0012, OWN0014, OWN0015, OWN0016,
   OWN0018 and OWN0019, plus the move codes the native typing stage already reports.
-- It runs on **checking MIR**, never emitted: one `Mir(Abstract(declaration))` per ordinary body
-  (generic or not), and one selected-body MIR per static selection. Inactive static arms are never
-  lowered, so they are never checked. Monomorphic instances are not checked again.
-- MIR gains storage markers, a region side table, explicit capture and provider loans, and calls
-  through declared bounds. Regions are finite point sets over MIR locations, solved as the bootstrap
-  solves them (`Lifetime.solve`). Loan liveness is a backward dataflow over the MIR control-flow
-  graph.
-- The check is one query family, `BorrowCheck`, keyed like the checked body it proves. It depends on
-  that body, its checking MIR and its callees' signatures, never on callee bodies, so an edit
-  re-checks only the edited body and the callers of a changed signature.
+- It runs on the **typed body**, inside the `Body` unit that produced it, after typing succeeds.
+  One `Body` per ordinary body (generic or not) and one per static selection. Inactive static arms
+  are never typed, so they are never checked. Monomorphic instances are not checked again.
+- The checker builds a transient control-flow graph over the typed body's evaluation points,
+  derives places and loans from typed nodes it already has (`Borrow`, receiver passes, call
+  arguments, pattern bindings, captures), and solves regions as the bootstrap does
+  (`Lifetime.solve`). Loan liveness is a backward dataflow over that graph. Nothing is retained
+  after the check except its answer.
+- The **checking unit** is the `Body` unit: keyed by declaration and selection, it reads only its
+  own body, the signatures of its callees and bound operations, and type summaries. It never reads
+  a callee's body, MIR or checking answer. An edit re-checks only the edited body and the callers
+  of a changed signature or type summary.
 - Until every body is checked, `SILK_GAP borrow-check` keeps counting unchecked emitted bodies, now
-  split by reason. When the count reaches zero on the self-build and the parity corpus agrees with
-  the bootstrap, the gap becomes a hard error and TypeScript can be deleted.
+  split by reason, and CI fails on any increase. When the count reaches zero on the self-build and
+  the parity corpus agrees with the bootstrap, the gap becomes a hard error and TypeScript can be
+  deleted.
 
 ## 1. What the checker reproduces
 
@@ -85,16 +100,25 @@ The bootstrap is the behavioral reference, not the architectural one.
   `OverlappingAssignment` (OWN0004), `IncompatibleLoopHeader` (OWN0005), `MatchBorrowEscape`
   (OWN0006), `GuardConsumesPattern` (OWN0008), `InvalidMatchScrutineePlace` (OWN0009),
   `BorrowedExtraction` (OWN0012), `ExclusiveBorrowRequiresMutable` (SEM0057) and
-  `UnsatisfiedLifetimeBound` (SEM0212). `CaptureAvailability` is a control-flow proof for captured
-  places.
+  `UnsatisfiedLifetimeBound` (SEM0212).
 - Region escapes are reported as `TypeMismatch` where the bootstrap reports OWN0019 (a #567 known
   gap). The borrow stage owns that fix.
+- `CaptureAvailability` already walks a typed body's control flow (blocks, branches, loops, `break`,
+  `continue`, `return`, `fail`, match arms) with joined path states. The borrow stage reuses that
+  walk shape for its own graph.
+- The typed body is a structured tree (`TypedBody.silk:377-446`): `Block`, `Branch`, `While`,
+  `Break`, `Continue`, `Return`, `Fail`, `Drop`, bindings and assignments, with expressions in
+  evaluation order. Places are a root (`Local` or a matched `Subject`) plus `PlaceStep`s, and
+  borrows are `Expression.Borrow{access, value}`. Anonymous functions are nested typed bodies
+  (`Expression.Callable{body}`), checked inside their enclosing unit.
 - The miss that matters in practice: the native compiler accepts loan conflicts. The stdlib once
   needed a fix for OWN0011 that only the bootstrap caught (PAPERCUTS, 2026-10-11).
 
 ## 2. Which bodies are checked
 
-A **checking unit** is one body as typing proves it, identified by its `Body` query key.
+A **checking unit** is one body as typing proves it: the `Body` unit, keyed by declaration and
+selection. Today that key is `Body{module, declaration, member}` with a declaration ordinal; once
+v2 slice 0 lands it is `(DeclIndex, selection)`. The checker never introduces a key of its own.
 
 | Body                                      | Unit                                      | Checked                       |
 | ----------------------------------------- | ----------------------------------------- | ----------------------------- |
@@ -102,7 +126,7 @@ A **checking unit** is one body as typing proves it, identified by its `Body` qu
 | Generic ordinary function                 | `Body{declaration, member: 0}`, abstract  | once, with symbolic `T`, `'a` |
 | Function with static selection            | `Body{declaration, member: selected + 1}` | once per interned selection   |
 | Type-dependent static condition           | the selected application's body, as above | once per selection            |
-| Inactive static arm                       | none (never lowered)                      | never                         |
+| Inactive static arm                       | none (never typed)                        | never                         |
 | Monomorphic instance of a checked unit    | none; it inherits its unit's answer       | never                         |
 | Drop glue and other compiler-built bodies | none; built from checked glue recipes     | marked checked, as today      |
 
@@ -122,42 +146,52 @@ is checked against its own contract, and the caller's arguments are checked agai
 callee's signature in the caller's unit.
 
 **Interaction with `needsStaticResidualization`.** Today `lowerMir` derives the selected body key
-from `InstanceKey.selected` and `internSelectedApplication`. The checking unit must use the same
-interned selection, so that each emitted instance maps to exactly one unit and the count in §6 is
-exact.
+from `InstanceKey.selected` and `internSelectedApplication`. That key names the `Body` unit whose
+checking answer covers the instance, so each emitted instance maps to exactly one unit and the
+count in §6 is exact.
 
-## 3. Checking MIR
+## 3. Checking the typed body
 
-Borrow checking reads MIR, not `TypedBody`, as #567 and the MIR note settle. MIR already has place
-operands, explicit `Ref` and `AddressOf` rvalues, origins on every statement and terminator, and
-symbolic lifetimes in local types. The checking variant adds the following, each as a new variant
-or side table, never as a second lowering pipeline.
+Borrow checking reads the `TypedBody`, the same representation the bootstrap checks (typed TIR,
+§1.2). Emission MIR is unchanged and is never read by the checker. Everything below is built
+inside the `Body` unit after typing succeeds, used, and dropped; only the answer is kept.
 
-1. **`InstanceKey.Abstract(declaration, selection)`.** This selects checking MIR for one unit. It
-   is lowered by the same `lowerMir` with generic parameters left symbolic. Types stay layout-free
-   (MIR has no layout), and an abstract `T` is treated as affine (GENERIC-001). A drop of an
-   abstract `T` is a `Drop` with abstract glue. It is never emitted, and the backend rejects an
-   `Abstract` key.
-2. **`Callee.Bound(operation, provider)`.** A call through a declared bound or interface operation
-   whose implementation is not chosen in the abstract body. The checker reads only its signature.
-3. **`StorageLive` and `StorageDead`.** These come from the Step 6 scope stack, for every local
-   that can be borrowed, not only owned ones. `StorageDead` kills loans of that local and makes
-   any later use of a region that contains one of its loans a violation (OWN0019 for escapes).
-4. **Region side table.** It is keyed by local and loan location (block, statement) and maps:
-   - each reference-typed local's symbolic lifetimes to region variables;
-   - each `Ref`/`AddressOf` to a loan `{place, access, region, origin}`;
-   - each typing `RegionRelation` obligation to an outlives constraint at its origin.
-     It is a side table, so emission MIR does not grow.
-5. **Explicit loans for non-`Ref` borrows.** Capture environments, Effect environments, provider
-   bindings (`bindRequirement*`, `provideMut`), call-argument borrows and returned views lower to
-   the same loan record, so the checker has one rule for all of them. This matches the bootstrap's
-   `LoanFact` origins one to one.
-6. **Reborrow parent link.** A loan whose place goes through `Deref` of a reference local records
-   the loan it derives from. The parent is suspended while the child is live (BORROW-005), and
-   siblings still conflict.
+1. **Evaluation points.** Each typed node gets a point in evaluation order: operands before their
+   operation, as `TypedBody` already orders them (aggregate fields, call arguments, `Index`
+   subject before index, infix left before right). `Return` and `Fail` each add an exit point.
+2. **Control-flow graph.** Edges follow the typed tree: `Block` in sequence, `Branch` to both arms
+   and a join, `While` with its back edge, `Break` and `Continue` to their loop, `Return` and
+   `Fail` to an exit, `Match` to each arm in order with guards before results. Every call and `run`
+   whose callee can fail also has an edge to the failure exit, so loans live across a call are live
+   on its failure path (BORROW-004). This is the walk `CaptureAvailability` already performs,
+   recorded as a graph instead of folded into one state.
+3. **Places.** A place is a root (`Local` or a matched `Subject`) and a path of `PlaceStep`s,
+   extended through `Field`, `Index` and `Dereference` expressions. An index without a proven
+   bound overlaps every index of the same root, as in the bootstrap.
+4. **Loans.** One loan record `{place, access, region, origin}` for every way a body borrows:
+   `Expression.Borrow`, `Shared` and `Mutable` receiver passes, call arguments for the duration of
+   the call, `Shared` and `Exclusive` pattern bindings, captured places of `Callable` environments,
+   Effect environments, and provider bindings. This matches the bootstrap's `LoanFact` origins one
+   to one, so the checker has one rule for all of them.
+5. **Storage ends.** A binding's storage ends at the exit of the `Block` that declares it, on every
+   path out of the block, including `break`, `continue`, `return` and `fail` edges. `Drop`, `Move`
+   and assignment of the whole owner also end its loans' validity.
+6. **Reborrows.** A loan whose place goes through `Dereference` of a reference local records the
+   loan it derives from. The parent is suspended while the child is live (BORROW-005), and siblings
+   still conflict.
+7. **Regions.** Each `Lifetime.Local` in a local's type and each loan gets a region variable. Each
+   `RegionRelation` and `Contents` obligation (`TypedBody.silk:454-497`) becomes an outlives
+   constraint at its origin.
+8. **Generic bodies.** A generic body is already typed against its own parameters, so it is checked
+   in the same pass: an abstract `T` is affine (GENERIC-001), a call through a declared bound is an
+   interface operation node whose signature is known, and a drop of `T` is a drop with abstract
+   glue. No symbolic lowering is needed.
+9. **Selected static bodies.** `Body(D, s)` holds the selected typed body. It is checked like any
+   other; inactive arms are absent.
 
-Emission MIR stays as it is. The checking unit and the emission instance share `lowerMir`, so a
-body cannot be checked in one shape and emitted in another.
+_Rejected:_ a separate checking MIR (`Mir(Abstract)`, `Callee.Bound`, storage markers and a region
+side table on MIR), the first version of this note. It costs a second lowering of every generic
+body on every cold build, and incremental compilation does not need it (v2 note §8.3).
 
 ## 4. Regions, loans and liveness
 
@@ -176,9 +210,10 @@ are given, not proved, in the body itself (LIFE-002).
 
 ### 4.2 Points
 
-Points are MIR locations (block, statement index), plus one exit point per `Return` and `Fail`.
-The bootstrap uses authored anchors instead. MIR locations are finer, and each carries the origin
-the diagnostic needs. Parity is defined on reported code and span, not on internal points (§7).
+Points are the typed body's evaluation points (§3), plus one exit point per `Return` and `Fail`.
+The bootstrap uses preorder authored anchors; evaluation points are at least as fine, and each
+carries the origin the diagnostic needs. Parity is defined on reported code and span, not on
+internal points (§7).
 
 ### 4.3 Solving
 
@@ -195,7 +230,7 @@ bitsets over the body's location count.
 
 ### 4.4 Liveness and conflicts
 
-Loan liveness is a backward dataflow over the CFG, normal and failure edges alike: a loan is live at
+Loan liveness is a backward dataflow over the graph of §3, normal and failure edges alike: a loan is live at
 a location if a use of its region is reachable from there before the loan is killed. At every
 access, the checker compares the accessed place against live loans with the bootstrap's overlap rule
 (field paths compare, unproven indices overlap everything):
@@ -220,32 +255,32 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
   OWN0014, checked at the `Call` that runs it.
 - A local-shared access callback gets a region bounded by the access call. A loan into the shared
   contents that outlives it is OWN0016.
-- OWN0020 (ownership across suspension) is out of scope until suspension MIR exists (MIR note §6),
-  and is reported as a named gap if reached.
+- OWN0020 (ownership across suspension) is out of scope until suspension lowering exists
+  (`mir-core-shape.md` §6), and is reported as a named gap if reached.
 
 ## 5. Place in the query graph
 
-A new family, `BorrowCheck`, takes the same `{module, declaration, member}` key as the `Body` it
-proves.
+The checker is part of the `Body` unit, as the v2 note's checking-unit rule requires:
 
-- **Demands:** `Body` (its typed answer and obligations), `Mir` for `InstanceKey.Abstract` of that
-  unit, and `Signature` of each callee and bound operation it calls. It never demands a callee's
-  `Body`, `BorrowCheck` or `Mir`. That keeps the G3 to G5 rule (callers depend only on callee
-  signatures and identities).
-- **Answer:** `Checked`, or `Rejected{first, further}` with the same `Rejection` records typing
-  uses, or `NotChecked{reason}` for a form the checker does not handle yet (§6). The answer is
-  small and content-compared, so an unchanged answer cuts off downstream re-execution.
-- **Who demands it:** `buildRuntime`, for the unit of every emitted instance, deduplicated by key.
-  `MirFunction.safetyChecked` and `InstanceRecipe.safetyChecked` then come from the `BorrowCheck`
-  answer instead of `BodyStage.FullyChecked`. A rejection joins `BackendBuild.Rejected` exactly as
-  typing rejections do.
-- **Incremental behavior:**
-  - editing a body re-runs its `Body`, its checking `Mir` and its `BorrowCheck`;
-  - editing a signature re-runs the `BorrowCheck` of its callers, through the signature dependency;
-  - nothing else re-runs.
-    Checking MIR is a separate key from emission MIR, so emission does not wait for checking or depend
-    on it.
-- **`borrowStatus()`** becomes a read of the `BorrowCheck` answer. The `BorrowStatus` enum gains
+- **Key.** The `Body` key: declaration and selection.
+- **Reads.** Its own typed body, `Signature` (in v2, `HeaderOf`) of each callee and bound
+  operation, and type summaries: `Copy`, `Drop`, variance and generated field lifetimes, read
+  through the per-declaration summary of v2 P5(a), never by walking field types. It never demands a
+  callee's `Body`, MIR or checking answer. That keeps the G3 to G5 rule (callers depend only on
+  callee signatures and identities).
+- **Answer.** `Checked`, `Rejected{first, further}` with the same `Rejection` records typing uses,
+  or `NotChecked{reason}` for a form the checker does not handle yet (§6). Spans are relative to
+  the declaration (v2 §3.5), so an edit elsewhere in the file never changes a cached answer. The
+  answer is part of the `Body` result, compared by v2's cutoff (§6.3 there); only the build verdict
+  reads it.
+- **Who reads it.** `buildRuntime`, for the unit of every emitted instance, deduplicated by key.
+  `MirFunction.safetyChecked` and `InstanceRecipe.safetyChecked` then come from the checking answer
+  instead of `BodyStage.FullyChecked`. A rejection joins `BackendBuild.Rejected` exactly as typing
+  rejections do.
+- **Incremental behavior.** Editing a body reruns its `Body` unit, typing and checking together.
+  Editing a signature reruns the `Body` units of its callers through the signature dependency.
+  Editing a type reruns the units whose type summary changed. Nothing else reruns.
+- **`borrowStatus()`** becomes a read of the checking answer. The `BorrowStatus` enum gains
   `Checked`, and `NotChecked` keeps its reason.
 
 ## 6. Counting unchecked bodies until it lands
@@ -260,7 +295,7 @@ definitions whose unit is not `Checked`. On the self-build that is 18,009 today.
 - A unit is `Checked` only when every loan, region and obligation in it was proved. A slice that
   meets an unsupported form answers `NotChecked{form}`. It never answers `Checked` and skips the
   form.
-- CI keeps the count visible. It must not grow on a PR without a stated reason, and it must reach
+- CI fails on any increase of the count (Q6), from the first slice on, and the count must reach
   zero on the self-build before the TypeScript compiler is deleted. At zero, the gap becomes a
   hard build error, and `borrow-check` leaves the gap catalog.
 
@@ -270,9 +305,13 @@ definitions whose unit is not `Checked`. On the self-build that is 18,009 today.
   existing ownership codes are: `LoanConflict` (OWN0010), `AccessDuringLoan` (OWN0011),
   `StoredCallableAccess` (OWN0014), `StoredEffectAccess` (OWN0015), `SharedAccessEscape` (OWN0016),
   `CaptureEscape` (OWN0018) and `LifetimeInvalidAtUse` (OWN0019). The bootstrap's own wording and
-  the generated diagnostic catalog stay authoritative for text.
+  the generated diagnostic catalog stay authoritative for text. OWN0017 has no bootstrap call site
+  and is dropped from the catalog (Q5).
+- **Spelling.** During the transition the native CLI prints each native name together with its
+  bootstrap code, for example `AccessDuringLoan (OWN0011)` (Q7).
 - **Spans:** the primary span is the later conflicting access for OWN0010 and OWN0011, relating
-  the earlier loan (BORROW-004), and the violating use for OWN0019, as in the bootstrap. MIR origins carry these spans already.
+  the earlier loan (BORROW-004), and the violating use for OWN0019, as in the bootstrap. Typed-node
+  origins carry these spans already. Answers store them relative to the declaration (Q2).
 - **Parity is measured differentially**, on code, primary span and module, over the bootstrap's
   expected-diagnostic programs: the ownership and lifetime cases in `test/support/corpus.ts`, plus
   a new invalid-ownership set covering every code in §1.1. The selfhost runner has no
@@ -290,7 +329,7 @@ Under the AGENTS.md cost rules:
 
 - **Structural cases first.** Each rule gets source cases in an existing `Semantic*Cases` file
   (`SemanticCaptureCases` for captures, `BorrowFieldCases` for places). They build one analysis per
-  source program and assert the `BorrowCheck` answer, rejection codes and spans with the existing
+  source program and assert the `Body` checking answer, rejection codes and spans with the existing
   `SemanticCaseSupport` helpers, never message text. A dedicated `BorrowCheckCases` root, as its own
   CI shard, is added only once the existing shards would exceed their time budget. Every test stays
   under 1 s, and the target is 500 ms.
@@ -310,79 +349,79 @@ Baseline: N0 builds N1 in about 384 s (Linux CI) or 348 s (macOS), of which abou
 front end. Peak RSS is 5.0 GiB on Linux. The self-build emits about 18,000 bodies. There are fewer
 units than that, because instances share a unit.
 
-Budget: the borrow stage, including checking MIR, adds at most **10% of front-end time (about 30 s)
-and 0.5 GiB peak RSS** to the self-build. That is about 1.6 ms per emitted body on average, and more
-per unit.
+Budget: the borrow stage adds at most **10% of front-end time (about 30 s) and 0.5 GiB peak RSS**
+to the self-build. That is about 1.6 ms per emitted body on average, and more per unit.
 
 How it stays within budget:
 
-- **Scalar fast path.** A unit with no loans, no reference-typed locals and no obligations (today's
-  `FullyChecked`) answers `Checked` without lowering checking MIR.
-- **Interned region and loan identities.** Regions, loans and places are ordinals within the unit.
+- **Scalar fast path.** A body with no loans, no reference-typed locals and no obligations (today's
+  `FullyChecked`) answers `Checked` without building a graph.
+- **No second lowering.** Checking reads the typed body that typing just built; generic bodies need
+  no symbolic MIR.
+- **Interned region and loan identities.** Regions, loans and places are ordinals within the body.
   Nothing compares identities by bytes: the front-end profile attributes about 30% of self time to
   byte identity comparison, and the checker must not add to it.
 - **Sparse dataflow.** Only locals that hold or are borrowed by a loan get liveness bitsets. Point
-  sets are bitsets over the unit's location count.
-- **Shared lowering.** For a non-generic unit, checking MIR and emission MIR come from the same
-  lowering of the same typed body. A later optimization can share the answer when they coincide.
-  The budget does not assume it.
-- **Per-slice measurement.** Each slice records the borrow stage's time and RSS on the self-build
-  in its PR. A slice that exceeds its share of the budget is fixed before the next one lands.
+  sets are bitsets over the body's evaluation points.
+- **Measured with recording off.** Each slice records the borrow stage's time and RSS on the
+  self-build in its PR, measured on a one-shot build, so the stage is not charged for revision
+  bookkeeping that v2 removes. A slice that exceeds its share of the budget is fixed before the next
+  one lands.
 
 ## 10. Implementation plan
 
 Each slice is one reviewable PR on `selfhost` (guarded inputs go to `main` first), keeps the
-self-build green, and leaves the unchecked count no higher than before.
+self-build green, and never raises the unchecked count. The differential oracle is the
+bootstrap's ownership checker on the corpus and the Cases roots: once a slice lands, a program the
+bootstrap rejects for a rule that slice covers must not compile natively. A program the reference
+rejects is never accepted.
 
-1. **Plumbing and counting.**
-   - Add the `BorrowCheck` family answering `NotChecked{awaiting}` for every unit.
-   - Make `safetyChecked` read it, and add the per-reason breakdown to `SILK_GAP borrow-check`.
-   - No behavior change; the count is unchanged.
-2. **Checking MIR for non-generic units.**
-   - Add `InstanceKey.Abstract` for units without parameters or selections, `StorageLive`/
-     `StorageDead`, the region side table and explicit loans for `Ref`/`AddressOf`.
-   - Extend the opt-in MIR check to validate markers and side-table consistency.
-3. **Loans and conflicts** (OWN0010, OWN0011, BORROW-001 to BORROW-005, BORROW-007).
-   - Non-generic units without captures, Effects or local sharing become `Checked`.
-   - The scalar fast path lands here.
-4. **Regions and OWN0019.**
-   - Add universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
+1. **Loans and conflicts in plain bodies.** The smallest slice that rejects a real class of unsafe
+   programs.
+   - The checking answer inside the `Body` result, `borrowStatus()` reading it, the per-reason
+     breakdown in `SILK_GAP borrow-check`, and CI failing on an increase.
+   - The evaluation graph, places and loans of §3 for non-generic, non-selected bodies without
+     captures, Effects or local sharing, plus the scalar fast path.
+   - OWN0010 and OWN0011 (BORROW-001 to BORROW-005, BORROW-007, CALL-001), with structured cases
+     asserting codes and spans. Every other body answers `NotChecked{reason}`.
+2. **Regions and OWN0019.**
+   - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
-5. **Abstract generic units.** `Callee.Bound`, symbolic types, abstract drops.
-6. **Selected static units**, per interned selection, including type-specific ones.
-7. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
+3. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
+   through the per-declaration summaries of v2 P5(a); this slice adds the summary for whatever it
+   needs if v2 has not landed it yet.
+4. **Selected static bodies**, per interned selection, including type-specific ones.
+5. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
    EFFECT-OWN-002, provider loans).
-8. **Local sharing** (OWN0016). Suspension stays a named reason until suspension MIR lands.
-9. **Parity and closure.**
+6. **Local sharing** (OWN0016). Suspension stays a named reason until suspension lowering lands.
+7. **Parity and closure.**
    - Expected-diagnostic corpus mode (`main` first), the invalid-ownership set, zero unchecked on
      the self-build.
    - The gap becomes an error.
    - Retire `BorrowStatus.NotChecked` and the `borrow-check` gap code.
 
-Slices 5 to 8 are independent once slice 4 lands, and can run in parallel lanes.
+Slices 3 to 6 are independent once slice 2 lands, and can run in parallel lanes. None depends on a
+v2 slice: the checker uses today's `Body` key and the v2 slices attach their edges to it later.
 
-## 11. Open questions for Julia
+## 11. Decisions
 
-1. **Unit of checking IR.** #567 and the MIR note settle on MIR. The largest new piece is
-   `Mir(Abstract)` for generic bodies, meaning MIR with symbolic types, bound calls and abstract
-   drops. The bootstrap checks typed TIR instead. Is MIR still the choice, given that cost? This
-   note assumes yes.
-2. **Span parity.** Is code plus primary-span parity on the differential corpus the right bar? Or
-   is code parity enough, with spans checked against the reference where the two compilers anchor
-   differently?
-3. **Two-phase borrows.** The bootstrap has none, and BORROW-004 says a later argument cannot
-   access an owner an earlier argument borrowed exclusively, so `Vector.append(&mut v, f(&v))` is
-   rejected. This note keeps that. Confirm that no two-phase relaxation is planned.
-4. **One owner for move rules.** The native move-side checks live in typing and
-   `CaptureAvailability`. Green-field suggests moving them into the borrow stage over MIR in a late
-   slice, so one stage owns ownership. Or should they stay in typing?
-5. **OWN0017 and OWN0020.** OWN0017 has no bootstrap call site. Should it be dropped from the
-   catalog? Is OWN0020 in scope for step 14, or deferred with suspension MIR?
-6. **When the gap becomes an error.** This note proposes making it an error only at zero on the
-   self-build (slice 9). Should CI instead fail on any increase from earlier slices?
-7. **Diagnostic spelling.** Should the native CLI print bootstrap codes (`OWN0011`) instead of, or
-   next to, `RejectionCode` names, so the generated catalog covers both compilers?
-8. **Region-sensitive applications.** This note argues that no instance is re-checked (§2). Is that
-   argument accepted, or should region-sensitive instances be re-checked defensively until it is
-   proved by a test?
+Julia decided the open questions in the joint review with #1433 (2026-10-11):
+
+1. **Unit of checking IR.** The typed body, inside the `Body` unit (v2 option S1). No checking MIR.
+2. **Span parity.** Code plus primary-span parity on the differential corpus. Answers store spans
+   relative to their declaration, so parity compares rendered spans.
+3. **Two-phase borrows.** None. BORROW-004 stays as written: `Vector.append(&mut v, f(&v))` is
+   rejected.
+4. **One owner for move rules.** Move and initialization checks stay in typing; loan and region
+   checks run after typing in the same `Body` unit. One unit and one key own both, so one body edit
+   reruns both and nothing else.
+5. **OWN0017 and OWN0020.** OWN0017 is dropped from the catalog; it has no bootstrap call site.
+   OWN0020 waits for suspension lowering and is a named gap until then.
+6. **When the gap becomes an error.** CI fails on any increase of the unchecked count from the
+   first slice; the gap becomes a hard error at zero on the self-build.
+7. **Diagnostic spelling.** During the transition the native CLI prints native names together with
+   bootstrap codes.
+8. **Region-sensitive applications.** No instance is re-checked: instances are never checking
+   units. The accepted v2 proposal P3(a) also removes lifetime-selective heads, so region-sensitive
+   applications disappear.
