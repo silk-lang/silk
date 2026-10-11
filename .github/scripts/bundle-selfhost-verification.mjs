@@ -25,7 +25,7 @@ const result = await build({
         let mode = args.length === 0 ? 'formatter' : undefined
         if (args.length === 2 && args[0] === '--mode') mode = args[1]
         const verification = Effect.gen(function* () {
-          if (mode === 'formatter') return yield* Verification.runConfigured(process.execPath)
+          if (mode === 'formatter') return yield* Verification.runConfigured()
           if (mode === 'corpus') return yield* CorpusVerification.runConfigured()
           if (mode === 'inventory') return yield* InventoryVerification.runConfigured().pipe(
             Effect.tapError((error) => Console.error(error.message)),

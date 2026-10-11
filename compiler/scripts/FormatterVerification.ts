@@ -9,7 +9,6 @@ import * as Stream from 'effect/Stream'
 import * as ChildProcess from 'effect/unstable/process/ChildProcess'
 import * as ChildProcessSpawner from 'effect/unstable/process/ChildProcessSpawner'
 import * as Intrinsic from '../../packages/compiler/src/Intrinsic.js'
-import * as CorpusVerification from './CorpusVerification.js'
 
 /** Canonical runtime members checked against the consuming selfhost checkout. */
 export const runtimeIntrinsicNames = Intrinsic.inventory()
@@ -19,13 +18,9 @@ export const runtimeIntrinsicNames = Intrinsic.inventory()
 
 export interface FormatterVerification {
   readonly repository: string
-  readonly node: string
-  readonly bootstrap: string
+  /** A native formatter safety gate built by the caller from the consuming checkout. */
   readonly gate: string
-  readonly compiler: string
-  readonly cCompiler: string
   readonly safetyLog: string
-  readonly selected?: ReadonlyArray<string>
 }
 
 export class VerificationError extends Data.TaggedError('FormatterVerificationError')<{
@@ -46,22 +41,17 @@ const capture = Effect.fnUntraced(function* (command: ChildProcess.Command) {
 }, Effect.scoped)
 
 /**
- * Verifies repository formatting without changing the checkout, then rebuilds the compiler and runs
- * the corpus on the committed text, so reported source positions match the authored expectations.
+ * Verifies the intrinsic catalog and repository formatting without changing the checkout. The
+ * corpus has its own modes; this one neither builds a compiler nor runs programs.
  */
 export const run = Effect.fn('FormatterVerification.run')(function* (
   self: FormatterVerification,
 ): Effect.fn.Return<
   void,
-  VerificationError | CorpusVerification.VerificationError | PlatformError.PlatformError,
-  Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+  VerificationError | PlatformError.PlatformError,
+  FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
-  // Corpus construction uses literal whitespace replacements in authored fixtures.
-  // Materialize it once; its runner reads the live stdlib.
-  const corpus = yield* CorpusVerification.materialize()
-  const pins = yield* CorpusVerification.readPins(self, corpus)
   const fs = yield* FileSystem.FileSystem
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const catalog = yield* fs.readFileString(
     `${self.repository}/compiler/src/semantic/IntrinsicCatalog.silk`,
   )
@@ -124,61 +114,21 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
       operation: 'verify repository formatting',
       reason: { _tag: 'InvalidInput' },
     })
-  const rebuilt = yield* spawner.exitCode(
-    ChildProcess.make(
-      self.node,
-      [
-        self.bootstrap,
-        'build',
-        '--manifest-path',
-        'compiler/silk.toml',
-        '--optimization',
-        'release-with-debug',
-      ],
-      { cwd: self.repository, stdout: 'inherit', stderr: 'inherit' },
-    ),
-  )
-  if (rebuilt !== 0)
-    return yield* new VerificationError({
-      message: `Compiler rebuild exited with ${rebuilt}`,
-      operation: 'rebuild compiler',
-      reason: { _tag: 'Exit', code: rebuilt },
-    })
-  yield* CorpusVerification.execute(self, corpus, pins, self.selected)
 })
 
 /** Resolves CI configuration from the repository directory, then runs verification. */
-export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(function* (
-  node: string,
-): Effect.fn.Return<
-  void,
-  | Config.ConfigError
-  | VerificationError
-  | CorpusVerification.VerificationError
-  | PlatformError.PlatformError,
-  Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
-> {
-  const path = yield* Path.Path
-  const repository = path.resolve('.')
-  const temporary = yield* Config.String('RUNNER_TEMP')
-  const compiler = yield* Config.String('SILKC')
-  const bootstrap = yield* Config.String('SILK_BOOTSTRAP')
-  const selection = yield* Config.String('SILK_SELFHOST_CORPUS_CASES').pipe(Config.withDefault(''))
-  const selected = selection
-    .split(',')
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0)
-  return yield* run({
-    repository,
-    node,
-    bootstrap,
-    gate: path.join(
-      repository,
-      'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
-    ),
-    compiler,
-    cCompiler: yield* CorpusVerification.cCompiler,
-    safetyLog: path.join(temporary, 'formatter-safety.log'),
-    ...(selected.length === 0 ? {} : { selected }),
-  })
-})
+export const runConfigured = Effect.fn('FormatterVerification.runConfigured')(
+  function* (): Effect.fn.Return<
+    void,
+    Config.ConfigError | VerificationError | PlatformError.PlatformError,
+    Path.Path | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+  > {
+    const path = yield* Path.Path
+    const temporary = yield* Config.String('RUNNER_TEMP')
+    return yield* run({
+      repository: path.resolve('.'),
+      gate: path.resolve(yield* Config.NonEmptyString('SILK_FORMAT_GATE')),
+      safetyLog: path.join(temporary, 'formatter-safety.log'),
+    })
+  },
+)
