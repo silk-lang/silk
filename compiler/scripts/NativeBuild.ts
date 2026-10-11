@@ -9,7 +9,6 @@ import * as FileSystem from 'effect/FileSystem'
 import type { PlatformError } from 'effect/PlatformError'
 import * as Schema from 'effect/Schema'
 import * as NativeProcess from './NativeProcess.ts'
-import * as NativeSeed from './NativeSeed.mjs'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
 
 export class NativeBuildError extends Data.TaggedError('NativeBuildError')<{
@@ -19,7 +18,7 @@ export class NativeBuildError extends Data.TaggedError('NativeBuildError')<{
 }> {}
 type SnapshotReceipt = Schema.Schema.Type<typeof SourceSnapshot.InputSnapshotSchema>
 interface Generation {
-  generation: 'N0' | 'N1'
+  generation: string
   path: string
   sha256: string | null
 }
@@ -29,17 +28,12 @@ export interface BuildReceipt {
   failure: { stage: string; message: string } | null
   target: string
   profile: { optimization: string; debug: boolean }
-  seed: Generation
+  producer: Generation
   linker: {
     requestedPath: string
     path: string
     sha256: string
     version: string
-    expected: { sha256: string; version: string }
-    matchesSeed: boolean
-    seedReceiptSha256: string
-    seedProfile: Schema.Schema.Type<typeof NativeSeed.SeedSchema>['profile']
-    linkProfile: { target: string; optimization: string; debug: boolean }
     environmentPolicy: 'standard-host-with-verified-clang'
   } | null
   output: Generation
@@ -60,11 +54,16 @@ export interface BuildReceipt {
     expectedStdout: ''
     outputSha256?: string
   } | null
+  /** Both generations emit the compiler's LLVM IR; a self-hosting chain requires equal bytes. */
+  fixpoint: { producerIrSha256: string | null; outputIrSha256: string | null } | null
   stages: (NativeProcess.Measurement & { readonly name: string })[]
 }
 export interface BuildOptions {
-  readonly seed: string
-  readonly seedReceipt: string
+  /** The compiler that builds the next generation; it must match `producerSha256` exactly. */
+  readonly producer: string
+  readonly producerSha256: string
+  readonly producerGeneration: string
+  readonly generation: string
   readonly clang: string
   readonly environment?: Readonly<Record<string, string | undefined>> | undefined
   readonly snapshot: string
@@ -72,6 +71,7 @@ export interface BuildOptions {
   readonly corpusSource?: string | undefined
   readonly optimization?: string | undefined
   readonly debug?: boolean | undefined
+  readonly fixpoint?: boolean | undefined
   readonly timeCommand?: string | undefined
   readonly timeoutMs?: number | undefined
 }
@@ -139,7 +139,7 @@ const executableHash = Effect.fnUntraced(function* (path: string, immutable: boo
   if (!stat.isFile() || (stat.mode & 0o111) === 0)
     return yield* reject(`expected a regular executable, without symlinks: ${path}`)
   if (immutable && (stat.mode & 0o222) !== 0)
-    return yield* reject(`native seed must have no write permission bits: ${path}`)
+    return yield* reject(`producer compiler must have no write permission bits: ${path}`)
   return yield* fileHash(path)
 })
 
@@ -166,10 +166,17 @@ const hostTarget = Effect.fnUntraced(function* () {
   return process.arch === 'arm64' ? 'aarch64-unknown-linux-gnu' : 'x86_64-unknown-linux-gnu'
 })
 
-/** One N0 build in a fresh directory, then only N1 may produce the smoke executable. */
+/**
+ * One producer build of the next generation in a fresh directory. Only the new generation may
+ * produce the smoke executable. With `fixpoint`, the producer and the new generation each emit the
+ * compiler's LLVM IR and the bytes must be identical; the producer's emission runs beside the
+ * build.
+ */
 export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
-  seed,
-  seedReceipt,
+  producer,
+  producerSha256,
+  producerGeneration,
+  generation,
   clang,
   environment = process.env,
   snapshot,
@@ -179,6 +186,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   ),
   optimization = 'speed',
   debug = false,
+  fixpoint = false,
   timeCommand = '/usr/bin/time',
   timeoutMs,
 }: BuildOptions): Effect.fn.Return<
@@ -187,8 +195,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   FileSystem.FileSystem
 > {
   const fs = yield* FileSystem.FileSystem
-  seed = resolve(seed)
-  seedReceipt = resolve(seedReceipt)
+  producer = resolve(producer)
   clang = resolve(clang)
   environment = nativeEnvironment(environment, clang)
   snapshot = resolve(snapshot)
@@ -197,11 +204,15 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   if (
     within(snapshot, outputDirectory) ||
     within(outputDirectory, snapshot) ||
-    within(outputDirectory, seed)
+    within(outputDirectory, producer)
   )
     return yield* reject('output directory must be separate from the immutable inputs')
   if (!['none', 'speed'].includes(optimization) || typeof debug !== 'boolean')
     return yield* reject('invalid native build profile')
+  if (!/^[a-f0-9]{64}$/.test(producerSha256))
+    return yield* reject('producer SHA-256 must be 64 lowercase hex digits')
+  if (!/^[A-Za-z0-9-]+$/.test(generation) || generation === producerGeneration)
+    return yield* reject('generation names must be distinct path-safe labels')
   yield* NativeProcess.validateTimeout(timeoutMs).pipe(
     Effect.mapError(
       (error) => new NativeBuildError({ message: error.message, reason: 'RejectedInput' }),
@@ -217,65 +228,48 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     failure: null,
     target,
     profile: { optimization, debug },
-    seed: { generation: 'N0', path: seed, sha256: null },
+    producer: { generation: producerGeneration, path: producer, sha256: null },
     linker: null,
     inputs: null,
-    output: { generation: 'N1', path: join(outputDirectory, 'N1'), sha256: null },
+    output: { generation, path: join(outputDirectory, generation), sha256: null },
     smoke: null,
+    fixpoint: fixpoint ? { producerIrSha256: null, outputIrSha256: null } : null,
     stages: [],
   }
-  let currentStage = 'inputs'
-  const work = Effect.gen(function* () {
-    receipt.seed.sha256 = yield* executableHash(seed, true)
-    const manifest = yield* SourceSnapshot.verifySnapshot({ directory: snapshot })
-    const compilerFiles = manifest.files.filter((file) => file.path.startsWith('compiler/'))
-    const stdlibFiles = manifest.files.filter((file) =>
-      file.path.startsWith('packages/compiler/stdlib/'),
-    )
-    if (compilerFiles.length === 0 || stdlibFiles.length === 0)
-      return yield* reject('snapshot must account for compiler and standard-library inputs')
-    receipt.inputs = {
-      directory: snapshot,
-      sourceCommit: manifest.sourceCommit,
-      normalizedDigest: manifest.normalizedDigest,
-      archiveSha256: manifest.archiveSha256,
-      compiler: { sha256: manifest.compilerDigest, files: compilerFiles },
-      stdlib: { sha256: manifest.stdlibDigest, files: stdlibFiles },
-    }
-    currentStage = 'linker-preflight'
-    const seedReceiptBytes = yield* fs.readFile(seedReceipt)
-    const seedReceiptSha256 = SourceSnapshot.hash(seedReceiptBytes)
-    const producer = yield* Schema.decodeEffect(Schema.fromJsonString(NativeSeed.SeedSchema))(
-      Buffer.from(seedReceiptBytes).toString('utf8'),
-    ).pipe(
-      Effect.mapError(
-        (error) =>
-          new NativeBuildError({
-            message: error.message,
-            reason: 'RejectedInput',
+  // Concurrent stages record the first one that failed, not the last one started.
+  let failedStage: string | null = null
+  const staged =
+    (name: string) =>
+    <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      self.pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            failedStage ??= name
           }),
-      ),
-    )
-    if (
-      producer.stage !== 'N0' ||
-      producer.binary.path !== 'N0' ||
-      producer.binary.mode !== '0555' ||
-      producer.binary.sha256 !== receipt.seed.sha256 ||
-      producer.sourceCommit !== manifest.sourceCommit ||
-      producer.inputSnapshot.archiveSha256 !== manifest.archiveSha256 ||
-      producer.inputSnapshot.normalizedDigest !== manifest.normalizedDigest ||
-      producer.inputSnapshot.compilerDigest !== manifest.compilerDigest ||
-      producer.inputSnapshot.stdlibDigest !== manifest.stdlibDigest ||
-      producer.bootstrap.stdlib.authority !== 'embedded-verified-main' ||
-      producer.bootstrap.stdlib.normalizedDigest !== manifest.stdlibDigest ||
-      producer.profile.target !== target ||
-      producer.profile.name !== 'release-with-debug' ||
-      producer.profile.optimization !== 'speed' ||
-      producer.profile.debug !== true ||
-      !/^[a-f0-9]{64}$/.test(producer.toolchain.clang.sha256) ||
-      producer.toolchain.clang.version.trim() === ''
-    )
-      return yield* reject('native seed receipt does not bind these N0/source/tool inputs')
+        ),
+      )
+  const work = Effect.gen(function* () {
+    const manifest = yield* Effect.gen(function* () {
+      receipt.producer.sha256 = yield* executableHash(producer, true)
+      if (receipt.producer.sha256 !== producerSha256)
+        return yield* reject(`${producerGeneration} SHA-256 differs from its verified identity`)
+      const manifest = yield* SourceSnapshot.verifySnapshot({ directory: snapshot })
+      const compilerFiles = manifest.files.filter((file) => file.path.startsWith('compiler/'))
+      const stdlibFiles = manifest.files.filter((file) =>
+        file.path.startsWith('packages/compiler/stdlib/'),
+      )
+      if (compilerFiles.length === 0 || stdlibFiles.length === 0)
+        return yield* reject('snapshot must account for compiler and standard-library inputs')
+      receipt.inputs = {
+        directory: snapshot,
+        sourceCommit: manifest.sourceCommit,
+        normalizedDigest: manifest.normalizedDigest,
+        archiveSha256: manifest.archiveSha256,
+        compiler: { sha256: manifest.compilerDigest, files: compilerFiles },
+        stdlib: { sha256: manifest.stdlibDigest, files: stdlibFiles },
+      }
+      return manifest
+    }).pipe(staged('inputs'))
     const inspectClang = Effect.fnUntraced(function* () {
       const path = yield* fs.realPath(clang)
       const info = yield* fs.stat(path)
@@ -302,37 +296,27 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject('clang changed while reading its identity')
       return { path, sha256, version }
     })
-    const tool = yield* inspectClang()
+    const tool = yield* inspectClang().pipe(staged('linker-preflight'))
     receipt.linker = {
       requestedPath: clang,
       ...tool,
-      expected: producer.toolchain.clang,
-      matchesSeed:
-        tool.sha256 === producer.toolchain.clang.sha256 &&
-        tool.version === producer.toolchain.clang.version,
-      seedReceiptSha256,
-      seedProfile: producer.profile,
-      linkProfile: { target, optimization, debug },
       environmentPolicy: 'standard-host-with-verified-clang',
     }
-    if (!receipt.linker.matchesSeed)
-      return yield* reject('clang SHA256/version differs from N0 seed toolchain')
     const env = nativeEnvironment(environment, tool.path)
-    const program = yield* smokeProgram(corpusSource)
-    receipt.smoke = {
+    const program = yield* smokeProgram(corpusSource).pipe(staged('inputs'))
+    const smoke = {
       name: 'trivial-features',
       corpusSource,
       corpusSha256: program.corpusSha256,
       sourceSha256: program.sha256,
       expectedExitCode: 42,
       expectedStdout: '',
-    }
+    } as const
+    receipt.smoke = { ...smoke }
     const checkInputs = Effect.fnUntraced(function* () {
-      if ((yield* executableHash(seed, true)) !== receipt.seed.sha256)
-        return yield* reject('N0 changed during native build/smoke')
+      if ((yield* executableHash(producer, true)) !== producerSha256)
+        return yield* reject(`${producerGeneration} changed during native build/smoke`)
       yield* SourceSnapshot.verifySnapshot({ directory: snapshot, receipt: manifest })
-      if ((yield* fileHash(seedReceipt)) !== seedReceiptSha256)
-        return yield* reject('N0 seed receipt changed during native build/smoke')
       const current = yield* inspectClang()
       if (
         current.path !== tool.path ||
@@ -341,57 +325,60 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       )
         return yield* reject('verified clang changed during native build/smoke')
     })
-    const invoke = Effect.fnUntraced(function* (
-      name: string,
-      command: ReadonlyArray<string>,
-      cwd: string,
-    ) {
-      currentStage = name
-      yield* checkInputs()
-      const evidence = yield* NativeProcess.run({
-        command,
-        cwd,
-        resourceFile: join(outputDirectory, `${name}-rss.txt`),
-        timeCommand,
-        env,
-        timeoutMs,
+    const invoke = (name: string, command: ReadonlyArray<string>, cwd: string) =>
+      Effect.gen(function* () {
+        yield* checkInputs()
+        const evidence = yield* NativeProcess.run({
+          command,
+          cwd,
+          resourceFile: join(outputDirectory, `${name}-rss.txt`),
+          timeCommand,
+          env,
+          timeoutMs,
+        })
+        const result = evidence.measurement
+        // Keep actual stage facts even if writing its completed evidence or postflight fails.
+        receipt.stages.push({ name, ...result })
+        yield* fs.writeFile(join(outputDirectory, `${name}-stdout.bin`), evidence.raw.stdout, {
+          flag: 'wx',
+        })
+        yield* fs.writeFile(join(outputDirectory, `${name}-stderr.bin`), evidence.raw.stderr, {
+          flag: 'wx',
+        })
+        const sidecar = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+          deadline: evidence.deadline,
+          resources: {
+            path: evidence.resources.path,
+            present: evidence.resources.bytes !== null,
+            error: evidence.resources.error,
+          },
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new NativeBuildError({ message: cause.message, reason: 'ExternalFailure', cause }),
+          ),
+        )
+        yield* fs.writeFileString(
+          join(outputDirectory, `${name}-process-evidence.json`),
+          `${sidecar}\n`,
+          { flag: 'wx' },
+        )
+        yield* checkInputs()
+        return result
       })
-      const result = evidence.measurement
-      // Keep actual stage facts even if writing its completed evidence or postflight fails.
-      receipt.stages.push({ name, ...result })
-      yield* fs.writeFile(join(outputDirectory, `${name}-stdout.bin`), evidence.raw.stdout, {
-        flag: 'wx',
-      })
-      yield* fs.writeFile(join(outputDirectory, `${name}-stderr.bin`), evidence.raw.stderr, {
-        flag: 'wx',
-      })
-      const sidecar = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
-        deadline: evidence.deadline,
-        resources: {
-          path: evidence.resources.path,
-          present: evidence.resources.bytes !== null,
-          error: evidence.resources.error,
-        },
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new NativeBuildError({ message: cause.message, reason: 'ExternalFailure', cause }),
-        ),
-      )
-      yield* fs.writeFileString(
-        join(outputDirectory, `${name}-process-evidence.json`),
-        `${sidecar}\n`,
-        { flag: 'wx' },
-      )
-      yield* checkInputs()
-      return result
-    })
     const stdlib = join(snapshot, 'packages/compiler/stdlib')
-    const argumentsFor = (source: string, output: string): ReadonlyArray<string> => [
+    const compilerRoot = join(snapshot, 'compiler/src/main.silk')
+    const argumentsFor = (
+      source: string,
+      output: string,
+      emit: 'executable' | 'llvm-ir',
+    ): ReadonlyArray<string> => [
       'build',
       source,
       '-o',
       output,
+      '--emit',
+      emit,
       '--stdlib',
       stdlib,
       '--optimization',
@@ -399,51 +386,90 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       '--debug',
       String(debug),
     ]
-    const built = yield* invoke(
-      'native-build',
-      [seed, ...argumentsFor(join(snapshot, 'compiler/src/main.silk'), receipt.output.path)],
-      join(snapshot, 'compiler'),
-    )
-    if (!NativeProcess.succeeded(built)) return yield* reject('N0 native build failed')
-    receipt.output.sha256 = yield* executableHash(receipt.output.path, false)
-    const seedStat = yield* executableInfo(seed)
-    const outputStat = yield* executableInfo(receipt.output.path)
-    if (seedStat.dev === outputStat.dev && seedStat.ino === outputStat.ino)
-      return yield* reject('N1 must be newly produced, not a hard link to N0')
-    yield* fs.chmod(receipt.output.path, outputStat.mode & ~0o222)
+    const emitIr = (name: string, compiler: string) =>
+      Effect.gen(function* () {
+        const ir = join(outputDirectory, `${name}.ll`)
+        const emitted = yield* invoke(
+          name,
+          [compiler, ...argumentsFor(compilerRoot, ir, 'llvm-ir')],
+          join(snapshot, 'compiler'),
+        )
+        if (!NativeProcess.succeeded(emitted)) return yield* reject(`${name} emission failed`)
+        return yield* fileHash(ir)
+      }).pipe(staged(name))
+    const build = Effect.gen(function* () {
+      const built = yield* invoke(
+        'native-build',
+        [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')],
+        join(snapshot, 'compiler'),
+      )
+      if (!NativeProcess.succeeded(built))
+        return yield* reject(`${producerGeneration} native build failed`)
+      receipt.output.sha256 = yield* executableHash(receipt.output.path, false)
+      const producerStat = yield* executableInfo(producer)
+      const outputStat = yield* executableInfo(receipt.output.path)
+      if (producerStat.dev === outputStat.dev && producerStat.ino === outputStat.ino)
+        return yield* reject(`${generation} must be newly produced, not a hard link`)
+      yield* fs.chmod(receipt.output.path, outputStat.mode & ~0o222)
+    }).pipe(staged('native-build'))
+    const producerIr = `${producerGeneration}-ir`
+    if (receipt.fixpoint) {
+      const [, producerIrSha256] = yield* Effect.all([build, emitIr(producerIr, producer)], {
+        concurrency: 2,
+      })
+      receipt.fixpoint.producerIrSha256 = producerIrSha256
+    } else yield* build
+    const output = receipt.output.path
+    const outputSha256 = receipt.output.sha256 ?? (yield* reject(`${generation} has no identity`))
     const smokeDirectory = join(outputDirectory, 'smoke')
-    yield* fs.makeDirectory(smokeDirectory)
     const smokeSource = join(smokeDirectory, 'main.silk')
     const smokeBinary = join(smokeDirectory, 'program')
-    yield* fs.writeFileString(smokeSource, program.source, { flag: 'wx' })
-    yield* fs.writeFileString(
-      join(smokeDirectory, 'silk.toml'),
-      '[package]\nname = "trivial-features"\nroot = "main.silk"\n',
-      { flag: 'wx' },
-    )
-    const smokeBuilt = yield* invoke(
-      'smoke-build',
-      [receipt.output.path, ...argumentsFor(smokeSource, smokeBinary)],
-      smokeDirectory,
-    )
-    if (!NativeProcess.succeeded(smokeBuilt)) return yield* reject('N1 smoke compilation failed')
-    receipt.smoke.outputSha256 = yield* executableHash(smokeBinary, false)
-    const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory)
-    if (ran.error !== null || ran.signal !== null || ran.exitCode !== 42 || ran.stdout !== '')
-      return yield* reject('trivial-features exit/stdout mismatch')
-    if ((yield* executableHash(receipt.output.path, true)) !== receipt.output.sha256)
-      return yield* reject('N1 changed during smoke')
-    if (
-      (yield* fileHash(smokeSource)) !== receipt.smoke.sourceSha256 ||
-      (yield* fileHash(smokeBinary)) !== receipt.smoke.outputSha256
-    )
-      return yield* reject('smoke input/output changed during execution')
+    const smokeOutput = yield* Effect.gen(function* () {
+      yield* fs.makeDirectory(smokeDirectory)
+      yield* fs.writeFileString(smokeSource, program.source, { flag: 'wx' })
+      yield* fs.writeFileString(
+        join(smokeDirectory, 'silk.toml'),
+        '[package]\nname = "trivial-features"\nroot = "main.silk"\n',
+        { flag: 'wx' },
+      )
+      const smokeBuilt = yield* invoke(
+        'smoke-build',
+        [output, ...argumentsFor(smokeSource, smokeBinary, 'executable')],
+        smokeDirectory,
+      )
+      if (!NativeProcess.succeeded(smokeBuilt))
+        return yield* reject(`${generation} smoke compilation failed`)
+      return yield* executableHash(smokeBinary, false)
+    }).pipe(staged('smoke-build'))
+    receipt.smoke = { ...smoke, outputSha256: smokeOutput }
+    yield* Effect.gen(function* () {
+      const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory)
+      if (ran.error !== null || ran.signal !== null || ran.exitCode !== 42 || ran.stdout !== '')
+        return yield* reject('trivial-features exit/stdout mismatch')
+      if ((yield* executableHash(output, true)) !== outputSha256)
+        return yield* reject(`${generation} changed during smoke`)
+      if (
+        (yield* fileHash(smokeSource)) !== smoke.sourceSha256 ||
+        (yield* fileHash(smokeBinary)) !== smokeOutput
+      )
+        return yield* reject('smoke input/output changed during execution')
+    }).pipe(staged('smoke-run'))
+    if (receipt.fixpoint) {
+      const outputIrSha256 = yield* emitIr(`${generation}-ir`, output)
+      receipt.fixpoint.outputIrSha256 = outputIrSha256
+      if (outputIrSha256 !== receipt.fixpoint.producerIrSha256)
+        return yield* reject(
+          `${producerGeneration} and ${generation} emitted different compiler LLVM IR`,
+        ).pipe(staged('fixpoint'))
+      if ((yield* executableHash(output, true)) !== outputSha256)
+        return yield* reject(`${generation} changed during IR emission`).pipe(staged('fixpoint'))
+    }
     receipt.status = 'passed'
   })
   yield* work.pipe(
     Effect.catch((error) =>
       Effect.sync(() => {
-        receipt.failure = { stage: currentStage, message: error.message }
+        receipt.failure = { stage: failedStage ?? 'inputs', message: error.message }
       }),
     ),
   )
@@ -452,13 +478,18 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
 })
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const usage =
+    'usage: node compiler/scripts/NativeBuild.ts --producer /immutable/compiler --producer-sha256 <hex> --producer-generation seed --generation N1 [--fixpoint] --clang /verified/clang --snapshot /snapshot --output /fresh/run'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
         parseArgs({
           options: {
-            seed: { type: 'string' },
-            'seed-receipt': { type: 'string' },
+            producer: { type: 'string' },
+            'producer-sha256': { type: 'string' },
+            'producer-generation': { type: 'string' },
+            generation: { type: 'string' },
+            fixpoint: { type: 'boolean', default: false },
             clang: { type: 'string' },
             snapshot: { type: 'string' },
             output: { type: 'string' },
@@ -477,18 +508,21 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         }),
     })
     if (
-      !values.seed ||
-      !values['seed-receipt'] ||
+      !values.producer ||
+      !values['producer-sha256'] ||
+      !values['producer-generation'] ||
+      !values.generation ||
       !values.clang ||
       !values.snapshot ||
       !values.output
     )
-      return yield* reject(
-        'usage: node compiler/scripts/NativeBuild.ts --seed /immutable/N0 --seed-receipt /immutable/seed-receipt.json --clang /verified/clang --snapshot /snapshot --output /fresh/run',
-      )
+      return yield* reject(usage)
     const receipt = yield* buildAndSmoke({
-      seed: values.seed,
-      seedReceipt: values['seed-receipt'],
+      producer: values.producer,
+      producerSha256: values['producer-sha256'],
+      producerGeneration: values['producer-generation'],
+      generation: values.generation,
+      fixpoint: values.fixpoint,
       clang: values.clang,
       snapshot: values.snapshot,
       outputDirectory: values.output,

@@ -242,24 +242,23 @@ Per AGENTS.md, claims are proven at the cheapest tier:
 
 ## CI
 
-The `cases` matrix gains a `native` flag per shard. A native shard needs the N1 executable from the
-`native-self-build` job's `selfhost-native-build` artifact and runs:
+Native shards live in their own `native-cases` matrix. A native shard installs the verified N1
+from the `native-n1` job's `selfhost-native-n1` artifact, the compiler the pinned seed builds from
+the checkout, and runs:
 
 ```sh
-"$SILKC" test "$PWD/compiler/src/<root>" --stdlib "$PWD/packages/compiler/stdlib" \
-  --optimization speed --no-cache | tee "$log"
+"$SILKC" test "$PWD/compiler/src/<root>" -o "$RUNNER_TEMP/<name>-tests" \
+  --stdlib "$PWD/packages/compiler/stdlib" --optimization speed --no-cache | tee "$log"
 node .github/scripts/check-selfhost-test-times.mjs "$log"
 ```
 
 Paths are absolute because the native CLI refuses non-normalized paths. Bootstrap shards keep the
-existing step. The timing guard runs on both.
+existing `cases` step. The timing guard runs on both. `Focused Linux Silk` and the seed candidate
+publication both require `native-cases`.
 
 The switch goes shard by shard, cheapest first: `format-m1-hir` (about 3 minutes on the bootstrap),
-then `target`, `callable`, and the six semantic shards. For each switched shard the PR shows the
-bootstrap and native logs side by side: the same names in the same order, the same PASS/FAIL per
-test, the same summary counts. The shard's first native run executes on the PR as well as on the
-push, so the comparison is on the PR's own head. Once every shard is native, the bootstrap step and
-the `download-bootstrap` step leave the `cases` job.
-
-The CI change is kept to the `cases` job so it rebases cleanly onto the seed-chain work that
-replaces N0 with a pinned native seed: only the artifact name the job downloads would change.
+then `target`, `callable`, and the six semantic shards. A shard moves by leaving the `cases` matrix
+for the `native-cases` matrix. For each switched shard the PR shows the bootstrap and native logs
+side by side: the same names in the same order, the same PASS/FAIL per test, the same summary
+counts. Native shards run on pull requests as well as pushes, so the comparison is on the PR's own
+head. Once every shard is native, the `cases` job and its `download-bootstrap` step are deleted.
