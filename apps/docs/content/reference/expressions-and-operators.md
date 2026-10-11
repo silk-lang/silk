@@ -702,7 +702,7 @@ interface Multiply<Right, Output> {
 
 At least one operand of an operator operation has type `Self`, `&Self`, or `&mut Self`. That
 operand is how an operator use finds the operation: the provider of every candidate conformance is
-one of the operand types.
+one of the operand types, and the conformance is declared in that type's own module.
 
 `operator *` grants this operation permission to participate in `*` selection. Everything after
 that eligibility check is ordinary interface machinery: complete parameter and result types,
@@ -734,13 +734,19 @@ These contracts permit `Vector * f64 -> Vector`, `Vector * Vector -> f64`, `Matr
 Vector`, and `Matrix * Matrix -> Matrix`. The types shown are ordinary library types; they need not
 become compiler-built-in merely to use mathematical notation.
 
-Operator selection uses the precise operand types and only their conformances. For each operand,
-it reads the conformances whose provider is that operand's type, seen through one reference, and
-whose interface marks an operation with the operator. Conformances of other types, and operator
-interfaces that no operand type implements, are never consulted, so importing a module or adding an
-operator interface elsewhere cannot change which operation an existing use selects. Selection does
-not use the expected result type, perform implicit conversion, inspect runtime tags, or choose by
-import order. Exactly one operation must match. Its declared result becomes the expression's type.
+Operator selection uses the precise operand types and only their own conformances. For each
+nominal operand type, seen through one reference, it reads the conformances that the type's
+declaring module provides for that type and whose interface marks an operation with the operator.
+A generic operand instead uses the operator operations of its declared bounds. Scalar and string
+operands use only the built-in operators. No other module, imported interface, or conformance is
+consulted, so importing a module or adding an operator interface elsewhere cannot change which
+operation an existing use selects. Selection does not use the expected result type, perform implicit
+conversion, inspect runtime tags, or choose by import order. Exactly one operation must match. Its
+declared result becomes the expression's type.
+
+A conformance that an interface's module declares for a foreign provider (IMPL-004) remains a
+complete conformance for bounds and named calls such as `Multiply.multiply(left, right)`, but it
+does not supply operator syntax.
 
 The mapped actor operation remains available independently of the operator:
 
@@ -781,7 +787,8 @@ contract is selected.
 
 **Current compiler:** Aligned. Generic bounds and concrete conformances use the same explicit
 marker, applied interface contract, and static witness selection. Concrete selection examines only
-the conformance buckets of the operand types. Operation spelling has no role in eligibility.
+the conformances that the operand types' own modules declare for them. Operation spelling has no
+role in eligibility.
 
 **Evidence:** [complete interface contracts](../../../../openspec/specs/bootstrap-complete-interface-contracts/spec.md),
 [static conformance specialization](../../../../openspec/specs/bootstrap-conditional-interface-conformance/spec.md),

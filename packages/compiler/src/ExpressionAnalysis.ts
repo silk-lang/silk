@@ -6901,20 +6901,10 @@ export const boundOperatorSelections = (
   )
 
 /**
- * The conformance bucket one operand type selects from: its nominal owner, or the scalar or string
- * type itself, seen through one reference. Other operand types own no conformance.
- */
-const operandOwner = (type: SemanticType): string | undefined => {
-  const operand = Type.isReference(type) ? type.target : type
-  if (typeof operand === 'string') return operand
-  if (Type.isString(operand)) return 'string'
-  return Type.isNominal(operand) ? `${operand.module}\u0000${operand.name}` : undefined
-}
-
-/**
- * Collects the concrete conformances an operator use may select (OP-009). Every operator
- * operation has a `Self` operand, so only the buckets of the operand types' owners can supply a
- * match. A conformance outside those buckets is never proved or offered.
+ * Collects the concrete conformances an operator use may select (OP-009): those the module of a
+ * nominal operand type, seen through one reference, declares for that type. Every operator
+ * operation has a `Self` operand, so the provider of any match is an operand type. Scalar and string
+ * operands own no bucket, and no other module or imported interface is examined.
  */
 export const concreteOperatorSelections = (
   index: DeclarationIndex.Index,
@@ -6922,47 +6912,63 @@ export const concreteOperatorSelections = (
   operator: Operator.Eligible,
   operands: ReadonlyArray<SemanticType>,
 ): ReadonlyArray<OperatorContractSelection> => {
-  const owners = new Set(operands.flatMap((operand) => operandOwner(operand) ?? []))
+  const owners = operands.flatMap((operand) => {
+    const owner = Type.isReference(operand) ? operand.target : operand
+    return Type.isNominal(owner) ? [owner] : []
+  })
+  const ownerModules = new Set(owners.map((owner) => owner.module))
   const interfaces = index.modules.flatMap((headers) => headers.interfaces)
   const selections = index.modules.flatMap((headers) =>
-    headers.conformances.flatMap((conformance) => {
-      if (
-        conformance.validity._tag !== 'ValidConformance' ||
-        conformance.coherence._tag !== 'Coherent' ||
-        conformance.termination._tag !== 'Terminating' ||
-        conformance.capability._tag !== 'Resolved' ||
-        conformance.provider._tag !== 'Resolved' ||
-        !Type.isNominal(conformance.capability.type)
-      )
-        return []
-      const capability = conformance.capability.type
-      const provider = conformance.provider.type
-      const providerOwner = operandOwner(provider)
-      if (providerOwner === undefined || !owners.has(providerOwner)) return []
-      const interface_ = interfaces.find(
-        (candidate) =>
-          candidate.canonical._tag === 'Canonical' &&
-          candidate.canonical.id.module === capability.module &&
-          candidate.canonical.id.name === capability.name &&
-          (candidate.visibility === 'Public' || candidate.canonical.id.module === module),
-      )
-      if (interface_ === undefined) return []
-      const proof = ConformanceProof.prove(index, provider, capability)
-      if (
-        proof._tag !== 'Proved' ||
-        proof.selection._tag !== 'SourceSelection' ||
-        proof.selection.module !== conformance.module ||
-        proof.selection.ordinal !== conformance.ordinal
-      )
-        return []
-      const application = DeclarationFacts.interfaceApplication(interface_, capability, provider)
-      if (application?.available !== true) return []
-      return application.operations.flatMap((operation) => {
-        if (operation.declaration.operator?.operator !== operator) return []
-        const selected = operatorContractSelection(capability, provider, operation)
-        return selected === undefined ? [] : [selected]
-      })
-    }),
+    !ownerModules.has(headers.module)
+      ? []
+      : headers.conformances.flatMap((conformance) => {
+          if (
+            conformance.validity._tag !== 'ValidConformance' ||
+            conformance.coherence._tag !== 'Coherent' ||
+            conformance.termination._tag !== 'Terminating' ||
+            conformance.capability._tag !== 'Resolved' ||
+            conformance.provider._tag !== 'Resolved' ||
+            !Type.isNominal(conformance.capability.type)
+          )
+            return []
+          const capability = conformance.capability.type
+          const provider = conformance.provider.type
+          if (
+            !Type.isNominal(provider) ||
+            provider.module !== headers.module ||
+            !owners.some(
+              (owner) => owner.module === provider.module && owner.name === provider.name,
+            )
+          )
+            return []
+          const interface_ = interfaces.find(
+            (candidate) =>
+              candidate.canonical._tag === 'Canonical' &&
+              candidate.canonical.id.module === capability.module &&
+              candidate.canonical.id.name === capability.name &&
+              (candidate.visibility === 'Public' || candidate.canonical.id.module === module),
+          )
+          if (interface_ === undefined) return []
+          const proof = ConformanceProof.prove(index, provider, capability)
+          if (
+            proof._tag !== 'Proved' ||
+            proof.selection._tag !== 'SourceSelection' ||
+            proof.selection.module !== conformance.module ||
+            proof.selection.ordinal !== conformance.ordinal
+          )
+            return []
+          const application = DeclarationFacts.interfaceApplication(
+            interface_,
+            capability,
+            provider,
+          )
+          if (application?.available !== true) return []
+          return application.operations.flatMap((operation) => {
+            if (operation.declaration.operator?.operator !== operator) return []
+            const selected = operatorContractSelection(capability, provider, operation)
+            return selected === undefined ? [] : [selected]
+          })
+        }),
   )
   const unique = new Map<string, OperatorContractSelection>()
   for (const selection of selections)
