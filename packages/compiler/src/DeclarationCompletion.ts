@@ -1317,15 +1317,23 @@ export const complete = (
         ).includes(module.module)
       )
         return { ...conformance, head }
-      const regionSelection = ConformanceHead.regionSelection(
-        conformance.capability.type,
-        conformance.provider.type,
-        conformance.typeParameters.flatMap((parameter) =>
-          (parameter.lifetimeBounds?.length ?? 0) > 0 && parameter.name._tag === 'Present'
-            ? [parameter.name.spelling]
-            : [],
-        ),
-      )
+      // Lifetimes never decide which code runs: a sealed Drop or Copy head is selected per type
+      // during lowering, with no typing proof behind it, so it may not depend on regions.
+      // Conformance heads may: coherence erases lifetimes and typing proves their relations.
+      const sealed =
+        Type.equals(conformance.capability.type, Type.dropCapability) ||
+        Type.equals(conformance.capability.type, Type.copyCapability)
+      const regionSelection = !sealed
+        ? undefined
+        : ConformanceHead.regionSelection(
+            conformance.capability.type,
+            conformance.provider.type,
+            conformance.typeParameters.flatMap((parameter) =>
+              (parameter.lifetimeBounds?.length ?? 0) > 0 && parameter.name._tag === 'Present'
+                ? [parameter.name.spelling]
+                : [],
+            ),
+          )
       if (regionSelection !== undefined)
         diagnostics.push(
           Diagnostic.regionSelectiveConformance(

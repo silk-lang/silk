@@ -441,7 +441,7 @@ export const unsatisfiedTypeOutlivesCode = 'SEM0213' as const
 export const invalidTestDeclarationCode = 'SEM0218' as const
 /** Emitted code references a function instance whose valid body native lowering does not support yet. */
 export const unsupportedLoweringCode = 'SEM0219' as const
-/** A conformance head names `'static`, repeats one region, or bounds a region. */
+/** A sealed Drop or Copy head names `'static`, repeats one region, or bounds a region. */
 export const regionSelectiveConformanceCode = 'SEM0220' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
@@ -4733,10 +4733,10 @@ export const nonTerminatingConformance = <L>(
 })
 
 /**
- * Creates the diagnostic for a conformance head that would select its witness by region.
+ * Creates the diagnostic for a sealed Drop or Copy head that would select by region.
  *
- * Lifetimes select no code: every region pattern of a goal must reach the same witness, so a head
- * may give each region position its own binder and nothing more.
+ * Lifetimes never decide which code runs: every region pattern of a type must run the same cleanup
+ * and copy, so a sealed head gives each region position its own unbounded binder.
  */
 export const regionSelectiveConformance = <L>(
   head: string,
@@ -4751,7 +4751,7 @@ export const regionSelectiveConformance = <L>(
   reason: { _tag: 'RegionSelectiveConformance' as const, head, selection },
   span,
   notes: [
-    'A conformance head gives every region position its own unbounded binder, because lifetimes never select a witness.',
+    'A sealed Drop or Copy head gives every region position its own unbounded binder, because lifetimes never decide which code runs.',
   ],
 })
 
