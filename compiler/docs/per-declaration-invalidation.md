@@ -1,314 +1,152 @@
 # Per-declaration invalidation
 
-**Status:** proposal. Nothing here is implemented, and implementation waits for Julia's approval.
-Original measurements were reported on `selfhost` `e1022f2`; the baseline behavior and line
-numbers in §§1–2 refer to `31fc6e3`. The region-identity discussion below also covers the current
-`selfhost` design documented in `region-sensitive-identity.md`.
+**Status:** implementation checkpoint; final acceptance validation is incomplete. See
+[the handoff](per-declaration-invalidation-handoff.md). Semantic facts validate through typed
+source projections and ordered direct query dependencies. Absolute syntax identities and source coordinates remain explicit
+inputs; moving them causes recomputation. This is a sound per-declaration cache with conservative
+location invalidation, rather than the location-independent cache originally proposed here.
 
-## Summary
+## Problem and observed result
 
-Every semantic answer in the native compiler stays valid only while the exact bytes of every
-module it transitively touched stay the same. The query keys are already per declaration, but
-validity is per module. An edit anywhere in a module therefore restarts every answer that touched
-that module. Two answer kinds survive the restart:
+The previous validator compared the complete bytes of every module an answer transitively
+observed. An edit to one function therefore restarted unrelated facts in its module and facts
+in importing modules. A special Body candidate path could keep some typed payloads after those
+restarts, but MIR still lowered again.
 
-- A checked body can keep its payload, but only if its own source positions did not move.
-- LLVM text is content-addressed and survives.
+The committed probe in `compiler/src/semantic/InvalidationCases.silk` uses two modules:
+`lib` defines `leaf` and `other`; `main` defines `a`, which calls `Lib.leaf()`, independent `b`,
+and `c`, which calls `Lib.other()`. Each revision demands all five bodies and all five MIR graphs
+in that order. The same-width edit changes `leaf`'s return value from `1` to `9`.
 
-MIR has no such escape and is lowered again every time. In the probe below, editing one leaf body
-re-lowers 4 of 5 functions, and adding a comment line re-checks every body in that file.
+| Observation                        | Previous validator | Current validator |
+| ---------------------------------- | ------------------ | ----------------- |
+| Body provider starts               | 4                  | 1                 |
+| Old Body payload reuse after start | 3                  | Removed path      |
+| MIR provider starts                | 4                  | 1                 |
+| Starts after a trailing comment    | —                  | 0 Body, 0 MIR     |
 
-This note proposes four changes:
+The previous behavior was reproduced on the PR's pre-implementation compiler. These are provider
+counts, not whole-project timing claims. The probe also compares warm and fresh MIR shape,
+exact callee instances, safety state, local syntax identities and spans. It checks shifted syntax,
+a declaration inserted before an existing function, missing modules and names becoming present,
+a signature becoming incompatible, and a newline edit that preserves byte offsets.
 
-1. Key declaration facts by stable declaration identity instead of syntax position.
-2. Observe per-declaration projections (header digest, body digest, name buckets) instead of whole
-   module bytes.
-3. Validate each answer through its direct dependencies and stop at equal results, so the early
-   cutoff that only Body has today applies to every family.
-4. Make positions and syntax references declaration-local, with current-revision location maps.
+Run the focused probes with a matching LLVM toolchain on `PATH`:
 
-With all four, an ordinary runtime body edit invalidates that body's affected instances and the
-facts that evaluated it statically. Runtime callers can keep their answers when the callee's
-signature stays equal. A signature edit propagates through facts that read that signature.
+```sh
+node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml \
+  --root src/semantic/InvalidationCases.silk --no-cache
+node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml \
+  --root src/semantic/SourceIndexCases.silk --no-cache
+node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml \
+  --root src/semantic/QueryCases.silk --no-cache
+```
 
-## 1. What keys on the module today, and why
+## Keys and declaration selection
 
-**Keys.** `Key` (`semantic/Semantic.silk:948`) is
-`{family, module, name, declaration, member, external}`. They fall into four groups:
+Declaration-family query addresses intern the full canonical `DeclarationId`, including the
+module and owner chain. Current declaration ordinals are refreshed when a key is encountered;
+they locate current syntax but no longer define the cache address. Applied facts retain their
+application, origin, conditional context and profile in the scoped key. Instance families retain
+their canonical instance, layout or content subjects.
 
-- **Declaration families** (`declarationFamily`, :845), from Import through Body and the
-  origin families. These key on `(module ordinal, declaration ordinal)`. The declaration
-  ordinal is the declaration's position in the module's `ModuleIndex`, so it is a syntax position:
-  inserting a declaration renumbers every later one.
-- **Applied families** (MemberShape, ConformanceHeads, ProofBounds, AppliedOperation,
-  AppliedInherent). These add interned applied types in `name` and `member`.
-- **Per-module families:** Name (per symbol), OperatorInterfaces, Implementations and
-  ProfileInput.
-- **Instance families:** Mir, EmissionInputs, Layout and LlvmText key only on an interned
-  instance, layout type or content index (`sameKey`, :3491). Their module and declaration fields
-  are informational.
+A declaration can be remapped across source edits only when every owner is uniquely named.
+Anonymous declarations and ambiguous owner chains require an exact declaring-source proof and
+use a source-revision-scoped address. They still survive changes to unrelated modules. A duplicate,
+removal or changed anonymous binding cannot accidentally select an older occurrence. No ordinal
+matching heuristic substitutes for identity.
 
-**Validity.** This is where the module granularity comes from.
+Selection answers still expose current ordinals. Changing those ordinals invalidates selection
+and syntax-bearing facts even when their stable cache address survives. This keeps existing
+absolute references safe while allowing a fresh answer to occupy the same declaration slot.
 
-- `source` (:4027) records an `Observation` (`semantic/SourceRevision.silk:41`) holding the
-  module's complete bytes, or the fact that it is absent.
-- `declarationAt` (:4060) and `header` read through `source`, so reading one header observes the
-  whole file.
-- `demandChild` (:5272) also observes the declaring module of every declaration-family child. The
-  reason given in the code: "a declaration ordinal names a declaration only in one source
-  revision".
-- `mergeEvidence` (:3985) copies the child's observations into the parent, so observations are
-  transitive.
-- On every later demand, `validAnswer` (:1573) compares each observation byte for byte. A single
-  mismatch forgets the answer.
+## Typed source projections
 
-The design is sound and simple: positional ordinals and absolute spans are only meaningful
-against the exact bytes they came from, so the whole file is what gets observed.
+`semantic/SourceRead.silk` records the input each provider consumed:
 
-**Existing cutoffs.**
+- **Presence:** whether a source exists. Missing modules are first-class negative inputs.
+- **Selection:** declaration identity, ambiguity, conditional arm and exposed ordinals.
+- **Header:** selection plus canonical header content and header locations.
+- **Body:** header and body content, with the complete owned syntax locations.
+- **Name:** the ordered candidates for one name, including visibility, import binding and
+  conditional context. An empty bucket is a first-class negative input.
+- **Shape:** ordered declaration headers for providers that scan a module's declarations.
 
-- **Body.**
-  - A forgotten Body answer becomes a candidate (`priorCandidate`, :3290).
-  - `reuseBody` (:44276) keeps the typed payload when two checks pass.
-  - First, the declaration's `BodyInput` (`semantic/BodyInput.silk:24`) is equal. That compares
-    the header and body fingerprints, exact declaration text, syntax index and span, stable
-    declaration identity, and recursively the enclosing input for a literal (`equals`, :85).
-  - Second, every recorded direct dependency returns the same `answerId` or an equal identity
-    value (`identityOfFact`, :3088).
-- **LlvmText** (`resolveLlvmText`, :52030) is named by a SHA-256 of its content, so an unchanged
-  instance keeps its text.
-- **Everything else has no cutoff.**
-  - `identityOfFact` returns nothing for Mir, Layout and EmissionInputs, so `resolveMir`
-    (:50341) re-lowers after any observed byte change, even when its Body was reused.
-  - Every restarted answer also re-reads and re-observes the module, which costs time even when
-    the payload is kept.
+Header and body projections also observe enclosing lexical headers. An anonymous body observes
+its enclosing bodies because preceding bindings and captures can affect it without changing the
+literal's own text. Shape reads are intentionally conservative for module scans: a header edit
+may invalidate several scanned facts, but an ordinary runtime body edit does not change them.
 
-## 2. What an edit invalidates today
+Each syntax location records HIR identity, byte span and one-based line and column. `SourceUnit`
+retains a line-start index belonging to its exact parsed bytes. Equal byte offsets alone are not
+sufficient: replacing a space with a newline before a declaration changes emitted locations.
+Comments after all consumed syntax preserve the projections. Comments that move consumed syntax
+cause the relevant facts to recompute.
 
-The probe uses two modules. `lib` has `leaf` and `other`. `main` has `a`, which calls
-`Lib.leaf()`, `b`, which is independent, and `c`, which calls `Lib.other()`. Every edit
-demands the Body and the MIR of all five functions, then counts query events. "Restarted" counts
-Body starts, and the figure in parentheses counts how many of those reused their payload.
+Exact source observations remain provenance for held authored cursors and diagnostics. They are
+not transitive validity inputs. The narrowly scoped exact-source proof for anonymous/ambiguous
+selection is part of declaration authentication, not a second whole-module validator.
 
-These are the original author's reported measurements, not independently reproduced results.
-The PR does not include the probe source or invocation. Preserve the baseline revision above;
-before using these counts as an implementation acceptance check, commit a reproducible probe
-with its fixtures, demand order, event filters, and command. Count provider starts, Body payload
-reuse, and MIR lowering separately; a validated hit is not a provider restart.
+## One validator for every family
 
-| Edit                                      | Bodies restarted (payload reused) | MIR lowered | Ideal              |
-| ----------------------------------------- | --------------------------------- | ----------- | ------------------ |
-| same-width edit to `leaf`'s body          | 4 (3)                             | 4           | 1 body, 1 MIR      |
-| same-width edit to `b`'s body             | 3 (2)                             | 3           | 1, 1               |
-| edit to `leaf`'s body that shifts `other` | 4 (2)                             | 4           | 1, 1               |
-| `leaf` result type `i32` to `i64`         | 4 (2)                             | 4           | 2 (`leaf`, `a`), 2 |
-| comment line at the top of `main`         | 3 (0)                             | 3           | 0, 0               |
+Every completed answer stores its own typed source reads and ordered direct query dependencies.
+Validation first checks the source reads, then visits the dependencies in their observed order.
+It stops immediately at the first changed input; it does not validate later dependencies from an
+old execution before rerunning the provider. The active-query reservation and frame are released
+on typed failure, including allocation failure.
 
-- **Signatures.** The edited module's Signature queries also restart: 2 or 3 per edit. Ideally
-  that happens only for the edited declaration's own Signature.
-- **Shifted positions.** `other` loses reuse once `leaf` grows by one byte, and every body in
-  `main` loses it after the comment. That is the span comparison in `BodyInput.equals`.
-- **Lowering.** MIR is re-lowered for every restarted body, including the reused ones, because
-  MIR has no identity.
+A dependency remains equal when its completed answer ID is unchanged, or when its complete
+result identity and location digest compare equal. This cutoff applies to all query families.
+Successful facts compare every field consumers can observe. Ordinary semantic refusals compare
+their code, module, spans, operands, names, related sites, witness evidence and declaration path.
+Refusals carrying static-execution or specialization traces conservatively require the same
+immutable diagnostic handle; they cannot produce an unsafe equality cutoff.
 
-## 3. Proposed design
+Backend equality includes complete MIR instruction recipes, exact selected type/instance
+identity, origins, admission edges, safety state and region-selection sensitivity. Layout uses
+canonical layout encoding and exact child types; emission inputs use their complete content subject; LLVM definitions
+compare text, symbol, encoding, foreign declarations and safety. Origin plans compare ordered
+applications, producers and solved environments. Hashes address canonical content; equality never
+uses truncated pretty printing or a fixed-buffer serialization.
 
-### 3.1 Stable declaration keys
+A runtime caller depends on the callee signature rather than the callee runtime body. Its body
+and MIR therefore survive a body-only edit to the callee when their actual inputs stay equal.
+Static evaluation records the bodies it executes, so changes to those bodies reach its callers.
+Profile, target, application and region-sensitive identity remain separate query inputs; this
+change does not broaden region erasure. See `region-sensitive-identity.md` for that contract.
 
-Declaration families key on an interned `DeclarationId` instead of a `ModuleIndex` position.
-`semantic/DeclarationId.silk` already represents the canonical module and owner chain, including
-each owner's kind, name, and same-key occurrence. Reuse that representation rather than adding
-another identity type. The position becomes a per-revision lookup from identity to syntax
-(`declarationAt`). Semantic readers observe existence and unambiguous selection, not the current
-ordinal or absolute span; otherwise a reorder would still invalidate them.
+The previous `BodyInput`, forgotten-Body candidate, special payload-reuse event and body-only
+validator are deleted. A validated Body hit can publish a new immutable answer wrapper with
+current source provenance while retaining its typed payload and answer ID. Previously returned
+handles remain unchanged. `Query.refresh` replaces only completed entries and cannot replace an
+active reservation or create an absent entry.
 
-Occurrence is an address within a revision, not proof that two revisions contain the same
-declaration. Same-key siblings, unnamed owners, and ambiguous ancestors need conservative
-invalidation unless matching can be proved. Inserting or reordering uniquely identified named
-declarations preserves keys; inserting another same-key sibling must never transfer an old answer
-to a different declaration. Deletion and rename change existence or name-bucket observations.
+## Discovery and retained handles
 
-### 3.2 Projection observations instead of module bytes
+Cache validity and source publication serve different purposes. A request rebuilds its current
+source discovery and demand footprint from the validated completed dependency graph, obtaining
+observations from the current revision. It therefore discovers sources on warm hits even when a
+cached answer's captured provenance belongs to an earlier revision. Public answer provenance
+continues to describe the capture retained by that handle.
 
-Replace `Observation {id, content}` with typed leaf reads, each holding a digest:
+Missing paths are included in discovery. Successful LLVM text is immutable content-addressed
+work; emission preparation contributes current source discovery. Failed LLVM preparation retains
+its own typed reads and dependencies so a repaired source can invalidate the failure.
 
-| Read                  | Digest                                         | Who records it                                          |
-| --------------------- | ---------------------------------------------- | ------------------------------------------------------- |
-| module presence       | present or absent                              | imports and source lookup, including failed lookup      |
-| declaration selection | absent, unique, or ambiguous identity          | declaration lookup                                      |
-| module shape          | imports, declaration identities and kinds      | Name, Implementations, OperatorInterfaces, ProfileInput |
-| declaration header    | `Fingerprint.headerDigest`                     | Signature, Contract, Members, Identity, ...             |
-| declaration body      | `Fingerprint.bodyDigest`                       | Body, Constant, Initializer, static evaluation          |
-| name bucket           | the candidate `DeclarationId` set for one name | Name                                                    |
+## Limits and further optimization
 
-- `hir/Fingerprint.silk` already produces canonical header and body encodings independent of
-  absolute positions and intern indices; `BodyInput` stores these bytes. Its header encoding
-  includes documentation and owner occurrence. Body binder ordinals depend on the header's
-  structure, so some header edits also change the body digest. These are conservative inputs,
-  not a guarantee that every comment or reorder leaves every digest equal.
-- Define module shape and name buckets in a canonical order when written order is irrelevant.
-  Preserve order for observations whose consumers depend on it, such as member layout. Import
-  aliases, visibility, conditional activation, and implementation-header reads must be covered;
-  a set of declaration names alone cannot validate resolution or coherence.
-- `source` stops observing anything. Each provider records exactly the projection it read.
-- `demandChild` no longer observes the child's module, because the key is now a stable identity.
+The implementation deliberately treats locations as observable inputs. It does not promise that
+inserting a comment line or another declaration preserves typed bodies containing absolute HIR
+references. Stable keys prevent aliasing; location digests force safe recomputation.
 
-### 3.3 Direct-dependency validation with early cutoff
+Making those edits cheap would require declaration-local syntax references throughout typed
+bodies, static facts, origin data, diagnostics and MIR, plus explicit current-revision location
+maps at their consumers. Removing location reads before completing that representation change
+would make the cache unsound. This is a separate representation optimization, not a prerequisite
+for the implemented body-edit cutoff.
 
-Each answer stores its own leaf reads and its direct dependencies, each dependency as a key plus
-the dependency's result fingerprint. It no longer stores transitive observations, so
-`mergeEvidence` goes away. Validating an answer works like this:
-
-1. Check its leaf reads against the current revision.
-2. Validate each direct dependency recursively, in recorded order.
-3. Compare each dependency's current fingerprint with the recorded one.
-4. Stop validation at the first mismatch and re-run the provider, recording fresh reads. Do not
-   demand the remaining old dependencies: the changed branch may no longer need them. If the
-   re-run yields an equal fingerprint, its own dependents stay valid. That is the cutoff.
-
-Validation stays within one held immutable revision and memoizes completed validation for that
-revision. An answer currently being validated is not a hit: use the query reservation and cycle
-rules rather than recursively accepting an unfinished answer. Publish new evidence even when
-the result is equal, since the set of dependencies may have changed.
-
-This is `reuseBody`'s rule (`answerId` or equal identity) applied to every family, and it
-replaces the Body-only candidate path. Every `Value` needs a fingerprint:
-
-- `identityOfFact` supplies structural equality for many front-end facts, not a universal digest.
-  It excludes OriginPlan, OriginEvidence, unsupported outcomes, and rejected diagnostics as well
-  as the backend families. Audit all outcomes, including absence and rejection, before removing
-  whole-module observations.
-- Mir, Layout and EmissionInputs need canonical result identities covering everything their
-  consumers read, including target, profile, ABI and provider inputs where applicable. LlvmText
-  already has a content subject. Store stable references rather than revision-local table indices
-  in cross-revision identities.
-
-The bootstrap's `jul-217-semantic-revision-validation` change used the same model: typed query
-and leaf reads with expected fingerprints, admitted by one ordered validator that stops at equal
-results. That change targets the TypeScript stack, but its rules carry over.
-
-### 3.4 Declaration-relative positions
-
-Checked bodies, MIR origins and gap spans store offsets relative to their declaration's start,
-plus that declaration's identity. A per-revision declaration base converts them to absolute spans
-only when a diagnostic, gap or debug location is reported. This handles edits before a declaration;
-it does not handle whitespace inserted inside it, which changes its internal offsets. For trivia
-edits within a declaration, use stable syntax anchors and a current-revision position map, or
-invalidate the position-bearing payload conservatively.
-
-`TypedBody` also retains revision-local `HirId`s in origins, literals, and selected static facts.
-Replace them with declaration-local syntax identities and resolve them against the current
-revision before reading authored syntax. Keeping an old `HirId` with a new source observation is
-unsound even if its declaration's digest is equal. Only after these consumers are updated can
-`BodyInput.equals` drop its exact-text, span, and syntax-index checks. Semantic equality and
-location refresh must be distinct so diagnostics stay current without forcing callers to recheck.
-
-### 3.5 What each edit invalidates under this design
-
-- **Body edit:** the body digest of that declaration changes.
-  - Its Body re-runs. Changed results propagate to Mir, EmissionInputs and LlvmText; an equal
-    result stops propagation at that family.
-  - Ordinary runtime callers that read only the callee's Signature are untouched. This matches the
-    `mir-core-shape.md` rule that body edits do not change callers' content subjects.
-  - Static evaluation that executed the edited body recorded a body read, so it re-runs.
-- **Signature edit:** the header digest changes.
-  - Its Signature re-runs, and if the result fingerprint differs, every answer that recorded that
-    Signature as a dependency re-runs: the callers' Bodies, then their MIR.
-  - Bodies that do not call it keep their answers without re-running.
-- **Comment before a declaration:** semantic results can remain equal, while its location map
-  refreshes. Documentation comments may change header inputs.
-- **Whitespace inside a declaration:** semantic reuse requires the syntax-anchor mapping above;
-  declaration-relative byte offsets alone are insufficient.
-- **Reorder:** uniquely identified declarations can retain answers when the observations they
-  read are order-independent. Ambiguous owners and order-sensitive member shapes invalidate.
-
-### 3.6 Compiling only what is used
-
-Builds are already demand-driven: `buildApplication` lowers the instances reachable from the
-entry, and only those. Two changes keep it that way:
-
-- The per-module families (Implementations, OperatorInterfaces) stay per module, but they read
-  the relevant module shape, import and activation facts, and implementation or interface
-  headers. An unrelated runtime body edit therefore need not disturb them. Scans still inspect
-  unused declaration headers where resolution or coherence requires them; this does not require
-  checking every unused runtime body.
-- Instance families keep keying on the instance, respecting the current split between
-  region-erased and region-sensitive applications (see §4).
-
-## 4. Cost, risks and the region-sensitivity work
-
-**Suggested work breakdown.** Establish a reproducible probe first. These are design components,
-not permission to land a second validation path. The green-field policy requires the generalized
-validator and removal of the Body-only candidate path to land together.
-
-1. **Fingerprints and cutoff for Mir, Layout and EmissionInputs.** Mir keeps its answer when its
-   Body and Signature dependencies are unchanged.
-   - Before: every MIR answer that touched an edited module is lowered again.
-   - After: only the edited instance's MIR, and the MIR of instances whose Body or Signature
-     actually changed, provided its other direct inputs remain equal.
-2. **Declaration-local syntax and positions.** Replace revision-local HIR references and add
-   location maps alongside declaration-relative spans. This removes the position-shift losses in
-   the probe and allows trivia reuse where syntax anchors remain equal. Update TypedBody, MIR
-   origins, gap spans and diagnostic rebasing together.
-3. **Stable `DeclarationId` keys and projection observations.** This is the largest step. Every
-   `declarationAt` and `source` caller changes, and so do `SourceRevision` and `SourceIndex`.
-4. **Direct-dependency validation.** Drop transitive observations and the Body-only candidate
-   path, which removes the dual reuse mechanism.
-
-**Risks.**
-
-- **Soundness depends on complete reads.** Any provider that reads source or another fact without
-  recording it can now keep a stale answer. Today the whole-module observation hides such gaps.
-  Mitigation: a verification mode that, whenever it reuses an answer, recomputes it and compares
-  fingerprints. It would run in the Cases roots and in one corpus CI leg. The reads most at risk:
-  - static evaluation that executes other declarations' bodies;
-  - reflection (`Reflect.fields`), which reads members;
-  - conformance coherence, which reads every `impl` header in scope;
-  - the module shape, which decides name resolution.
-- **Fingerprint cost.** Canonical MIR encoding and hashing cost time on cold builds. Measure
-  cold-build time and retained bytes as well as warm provider counts. Typed leaf reads can
-  outnumber whole-module observations, whose bytes are shared today; memory cost is not yet known.
-- **Diagnostics.** Rebasing must happen in exactly one place, or spans will drift. The
-  diagnostic catalog tests that assert spans would catch that.
-- **Verification oracle.** Recompute against a fresh resolver that cannot hit the same cached
-  answers, and compare semantic outcomes plus diagnostics rebased to the current revision.
-  Recomputing through the cache under test or comparing the same incomplete fingerprint is not
-  sufficient evidence that all reads were recorded.
-
-**Required acceptance cases.** In addition to the reported probe, cover a failed name lookup
-becoming present, module deletion and restoration, declaration rename and deletion, same-key
-sibling insertion, unnamed-owner insertion, trivia inside a body, documentation changes, and
-conditional dependencies that disappear after an edit. Verify static evaluation, reflection,
-coherence, cycle diagnostics, nested captures, current diagnostic spans, and target/profile
-changes against fresh results. Assert query-event counts structurally; measure time and memory
-in opt-in benchmarks.
-
-**Interaction with the current region-sensitivity design.**
-
-`region-sensitive-identity.md` describes the shipped rule: applications normally share one
-region-erased backend instance, but consulting lifetime-selective heads or lending their own
-regions to a sensitive application makes their patterns distinct. Sensitivity is recorded with
-MIR and implementation heads; builds reconstruct its transitive closure and may restart their
-walk. A MIR result fingerprint must include sensitivity and lending-reference evidence as well
-as instructions. Equal instructions with changed sensitivity are not an equal result for these
-consumers. Preserve the build's closure and fresh-build equivalence when adding cutoff.
-
-**Historical alternative (#1242).**
-
-As of 2026-10-10 (America/Sao_Paulo), #1242 is closed without merging. Its draft reported that
-per-pattern validation still expanded combinatorially and required language decisions. Treat it
-as a design reference, not an implemented prerequisite or an approved validity algorithm.
-
-- #1242 proposed splitting instance code identity (regions erased) from region-pattern validity
-  (a new `Family.Validity`).
-- If a region-erased code identity is adopted, instance families (Mir, EmissionInputs, LlvmText)
-  can key on it only after proving that erased distinctions cannot select different code. An edit
-  still affects every demanded specialization of the declaration, rather than exactly one instance.
-- A validity family can use cutoff, but must record all semantic inputs read by its checks,
-  including conformance and cleanup selection. Signature and Body fingerprints alone are not a
-  demonstrated complete dependency set. Equal code may allow emission reuse while validity checks
-  re-run; semantic validity does not follow from that code equality.
-- The proposed per-pattern validity family is not the shipped sensitivity mechanism. Do not
-  introduce it as a prerequisite for invalidation. The current identity and sensitivity evidence
-  must participate in direct-dependency validation; equal emitted code does not prove equal
-  validity.
+The structural probe establishes invalidation granularity and warm/fresh agreement for its
+fixtures. It does not establish project-wide latency or memory improvement. Parsing still reads a
+complete changed source, and projection hashing currently runs on demand. Benchmarking large
+projects can justify caching immutable projections in `SourceIndex` without changing the
+validation contract.
