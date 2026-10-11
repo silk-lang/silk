@@ -7,7 +7,6 @@ import * as DeclarationFacts from './DeclarationFacts.js'
 import type * as DeclarationIndex from './DeclarationIndex.js'
 import type * as Elaboration from './Elaboration.js'
 import type * as ModuleClosure from './ModuleClosure.js'
-import * as SemanticContext from './SemanticContext.js'
 import * as Type from './Type.js'
 
 /** Authoritative ownership and logical path for a source supply that is not a project file. */
@@ -25,14 +24,15 @@ export interface Request {
   readonly sources?: ReadonlyMap<string, Source>
 }
 
-/** Runtime metadata projected from one phase-only test descriptor. */
+/**
+ * Runtime metadata projected from one phase-only test descriptor. It holds no source position, so
+ * moving a test changes neither its descriptor nor the catalog a runner specializes over.
+ */
 export interface Info {
   readonly identity: string
   readonly name: string
   readonly module: string
   readonly path: string
-  readonly line: number
-  readonly column: number
   readonly fingerprint: string
 }
 
@@ -136,34 +136,6 @@ const callableType = (declaration: DeclarationFacts.DeclarationFact): Type.Calla
   )
 }
 
-/** Offsets just past each newline of one source; line `n` (1-based) starts at entry `n - 1`. */
-const lineStarts = (bytes: Uint8Array): ReadonlyArray<number> => {
-  const starts = [0]
-  for (let index = 0; index < bytes.length; index += 1)
-    if (bytes[index] === 0x0a) starts.push(index + 1)
-  return starts
-}
-
-/**
- * The 1-based line and column of one test declaration. Rescanning the source from its start for
- * every test cost 13 s on the selfhost semantic root, so each module's line starts are built once.
- */
-const position = (
-  module: ModuleClosure.Module,
-  starts: ReadonlyArray<number>,
-  declaration: DeclarationFacts.DeclarationFact,
-): { readonly line: number; readonly column: number } => {
-  const offset = SemanticContext.make(module.authored).spanOf(declaration.anchor).start
-  let low = 0
-  let high = starts.length - 1
-  while (low < high) {
-    const middle = (low + high + 1) >> 1
-    if ((starts[middle] ?? 0) <= offset) low = middle
-    else high = middle - 1
-  }
-  return { line: low + 1, column: offset - (starts[low] ?? 0) + 1 }
-}
-
 const compareEntries = (left: Entry, right: Entry): number => {
   const module = Canonical.compare(left.info.module, right.info.module)
   if (module !== 0) return module
@@ -187,12 +159,9 @@ export const make = Effect.fn('TestDiscovery.make')(function* (
     const source = module === undefined ? undefined : sourceOf(request, module)
     const result = results.get(headers.module)
     if (module === undefined || source?.ownership !== 'Project' || result === undefined) continue
-    let starts: ReadonlyArray<number> | undefined
     for (const declaration of headers.declarations) {
       if (!declaration.test || declaration.canonical._tag !== 'Canonical') continue
       if (declaration.name._tag !== 'Present') continue
-      starts ??= lineStarts(module.syntax.source.bytes)
-      const location = position(module, starts, declaration)
       entries.push({
         declaration,
         callable: callableType(declaration),
@@ -201,8 +170,6 @@ export const make = Effect.fn('TestDiscovery.make')(function* (
           name: declaration.name.spelling,
           module: headers.module,
           path: source.logicalPath,
-          line: location.line,
-          column: location.column,
           fingerprint: yield* fingerprint(result, declaration),
         },
       })
@@ -227,8 +194,6 @@ export const make = Effect.fn('TestDiscovery.make')(function* (
             entry.info.name,
             entry.info.module,
             entry.info.path,
-            String(entry.info.line),
-            String(entry.info.column),
             entry.info.fingerprint,
             Type.key(entry.callable),
           ]),

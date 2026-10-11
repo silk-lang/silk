@@ -104,9 +104,14 @@ assuming a root or returning an empty catalog.
 `Intrinsic.tests()` produces a finite heterogeneous static catalog. Each
 `Intrinsic.Test<F>` descriptor represents one discovered declaration and retains that test's exact
 callable type `F`. `Intrinsic.testInfo(descriptor)` produces immutable identity, name, module,
-logical project-relative path, source position, and fingerprint metadata.
+logical project-relative path, and fingerprint metadata.
 `Intrinsic.testFunction(descriptor)` crosses the static boundary once and produces the exact
 ordinary runtime callable.
+
+Descriptors and their metadata carry no source line or column. Moving a test, or editing text
+around it, therefore leaves the catalog and every runner specialization over it unchanged; only an
+edit to the test's own declaration changes its fingerprint (TEST-005). A tool that shows where a
+test is declared resolves the test's identity against the current source.
 
 The descriptor authorizes callable extraction for its marked test, including a private test. It
 does not authorize ordinary access to that declaration or another private declaration. Static
