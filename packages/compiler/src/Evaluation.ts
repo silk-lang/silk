@@ -1457,8 +1457,6 @@ const evaluateIntrinsic = (
       text(info.name),
       text(info.module),
       text(info.path),
-      { _tag: 'IntegerValue', type: 'usize', value: BigInt(info.line) },
-      { _tag: 'IntegerValue', type: 'usize', value: BigInt(info.column) },
       text(info.fingerprint),
     ]
     const ordinal = Type.intrinsicNominalOrdinal(Type.testInfo)
@@ -1472,8 +1470,6 @@ const evaluateIntrinsic = (
       Type.string(Lifetime.staticLifetime),
       Type.string(Lifetime.staticLifetime),
       Type.string(Lifetime.staticLifetime),
-      'usize',
-      'usize',
       Type.string(Lifetime.staticLifetime),
     ]
     return admittedValue(
