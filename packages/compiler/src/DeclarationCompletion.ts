@@ -195,6 +195,59 @@ const argumentBinder = (argument: Type.GenericArgument): string | undefined => {
     : undefined
 }
 
+// The provider declaration's parameters, the substitution of the provider's arguments for them,
+// and the declared parameter that a head binder stands for as a direct provider argument.
+const providerDeclaration = (modules: ReadonlyArray<ModuleHeaders>, provider: Type.Type) => {
+  const declared = Type.isNominal(provider)
+    ? (memberByNominal(modules, provider)?.typeParameters ?? [])
+    : []
+  const substitution: Type.Substitution = new Map(
+    Type.isNominal(provider)
+      ? declared.flatMap((parameter, index) => {
+          const argument = provider.arguments[index]
+          return argument === undefined ? [] : [[parameterArgumentKey(parameter.type), argument]]
+        })
+      : [],
+  )
+  const counterpart = (binder: Type.Parameter): TypeParameterFact | undefined => {
+    if (!Type.isNominal(provider)) return undefined
+    const own = parameterArgumentKey(binder)
+    return declared[provider.arguments.findIndex((argument) => argumentBinder(argument) === own)]
+  }
+  return { substitution, counterpart }
+}
+
+/**
+ * Spells the interface bounds of a sealed head that the provider's declaration does not imply. A
+ * conformance may hold for some regions of a type and not others, so an interface bound decides
+ * cleanup or copying by region unless every value of the provider type already satisfies it.
+ * Sealed `Copy` bounds are region-independent under the same rule and stay allowed.
+ */
+const unimpliedInterfaceBounds = (
+  modules: ReadonlyArray<ModuleHeaders>,
+  provider: Type.Type,
+  requirements: ReadonlyArray<ConformanceHead.Requirement>,
+): ReadonlyArray<string> => {
+  const { substitution, counterpart } = providerDeclaration(modules, provider)
+  return requirements.flatMap((requirement) => {
+    if (Type.equals(requirement.capability, Type.copyCapability)) return []
+    const declared = Type.isParameter(requirement.provider)
+      ? counterpart(requirement.provider)
+      : undefined
+    const implied = (declared?.bounds ?? []).some(
+      (bound) =>
+        bound._tag === 'ResolvedBound' &&
+        Type.equals(
+          Type.substitute(bound.application.capability, substitution),
+          requirement.capability,
+        ),
+    )
+    return implied
+      ? []
+      : [`${Type.display(requirement.provider)}: ${Type.display(requirement.capability)}`]
+  })
+}
+
 /**
  * Names the head binders whose region-carrying bounds the provider's declaration does not already
  * imply. A binder that stands as argument `i` of the provider is implied when declared parameter
@@ -206,21 +259,9 @@ const unimpliedRegionBinders = (
   provider: Type.Type,
   parameters: ReadonlyArray<TypeParameterFact>,
 ): ReadonlyArray<string> => {
-  const declaration = Type.isNominal(provider) ? memberByNominal(modules, provider) : undefined
-  const declared = declaration?.typeParameters ?? []
-  const substitution: Type.Substitution = new Map(
-    Type.isNominal(provider)
-      ? declared.flatMap((parameter, index) => {
-          const argument = provider.arguments[index]
-          return argument === undefined ? [] : [[parameterArgumentKey(parameter.type), argument]]
-        })
-      : [],
-  )
+  const { substitution, counterpart: declaredFor } = providerDeclaration(modules, provider)
   const implied = (parameter: TypeParameterFact, contract: Type.Type | undefined): boolean => {
-    if (!Type.isNominal(provider)) return false
-    const own = parameterArgumentKey(parameter.type)
-    const position = provider.arguments.findIndex((argument) => argumentBinder(argument) === own)
-    const counterpart = declared[position]
+    const counterpart = declaredFor(parameter.type)
     if (counterpart === undefined) return false
     const lifetimesImplied = (parameter.lifetimeBounds ?? []).every((required) =>
       (counterpart.lifetimeBounds ?? []).some((available) =>
@@ -1401,6 +1442,7 @@ export const complete = (
             conformance.capability.type,
             conformance.provider.type,
             unimpliedRegionBinders(modules, conformance.provider.type, conformance.typeParameters),
+            unimpliedInterfaceBounds(modules, conformance.provider.type, requirements),
           )
       if (regionSelection !== undefined)
         diagnostics.push(

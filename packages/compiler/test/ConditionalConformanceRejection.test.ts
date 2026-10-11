@@ -181,7 +181,8 @@ it.effect('rejects sealed Drop and Copy heads that depend on regions', () =>
     // lowering, so a sealed head may not name `'static`, repeat one region, or bound a region.
     // Conformance heads may, because coherence erases lifetimes and typing proves their relations.
     // A bound the provider's declaration already requires holds for every value of the type, so a
-    // head may repeat it.
+    // head may repeat it. An interface bound is a region bound in disguise: `Box<Tag<'x>>` would
+    // run its hook only when `'x` is `'static`.
     const source = `interface Mark {}
 struct Lasting<'a> { value: &'a i32 }
 struct Pair<'a, 'b> { left: &'a i32 right: &'b i32 }
@@ -191,6 +192,10 @@ struct Free<'a, 'b> { left: &'a i32 right: &'b i32 }
 struct Token<F: once fn(i32) -> i32> { marker: F }
 struct Kept<F: once fn<'static>(i32) -> i32> { marker: F }
 struct Long<'a: 'b, 'b> { left: &'a i32 right: &'b i32 }
+interface Label {}
+struct Tag<'a> { value: &'a i32 }
+struct Box<T> { value: T }
+struct Labelled<T: Label> { value: T }
 
 impl Drop for Lasting<'static> {
   fn drop(self: &mut Lasting<'static>) -> () { return () }
@@ -210,6 +215,13 @@ impl<F: once fn<'static>(i32) -> i32> Drop for Kept<F> {
   fn drop(self: &mut Kept<F>) -> () { return () }
 }
 impl<'a: 'b, 'b> Copy for Long<'a, 'b> {}
+impl<'a: 'static> Label for Tag<'a> {}
+impl<T: Label> Drop for Box<T> {
+  fn drop(self: &mut Box<T>) -> () { return () }
+}
+impl<T: Label> Drop for Labelled<T> {
+  fn drop(self: &mut Labelled<T>) -> () { return () }
+}
 impl Mark for Lasting<'static> {}
 impl<'a> Mark for Pair<'a, 'a> {}
 impl<'a: 'b, 'b> Mark for Ordered<'a, 'b> {}
@@ -228,6 +240,7 @@ pub fn main() -> i32 { return 0 }`
         "impl<'a: 'b, 'b> Copy for Ordered<'a, 'b> {}",
         "impl<'a, T: 'a> Copy for Held<'a, T> {}",
         "impl<F: once fn<'static>(i32) -> i32> Drop for Token<F> {",
+        'impl<T: Label> Drop for Box<T> {',
       ],
     )
   }),
