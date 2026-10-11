@@ -4186,9 +4186,13 @@ export const freeLifetimes = (self: Type): ReadonlyArray<Lifetime.Lifetime> => [
   ).values(),
 ]
 
-/** Lists every free region atom once per position it occupies, in deterministic preorder. */
+/**
+ * Lists every free region atom once per position it occupies, in deterministic preorder. A type
+ * parameter's representation bound is its contract, not a position of the type, so it is skipped.
+ */
 export const regionOccurrences = (self: Type): ReadonlyArray<Lifetime.Atom> =>
   fold(self, {
+    descend: (type) => !isParameter(type),
     argument: (argument, inBinderScope) =>
       Lifetime.isLifetime(argument) &&
       argument._tag !== 'IntersectionLifetime' &&
