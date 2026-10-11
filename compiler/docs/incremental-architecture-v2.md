@@ -32,9 +32,10 @@ cold-build gate.
   of 81 rounds. Three quarters of the round cost was the instance walk repeating itself (§1.4).
 - The first build of an incremental session is estimated at under 1% time and about 1.1% RSS over
   one-shot, against a proposed budget of 3% and 5% (§9).
-- Nine language proposals and three safety-model options are ranked for Julia (§8). The largest
-  precision gains come from scoping results by the profile entries they read, and from removing the
-  three build-wide fixed points: failure observation, region sensitivity and suspension.
+- Nine ranked language proposals (§8): Julia accepted seven, among them scoping results by the
+  profile entries they read and removing the three build-wide fixed points (failure observation,
+  region sensitivity, suspension), and deferred two. The three safety-model options are still
+  open.
 - The work starts with two changes that need no new design and land first: one build round instead
   of 81, and no recording in one-shot builds, worth the measured 34% together. Six slices then
   build the graph, its precision and cutoff, backend reuse and the session driver (§10).
@@ -671,7 +672,10 @@ considering later, each only after a measurement shows it pays:
 
 ## 8. Language and safety-model proposals
 
-Every item here is a proposal for Julia to decide. None is assumed by §2 to §7: the design works
+Julia decided the proposals on 2026-10-11: P1, P2(c), P3(a), P4 (inferred summaries), P5(a), P6,
+P7 and P9 are accepted; P5(b) and P8 are deferred. Each proposal below records its decision. The
+safety-model options of §8.3 are still open. Before the decision, every item was a proposal for
+Julia, and none is assumed by §2 to §7: the design works
 on today's language, and each proposal makes it cheaper or more precise. Each states the reference
 change, what it buys, and why memory safety still holds. They are ranked by benefit, highest first.
 The survey behind them read the reference and the native implementation; its citations were
@@ -704,6 +708,8 @@ largest reason this design can be precise.
 
 **P1. Results depend on the profile entries they read, not on the whole profile.**
 
+**Decision (Julia, 2026-10-11): accepted.**
+
 - _Today._ Every query key includes the request's profile slot, application and condition context
   (`ScopedKey`, `Semantic.silk:976`; `internKey`, `:3887`). Any change to one package parameter or
   target fact opens a new cache partition; no answer is shared, even one that never reads the
@@ -718,6 +724,8 @@ largest reason this design can be precise.
 - _Safety._ Unchanged. This is dependency granularity, not semantics.
 
 **P2. Make failure observation local instead of a whole-program switch.**
+
+**Decision (Julia, 2026-10-11): accepted, option (c).**
 
 - _Today._ If any reached function runs `observeDiagnostics`, every function is lowered again in
   observing mode with hidden parameters, and the instance graph is walked twice
@@ -736,6 +744,8 @@ largest reason this design can be precise.
   observation to be explicit.
 
 **P3. Region-erased identity without a build-wide fixed point.**
+
+**Decision (Julia, 2026-10-11): accepted, option (a).**
 
 - _Today._ An application is region-sensitive if lowering consulted a lifetime-selective head, or
   if it lends its regions to one that did (`region-sensitive-identity.md`). Rule 2 is a fixed point
@@ -763,6 +773,8 @@ Guard<'static, 'data>`, `packages/compiler/test/support/corpus.ts:8439`), and co
   have about a dozen, which exist to test this feature.
 
 **P4. Suspension summaries inferred per instance, with cutoff (no language change).**
+
+**Decision (Julia, 2026-10-11): accepted as the inferred per-instance summary below; declared modes only as a fallback.**
 
 Julia's direction (2026-10-11): keep Effect uncolored. This is the recommended option; declared
 modes are kept only as a fallback.
@@ -844,6 +856,8 @@ Then:
 
 **P5. Type summaries instead of transitive walks, and optionally explicit lifetimes on types.**
 
+**Decision (Julia, 2026-10-11): (a) accepted; (b) deferred.**
+
 - _Today._ Generated field lifetimes are transitive: a nested nominal used without written
   lifetimes contributes its own generated lifetimes (LIFE-003, `lifetimes.md:73-90`;
   `FieldLifetimes`, `Semantic.silk:16191`). Variance is recomputed per use (`Semantic.silk:30130`
@@ -864,6 +878,8 @@ Then:
 
 **P6. Operators selected through their operands' conformance buckets.**
 
+**Decision (Julia, 2026-10-11): accepted; the OP-009 open question is answered yes.**
+
 - _Today._ Operator discovery collects every operator-eligible interface of every namespace-imported
   module (`collectOperatorInterfaces`, `Semantic.silk:60658`), and each operator use reads all of
   their buckets. Adding an operator interface to an imported module can make unrelated operator
@@ -878,6 +894,8 @@ Then:
 
 **P7. Test descriptors without static positions.**
 
+**Decision (Julia, 2026-10-11): accepted.**
+
 - _Today._ Each test descriptor carries its line and column (TEST-004, `testing.md:100`), so any
   edit that shifts a test changes the catalog and re-specializes the runner's `static for`.
 - _Option._ The descriptor carries an opaque location handle that the runner renders at report
@@ -888,6 +906,8 @@ Then:
 
 **P8. Local polymorphic-recursion admission.**
 
+**Decision (Julia, 2026-10-11): deferred.**
+
 - _Today._ Whether a recursive specialization is admitted depends on the path from the roots
   (GEN-006, `generics-interfaces-and-specialization.md:327`; `Specialization.silk:1320-1360`).
 - _Option._ Decide admission per strongly connected component of one declaration's own static call
@@ -897,6 +917,8 @@ Then:
 - _Safety._ Unchanged; this concerns termination of specialization.
 
 **P9. Name `impl` blocks by their head.**
+
+**Decision (Julia, 2026-10-11): accepted.**
 
 - An unnamed `impl` block's identity is its occurrence among unnamed siblings, so inserting one
   shifts the others (§3.3). Coherent conformance heads are distinct by definition, so the written
@@ -1127,8 +1149,10 @@ backdating, potentially-outdated verification. Acceptance:
 - `completeMirEqualityIncludesSafetyRegionsAndReportingOrigins`: MIR equality covers safety regions
   and reporting origins, so cutoff never hides a change in either.
 
-**Slice 6, bucket and profile dependees.** `ImplSet`, `InherentSet`, `ProfileEntry`, plus whichever
-of P1, P5(a), P6 and P9 Julia accepts.
+**Slice 6, bucket and profile dependees.** `ImplSet`, `InherentSet`, `ProfileEntry`, plus the
+accepted P1, P5(a), P6 and P9. The other accepted proposals land as their own slices after slice
+5, each with its reference change where it has one: P2(c) and P3(a) in lowering, P4 with the
+SCC-capable query, P7 in test discovery and the runner.
 
 **Slice 7, backend reuse.** Codegen units keyed by content subjects, object reuse, linking.
 
@@ -1154,17 +1178,12 @@ counts and results in existing case files, no timing assertions, no per-feature 
    descriptors)?
 4. **Unit granularity.** One `Header` unit per declaration (proposed), accepting that a caller
    reading only member names reruns when a field type changes?
-5. **Language proposals.** For each of P1 to P9 in §8.2: accept, reject, or defer. The ranking is
-   P1 (profile entries), P2 (failure observation), P3 (lifetime-selective heads), P4 (inferred suspension
-   summaries, Julia's direction), P5 (type summaries; explicit field lifetimes), P6 (operators through operand
-   buckets, tied to the open OP-009 question), P7 (test positions), P8 (local recursion admission),
-   P9 (`impl` identity by head).
-6. **Safety model.** Borrow checking on the typed body inside the `Body` unit (S1), or a separate
+5. **Safety model.** Borrow checking on the typed body inside the `Body` unit (S1), or a separate
    unit over checking MIR as #1421 proposes (S2)? Both are incremental units with their own cutoff.
-7. **Backend partitioning.** Codegen units by defining module, or by a fixed number of symbol-hash
+6. **Backend partitioning.** Codegen units by defining module, or by a fixed number of symbol-hash
    buckets? And should the fixpoint gate compare IR per codegen unit?
-8. **Session order.** Watch mode before the LSP (proposed)?
-9. **Disk caches.** None in v2 (proposed), with object code per codegen unit as the first candidate
+7. **Session order.** Watch mode before the LSP (proposed)?
+8. **Disk caches.** None in v2 (proposed), with object code per codegen unit as the first candidate
    after measurement?
-10. **Budgets.** One-shot within 1% of a recorder-free build, first incremental build within 3%
-    time and 5% RSS (proposed)?
+9. **Budgets.** One-shot within 1% of a recorder-free build, first incremental build within 3%
+   time and 5% RSS (proposed)?
