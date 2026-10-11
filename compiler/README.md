@@ -206,6 +206,11 @@ is the root for local module paths. Without a manifest, the entry file's directo
 root. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
+Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filter <text>]
+[--file <path>] [--optimization <none|speed>] [--debug <true|false>] --no-cache`. It builds the
+bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
+plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
+
 ### One native generation and its smoke receipt
 
 `NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
@@ -309,6 +314,8 @@ reads only the syntax index, so a name with a conditional candidate there is the
   suspension, closures and the opt-in MIR check.
 - [Effect calling convention](docs/effect-calling-convention.md): how native code receives Effect
   providers, returns typed failures, and expands the Effect composition intrinsics (roadmap step 5).
+- [Native `silkc test`](docs/native-test.md): test discovery, the runner exchange, and the CI
+  switch of the Cases shards.
 
 ## Development branches and bootstrap
 
