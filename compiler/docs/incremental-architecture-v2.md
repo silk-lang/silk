@@ -34,8 +34,11 @@ cold-build gate.
 - Nine language proposals and three safety-model options are ranked for Julia (§8). The largest
   precision gains come from scoping results by the profile entries they read, and from removing the
   three build-wide fixed points: failure observation, region sensitivity and suspension.
-- The work starts with two deletions that need no new design, worth the measured 34%. Six slices
-  then build the graph, its precision and cutoff, backend reuse and the session driver (§10).
+- The work starts with two changes that need no new design and land first: one build round instead
+  of 81, and no recording in one-shot builds, worth the measured 34% together. Six slices then
+  build the graph, its precision and cutoff, backend reuse and the session driver (§10).
+- Checking units are incremental units with their own cutoff, keyed like the body they prove, so
+  native borrow checking can start now (§8.3).
 
 ## 1. Current state
 
@@ -421,19 +424,24 @@ answers (`OriginContext`). They record nothing in a one-shot build because the r
 The same flag gates fingerprinting (§3.1), the dedup set, unit revision stamps and the dependee
 maps. A one-shot build allocates none of them.
 
+This is a recording policy, not a dual path. Julia decided on 2026-10-11 that one recorder which
+returns early in one-shot builds is allowed under the green-field rule (the `AGENTS.md` rule added
+in #1434). The analysis code is the same in both modes; only whether facts about it are retained
+differs.
+
 ### 5.2 What a one-shot build still pays
 
 The audit's lesson is to account these separately (audit §1):
 
-| Work                                                                               | One-shot              | Why it stays                                                       |
-| ---------------------------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------ |
-| Identity interning                                                                 | yes                   | it replaces byte comparison and copying, a net gain (#1427, #1431) |
-| Unit table and memo answers                                                        | yes                   | memoization is the scheduler; every unit runs at most once         |
-| Instance walk and reachability                                                     | yes                   | emission needs it (`buildRuntime`, `Semantic.silk:64948`)          |
-| Diagnostics and reference context                                                  | yes                   | output                                                             |
-| Fingerprints                                                                       | no                    | nothing compares them                                              |
-| Edges, dependee maps, stamps                                                       | no                    | nothing invalidates                                                |
-| Source observations, footprints, body evidence, answer identity copies, validation | deleted in both modes | replaced by the graph (§10)                                        |
+| Work                                                                               | One-shot | Why it stays                                                                           |
+| ---------------------------------------------------------------------------------- | -------- | -------------------------------------------------------------------------------------- |
+| Identity interning                                                                 | yes      | it replaces byte comparison and copying, a net gain (#1427, #1431)                     |
+| Unit table and memo answers                                                        | yes      | memoization is the scheduler; every unit runs at most once                             |
+| Instance walk and reachability                                                     | yes      | emission needs it (`buildRuntime`, `Semantic.silk:64948`)                              |
+| Diagnostics and reference context                                                  | yes      | output                                                                                 |
+| Fingerprints                                                                       | no       | nothing compares them                                                                  |
+| Edges, dependee maps, stamps                                                       | no       | nothing invalidates                                                                    |
+| Source observations, footprints, body evidence, answer identity copies, validation | no       | not recorded one-shot from §10 slice 2; deleted when the graph replaces them (slice 3) |
 
 ### 5.3 One scheduler
 
@@ -450,12 +458,14 @@ reads every module the build observed as absent, publishes a new `Revision`, cal
 `Semantic.revise` and runs the build again until no new file arrives (`main.silk:470-497`,
 `ModuleSources.publishObserved`, `driver/ModuleSources.silk:613`). Each round revalidates every
 cached answer against the new revision (`validAnswer`, `Semantic.silk:1627`) and recomputes every
-answer that observed a newly present module. §1.4 measures what this costs.
+answer that observed a newly present module. §1.3 measures what this costs.
 
-v2 loads sources on demand. The source provider becomes a `service` that the driver supplies: a
+Preloading lands first (§10 slice 1): the driver reads the module set before the semantic build,
+so the build runs once. The end state for a session is on-demand loading, because a watch session
+cannot know in advance which modules an edit will import. The source provider becomes a `service` that the driver supplies: a
 `SourceIndex` miss asks it for the module's bytes or absence, and the answer is final for the
-session's current revision. A one-shot build then runs exactly once, and `Semantic.revise` is
-called only by an incremental session when files change. The semantic store still never touches
+session's current revision. `Semantic.revise` is then called only by an incremental session when
+files change. The semantic store still never touches
 the filesystem itself; it reads through the provider, which tests replace with an in-memory map.
 
 ## 6. Invalidation and cutoff
@@ -808,17 +818,42 @@ signatures and type properties. That makes the checking unit local, as #1421 ass
 - Its §9 budget (10% of front end, 0.5 GiB) should be measured with the recorder off, so the
   borrow stage is not charged for bookkeeping that v2 removes.
 
-**Which #1421 questions this answers or reframes:**
+**The checking-unit rule.** A checking unit is an incremental unit with its own cutoff:
 
-- _Q1 (MIR or typed body)._ Reframed. Incremental compilation does not need MIR: both S1 and S2 are
-  units keyed by `(DeclIndex, selection)` that read only the body, callee headers and type
-  summaries. The choice is about cold cost and one representation, and S1 is cheaper cold.
-- _Q8 (re-check region-sensitive instances)._ Answered by P3(a): there are none.
-- _§5 "an unchanged answer cuts off downstream re-execution"._ Confirmed, with v2's cutoff table
-  (§6.3). Nothing reads a borrow answer except the build verdict and the emitted body's
-  `safetyChecked` flag.
-- _Q3 (no two-phase borrows) and Q4 (one owner for move rules)._ Unaffected by incremental
-  compilation, except that under S1 one stage owns both naturally.
+- it is keyed by `(DeclIndex, selection)`, the key of the `Body` it proves, never by an instance
+  or by a declaration ordinal;
+- it reads only that body (through its own `Body` unit), the `HeaderOf` of every callee and bound
+  operation it calls, and the type summaries of the types it touches (P5a). It never reads a
+  callee's body, MIR or checking answer;
+- its result is `Checked`, `Rejected` with codes and relative anchors, or `NotChecked{reason}`, and
+  §6.3 compares exactly that;
+- a body edit reruns the edited declaration's checking units; a signature edit reruns the checking
+  units of the callers whose `HeaderOf` read changed; a type edit reruns those whose summary
+  changed. Nothing else reruns.
+
+Native borrow checking can start with this rule against today's query engine: the key and the read
+set are what matter, and v2 slice 3 attaches edges to them without changing the checker.
+
+**#1421's open questions.** Already decided by Julia: no two-phase borrows (Q3), OWN0017 dropped
+(Q5), and native names printed with bootstrap codes (Q7). This design answers or reframes:
+
+- _Q1 (MIR or typed body)._ Reframed: incremental compilation does not require MIR. S1 and S2 are
+  both checking units under the rule above. The choice is cold cost against one representation:
+  S1 adds no second lowering of generic bodies, S2 keeps emission and checking on one shape.
+- _Q2 (span parity)._ Compatible with code plus primary-span parity, with one requirement: checking
+  answers store spans relative to their declaration (§3.5), because cutoff compares them. Parity
+  then compares rendered spans, and an edit elsewhere in the file never changes a cached answer.
+- _Q4 (one owner for move rules)._ Not constrained by incremental compilation as long as move and
+  loan checks of one body run under the same key, so one body edit reruns both and nothing else.
+  Under S1 one stage owns both naturally. Under S2, keeping moves in typing is equally incremental.
+- _Q6 (when the gap becomes an error)._ Not constrained. The unchecked count is the number of
+  `NotChecked` answers among checking units of emitted bodies, deterministic per build in both
+  modes, so CI can fail on any increase from the first slice.
+- _Q8 (re-check region-sensitive instances)._ Answered: instances are never checking units, so
+  region-sensitive instances need no check of their own in either mode. P3(a) also removes them
+  outright.
+- _#1421 §5, "an unchanged answer cuts off downstream re-execution"._ Confirmed by §6.3. Nothing
+  reads a checking answer except the build verdict and the emitted body's `safetyChecked` flag.
 
 ## 9. Budgets and evidence
 
@@ -834,7 +869,7 @@ signatures and type properties. That makes the checking unit local, as #1421 ass
 - **Why it can hold.** In a one-shot build the recorder is one predictable branch per child demand
   (15.6 million in §1.2) and no fingerprints are computed. **[assumption]** At under a nanosecond
   per taken branch, that is below 20 ms.
-- **Slices 1 and 2 are not gated this way.** They delete work; they report before and after, and
+- **Slices 1 and 2 are not gated this way.** They remove work; they report before and after, and
   must show the measured gains of §1.3 or explain the difference.
 
 ### 9.2 The first build of an incremental session
@@ -907,26 +942,29 @@ ordinal (`Key.declaration`, `Semantic.silk:965`), and answers hold handles inste
 (`Value.Selected`, `:692`). Also count the stdlib and corpus `impl` heads that P3(a) would reject,
 for Julia's decision.
 
-**Slice 1, sources on demand.** A source-provider service answers `SourceIndex` misses. Delete the
-discovery loop in `main.silk:470-497`, `ModuleSources.publishObserved` and the attempted-module
-list, and the source event log the driver reads. A one-shot build calls `Semantic.revise` never.
+**Slice 1, one build round (lands first, compile-speed worker).** The driver preloads the
+module set before the semantic build, so a one-shot build never calls `Semantic.revise` and the
+discovery loop in `main.silk:470-497` with `ModuleSources.publishObserved` is deleted. The
+on-demand source provider of §5.4 replaces preloading when the session driver needs it (slice 8).
 **Expected [measured upper bound]:** about 22% of user time (§1.3).
 
-**Slice 2, delete per-answer revision evidence.** Delete `Answer.sources`, `Answer.footprint`,
-`Answer.identity`, `Answer.answerId`, `Answer.bodyEvidence`, `SourceFrame`, `mergeEvidence`,
-`appendObservation`, `validAnswer`, `BodyDependency`, `BodyCandidate`, `reuseBody`,
-`priorCandidate`, `BodyInput`'s text and canonical encodings, `Request.hasDemand` and
-`Request.hasDiscovered`, and `SourceRevision.Observation`. Until slice 3, `Semantic.revise`
-discards every answer: correct, with no reuse. Body reuse is used today only by tests and by the
-discovery loop that slice 1 deletes. Tests that assert reuse counts are deleted here and return as
-acceptance cases in slices 4 and 5. **Expected [measured upper bound]:** about 16% of the remaining
-user time, 2.4% of RSS (§1.3). This needs Julia's agreement, because it removes incremental reuse
-for a few slices (§11, Q1).
+**Slice 2, no recording in one-shot builds (lands first, compile-speed worker).** Behind the
+one-shot early return of §5.1, a one-shot build skips observation capture and merging,
+footprints, body-dependency records, answer identity copies, `BodyInput` text and encodings, and
+memo-hit validation. A store that will be revised keeps today's evidence until slice 3 replaces
+it. **Expected [measured upper bound]:** about 16% of the remaining user time and 2.4% of RSS
+(§1.3); skipping `BodyInput` work may add to it.
 
 **Slice 3, the session and the graph at module granularity.** The `Recorder` with its early return,
 unit states and revision stamps, the edge array, dependee maps and free list, and update steps 1 to
-5 with one input kind, `SourceFile(M)` by file fingerprint. Measure §9.1 and §9.2. Acceptance: for
-every #1359 scenario, a revised store's results equal a fresh store's.
+5 with one input kind, `SourceFile(M)` by file fingerprint. It deletes the evidence machinery that
+slice 2 only stopped recording: `Answer.sources`, `Answer.footprint`, `Answer.identity`,
+`Answer.answerId`, `Answer.bodyEvidence`, `SourceFrame`, `mergeEvidence`, `appendObservation`,
+`validAnswer`, `BodyDependency`, `BodyCandidate`, `reuseBody`, `priorCandidate`, `BodyInput`'s text
+and canonical encodings, `Request.hasDemand`, `Request.hasDiscovered` and
+`SourceRevision.Observation`. Tests that assert today's reuse counts are rewritten against unit
+starts. Measure §9.1 and §9.2. Acceptance: for every #1359 scenario, a revised store's results
+equal a fresh store's.
 
 **Slice 4, declaration precision.** `whole` and `prototype` fingerprints, `DeclSource`,
 `DeclPrototype`, `Name`, `Namespace`; relative spans and the location table. Acceptance, from
@@ -969,9 +1007,9 @@ counts and results in existing case files, no timing assertions, no per-feature 
 
 ## 11. Open questions for Julia
 
-1. **Temporary loss of reuse.** May slice 2 delete body reuse and revision validation before the
-   graph exists (slices 3 to 5), given that only tests and the discovery loop use them and the
-   deletion is worth about 16% of a cold build?
+1. **Reuse between slices 3 and 4.** Slice 3 replaces body reuse with module-granularity
+   invalidation, so a revised store reruns every unit of an edited module until slice 4 restores
+   declaration precision. Acceptable, given that only tests use revision today?
 2. **Fingerprint hash.** A 128-bit non-cryptographic word-at-a-time hash (proposed), or BLAKE3
    truncated to 128 bits as Zig uses, for resistance to deliberate collisions at several times the
    cost per byte?
