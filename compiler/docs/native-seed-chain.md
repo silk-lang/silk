@@ -72,10 +72,10 @@ Jobs in `.github/workflows/selfhost.yml`:
    (`NativeBuild.ts --fixpoint`). The N2 build and N1's IR emission run concurrently; on the runner
    each peaked at 4.74 GB, at most 9.5 GB together, inside the 16 GB ubuntu-24.04 runner. This job is the required check that replaces
    **Authored native seed (N0)**.
-3. **Selfhost native corpus** runs the full corpus with N1 (the verification harness's
+3. **Selfhost native corpus** builds the formatter safety gate with N1 and verifies repository
+   formatting with it, then runs the full corpus with N1 (the verification harness's
    `--mode corpus-full`) and keeps the baseline-pass and accepted-failure checks.
-4. **Native formatter safety** builds the formatter gate and verifies repository formatting.
-5. **Selfhost cases** shards are unchanged (milestone 2 moves them off the bootstrap).
+4. **Selfhost cases** shards are unchanged (milestone 2 moves them off the bootstrap).
 
 N1 and N2 are compiled from the same source by different compilers, so identical IR shows that the
 seed and N1 agree on the meaning of the compiler. A change to code generation still reaches a
@@ -151,6 +151,5 @@ not outlive the push run that publishes its replacement.
   `NativeBuild.ts` go away; `NativeBuild.ts` builds any generation from a hash-verified compiler.
 - `SourceSnapshot.mjs` is unchanged and still defines the exact inputs.
 - `check-native-contracts` runs in the N1 job.
-- The corpus no longer rebuilds the compiler with the bootstrap. Until the formatter verification
-  mode on `main` stops rebuilding the compiler (a guarded change that lands on `main` first), the
-  formatter safety job still runs that rebuild; it is not on the required path.
+- The corpus and formatter verification no longer use the bootstrap: N1 compiles the corpus and
+  builds the formatter safety gate, and the harness's formatter mode only verifies formatting.
