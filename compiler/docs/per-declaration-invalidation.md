@@ -1,6 +1,6 @@
 # Per-declaration invalidation
 
-**Status:** parked draft; the cold-build gate fails (see
+**Status:** parked draft; the cold-build gate fails. See
 [the handoff](per-declaration-invalidation-handoff.md). Semantic facts validate through typed
 source projections and ordered direct query dependencies. Absolute syntax identities and source coordinates remain explicit
 inputs; moving them causes recomputation. This is a sound per-declaration cache with conservative
