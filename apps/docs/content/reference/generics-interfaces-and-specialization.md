@@ -1507,8 +1507,10 @@ conformance head applies to a goal whatever regions it carries; a conformance he
 `'static`, repeat one region, or bound a region, and typing proves those relations at each use with
 the real regions. A sealed `Drop` or `Copy` head is different: cleanup and copying are chosen for a
 type without a proof at the use, so such a head may not name `'static`, name one region at two
-positions, or bound a region (`'a: 'b`, `T: 'a`). Each of its region positions takes its own
-unbounded binder.
+positions, or bound a region (`'a: 'b`, `T: 'a`, or a representation contract that names a region).
+Each of its region positions takes its own unbounded binder. The one exception is a bound the
+provider's declaration already places on the same parameter: every value of the type satisfies it,
+so repeating it on the head selects nothing.
 
 ```silk,ignore
 struct Guard<'a> { value: &'a i32 }
@@ -1516,6 +1518,10 @@ struct Guard<'a> { value: &'a i32 }
 impl<'a> Drop for Guard<'a> { /* ... */ }        // valid
 impl Drop for Guard<'static> { /* ... */ }       // invalid: cleanup would depend on a region
 impl<'a: 'static> Drop for Guard<'a> { /* ... */ } // invalid: a region bound
+
+struct Lasting<'a: 'static> { value: &'a i32 }
+
+impl<'a: 'static> Drop for Lasting<'a> { /* ... */ } // valid: Lasting already requires it
 ```
 
 **Boundary:** Silk does not rank a concrete `impl` above a generic one, rank stronger bounds above
