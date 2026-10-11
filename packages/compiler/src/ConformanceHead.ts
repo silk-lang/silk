@@ -76,9 +76,9 @@ export type TerminationFailure =
     }
 
 /**
- * Why a head would let a region choose its witness. Coherence erases lifetimes, so a head may only
- * give every region position its own unbounded binder; then each region pattern of a goal matches
- * it alike, and a specialization never depends on which regions a caller supplied.
+ * Why a sealed Drop or Copy head would let a region decide which code runs. Such a head may only
+ * give every region position its own unbounded binder; then each region pattern of a type matches
+ * it alike, and cleanup or copying never depends on which regions a caller supplied.
  */
 export type RegionSelection =
   | { readonly _tag: 'StaticRegion' }
