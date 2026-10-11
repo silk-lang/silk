@@ -1,12 +1,14 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import * as Diagnostic from '../src/Diagnostic.js'
 import * as FormattedDocument from '../src/FormattedDocument.js'
 import * as Lexer from '../src/Lexer.js'
 import * as Parser from '../src/Parser.js'
 import * as SourceFile from '../src/SourceFile.js'
+import * as SourceResolver from '../src/SourceResolver.js'
 import * as SyntaxFormatter from '../src/SyntaxFormatter.js'
 
 const encoder = new TextEncoder()
@@ -213,6 +215,47 @@ it.effect('formats the contextual marker before ordinary and effect contracts', 
     assert.strictEqual(
       new TextDecoder().decode(FormattedDocument.toUint8Array(effectful)),
       'interface M {\n  operator * effect fn mul(left: Self, right: i32) -> Self\n}\n',
+    )
+  }),
+)
+
+it.effect('selects operators only from the operand type module conformances', () =>
+  Effect.gen(function* () {
+    // `Merge for Value` lives in the interface's module (IMPL-004), so it serves the named call but
+    // not `+`: an operator use reads only the conformances `Value`'s own module declares.
+    const value = `pub struct Value { pub raw: i32 }
+pub fn first(left: Value, right: Value) -> Value {
+  drop right
+  return move left
+}`
+    const merge = `import operators.value { Value }
+pub interface Merge { operator + fn add(left: Self, right: Self) -> Self }
+impl Merge for Value { add: Value.first }`
+    const main = `import operators.value { Value }
+import operators.merge { Merge }
+fn named(left: Value, right: Value) -> Value { return Merge.add(move left, move right) }
+fn spelled(left: Value, right: Value) -> Value { return move left + move right }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* Analysis.make({
+      root: 'operators/main',
+      configuration: AnalysisFixture.configuration('operators/main'),
+    }).pipe(
+      Effect.provide(
+        SourceResolver.overlay([
+          SourceFile.make('operators/main', encoder.encode(main)),
+          SourceFile.make('operators/value', encoder.encode(value)),
+          SourceFile.make('operators/merge', encoder.encode(merge)),
+        ]).pipe(Layer.provideMerge(SourceResolver.empty)),
+      ),
+    )
+    const operator = main.indexOf('+')
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [
+        diagnostic.code,
+        diagnostic.span.start,
+        diagnostic.span.end,
+      ]),
+      [[Diagnostic.operatorNotApplicableCode, operator, operator + 1]],
     )
   }),
 )
