@@ -13,7 +13,7 @@ The language contract is the reference chapter [Tests and the source runner](../
 ## Command
 
 ```sh
-silkc test <root.silk> [--stdlib <dir>] [--filter <text>] [--file <path>] \
+silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--file <path>] \
   [--optimization none|speed] [--debug true|false] --no-cache
 ```
 
@@ -23,8 +23,10 @@ silkc test <root.silk> [--stdlib <dir>] [--filter <text>] [--file <path>] \
   package `compiler/silk.toml`, module directory `compiler/src`.
 - The executable entry is the bundled runner `silk/test_runner`, an ordinary standard-library module
   (TEST-007). The discovery root is a second root of the same compilation. It need not have `main`.
-- `--filter` and `--file` are passed to the runner unchanged (TEST-006). `--file` is normalized to
-  the package-relative logical path first, as the bootstrap does.
+- `-o` names the runner executable, as for `build`. The plan and receipt are written beside it as
+  `<executable>.plan` and `<executable>.receipt` and removed after the run.
+- `--filter` and `--file` are passed to the runner unchanged (TEST-006). `--file` takes the
+  package-relative logical path the catalog reports, such as `src/semantic/TargetCases.silk`.
 - `--no-cache` is required for now. Result reuse (TEST-008) needs execution identities that the
   native compiler does not publish yet; without the flag the command reports
   `SILK_GAP test-result-cache` and exits 2 before compiling. When execution identities land, the
@@ -34,15 +36,15 @@ The command compiles the runner, writes an Uncached plan, runs the executable, a
 and exits with the runner's status:
 
 1. Build the test application exactly like `build` builds an application, with two differences:
-   the semantic request's application module is `silk/test_runner` and it carries the discovery
-   root. The executable goes to `<module dir>/../build/test/<target>/<root logical path>`, so a
-   shard's roots never overwrite each other.
+   the semantic request's application module is `silk/test_runner`, and the store selects the
+   source file as its discovery root.
 2. Read the published test catalog from the same semantic store (the discovery answer below) and
    compute the catalog digest: SHA-256 over `u64le ordinal ‖ u64le length ‖ identity bytes` for
    every test in catalog order, the framing `silk/test_exchange` checks.
-3. Write the 256-byte Uncached plan (`SLKTPLN1`, version 1, mode 2, a 32-byte nonce read from
-   `/dev/urandom`, the digest, the discovered count, zero padding) into a fresh exchange
-   directory beside the executable.
+3. Write the 256-byte Uncached plan (`SLKTPLN1`, version 1, mode 2, a 32-byte nonce, the digest,
+   the discovered count, zero padding). The nonce only has to differ between runs, so that a stale
+   receipt never binds a new plan: it is the SHA-256 of the system clock, the executable path and
+   the catalog digest.
 4. Run the executable through `silk.child_process` with
    `[--file F] [--filter T] --silk-test-plan <dir>/plan.bin --silk-test-result <dir>/receipt.bin`.
    Its stdout and stderr are copied to the command's stdout and stderr when it exits.
@@ -50,9 +52,9 @@ and exits with the runner's status:
    256 bytes, `SLKTRCP1`, version, mode, the plan's nonce, SHA-256 of the plan bytes, the plan's
    discovered count, consistent counts (`cached = 0`, `executed = selected`,
    `passed + failed = selected`), the status that matches `failed`, and zero padding.
-6. Remove the exchange directory and exit with the process status: 0 or 1 from an admitted
-   receipt; 2 for an operational failure (spawn failure, invalid or missing receipt); the raw
-   status for an abnormal exit (a trap or signal). Compile refusals keep `build`'s statuses and
+6. Remove the plan and receipt and exit with the process status: 0 or 1 from an admitted
+   receipt; 2 for an operational failure (an invalid or missing receipt, or the runner's own 2);
+   the raw status of any other exit, and 128 plus the signal for a signal. Compile refusals keep `build`'s statuses and
    output: `SILK_BUILD_ERROR=` lines and status 1 for a rejection, `SILK_UNSUPPORTED_JSON=` and
    status 2 for a gap.
 
@@ -96,11 +98,14 @@ its place. No check reads it.
 Test discovery is a semantic query, not a driver scan, so the catalog that the driver digests and
 the catalog the runner iterates are the same answer.
 
-### Request and discovery
+### Discovery root
 
-`Semantic.Request.forTests(application, discoveryRoot)` names the runner as the application and
-records the discovery root. The root becomes a request root, so its module and its imports are
-loaded and published like the application's, and it can be an import-only file.
+`Semantic.selectDiscovery(root, directory)` selects the discovery root of a test build, like
+`selectExecutionStorage` selects a composition component: a fixed input of the store. `directory`
+is the module directory's path relative to the package manifest (`src`), which prefixes each
+test's logical path. The root is the build's entry source, so it and its imports are read and
+published like any demanded module, and it can be an import-only file. `Semantic.demandTests`
+returns the catalog to the driver.
 
 A new query family, `Tests`, keyed by the discovery root module, answers the catalog:
 
@@ -112,9 +117,11 @@ A new query family, `Tests`, keyed by the discovery root module, answers the cat
    that is a valid test entry (below).
 4. Sort by module logical path, name, identity.
 
-Each entry records the declaration identity, the module logical path, the name, the source line
-and byte column of the declaration (1-based), the authored fingerprint, and the callable type the
-signature query already produces for the function. The catalog's dependency edges are the module
+Each entry records the declaration identity (`project:<module>` and the declaration's owner steps,
+such as `project:semantic/TargetCases/function=frozenTargetRequiresExplicitSelection#0`, the
+bootstrap's spelling), the module, the name, the package-relative path, the 1-based line and byte
+column of the declaration, the authored fingerprint, and the exact callable type of naming the
+function as a value. The catalog's identity is a SHA-256 over its entries; descriptors carry it. The catalog's dependency edges are the module
 imports and headers it read, so editing a test body leaves the catalog answer valid while editing a
 header or an import revalidates it.
 
@@ -155,8 +162,11 @@ checked intrinsic types next to `Fields` and `Field`:
   `name`, `module`, `path` (all `string<'static>`), `line`, `column` (`usize`), and `fingerprint`
   (`string<'static>`).
 
-New `StaticValue` forms carry the authority: `Test {ty, declaration, authorization}` where the
-authorization is the catalog identity, minted only by the catalog provider, like `Field`.
+A descriptor is a phase-only aggregate of the sealed `Test<F>` type holding the catalog identity
+and the test's ordinal, like the existing `Intrinsic.Type<Owner>` descriptor; a `TestInfo` is an
+aggregate of the seven fields. Source cannot construct a sealed family, and `StaticValue` mints
+these values only through the discovery constructors, so a descriptor cannot be forged. The
+catalog is a `Sequence` at the `Tests` type.
 
 The primitives:
 
@@ -168,9 +178,13 @@ The primitives:
   a reflected field label is embedded today.
 - `testFunction<F>(static descriptor: Test<F>) -> F` is mixed-phase, checked like `borrowField`:
   the descriptor is a static slot, authenticated against the catalog, and the result is the test
-  function's ordinary callable value (a `CallableValue` with no captures). Calling it is an
-  ordinary call of that function. A descriptor from another catalog, or for a declaration that is
-  no longer a test, is a static-phase rejection.
+  function's ordinary callable value: its application, no captures, and a shared contract that
+  takes nothing and returns the call's result (the constructed Effect of a `test effect fn`). One
+  helper computes this type for both the catalog and the checker, so `Test<F>` and the checked
+  value always agree. A descriptor from another catalog is a static-phase rejection.
+- A projection rooted at a static-phase call, `Intrinsic.testInfo(descriptor).identity`, is
+  evaluated as a whole in a runtime body, as a projection of a static binding already is; only
+  the text or position reaches the runtime program.
 
 `static for descriptor in Intrinsic.tests()` uses the existing mixed-body `static for`: the
 catalog is a sequence value, each iteration binds one descriptor, and the body is selected once per
@@ -205,11 +219,10 @@ TypeScript compiler and its 8 to 12 GiB heap from the job, not the front-end tim
 
 Per AGENTS.md, claims are proven at the cheapest tier:
 
-- TEST-001 spans and codes, discovery order and membership, `tests()` without a root, foreign
-  descriptors, and the `TestInfo` values: structured analysis assertions in a semantic Cases file,
-  with in-memory sources and a discovery root on the request. No process runs.
-- The plan encoding and the receipt admission: pure-function cases over bytes in a driver Cases
-  file.
+- TEST-001 spans and codes: the existing contract fixture in `SemanticSignatureCases.silk`.
+- Discovery order, membership, entry metadata, refusals, and a body that iterates the catalog,
+  reads `TestInfo` and binds each `testFunction`: `TestDiscoveryCases.silk`, imported by the
+  static root. In-memory sources, no process runs.
 - The end-to-end command is exercised by CI itself: a native shard is a complete run whose names,
   results and timings the existing log check reads. No test spawns the compiler.
 
