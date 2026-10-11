@@ -119,9 +119,10 @@ A new query family, `Tests`, keyed by the discovery root module, answers the cat
 
 Each entry records the declaration identity (`project:<module>` and the declaration's owner steps,
 such as `project:semantic/TargetCases/function=frozenTargetRequiresExplicitSelection#0`, the
-bootstrap's spelling), the module, the name, the package-relative path, the 1-based line and byte
-column of the declaration, the authored fingerprint, and the exact callable type of naming the
-function as a value. The catalog's identity is a SHA-256 over its entries; descriptors carry it. The catalog's dependency edges are the module
+bootstrap's spelling), the module, the name, the package-relative path, the authored fingerprint,
+and the exact callable type of naming the function as a value. It records no source position
+(TEST-004), so moving a test changes neither the catalog nor a runner specialized over it. The
+catalog's identity is a SHA-256 over its entries; descriptors carry it. The catalog's dependency edges are the module
 imports and headers it read, so editing a test body leaves the catalog answer valid while editing a
 header or an import revalidates it.
 
@@ -160,8 +161,7 @@ to `Fields` and `Field`:
   with no runtime representation.
 - `TestInfo` is a compiler-generated struct, not phase-only (as in the bootstrap's
   `isStaticPhaseOnly`), with the bootstrap's fields in order: `identity`,
-  `name`, `module`, `path` (all `string<'static>`), `line`, `column` (`usize`), and `fingerprint`
-  (`string<'static>`).
+  `name`, `module`, `path` and `fingerprint`, all `string<'static>`.
 
 A descriptor is a phase-only aggregate of the sealed `Test<F>` type holding the catalog identity
 and the test's ordinal, like the existing `Intrinsic.Type<Owner>` descriptor; a `TestInfo` is an
