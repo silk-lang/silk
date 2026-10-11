@@ -71,11 +71,21 @@ absolute references safe while allowing a fresh answer to occupy the same declar
 - **Name:** the ordered candidates for one name, including visibility, import binding and
   conditional context. An empty bucket is a first-class negative input.
 - **Shape:** ordered declaration headers for providers that scan a module's declarations.
+- **Diagnostics:** the count and spans of a module's parse diagnostics.
 
 Header and body projections also observe enclosing lexical headers. An anonymous body observes
 its enclosing bodies because preceding bindings and captures can affect it without changing the
 literal's own text. Shape reads are intentionally conservative for module scans: a header edit
 may invalidate several scanned facts, but an ordinary runtime body edit does not change them.
+
+A provider that reads raw syntax records the projection of the declaration owning that syntax:
+the header when the node lies in it, otherwise the body. Locating a declaration by identity is a
+Selection read; only an absent identity observes the module shape. Static execution follows the
+same rule. Its authored cursor observes only the module's presence, because the evaluated root's
+own query already observes the syntax it supplies. A selected static callee records its own Body
+read, and mixed static bodies record Name reads for routed spellings, Header and Body reads for
+the declarations they inspect, and a Diagnostics read for their parse-error check. A declaration
+appended after a `static if` function therefore leaves that function's signature and body valid.
 
 Each syntax location records HIR identity, byte span and one-based line and column. `SourceUnit`
 retains a line-start index belonging to its exact parsed bytes. Equal byte offsets alone are not
@@ -146,7 +156,16 @@ would make the cache unsound. This is a separate representation optimization, no
 for the implemented body-edit cutoff.
 
 The structural probe establishes invalidation granularity and warm/fresh agreement for its
-fixtures. It does not establish project-wide latency or memory improvement. Parsing still reads a
-complete changed source, and projection hashing currently runs on demand. Benchmarking large
-projects can justify caching immutable projections in `SourceIndex` without changing the
-validation contract.
+fixtures. It does not establish project-wide latency improvement. Parsing still reads a complete
+changed source.
+
+## Projection cost
+
+Recording a read must not cost more than the fact it protects. Each parsed source retains every
+projection computed from it: content digest, location digest and stability, keyed by kind,
+declaration ordinal and name. Later reads and validations of the same exact source reuse the
+entry, and it is discarded with the source payload. A stability check looks up each owner prefix
+of the identity by hash instead of scanning the module, and each parsed source builds, on first
+request, a table from authored node to its innermost owning declaration. Without these, a cold
+self-build hashed every declaration header for each module-shape read and scanned the module for
+each dependency edge and each type, path, lifetime and binder node it read.
