@@ -51,20 +51,18 @@ try {
     'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
   )
   mkdirSync(join(gate, '..'), { recursive: true })
-  writeFileSync(
-    gate,
-    '#!/bin/sh\nprintf "\\n// formatted witness\\n" >> packages/compiler/stdlib/silk/i32.silk\nprintf "formatted checkout\\n"\n',
-  )
+  const verifyingGate = '#!/bin/sh\nprintf "FORMAT_SAFETY checked=1\\n"\n'
+  writeFileSync(gate, verifyingGate)
   chmodSync(gate, 0o755)
   const bootstrap = join(temporary, 'bootstrap.mjs')
   writeFileSync(
     bootstrap,
-    `import {readFileSync} from 'node:fs'; import assert from 'node:assert/strict'; assert.deepEqual(process.argv.slice(2), ['build', '--manifest-path', 'compiler/silk.toml', '--optimization', 'release-with-debug']); assert.ok(readFileSync('packages/compiler/stdlib/silk/i32.silk', 'utf8').includes('formatted witness')); console.log('rebuilt formatted checkout');`,
+    `import assert from 'node:assert/strict'; assert.deepEqual(process.argv.slice(2), ['build', '--manifest-path', 'compiler/silk.toml', '--optimization', 'release-with-debug']); console.log('rebuilt committed checkout');`,
   )
   const compiler = join(temporary, 'silkc')
   writeFileSync(
     compiler,
-    '#!/bin/sh\nif ! grep -q "formatted witness" "$6/silk/i32.silk"; then exit 9; fi\nprintf "#!/bin/sh\\nexit 42\\n" > program\nchmod +x program\n',
+    '#!/bin/sh\nprintf "#!/bin/sh\\nexit 42\\n" > program\nchmod +x program\n',
   )
   chmodSync(compiler, 0o755)
   const downloaded = join(temporary, 'verification.mjs')
@@ -86,9 +84,24 @@ try {
     })
   const result = invoke()
   assert.strictEqual(result.status, 0, result.stderr)
-  assert.match(result.stdout, /rebuilt formatted checkout/)
+  assert.match(result.stdout, /rebuilt committed checkout/)
   assert.match(result.stdout, /PASS trivial-features/)
-  assert.match(readFileSync(join(temporary, 'formatter-safety.log'), 'utf8'), /formatted checkout/)
+  assert.match(
+    readFileSync(join(temporary, 'formatter-safety.log'), 'utf8'),
+    /FORMAT_SAFETY checked=1/,
+  )
+  // The gate verifies only: a gate that rewrites a tracked source fails before the rebuild.
+  writeFileSync(
+    gate,
+    '#!/bin/sh\nprintf "\\n// formatted witness\\n" >> packages/compiler/stdlib/silk/i32.silk\n',
+  )
+  const rewritten = invoke()
+  assert.notStrictEqual(rewritten.status, 0)
+  assert.match(rewritten.stdout + rewritten.stderr, /changed tracked sources/)
+  execFileSync('git', ['checkout', '--', 'packages/compiler/stdlib/silk/i32.silk'], {
+    cwd: checkout,
+  })
+  writeFileSync(gate, verifyingGate)
   // The downloaded tooling must validate consumer data, rather than embed main's track.
   writeFileSync(track, JSON.stringify(['trivial-features', 'trivial-features']))
   assert.notStrictEqual(invoke().status, 0)
@@ -115,6 +128,10 @@ try {
 if [ "$6" != '${checkout}/packages/compiler/stdlib' ]; then exit 8; fi
 if ! grep -q 'consumer corpus stdlib witness' "$6/silk/i32.silk"; then exit 9; fi
 printf '%s:%s\\n' "$8" "\${10}" >> '${calls}'
+if grep -q 'import silk.json_reflect' "$2"; then
+  printf '%s\\n' 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"smoke-gap","reason":"fake compiler gap"}]}' >&2
+  exit 1
+fi
 printf '#!/bin/sh\\nexit 42\\n' > program
 chmod +x program
 `,
@@ -152,7 +169,8 @@ chmod +x program
   assert.strictEqual(invokeCorpus(undefined, { SILK_BOOTSTRAP: bootstrap }).status, 0)
   assert.strictEqual(existsSync(sentinel), false)
   // Full mode uses the same immutable artifact but executes every regular case. The fake
-  // compiler intentionally produces unpinned mismatches; those remain observations here.
+  // compiler intentionally produces unpinned mismatches and an explicit gap; those remain
+  // observations here, independently of which fixture inputs the harness supports.
   const full = invokeCorpus(['--mode', 'corpus-full'], { SILK_BOOTSTRAP: bootstrap })
   assert.strictEqual(full.status, 0, full.stdout + full.stderr)
   const prefix = 'SELFHOST_CORPUS_MANIFEST='
@@ -211,7 +229,7 @@ chmod +x program
     { _tag: 'Trap' },
   )
   assert.match(full.stdout, /^FAIL /m)
-  assert.match(full.stdout, /^UNSUPPORTED /m)
+  assert.match(full.stdout, /^UNSUPPORTED json-reflect: smoke-gap: fake compiler gap$/m)
   assert.deepStrictEqual(readFileSync(downloaded), readFileSync(bundle))
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)

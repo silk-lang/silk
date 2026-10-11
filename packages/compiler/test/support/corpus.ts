@@ -94,6 +94,12 @@ import {
   affineBorrowedStream,
 } from './borrowedOutcomes.js'
 import { storedCatchSuspension } from './storedCatchSuspension.js'
+import {
+  foreignUnwindFixture,
+  foreignDirectUnwind,
+  foreignCallbackUnwind,
+  foreignIndirectUnwind,
+} from './foreignUnwind.js'
 
 // Folded from Transcendental.test.ts: every runtime bit pattern is committed independently of the
 // compiler implementation. `referenceBits` records the high-precision oracle; `acceptedBits`
@@ -379,6 +385,25 @@ effect fn recover(error: WriterError) -> i32 { return 3 }
 
 pub fn main() -> i32 {
   return run Effect.catchAll(render(), recover)
+}`
+
+/** Calls producing a referent place remain part of the executable instance closure. */
+export const dereferencedCallAcceptance = `fn view(owner: &i32) -> &i32 { return owner }
+pub fn main() -> i32 { let value = 42 return view(&value).* }`
+
+/** A public reflection wrapper specializes once for each sealed field descriptor. */
+export const reflectedBorrowWrapperAcceptance = `import silk.reflect { Reflect }
+struct Box { pub first: i32 pub second: i32 }
+fn read(owner: &Box) -> i32 {
+  let mut total = 0
+  static for field in Intrinsic.reflectFields<Box>() {
+    total = total + Reflect.borrowField<Box, i32>(owner, field).*
+  }
+  return total
+}
+pub fn main() -> i32 {
+  let value = Box { first: 20, second: 22 }
+  return read(&value)
 }`
 
 /** Static template parsing and reflection erase before the shared engine differential. */
@@ -7326,6 +7351,209 @@ const independentExecutionLatchedDestroy = readFileSync(
   new URL('../../conformance/execution-storage/latched-destroy.silk', import.meta.url),
   'utf8',
 )
+/**
+ * A failure caught again after its handler rethrows, and one caught in a loop, under an observer
+ * that counts live diagnostics: each handler runs while its failure is live, every node produced is
+ * released, and none is live when the observer state drops.
+ */
+const diagnosticReleaseBalance = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+
+struct State {
+  live: i32
+  produced: i32
+  released: i32
+  handled: i32
+  bad: i32
+  closed: i32
+}
+struct Observer { state: Shared<State> }
+fn closeObserver(state: &mut State) -> () {
+  if state.live != 0 { state.bad = state.bad + 1 }
+  state.closed = state.closed + 1
+  return ()
+}
+impl Drop for Observer {
+  fn drop(self: &mut Observer) -> () { Shared.withMut(&self.state, closeObserver) return () }
+}
+fn event(state: &mut State, event: u8, first: usize) -> usize {
+  if event == 0 || event == 1 || event == 2 {
+    state.live = state.live + 1
+    state.produced = state.produced + 1
+    return 1
+  }
+  if event == 4 && first != 0 {
+    state.live = state.live - 1
+    state.released = state.released + 1
+  }
+  return 0
+}
+fn observe(state: &mut Observer, operation: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize {
+  return Shared.withMut(&state.state, event(operation, first))
+}
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+  return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
+}
+// A handler runs while the failure it handles is still a live diagnostic.
+fn handling(state: &mut State) -> () {
+  if state.live <= 0 { state.bad = state.bad + 1 }
+  state.handled = state.handled + 1
+  return ()
+}
+struct First { state: Shared<State> }
+struct Second { state: Shared<State> }
+effect fn deep(state: Shared<State>) -> i32 ! First { fail First { state: move state } }
+effect fn middle(state: Shared<State>) -> i32 ! First { return run deep(move state) }
+effect fn rethrow(error: First) -> i32 ! Second {
+  Shared.withMut(&error.state, handling)
+  let First { state } = move error
+  fail Second { state: move state }
+}
+effect fn settle(error: Second) -> i32 {
+  Shared.withMut(&error.state, handling)
+  drop move error
+  return 7
+}
+effect fn settleFirst(error: First) -> i32 {
+  Shared.withMut(&error.state, handling)
+  drop move error
+  return 3
+}
+effect fn caughtAgain(state: Shared<State>) -> i32 {
+  let inner = Effect.catchAll(middle(move state), rethrow)
+  return run Effect.catchAll(move inner, settle)
+}
+effect fn caughtInLoop(state: Shared<State>) -> i32 {
+  let mut total = 0
+  let mut at = 0
+  while at < 3 {
+    total = total + run Effect.catchAll(middle(Shared.clone(&state)), settleFirst)
+    at = at + 1
+  }
+  return total
+}
+fn balanced(state: &mut State) -> i32 {
+  if state.bad != 0 || state.closed != 1 || state.live != 0 { return -1 }
+  if state.produced == 0 || state.released != state.produced { return -1 }
+  return state.handled
+}
+effect fn exercise(again: bool) -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let state = run Shared.make<State>(State { live: 0, produced: 0, released: 0, handled: 0, bad: 0, closed: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if again {
+    let value = run observing(Observer { state: Shared.clone(&state) }, observe, caughtAgain(Shared.clone(&state)))
+    if value != 7 { return -1 }
+  } else {
+    let value = run observing(Observer { state: Shared.clone(&state) }, observe, caughtInLoop(Shared.clone(&state)))
+    if value != 9 { return -1 }
+  }
+  return Shared.withMut(&state, balanced)
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  if (run exercise(true)) != 2 { return 1 }
+  if (run exercise(false)) != 3 { return 2 }
+  return 42
+}
+effect fn noMemory(error: OutOfMemoryError) -> i32 { return 3 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), noMemory) }`
+
+/**
+ * A recovery handler parks while the failure it handles is a live diagnostic, and its Execution is
+ * cancelled there: the payload drops while the failure is live, and the failure's node is released
+ * before the observer state drops.
+ */
+const diagnosticCancelledHandlerRelease = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution, Wake }
+import silk.shared { Shared }
+
+struct State {
+  live: i32
+  produced: i32
+  released: i32
+  parked: i32
+  dropped: i32
+  bad: i32
+  closed: i32
+}
+struct Observer { state: Shared<State> }
+fn closeObserver(state: &mut State) -> () {
+  if state.live != 0 { state.bad = state.bad + 1 }
+  state.closed = state.closed + 1
+  return ()
+}
+impl Drop for Observer {
+  fn drop(self: &mut Observer) -> () { Shared.withMut(&self.state, closeObserver) return () }
+}
+fn event(state: &mut State, event: u8, first: usize) -> usize {
+  if event == 0 || event == 1 || event == 2 {
+    state.live = state.live + 1
+    state.produced = state.produced + 1
+    return 1
+  }
+  if event == 4 && first != 0 {
+    state.live = state.live - 1
+    state.released = state.released + 1
+  }
+  return 0
+}
+fn observe(state: &mut Observer, operation: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize {
+  return Shared.withMut(&state.state, event(operation, first))
+}
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+  return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
+}
+struct Rejected { state: Shared<State> }
+fn recordDrop(state: &mut State) -> () {
+  if state.live <= 0 { state.bad = state.bad + 1 }
+  state.dropped = state.dropped + 1
+  return ()
+}
+impl Drop for Rejected {
+  fn drop(self: &mut Rejected) -> () { Shared.withMut(&self.state, recordDrop) return () }
+}
+struct Guard { wake: Wake }
+fn register(wake: Wake) -> Guard { return Guard { wake: move wake } }
+fn parking(state: &mut State) -> () {
+  if state.live <= 0 { state.bad = state.bad + 1 }
+  state.parked = state.parked + 1
+  return ()
+}
+effect fn reject(state: Shared<State>) -> i32 ! Rejected { fail Rejected { state: move state } }
+// The handler parks while the failure it handles is live; its Execution is then cancelled.
+effect fn parkWhileHandling(error: Rejected) -> i32 {
+  Shared.withMut(&error.state, parking)
+  run Execution.park(register)
+  drop move error
+  return 1
+}
+effect fn observed(state: Shared<State>) -> i32 {
+  let body = Effect.catchAll(reject(Shared.clone(&state)), parkWhileHandling)
+  return run observing(Observer { state: move state }, observe, move body)
+}
+fn complete(state: &mut (), value: i32) -> () { return () }
+fn suspend(state: &mut (), execution: Intrinsic.Execution<i32>) -> () { drop move execution return () }
+fn ready(state: &Shared<State>) -> () { return () }
+fn inspect(state: &mut State) -> i32 {
+  if state.bad != 0 || state.closed != 1 || state.live != 0 || state.parked != 1 || state.dropped != 1 { return -1 }
+  if state.produced == 0 || state.released != state.produced { return -1 }
+  return 42
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let state = run Shared.make<State>(State { live: 0, produced: 0, released: 0, parked: 0, dropped: 0, bad: 0, closed: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let execution = run Execution.make(observed(Shared.clone(&state)), Shared.clone(&state), ready)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut branch = ()
+  run Execution.drive(move execution, &mut branch, complete, suspend)
+  return Shared.withMut(&state, inspect)
+}
+effect fn noMemory(error: OutOfMemoryError) -> i32 { return 1 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), noMemory) }`
+
 export const independentExecutionFinalizedDestroy = readFileSync(
   new URL('../../conformance/execution-storage/finalized-destroy.silk', import.meta.url),
   'utf8',
@@ -8087,6 +8315,16 @@ const borrowedRecoveryStorageCorpus: ReadonlyArray<CorpusProgram> = [
 ]
 
 export const nativeCorpus: ReadonlyArray<CorpusProgram> = [
+  {
+    name: 'dereferenced-call-target',
+    source: dereferencedCallAcceptance,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'reflected-borrow-wrapper',
+    source: reflectedBorrowWrapperAcceptance,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   {
     name: 'owned-allocation-preflight-refusal',
     source: ordinaryStorageSource(`import silk.effect { Effect }
@@ -10767,6 +11005,27 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'foreign-direct-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignDirectUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
+  },
+  {
+    name: 'foreign-callback-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignCallbackUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
+  },
+  {
+    name: 'foreign-indirect-forbidden-unwind',
+    source: 'pub fn main() -> i32 { return 1 / 0 }',
+    nativeSource: foreignIndirectUnwind,
+    nativeCSources: { silk_test_foreign_unwind: foreignUnwindFixture },
+    expected: { _tag: 'Trap' },
+  },
+  {
     name: 'foreign-libc-environ-static',
     source: 'pub fn main() -> i32 { return 42 }',
     nativeSource: `import silk.pointer { Pointer }
@@ -10854,6 +11113,16 @@ pub effect fn main() -> () ! SomeError { return () }`,
     nativeStderr: '',
     nativeRuns: [{}, { arguments: ['one', 'two'] }],
     expected: { _tag: 'Completes', result: 0 },
+  },
+  {
+    name: 'diagnostic-observer-release-balance',
+    source: diagnosticReleaseBalance,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
+    name: 'diagnostic-observer-cancelled-handler-release',
+    source: diagnosticCancelledHandlerRelease,
+    expected: { _tag: 'Completes', result: 42 },
   },
   {
     name: 'native-termination-logical-path',

@@ -38,7 +38,15 @@ Lifetime parameters use the same declaration list with a distinct argument names
 lifetimes follows [header elision](lifetimes.md); the explicit-prefix and inference rules below
 continue to govern ordinary arguments. `T: 'data` constrains borrowed contents, and
 `'long: 'short` constrains validity regions. These predicates never initiate implementation search.
-Lifetime arguments are erased from runtime specialization and physical layout identity.
+Lifetime arguments are erased from physical layout identity. They are also erased from runtime
+specialization identity, so every region pattern of one application shares one body, unless the
+application is region-sensitive. A lifetime-selective head is an `impl` head that names `'static`,
+names one region at two positions of its contract or provider, or bounds a region; only such a
+head can accept one region pattern of an application and refuse another, or select a different
+`Drop` or `Copy` for it. An application is region-sensitive when selecting its body's
+conformances, cleanup or copies consults a lifetime-selective head, or when it lends one of its
+own regions to a region-sensitive application. Each region pattern of a region-sensitive
+application is its own specialization.
 
 ### GEN-001 — Each generic parameter has a declaration-local canonical identity
 
@@ -1434,13 +1442,32 @@ impl<T: Hashable + Display> Inspectable for Box<T> {
 An inline body or mapped generic actor function is checked once under those declared bounds. It
 does not gain operations from concrete types that happen to satisfy the `impl` later.
 
+A conformance head may end in a `where` clause of provider and membership constraints over its
+binders, written as on a function signature:
+
+```silk,ignore
+impl<'provider, P> HttpTransport for Plain<'provider, P>
+where &mut P provides &ByteDuplex from &mut ByteDuplex {
+  readSomeRaw: Plain.read
+  // ...
+}
+```
+
+Each clause is a premise of every inline member. A witness may require only the `where`
+constraints that the head or the implemented operation states, as with its interface bounds, so a
+mapped `Plain.read` that needs `&mut P provides &ByteDuplex from &mut ByteDuplex` is admitted only
+under a head that states it. The constraints are discharged where a concrete provider instantiates
+the witness.
+
 **Boundary:** Every `impl` parameter must be determined by the interface application or provider
 head, and every bounded provider parameter must occur structurally inside the conformance provider.
 A parameter introduced only by a bound would create indistinguishable witnesses and is invalid.
-The first stable model has no `where` clause or bounds on arbitrary constructed types.
+An inherent head takes neither bounds nor a `where` clause, and no head bounds arbitrary
+constructed types.
 
 **Diagnostics:** An undetermined parameter reports an unconstrained-impl-parameter diagnostic at
-its declaration. A bound whose provider does not occur inside the conformance provider reports the
+its declaration. A witness `where` constraint the head and operation do not state reports `SEM0083`
+at the mapping, and a `where` clause on an inherent head reports `SEM0194`. A bound whose provider does not occur inside the conformance provider reports the
 non-descending requirement described by IMPL-008. Invalid operations inside the body retain their
 ordinary missing-bound or contract diagnostics.
 

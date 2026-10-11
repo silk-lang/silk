@@ -185,7 +185,7 @@ effect<'call> fn respondHttp<'call, 'request: 'call, 'connection: 'request, 'tra
     Version.Http11, status, Option.some<&'static [u8]>(b"No Content"), headers, httpValueLimits(),
   ) {
     Result.Failure {error} => { fail ServerError.Value {error: move error} }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
   run reject(&mut request.*, &response, Option.none<Instant>())
   return 42
@@ -304,7 +304,7 @@ effect fn tcpCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | ByteI
       if unsafe silk_listener_stub_getsocknames() == 0 { return 132 }
       return 133
     }
-    Result<Listener, NativeSocketError>.Success {value} => value
+    Result<Listener, NativeSocketError>.Success {value} => move value
   }
   let bound = Listener.boundAddress(&listener)
   let port = match move bound {
@@ -318,7 +318,7 @@ effect fn tcpCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | ByteI
   )
   let accepted = match move admitted {
     Result<Accepted, NativeSocketError>.Failure {error} => { return 134 }
-    Result<Accepted, NativeSocketError>.Success {value} => value
+    Result<Accepted, NativeSocketError>.Success {value} => move value
   }
   run Listener.close(&mut listener)
   let used = run Effect.result(
@@ -340,7 +340,7 @@ effect fn unixCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | Byte
   let opened = run Effect.result(listenUnix(path, ListenOptions.defaults()))
   let mut listener = match move opened {
     Result<Listener, NativeSocketError>.Failure {error} => { return 136 }
-    Result<Listener, NativeSocketError>.Success {value} => value
+    Result<Listener, NativeSocketError>.Success {value} => move value
   }
   if unsafe silk_listener_connect_unix(Pointer.fromSlice<u8>(path), path.length) != 42 { return 41 }
   let admitted = run Effect.result(
@@ -349,7 +349,7 @@ effect fn unixCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | Byte
   )
   let accepted = match move admitted {
     Result<Accepted, NativeSocketError>.Failure {error} => { return 137 }
-    Result<Accepted, NativeSocketError>.Success {value} => value
+    Result<Accepted, NativeSocketError>.Success {value} => move value
   }
   run Listener.close(&mut listener)
   if unsafe silk_listener_path_exists(Pointer.fromSlice<u8>(path), path.length) != 1 { return 42 }
@@ -482,12 +482,12 @@ impl AcceptedContext<i32, never, never ? never> for ParkedAcceptedContext {
 }
 
 effect fn scopedListenerSuccess(listener: &mut Listener) -> i32 {
-  if Listener.phase(listener) != ListenerPhase.Open { return 183 }
+  if Listener.phase(&listener.*) != ListenerPhase.Open { return 183 }
   return 42
 }
 
 effect fn scopedListenerFailure(listener: &mut Listener) -> i32 ! ByteIoError {
-  if Listener.phase(listener) != ListenerPhase.Open { return 184 }
+  if Listener.phase(&listener.*) != ListenerPhase.Open { return 184 }
   fail ByteDuplex.provider(ByteIoOperation.Flush, 777)
 }
 

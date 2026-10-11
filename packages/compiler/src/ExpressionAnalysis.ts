@@ -5687,13 +5687,13 @@ export const finishIntrinsicContractCall = (
         aggregateKey(Type.testInfo),
         intrinsicStruct(Type.testInfo, call, call.anchor),
       )
-    // The phase-only catalog value may seed a deferred `static for` before target selection. The
-    // statement analyzer preserves that loop without lowering the value; its expanded analysis
-    // evaluates this call again with the sealed discovery catalog.
+    const result = Type.substitute(operation.rule.contract.result, substitution)
+    // A sealed phase-only result may seed a deferred iterable before target selection. Static
+    // expansion evaluates it again; ordinary runtime positions retain their phase boundary.
     const phaseDiagnostic =
       caller.phase === 'Static' ||
       resolution.staticContext !== undefined ||
-      (operation.spelling === 'tests' && Type.isStaticPhaseOnly(operation.rule.contract.result))
+      (resolution.staticIterable === true && Type.isStaticPhaseOnly(result))
         ? undefined
         : Diagnostic.staticPhaseViolation(
             `Intrinsic.${operation.spelling}`,
@@ -5701,7 +5701,6 @@ export const finishIntrinsicContractCall = (
             [],
             Location.at(call.anchor),
           )
-    const result = Type.substitute(operation.rule.contract.result, substitution)
     const type =
       analyzed.fact._tag === 'Compatible' && phaseDiagnostic === undefined
         ? availableExpressionType(result)
@@ -11297,7 +11296,7 @@ export const finishDeclarationCall = (
           if (parameter.phase !== 'Runtime') return []
           const argument = argumentsResult.facts.at(parameter.id.ordinal)
           return argument?.type._tag === 'Available' &&
-            Type.containsStaticPhaseOnly(argument.type.type)
+            DeclarationFacts.containsStaticPhaseOnly(resolution.index, argument.type.type)
             ? [
                 Diagnostic.staticPhaseViolation(
                   'runtime call argument with a phase-only type',
@@ -11626,6 +11625,10 @@ export interface StaticAnalysisContext {
   readonly observeResolved?: NonNullable<Evaluation.NodeContext['observeResolved']>
   readonly returnedTextSpan?: { value: Location.Location | undefined }
   readonly trace: Evaluation.Trace
+  /** Charges evaluator work needed to reach a static-control boundary in this function. */
+  readonly step?: NonNullable<Evaluation.NodeContext['step']>
+  /** Retains an evaluator failure before body diagnostics erase its typed cause. */
+  readonly recordFailure?: (failure: Evaluation.StaticFailure) => void
   /** The nodes of what this body has analyzed so far, which is what the evaluator interprets. */
   readonly nodes: import('./BodyBuilder.js').StaticLowering
   readonly lookup: Evaluation.NodeContext['lookup']
@@ -11695,6 +11698,8 @@ export interface ResolutionContext {
   /** Publishes tooling rows before the short-lived semantic decision is discarded. */
   readonly publishExpressionDecision?: (decision: ExpressionDecision) => void
   readonly staticContext?: StaticAnalysisContext
+  /** Only the iterable expression of `static for` may defer sealed phase-only intrinsic results. */
+  readonly staticIterable?: true
   /** Static calls under ordinary control in a static function execute only after branch selection. */
   readonly deferStaticCalls?: true
   /** Hidden anonymous bodies discovered while analyzing the current context declaration. */

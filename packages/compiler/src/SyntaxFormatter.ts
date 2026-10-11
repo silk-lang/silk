@@ -896,8 +896,11 @@ const printImplDeclaration = (
   prefix: FormatDocument.Document,
 ): FormatDocument.Document => {
   const nodes = directNodes(node)
+  const whereClause = nodes.find((child) => child.kind === 'WhereClause')
   const typeParameters = nodes[0]?.kind === 'TypeParameterList' ? nodes[0] : undefined
-  const positional = typeParameters === undefined ? nodes : nodes.slice(1)
+  const positional = (typeParameters === undefined ? nodes : nodes.slice(1)).filter(
+    (child) => child !== whereClause,
+  )
   // An inherent impl has one type node before its members; a conformance has two around `for`.
   const forKeyword = directTokens(node).find((token) => token.kind === 'ForKeyword')
   const capability = positional[0] ?? nodeOf(node, 'TypePath')
@@ -918,6 +921,9 @@ const printImplDeclaration = (
           printToken(context, target.keyword, FormatDocument.text(' ')),
           printNode(context, target.node, FormatDocument.text(' ')),
         ]),
+    ...(whereClause === undefined
+      ? []
+      : [FormatDocument.group(printNode(context, whereClause, FormatDocument.softLine))]),
     printToken(context, open, FormatDocument.text(' ')),
   )
   if (members.length === 0) return FormatDocument.concat(head, printToken(context, close))
