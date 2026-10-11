@@ -173,6 +173,78 @@ const foreignFunctionPointerAdmission = (
   ])
 }
 
+// A binder's representation contract when it names a region, such as `once fn<'static>(i32) -> i32`.
+const regionContract = (parameter: TypeParameterFact): Type.Type | undefined => {
+  const contract = parameter.representationBound?.contract
+  return contract?._tag === 'Resolved' && Type.regionOccurrences(contract.type).length > 0
+    ? contract.type
+    : undefined
+}
+
+const parameterArgumentKey = (parameter: Type.Parameter): string =>
+  parameter.kind === 'Lifetime'
+    ? Lifetime.key(Lifetime.bound(parameter.owner, parameter.ordinal, parameter.name))
+    : Type.key(parameter)
+
+// The head binder an argument of the provider names directly, keyed as `parameterArgumentKey`.
+const argumentBinder = (argument: Type.GenericArgument): string | undefined => {
+  if (Lifetime.isLifetime(argument)) return Lifetime.key(argument)
+  if (Type.isRepresentationParameterArgument(argument)) return Type.key(argument.parameter)
+  return Type.isTypeArgument(argument) && Type.isParameter(argument)
+    ? Type.key(argument)
+    : undefined
+}
+
+/**
+ * Names the head binders whose region-carrying bounds the provider's declaration does not already
+ * imply. A binder that stands as argument `i` of the provider is implied when declared parameter
+ * `i` carries the same bounds under the provider's arguments: every well-formed value of the
+ * provider type already satisfies them, so no region pattern of that type can miss the head.
+ */
+const unimpliedRegionBinders = (
+  modules: ReadonlyArray<ModuleHeaders>,
+  provider: Type.Type,
+  parameters: ReadonlyArray<TypeParameterFact>,
+): ReadonlyArray<string> => {
+  const declaration = Type.isNominal(provider) ? memberByNominal(modules, provider) : undefined
+  const declared = declaration?.typeParameters ?? []
+  const substitution: Type.Substitution = new Map(
+    Type.isNominal(provider)
+      ? declared.flatMap((parameter, index) => {
+          const argument = provider.arguments[index]
+          return argument === undefined ? [] : [[parameterArgumentKey(parameter.type), argument]]
+        })
+      : [],
+  )
+  const implied = (parameter: TypeParameterFact, contract: Type.Type | undefined): boolean => {
+    if (!Type.isNominal(provider)) return false
+    const own = parameterArgumentKey(parameter.type)
+    const position = provider.arguments.findIndex((argument) => argumentBinder(argument) === own)
+    const counterpart = declared[position]
+    if (counterpart === undefined) return false
+    const lifetimesImplied = (parameter.lifetimeBounds ?? []).every((required) =>
+      (counterpart.lifetimeBounds ?? []).some((available) =>
+        Lifetime.equals(Type.substituteLifetime(available, substitution), required),
+      ),
+    )
+    if (contract === undefined) return lifetimesImplied
+    const declaredContract = counterpart.representationBound?.contract
+    return (
+      lifetimesImplied &&
+      counterpart.representationBound?.kind === parameter.representationBound?.kind &&
+      declaredContract?._tag === 'Resolved' &&
+      Type.equals(Type.substitute(declaredContract.type, substitution), contract)
+    )
+  }
+  return parameters.flatMap((parameter) => {
+    const contract = regionContract(parameter)
+    const carriesRegion = (parameter.lifetimeBounds?.length ?? 0) > 0 || contract !== undefined
+    return !carriesRegion || implied(parameter, contract) || parameter.name._tag !== 'Present'
+      ? []
+      : [parameter.name.spelling]
+  })
+}
+
 export const complete = (
   self: DeclarationIndex.Index,
   resolvers: ResolutionSeams.ResolutionSeams,
@@ -1328,11 +1400,7 @@ export const complete = (
         : ConformanceHead.regionSelection(
             conformance.capability.type,
             conformance.provider.type,
-            conformance.typeParameters.flatMap((parameter) =>
-              (parameter.lifetimeBounds?.length ?? 0) > 0 && parameter.name._tag === 'Present'
-                ? [parameter.name.spelling]
-                : [],
-            ),
+            unimpliedRegionBinders(modules, conformance.provider.type, conformance.typeParameters),
           )
       if (regionSelection !== undefined)
         diagnostics.push(
