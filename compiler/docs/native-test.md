@@ -201,17 +201,31 @@ natively and the stub executable writes a valid receipt for a hand-written plan.
 1. `Intrinsic.stringEqualsExact` is an `intrinsic-member` gap. It is a listed catalog member that
    the runner's argument parser uses; it lowers to the existing string equality.
 2. `Format.format` with the summary template exhausts the native static step limit
-   (`StaticStepLimit` in `silk/format.silk` template validation). The native limit is 10,000 steps
-   per demand graph against the bootstrap's 100,000. Thresholds are compiler policy (reference,
-   static evaluation); the native limit moves to the bootstrap's value so a program inside the
-   bootstrap's limits is inside the native ones.
+   (`StaticStepLimit` in `silk/format.silk` template validation). The retry that supplies a needed
+   constant still stopped at a stale fixed budget of 10,000 steps, while the evaluation it retries
+   runs under the 100,000-step limit it shares with the bootstrap. The retry now reads the
+   machine's own limit.
 3. The discovery intrinsics above.
+
+The stub hid two more limits, because it replaced each `static for` with `if false`. Inside a
+`static for` over the catalog the runner borrows its own per-test locals (`&identity`, `&value`,
+`&entry`) and outside state (`&mut plan`) in plain calls, and `validatePlan` returns from inside the
+loop. The native checker refused both:
+
+4. A loan of storage an occurrence generates was refused outright, because its region is keyed by
+   the borrow's syntax, which every occurrence shares. Sharing the key is sound while the loan
+   stays inside its occurrence: an occurrence's nodes are checked together, regions select no code,
+   and a place declared outside the iteration keeps the region its declaration gave it. The check
+   now refuses only a write of such a loan to an outside local or through a dereference.
+5. An authored `return` or `fail` inside an occurrence was refused. Both leave the function as they
+   do anywhere else; the expansion completes only when every occurrence can. `break` and
+   `continue` stay refused: a `static for` is not a runtime loop.
 
 The test bodies of the compiler's Cases roots are compiler source the native compiler already
 builds. As a check, `semantic/TargetCases.silk` with its
 `test` markers turned into `pub` and a hand-written `main` calling all 17 tests compiles with N0
 in 7 min 19 s at `--optimization none` (almost all of it the front end over the reached compiler
-source) and runs. So the shards need the discovery work and the two fixes above, not further
+source) and runs. So the shards need the discovery work and the fixes above, not further
 front-end coverage. The native shard's cost is close to a self-build per root; it removes the
 TypeScript compiler and its 8 to 12 GiB heap from the job, not the front-end time.
 
