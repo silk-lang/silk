@@ -700,6 +700,10 @@ interface Multiply<Right, Output> {
 }
 ```
 
+At least one operand of an operator operation has type `Self`, `&Self`, or `&mut Self`. That
+operand is how an operator use finds the operation: the provider of every candidate conformance is
+one of the operand types.
+
 `operator *` grants this operation permission to participate in `*` selection. Everything after
 that eligibility check is ordinary interface machinery: complete parameter and result types,
 ownership modes, Effect channels, conformance mapping, coherence, static specialization, and
@@ -730,7 +734,11 @@ These contracts permit `Vector * f64 -> Vector`, `Vector * Vector -> f64`, `Matr
 Vector`, and `Matrix * Matrix -> Matrix`. The types shown are ordinary library types; they need not
 become compiler-built-in merely to use mathematical notation.
 
-Operator selection uses the precise operand types and the statically visible conformances. It does
+Operator selection uses the precise operand types and only their conformances. For each operand,
+it reads the conformances whose provider is that operand's type, seen through one reference, and
+whose interface marks an operation with the operator. Conformances of other types, and operator
+interfaces that no operand type implements, are never consulted, so importing a module or adding an
+operator interface elsewhere cannot change which operation an existing use selects. Selection does
 not use the expected result type, perform implicit conversion, inspect runtime tags, or choose by
 import order. Exactly one operation must match. Its declared result becomes the expression's type.
 
@@ -757,20 +765,23 @@ move vector * 2.0 // consuming multiplication
 &vector * 2.0     // valid only for a contract whose left operand is &Vector
 ```
 
+An operator operation without a `Self`, `&Self`, or `&mut Self` operand is invalid, because no
+operand type would lead to its conformances.
+
 Only an interface operation may opt into an existing operator. A free function cannot declare a
 new spelling, precedence level, associativity rule, or conditional evaluation policy. In
 particular, user declarations cannot redefine `&&`, `||`, `|>`, `run`, assignment, or another
 control form.
 
-**Diagnostics:** An operator declaration with the wrong arity or a spelling outside its prefix or
-infix category reports `SEM0134` at that interface operation. No matching conformance reports
+**Diagnostics:** An operator declaration with the wrong arity, a spelling outside its prefix or
+infix category, or no `Self` operand reports `SEM0134` at that interface operation. No matching conformance reports
 `SEM0135` at the operator. Multiple matching operations report `SEM0136`, listing the competing
 interface operations. Ordinary argument diagnostics remain attached to the operand after a unique
 contract is selected.
 
 **Current compiler:** Aligned. Generic bounds and concrete conformances use the same explicit
-marker, applied interface contract, and static witness selection. Operation spelling has no role in
-eligibility.
+marker, applied interface contract, and static witness selection. Concrete selection examines only
+the conformance buckets of the operand types. Operation spelling has no role in eligibility.
 
 **Evidence:** [complete interface contracts](../../../../openspec/specs/bootstrap-complete-interface-contracts/spec.md),
 [static conformance specialization](../../../../openspec/specs/bootstrap-conditional-interface-conformance/spec.md),

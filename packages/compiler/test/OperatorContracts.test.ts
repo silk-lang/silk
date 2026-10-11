@@ -137,14 +137,20 @@ it.effect('rejects control markers, service markers, and ambiguous marked contra
   Effect.gen(function* () {
     const invalid = yield* snapshot(`interface Invalid {
   operator && fn both(left: Self, right: Self) -> bool
+  operator * fn scale(left: i32, right: Wrapped<Self>) -> i32
 }
+struct Wrapped<T> { value: T }
 service Runtime {
   operator + fn add(left: i32, right: i32) -> i32
 }
 pub fn main() -> i32 { return 0 }`)
     assert.deepEqual(
       Analysis.diagnostics(invalid).map((diagnostic) => diagnostic.code),
-      [Diagnostic.invalidOperatorContractCode, Diagnostic.invalidOperatorContractCode],
+      [
+        Diagnostic.invalidOperatorContractCode,
+        Diagnostic.invalidOperatorContractCode,
+        Diagnostic.invalidOperatorContractCode,
+      ],
     )
 
     const ambiguous = yield* snapshot(`struct Value { raw: i32 }

@@ -6900,11 +6900,29 @@ export const boundOperatorSelections = (
     }),
   )
 
+/**
+ * The conformance bucket one operand type selects from: its nominal owner, or the scalar or string
+ * type itself, seen through one reference. Other operand types own no conformance.
+ */
+const operandOwner = (type: SemanticType): string | undefined => {
+  const operand = Type.isReference(type) ? type.target : type
+  if (typeof operand === 'string') return operand
+  if (Type.isString(operand)) return 'string'
+  return Type.isNominal(operand) ? `${operand.module}\u0000${operand.name}` : undefined
+}
+
+/**
+ * Collects the concrete conformances an operator use may select (OP-009). Every operator
+ * operation has a `Self` operand, so only the buckets of the operand types' owners can supply a
+ * match. A conformance outside those buckets is never proved or offered.
+ */
 export const concreteOperatorSelections = (
   index: DeclarationIndex.Index,
   module: string,
   operator: Operator.Eligible,
+  operands: ReadonlyArray<SemanticType>,
 ): ReadonlyArray<OperatorContractSelection> => {
+  const owners = new Set(operands.flatMap((operand) => operandOwner(operand) ?? []))
   const interfaces = index.modules.flatMap((headers) => headers.interfaces)
   const selections = index.modules.flatMap((headers) =>
     headers.conformances.flatMap((conformance) => {
@@ -6919,6 +6937,8 @@ export const concreteOperatorSelections = (
         return []
       const capability = conformance.capability.type
       const provider = conformance.provider.type
+      const providerOwner = operandOwner(provider)
+      if (providerOwner === undefined || !owners.has(providerOwner)) return []
       const interface_ = interfaces.find(
         (candidate) =>
           candidate.canonical._tag === 'Canonical' &&
@@ -7312,7 +7332,14 @@ export const analyzeOperatorExpression = (
   if (!builtinOperand) {
     const candidates = [
       ...boundOperatorSelections(declaration, operator),
-      ...concreteOperatorSelections(resolution.index, AuthoredWalk.moduleName(context), operator),
+      ...concreteOperatorSelections(
+        resolution.index,
+        AuthoredWalk.moduleName(context),
+        operator,
+        argumentsResult.facts.flatMap((argument) =>
+          argument.type._tag === 'Available' ? [argument.type.type] : [],
+        ),
+      ),
     ].filter((candidate) =>
       operatorSelectionMatches(candidate, argumentsResult.facts, node, resolution),
     )
