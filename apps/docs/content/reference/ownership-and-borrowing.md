@@ -510,6 +510,12 @@ fn invalid() -> i32 {
 argument. Argument evaluation order does not shorten an earlier loan to the end of that argument's
 evaluation; the callee receives all arguments together.
 
+Reading `.length` of a fixed-size array `[T; N]` while a loan of that array is live is not an
+access: the length is part of the array's type, and reading it reads no storage. For
+`values: [i32; 2]`, the call `replace(&mut values, values.length - 1)` is valid even though the first
+argument borrows `values` exclusively. `.length` of a slice or a `Vector` reads runtime storage, so
+it is an access and follows the rule above.
+
 **Diagnostics:** Conflicting slice arguments report `OWN0010` at the later borrow and relate the
 earlier loan. Directly reading the owner in a later argument while an exclusive loan is active
 reports `OWN0011`.
