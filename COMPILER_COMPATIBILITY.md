@@ -14,15 +14,6 @@ The fixture now declares both functions in `impl Vector`, retaining its expected
 The bootstrap is frozen during backend development; retire this entry when it enforces the
 same owner lookup rule.
 
-## Fixed-array length during a loan
-
-BORROW-004 states that reading `.length` of a fixed-size array `[T; N]` while a loan of the array
-is live is not an access, because the length is part of the type (Julia, 2026-10-11). The native
-compiler implements this in its loan checker (`compiler/src/semantic/BorrowCheck.silk`). The
-TypeScript bootstrap cannot express the case: it rejects `.length` on a fixed array (`SEM0026`) and
-indexing through `&mut [T; N]` (`SEM0032`), so the rule has no bootstrap test. Retire this entry if
-the bootstrap gains fixed-array `.length`, with a test of the rule.
-
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
