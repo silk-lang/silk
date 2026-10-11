@@ -77,7 +77,17 @@ export interface BuildOptions {
 }
 // Forward standard process necessities only; compiler/tool overrides come from verified inputs.
 // Never serialize this environment: measurement exposes only the verified SILKC_CLANG binding.
-const allowedEnvironment = ['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE']
+const allowedEnvironment = [
+  'PATH',
+  'SDKROOT',
+  'HOME',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+]
 const nativeEnvironment = (
   current: Readonly<Record<string, string | undefined>>,
   clang: string,
