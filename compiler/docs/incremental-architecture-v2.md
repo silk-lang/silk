@@ -8,7 +8,7 @@ as superseded after it failed the cold-build gate.
 [research/zig-incremental-verification.md](research/zig-incremental-verification.md) (cited as
 "audit §n"), the #1359 gate comment, the native self-build profile (#1427), identity interning
 (#1431), the borrow-checking note (#1421), [mir-core-shape.md](mir-core-shape.md),
-[region-sensitive-identity.md](region-sensitive-identity.md) and #567.
+[region-erased-identity.md](region-erased-identity.md) and #567.
 
 **Evidence tags.** Every claim carries one of:
 
@@ -747,10 +747,13 @@ largest reason this design can be precise.
 
 **P3. Region-erased identity without a build-wide fixed point.**
 
-**Decision (Julia, 2026-10-11): accepted, option (a).**
+**Decision (Julia, 2026-10-11): accepted, option (a).** Implemented with the restriction on
+sealed `Drop` and `Copy` heads only: conformance heads stay unrestricted, because typing proves
+them at the call site. The rule, the walk and `exactApplications` are deleted; see
+[region-erased-identity.md](region-erased-identity.md).
 
 - _Today._ An application is region-sensitive if lowering consulted a lifetime-selective head, or
-  if it lends its regions to one that did (`region-sensitive-identity.md`). Rule 2 is a fixed point
+  if it lends its regions to one that did (formerly `region-sensitive-identity.md`). Rule 2 is a fixed point
   over the reached graph, and `buildFrom` walks the graph again when marks grow
   (`Semantic.silk:65386`). Adding one lifetime-selective head can make distant callers exact.
 - _Options._ (a) Forbid lifetime-selective `impl` heads: a head may not name `'static`, repeat one
