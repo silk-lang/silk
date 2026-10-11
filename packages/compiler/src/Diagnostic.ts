@@ -180,11 +180,9 @@ export const unknownOwnedCallableReturnCode = 'SEM0081' as const
 export const nonFiniteEffectJoinCode = 'SEM0132' as const
 /** Stable code for a refutable pattern in an unconditional local binding. */
 export const refutableLetPatternCode = 'SEM0133' as const
-/** Stable code for an operator marker that cannot describe its interface operation. */
-export const invalidOperatorContractCode = 'SEM0134' as const
-/** Stable code for operator syntax with no marked operation accepting its operands. */
+/** Stable code for operator syntax whose operator interface has no conformance accepting its operands. */
 export const operatorNotApplicableCode = 'SEM0135' as const
-/** Stable code for operator syntax matched by more than one marked operation. */
+/** Stable code for operator syntax matched by more than one conformance of its operator interface. */
 export const ambiguousOperatorCode = 'SEM0136' as const
 /** Stable code for an unsafe acknowledgement that does not complete an unsafe invocation. */
 export const misplacedUnsafeAcknowledgementCode = 'SEM0137' as const
@@ -584,7 +582,6 @@ export type Code =
   | typeof unknownOwnedCallableReturnCode
   | typeof nonFiniteEffectJoinCode
   | typeof refutableLetPatternCode
-  | typeof invalidOperatorContractCode
   | typeof operatorNotApplicableCode
   | typeof ambiguousOperatorCode
   | typeof misplacedUnsafeAcknowledgementCode
@@ -899,7 +896,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
     }
   | { readonly _tag: 'InvalidExecutablePropertyConjunct'; readonly conjunct: string }
   | { readonly _tag: 'InvalidConformance'; readonly detail: string }
-  | { readonly _tag: 'InvalidOperatorContract'; readonly detail: string }
   | {
       readonly _tag: 'OperatorNotApplicable'
       readonly operator: string
@@ -1918,17 +1914,6 @@ export const invalidConstant = <L>(detail: string, span: L): Diagnostic<L> => ({
   severity: 'error',
   message: `Invalid constant: ${detail}`,
   reason: { _tag: 'InvalidConstant' as const, detail },
-  span,
-})
-
-/** Creates the declaration diagnostic for an invalid interface operator marker. */
-export const invalidOperatorContract = <L>(detail: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'semantic',
-  code: invalidOperatorContractCode,
-  severity: 'error',
-  message: `Invalid operator contract: ${detail}`,
-  reason: { _tag: 'InvalidOperatorContract' as const, detail },
   span,
 })
 
