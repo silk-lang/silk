@@ -1502,6 +1502,37 @@ impl Convert<i32> for Settings { /* ... */ }
 impl Convert<string> for Settings { /* ... */ }
 ```
 
+Lifetimes never decide which code runs. Overlap is checked with lifetimes erased, so at most one
+conformance head applies to a goal whatever regions it carries; a conformance head may name
+`'static`, repeat one region, or bound a region, and typing proves those relations at each use with
+the real regions. A sealed `Drop` or `Copy` head is different: cleanup and copying are chosen for a
+type without a proof at the use, so such a head may not name `'static`, name one region at two
+positions, or bound a region (`'a: 'b`, `T: 'a`, or a representation contract that names a region).
+Each of its region positions takes its own unbounded binder. An interface bound on such a head is a
+region bound in disguise, because a conformance head may hold for some regions of a type and not
+others, so it follows the same rule. A `Copy` bound is region-independent by this rule and stays
+allowed. The one exception is a bound the provider's declaration already places on the same
+parameter: every value of the type satisfies it, so repeating it on the head selects nothing.
+
+```silk,ignore
+struct Guard<'a> { value: &'a i32 }
+
+impl<'a> Drop for Guard<'a> { /* ... */ }        // valid
+impl Drop for Guard<'static> { /* ... */ }       // invalid: cleanup would depend on a region
+impl<'a: 'static> Drop for Guard<'a> { /* ... */ } // invalid: a region bound
+
+struct Lasting<'a: 'static> { value: &'a i32 }
+
+impl<'a: 'static> Drop for Lasting<'a> { /* ... */ } // valid: Lasting already requires it
+
+interface Label {}
+impl<'a: 'static> Label for Guard<'a> {}           // valid: a conformance head
+struct Cell<T> { value: T }
+
+impl<T: Label> Drop for Cell<T> { /* ... */ }      // invalid: Cell<Guard<'x>> would clean up only
+                                                   // when 'x is 'static
+```
+
 **Boundary:** Silk does not rank a concrete `impl` above a generic one, rank stronger bounds above
 weaker bounds, select by source or import order, or support negative bounds. An optimized special
 case that overlaps a broad generic conformance must remain an ordinary actor function until a
@@ -1510,7 +1541,8 @@ separate explicit-specialization model is designed.
 **Diagnostics:** A duplicate head reports a duplicate-conformance diagnostic. A distinct but
 potentially unifiable head reports an overlapping-conformance diagnostic at the later declaration
 with the earlier declaration as a related span. The diagnostic shows the common goal shape; it
-does not claim that one bound should win.
+does not claim that one bound should win. A sealed `Drop` or `Copy` head that names `'static`,
+repeats a region, or bounds a region reports `SEM0220` at the declaration.
 
 **Current compiler:** Aligned. It alpha-normalizes generic heads and conservatively rejects heads
 whose provider and interface applications may unify without consulting their bounds.
