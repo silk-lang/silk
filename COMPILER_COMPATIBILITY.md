@@ -1205,6 +1205,24 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   by `silkc test`.
 - **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
+### References to fixed arrays
+
+- **Status:** divergence recorded on 2026-10-11 for the native parser fix that follows #1442. It is
+  retired when a separately authorized bootstrap parser repair accepts the same syntax.
+- **Rule:** VIEW-001 makes `&T` and `&mut T` references to one complete `T`, and the fixed-array
+  syntax requirement accepts `[T; N]` wherever an explicit type is accepted. `&'a mut [i32; 2]` is
+  therefore a reference to a fixed array, while `&[T]` without a length stays a slice.
+- **Compilers:** the bootstrap parser reads every `&[` as a slice and reports `PAR0002` at the
+  semicolon. The selfhost parser looks ahead for a semicolon at the bracket's own depth and parses
+  a reference to a `FixedArrayType`; it used to read the same slice and report a misleading
+  `CallArity` at the call.
+- **Source migration:** source the bootstrap must still build, including the compiler, names the
+  array through a type alias (`type Pair = [i32; 2]` and `&mut Pair`), which both compilers accept.
+- **Diagnostics and limits:** only the parse differs; with an alias both compilers type the
+  reference identically.
+- **Evidence:** `parser/ParserCases.referencesToFixedArrays` asserts the reference, its fixed-array
+  operand, the following parameter and a slice parameter, with no diagnostics.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or
