@@ -103,11 +103,28 @@ const program = Effect.gen(function* () {
   )
   assert.equal(explicit.status, 0, explicit.stderr)
   assert.equal(yield* fs.exists(join(directory, 'explicit.silkc.ll')), false)
+  // Another target emits its IR without linking; only the host target links an executable.
+  const foreign =
+    process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
+  const cross = yield* invoke(
+    silkc,
+    [...argumentsFor('cross.ll'), '--emit', 'llvm-ir', '--target', foreign],
+    directory,
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(cross.status, 0, cross.stderr)
+  assert.equal(yield* fs.exists(marker), false, 'cross-target IR output must not invoke Clang')
+  const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
+  assert.ok(crossIr.length > 0)
+  assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
   for (const selectors of [
     ['--emit', 'invalid'],
     ['--emit'],
     ['--emit', 'llvm-ir', '--emit', 'llvm-ir'],
     ['--emit', 'executable', '--emit', 'llvm-ir'],
+    ['--target', foreign],
+    ['--emit', 'llvm-ir', '--target', 'no-such-target'],
+    ['--emit', 'llvm-ir', '--target', foreign, '--target', foreign],
   ]) {
     const rejected = yield* invoke(silkc, [...argumentsFor('rejected'), ...selectors], directory, {
       ...process.env,
