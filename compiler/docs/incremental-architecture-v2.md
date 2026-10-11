@@ -28,7 +28,8 @@ cold-build gate.
   edge array, and cutoff on interned results. Zig's push marking is combined with salsa-style pull
   verification to fit Silk's demand-driven queries (§2 to §6).
 - A one-shot build records nothing: one early return in one recorder, and no fingerprints (§5).
-  Modules load on demand, so a build runs once instead of 81 rounds.
+  Modules are read before or during the build, never by revising it, so a build runs once instead
+  of 81 rounds. Three quarters of the round cost was the instance walk repeating itself (§1.4).
 - The first build of an incremental session is estimated at under 1% time and about 1.1% RSS over
   one-shot, against a proposed budget of 3% and 5% (§9).
 - Nine language proposals and three safety-model options are ranked for Julia (§8). The largest
@@ -50,9 +51,9 @@ All **[source]**, `selfhost` at `74637a1`.
 
 - its direct dependencies, deduplicated (`distinctDependencies`, `:5116`);
 - every _transitive_ source observation, as shared handles (`sources`);
-- every _transitive_ demand footprint, one per family and module (`footprint`). Only
-  `Request.hasDemand` and `Request.hasDiscovered` (`:3561`, `:3578`) read footprints and
-  `discoveredBy`-style observation scans, and only `*Cases.silk` files call those;
+- every _transitive_ demand footprint, one per family and module (`footprint`). Footprints are
+  read only by `Request.hasDemand` (`:3578`), and `Request.hasDiscovered` (`:3561`) scans the
+  observations; only `*Cases.silk` files call either;
 - a copy of its value for later body reuse (`identityOfFact`, `:3205`);
 - for a body, its direct-dependency evidence (`BodyEvidence`).
 
@@ -154,8 +155,50 @@ of machine; the IR emission measured here is the front end and MIR part of it.
 
 ### 1.4 Where the round cost goes
 
-Pending: a frame-pointer profile of a bootstrap-built N0 attributes the 62 s of the discovery
-rounds and the 35 s of evidence. It is added here when measured.
+**[measured]** Method of #1427: N0 built by the TypeScript bootstrap from the instrumented tree,
+with `"frame-pointer"="all"` added to every LLVM definition before clang (checked on a prologue),
+sampled by `perf record -F 499 -g` while emitting the compiler's IR. Both runs emitted the same IR
+as §1.3. Under perf, N0 took 293.4 s user with today's driver and 229.0 s preloaded, the same 64 s
+gap N1 showed.
+
+| Samples             | 81 rounds | One round | Difference   |
+| ------------------- | --------- | --------- | ------------ |
+| total               | 150,158   | 117,570   | 32,588       |
+| inside `demandRaw`  | 121,219   | 112,734   | 8,485 (26%)  |
+| outside `demandRaw` | 28,939    | 4,836     | 24,103 (74%) |
+
+Outside the query engine, every sample sits in `buildFrom`'s instance walk. Its largest parts:
+
+| Called by `buildFrom`         | 81 rounds | One round |
+| ----------------------------- | --------- | --------- |
+| `cleanupAdmits`               | 8,377     | 191       |
+| `internBackendVariant`        | 6,610     | 503       |
+| `InstanceKey.sameApplication` | 4,182     | 663       |
+| `markRegionSensitive`         | 2,883     | 385       |
+| `closeSuspendable`            | 913       | 815       |
+
+So three quarters of the round cost is the instance walk repeating its unmemoized work, cleanup
+admission, backend variant interning, application comparison and the region-sensitivity closure,
+once per round over everything reached so far. The other quarter is memo-hit validation and the
+recomputation of answers that saw a module appear.
+
+Two findings for the design:
+
+- **The instance walk is a global linear pass.** With one round it still costs 4.1% of the build
+  (4,836 samples, about 10 s). A session that reruns it in full after every edit pays that on each
+  update. §7.1 makes its per-instance results units.
+- **Content interning uses SHA-256.** `silk_sha2_compress32` is 2.5% of self time, all of it under
+  `internLlvmInput` (`Semantic.silk:55615-55640`), which hashes each emission input with both
+  `InternIndex.hashBytes` and SHA-256 and compares the digests. Comparing the content bytes after
+  the 64-bit hash, or using the fingerprint hash of §3.1, removes it.
+
+Where the per-answer evidence goes in the one-round profile (inclusive, overlapping):
+`mergeEvidence` 6.6%, `source()` 6.4% (of which `SourceIndex.demand` 5.5%),
+`Observation.matches` 3.7%, `appendFootprint` 3.2%, `footprintIn` 2.1%, `appendObservation` 1.5%,
+`SourceIndex.sharedIdentity` 0.9%, `Fingerprint.header` and `Fingerprint.body` 0.8%,
+`BodyInput.make` 0.3%. This agrees with the 16% the stub saved. `source()` stays hot without
+recording (33 million calls in the stubbed run), because HIR reads go through it; interned module
+handles make it an array index.
 
 ## 2. Units and dependees
 
@@ -192,6 +235,16 @@ declaration's own syntax stop being separately tracked; they run inside the unit
   so they consume the same dependees. One unit records each consumed dependee once. The price is
   coarser cutoff inside one declaration: a caller that reads only a struct's member names reruns
   when a field type changes. That is the same precision Zig accepts for `nav_ty` (audit §3).
+
+The remaining families stop being cached answers with their own evidence. `Name` and `Import`
+run inside their consumer, which records `Name(M, n)`. `Implementations`, `ConformanceHeads` and
+`InherentMembers` run inside their consumer, which records `ImplSet` or `InherentSet`.
+`OperatorInterfaces` records `Namespace` of each module it scans (P6 narrows it). `ProfileInput`
+becomes `ProfileEntry` reads. `OpaqueRealization`, `CallableOrigin` and the four origin-transaction
+families produce the `Realization` result of a `Body` unit. Origins are a fixed point over
+producers that forward each other's results (REP-005), so a cycle of `Body` units is computed and
+compared as one strongly connected group, the same engine addition the suspension summary needs
+(`mir-core-shape.md` §6). A group reruns as a whole when any member is outdated.
 
 Generic selections stay as today: an ordinary generic body is one `Body(D, none)`, a static
 selection is `Body(D, s)` with `s` the interned selection (the settled decision in #567). The
@@ -252,7 +305,7 @@ Differences from Zig, each deliberate:
 
 - **Tokens, not raw bytes.** Zig hashes raw source slices, so comment edits rerun analysis (audit
   §2). Silk's parser already holds tokens, so excluding trivia costs nothing extra and makes
-  comment and whitespace edits free. Positions are excluded too; §3.3 says how locations stay
+  comment and whitespace edits free. Positions are excluded too; §3.5 says how locations stay
   current.
 - **Nested declarations by identity.** Zig's outer declaration hash includes nested declaration
   text (audit §2). Silk's methods live inside `impl` blocks, so including them would make every
@@ -305,7 +358,7 @@ The identity contract, stated per edit:
 | Edit a declaration's body                                                                | kept                                                                             | `DeclSource(D)` changes; `DeclPrototype(D)` does not                                                                                       |
 | Rename                                                                                   | old identity lost, new one created                                               | `Name(M, old)` and `Name(M, new)` change; dependers of the old handle are outdated                                                         |
 | Move to another scope, module or file                                                    | lost and created                                                                 | as rename. No relocation matching, as in Zig (audit §6)                                                                                    |
-| Insert, delete or reorder unnamed siblings of one kind (`impl` blocks, conditional arms) | identities shift by occurrence                                                   | the shifted declarations compare unequal fingerprints and rerun; correct, but imprecise. §8 P6 proposes naming `impl` blocks by their head |
+| Insert, delete or reorder unnamed siblings of one kind (`impl` blocks, conditional arms) | identities shift by occurrence                                                   | the shifted declarations compare unequal fingerprints and rerun; correct, but imprecise. §8 P9 proposes naming `impl` blocks by their head |
 | Same-key named siblings (`IndexedDeclaration.ambiguous`, `ModuleIndex.silk:65`)          | kept by occurrence while the count is unchanged; all lost when the count changes | conservative; such siblings are already diagnostics in most positions                                                                      |
 | Move a file to another module or package                                                 | every declaration in it is lost                                                  | as Zig's module reassignment (audit §6)                                                                                                    |
 
@@ -319,13 +372,13 @@ compaction (§4.4).
 
 v2 needs dense integer handles, not only shared records:
 
-- `ModuleIndex: u32`, one per module identity in the session. #1431 makes `ModuleId` a shared
+- `ModuleOrdinal: u32`, one per module identity in the session. #1431 makes `ModuleId` a shared
   record compared by address (`ModuleId.silk` on #1431); the next step is the ordinal table
   #1427 proposes, held by the session.
 - `DeclIndex: u32`, one per `DeclarationId`, keyed by module ordinal plus owner-chain bytes,
   with the canonical bytes cached once (#1427 step 2).
 - `NameIndex: u32` for interned spellings, which `Resolver.names` already is
-  (`Semantic.silk:1414`).
+  (`Semantic.silk:1413`).
 - `TypeIndex: u32` for hash-consed types, needed before header and layout cutoff can compare
   handles instead of walking trees (#1427 step 3). Until then those comparisons are structural and
   run only on the incremental path.
@@ -358,7 +411,7 @@ One graph per session, owned by the semantic store, in the shape the audit measu
 §4), with two changes noted below.
 
 - **Units.** The interned unit table gains, per unit, `firstEdge: u32`, `state: u8` and two
-  revision stamps (§6.2). 12 bytes per unit beyond today's `ScopedKey`.
+  `u32` revision stamps (§6.2): 13 bytes, 16 with alignment, beyond today's `ScopedKey`.
 - **Dependees.** One hash map per dependee kind from the kind's key (a `u32`, or a `u64` for the
   pair keys of `Name`, `ImplSet`, `Realization`) to a dense `DependeeIndex: u32`. A dense
   dependee record holds the head edge. Zig maps keys directly to head edges and must leave a dummy
@@ -399,10 +452,10 @@ Retained bytes for a session that has built the compiler once:
 ```
 graph = 16 E                        edges
       + ~24 D                       dependee map entry, record, load factor
-      + 12 U                        per-unit graph fields
+      + 16 U                        per-unit graph fields
 ```
 
-E, D and U are measured in §1.4 for today's queries and projected in §9.2 for v2 units.
+E, D and U are measured in §1.2 for today's queries and projected in §9.2 for v2 units.
 
 ## 5. Recording policy
 
@@ -462,10 +515,10 @@ answer that observed a newly present module. §1.3 measures what this costs.
 
 Preloading lands first (§10 slice 1): the driver reads the module set before the semantic build,
 so the build runs once. The end state for a session is on-demand loading, because a watch session
-cannot know in advance which modules an edit will import. The source provider becomes a `service` that the driver supplies: a
-`SourceIndex` miss asks it for the module's bytes or absence, and the answer is final for the
-session's current revision. `Semantic.revise` is then called only by an incremental session when
-files change. The semantic store still never touches
+cannot know in advance which modules an edit will import. The source provider becomes a
+`service` that the driver supplies: a `SourceIndex` miss asks it for the module's bytes or
+absence, and the answer is final for the session's current revision. `Semantic.revise` is then
+called only by an incremental session when files change. The semantic store still never touches
 the filesystem itself; it reads through the provider, which tests replace with an in-memory map.
 
 ## 6. Invalidation and cutoff
@@ -485,7 +538,8 @@ the filesystem itself; it reads through the provider, which tests replace with a
    - `upToDate`: return the cached result. There is no per-hit validation walk.
    - `outdated`: rerun `u`.
    - `potentiallyOutdated`: for each dependee on `u`'s edge chain, in recording order, bring its
-     producing unit up to date with `demand`. If its `changedAt` is newer than `u.verifiedAt`,
+     producing unit up to date with `demand` (an input dependee has no producer and already
+     carries its last-change revision from step 2). If the dependee changed after `u.verifiedAt`,
      rerun `u` and stop. If none changed, `u` becomes `upToDate` without running.
    - `absent`: run `u`.
 5. **Rerun.** Remove `u`'s edges, run its provider, record fresh edges, compare the new result with
@@ -502,7 +556,7 @@ demanded again reports `Cycle` (`Query.silk:107`).
 ### 6.2 Revision stamps
 
 A session revision is a `u32` counter, advanced once per update. Each unit stores `changedAt` and
-`verifiedAt` (8 bytes, in the 12 of §4.1). Input dependees store the revision of their last change.
+`verifiedAt` (8 bytes, in the 16 of §4.1). Input dependees store the revision of their last change.
 
 ### 6.3 Every cutoff point
 
@@ -523,7 +577,7 @@ A session revision is a `u32` counter, advanced once per update. Each unit store
 | `Borrow(D, s)`                | `Checked`, or rejection codes with relative spans                      | nothing downstream reads more                                                                                                      |
 | `Coherence(I)`                | accepted, or rejection code with relative span                         | same                                                                                                                               |
 | `Instance(k)`                 | the interned content subject of the LLVM definition                    | it is already the `LlvmText` key (`mir-core-shape.md` §2): equal content is the same answer, and object code keyed by it is reused |
-| `Catalog(root)`               | the ordered catalog                                                    | §8 P5 narrows what it contains                                                                                                     |
+| `Catalog(root)`               | the ordered catalog                                                    | §8 P7 narrows what it contains                                                                                                     |
 
 **Where interned equality is not enough.** Interned equality is sound only when the interned value
 is the entire consumed result (audit §5). Four conditions follow:
@@ -544,9 +598,10 @@ is the entire consumed result (audit §5). Four conditions follow:
 
 Zig disables comptime-call memoization in incremental mode because a memoized call's dependencies
 are not given to the caller (audit §7). Silk's static machine keeps a completed-call memo per
-machine (`Machine.complete`, `StaticExecution.silk:235-248`, checked at `:2843`), and a machine lives for one demand
-(**[source]**, survey of `StaticExecution.make` call sites). Across units, static results are
-shared only through `Value` units. So Silk needs no mode switch, provided two rules hold:
+machine (`Machine.complete`, `StaticExecution.silk:235-248`, checked at `:2843`). Machines are
+created per demand at the `StaticExecution.make` call sites (**[source]**); that none outlives its
+demand is read from those sites, not enforced by a type (**[assumption]**). Across units, static
+results are shared only through `Value` units. So Silk needs no mode switch, provided two rules hold:
 
 - a static machine never outlives the unit that created it;
 - a static call reads the callee's `DeclSource`, not its `HeaderOf`, because it executes the body
@@ -575,6 +630,13 @@ What a long-running session retains between updates:
 - the graph.
 
 What it drops: static machines, MIR after its LLVM text is produced, request-local state.
+
+**The instance walk must not rerun in full.** `buildFrom` walks every reached instance outside the
+query engine; with one round that is 4.1% of a cold build (§1.4). In a session, each instance's
+outgoing references, cleanup admission and variant become a unit result keyed by the instance, so
+an update walks only from instances whose `Instance` unit reran. Zig caches its reference
+traversal for the same reason (audit §7). The region-sensitivity and suspension closures in the
+walk are whole-program; P3 and P4 remove them, and without those proposals they rerun per update.
 
 ### 7.2 The backend is part of the design
 
@@ -682,12 +744,18 @@ largest reason this design can be precise.
   `generics-interfaces-and-specialization.md`: coherence already erases lifetimes, so heads that
   differ only in regions are already rejected; (a) rejects heads that select by region at all.
 - _Buys._ Cold: removes the repeated walk for programs that reach such heads, and the per-body
-  `regionSelections` bookkeeping. Incremental: instance identity stops depending on the whole walk.
+  `regionSelections` bookkeeping. **[measured]** `markRegionSensitive` alone is 0.3% of the
+  one-round self-build profile (385 of 117,570 samples, §1.4). Incremental: instance identity
+  stops depending on the whole walk.
 - _Safety._ (a) only rejects programs. The region-sensitive identity note proves erasure sound
   exactly when no consulted head is lifetime-selective, which (a) makes always true. Borrow checking
   is unaffected because instances are never checked (#1421 §2), and #1421's question 8 disappears.
-- _Cost to users._ Any stdlib or corpus `impl` whose head names `'static` must change. The survey
-  did not count them; slice 0 of §10 counts before Julia decides.
+- _Cost to users._ **[measured, grep]** No conformance or sealed `Drop`/`Copy` head in the stdlib
+  or the compiler's non-test sources names `'static`, repeats a region or bounds one. The stdlib
+  has one inherent `impl` with `'static` type bounds (`silk/fiber.silk:541`), which (a) does not
+  touch because inherent impls select no witness. The corpus has one (`impl<'data> Drop for
+Guard<'static, 'data>`, `packages/compiler/test/support/corpus.ts:8439`), and compiler test cases
+  have about a dozen, which exist to test this feature.
 
 **P4. Suspension declared in contracts.**
 
@@ -701,8 +769,9 @@ largest reason this design can be precise.
 - _Reference change._ `effect-suspension.md` SUSP-003 and the execution modes; EFF rules for the
   contract syntax.
 - _Buys._ Incremental: a new suspension point changes one signature and propagates through
-  `HeaderOf`, with cutoff. Cold: removes the closure pass and the extra walk with suspendable roots
-  (`Semantic.silk:65470`). It also makes `NonParking` checkable, which the native compiler accepts
+  `HeaderOf`, with cutoff. Cold: removes the closure pass (**[measured]** `closeSuspendable` is
+  0.7% of the one-round self-build profile, 815 samples, §1.4) and the extra walk with suspendable
+  roots (`Semantic.silk:65470`). It also makes `NonParking` checkable, which the native compiler accepts
   unchecked today (survey, `Semantic.silk:62607`).
 - _Safety._ Unchanged; parking is about scheduling, and frames keep the same ownership rules.
 
@@ -868,7 +937,7 @@ set are what matter, and v2 slice 3 attaches edges to them without changing the 
   them.
 - **Why it can hold.** In a one-shot build the recorder is one predictable branch per child demand
   (15.6 million in §1.2) and no fingerprints are computed. **[assumption]** At under a nanosecond
-  per taken branch, that is below 20 ms.
+  per predicted, not-taken branch, that is below 20 ms.
 - **Slices 1 and 2 are not gated this way.** They remove work; they report before and after, and
   must show the measured gains of §1.3 or explain the difference.
 
@@ -884,7 +953,7 @@ dependency list:
 | ---------------------------------------------------------- | ----------------------------------------------------------------- | -------------------------------- |
 | edges, 16 bytes each                                       | 2.8 million                                                       | 45 MB                            |
 | dependee records and map entries, about 24 bytes each      | at most 0.3 million **[assumption]**                              | 7 MB                             |
-| unit graph fields, 12 bytes each                           | 0.11 million                                                      | 1.3 MB                           |
+| unit graph fields, 16 bytes each                           | 0.11 million                                                      | 1.8 MB                           |
 | fingerprints, 32 bytes per declaration plus file hashes    | about 7,700 named declarations **[measured, grep approximation]** | 0.3 MB                           |
 | **retained total**                                         |                                                                   | **about 54 MB, 1.1% of 4.73 GB** |
 | dedup probe per child demand, about 10 ns **[assumption]** | 15.6 million                                                      | 0.16 s                           |
@@ -897,7 +966,7 @@ measurement in slice 3.
 
 ### 9.3 Updates
 
-**[assumption]** Targets for watch mode on the compiler itself, to be confirmed by slice 7:
+**[assumption]** Targets for watch mode on the compiler itself, to be confirmed by slice 8:
 
 - a body edit with an unchanged signature: one `Body`, `Borrow` and `Instance` unit rerun, one
   codegen unit recompiled, front end under 100 ms;
@@ -924,6 +993,7 @@ Counted only in an incremental session:
 | units reanalyzed, per kind                                 | update, step 5                                                                                    |
 | propagations stopped by equal results, per cutoff point    | update, step 5 (backdated reruns) and step 4 (potentially outdated units cleared without running) |
 | codegen units recompiled and reused                        | backend                                                                                           |
+| instances visited by the walk, and walk time               | `buildFrom`                                                                                       |
 
 `silkc build --stats` prints them on standard error after the build, in a fixed text form a script
 can parse. The cold-build gate (§9.1), the first-build budget (§9.2) and the update targets (§9.3)
@@ -939,8 +1009,7 @@ what it supersedes.
 **Slice 0, prerequisites.** `ModuleId` ordinals (#1431, then the ordinal table of #1427 step 1),
 then `DeclIndex` interning (#1427 step 2). Unit keys hold `DeclIndex` instead of the declaration
 ordinal (`Key.declaration`, `Semantic.silk:965`), and answers hold handles instead of ordinals
-(`Value.Selected`, `:692`). Also count the stdlib and corpus `impl` heads that P3(a) would reject,
-for Julia's decision.
+(`Value.Selected`, `:692`).
 
 **Slice 1, one build round (lands first, compile-speed worker).** The driver preloads the
 module set before the semantic build, so a one-shot build never calls `Semantic.revise` and the
