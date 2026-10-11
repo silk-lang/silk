@@ -1,0 +1,285 @@
+//! Typed source projections used by semantic cache validation.
+//!
+//! Source observations retain provenance. A Read records the smaller part whose content a
+//! provider actually consumed; validation never uses transitive source bytes.
+
+import hir.Fingerprint
+import hir.Hir
+import hir.Hir {Module, HirId}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {ModuleId}
+import semantic.ModuleIndex {ModuleIndex, Arm}
+import semantic.SourceUnit {SourceUnit}
+import semantic.SourceRevision {Observation}
+import semantic.SourceIndex {SourceIndex, IndexedSource, NoRejection, SourceResult}
+import semantic.Query {Cycle}
+import semantic.RuntimeEncoding
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.sha2 {Sha256}
+import silk.usize
+import silk.vector {Vector}
+
+/// A provider's source input. Header/body reads include declaration selection and ambiguity.
+pub enum Kind { Presence, Selection, Header, Body, Shape, Name }
+
+pub struct Read {
+  pub module: usize
+  pub kind: Kind
+  pub declaration: Option<Shared<DeclarationId>>
+  // Unnamed/ambiguous owner chains have no cross-edit matching proof. They may be reused
+  // across unrelated revisions only while their declaring source remains exact.
+  pub selection: Option<Shared<Observation>>
+  pub name: usize
+  pub digest: [u8; 32]
+  pub locations: [u8; 32]
+}
+
+pub fn sameDigest(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// An occurrence can be remapped only when every owner is uniquely named.
+pub fn stable(source: &IndexedSource, ordinal: usize) -> bool {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+  if ordinal >= declarations.length { return false }
+  let identity = &declarations[ordinal].identity
+  let mut owner = usize.ZERO
+  while owner < DeclarationId.ownerCount(identity) {
+    if !DeclarationId.ownerNamed(identity, owner) { return false }
+    owner = owner + usize.ONE
+  }
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if declarations[at].ambiguous && DeclarationId.isPrefixOf(&declarations[at].identity, identity) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn parentOf(source: &IndexedSource, ordinal: usize) -> Option<usize> {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+  return match &declarations[ordinal].parent {
+    Option<usize>.Some {value} => Option.some<usize>(value)
+    _ => Option.none<usize>()
+  }
+}
+
+effect fn syntaxLocations(output: &mut Bytes, source: &IndexedSource, id: HirId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let hir = IndexedSource.authored(source)
+  let span = Module.span(hir, id)
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(id.index))
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(span.start))
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(span.end))
+  let start = SourceUnit.position(IndexedSource.sourceUnit(source), span.start)
+  let end = SourceUnit.position(IndexedSource.sourceUnit(source), span.end)
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(start.line))
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(start.column))
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(end.line))
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(end.column))
+  let children = run Hir.ownedChildren(hir, id)
+  let listed = Vector.asSlice<HirId>(&children)
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(listed.length))
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run syntaxLocations(&mut output.*, source, listed[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn declarationLocations(output: &mut Bytes, source: &IndexedSource, ordinal: usize, kind: Kind) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+  let declaration = &declarations[ordinal]
+  // Selection answers expose ordinals; syntax-bearing facts expose HIR identities and spans.
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(ordinal))
+  if let Option<Arm>.Some {value: arm} = &declaration.arm {
+    run RuntimeEncoding.word(&mut output.*, usize.toU64(arm.conditional))
+  }
+  if kind == Kind.Body {
+    run syntaxLocations(&mut output.*, source, declaration.local)
+  } else if kind != Kind.Selection {
+    run syntaxLocations(&mut output.*, source, declaration.header)
+  }
+  return ()
+}
+
+effect fn declarationContent(output: &mut Bytes, source: &IndexedSource, ordinal: usize, kind: Kind) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+  let declaration = &declarations[ordinal]
+  run RuntimeEncoding.declaration(&mut output.*, &declaration.identity)
+  let mut ambiguous: u64 = 0
+  if declaration.ambiguous { ambiguous = 1 }
+  run RuntimeEncoding.word(&mut output.*, ambiguous)
+  if let Option<Arm>.Some {value: arm} = &declaration.arm {
+    run RuntimeEncoding.declaration(&mut output.*, &declarations[arm.conditional].identity)
+    let mut holds: u64 = 0
+    if arm.holds { holds = 1 }
+    run RuntimeEncoding.word(&mut output.*, holds)
+  }
+  if kind != Kind.Selection {
+    let header = run Fingerprint.headerDigest(IndexedSource.authored(source), declaration.local)
+    run RuntimeEncoding.field(&mut output.*, &header)
+  }
+  if kind == Kind.Body {
+    let digest = run Fingerprint.bodyDigest(IndexedSource.authored(source), declaration.local)
+    run RuntimeEncoding.field(&mut output.*, &digest)
+  }
+  return ()
+}
+
+effect fn content(source: &IndexedSource, kind: Kind, ordinal: usize, name: &[u8]) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run RuntimeEncoding.word(&mut output, 1)
+  let index = IndexedSource.moduleIndex(source)
+  let declarations = ModuleIndex.listDeclarations(index)
+  if kind == Kind.Selection || kind == Kind.Header || kind == Kind.Body {
+    if ordinal < declarations.length {
+      run declarationContent(&mut output, source, ordinal, kind)
+    }
+  } else if kind == Kind.Shape {
+    // Written order is retained for scans that select declaration-order members or imports.
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      run declarationContent(&mut output, source, at, Kind.Header)
+      at = at + usize.ONE
+    }
+  } else if kind == Kind.Name {
+    let candidates = ModuleIndex.listCandidates(index)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      if sameDigest(Bytes.asSlice(&candidate.name), name) {
+        run RuntimeEncoding.declaration(&mut output, &declarations[candidate.declaration].identity)
+        run RuntimeEncoding.word(&mut output, usize.toU64(candidate.ordinal))
+        let mut visible: u64 = 0
+        if candidate.isPublic { visible = 1 }
+        run RuntimeEncoding.word(&mut output, visible)
+        // The import/header content distinguishes binding categories and conditional context.
+        run declarationContent(&mut output, source, candidate.declaration, Kind.Header)
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move output
+}
+
+/// Captures one typed projection from an authenticated current source answer.
+pub effect fn capture(store: &SourceIndex, answer: &Shared<Result<SourceResult, NoRejection>>,
+  module: &ModuleId, moduleOrdinal: usize, kind: Kind, ordinal: usize, name: &[u8], nameOrdinal: usize) -> Read
+! OutOfMemoryError ? &mut Allocator {
+  let mut declaration = Option.none<Shared<DeclarationId>>()
+  let mut selection = Option.none<Shared<Observation>>()
+  let mut encoded = Bytes.make()
+  let mut locations = Bytes.make()
+  if let Option<&IndexedSource>.Some {value: source} = move SourceIndex.source(store, answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+    if (kind == Kind.Selection || kind == Kind.Header || kind == Kind.Body) && ordinal < declarations.length {
+      declaration = Option.some<Shared<DeclarationId>>(run Shared.make<DeclarationId>(
+        run DeclarationId.copy(&declarations[ordinal].identity)))
+      if !stable(source, ordinal) {
+        selection = Option.some<Shared<Observation>>(run Shared.make<Observation>(
+          run Observation.copy(IndexedSource.sourceObservation(source))))
+      }
+    }
+    encoded = run content(source, kind, ordinal, name)
+    if (kind == Kind.Header || kind == Kind.Body) && ordinal < declarations.length {
+      // Lexical scopes contribute header inputs. An anonymous body additionally captures its
+      // enclosing body: preceding locals and captures can change without changing the literal.
+      let mut parent = parentOf(source, ordinal)
+      let count = DeclarationId.ownerCount(&declarations[ordinal].identity)
+      let anonymous = count > usize.ZERO && !DeclarationId.ownerNamed(&declarations[ordinal].identity, count - usize.ONE)
+      while true {
+        let position = match move parent { Option<usize>.Some {value} => value _ => { break } }
+        let mut parentKind = Kind.Header
+        if kind == Kind.Body && anonymous { parentKind = Kind.Body }
+        run declarationContent(&mut encoded, source, position, parentKind)
+        run declarationLocations(&mut locations, source, position, parentKind)
+        parent = parentOf(source, position)
+      }
+    }
+    if (kind == Kind.Selection || kind == Kind.Header || kind == Kind.Body) && ordinal < declarations.length {
+      run declarationLocations(&mut locations, source, ordinal, kind)
+    } else if kind == Kind.Shape {
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        run declarationLocations(&mut locations, source, at, Kind.Header)
+        at = at + usize.ONE
+      }
+    } else if kind == Kind.Name {
+      let candidates = ModuleIndex.listCandidates(IndexedSource.moduleIndex(source))
+      let mut at = usize.ZERO
+      while at < candidates.length {
+        let candidate = &candidates[at]
+        if sameDigest(Bytes.asSlice(&candidate.name), name) {
+          run declarationLocations(&mut locations, source, candidate.declaration, Kind.Header)
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  let locationDigest = Sha256.hash(Bytes.asSlice(&locations))
+  run RuntimeEncoding.field(&mut encoded, &locationDigest)
+  return Read {module: moduleOrdinal, kind: kind, declaration: move declaration,
+    selection: move selection, name: nameOrdinal, digest: Sha256.hash(Bytes.asSlice(&encoded)), locations: locationDigest}
+}
+
+/// Re-observes the same declaration identity, including negative source/name reads.
+pub effect fn matches(read: &Read, store: &mut SourceIndex, module: &ModuleId, name: &[u8]) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run SourceIndex.demand(&mut store.*, module)
+  let mut ordinal = usize.MAX
+  if let Option<&IndexedSource>.Some {value: source} = move SourceIndex.source(&store.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+    if let Option<Shared<DeclarationId>>.Some {value: identity} = &read.declaration {
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        if Shared.with<DeclarationId, bool>(&identity, fn(prior: &DeclarationId) -> bool {
+          return DeclarationId.equals(prior, &declarations[at].identity)
+        }) {
+          if !stable(source, at) {
+            let proved = match &read.selection {
+              Option<Shared<Observation>>.Some {value} => Shared.with<Observation, bool>(&value, fn(observed: &Observation) -> bool {
+                return SourceIndex.matchesObservation(&store.*, observed)
+              })
+              _ => false
+            }
+            if !proved { return false }
+          }
+          ordinal = at
+          break
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  let current = run capture(&store.*, &answer, module, read.module, read.kind, ordinal, name, read.name)
+  return sameDigest(&read.digest, &current.digest)
+}
+
+/// Copies a read without allocating under an answer's shared borrow.
+pub fn copy(read: &Read) -> Read {
+  let declaration = match &read.declaration {
+    Option<Shared<DeclarationId>>.Some {value} => Option.some<Shared<DeclarationId>>(Shared.clone<DeclarationId>(&value))
+    Option<Shared<DeclarationId>>.None => Option.none<Shared<DeclarationId>>()
+  }
+  let selection = match &read.selection {
+    Option<Shared<Observation>>.Some {value} => Option.some<Shared<Observation>>(Shared.clone<Observation>(&value))
+    _ => Option.none<Shared<Observation>>()
+  }
+  return Read {module: read.module, kind: read.kind, declaration: move declaration, selection: move selection,
+    name: read.name, digest: read.digest, locations: read.locations}
+}
