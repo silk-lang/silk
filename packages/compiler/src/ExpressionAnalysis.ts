@@ -56,6 +56,7 @@ import type {
   MatchArmBodyFact,
   MatchExpressionDecision,
   MoveExpressionDecision,
+  OperatorPredicate,
   ParameterFact,
   ParameterReferenceFact,
   PatternBindingFact,
@@ -6877,17 +6878,76 @@ export const operatorContractSelection = (
   }
 }
 
+/** The one stdlib interface operation an overloadable operator stands for (OP-009). */
+export interface OperatorBinding {
+  readonly module: string
+  readonly interface: string
+  readonly operation: string
+}
+
+/**
+ * Binds each overloadable operator to its stdlib interface operation. This table is the compiler's
+ * only knowledge of those interfaces (the documented operator exception to minimal compiler
+ * privilege); everything after it is ordinary conformance selection.
+ */
+export const operatorBinding = (operator: Operator.Eligible): OperatorBinding => {
+  const ops = (name: string, operation: string): OperatorBinding => ({
+    module: 'silk/ops',
+    interface: name,
+    operation,
+  })
+  switch (operator) {
+    case 'Add':
+      return ops('Add', 'add')
+    case 'Subtract':
+      return ops('Subtract', 'subtract')
+    case 'Multiply':
+      return ops('Multiply', 'multiply')
+    case 'Divide':
+      return ops('Divide', 'divide')
+    case 'Remainder':
+      return ops('Remainder', 'remainder')
+    case 'Negate':
+      return ops('Negate', 'negate')
+    case 'BitAnd':
+      return ops('BitAnd', 'bitAnd')
+    case 'BitOr':
+      return ops('BitOr', 'bitOr')
+    case 'BitXor':
+      return ops('BitXor', 'bitXor')
+    case 'BitNot':
+      return ops('BitNot', 'bitNot')
+    case 'Not':
+      return ops('Not', 'not')
+    case 'Equals':
+    case 'NotEquals':
+      return { module: 'silk/equal', interface: 'Equal', operation: 'equals' }
+    case 'LessThan':
+    case 'LessOrEqual':
+    case 'GreaterThan':
+    case 'GreaterOrEqual':
+      return { module: 'silk/order', interface: 'Order', operation: 'compare' }
+  }
+}
+
+const bindsCapability = (binding: OperatorBinding, capability: Type.Nominal): boolean =>
+  capability.module === binding.module && capability.name === binding.interface
+
 export const boundOperatorSelections = (
   declaration: DeclarationFact,
   operator: Operator.Eligible,
-): ReadonlyArray<OperatorContractSelection> =>
-  declaration.typeParameters.flatMap((parameter) =>
+): ReadonlyArray<OperatorContractSelection> => {
+  const binding = operatorBinding(operator)
+  return declaration.typeParameters.flatMap((parameter) =>
     parameter.bounds.flatMap((bound) => {
-      if (bound._tag !== 'ResolvedBound') {
+      if (bound._tag !== 'ResolvedBound' || !bindsCapability(binding, bound.application.capability))
         return []
-      }
       return bound.application.operations.flatMap((operation) => {
-        if (operation.declaration.operator?.operator !== operator) return []
+        if (
+          operation.declaration.name._tag !== 'Present' ||
+          operation.declaration.name.spelling !== binding.operation
+        )
+          return []
         const selected = operatorContractSelection(
           bound.application.capability,
           parameter.type,
@@ -6897,12 +6957,12 @@ export const boundOperatorSelections = (
       })
     }),
   )
+}
 
 /**
- * Collects the concrete conformances an operator use may select (OP-009): those the module of a
- * nominal operand type, seen through one reference, declares for that type. Every operator
- * operation has a `Self` operand, so the provider of any match is an operand type. Scalar and string
- * operands own no bucket, and no other module or imported interface is examined.
+ * Collects the concrete conformances an operator use may select (OP-009). The provider is the
+ * left (or only) operand's type, seen through one reference, so IMPL-004 places every candidate in
+ * the operator interface's module or the provider's own module; no other module is read.
  */
 export const concreteOperatorSelections = (
   index: DeclarationIndex.Index,
@@ -6910,14 +6970,16 @@ export const concreteOperatorSelections = (
   operator: Operator.Eligible,
   operands: ReadonlyArray<SemanticType>,
 ): ReadonlyArray<OperatorContractSelection> => {
-  const owners = operands.flatMap((operand) => {
-    const owner = Type.isReference(operand) ? operand.target : operand
-    return Type.isNominal(owner) ? [owner] : []
-  })
-  const ownerModules = new Set(owners.map((owner) => owner.module))
+  const binding = operatorBinding(operator)
+  const first = operands.at(0)
+  const subject = first !== undefined && Type.isReference(first) ? first.target : first
+  const owners = new Set([
+    binding.module,
+    ...(subject !== undefined && Type.isNominal(subject) ? [subject.module] : []),
+  ])
   const interfaces = index.modules.flatMap((headers) => headers.interfaces)
   const selections = index.modules.flatMap((headers) =>
-    !ownerModules.has(headers.module)
+    !owners.has(headers.module)
       ? []
       : headers.conformances.flatMap((conformance) => {
           if (
@@ -6926,19 +6988,12 @@ export const concreteOperatorSelections = (
             conformance.termination._tag !== 'Terminating' ||
             conformance.capability._tag !== 'Resolved' ||
             conformance.provider._tag !== 'Resolved' ||
-            !Type.isNominal(conformance.capability.type)
+            !Type.isNominal(conformance.capability.type) ||
+            !bindsCapability(binding, conformance.capability.type)
           )
             return []
           const capability = conformance.capability.type
           const provider = conformance.provider.type
-          if (
-            !Type.isNominal(provider) ||
-            provider.module !== headers.module ||
-            !owners.some(
-              (owner) => owner.module === provider.module && owner.name === provider.name,
-            )
-          )
-            return []
           const interface_ = interfaces.find(
             (candidate) =>
               candidate.canonical._tag === 'Canonical' &&
@@ -6962,7 +7017,11 @@ export const concreteOperatorSelections = (
           )
           if (application?.available !== true) return []
           return application.operations.flatMap((operation) => {
-            if (operation.declaration.operator?.operator !== operator) return []
+            if (
+              operation.declaration.name._tag !== 'Present' ||
+              operation.declaration.name.spelling !== binding.operation
+            )
+              return []
             const selected = operatorContractSelection(capability, provider, operation)
             return selected === undefined ? [] : [selected]
           })
@@ -7031,6 +7090,45 @@ const selectedOperatorReference = (
     resolution,
   )
 
+/**
+ * The comparison a predicate operator applies to its interface result (OP-009): `!=` negates
+ * `Equal.equals`, and `<`, `<=`, `>` and `>=` test `Order.compare` against one `Ordering` member, so
+ * both operands are evaluated once in written order. Other operators return the result unchanged.
+ */
+const operatorPredicate = (
+  operator: Operator.Eligible,
+  result: SemanticType,
+  index: DeclarationIndex.Index,
+): OperatorPredicate | undefined => {
+  if (operator === 'NotEquals') return { _tag: 'NegatedOperatorResult' }
+  let wanted: { readonly member: string; readonly negated: boolean } | undefined
+  if (operator === 'LessThan') wanted = { member: 'Less', negated: false }
+  else if (operator === 'LessOrEqual') wanted = { member: 'Greater', negated: true }
+  else if (operator === 'GreaterThan') wanted = { member: 'Greater', negated: false }
+  else if (operator === 'GreaterOrEqual') wanted = { member: 'Less', negated: true }
+  else wanted = undefined
+  if (wanted === undefined) return undefined
+  const ordering = enumFactByType(index, result)
+  const member = ordering?.members.find(
+    (candidate) => candidate.name._tag === 'Present' && candidate.name.spelling === wanted.member,
+  )
+  if (
+    ordering?.canonical._tag !== 'Canonical' ||
+    member?.canonical._tag !== 'Canonical' ||
+    member.discriminant._tag !== 'Available' ||
+    !Type.isNominal(result)
+  )
+    return undefined
+  return {
+    _tag: 'OrderingOperatorResult',
+    enum: ordering.canonical.id,
+    member: member.canonical.id,
+    discriminant: member.discriminant.value,
+    enumType: result,
+    negated: wanted.negated,
+  }
+}
+
 export const finishInterfaceOperator = (
   context: SemanticContext.SemanticContext,
   node: AuthoredHir.Expression,
@@ -7063,15 +7161,17 @@ export const finishInterfaceOperator = (
     undefined,
     resolution,
   )
-  const type =
-    contract.fact._tag === 'Compatible'
-      ? availableExpressionType(reference.result)
-      : unavailableExpressionType
+  const predicate = operatorPredicate(operator, reference.result, resolution.index)
+  let type: ExpressionTypeFact
+  if (contract.fact._tag !== 'Compatible') type = unavailableExpressionType
+  else if (predicate === undefined) type = availableExpressionType(reference.result)
+  else type = availableBoolExpressionType
   return {
     fact: {
       _tag: 'Operator',
       operator,
       reference,
+      ...(predicate === undefined ? {} : { predicate }),
       arguments: arguments_,
       mappings: reference.parameters.flatMap((expected, ordinal) => {
         const argument = arguments_.at(ordinal)
