@@ -23,9 +23,10 @@ cold-build gate.
   **[measured]** With identical emitted IR, removing the driver's revise-based module discovery
   cuts 22% of user time, and removing per-answer revision evidence cuts another 16% of what
   remains: 285 s becomes 187 s. Peak RSS drops only 2.4% (§1).
-- v2 replaces that machinery with Zig's shape, verified in the audit: a small set of semantic
+- v2 replaces that machinery with the shape the audit verified in Zig: a small set of semantic
   dependee kinds over interned handles, fingerprints computed once while indexing, one central
-  edge array, push marking plus pull verification, and cutoff on interned results (§2 to §6).
+  edge array, and cutoff on interned results. Zig's push marking is combined with salsa-style pull
+  verification to fit Silk's demand-driven queries (§2 to §6).
 - A one-shot build records nothing: one early return in one recorder, and no fingerprints (§5).
   Modules load on demand, so a build runs once instead of 81 rounds.
 - The first build of an incremental session is estimated at under 1% time and about 1.1% RSS over
@@ -33,8 +34,8 @@ cold-build gate.
 - Nine language proposals and three safety-model options are ranked for Julia (§8). The largest
   precision gains come from scoping results by the profile entries they read, and from removing the
   three build-wide fixed points: failure observation, region sensitivity and suspension.
-- The work starts with two deletions that need no new design, worth the measured 34%, then builds
-  the graph in five slices (§10).
+- The work starts with two deletions that need no new design, worth the measured 34%. Six slices
+  then build the graph, its precision and cutoff, backend reuse and the session driver (§10).
 
 ## 1. Current state
 
@@ -533,7 +534,7 @@ is the entire consumed result (audit §5). Four conditions follow:
 
 Zig disables comptime-call memoization in incremental mode because a memoized call's dependencies
 are not given to the caller (audit §7). Silk's static machine keeps a completed-call memo per
-machine (`StaticExecution.silk:236`, checked near `:2843`), and a machine lives for one demand
+machine (`Machine.complete`, `StaticExecution.silk:235-248`, checked at `:2843`), and a machine lives for one demand
 (**[source]**, survey of `StaticExecution.make` call sites). Across units, static results are
 shared only through `Value` units. So Silk needs no mode switch, provided two rules hold:
 
