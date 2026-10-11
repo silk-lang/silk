@@ -36,10 +36,11 @@ late upload or rerun of an older commit cannot replace a newer compiler. Artifac
 for 90 days; expired pins fail with an explicit error. The selfhost M1 CI lane uses this action.
 Main also publishes `silk-selfhost-verification` from the same checked run. The download action's
 `verification: 'true'` input fetches this standalone Node 24 harness and returns `verification-path`.
-It verifies the consuming checkout's formatter, intrinsic catalog, and corpus against
-`compiler/scripts/selfhost-track.json`, then rebuilds using `SILK_BOOTSTRAP`. Set `SILKC` to the
-native compiler and `RUNNER_TEMP` to the log directory. Selfhost needs no dependency install or
-verification packaging job.
+Its default mode verifies the consuming checkout's intrinsic catalog and formatting with the
+formatter safety gate named by `SILK_FORMAT_GATE`, writing its log to `RUNNER_TEMP`. Its `corpus`
+and `corpus-full` modes run the corpus against `compiler/scripts/selfhost-track.json` with the
+native compiler named by `SILKC`. Selfhost needs no dependency install or verification packaging
+job.
 
 The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
 repositories can pass a `token` with Actions read access to `julia-script/silk`; their own
