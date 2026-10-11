@@ -1177,22 +1177,33 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `sliceConversionsRetainRegionAccessAndDiagnostics` asserts `TypeMismatch` at
   `&local` and `&[42]`. The bootstrap's `RuntimeSliceOwnership.test.ts` asserts `OWN0019`.
 
-### Selfhost test declaration diagnostics
+### Test declaration diagnostics and discovery
 
-- **Status:** recorded on 2026-10-08 with the Stage 1 census tail.
+- **Status:** recorded on 2026-10-08 with the Stage 1 census tail; native discovery and TEST-001
+  implemented on 2026-10-11 (#1422).
 - **Rule:** [TEST-001](apps/docs/content/reference/testing.md#test-001--test-marks-a-parameterless-unit-function)
   admits a module-level, safe, non-static function with a body, no generic or value parameters and
-  unit success as a test entry; [TEST-002](apps/docs/content/reference/testing.md#test-002--ordinary-builds-do-not-execute-or-retain-tests)
-  analyzes an active test entry like any other function in an ordinary build.
-- **Compilers:** both analyze a valid test entry as an ordinary function. The bootstrap reports an
-  invalid entry as `InvalidTestDeclaration`; selfhost has no test declaration diagnostic yet and
-  refuses that signature as `Unsupported`.
+  unit success as a test entry, and reports an invalid entry at the conflicting qualifier,
+  parameter, binder or success type. [TEST-003](apps/docs/content/reference/testing.md#test-003--one-explicit-root-and-its-active-imports-define-discovery)
+  and [TEST-004](apps/docs/content/reference/testing.md#test-004--discovery-exposes-sealed-static-descriptors-and-exact-callables)
+  define the catalog of one root's active import closure.
+- **Compilers:** both analyze a valid test entry as an ordinary function and catalog the same
+  tests in the same order. The bootstrap reports every invalid entry as `SEM0218` at the `test`
+  qualifier. Selfhost reports `InvalidTestDeclaration` at the span the reference names: `static`,
+  `unsafe` or the linkage for those qualifiers, the first binder, the first parameter, or the
+  written success type; an associated member is reported at `test`. Native test identities use the
+  bootstrap's spelling; native fingerprints frame the native HIR encoding, so they differ from the
+  bootstrap's (TEST-005 does not fix the bytes).
 - **Source migration:** none.
-- **Diagnostics and limits:** selfhost does not discover, describe or run tests.
+- **Diagnostics and limits:** native `silkc test` requires `--no-cache`; test-result reuse
+  (TEST-008) needs execution identities the native compiler does not publish yet and reports
+  `SILK_GAP test-result-cache` otherwise.
 - **Evidence:** `callableAndEffectSignatureContracts` in
-  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` signature and
-  body and the refused parameterized entry.
-- **Owner:** the test declaration diagnostic and discovery: #567 follow-ups.
+  `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` and each
+  TEST-001 span; `compiler/src/semantic/TestDiscoveryCases.silk` checks the catalog, its refusals
+  and a body iterating it. The native Cases shards in `selfhost.yml` run the bundled runner built
+  by `silkc test`.
+- **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
 ## Maintaining this file
 
