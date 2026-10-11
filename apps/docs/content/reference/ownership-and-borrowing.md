@@ -510,11 +510,11 @@ fn invalid() -> i32 {
 argument. Argument evaluation order does not shorten an earlier loan to the end of that argument's
 evaluation; the callee receives all arguments together.
 
-Reading `.length` of a fixed-size array `[T; N]` while a loan of that array is live is not an
-access: the length is part of the array's type, and reading it reads no storage. For
-`values: [i32; 2]`, the call `replace(&mut values, values.length - 1)` is valid even though the first
-argument borrows `values` exclusively. `.length` of a slice or a `Vector` reads runtime storage, so
-it is an access and follows the rule above.
+Reading `.length` of any place while an exclusive loan of it is live is an access, whether the
+place is a fixed-size array, a slice or a `Vector`, even though a fixed array's length is part of
+its type. For `values: [i32; 2]`, `replace(&mut values, values.length - 1)` reports `OWN0011` at
+the length read and relates the first argument's loan. Bind the length before the call instead:
+`let last = values.length - 1` and then `replace(&mut values, last)`.
 
 **Diagnostics:** Conflicting slice arguments report `OWN0010` at the later borrow and relate the
 earlier loan. Directly reading the owner in a later argument while an exclusive loan is active
