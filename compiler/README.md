@@ -189,8 +189,11 @@ such as a provision section's `once Effect<'env; ...>` representation bound. A f
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors.
 
-Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> --stdlib <directory>
---optimization <none|speed> --debug <true|false>`.
+Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> --target <triple>
+--stdlib <directory> --optimization <none|speed> --debug <true|false>`.
+The target defaults to the compiler's host target. Another supported target emits only LLVM IR:
+an executable build for a non-host target is an invalid build profile, so the macOS CI leg
+cross-emits the compiler's IR on Linux and links it on macOS.
 The output defaults to an executable. `--emit llvm-ir` writes the exact completed backend module
 bytes to the requested file, returns success without invoking Clang, and creates no intermediate
 executable or temporary IR file. Invalid or repeated output selectors fail before source loading.
