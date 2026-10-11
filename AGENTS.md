@@ -14,6 +14,10 @@ compatibility contract.
   path remains or its cleanup is deferred to a future task.
 - Prefer a breaking change over a compromised design. Existing usage inside this repository is a
   migration target to update, not a reason to preserve the old shape.
+- Bookkeeping that only serves a later revision, such as dependency edges or validation evidence,
+  may be gated on whether the build can be revised: one code path whose recorder returns early in a
+  one-shot build. This is a recording policy, not a dual path. It must not change what the
+  compiler computes, and both modes need a test. Alternate semantic paths stay forbidden.
 
 These conventions apply to the entire repository. The current `effect-patterns` skill is the
 authoritative source for Effect architecture. When this file and that skill differ, follow the
