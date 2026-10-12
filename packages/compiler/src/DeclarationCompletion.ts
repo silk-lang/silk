@@ -2192,14 +2192,18 @@ export const complete = (
     }
   })
 
-  // GEN-005: an interface is a compile-time contract, not a storable existential value, so no
-  // field, parameter or result type may mention one (SEM0018). Bounds and impl heads name
-  // interfaces through their own facts and never reach this pass.
+  // GEN-005: an interface is a compile-time contract, not a storable existential value, and a
+  // service is an interface in every respect but requirement eligibility (SERV-003). No field,
+  // parameter or result type may mention either (SEM0018). Bounds, impl heads and requirement
+  // rows name contracts through their own facts and never reach this pass.
   const rejectInterfaceValue = (fact: DeclaredTypeFact): DeclaredTypeFact => {
     if (fact._tag !== 'Resolved') return fact
-    const contract = Type.nominals(fact.type).find(
-      (nominal) => memberByNominal(modules, nominal)?._tag === 'InterfaceDeclaration',
-    )
+    const contract = Type.valueNominals(fact.type).find((nominal) => {
+      const declaration = memberByNominal(modules, nominal)
+      return (
+        declaration?._tag === 'InterfaceDeclaration' || declaration?._tag === 'ServiceDeclaration'
+      )
+    })
     if (contract === undefined) return fact
     const diagnostic = Diagnostic.expectedType(fact.spelling, Location.at(fact.anchor))
     diagnostics.push(diagnostic)

@@ -364,13 +364,16 @@ it.effect('records the resolved bound contract on the declaration it belongs to'
   }),
 )
 
-it.effect('rejects an interface in a field, parameter or result type', () =>
+it.effect('rejects an interface or service in a field, parameter or result type', () =>
   Effect.gen(function* () {
     const source = `interface Label { fn label(value: &Self) -> i32 }
+service Logger {}
 type Labeled = Label
 struct Holder { label: Label }
 fn take(value: &Labeled) -> i32 { return 0 }
 fn give() -> Label { return () }
+fn log(logger: &Logger) -> i32 { return 0 }
+effect fn required() -> i32 ? &Logger { return 0 }
 pub fn main() -> i32 { return 0 }`
     const self = yield* snapshot(source)
     assert.deepEqual(
@@ -379,6 +382,7 @@ pub fn main() -> i32 { return 0 }`
         [Diagnostic.expectedTypeCode, source.indexOf('Label }')],
         [Diagnostic.expectedTypeCode, source.indexOf('&Labeled')],
         [Diagnostic.expectedTypeCode, source.indexOf('Label { return')],
+        [Diagnostic.expectedTypeCode, source.indexOf('&Logger)')],
       ],
     )
   }),
