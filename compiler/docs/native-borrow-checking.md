@@ -1,7 +1,7 @@
 # Native borrow checking
 
 Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). Nothing here is
-implemented yet. It relies on [`region-sensitive-identity.md`](region-sensitive-identity.md) and
+implemented yet. It relies on [`region-erased-identity.md`](region-erased-identity.md) and
 follows [`incremental-architecture-v2.md`](incremental-architecture-v2.md) (§8.3, the
 checking-unit rule).
 
@@ -138,15 +138,15 @@ bodies are checked per selection, including type-specific selections when a stat
 generic types"). A non-generic body is simply the case of an abstract body with no parameters, so
 it needs no separate path.
 
-**Why instances need no re-check.** Region-sensitive identity already establishes that a body's
+**Why instances need no re-check.** Region-erased identity already establishes that a body's
 generic bounds (`'b: 'a`, `T: 'a`) are premises proved against its own parameters, that caller
 regions reach an instance only as a numbering (`Lifetime.Supplied`), and that relations between
 distinct caller-local regions are obligations of the caller's body, proved before the call is
 selected. A loan conflict depends on the body's places and control flow, which substitution does
 not change. A static selection that changes the body produces a new selection key, which is its own
-unit. A region-sensitive application selects different callees by region pattern, but each callee
-is checked against its own contract, and the caller's arguments are checked against the selected
-callee's signature in the caller's unit.
+unit. Every region pattern of an application selects the same callees, each callee is checked
+against its own contract, and the caller's arguments are checked against the selected callee's
+signature in the caller's unit.
 
 **Interaction with `needsStaticResidualization`.** Today `lowerMir` derives the selected body key
 from `InstanceKey.selected` and `internSelectedApplication`. That key names the `Body` unit whose
@@ -432,5 +432,5 @@ Julia decided the open questions in the joint review with #1433 (2026-10-11):
 7. **Diagnostic spelling.** During the transition the native CLI prints native names together with
    bootstrap codes.
 8. **Region-sensitive applications.** No instance is re-checked: instances are never checking
-   units. The accepted v2 proposal P3(a) also removes lifetime-selective heads, so region-sensitive
-   applications disappear.
+   units. P3 removed region-dependent sealed heads, so region-sensitive applications no longer
+   exist.
