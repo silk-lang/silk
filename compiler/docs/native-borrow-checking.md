@@ -296,9 +296,8 @@ cover first:
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
-  exclusive views included, are proved, but the body is not region-closed (below), retains a region
-  relation or capture contents, or stages an exclusive view into a section without `&mut`; later
-  slices prove those.
+  exclusive views included, are proved, but the body is not region-closed (below), or retains a
+  region relation or capture contents; later slices prove those.
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local. One such form must reject rather than stay unchecked: a
@@ -402,9 +401,7 @@ root's scope:
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
 
-Pending means a region relation or capture contents typing retained, or an exclusive view a section
-stages without `&mut`: OWN0003 holds by-value operands to `move`, but not yet every staged argument
-(a generic callable parameter's section stages one unchecked). Scope ends as events,
+Pending means a region relation or capture contents typing retained. Scope ends as events,
 OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
 the first point at which a loan can outlive its root.
 
