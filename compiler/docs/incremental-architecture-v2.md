@@ -1200,3 +1200,21 @@ was accepted:
 
 Language proposals: §8.2. Earlier decisions folded in: mode-gated recording (§5.1), preloading and
 one-shot no-record landing first (§10 slices 1 and 2).
+
+## 12. Open issues
+
+1. **An unrelated declaration changes a body's STATIC-009 diagnosis.** Found while measuring
+   #1474; it reproduces on selfhost before that change, so it is not inside the `PhaseOnly` query.
+   In one module:
+
+   ```silk
+   struct Plan { parts: Intrinsic.StaticSequence<i32> mode: i32 }
+   static fn make() -> Plan { return Plan { parts: Intrinsic.staticSequenceEmpty<i32>(), mode: 1 } }
+   fn bind() -> i32 { let held = make() return 0 }
+   ```
+
+   `bind`'s selected body rejects `make()` with `StaticPhaseViolation`. Adding only
+   `struct Anchored<'a> { plan: Plan, at: &'a i32 }` to the module changes that rejection to a
+   different code at the same body, while `struct Anchored { plan: Plan }` does not. A body's
+   answer must depend only on what it reads (§2), so this is the cross-declaration dependence that
+   incremental reuse cannot have. The cause is not yet investigated.
