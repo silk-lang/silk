@@ -499,6 +499,36 @@ export const appliedOwnerTypeArgumentNodes = (
 }
 
 /**
+ * The placement diagnostic for a member list written after an unwritten owner (GEN-008). When the
+ * selected inherent member or service operation uses its owner's parameters, its type arguments
+ * follow a written owner; a member that uses none of them keeps its own list.
+ */
+export const ownerArgumentPlacementDiagnostics = (
+  context: SemanticContext.SemanticContext,
+  call: AuthoredHir.Expression,
+  resolution: ResolutionContext,
+): ReadonlyArray<Diagnostic.Located> => {
+  if (call._tag !== 'CallExpression' || call.generics === undefined) return []
+  if (call.generics.arguments.length === 0) return []
+  const callee = callCallee(call)
+  if (callee._tag === 'MemberExpression' && callee.selector.subject._tag === 'AppliedType')
+    return []
+  const selected = appliedOwnerBinders(context, call, resolution)
+  if (selected === undefined) return []
+  const key = (parameter: Type.Parameter) => `${parameter.kind === 'Lifetime'}:${parameter.name}`
+  const listed = new Set(selected.listed.map(key))
+  if (!selected.binders.some((binder) => listed.has(key(binder.type)))) return []
+  const member = referenceNames(call).at(1)
+  return [
+    Diagnostic.ownerArgumentPlacement(
+      selected.owner,
+      member === undefined ? '' : (SemanticContext.nameText(context, member) ?? ''),
+      Location.at(call.generics.anchor),
+    ),
+  ]
+}
+
+/**
  * The binders an owner application supplies for a qualified call, and the ones the selected
  * member lists. An inherent member lists the impl binders its signature names; a service
  * operation is applied under every binder of its service.
