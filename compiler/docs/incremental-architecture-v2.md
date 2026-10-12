@@ -279,10 +279,10 @@ this way is dropped and its readers consume a coarser kind.
 | `LayoutOf(T)`       | type application                 | `Layout(T)` produced an unequal layout                                                       | a field edit that keeps size, alignment and offsets stops at the layout                                                                                                 |
 | `ProfileEntry(p)`   | profile parameter or target fact | that one value changes                                                                       | changing one package parameter reruns only its readers (§8, proposal P1)                                                                                                |
 
-Two more are needed only in an incremental session that emits debug information or embeds files:
-`DeclLocation(D)` (the declaration's line and column, read only by emission with `--debug true`,
-the analogue of Zig's line-number update, audit §6) and `EmbeddedFile(F)`. They never appear in a
-build without those features.
+Two more complete the set. `DeclLocation(D)` is the declaration's position, read by every unit
+whose result reports one (§3.5): a rejected or unsupported unit, observed trap and context labels,
+and emission with `--debug true`, the analogue of Zig's line-number update (audit §6).
+`EmbeddedFile(F)` appears only in a build that embeds files.
 
 What is **not** a dependee: syntax projections (presence, selection, header, body, name, shape)
 read by #1359, source positions, declaration ordinals, and observations of whole modules. Each
@@ -400,18 +400,27 @@ fixpoint stays meaningful (#1427).
 
 ### 3.5 Locations
 
-Fingerprints exclude positions, so a body that moves keeps its unit result. Locations stay current
-by construction instead of by invalidation:
+Fingerprints exclude positions, so a body that moves keeps its unit result only when nothing it
+stores is an absolute position. Every declaration has an anchor (`semantic.Anchor`): its first HIR
+node and its first significant byte, both read from the current parse. A declaration's nodes,
+nested declarations included, form one contiguous postorder arena range ending at the declaration
+node, and lowering records where each range starts.
 
-- typed bodies, MIR origins and retained diagnostics store spans relative to their declaration's
-  start;
-- each indexed module keeps a per-declaration table of absolute start offset, line and column,
-  rebuilt on every parse;
-- a diagnostic is rendered against the current table when it is reported.
+- Typed bodies store origins as a node and a byte span counted from their declaration's anchor.
+  Body-local region ordinals count the same way, so an instance's runtime identity is unchanged
+  by a move. An anonymous literal is checked inside its enclosing named declaration and uses that
+  anchor. MIR copies typed origins unchanged.
+- Rejections and backend gaps keep absolute spans, because a reported position must be current.
+  Code that works on relative origins converts once, where the result leaves it: the body check
+  for borrow-check verdicts, MIR lowering for its gaps, and LLVM text for emission gaps.
+- A unit whose result depends on a location records `DeclLocation(D)`, so a move reruns it. That
+  covers rejected and unsupported units, observed trap and context labels (which name line and
+  column), and emission with debug information.
 
-This covers #1359's `unchangedByteOffsetsStillObserveChangedLineCoordinates` scenario without
-rerunning the body. Only emission with debug information reads absolute lines, through
-`DeclLocation(D)`.
+A body that checks, lowers and emits without a diagnostic therefore keeps every answer when an
+edit above it moves it, while #1359's
+`unchangedByteOffsetsStillObserveChangedLineCoordinates` scenario reruns only the units that
+report a position.
 
 ## 4. The graph
 
@@ -1005,9 +1014,10 @@ set are what matter, and v2 slice 3 attaches edges to them without changing the 
 - _Q1 (MIR or typed body)._ Reframed: incremental compilation does not require MIR. S1 and S2 are
   both checking units under the rule above. The choice was cold cost against one representation,
   and Julia chose S1: no second lowering of generic bodies.
-- _Q2 (span parity)._ Compatible with code plus primary-span parity, with one requirement: checking
-  answers store spans relative to their declaration (§3.5), because cutoff compares them. Parity
-  then compares rendered spans, and an edit elsewhere in the file never changes a cached answer.
+- _Q2 (span parity)._ Compatible with code plus primary-span parity, with one requirement: checked
+  bodies store origins relative to their declaration (§3.5), because cutoff compares them. Parity
+  then compares rendered spans, and an edit elsewhere in the file never changes a cached accepted
+  body; a rejection names an absolute span and reruns when its declaration moves.
 - _Q4 (one owner for move rules)._ Not constrained by incremental compilation as long as move and
   loan checks of one body run under the same key, so one body edit reruns both and nothing else.
   Under S1 one stage owns both naturally. Under S2, keeping moves in typing is equally incremental.
