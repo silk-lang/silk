@@ -190,56 +190,56 @@ effect fn provider(values: &[u8]) -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(values)
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.End {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.End {
     readyAt: SystemClock.make(0, 0),
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     // One-byte buffered reads may consume one audit entry per input byte.
     // Reserve the EOF read and scoped flush/close operations as well.
     values.length + 8,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
 effect fn failingProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Failure {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Failure {
     readyAt: SystemClock.make(0, 0),
     code: 17,
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     8,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
 effect fn deadlineProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 10),
     bytes: run Bytes.copy(&b"x"),
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     8,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -277,7 +277,7 @@ effect<'call> fn rawReader<
   while true {
     let mut output: [u8; 4] = [0, 0, 0, 0]
     let progress = run Effect.catchAll(
-      ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+      ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock),
       classifyFailure,
     )
@@ -352,7 +352,7 @@ effect fn readExpected<'call, 'reader: 'call, 'transport: 'reader, 'head: 'reade
   while true {
     let mut output: [u8; 4] = [0, 0, 0, 0]
     let progress = run Effect.catchAll(
-      ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+      ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock),
       classifyFailure,
     )
@@ -514,7 +514,7 @@ effect fn emptyRead<'call, 'reader: 'call, 'transport: 'reader, 'head: 'reader>(
   let mut clock = FixedClock {}
   let mut output: [u8; 0] = []
   let progress = run Effect.catchAll(
-    ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+    ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock),
     classifyFailure,
   )
@@ -554,7 +554,7 @@ effect fn identityRead<'call, 'reader: 'call, 'transport: 'reader, 'head: 'reade
   while true {
     let mut output: [u8; 1] = [0]
     let progress = run Effect.catchAll(
-      ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+      ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock),
       classifyFailure,
     )
@@ -586,7 +586,7 @@ effect fn emptyBudgetRead<'call, 'reader: 'call, 'transport: 'reader, 'head: 're
   let mut clock = FixedClock {}
   let mut output: [u8; 1] = [0]
   let progress = run Effect.catchAll(
-    ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+    ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock),
     classifyFailure,
   )
@@ -607,7 +607,7 @@ effect fn deadlineRead<'call, 'reader: 'call, 'transport: 'reader, 'head: 'reade
     ContentReader.readSome(
       &mut reader.*,
       &mut output,
-      Option.some<Instant>(SystemClock.make(0, 10)),
+      Option<Instant>.some(SystemClock.make(0, 10)),
     ) |> Effect.provideMut<MonotonicClock>(&mut clock),
   )
   match move attempted {
@@ -696,7 +696,7 @@ effect fn partialChecksumRead<'call, 'reader: 'call, 'transport: 'reader, 'head:
   while true {
     let mut output: [u8; 1] = [0]
     let attempted = run Effect.result(
-      ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+      ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock),
     )
     let mut step = ChecksumStep.Progress {state: ContentProgressState.Data}
@@ -785,7 +785,7 @@ effect fn readFailure<'call, 'reader: 'call, 'transport: 'reader, 'head: 'reader
   let mut output: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
   while true {
     let attempted = run Effect.result(
-      ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+      ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock),
     )
     let progress = match move attempted {
@@ -1215,7 +1215,7 @@ effect<'session> fn chunkedSession<'session>(
   // The suffix may still be in the provider when the read buffer holds only two bytes.
   let mut suffix: [u8; 4] = [0, 0, 0, 0]
   let mut clock = FixedClock {}
-  let read = BufferedDuplex.readExact(&mut body.*, &mut suffix, Option.none<Instant>())
+  let read = BufferedDuplex.readExact(&mut body.*, &mut suffix, Option<Instant>.none())
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   match move (run Effect.result(move read)) {
     Result.Failure {error} => { drop error return 299 }
@@ -1990,7 +1990,7 @@ fn cancellationParked(state: &mut i32, execution: Intrinsic.Execution<i32>) -> (
 
 effect fn structuredCancellation() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<CancellationState>(CancellationState {
+  let state = run Shared<CancellationState>.make(CancellationState {
     ownerDrops: usize.ZERO,
     auditEntries: usize.ZERO,
     closeAttempts: usize.ZERO,

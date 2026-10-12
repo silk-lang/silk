@@ -161,8 +161,8 @@ effect fn leaf(value: i32) -> Tree ! OutOfMemoryError ? &mut Allocator {
 }
 
 effect fn branch(left: Tree, right: Tree, value: i32) -> Tree ! OutOfMemoryError ? &mut Allocator {
-  let boxedLeft = run Box.make<Tree>(move left)
-  let boxedRight = run Box.make<Tree>(move right)
+  let boxedLeft = run Box<Tree>.make(move left)
+  let boxedRight = run Box<Tree>.make(move right)
   return Tree {
     shape: Shape { kind: Branch { left: move boxedLeft, right: move boxedRight } },
     value: value
@@ -176,7 +176,7 @@ fn total(self: &Tree) -> i32 {
 fn shapeTotal(self: &Shape) -> i32 {
   return match &self.kind {
     Leaf nothing => 0
-    Branch { left, right } => boxTotal(Box.get<Tree>(&left)) + boxTotal(Box.get<Tree>(&right))
+    Branch { left, right } => boxTotal(Box<Tree>.get(&left)) + boxTotal(Box<Tree>.get(&right))
   }
 }
 

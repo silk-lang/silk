@@ -763,32 +763,32 @@ effect fn rawMemoryTransport(
   let first = run Bytes.copy(${silkBytes(firstFlight)})
   let second = run Bytes.copy(${silkBytes(secondFlight)})
   let third = run Bytes.copy(${silkBytes(thirdFlight)})
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(100, 0),
     bytes: move first,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(100, 0),
     bytes: move second,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(100, 0),
     bytes: move third,
   })
   if peerClose {
-    run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+    run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
       readyAt: SystemClock.make(100, 0),
       bytes: run Bytes.copy(${silkBytes(tlsClientRsaServerCloseNotify)}),
     })
   }
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   let mut index = usize.ZERO
   while index < 16 {
     let mut count: usize = 65535
     if index == usize.ZERO { count = usize.ONE }
     if index == usize.ONE { count = 2 }
-    run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+    run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
       readyAt: SystemClock.make(100, 0),
       action: MemoryWriteAction.Accept {count: count},
     })
@@ -815,18 +815,18 @@ ${
 ) -> DirectCancellationDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let inner = run rawMemoryTransport(Option.none<i32>(), false)
+  let inner = run rawMemoryTransport(Option<i32>.none(), false)
   return DirectCancellationDuplex {inner: move inner, state: move state}
 }
 
 effect fn emptyTransport() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let reads = Vector.make<MemoryReadEvent>()
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let reads = Vector<MemoryReadEvent>.make()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   let mut index = usize.ZERO
   while index < 4 {
-    run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+    run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
       readyAt: SystemClock.make(100, 0),
       action: MemoryWriteAction.Accept {count: 65535},
     })
@@ -837,7 +837,7 @@ effect fn emptyTransport() -> MemoryByteDuplex
     move writes,
     1024,
     16,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -931,7 +931,7 @@ effect fn useAuthenticated(
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   ]
-  let read = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option.none<Instant>())
+  let read = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
   let count = match move read {
     ReadTransfer.Data {count: transferred} => transferred
     ReadTransfer.End => { return 3 }
@@ -943,17 +943,17 @@ effect fn useAuthenticated(
     if plaintext[index] != expected[index] { return 5 }
     index = index + usize.ONE
   }
-  let written = run OwnedConnection.writeSome(&mut connection.*, &b"ping", Option.none<Instant>())
+  let written = run OwnedConnection.writeSome(&mut connection.*, &b"ping", Option<Instant>.none())
   if written != 4 { return 6 }
-  run OwnedConnection.flush(&mut connection.*, Option.none<Instant>())
-  run OwnedConnection.shutdownWrite(&mut connection.*, Option.none<Instant>())
-  let ended = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option.none<Instant>())
+  run OwnedConnection.flush(&mut connection.*, Option<Instant>.none())
+  run OwnedConnection.shutdownWrite(&mut connection.*, Option<Instant>.none())
+  let ended = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
   match move ended {
     ReadTransfer.Data {count: unexpectedCount} => { drop unexpectedCount return 7 }
     ReadTransfer.End => {}
   }
   if OwnedConnection.phase(&connection.*) != ConnectionPhase.WriteShutdown { return 8 }
-  run OwnedConnection.shutdownWrite(&mut connection.*, Option.none<Instant>())
+  run OwnedConnection.shutdownWrite(&mut connection.*, Option<Instant>.none())
   return 42
 }
 
@@ -969,13 +969,13 @@ ${
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   ]
-  let first = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option.none<Instant>())
+  let first = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
   match move first {
     ReadTransfer.Data {count} => { if count != b"coalesced authenticated plaintext".length { return 1 } }
     ReadTransfer.End => { return 2 }
   }
   let truncated = run Effect.result(
-    OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option.none<Instant>())
+    OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
   )
   match move truncated {
     Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Success {value} => { return 3 }
@@ -990,7 +990,7 @@ ${
   if OwnedConnection.phase(&connection.*) != ConnectionPhase.Closed { return 6 }
   let mut empty: [u8; 0] = []
   let later = run Effect.result(
-    OwnedConnection.readSome(&mut connection.*, &mut empty, Option.none<Instant>())
+    OwnedConnection.readSome(&mut connection.*, &mut empty, Option<Instant>.none())
   )
   match move later {
     Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Success {value} => { return 7 }
@@ -1047,7 +1047,7 @@ effect fn timeoutDeadlineCase(
 ) -> bool
 ! TrustSourceError | OutOfMemoryError
 ? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
-  let audit = run Shared.make<DeadlineAudit>(DeadlineAudit {
+  let audit = run Shared<DeadlineAudit>.make(DeadlineAudit {
     writes: usize.ZERO,
     flushes: usize.ZERO,
     closes: usize.ZERO,
@@ -1104,7 +1104,7 @@ effect fn postReadBoundaryCase(
 ) -> bool
 ! TrustSourceError | OutOfMemoryError
 ? &mut SystemClock | &mut Allocator {
-  let state = run Shared.make<PostReadState>(PostReadState {
+  let state = run Shared<PostReadState>.make(PostReadState {
     readReturned: false,
     reads: usize.ZERO,
     writes: usize.ZERO,
@@ -1193,7 +1193,7 @@ effect fn pendingDirectWrite(
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = ParkingClock {}
   let mut random = ScriptedRandom {filled: usize.ZERO}
-  let written = run OwnedConnection.writeSome(&mut owner.*, &b"ambiguous", Option.none<Instant>())
+  let written = run OwnedConnection.writeSome(&mut owner.*, &b"ambiguous", Option<Instant>.none())
     |> Effect.provideMut<MonotonicClock>(&mut clock)
     |> Effect.provideMut<Random>(&mut random)
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -1234,42 +1234,42 @@ where &mut P provides &ByteDuplex from &mut ByteDuplex,
   let mut empty: [u8; 0] = []
   let mut output: [u8; 1] = [0]
   let emptyRead = run Effect.result(
-    OwnedConnection.readSome(&mut owner.*, &mut empty, Option.none<Instant>())
+    OwnedConnection.readSome(&mut owner.*, &mut empty, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
   if !isClosedFailure<ReadTransfer>(move emptyRead, ByteIoOperation.Read) { return false }
   let read = run Effect.result(
-    OwnedConnection.readSome(&mut owner.*, &mut output, Option.none<Instant>())
+    OwnedConnection.readSome(&mut owner.*, &mut output, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
   if !isClosedFailure<ReadTransfer>(move read, ByteIoOperation.Read) { return false }
   let emptyWrite = run Effect.result(
-    OwnedConnection.writeSome(&mut owner.*, &b"", Option.none<Instant>())
+    OwnedConnection.writeSome(&mut owner.*, &b"", Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
   if !isClosedFailure<usize>(move emptyWrite, ByteIoOperation.Write) { return false }
   let write = run Effect.result(
-    OwnedConnection.writeSome(&mut owner.*, &b"x", Option.none<Instant>())
+    OwnedConnection.writeSome(&mut owner.*, &b"x", Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
   if !isClosedFailure<usize>(move write, ByteIoOperation.Write) { return false }
   let flushed = run Effect.result(
-    OwnedConnection.flush(&mut owner.*, Option.none<Instant>())
+    OwnedConnection.flush(&mut owner.*, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
   if !isClosedFailure<()>(move flushed, ByteIoOperation.Flush) { return false }
   let shutdown = run Effect.result(
-    OwnedConnection.shutdownWrite(&mut owner.*, Option.none<Instant>())
+    OwnedConnection.shutdownWrite(&mut owner.*, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
       |> Effect.provideMut<Random>(&mut random)
       |> Effect.provideMut<Allocator>(&mut allocator)
@@ -1310,7 +1310,7 @@ effect fn cancelDirectOwned(
 ) -> i32
 ! ConnectionError | TrustSourceError | OutOfMemoryError
 ? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
-  let state = run Shared.make<DirectCancellationState>(DirectCancellationState {
+  let state = run Shared<DirectCancellationState>.make(DirectCancellationState {
     armed: false,
     closed: false,
     offers: usize.ZERO,
@@ -1348,7 +1348,7 @@ effect fn postFinishedDeadline(
 ) -> bool
 ! ConnectionError | TrustSourceError | OutOfMemoryError
 ? &mut SystemClock | &mut Allocator {
-  let countingState = run Shared.make<DirectCancellationState>(DirectCancellationState {
+  let countingState = run Shared<DirectCancellationState>.make(DirectCancellationState {
     armed: false,
     closed: false,
     offers: usize.ZERO,
@@ -1391,7 +1391,7 @@ effect fn postFinishedDeadline(
   if finalCheck <= usize.ONE { return false }
 
   random.filled = usize.ZERO
-  let expiringState = run Shared.make<DirectCancellationState>(DirectCancellationState {
+  let expiringState = run Shared<DirectCancellationState>.make(DirectCancellationState {
     armed: false,
     closed: false,
     offers: usize.ZERO,
@@ -1445,9 +1445,9 @@ effect fn directCloseFailure(
 ) -> bool
 ! ConnectionError | TrustSourceError | OutOfMemoryError
 ? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
-  let audit = run Shared.make<OwnedMemoryAudit>(freshOwnedMemoryAudit())
+  let audit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
   let transport = run ownedMemoryTransport(
-    Option.some<i32>(91),
+    Option<i32>.some(91),
     false,
     Shared.clone(&audit),
   )
@@ -1480,7 +1480,7 @@ effect fn directCloseFailure(
 
 effect fn cancelSuspendedConnection() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<CancellationState>(CancellationState {
+  let state = run Shared<CancellationState>.make(CancellationState {
     closes: usize.ZERO,
     callbacks: usize.ZERO,
   }) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -1510,9 +1510,9 @@ effect fn runCases(
 ? &mut SystemClock
   | &mut MonotonicClock
   | &mut Allocator {
-  let successAudit = run Shared.make<OwnedMemoryAudit>(freshOwnedMemoryAudit())
+  let successAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
   let success = run ownedMemoryTransport(
-    Option.none<i32>(),
+    Option<i32>.none(),
     true,
     Shared.clone(&successAudit),
   )
@@ -1536,9 +1536,9 @@ ${
   includeFailureCases
     ? `  if !(run preparationFailureLeavesProvider()) { return 19 }
   random.filled = usize.ZERO
-  let failingAudit = run Shared.make<OwnedMemoryAudit>(freshOwnedMemoryAudit())
+  let failingAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
   let failing = run ownedMemoryTransport(
-    Option.some<i32>(91),
+    Option<i32>.some(91),
     false,
     Shared.clone(&failingAudit),
   )
@@ -1563,9 +1563,9 @@ ${
   }
   if !Shared.with(&failingAudit, observedTerminalClose) { return 23 }
   random.filled = usize.ZERO
-  let truncatedAudit = run Shared.make<OwnedMemoryAudit>(freshOwnedMemoryAudit())
+  let truncatedAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
   let truncated = run ownedMemoryTransport(
-    Option.none<i32>(),
+    Option<i32>.none(),
     false,
     Shared.clone(&truncatedAudit),
   )
@@ -1580,7 +1580,7 @@ ${
   if truncation != 42 { return 25 }
   if !Shared.with(&truncatedAudit, observedTerminalClose) { return 26 }
   random.filled = usize.ZERO
-  let endedAudit = run Shared.make<OwnedMemoryAudit>(freshOwnedMemoryAudit())
+  let endedAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
   let ended = run ownedEmptyTransport(Shared.clone(&endedAudit))
   let endedTrust = run preparedTrust(trust)
   let mut endedCallbacks = CallbackCounter {calls: usize.ZERO}
@@ -1614,7 +1614,7 @@ ${
     config,
     trust,
     &mut random.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     130,
     true,
   )) { return 32 }
@@ -1623,7 +1623,7 @@ ${
     config,
     trust,
     &mut random.*,
-    Option.some<Instant>(SystemClock.make(105, 0)),
+    Option<Instant>.some(SystemClock.make(105, 0)),
     105,
     true,
   )) { return 33 }
@@ -1632,7 +1632,7 @@ ${
     config,
     trust,
     &mut random.*,
-    Option.some<Instant>(SystemClock.make(140, 0)),
+    Option<Instant>.some(SystemClock.make(140, 0)),
     130,
     true,
   )) { return 34 }
@@ -1641,7 +1641,7 @@ ${
     config,
     trust,
     &mut random.*,
-    Option.some<Instant>(SystemClock.make(99, 0)),
+    Option<Instant>.some(SystemClock.make(99, 0)),
     99,
     false,
   )) { return 35 }
