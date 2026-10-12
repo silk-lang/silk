@@ -545,9 +545,10 @@ fn consume(values: &mut [u8]) -> () { return () }
 fn invalid(self: &Wrapper) -> () { return consume(&mut self.values) }
 pub fn main() -> i32 { return 0 }`),
       )
+      // `self` is a shared view, so its field cannot be reborrowed exclusively (BORROW-005).
       assert.include(
         Analysis.diagnostics(shared).map((diagnostic) => diagnostic.code),
-        'SEM0057',
+        'SEM0058',
       )
     }),
 )

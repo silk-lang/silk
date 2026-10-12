@@ -1270,20 +1270,28 @@ export const borrowSubject = (
     parentReference.access === 'Exclusive' &&
     (expected === undefined || (!Type.isReference(expected) && !Type.isSlice(expected))) &&
     !exclusiveBorrowRoot(root)
+  const placeBorrowAccess =
+    subjectFact._tag === 'FieldProjection' ||
+    subjectFact._tag === 'ReferentProjection' ||
+    subjectFact._tag === 'IndexProjection'
+      ? subjectFact.placeBorrowAccess
+      : undefined
   // A view context reborrows the referent, and reborrowing never strengthens access (BORROW-005).
+  // A place reached through a shared view is likewise never borrowed exclusively.
   if (
-    parentReference !== undefined &&
-    parentReference.access === 'Shared' &&
     access === 'Exclusive' &&
-    (projectedReference !== undefined ||
-      (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))
+    (placeBorrowAccess === 'Shared' ||
+      (parentReference !== undefined &&
+        parentReference.access === 'Shared' &&
+        (projectedReference !== undefined ||
+          (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))))
   )
     return unavailableBorrow(
       node,
       access,
       subject,
       diagnostics,
-      Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
+      Diagnostic.invalidReborrow('Shared', access, Location.at(node.anchor)),
     )
   if (
     parentReference !== undefined &&
@@ -4710,7 +4718,7 @@ export const analyzeProjection = (
     subject.fact._tag === 'IndexProjection'
       ? subject.fact.placeBorrowAccess
       : undefined
-  const placeBorrowAccess = combinedBorrowAccess(inheritedAccess, undefined)
+  const placeBorrowAccess = combinedBorrowAccess(inheritedAccess, reference?.access)
   const baseBorrowRoot = borrowRoot(context, subject.fact)
   const projectedBorrowRoot =
     state._tag === 'Resolved' && baseBorrowRoot !== undefined
