@@ -2414,7 +2414,6 @@ const serviceOperation = (value: DeclarationFacts.ServiceOperationFact): string 
     value.functionKind,
     boolean(value.unsafe),
     array(value.staticProperties),
-    optional(value.operator?.operator),
     array(value.typeParameters.map(typeParameter)),
     number(value.parameterCount),
     array(value.parameters.map(parameter)),
