@@ -550,10 +550,12 @@ child call returns, the parent becomes available with its original access.
 **Boundary:** Reborrowing never strengthens access. `&mut values` is invalid when `values` is only
 `&[T]`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
 exclusive reborrow. Forwarding an exclusive reference is written `&mut values`; passing the binding
-by value without `move` reports `OWN0003`.
+by value without `move` reports `OWN0003`. Method syntax is the one implicit reborrow:
+`counter.bump()` with `counter: &mut Counter` reborrows the referent for the receiver parameter
+(CALL-003).
 
-**Diagnostics:** Attempting to strengthen a shared slice into an exclusive reborrow reports
-`SEM0058`. Accessing a suspended parent during a child loan reports the applicable loan conflict.
+**Diagnostics:** Attempting to strengthen a shared reference or slice into an exclusive reborrow
+reports `SEM0058`. Accessing a suspended parent during a child loan reports the applicable loan conflict.
 
 **Evidence:** [runtime-slice specification](../../../../openspec/specs/bootstrap-runtime-slices/spec.md),
 [slice semantics tests](../../../../packages/compiler/test/RuntimeSliceSemantics.test.ts),
