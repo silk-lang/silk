@@ -6,9 +6,11 @@
 //     without a line. A line whose program did not run is only a notice: selfhost CI runs main's
 //     published corpus, so a selfhost change declares a new program's line before main's bundle
 //     carries the program.
-//   check-borrow-gap.mjs update <corpus log>
-//     Rewrites the baseline from a corpus log, with one line for every program that ran, which drops
-//     the lines of programs the corpus no longer has. It is the only writer of the file. CI's corpus job
+//   check-borrow-gap.mjs update [--prune] <corpus log>
+//     Rewrites the baseline from a corpus log, with one line for every program that ran. A line whose
+//     program did not run is kept and listed as "not run", so regenerating from CI's log never loses
+//     a line declared ahead of main's bundle; `--prune` drops those lines instead, for programs the
+//     corpus no longer has. It is the only writer of the file. CI's corpus job
 //     builds its corpus from main's verification harness, which can differ from a local run on this
 //     branch's corpus.ts; the baseline must match CI, so regenerate from the job's
 //     `selfhost-corpus-timings` artifact (or its log) whenever the two disagree.
@@ -120,7 +122,21 @@ const compare = (baseline, actual) => {
   }
 }
 
-const [mode, first, second] = process.argv.slice(2)
+// The program lines `update` writes, and the baseline programs absent from the run, which are kept
+// unless pruned.
+const updatedLines = (current, actual, prune) => {
+  const programs = new Map(actual)
+  const absent = [...current.programs.keys()].filter((name) => !actual.has(name)).sort(byText)
+  if (!prune) for (const name of absent) programs.set(name, current.programs.get(name) ?? {})
+  const lines = [...programs.keys()]
+    .sort(byText)
+    .map((name) => `${name} ${format(programs.get(name) ?? {})}`.trimEnd())
+  return { lines, absent }
+}
+
+const [mode, ...operands] = process.argv.slice(2)
+const prune = mode === 'update' && operands[0] === '--prune'
+const [first, second] = prune ? operands.slice(1) : operands
 
 if (mode === 'corpus') {
   const baseline = parseBaseline(readFileSync(baselineUrl, 'utf8'), 'compiler/borrow-check-gap.txt')
@@ -138,9 +154,8 @@ if (mode === 'corpus') {
   const header = readFileSync(baselineUrl, 'utf8')
     .split('\n')
     .filter((line) => line.startsWith('#'))
-  const lines = [...actual.keys()]
-    .sort(byText)
-    .map((name) => `${name} ${format(actual.get(name) ?? {})}`.trimEnd())
+  const { lines, absent } = updatedLines(current, actual, prune)
+  for (const name of absent) print(`${prune ? 'pruned' : 'not run'}: ${name}`)
   const retired = [...current.retired].sort(byText).join(' ')
   writeFileSync(baselineUrl, [...header, `retired ${retired}`, ...lines, ''].join('\n'))
 } else if (mode === 'diff') {
@@ -220,12 +235,20 @@ if (mode === 'corpus') {
     failures: 2,
     notices: 0,
   })
+  const current = parseBaseline(baselineText, 'fixture')
+  const ran = new Map(Object.entries({ beta: { regions: 1 } }))
+  const kept = updatedLines(current, ran, false)
+  const pruned = updatedLines(current, ran, true)
+  if (kept.lines.join('|') !== 'alpha regions=2|beta regions=1')
+    throw new Error(`update keeps a line whose program did not run: ${kept.lines.join('|')}`)
+  if (pruned.lines.join('|') !== 'beta regions=1' || pruned.absent.join('|') !== 'alpha')
+    throw new Error(`update --prune drops it: ${pruned.lines.join('|')}`)
   failures.length = 0
   notices.length = 0
   print('borrow-gap guard self-test passed')
 } else {
   throw new Error(
-    'Usage: check-borrow-gap.mjs corpus <log> | update <log> | diff <old> <new> | self-build <directory> | self-test',
+    'Usage: check-borrow-gap.mjs corpus <log> | update [--prune] <log> | diff <old> <new> | self-build <directory> | self-test',
   )
 }
 
