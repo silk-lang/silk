@@ -75,7 +75,8 @@ Jobs in `.github/workflows/selfhost.yml`:
 3. **Selfhost native corpus** builds the formatter safety gate with N1 and verifies repository
    formatting with it, then runs the full corpus with N1 (the verification harness's
    `--mode corpus-full`) and keeps the baseline-pass and accepted-failure checks.
-4. **Selfhost cases** shards are unchanged (milestone 2 moves them off the bootstrap).
+4. **Native selfhost cases** shards build each source test root's runner with N1 (`silkc test`)
+   and run it under the per-test time guard.
 
 N1 and N2 are compiled from the same source by different compilers, so identical IR shows that the
 seed and N1 agree on the meaning of the compiler. A change to code generation still reaches a
@@ -83,8 +84,8 @@ fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
 ## Publication
 
-A successful `selfhost` push run (every job above green, cases included) runs **Publish native
-seed candidate**. It creates the prerelease `native-seed-<commit>` targeting that commit with:
+A successful `selfhost` push run (every job above green) runs **Publish native seed candidate**. It
+creates the prerelease `native-seed-<commit>` targeting that commit with:
 
 - `silk-compiler-x86_64-unknown-linux-gnu`: N2;
 - `chain-receipt.json`: seed identity, N1/N2 hashes, IR hash, smoke and toolchain facts;
