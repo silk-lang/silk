@@ -103,6 +103,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard {
   tag: i32
   storage: Intrinsic.Allocation
