@@ -34,13 +34,13 @@ import silk.option { Option }
 pub fn main() -> i32 {
   let scalar = char.fromU32(0x2603)
   let value = move scalar
-    |> Option.unwrapOr<char>('?')
+    |> Option<char>.unwrapOr('?')
   if char.toU32(value) != 0x2603 {
     return 1
   }
   let surrogate = char.fromU32(0xD800)
   let replacement = move surrogate
-    |> Option.unwrapOr<char>('?')
+    |> Option<char>.unwrapOr('?')
   if replacement != '?' {
     return 2
   }

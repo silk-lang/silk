@@ -56,8 +56,8 @@ effect fn restrictedAnchor() -> TrustAnchor ! OutOfMemoryError ? &mut Allocator 
   ]
   let result = run TrustAnchor.fromCertificateWithConstraints(
     move certificate,
-    Option.some<usize>(2),
-    Option.some<&[u8]>(&constraint),
+    Option<usize>.some(2),
+    Option<&[u8]>.some(&constraint),
     ProfileLimits.defaults(),
   )
   return match move result {
@@ -71,7 +71,7 @@ fn snapshot(result: Result<TrustSnapshot, TrustSourceError>) -> TrustSnapshot {
     Result<TrustSnapshot, TrustSourceError>.Success { value } => move value
     Result<TrustSnapshot, TrustSourceError>.Failure { .. } => {
       let invalid = 1 / 0
-      return snapshot(TrustSnapshot.fromAnchors(Vector.make<TrustAnchor>(), limits(0, 0)))
+      return snapshot(TrustSnapshot.fromAnchors(Vector<TrustAnchor>.make(), limits(0, 0)))
     }
   }
 }
@@ -177,27 +177,27 @@ effect fn suite() -> i32 ! TrustSourceError | OutOfMemoryError ? &mut Allocator 
   let loadDefaults = TrustLoadLimits.defaults()
   if loadDefaults.snapshot.anchors != 1024 || loadDefaults.decode.inputBytes != 16777216 { return 3 }
 
-  let empty = snapshot(TrustSnapshot.fromAnchors(Vector.make<TrustAnchor>(), limits(0, 0)))
+  let empty = snapshot(TrustSnapshot.fromAnchors(Vector<TrustAnchor>.make(), limits(0, 0)))
   if !snapshotShape(&empty, 0) { return 4 }
 
-  let mut tooMany = Vector.make<TrustAnchor>()
+  let mut tooMany = Vector<TrustAnchor>.make()
   let one = run plainAnchor()
-  let appended = run Vector.append<TrustAnchor>(&mut tooMany, move one)
+  let appended = run Vector<TrustAnchor>.append(&mut tooMany, move one)
   if !limitFailure(TrustSnapshot.fromAnchors(move tooMany, limits(0, 100000)), TrustLimitKind.AnchorCount, 0) { return 5 }
 
-  let mut tooLarge = Vector.make<TrustAnchor>()
+  let mut tooLarge = Vector<TrustAnchor>.make()
   let large = run plainAnchor()
   let largeBytes = TrustAnchor.encodedBytes(&large)
-  let appendedLarge = run Vector.append<TrustAnchor>(&mut tooLarge, move large)
+  let appendedLarge = run Vector<TrustAnchor>.append(&mut tooLarge, move large)
   if !limitFailure(TrustSnapshot.fromAnchors(move tooLarge, limits(1, largeBytes - 1)), TrustLimitKind.EncodedBytes, largeBytes - 1) { return 6 }
 
-  let mut values = Vector.make<TrustAnchor>()
+  let mut values = Vector<TrustAnchor>.make()
   let first = run plainAnchor()
   let firstBytes = TrustAnchor.encodedBytes(&first)
   let second = run restrictedAnchor()
   let secondBytes = TrustAnchor.encodedBytes(&second)
-  let appendedFirst = run Vector.append<TrustAnchor>(&mut values, move first)
-  let appendedSecond = run Vector.append<TrustAnchor>(&mut values, move second)
+  let appendedFirst = run Vector<TrustAnchor>.append(&mut values, move first)
+  let appendedSecond = run Vector<TrustAnchor>.append(&mut values, move second)
   let primary = snapshot(TrustSnapshot.fromAnchors(move values, limits(2, firstBytes + secondBytes)))
   let primaryValues = TrustSnapshot.anchors(&primary)
   if primaryValues.length != 2 || !noPathLength(&primaryValues[0]) || !pathLength(&primaryValues[1], 2) { return 7 }
@@ -213,9 +213,9 @@ effect fn suite() -> i32 ! TrustSourceError | OutOfMemoryError ? &mut Allocator 
   let copiedValues = TrustSnapshot.anchors(&copied)
   if copiedValues.length != 2 || !noPathLength(&copiedValues[0]) || !pathLength(&copiedValues[1], 2) { return 8 }
 
-  let mut additionalValues = Vector.make<TrustAnchor>()
+  let mut additionalValues = Vector<TrustAnchor>.make()
   let additionalAnchor = run plainAnchor()
-  let appendedAdditional = run Vector.append<TrustAnchor>(&mut additionalValues, move additionalAnchor)
+  let appendedAdditional = run Vector<TrustAnchor>.append(&mut additionalValues, move additionalAnchor)
   let additional = snapshot(TrustSnapshot.fromAnchors(move additionalValues, limits(1, firstBytes)))
   let combineCountRejected = run TrustSnapshot.combine(&copied, &additional, limits(2, firstBytes + secondBytes + firstBytes))
   if !limitFailure(move combineCountRejected, TrustLimitKind.AnchorCount, 2) { return 26 }
@@ -260,14 +260,14 @@ effect fn suite() -> i32 ! TrustSourceError | OutOfMemoryError ? &mut Allocator 
   if !laterRejected { return 13 }
 
   let mut outer = MemoryTrustSource.make(move combined)
-  let innerSnapshot = snapshot(TrustSnapshot.fromAnchors(Vector.make<TrustAnchor>(), limits(0, 0)))
+  let innerSnapshot = snapshot(TrustSnapshot.fromAnchors(Vector<TrustAnchor>.make(), limits(0, 0)))
   let mut inner = MemoryTrustSource.make(move innerSnapshot)
   let nested = run nestedCounts(&mut inner) |> Effect.provideMut<TrustSource>(&mut outer)
   if nested != 303 { return 14 }
 
   let held = run TrustSource.load(TrustLoadLimits.defaults())
     |> Effect.provideMut<TrustSource>(&mut outer)
-  let replacement = snapshot(TrustSnapshot.fromAnchors(Vector.make<TrustAnchor>(), limits(0, 0)))
+  let replacement = snapshot(TrustSnapshot.fromAnchors(Vector<TrustAnchor>.make(), limits(0, 0)))
   let old = MemoryTrustSource.replace(&mut outer, move replacement)
   if !snapshotShape(&old, 3) || !snapshotShape(&held, 3) { return 15 }
   let after = run loadedCount() |> Effect.provideMut<TrustSource>(&mut outer)
@@ -344,7 +344,7 @@ export const trustSourceWasmSource = `${imports}
 effect fn allocated() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let empty = TrustSnapshot.fromAnchors(
-    Vector.make<TrustAnchor>(),
+    Vector<TrustAnchor>.make(),
     SnapshotLimits { anchors: usize.ZERO, encodedBytes: usize.ZERO },
   )
   let original = match move empty {

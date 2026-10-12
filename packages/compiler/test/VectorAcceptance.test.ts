@@ -16,30 +16,30 @@ import silk.vector { Vector }
 struct Entry<'a> { value: &'a mut i32 }
 impl<'a> Drop for Entry<'a> { fn drop(self: &mut Entry<'a>) -> () { return () } }
 effect fn shared<'a>(value: &'a i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut values = Vector.make<&'a i32>()
-  run Vector.append<&'a i32>(&mut values, value)
-  run Vector.insert<&'a i32>(&mut values, 0, value)
-  let old = Vector.set<&'a i32>(&mut values, 0, value)
-  let saved = Vector.remove<&'a i32>(&mut values, 0)
+  let mut values = Vector<&'a i32>.make()
+  run Vector<&'a i32>.append(&mut values, value)
+  run Vector<&'a i32>.insert(&mut values, 0, value)
+  let old = Vector<&'a i32>.set(&mut values, 0, value)
+  let saved = Vector<&'a i32>.remove(&mut values, 0)
   drop values
   return saved.*
 }
 effect fn exclusive<'a>(value: &'a mut i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut values = Vector.make<Entry<'a>>()
-  run Vector.append<Entry<'a>>(&mut values, Entry { value: move value })
-  let saved = Vector.remove<Entry<'a>>(&mut values, 0)
+  let mut values = Vector<Entry<'a>>.make()
+  run Vector<Entry<'a>>.append(&mut values, Entry { value: move value })
+  let saved = Vector<Entry<'a>>.remove(&mut values, 0)
   drop values
   return saved.value.*
 }
 effect fn invalidExtracted() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut source = 1 let mut values = Vector.make<&i32>()
-  run Vector.append<&i32>(&mut values, &source)
-  let saved = Vector.remove<&i32>(&mut values, 0) drop values
+  let mut source = 1 let mut values = Vector<&i32>.make()
+  run Vector<&i32>.append(&mut values, &source)
+  let saved = Vector<&i32>.remove(&mut values, 0) drop values
   source = 2 return saved.*
 }
 effect fn invalidCleanup() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut source = 1 let mut values = Vector.make<Entry>()
-  run Vector.append<Entry>(&mut values, Entry { value: &mut source })
+  let mut source = 1 let mut values = Vector<Entry>.make()
+  run Vector<Entry>.append(&mut values, Entry { value: &mut source })
   source = 2 return 0
 }`
       const self = yield* Analysis.ofSource('vector-acceptance/dependent-elements', ascii(source))
@@ -79,11 +79,11 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let layout = Layout.of<[i32; 1]>()
   let allocation = run Allocator.allocate(move layout) |> Effect.provideMut(&mut allocator)
-  let mut events = Vector.make<Guard | Marker>()
+  let mut events = Vector<Guard | Marker>.make()
   let event = guarded(move allocation)
-  let appended = run Vector.append<Guard | Marker>(&mut events, move event) |>
+  let appended = run Vector<Guard | Marker>.append(&mut events, move event) |>
     Effect.provideMut(&mut allocator)
-  let observed = Vector.get<Guard | Marker>(&events, 0)
+  let observed = Vector<Guard | Marker>.get(&events, 0)
   drop observed
   return 42
 }
@@ -111,8 +111,8 @@ struct Entry { value: i32 }
 impl Drop for Entry { fn drop(self: &mut Entry) -> () { return () } }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<Entry>()
-  run Vector.append<Entry>(&mut values, Entry { value: 42 })
+  let mut values = Vector<Entry>.make()
+  run Vector<Entry>.append(&mut values, Entry { value: 42 })
     |> Effect.provideMut(&mut allocator)
   drop values
   return 42
@@ -149,11 +149,11 @@ import silk.effect { Effect }
 import silk.vector { Vector }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<i32>()
-  run Vector.append<i32>(&mut values, 2) |> Effect.provideMut(&mut allocator)
-  run Vector.append<i32>(&mut values, 1) |> Effect.provideMut(&mut allocator)
-  run Vector.sort<i32>(&mut values) |> Effect.provideMut(&mut allocator)
-  return Vector.get<i32>(&values, 0) + Vector.get<i32>(&values, 1)
+  let mut values = Vector<i32>.make()
+  run Vector<i32>.append(&mut values, 2) |> Effect.provideMut(&mut allocator)
+  run Vector<i32>.append(&mut values, 1) |> Effect.provideMut(&mut allocator)
+  run Vector<i32>.sort(&mut values) |> Effect.provideMut(&mut allocator)
+  return Vector<i32>.get(&values, 0) + Vector<i32>.get(&values, 1)
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
 pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`),

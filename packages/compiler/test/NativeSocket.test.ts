@@ -202,7 +202,7 @@ import silk.system_clock {Instant}
 
 pub fn main() -> i32 {
   let endpoints: [Endpoint; 0] = []
-  let pending = connectResolvedOwned(&endpoints, ConnectOptions.defaults(), Option.none<Instant>())
+  let pending = connectResolvedOwned(&endpoints, ConnectOptions.defaults(), Option<Instant>.none())
   drop pending
   return 42
 }`
