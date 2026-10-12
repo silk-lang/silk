@@ -218,6 +218,38 @@ receiver; the explicit spellings `Type.member(&value, ...)` and `Type.member(mov
 remain available. A callable field of the same name is applied instead, and an rvalue chains:
 `Counter { value: 42 }.take()` consumes the temporary.
 
+A receiver whose type is a reference `&T` or `&mut T` to a nominal type calls that type's receiver
+methods through a reborrow of its referent, for parameter zero only. `self: &Self` takes a shared
+reborrow, which an exclusive reference also permits. `self: &mut Self` takes an exclusive reborrow,
+which requires an exclusive reference but not a `mut` binding: the binding is not written, its
+referent is. The reborrow is exactly the explicit `Type.member(&mut counter, ...)` (BORROW-005): it
+lasts for the call and suspends the reference for that time, and a method returning a reference
+tied to `self` extends the reborrow to that result's uses. A `self: Self` method reads the referent
+as `counter.*` would: a Copy referent is copied (OWN-002), and an affine referent cannot be moved
+out of a borrow.
+
+```silk
+pub struct Counter { value: i32 }
+
+impl Counter {
+  pub fn read(self: &Self) -> i32 { return self.value }
+  pub fn bump(self: &mut Self) -> () { self.value = self.value + 1 }
+}
+
+fn step(counter: &mut Counter) -> i32 {
+  counter.bump()
+  return counter.read()
+}
+
+pub fn main() -> i32 {
+  let mut value = Counter { value: 41 }
+  return step(&mut value)
+}
+```
+
+`step` reborrows `counter` exclusively for `bump` and shared for `read`; each reborrow ends with its
+call, so `counter` stays usable and `main` reads 42.
+
 A receiver method named without a call is a bound method value: the section whose only capture is
 the receiver, taken under the same declared mode, awaiting the member's parameters after `self`.
 
@@ -244,8 +276,11 @@ exclusive loan, and a `Self` receiver moves the place into a `once fn` that drop
 is never invoked. The bound value lowers and executes as `Counter.read` sectioned over its first
 parameter would.
 
-**Boundary:** A receiver is never dereferenced or coerced: `boxed.read()` on a `Box<Counter>` does
-not reach `Counter.read`. An associated function without a receiver is not a value member, called or
+**Boundary:** Apart from the reference reborrow above, a receiver is never dereferenced or coerced:
+`boxed.read()` on a `Box<Counter>` does not reach `Counter.read`, and a reference to a reference is
+not reborrowed twice. The reborrow applies to the receiver only. Any other argument that is an
+exclusive reference is forwarded with `&mut` (BORROW-005); `counter.add(other)` with
+`other: &mut Counter` reports `OWN0003` at `other`. An associated function without a receiver is not a value member, called or
 not: `value.zero()` and `value.zero` are rejected. A borrowed receiver of a bound value must be a
 place: `Counter { value: 1 }.read` without a call is rejected because the section would outlive
 the temporary. A receiver of a generic parameter type resolves only through the parameter's bounds
@@ -253,10 +288,15 @@ the temporary. A receiver of a generic parameter type resolves only through the 
 
 **Diagnostics:** Calling or naming an associated function on a value reports `SEM0198`. An unknown
 member keeps the field diagnostic `SEM0027`. Receiver ownership uses the ordinary loan and move
-diagnostics (`SEM0057`, `OWN0001`); binding a borrowed temporary reports `SEM0056`.
+diagnostics (`SEM0057`, `OWN0001`); binding a borrowed temporary reports `SEM0056`. Through a
+reference receiver, the diagnostics are those of the explicit spelling: a `self: &mut Self` method
+called through a shared reference reports `SEM0056` as `&mut counter` does, a `self: Self` method on
+an affine referent reports `OWN0012`, and an outstanding loan of the referent that conflicts with
+the reborrow reports `OWN0010`.
 
 **Evidence:** [method call semantics](../../../../packages/compiler/src/ExpressionAnalysis.ts),
 [method-call specification](../../../../openspec/specs/bootstrap-method-calls/spec.md),
+[reference receiver tests](../../../../packages/compiler/test/Ownership.test.ts),
 [inherent members](modules-names-and-visibility.md#name-005--a-nominal-qualifier-exposes-only-its-associated-items).
 
 ### RETURN-001 — `return` exits with a value compatible with the declared result

@@ -1865,6 +1865,63 @@ pub fn main() -> i32 { return 0 }`
   }),
 )
 
+it.effect('reborrows a reference receiver for parameter zero only', () =>
+  Effect.gen(function* () {
+    const source = `struct Counter { value: i32 }
+impl Counter {
+  fn read(self: &Self) -> i32 { return self.value }
+  fn bump(self: &mut Self) -> () { self.value = self.value + 1 }
+  fn take(self: Self) -> i32 { return self.value }
+  fn add(self: &mut Self, other: &mut Self) -> () { self.value = other.value }
+  fn slot(self: &mut Self) -> &mut i32 { return &mut self.value }
+}
+struct Pair { value: i32 }
+impl Copy for Pair {}
+impl Pair { fn take(self: Self) -> i32 { return self.value } }
+fn exclusive(counter: &mut Counter) -> i32 {
+  counter.bump()
+  counter.bump()
+  return counter.read()
+}
+fn shared(counter: &Counter) -> i32 { return counter.read() + counter.read() }
+fn copied(pair: &Pair) -> i32 { return pair.take() + pair.take() }
+fn strengthened(counter: &Counter) -> () { counter.bump() }
+fn moved(counter: &mut Counter) -> i32 { return counter.take() }
+fn conflicting(counter: &mut Counter) -> i32 {
+  let held = &counter.value
+  counter.bump()
+  return held.*
+}
+fn retained(counter: &mut Counter) -> i32 {
+  let first = counter.slot()
+  let second = counter.slot()
+  first.* = 1
+  return 0
+}
+fn forwarded(counter: &mut Counter, other: &mut Counter) -> () { counter.add(other) }
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* Analysis.ofSource(
+      'ownership/reference-receiver-reborrow',
+      ascii(source),
+    )
+    const at = (text: string, after: string) => source.indexOf(text, source.indexOf(after))
+
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [
+        { code: 'SEM0056', start: at('counter.bump()', 'fn strengthened') },
+        { code: 'OWN0012', start: at('counter.take()', 'fn moved') },
+        { code: 'OWN0010', start: at('counter.bump()', 'fn conflicting') },
+        { code: 'OWN0010', start: at('counter.slot()', 'let second') },
+        { code: 'OWN0003', start: at('other)', 'counter.add') },
+      ],
+    )
+  }),
+)
+
 it('requires explicit transfer at mutable owned parameter boundaries and rejects overlap', () => {
   const caller = check(
     'ownership/mutable-owned-parameter-caller-move',
