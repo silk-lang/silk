@@ -950,6 +950,14 @@ fn nested(input: &Outer) -> i32 {
     Outer.Other => 0
   }
 }
+union Choice<T> { Held {value: T}, Vacant }
+struct Slot { choice: Choice<i32> marker: i32 }
+fn nestedField(slot: &Slot) -> i32 {
+  return match &slot.* {
+    Slot {choice: Choice<i32>.Held {value}, marker} => value + marker
+    Slot {choice: Choice<i32>.Vacant, marker} => marker
+  }
+}
 fn fallback(input: Outer | Empty) -> i32 {
   return match move input { Empty {} => 0 _ => 42 }
 }
@@ -967,6 +975,9 @@ pub fn main() -> i32 {
   let nestedOwner = Outer.Io {error: Inner.Open {operation: 17}}
   let nestedValue = nested(&nestedOwner)
   drop nestedValue
+  let slot = Slot {choice: Choice<i32>.Held {value: 2}, marker: 3}
+  let slotValue = nestedField(&slot)
+  drop slotValue
   let mut guard = Guard {provider: Counter {value: 41}}
   update(&mut guard)
   let whole = readWhole(&guard.provider)
