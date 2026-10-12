@@ -4,43 +4,51 @@
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`.
 
-Compile-time ordering witnesses and a three-way result derived from strict comparison.
+The interface that gives user types the `<`, `<=`, `>`, and `>=` operators.
 
 ## When to use
 
-Add an [`Order`](#declaration-73696c6b2f6f726465723a3a4f72646572) bound when a generic algorithm needs `<`, as sorting and binary search do. Use
-[`compare`](#declaration-73696c6b2f6f726465723a3a4f726465722e636f6d70617265) when all three outcomes matter, or [`less`](#declaration-73696c6b2f6f726465723a3a4f726465722e6c657373) and [`equal`](#declaration-73696c6b2f6f726465723a3a4f726465722e657175616c) for predicates.
+Implement [`Order`](#declaration-73696c6b2f6f726465723a3a4f72646572) when values of a type have a total order. Add a `T: Order` bound when a
+generic algorithm compares its type parameter, as sorting and binary search do.
 
 ## Details
 
-An interface witness is selected during specialization; it creates no service requirement or
-runtime dispatch. [`Equal`](#declaration-73696c6b2f6f726465723a3a457175616c) means neither operand orders before the other, so equality cannot
-disagree with the witness's own strict ordering.
+`&left < &right` means `Order.compare(&left, &right) == Ordering.Less` for the conformance of
+the operand type; `<=` tests `!= Ordering.Greater`, `>` tests `== Ordering.Greater`, and `>=`
+tests `!= Ordering.Less` (OP-009). Both operands are evaluated once, in written order. Concrete
+scalar operands always use the built-in comparison. A witness is selected during specialization;
+it creates no service requirement or runtime dispatch.
 
 ## Gotchas
 
-A witness must define a strict total order. The module cannot verify this law. If two different
-values are incomparable, [`compare`](#declaration-73696c6b2f6f726465723a3a4f726465722e636f6d70617265) and [`equal`](#declaration-73696c6b2f6f726465723a3a4f726465722e657175616c) report them as equal.
+A witness must define a total order. The module cannot verify this law.
 
 ## Examples
 
-### Classify each comparison result
+### Order a user type
 
 ```silk
-import silk.order { Order }
+import silk.order { Order, Ordering }
+
+struct Version { major: i32 minor: i32 }
+
+fn compareVersions(left: &Version, right: &Version) -> Ordering {
+  if left.major != right.major {
+    if left.major < right.major { return Ordering.Less }
+    return Ordering.Greater
+  }
+  if left.minor < right.minor { return Ordering.Less }
+  if left.minor > right.minor { return Ordering.Greater }
+  return Ordering.Equal
+}
+
+impl Order for Version { compare: Version.compareVersions }
 
 pub fn main() -> i32 {
-  let low = Order.compare<i32>(2, 7)
-  let same = Order.compare<i32>(7, 7)
-  let high = Order.compare<i32>(9, 7)
-  if !Order.isLess(&low) {
+  let old = Version { major: 1, minor: 4 }
+  let new = Version { major: 2, minor: 0 }
+  if !(&old < &new) || &new <= &old {
     return 1
-  }
-  if !Order.isEqual(&same) {
-    return 2
-  }
-  if !Order.isGreater(&high) {
-    return 3
   }
   return 42
 }
@@ -48,57 +56,47 @@ pub fn main() -> i32 {
 
 Import as `Order` with `import silk.order { Order }`.
 
-Public declarations: 5.
-
-<a id="declaration-73696c6b2f6f726465723a3a4c657373"></a>
-
-## `Less`
-
-```silk
-pub struct Less
-```
-
-The left value orders before the right value.
-
-<a id="declaration-73696c6b2f6f726465723a3a457175616c"></a>
-
-## `Equal`
-
-```silk
-pub struct Equal
-```
-
-Neither value orders before the other.
-
-<a id="declaration-73696c6b2f6f726465723a3a47726561746572"></a>
-
-## `Greater`
-
-```silk
-pub struct Greater
-```
-
-The left value orders after the right value.
+Public declarations: 2.
 
 <a id="declaration-73696c6b2f6f726465723a3a4f72646572696e67"></a>
 
 ## `Ordering`
 
 ```silk
-pub struct Ordering
+pub enum Ordering
 ```
 
-A three-way comparison result that contains exactly one of [`Less`](#declaration-73696c6b2f6f726465723a3a4c657373), [`Equal`](#declaration-73696c6b2f6f726465723a3a457175616c), or [`Greater`](#declaration-73696c6b2f6f726465723a3a47726561746572).
+The result of comparing two values.
 
-<a id="declaration-73696c6b2f6f726465723a3a4f72646572696e673a3a6669656c643a30"></a>
+<a id="declaration-73696c6b2f6f726465723a3a4f72646572696e673a3a6d656d6265723a30"></a>
 
-### Field `value`
+### `Less`
 
 ```silk
-pub value: silk/order.Equal | silk/order.Greater | silk/order.Less
+Less = 0
 ```
 
-The comparison result, which a `match` expression narrows to one outcome type.
+The left value orders before the right value.
+
+<a id="declaration-73696c6b2f6f726465723a3a4f72646572696e673a3a6d656d6265723a31"></a>
+
+### `Equal`
+
+```silk
+Equal = 1
+```
+
+Neither value orders before the other.
+
+<a id="declaration-73696c6b2f6f726465723a3a4f72646572696e673a3a6d656d6265723a32"></a>
+
+### `Greater`
+
+```silk
+Greater = 2
+```
+
+The left value orders after the right value.
 
 <a id="declaration-73696c6b2f6f726465723a3a4f72646572"></a>
 
@@ -108,112 +106,22 @@ The comparison result, which a `match` expression narrows to one outcome type.
 pub interface Order
 ```
 
-Static strict-ordering contract for primitive comparable values.
-
-### When to use
-
-Use this interface when a generic algorithm needs strict ordering through `<`.
-
-### Details
-
-A witness supplies the strict `lessThan` the operator `<` spells. Equality is derived from it
-rather than declared, so a witness cannot disagree with itself about which values are equal.
+The interface behind `<`, `<=`, `>`, and `>=`.
 
 ### Gotchas
 
-An implementation must define a strict total order. If two different values are incomparable,
-[`compare`](#declaration-73696c6b2f6f726465723a3a4f726465722e636f6d70617265) and [`equal`](#declaration-73696c6b2f6f726465723a3a4f726465722e657175616c) treat them as equal.
+An implementation must define a total order: for any two values exactly one of `Less`, `Equal`,
+and `Greater` holds, consistently with every other comparison.
 
-<a id="declaration-73696c6b2f6f726465723a3a4f726465723a3a6f7065726174696f6e3a6c6573735468616e"></a>
+<a id="declaration-73696c6b2f6f726465723a3a4f726465723a3a6f7065726174696f6e3a636f6d70617265"></a>
 
-### Operation `lessThan`
-
-```silk
-operator < fn lessThan<'life0, 'life1>(left: &'life0 Self, right: &'life1 Self) -> bool
-```
-
-Reports whether `left` orders strictly before `right`. An implementation must define a strict
-total order so different values are not incomparable.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e636f6d70617265"></a>
-
-### Associated function `Order.compare`
+### Operation `compare`
 
 ```silk
-pub fn compare<T>(left: T, right: T) -> Ordering
+fn compare<'life0, 'life1>(left: &'life0 Self, right: &'life1 Self) -> Ordering
 ```
 
-Compares two values three ways using the concrete comparison selected during specialization.
-
-#### When to use
-
-Use this function when the caller needs to distinguish less, equal, and greater outcomes.
-
-#### Details
-
-Calls the selected strict comparison with `left, right`. If that result is false, it calls the
-comparison with `right, left`. The function then consumes both owned arguments.
-
-#### Gotchas
-
-If neither comparison is true, this function returns [`Equal`](#declaration-73696c6b2f6f726465723a3a457175616c). The witness must not leave two
-different values incomparable.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e6c657373"></a>
-
-### Associated function `Order.less`
-
-```silk
-pub fn less<T>(left: T, right: T) -> bool
-```
-
-Reports whether `left` orders strictly before `right` under the selected [`Order`](#declaration-73696c6b2f6f726465723a3a4f72646572) witness. The
-function calls the witness once and then consumes both owned arguments.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e657175616c"></a>
-
-### Associated function `Order.equal`
-
-```silk
-pub fn equal<T>(left: T, right: T) -> bool
-```
-
-Reports whether neither value orders before the other under the selected [`Order`](#declaration-73696c6b2f6f726465723a3a4f72646572) witness. The
-function calls the witness once or twice and then consumes both owned arguments.
-
-#### Gotchas
-
-If the witness leaves different values incomparable, this function reports them as equal.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e69734c657373"></a>
-
-### Associated function `Order.isLess`
-
-```silk
-pub fn isLess<'life0>(ordering: &'life0 silk/order.Ordering) -> bool
-```
-
-Reports whether an ordering is `Less`.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e6973457175616c"></a>
-
-### Associated function `Order.isEqual`
-
-```silk
-pub fn isEqual<'life0>(ordering: &'life0 silk/order.Ordering) -> bool
-```
-
-Reports whether an ordering is `Equal`.
-
-<a id="declaration-73696c6b2f6f726465723a3a4f726465722e697347726561746572"></a>
-
-### Associated function `Order.isGreater`
-
-```silk
-pub fn isGreater<'life0>(ordering: &'life0 silk/order.Ordering) -> bool
-```
-
-Reports whether an ordering is `Greater`.
+Compares `left` with `right`.
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a30"></a>
 
@@ -225,10 +133,10 @@ impl Order for u8
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a303a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.u8LessThan
+compare = u8.impl@0.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a31"></a>
@@ -241,10 +149,10 @@ impl Order for u16
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a313a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.u16LessThan
+compare = u16.impl@1.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a32"></a>
@@ -257,10 +165,10 @@ impl Order for u32
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a323a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.u32LessThan
+compare = u32.impl@2.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a33"></a>
@@ -273,10 +181,10 @@ impl Order for u64
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a333a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.u64LessThan
+compare = u64.impl@3.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a34"></a>
@@ -289,10 +197,10 @@ impl Order for usize
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a343a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.usizeLessThan
+compare = usize.impl@4.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a35"></a>
@@ -305,10 +213,10 @@ impl Order for i8
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a353a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.i8LessThan
+compare = i8.impl@5.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a36"></a>
@@ -321,10 +229,10 @@ impl Order for i16
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a363a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.i16LessThan
+compare = i16.impl@6.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a37"></a>
@@ -337,10 +245,10 @@ impl Order for i32
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a373a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.i32LessThan
+compare = i32.impl@7.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a38"></a>
@@ -353,10 +261,10 @@ impl Order for i64
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a383a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.i64LessThan
+compare = i64.impl@8.compare
 ```
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a39"></a>
@@ -369,8 +277,8 @@ impl Order for isize
 
 <a id="declaration-73696c6b2f6f726465723a3a696d706c656d656e746174696f6e3a393a3a6f7065726174696f6e3a30"></a>
 
-### Operation `lessThan`
+### Operation `compare`
 
 ```silk
-lessThan = Intrinsic.isizeLessThan
+compare = isize.impl@9.compare
 ```
