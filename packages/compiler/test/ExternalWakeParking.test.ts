@@ -92,7 +92,7 @@ import silk.shared { Shared }
 struct Empty {}
 struct Waiting { wake: Wake }
 struct WaiterState { slot: Empty | Waiting }
-struct Guard { storage: Allocation state: Shared<WaiterState> }
+struct Guard { storage: Intrinsic.Allocation state: Shared<WaiterState> }
 fn install(state: &mut WaiterState, wake: Wake) -> () {
   let previous = Intrinsic.replace(state.slot, Waiting { wake: move wake })
   drop previous
@@ -110,7 +110,7 @@ fn signal(state: &Shared<WaiterState>) -> () {
 }
 fn register(
   wake: Wake,
-  storage: Allocation,
+  storage: Intrinsic.Allocation,
   state: Shared<WaiterState>
 ) -> Guard {
   let installing = install(move wake)
@@ -118,7 +118,7 @@ fn register(
   signal(&state)
   return Guard { storage: move storage, state: move state }
 }
-effect fn parked(storage: Allocation, state: Shared<WaiterState>) -> () {
+effect fn parked(storage: Intrinsic.Allocation, state: Shared<WaiterState>) -> () {
   let retained = Shared.clone(&state)
   let registration = register(move storage, move state)
   let resumed = run Execution.park(move registration)
@@ -458,12 +458,12 @@ import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
 import silk.layout { Layout }
-fn use(value: (), holder: &Allocation) -> () { return () }
-fn register(wake: Wake, holder: &Allocation) -> once fn(()) -> () {
+fn use(value: (), holder: &Intrinsic.Allocation) -> () { return () }
+fn register(wake: Wake, holder: &Intrinsic.Allocation) -> once fn(()) -> () {
   drop wake
   return use(holder)
 }
-effect fn parked(holder: Allocation) -> () {
+effect fn parked(holder: Intrinsic.Allocation) -> () {
   let registration = register(&holder)
   let resumed = run Execution.park(move registration)
   drop holder

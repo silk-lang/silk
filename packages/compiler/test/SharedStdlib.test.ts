@@ -17,7 +17,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.shared { Shared }
 struct BadAllocator {}
-effect fn badAllocate(self: &mut BadAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn badAllocate(self: &mut BadAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   drop layout
   let wrong = Layout.of<u8>()
   return run Intrinsic.systemAllocationAcquire(move wrong)
@@ -224,7 +224,7 @@ struct ReconstructingAllocator {}
 fn rebuild(parts: Parts) -> Layout {
   return Layout {alignment: parts.requestedAlignment, bytes: parts.requestedBytes}
 }
-effect fn allocate(self: &mut ReconstructingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut ReconstructingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   let parts = Parts {requestedBytes: layout.bytes, requestedAlignment: layout.alignment}
   return run Intrinsic.systemAllocationAcquire(rebuild(move parts))
 }
