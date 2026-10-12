@@ -444,6 +444,8 @@ export const unsupportedLoweringCode = 'SEM0219' as const
 export const regionSelectiveConformanceCode = 'SEM0220' as const
 /** A member list follows an unwritten owner whose parameters the member uses (GEN-008). */
 export const ownerArgumentPlacementCode = 'SEM0221' as const
+/** Stable code for a namespace-qualified type named where a value is required (NAME-005). */
+export const namespaceQualifiedTypeCode = 'SEM0222' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -489,6 +491,7 @@ export type Code =
   | typeof unsupportedLoweringCode
   | typeof regionSelectiveConformanceCode
   | typeof ownerArgumentPlacementCode
+  | typeof namespaceQualifiedTypeCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -1442,6 +1445,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly member: string
       readonly owner: string
     }
+  | { readonly _tag: 'NamespaceQualifiedType'; readonly module: string; readonly member: string }
   | {
       readonly _tag: 'AssociatedFunctionOnValue'
       readonly owner: string
@@ -2796,6 +2800,25 @@ export const importedInherentMember = <L>(
   severity: 'error',
   message: `${module} has no root declaration ${member}; it is a member of ${owner}, so import ${owner} and write ${owner}.${member}`,
   reason: { _tag: 'ImportedInherentMember' as const, module, member, owner },
+  span,
+})
+
+/**
+ * Rejects a namespace-qualified type where a value is required, including as the qualifier of its
+ * own members: a namespace exposes root declarations, and a type's members are reached through the
+ * selected type (NAME-005).
+ */
+export const namespaceQualifiedType = <L>(
+  module: string,
+  member: string,
+  span: L,
+): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: namespaceQualifiedTypeCode,
+  severity: 'error',
+  message: `${member} in ${module} is a type, not a value; select it with an import and write ${member}.<member> for its members`,
+  reason: { _tag: 'NamespaceQualifiedType' as const, module, member },
   span,
 })
 
