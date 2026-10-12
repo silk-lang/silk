@@ -311,7 +311,7 @@ pub fn main() -> i32 { return 0 }`
     })),
     [
       { code: 'SEM0210', span: '&Counter' },
-      { code: 'SEM0056', span: 'counter' },
+      { code: 'SEM0058', span: '&mut counter' },
       { code: 'OWN0019', span: '&owned' },
       { code: 'SEM0212', span: '&owned' },
     ],
