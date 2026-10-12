@@ -509,6 +509,26 @@ Each entry records:
 - **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 
+### Bootstrap roots a pattern binding's borrow at the binding
+
+- **Status:** known bootstrap soundness gap, found on 2026-10-12 by the native `patterns`
+  borrow-check slice; the bootstrap fix lands on `main` next and retires this entry.
+- **Rule:** a binding of `match &` or `match &mut` is a projection of the subject's selected payload,
+  and an exclusive binding mutates that payload (MATCH-002). Borrowing such a binding therefore
+  borrows the subject's place, and conflicts with a live loan of that place (BORROW-001).
+- **Compilers:** the native borrow checker treats every `match place`, `&` or `&mut` binding as the
+  subject place plus its pattern path. The bootstrap's loan pass roots a borrow of a binding at the
+  binding itself, so a binding borrow never conflicts with a loan of the subject. In an arm of
+  `match &mut held` that binds `value`, `let other = &held` followed by `increment(&mut value)` and
+  a later use of `other` is accepted by the bootstrap and rejected natively with `LoanConflict`
+  (OWN0010) at `&mut value`, relating `&held`.
+- **Source migration:** none; no stdlib, corpus or compiler source relies on the acceptance (the
+  native self-build and the full corpus report no rejection).
+- **Evidence:** the `bindingDuringLoan` case of `matchAccessesAreChecked` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`; the bootstrap accepts the same program through
+  `Analysis.ofSource`.
+- **Open questions:** none.
+
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
