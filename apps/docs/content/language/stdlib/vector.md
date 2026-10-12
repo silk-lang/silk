@@ -400,6 +400,21 @@ Appends every byte of one borrowed sequence in source order with one bulk copy.
 
 If growth fails, the vector keeps its prior contents, length, and capacity.
 
+<a id="declaration-73696c6b2f766563746f723a3a566563746f722e617070656e645265706561746564"></a>
+
+### Method `Vector.appendRepeated`
+
+```silk
+pub effect<'life1> fn appendRepeated<'life1>(self: &'life1 mut silk/vector.Vector<u8>, byte: u8, count: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Appends `count` copies of `byte` with one bulk fill.
+
+#### Details
+
+A zero count does not allocate. If growth fails, the vector keeps its prior contents, length,
+and capacity.
+
 <a id="declaration-73696c6b2f766563746f723a3a696d706c656d656e746174696f6e3a30"></a>
 
 ## Implementation `Drop for silk/vector.Vector<T>`

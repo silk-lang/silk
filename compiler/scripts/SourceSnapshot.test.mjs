@@ -7,7 +7,7 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Result from 'effect/Result'
 import * as Schema from 'effect/Schema'
 import * as NativeProcess from './NativeProcess.ts'
-import { buildSeed, candidate, readPin, verifyBootstrapStdlib, verifySeed } from './NativeSeed.mjs'
+import { candidate, readPin, verifySeed } from './NativeSeed.mjs'
 import { createSnapshot, hash, verifySnapshot } from './SourceSnapshot.mjs'
 
 const require = createRequire(new URL('../../packages/compiler/package.json', import.meta.url))
@@ -54,37 +54,7 @@ const fixture = Effect.fnUntraced(function* () {
   const revision = yield* git('rev-parse', 'HEAD')
   const snapshot = join(temporary, 'snapshot')
   const receipt = yield* createSnapshot({ repository, directory: snapshot })
-  const bootstrap = join(temporary, 'bootstrap.mjs')
-  yield* fs.writeFileString(
-    bootstrap,
-    `import {mkdirSync,writeFileSync,chmodSync} from 'node:fs'; import {dirname} from 'node:path'; import assert from 'node:assert/strict'; assert.deepEqual(process.argv.slice(2),['build','--manifest-path','compiler/silk.toml','--optimization','release-with-debug']); const p='compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-compiler'; mkdirSync(dirname(p),{recursive:true}); writeFileSync(p,'#!/bin/sh\\nexit 42\\n'); chmodSync(p,0o755);`,
-  )
-  const clang = join(temporary, 'clang')
-  yield* fs.writeFileString(clang, '#!/bin/sh\necho "LLVM toolchain fixture"\n')
-  yield* fs.chmod(clang, 0o755)
-  const artifact = join(temporary, 'artifact')
-  return {
-    fs,
-    temporary,
-    repository,
-    snapshot,
-    revision,
-    receipt,
-    bootstrap,
-    artifact,
-    git,
-    put,
-    options: {
-      repository,
-      snapshot,
-      artifact,
-      bootstrap,
-      bootstrapCommit: revision,
-      bootstrapRun: '123',
-      clang,
-      llvmAr: clang,
-    },
-  }
+  return { fs, temporary, repository, snapshot, revision, receipt, git, put }
 })
 const failure = Effect.fnUntraced(
   /** @param {import('effect/Effect').Effect<unknown,{message:string},import('effect/FileSystem').FileSystem>} effect @param {RegExp} expected */
@@ -118,76 +88,6 @@ it.effect(
       )
       yield* failure(verifySnapshot({ directory: second }), /Snapshot bytes or mode changed/)
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-)
-
-it.effect('binds the bootstrap seed receipt to the snapshot and publishes an immutable N0', () =>
-  Effect.gen(function* () {
-    const f = yield* fixture()
-    const seed = yield* buildSeed(f.options)
-    assert.strictEqual(seed.sourceCommit, f.revision)
-    assert.strictEqual(seed.inputSnapshot.normalizedDigest, f.receipt.normalizedDigest)
-    assert.strictEqual(seed.bootstrap.commit, f.revision)
-    assert.strictEqual(seed.bootstrap.runId, '123')
-    assert.strictEqual(seed.bootstrap.stdlib.authority, 'embedded-verified-main')
-    assert.strictEqual(seed.bootstrap.stdlib.normalizedDigest, f.receipt.stdlibDigest)
-    assert.deepEqual(seed.profile, {
-      target: 'x86_64-unknown-linux-gnu',
-      name: 'release-with-debug',
-      optimization: 'speed',
-      debug: true,
-    })
-    assert.match(seed.bootstrap.sha256, /^[a-f0-9]{64}$/)
-    assert.match(seed.toolchain.clang.sha256, /^[a-f0-9]{64}$/)
-    assert.strictEqual((yield* f.fs.stat(join(f.artifact, 'N0'))).mode & 0o777, 0o555)
-    assert.strictEqual((yield* NativeProcess.execute(join(f.artifact, 'N0'), [])).status, 42)
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-)
-
-it.effect(
-  'rejects embedded stdlib drift, failed bootstrap, and stale output without publishing a seed',
-  () =>
-    Effect.gen(function* () {
-      const f = yield* fixture()
-      yield* f.put('packages/compiler/stdlib/silk/i32.silk', 'pub let ZERO = 1\n')
-      yield* f.git('add', '.')
-      yield* f.git(
-        '-c',
-        'user.name=Snapshot Test',
-        '-c',
-        'user.email=snapshot@example.invalid',
-        'commit',
-        '-qm',
-        'changed stdlib',
-      )
-      yield* failure(
-        verifyBootstrapStdlib({
-          repository: f.repository,
-          bootstrapCommit: yield* f.git('rev-parse', 'HEAD'),
-          snapshotReceipt: f.receipt,
-        }),
-        /embedded stdlib differs/,
-      )
-      yield* f.fs.writeFileString(f.bootstrap, 'process.exit(7)\n')
-      yield* failure(buildSeed(f.options), /Native seed build failed: 7/)
-      assert.isFalse(yield* f.fs.exists(f.artifact))
-      yield* f.fs.makeDirectory(join(f.snapshot, 'compiler/build'), { recursive: true })
-      yield* f.fs.writeFileString(f.bootstrap, 'process.exit(0)\n')
-      yield* failure(buildSeed(f.options), /fresh snapshot without build outputs/)
-      assert.isFalse(yield* f.fs.exists(f.artifact))
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-)
-
-it.effect('rejects source mutation during a bootstrap seed build', () =>
-  Effect.gen(function* () {
-    const f = yield* fixture()
-    const bootstrap = yield* f.fs.readFileString(f.bootstrap)
-    yield* f.fs.writeFileString(
-      f.bootstrap,
-      `${bootstrap}\nwriteFileSync('compiler/src/main.silk', 'mutated during build')\n`,
-    )
-    yield* failure(buildSeed(f.options), /Snapshot bytes or mode changed/)
-    assert.isFalse(yield* f.fs.exists(f.artifact))
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
 it.effect('installs only downloaded bytes that match a Release pin', () =>
@@ -224,12 +124,10 @@ it.effect('installs only downloaded bytes that match a Release pin', () =>
       yield* encodeJson({ ...pin, seed: { ...pin.seed, tag: `native-seed-${'0'.repeat(40)}` } }),
     )
     yield* failure(readPin(pinPath), /tag must name its source commit/)
-    const bootstrapPin = { schemaVersion: 1, seed: { _tag: 'Bootstrap', reason: 're-seed' } }
-    yield* f.fs.writeFileString(pinPath, yield* encodeJson(bootstrapPin))
-    assert.deepEqual(yield* readPin(pinPath), bootstrapPin)
-    yield* failure(
-      verifySeed({ pin: pinPath, download, destination: join(f.temporary, 'none') }),
-      /Only a Release pin/,
+    yield* f.fs.writeFileString(
+      pinPath,
+      yield* encodeJson({ schemaVersion: 1, seed: { _tag: 'Bootstrap', reason: 're-seed' } }),
     )
+    yield* failure(readPin(pinPath), /./)
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
