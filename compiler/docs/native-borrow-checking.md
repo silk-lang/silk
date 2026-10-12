@@ -323,14 +323,16 @@ corpus program, `<program> <reason>=<count> ...` (a bare name when nothing is un
   goes stale and a later rise cannot hide under an old high count. A program that ran without a line
   also fails. A line whose program did not run is only a notice: the job runs main's published
   corpus, so a selfhost PR can declare a new program's line before main's bundle carries the
-  program. `update` writes a line for every program that ran and drops the rest. A PR that changes
-  checking or the corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, the
-  file's only writer, and `diff <old> <new>` prints the per-program transition table for its
-  description. The corpus job builds its programs from main's verification harness, which can differ
-  from a local run on this branch's `corpus.ts`; the file must match CI, so when they disagree, run
-  `update` on the job's `selfhost-corpus-timings` artifact or its log. Lines are independent and git
-  merges the file with `merge=union`; two branches that changed the same program leave two lines for
-  it, which fail until `update` reruns.
+  program. `update` writes a line for every program that ran and keeps, listing them as "not run",
+  the lines of programs that did not; `update --prune` drops those instead, for programs the corpus
+  no longer has. A PR that changes checking or the corpus reruns `node
+  .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
+  <new>` prints the per-program transition table for its description. The corpus job builds its
+  programs from main's verification harness, which can differ from a local run on this branch's
+  `corpus.ts`; the file must match CI, so when they disagree, run `update` on the job's
+  `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file with
+  `merge=union`; two branches that changed the same program leave two lines for it, which fail until
+  `update` reruns.
 - A reason that a slice retires is listed on the `retired` line and must be zero everywhere. The
   corpus job and the N2 self-build step both fail if a retired reason reappears. The self-build
   totals grow with the compiler, so they are printed as a receipt and never recorded.
