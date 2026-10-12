@@ -2321,6 +2321,48 @@ it('parses a move operand with its keyword and name', () => {
   assert.deepEqual(result.parserDiagnostics, [])
 })
 
+it('parses a primary move operand with its postfix operations (OWN-003)', () => {
+  const source = `pub fn main() -> i32 {
+  let bare = move run find(1)
+  let grouped = move (run find(1))
+  let applied = move Holder<Token>.make(token)
+  let field = move holder.value
+  let compared = move left < right
+  return 0
+}`
+  const result = parseText('fixture://move-operands.silk', source)
+  const fn = directFunctionDeclarations(result.root).at(0)
+  const block = fn === undefined ? undefined : SyntaxTree.directNode(fn, 'Block')
+  const initializers = (
+    block === undefined ? [] : SyntaxTree.directNodes(block, 'BindingStatement')
+  )
+    .map((binding) => binding.children.filter(SyntaxTree.isNode).at(-1))
+    .map((node) => node ?? raise('expected a binding initializer'))
+  const operand = (move: SyntaxTree.Node): SyntaxTree.Node =>
+    move.children.filter(SyntaxTree.isNode).at(0) ?? raise('expected a move operand')
+  const [bare, grouped, applied, field, compared] = initializers
+
+  assert.deepEqual(
+    initializers.map((node) => node.kind),
+    ['MoveExpression', 'MoveExpression', 'MoveExpression', 'MoveExpression', 'InfixExpression'],
+  )
+  // `run` extends greedily, so both spellings move the same `run find(1)`.
+  const groupedRun = operand(grouped ?? raise('expected grouped move'))
+  assert.strictEqual(operand(bare ?? raise('expected bare move')).kind, 'RunExpression')
+  assert.strictEqual(groupedRun.kind, 'GroupedExpression')
+  assert.strictEqual(SyntaxTree.directNode(groupedRun, 'RunExpression')?.kind, 'RunExpression')
+  assert.strictEqual(operand(applied ?? raise('expected applied move')).kind, 'CallExpression')
+  assert.strictEqual(
+    operand(field ?? raise('expected field move')).kind,
+    'FieldProjectionExpression',
+  )
+  // A comparison next to `move` still applies to the moved operand.
+  assert.strictEqual(compared?.children.filter(SyntaxTree.isNode).at(0)?.kind, 'MoveExpression')
+  assert.deepEqual(result.parserDiagnostics, [])
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('recovers a missing initializer at the return boundary', () => {
   const result = parseText(
     'fixture://missing-initializer.silk',

@@ -153,6 +153,11 @@ the source binding. Reading a Copy leaf is valid and produces no ownership diagn
 `move value` transfers the complete value and its future cleanup responsibility to the receiving
 owner. After the move, the source binding is unavailable on every path where the move occurred.
 
+The operand of `move` is a primary expression with its postfix operations: a place such as
+`value.field`, a call such as `Holder<Token>.make(token)`, a grouped expression, or `run`. A `run`
+operand extends greedily (OP-001), so `move run f()` moves the whole `run f()` and has the same
+effect as `move (run f())`.
+
 ```silk
 struct Token { kind: i32 }
 

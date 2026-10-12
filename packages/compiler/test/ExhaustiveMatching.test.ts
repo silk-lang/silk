@@ -496,6 +496,21 @@ pub fn inspect(value: Point | i32) -> i32 {
     ownership(moved).diagnostics.map((diagnostic) => diagnostic.code),
     'OWN0001',
   )
+
+  // `move` takes a primary operand with its postfix operations (OWN-003).
+  const fresh = analyze(
+    'moved-fresh-selection',
+    `pub struct Token { kind: i32 }
+pub union Slot<T> { Held { value: T }, Vacant }
+effect fn find(kind: i32) -> Slot<Token> { return Slot<Token>.Held { value: Token { kind: kind } } }
+pub effect fn inspect() -> i32 {
+  if let Slot<Token>.Held { value } = move run find(1) { return value.kind }
+  if let Slot<Token>.Held { value } = move (run find(2)) { return value.kind }
+  return 0
+}`,
+  )
+  assert.deepEqual(fresh.diagnostics, [])
+  assert.deepEqual(ownership(fresh).diagnostics, [])
 })
 
 it('keeps borrowed owners live, consumes move matches, and requires mutable exclusive roots', () => {
