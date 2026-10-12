@@ -214,6 +214,8 @@ export const resolveDeclaredType = (
     return resolveExactRepresentation(spanOf, module, fact, resolvers, modules)
   if (fact._tag === 'Unresolved') {
     const resolved = resolvers.type(module, fact.path)
+    if (resolved.fact._tag === 'Resolved' && resolved.fact.aliasParameters !== undefined)
+      return applyGenericAlias(spanOf, module, fact, resolved.fact, [], resolvers, modules)
     if (resolved.fact._tag !== 'Resolved' || !Type.isNominal(resolved.fact.type)) return resolved
     // A nominal that already carries arguments came through an alias, which applied them.
     if (resolved.fact.type.arguments.length > 0) return resolved
@@ -461,6 +463,29 @@ export const resolveDeclaredType = (
       fact.target._tag === 'Unresolved'
         ? resolvers.type(module, fact.target.path)
         : resolveDeclaredType(spanOf, module, fact.target, resolvers, modules)
+    if (target.fact._tag === 'Resolved' && target.fact.aliasParameters !== undefined) {
+      if (fact.requirementRow !== undefined) {
+        const diagnostic = Diagnostic.typeArgumentArity(
+          fact.spelling,
+          target.fact.aliasParameters.parameters.length,
+          fact.arguments.length + 1,
+          Location.at(fact.target.anchor),
+        )
+        return {
+          fact: { ...fact, cause: Diagnostic.identity(diagnostic) },
+          diagnostics: [...target.diagnostics, diagnostic],
+        }
+      }
+      return applyGenericAlias(
+        spanOf,
+        module,
+        fact,
+        target.fact,
+        fact.arguments,
+        resolvers,
+        modules,
+      )
+    }
     const targetDeclaration =
       target.fact._tag === 'Resolved' && Type.isNominal(target.fact.type)
         ? memberByNominal(modules, target.fact.type)
@@ -1018,6 +1043,126 @@ const genericArgumentForParameter = (
 
 type GenericArgumentResolution = TypeResolution & {
   readonly argument?: Type.GenericArgument
+}
+
+/** The parameters a use of an alias elides like a nominal's, implicit lifetimes included. */
+export const aliasUseParameters = (
+  fact: DeclaredTypeFact,
+): ReadonlyArray<Type.Parameter> | undefined =>
+  fact._tag === 'Resolved' ? fact.aliasParameters?.parameters : undefined
+
+/**
+ * Whether a use of an alias is one borrowed input for header elision (LIFE-003), as its written-out
+ * target is: the target is a reference, slice or string whose one lifetime the use elides.
+ */
+export const borrowedAliasUse = (fact: DeclaredTypeFact): boolean =>
+  fact._tag === 'Resolved' &&
+  fact.aliasParameters !== undefined &&
+  fact.aliasParameters.parameters.filter((parameter) => parameter.kind === 'Lifetime').length ===
+    1 &&
+  (Type.isReference(fact.type) || Type.isSlice(fact.type) || Type.isString(fact.type))
+
+/**
+ * Applies a generic alias (TYPE-004) to the arguments written at one use. Every parameter takes a
+ * written argument, except that lifetimes may all be elided like a nominal's. The substituted
+ * target is normalized, so a union target flattens and dedupes (`Fallible<IoError>` is
+ * `IoError`), and each distinct argument list is expanded once.
+ */
+const applyGenericAlias = (
+  spanOf: SpanOf,
+  module: string,
+  fact: Extract<DeclaredTypeFact, { readonly _tag: 'Unresolved' | 'Applied' }>,
+  target: Extract<DeclaredTypeFact, { readonly _tag: 'Resolved' }>,
+  written: ReadonlyArray<DeclaredTypeFact>,
+  resolvers: ResolutionSeams.ResolutionSeams,
+  modules: ReadonlyArray<ModuleHeaders>,
+): TypeResolution => {
+  const generic = target.aliasParameters
+  if (generic === undefined) return { fact: target, diagnostics: [] }
+  const anchor = fact._tag === 'Applied' ? fact.target.anchor : fact.anchor
+  const valueParameters = generic.parameters.filter((parameter) => parameter.kind !== 'Lifetime')
+  const lifetimeParameters = generic.parameters.filter((parameter) => parameter.kind === 'Lifetime')
+  let ordinal = 0
+  const arguments_ = written.map((argument) =>
+    argument._tag === 'Lifetime'
+      ? resolveGenericArgument(spanOf, module, argument, undefined, resolvers, modules)
+      : resolveGenericArgument(
+          spanOf,
+          module,
+          argument,
+          valueParameters.at(ordinal++),
+          resolvers,
+          modules,
+        ),
+  )
+  const diagnostics: Array<Diagnostic.Located> = arguments_.flatMap((argument) => [
+    ...argument.diagnostics,
+  ])
+  const writtenLifetimes = arguments_.flatMap((argument) =>
+    argument.fact._tag === 'Lifetime' ? [argument.fact.lifetime] : [],
+  )
+  const ordinary = arguments_.filter((argument) => argument.fact._tag !== 'Lifetime')
+  const lifetimes =
+    writtenLifetimes.length > 0 ? writtenLifetimes : (fact.implicitLifetimeArguments ?? [])
+  if (
+    ordinary.length !== valueParameters.length ||
+    lifetimes.length !== lifetimeParameters.length
+  ) {
+    const diagnostic = Diagnostic.typeArgumentArity(
+      fact.spelling,
+      generic.parameters.length,
+      written.length,
+      Location.at(anchor),
+    )
+    return {
+      fact: { _tag: 'Unavailable', anchor: fact.anchor, cause: Diagnostic.identity(diagnostic) },
+      diagnostics: [...diagnostics, diagnostic],
+    }
+  }
+  const unavailable = ordinary.find((argument) => argument.argument === undefined)
+  if (unavailable !== undefined)
+    return {
+      fact: {
+        _tag: 'Unavailable',
+        anchor: fact.anchor,
+        ...('cause' in unavailable.fact && unavailable.fact.cause !== undefined
+          ? { cause: unavailable.fact.cause }
+          : {}),
+      },
+      diagnostics,
+    }
+  let lifetimeOrdinal = 0
+  let valueOrdinal = 0
+  const concrete = generic.parameters.map((parameter): Type.GenericArgument =>
+    parameter.kind === 'Lifetime'
+      ? (lifetimes[lifetimeOrdinal++] ?? Lifetime.staticLifetime)
+      : (ordinary[valueOrdinal++]?.argument ?? parameter),
+  )
+  const key = concrete.map(Type.genericArgumentKey).join('\u0000')
+  let expanded = generic.expansions.get(key)
+  if (expanded === undefined) {
+    const substitution = TypeInference.substitution(generic.parameters, concrete)
+    expanded = substitution === undefined ? target.type : Type.substitute(target.type, substitution)
+    generic.expansions.set(key, expanded)
+  }
+  // Union normalization failing leaves an alias parameter in place; report the members it rejects.
+  const aliasKeys = new Set(generic.parameters.map(Type.key))
+  if (Type.parameters(expanded).some((parameter) => aliasKeys.has(Type.key(parameter)))) {
+    const diagnostic = Diagnostic.invalidUnionMember(Type.encode(expanded), Location.at(anchor))
+    return {
+      fact: { _tag: 'Unavailable', anchor: fact.anchor, cause: Diagnostic.identity(diagnostic) },
+      diagnostics: [...diagnostics, diagnostic],
+    }
+  }
+  return {
+    fact: {
+      _tag: 'Resolved',
+      type: expanded,
+      spelling: Type.encode(expanded),
+      anchor: fact.anchor,
+    },
+    diagnostics,
+  }
 }
 
 /** Resolves a generic argument with the declaration parameter's kind available as context. */
