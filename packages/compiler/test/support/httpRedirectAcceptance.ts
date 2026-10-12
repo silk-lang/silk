@@ -431,14 +431,14 @@ effect fn redirectReplayRowWitness(factory: &mut RedirectFactory) -> i32
     RedirectProducer,
     RedirectFactoryFailure,
     &mut RedirectFactoryRequirement,
-  >.acquire(factory)
+  >.acquire(&mut factory)
   let use = effect fn(owned: &mut RedirectProducer) -> i32
   ! RedirectProducerFailure
   ? &mut RedirectProducerRequirement {
     let mut output: [u8; 1] = [0]
     let chunk = run BodyProducer<
       RedirectProducerFailure ? &mut RedirectProducerRequirement
-    >.pull(owned, &mut output)
+    >.pull(&mut owned, &mut output)
     if chunk.length == usize.ONE && chunk.end && output[usize.ZERO] == 120 { return 17 }
     return -1
   }
@@ -447,7 +447,7 @@ effect fn redirectReplayRowWitness(factory: &mut RedirectFactory) -> i32
       RedirectProducer,
       RedirectFactoryFailure,
       &mut RedirectFactoryRequirement,
-    >.release(factory, owned)
+    >.release(&mut factory, &mut owned)
   }
   return run Effect.useReleaseNonParking(move producer, move use, move release)
 }
