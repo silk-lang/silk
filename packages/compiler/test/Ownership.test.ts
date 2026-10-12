@@ -1890,6 +1890,15 @@ fn strengthenedExplicit(counter: &Counter) -> () { Counter.bump(&mut counter) }
 fn clear(values: &mut [i32]) -> () { return () }
 fn strengthenedArray(source: &([i32; 2])) -> () { clear(&mut source) }
 fn strengthenedReferent<'a>(value: &'a i32) -> &'a mut i32 { return &mut value.* }
+fn increment(value: &mut i32) -> () { value.* = value.* + 1 }
+fn strengthenedField(counter: &Counter) -> () {
+  let mut held = counter
+  increment(&mut held.value)
+}
+fn strengthenedElement(counters: &[Counter]) -> () {
+  let mut held = counters
+  Counter.bump(&mut held[0])
+}
 fn moved(counter: &mut Counter) -> i32 { return counter.take() }
 fn conflicting(counter: &mut Counter) -> i32 {
   let held = &counter.value
@@ -1920,6 +1929,9 @@ pub fn main() -> i32 { return 0 }`
         { code: 'SEM0058', start: at('&mut counter', 'fn strengthenedExplicit') },
         { code: 'SEM0058', start: at('&mut source', 'fn strengthenedArray') },
         { code: 'SEM0058', start: at('&mut value.*', 'fn strengthenedReferent') },
+        // A mutable binding of a shared view still reaches its places only through that view.
+        { code: 'SEM0058', start: at('&mut held.value', 'fn strengthenedField') },
+        { code: 'SEM0058', start: at('&mut held[0]', 'fn strengthenedElement') },
         { code: 'OWN0012', start: at('counter.take()', 'fn moved') },
         { code: 'OWN0010', start: at('counter.bump()', 'fn conflicting') },
         { code: 'OWN0010', start: at('counter.slot()', 'let second') },
