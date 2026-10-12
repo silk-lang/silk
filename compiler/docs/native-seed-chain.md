@@ -84,8 +84,8 @@ fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
 ## Publication
 
-A successful `selfhost` push run (every job above green) runs **Publish native
-seed candidate**. It creates the prerelease `native-seed-<commit>` targeting that commit with:
+A successful `selfhost` push run (every job above green) runs **Publish native seed candidate**. It
+creates the prerelease `native-seed-<commit>` targeting that commit with:
 
 - `silk-compiler-x86_64-unknown-linux-gnu`: N2;
 - `chain-receipt.json`: seed identity, N1/N2 hashes, IR hash, smoke and toolchain facts;
