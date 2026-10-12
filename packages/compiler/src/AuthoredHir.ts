@@ -619,7 +619,6 @@ export type DeclarationHeader =
         | {
             readonly _tag: 'OperationHeader'
             readonly contract: CallableContract
-            readonly operator: Name | undefined
             readonly properties: ReadonlyArray<PropertyClause>
           }
         | { readonly _tag: 'ImplAliasHeader'; readonly target: Path }
@@ -895,7 +894,7 @@ export const fields = freezeFieldRegistry({
   MissingDeclarationHeader: nodeFields,
   InvalidDeclarationHeader: [...nodeFields, 'retained'],
   FunctionHeader: [...namedFields, 'contract', 'linkage', 'properties'],
-  OperationHeader: [...namedFields, 'contract', 'operator', 'properties'],
+  OperationHeader: [...namedFields, 'contract', 'properties'],
   ImplAliasHeader: [...namedFields, 'target'],
   StructHeader: [...namedFields, 'generics', 'genericsAnchor', 'fields', 'abi'],
   TupleHeader: [...namedFields, 'generics', 'elements'],
@@ -979,7 +978,6 @@ export const optionalFields = freezeFieldRegistry({
   ImportHeader: ['alias', 'members'],
   ImplHeader: ['target'],
   FunctionHeader: ['linkage'],
-  OperationHeader: ['operator'],
   StructHeader: ['genericsAnchor', 'abi'],
   EnumHeader: ['representation'],
   ConstantHeader: ['type'],

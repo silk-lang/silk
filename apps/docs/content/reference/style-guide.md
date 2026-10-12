@@ -113,10 +113,7 @@ pub fn main() -> i32 {
 
 Put an operation where its receiver is. A function whose first parameter is the owner and whose
 meaning belongs to that type is a member; a function that would pick one owner arbitrarily among
-equals is free. The standard library follows this split with one deliberate exception:
-`Order.compare`, `Order.less`, `Order.equal`, `Order.isLess`, `Order.isEqual`, and
-`Order.isGreater` are associated functions of the `Order` interface although their parameters are
-`T: Order` values or an `Ordering`, so the spelling callers already use stays stable.
+equals is free. The standard library follows this split.
 
 Nominal data types remain primarily data. An inherent `impl` collects the operations intrinsic to
 its owner; a conformance `impl Contract for Type` exists because the type conforms to an interface
