@@ -2307,7 +2307,14 @@ const residualExpression = (
     fact.type._tag === 'Available'
   ) {
     const borrowIds = loanEndsOf(fact.arguments, self)
-    return {
+    const predicate = fact._tag === 'Operator' ? fact.predicate : undefined
+    const span = options.context.spanOf(fact.anchor)
+    const origin = Tir.authored(fact.anchor)
+    // A comparison operator wraps its interface call; the nested nodes are synthetic for the
+    // operator's own position.
+    const nested = (expression: Tir.Expression): Tir.Expression =>
+      options.builder === undefined ? expression : BodyArena.node(options.builder, expression)
+    const call: Tir.Expression = {
       _tag: 'InterfaceOperationCall',
       ...(fact._tag === 'Operator' ? { operator: true as const } : {}),
       capability: fact.reference.capability,
@@ -2321,9 +2328,43 @@ const residualExpression = (
         tirExpression(argument.expression, options, argumentBorrowId(argument, ordinal, self)),
       ),
       loanEnds: borrowIds,
-      type: fact.type.type,
-      span: options.context.spanOf(fact.anchor),
-      origin: Tir.authored(fact.anchor),
+      type: predicate === undefined ? fact.type.type : fact.reference.result,
+      span,
+      origin: predicate === undefined ? origin : Tir.synthetic(fact.anchor, 'operator-call'),
+    }
+    if (predicate === undefined) return call
+    if (predicate._tag === 'OrderingOperatorResult')
+      return {
+        _tag: 'EnumEquality',
+        enum: predicate.enum,
+        left: nested(call),
+        right: nested({
+          _tag: 'EnumMember',
+          enum: predicate.enum,
+          member: predicate.member,
+          discriminant: predicate.discriminant,
+          type: predicate.enumType,
+          span,
+          origin: Tir.synthetic(fact.anchor, 'operator-ordering'),
+        }),
+        negated: predicate.negated,
+        type: Scalar.boolean.spelling,
+        span,
+        origin,
+      }
+    const not = Intrinsic.findOperation(Scalar.boolean.spelling, 'not')
+    if (not === undefined) throw new RangeError('The bool actor lost its not operation')
+    return {
+      _tag: 'BuiltinCall',
+      operation: 'Not',
+      intrinsic: not.id,
+      typeArguments: [],
+      arguments: [nested(call)],
+      loanEnds: [],
+      heldLoans: [],
+      type: Scalar.boolean.spelling,
+      span,
+      origin,
     }
   }
   if (
