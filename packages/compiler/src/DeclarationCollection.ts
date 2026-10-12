@@ -71,7 +71,6 @@ import * as DeclarationIndex from './DeclarationIndex.js'
 import * as Diagnostic from './Diagnostic.js'
 import * as ForeignSymbol from './ForeignSymbol.js'
 import type * as ModuleClosure from './ModuleClosure.js'
-import * as Operator from './Operator.js'
 import * as RequirementRow from './RequirementRow.js'
 import * as RowAlgebra from './RowAlgebra.js'
 import * as Scalar from './Scalar.js'
@@ -3685,13 +3684,6 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
             )
           const staticProperties: ReadonlyArray<Type.SealedStaticProperty> =
             validNonParking.length === 0 ? [] : ['Intrinsic.NonParking']
-          const operatorName = operationHeader.operator
-          const operatorSpelling =
-            operatorName === undefined ? undefined : nameText(context, operatorName)
-          const selectedOperator =
-            operatorSpelling === undefined
-              ? undefined
-              : eligibleOperator(operatorSpelling, parameterFacts.length)
           diagnostics.push(
             ...parameters.flatMap((parameter) => parameter.diagnostics),
             ...duplicateParameterDiagnostics(context, parameterFacts),
@@ -3700,24 +3692,6 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
             ...requirementRow.diagnostics,
             ...constraints.diagnostics,
           )
-          if (operatorName !== undefined) {
-            let detail: string | undefined
-            if (header._tag !== 'InterfaceHeader') {
-              detail = 'only interface operations may declare an operator'
-            } else if (
-              operationTypeParameters.facts.some((parameter) => parameter.type.kind !== 'Lifetime')
-            ) {
-              detail = 'operator operations cannot declare operation-local value or row parameters'
-            } else if (selectedOperator === undefined) {
-              detail = `${operatorSpelling ?? 'the marker'} is not an eligible ${parameterFacts.length}-operand operator`
-            } else {
-              detail = undefined
-            }
-            if (detail !== undefined)
-              diagnostics.push(
-                Diagnostic.invalidOperatorContract(detail, Location.at(operatorName.anchor)),
-              )
-          }
           if (operation.body._tag === 'CallableBody' && operation.body.block !== undefined)
             diagnostics.push(
               Diagnostic.invalidServiceDeclaration(
@@ -3746,17 +3720,6 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
             },
             parameterCount: parameterFacts.length,
             parameters: parameterFacts,
-            ...(operatorName !== undefined &&
-            selectedOperator !== undefined &&
-            header._tag === 'InterfaceHeader' &&
-            operationTypeParameters.facts.every((parameter) => parameter.type.kind === 'Lifetime')
-              ? {
-                  operator: {
-                    operator: selectedOperator,
-                    anchor: operatorName.anchor,
-                  },
-                }
-              : {}),
             name: operationName,
             returnType: returnType.fact,
             ...(returnType.opaqueResult === undefined
@@ -4608,31 +4571,6 @@ const headerGenerics = (
  * The authored marker keeps the written spelling rather than a token, so selection matches on
  * the operator table's own canonical spellings instead of a lexer token kind.
  */
-const eligibleOperator = (spelling: string, arity: number): Operator.Eligible | undefined => {
-  const unary: ReadonlyArray<Operator.Eligible> = ['Negate', 'Not', 'BitNot']
-  const binary: ReadonlyArray<Operator.Eligible> = [
-    'Multiply',
-    'Divide',
-    'Remainder',
-    'Add',
-    'Subtract',
-    'LessThan',
-    'LessOrEqual',
-    'GreaterThan',
-    'GreaterOrEqual',
-    'Equals',
-    'NotEquals',
-    'BitAnd',
-    'BitOr',
-    'BitXor',
-  ]
-  let candidates: ReadonlyArray<Operator.Eligible>
-  if (arity === 1) candidates = unary
-  else if (arity === 2) candidates = binary
-  else candidates = []
-  return candidates.find((candidate) => Operator.spelling(candidate) === spelling)
-}
-
 /** A conformance's destructor hook, which the source spells `drop` rather than a name. */
 const isDropHook = (
   context: Context,
