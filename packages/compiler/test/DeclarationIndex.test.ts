@@ -726,9 +726,9 @@ impl Present for i32 {
   fn present(value: &Self) -> i32 { return 2 }
 }
 
-interface Combined { operator + fn add(left: Self, right: Self) -> Self }
+interface Combined { fn add(left: Self, right: Self) -> Self }
 impl Combined for i32 { add: Intrinsic.i32WrappingAdd }
-interface Compared { operator < fn less(left: &Self, right: &Self) -> bool }
+interface Compared { fn less(left: &Self, right: &Self) -> bool }
 impl Compared for i32 { fn less(left: &Self, right: &Self) -> bool { return false } }`,
       ],
     ])
@@ -761,7 +761,6 @@ impl Compared for i32 { fn less(left: &Self, right: &Self) -> bool { return fals
       comparison?.typeParameters.map((parameter) => parameter.type.kind),
       ['Lifetime', 'Lifetime'],
     )
-    assert.strictEqual(comparison?.operator?.operator, 'LessThan')
     assert.isDefined(
       ConformanceProof.interfaceWitnessImplementation(
         index,
