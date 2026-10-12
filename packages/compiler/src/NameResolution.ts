@@ -924,13 +924,18 @@ export const makeResolvers = (
       return withDiagnostics(result, [diagnostic])
     }
     active.push(named)
-    const resolved = DeclarationResolution.resolveDeclaredType(
-      resolution.contexts.spanOf,
-      named.canonical.id.module,
-      named.target,
-      resolvers,
-      index.modules,
-    )
+    // A bare path target may name an unapplied generic declaration; each use site then supplies
+    // the arguments and receives the ordinary arity diagnostic when it omits them.
+    const resolved =
+      named.target._tag === 'Unresolved'
+        ? resolvers.type(named.canonical.id.module, named.target.path)
+        : DeclarationResolution.resolveDeclaredType(
+            resolution.contexts.spanOf,
+            named.canonical.id.module,
+            named.target,
+            resolvers,
+            index.modules,
+          )
     active.pop()
     const diagnostics: Array<Diagnostic.Located> = [...resolved.diagnostics]
     const cycleCause = cycleCauses.get(named)
