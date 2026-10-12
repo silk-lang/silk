@@ -326,12 +326,13 @@ Differences from Zig, each deliberate:
 **Hash.** 128 bits, non-cryptographic, word at a time, streaming over tokens. The backend already
 names symbols by two seeded 64-bit hashes (`backend/InstanceKey.silk:676-678`, byte at a time
 through `InternIndex.hashBytes`, `semantic/InternIndex.silk:100`). The fingerprint hash is
-`semantic/ContentHash.silk`: MurmurHash3 x64-128 with seed zero, sixteen bytes per step. It was
-pulled forward from slice 4 to name emission subjects in place of SHA-256. **[assumption]** At 128 bits, the
-chance of any collision among 10^7 fingerprints is about 10^14 / 2^129, below 10^-24. The threat
-model is accidental collision; a deliberately colliding source file is out of scope, as it is for
-Zig's truncated BLAKE3 (audit §2). If Julia wants adversarial resistance, BLAKE3 truncated to 128
-bits is the alternative, at several times the cost per byte.
+`semantic/ContentHash.silk`: SipHash-1-3 with a 128-bit output and a zero key, eight bytes per
+step, as rustc's stable hasher uses. It was pulled forward from slice 4 to name emission subjects in
+place of SHA-256. **[assumption]** At 128 bits, the chance of any accidental collision among 10^7
+fingerprints is about 10^14 / 2^129, below 10^-24. A collision means wrong artifact reuse, so
+crafted inputs matter too. MurmurHash3 was faster but has seed-independent multicollision
+constructions (Aumasson and Bernstein, 2012); SipHash has no known practical collision
+construction, so a crafted collision costs a generic 2^64 search.
 
 **Cost.** **[measured]** The self-build reads 184 modules totalling 7.3 MB (the compiler's
 non-test sources plus the stdlib modules it imports). A grep approximation counts about 7,700 named
