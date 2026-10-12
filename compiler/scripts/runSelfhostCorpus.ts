@@ -22,11 +22,18 @@ export interface BuildDiagnostic {
   readonly module: string
 }
 
+/** The bodies a successful build left without native borrow checking, in total and per reason. */
+export interface BorrowGap {
+  readonly total: number
+  readonly reasons: Readonly<Record<string, number>>
+}
+
 export type CaseResult =
-  | { readonly name: string; readonly status: 'pass' }
+  | { readonly name: string; readonly status: 'pass'; readonly borrowGap?: BorrowGap }
   | {
       readonly name: string
       readonly status: 'fail'
+      readonly borrowGap?: BorrowGap
       readonly code: string
       /** Every distinct semantic rejection the build printed, in order; empty for other failures. */
       readonly diagnostics: ReadonlyArray<BuildDiagnostic>
@@ -44,6 +51,7 @@ export interface Summary {
 }
 
 const unsupportedPrefix = 'SILK_UNSUPPORTED_JSON='
+const borrowGapPrefix = 'SILK_GAP borrow-check: '
 const buildErrorPrefix = 'SILK_BUILD_ERROR='
 // A native build of certificate-bounded-decoding takes 28.5-30 s on the hosted Linux runner, so a
 // 30 s build deadline timed it out at random; builds get 4x that, while program runs stay short.
@@ -95,6 +103,26 @@ const validGap = (gap: unknown): gap is Gap => {
     'span' in source &&
     validSpan(source.span)
   )
+}
+
+/**
+ * Reads a successful build's borrow-check gap line,
+ * `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...; note)`. A line without a
+ * per-reason breakdown keeps only its total.
+ */
+export const parseBorrowGap = (stderr: string): BorrowGap | undefined => {
+  const line = stderr.split('\n').find((candidate) => candidate.startsWith(borrowGapPrefix))
+  if (line === undefined) return undefined
+  const match = /^(\d+) bodies not borrow-checked \(([^)]*)\)$/.exec(
+    line.slice(borrowGapPrefix.length),
+  )
+  if (match === null) throw new Error(`malformed borrow-check gap line: ${line}`)
+  const reasons: Record<string, number> = {}
+  for (const part of (match[2] ?? '').split(';', 1)[0]?.split(', ') ?? []) {
+    const reason = /^([a-z-]+) (\d+)$/.exec(part)
+    if (reason !== null) reasons[reason[1] ?? ''] = Number(reason[2])
+  }
+  return { total: Number(match[1]), reasons }
 }
 
 /** Only B1's machine-readable gap record can classify a failed build as unsupported. */
@@ -336,6 +364,8 @@ export const runCase = (
     const profiles = program.nativeProfiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
     ]
+    // Every profile checks the same bodies, so the first build's gap stands for the program.
+    let borrowGap: BorrowGap | undefined
     for (const profile of profiles) {
       const built = spawnSync(
         silkc,
@@ -374,6 +404,7 @@ export const runCase = (
           reason: `profile ${profile.name}: build: ${processFailure(built)}`,
         }
       }
+      borrowGap ??= parseBorrowGap(text(built.stderr))
 
       for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
         const mismatch = compareRun(program, invocation, runExecutable(executable, invocation))
@@ -381,13 +412,14 @@ export const runCase = (
           return {
             name: program.name,
             status: 'fail',
+            ...(borrowGap === undefined ? {} : { borrowGap }),
             code: 'RUNTIME_MISMATCH',
             diagnostics: [],
             reason: `profile ${profile.name}: run ${ordinal + 1}: ${mismatch}`,
           }
       }
     }
-    return { name: program.name, status: 'pass' }
+    return { name: program.name, status: 'pass', ...(borrowGap === undefined ? {} : { borrowGap }) }
   } catch (error) {
     return {
       name: program.name,
@@ -473,6 +505,10 @@ export const runCorpus = (
         )
         .join('; ')}`
     process.stdout.write(`${result.status.toUpperCase()} ${result.name}${detail}\n`)
+    if (result.status !== 'unsupported' && result.borrowGap !== undefined)
+      process.stdout.write(
+        `SELFHOST_BORROW_GAP=${JSON.stringify({ name: result.name, ...result.borrowGap })}\n`,
+      )
   }
   const summary = summarize(results, track)
   process.stdout.write(

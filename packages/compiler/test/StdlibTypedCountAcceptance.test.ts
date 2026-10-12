@@ -10,10 +10,12 @@ const ascii = (value: string): Uint8Array =>
 
 const decoder = new TextDecoder()
 
-/** The five modules that used to copy a private `counted` identity to type their own literals. */
+/**
+ * Modules that used to copy a private `counted` identity to type their own literals and still count
+ * with typed literals. `silk/bytes` no longer counts at all.
+ */
 const previousHolders = [
   'silk/vector',
-  'silk/bytes',
   'silk/string',
   'silk/filesystem',
   'silk/os_filesystem',
