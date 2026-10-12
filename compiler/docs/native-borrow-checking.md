@@ -303,13 +303,13 @@ cover first:
   (EFF-003), and invoking an `effect fn` value without `run` is checked as the construction of an
   Effect that borrows its callee (EFFECT-OWN-001).
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
-- `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
-  reference.
+- `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
+  place that is not rooted in a local.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
-  replacement, or a loan a retaining result carries approximately. It is an unchecked status: such
-  a body is never `FullyChecked`, counts in the baseline like any other reason, and a rise in it
-  fails the corpus guard like a rise in any reason. Not rejecting a body never means accepting it
-  as checked.
+  replacement, a loan a retaining result carries approximately, or a move of a reference whose
+  referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
+  in the baseline like any other reason, and a rise in it fails the corpus guard like a rise in any
+  reason. Not rejecting a body never means accepting it as checked.
 
 A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
 the form.
