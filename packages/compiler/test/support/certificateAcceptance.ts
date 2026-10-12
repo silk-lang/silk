@@ -783,7 +783,7 @@ effect fn uniqueIds() -> bool ! OutOfMemoryError ? &mut Allocator {
   }
 }
 struct RefusingAllocator { calls: usize failAt: usize }
-effect fn allocate(self: &mut RefusingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut RefusingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + usize.ONE
   if self.calls == self.failAt { return run Allocator.outOfMemory() }
   let mut system = Allocator.systemAllocatorProvider()

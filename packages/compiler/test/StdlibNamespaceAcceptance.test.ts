@@ -616,12 +616,12 @@ import silk.slot { Slot }
 import silk.unicode { Unicode }
 import silk.unicode_tables { UnicodeTables }
 
-fn rawCount(buffer: &RawBuffer<i32>) -> usize {
+fn rawCount(buffer: &Intrinsic.RawBuffer<i32>) -> usize {
   unsafe { return RawBuffer.count<i32>(buffer) }
   return 0
 }
 
-fn take(slot: Slot<i32>) -> i32 {
+fn take(slot: Intrinsic.Slot<i32>) -> i32 {
   unsafe { return Slot.take<i32>(move slot) }
   return 0
 }

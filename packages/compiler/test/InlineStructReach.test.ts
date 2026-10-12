@@ -53,14 +53,17 @@ const structNamed = (
 
 /**
  * The compiler-owned indirections are the base case of the whole rule: their representations are
- * `{$allocation, count}` and `{$address}` whatever they hold, so a field of `RawBuffer<Node>` needs
+ * `{$allocation, count}` and `{$address}` whatever they hold, so a field of `Intrinsic.RawBuffer<Node>` needs
  * nothing about `Node`'s layout. Before this change `Type.nominals` recursed into type arguments
  * and this exact shape was `SEM0020` with an unavailable dependency.
  */
 it.effect('accepts a struct that reaches itself through compiler-owned raw storage', () =>
   Effect.gen(function* () {
     const index = yield* collect('storage', [
-      ['storage', 'struct Node { next: RawBuffer<Node> }\npub fn main() -> i32 { return 0 }'],
+      [
+        'storage',
+        'struct Node { next: Intrinsic.RawBuffer<Node> }\npub fn main() -> i32 { return 0 }',
+      ],
     ])
     assert.deepEqual(codesOf(index), [])
 
@@ -71,7 +74,7 @@ it.effect('accepts a struct that reaches itself through compiler-owned raw stora
       node?.dependency._tag === 'Available'
         ? node.dependency.types.map((type) => Type.encode(type))
         : [],
-      ['silk/core.RawBuffer<storage.Node>', 'storage.Node'],
+      ['storage.Node', 'Intrinsic.RawBuffer<storage.Node>'],
     )
   }),
 )
@@ -85,7 +88,7 @@ it.effect('accepts a cycle through a user generic that indirects its own paramet
     const generic = yield* collect('indirecting', [
       [
         'indirecting',
-        'struct Cell<T> { buffer: RawBuffer<T> }\n' +
+        'struct Cell<T> { buffer: Intrinsic.RawBuffer<T> }\n' +
           'struct Node { next: Cell<Node> }\n' +
           'pub fn main() -> i32 { return 0 }',
       ],
@@ -98,7 +101,7 @@ it.effect('accepts a cycle through a user generic that indirects its own paramet
     const nested = yield* collect('nested', [
       [
         'nested',
-        'struct Cell { buffer: RawBuffer<Cell> }\n' +
+        'struct Cell { buffer: Intrinsic.RawBuffer<Cell> }\n' +
           'struct Node { next: Cell }\n' +
           'pub fn main() -> i32 { return 0 }',
       ],
@@ -171,7 +174,7 @@ it.effect('agrees between the component walk and the self-edge test', () =>
     const alone = yield* collect('alone', [
       [
         'alone',
-        'struct Cell<T> { buffer: RawBuffer<T> }\n' +
+        'struct Cell<T> { buffer: Intrinsic.RawBuffer<T> }\n' +
           'struct Node { next: Cell<Node> value: i32 }\n' +
           'pub fn main() -> i32 { return 0 }',
       ],
@@ -181,8 +184,8 @@ it.effect('agrees between the component walk and the self-edge test', () =>
     // Two structs whose only cycle passes through an indirection form a component of two, which is
     // the path through the component walk rather than the self-edge test.
     const mutual = yield* collect('mutual/A', [
-      ['mutual/A', 'import mutual.B\npub struct A { value: RawBuffer<B.B> }'],
-      ['mutual/B', 'import mutual.A\npub struct B { value: RawBuffer<A.A> }'],
+      ['mutual/A', 'import mutual.B\npub struct A { value: Intrinsic.RawBuffer<B.B> }'],
+      ['mutual/B', 'import mutual.A\npub struct B { value: Intrinsic.RawBuffer<A.A> }'],
     ])
     assert.deepEqual(codesOf(mutual), [])
     assert.strictEqual(structNamed(mutual, 'A')?.dependency._tag, 'Available')
@@ -199,7 +202,7 @@ it.effect('produces the same answer regardless of declaration and module order',
     const forward = yield* collect('order', [
       [
         'order',
-        'struct Cell<T> { buffer: RawBuffer<T> }\n' +
+        'struct Cell<T> { buffer: Intrinsic.RawBuffer<T> }\n' +
           'struct Pair<T> { value: T }\n' +
           'struct Good { next: Cell<Good> }\n' +
           'pub fn main() -> i32 { return 0 }',
@@ -210,7 +213,7 @@ it.effect('produces the same answer regardless of declaration and module order',
         'order',
         'struct Good { next: Cell<Good> }\n' +
           'struct Pair<T> { value: T }\n' +
-          'struct Cell<T> { buffer: RawBuffer<T> }\n' +
+          'struct Cell<T> { buffer: Intrinsic.RawBuffer<T> }\n' +
           'pub fn main() -> i32 { return 0 }',
       ],
     ])
@@ -239,7 +242,9 @@ it.effect('lays out a struct that reaches itself through raw storage', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'inline-reach/layout',
-      ascii('struct Node { next: RawBuffer<Node> value: i32 }\npub fn main() -> i32 { return 0 }'),
+      ascii(
+        'struct Node { next: Intrinsic.RawBuffer<Node> value: i32 }\npub fn main() -> i32 { return 0 }',
+      ),
       'wasm32-unknown-unknown',
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
