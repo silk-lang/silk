@@ -2154,6 +2154,7 @@ const residualExpression = (
       ...(fact.invocationParameters === undefined
         ? {}
         : { invocationParameters: fact.invocationParameters }),
+      ...(fact.anonymous === undefined ? {} : { lexical: true as const }),
       site: fact.site,
       target,
       remainingParameters: fact.remainingParameters,
