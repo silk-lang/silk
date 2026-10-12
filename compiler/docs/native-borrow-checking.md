@@ -382,8 +382,8 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.
 - **Where the reference and the bootstrap disagree**, the reference wins (it is prescriptive over
-  both compilers). The bootstrap gets a `main` fix in the same slice. A difference is never added to
-  `acceptedFailures`.
+  both compilers). The bootstrap gets a `main` fix in the same slice. The corpus job fails on any
+  `FAIL`, so a difference is never tolerated as a corpus failure.
 - **Positive parity:** the stdlib, the corpus and the compiler itself must pass the native checker
   with zero rejections, because they pass the bootstrap's.
 
