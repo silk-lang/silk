@@ -276,8 +276,8 @@ ${decoded('restrictedRoot', certificateAt(pathLengthZero.anchors, 0, pathLengthZ
 ${decoded('acceptedRoot', certificateAt(pathLengthZero.anchors, 0, pathLengthZero.id), 264)}
   let restrictedResult = run TrustAnchor.fromCertificateWithConstraints(
     move restrictedRoot,
-    Option.some<usize>(usize.ZERO),
-    Option.none<&[u8]>(),
+    Option<usize>.some(usize.ZERO),
+    Option<&[u8]>.none(),
     ProfileLimits.defaults(),
   )
   let restricted = match move restrictedResult {
@@ -330,8 +330,8 @@ ${decoded('acceptedRoot', certificateAt(permittedDns.anchors, 0, permittedDns.id
   let narrowDer = Slice.view<u8>(&narrow, usize.ZERO, 23)
   let narrowResult = run TrustAnchor.fromCertificateWithConstraints(
     move narrowRoot,
-    Option.none<usize>(),
-    Option.some<&[u8]>(narrowDer),
+    Option<usize>.none(),
+    Option<&[u8]>.some(narrowDer),
     ProfileLimits.defaults(),
   )
   let narrowAnchor = match move narrowResult {
@@ -376,27 +376,27 @@ ${decoded('root', certificateAt(pathLengthZero.anchors, 0, pathLengthZero.id), 2
   let algorithmOnly = Slice.view<Certificate>(&candidates, 2, 1)
   let algorithmOutcome = run CertificatePath.validate(&leaf, algorithmOnly, &anchors, &at, ValidationLimits.defaults())
   if !exactIntermediateRejection(
-    move algorithmOutcome, ValidationReason.UnsupportedAlgorithm, usize.ZERO, Option.none<usize>(),
+    move algorithmOutcome, ValidationReason.UnsupportedAlgorithm, usize.ZERO, Option<usize>.none(),
   ) { return 289 }
   let mismatchOnly = Slice.view<Certificate>(&candidates, 3, 1)
   let mismatchOutcome = run CertificatePath.validate(&leaf, mismatchOnly, &anchors, &at, ValidationLimits.defaults())
   if !exactIntermediateRejection(
-    move mismatchOutcome, ValidationReason.UnsupportedParameters, usize.ZERO, Option.none<usize>(),
+    move mismatchOutcome, ValidationReason.UnsupportedParameters, usize.ZERO, Option<usize>.none(),
   ) { return 290 }
   let policyOnly = Slice.view<Certificate>(&candidates, 4, 1)
   let policyOutcome = run CertificatePath.validate(&leaf, policyOnly, &anchors, &at, ValidationLimits.defaults())
   if !exactIntermediateRejection(
-    move policyOutcome, ValidationReason.UnsupportedPolicy, usize.ZERO, Option.some<usize>(usize.ZERO),
+    move policyOutcome, ValidationReason.UnsupportedPolicy, usize.ZERO, Option<usize>.some(usize.ZERO),
   ) { return 291 }
   let featureOnly = Slice.view<Certificate>(&candidates, 5, 1)
   let featureOutcome = run CertificatePath.validate(&leaf, featureOnly, &anchors, &at, ValidationLimits.defaults())
   if !exactIntermediateRejection(
-    move featureOutcome, ValidationReason.UnsupportedExtension, usize.ZERO, Option.some<usize>(usize.ZERO),
+    move featureOutcome, ValidationReason.UnsupportedExtension, usize.ZERO, Option<usize>.some(usize.ZERO),
   ) { return 292 }
   let rejected = Slice.view<Certificate>(&candidates, usize.ZERO, 6)
   let rejectedOutcome = run CertificatePath.validate(&leaf, rejected, &anchors, &at, ValidationLimits.defaults())
   if !exactAnchorRejection(
-    move rejectedOutcome, ValidationReason.InvalidSignature, usize.ZERO, Option.none<usize>(),
+    move rejectedOutcome, ValidationReason.InvalidSignature, usize.ZERO, Option<usize>.none(),
   ) { return 293 }
   let expected: [usize; 1] = [6]
   let accepted = run CertificatePath.validate(&leaf, &candidates, &anchors, &at, ValidationLimits.defaults())
@@ -417,7 +417,7 @@ ${decoded('ignored', ignoredAnchor, 295)}
   let missingOnly = Slice.view<TrustAnchor>(&anchors, usize.ZERO, usize.ONE)
   let rejected = run CertificatePath.validate(&leaf, &intermediates, missingOnly, &at, ValidationLimits.defaults())
   if !exactAnchorRejection(
-    move rejected, ValidationReason.InvalidKey, usize.ZERO, Option.none<usize>(),
+    move rejected, ValidationReason.InvalidKey, usize.ZERO, Option<usize>.none(),
   ) { return 296 }
   let expected: [usize; 0] = []
   let accepted = run CertificatePath.validate(&leaf, &intermediates, &anchors, &at, ValidationLimits.defaults())
@@ -447,7 +447,7 @@ ${decoded('emptyCritical', emptySubjectEmptyCriticalSan, 304)}
   if !exactLeafFailure(
     move outcome,
     ValidationReason.UnsupportedExtension,
-    Option.some<usize>(5),
+    Option<usize>.some(5),
     criticalOffset,
   ) { return 301 }
   let missingOutcome = run CertificatePath.validate(
@@ -456,7 +456,7 @@ ${decoded('emptyCritical', emptySubjectEmptyCriticalSan, 304)}
   if !exactLeafFailure(
     move missingOutcome,
     ValidationReason.InvalidName,
-    Option.none<usize>(),
+    Option<usize>.none(),
     Certificate.offsets(&emptyMissing).subject,
   ) { return 306 }
   let noncriticalOffset = match move extensionOffset(&emptyNoncritical, 3, false) {
@@ -469,7 +469,7 @@ ${decoded('emptyCritical', emptySubjectEmptyCriticalSan, 304)}
   if !exactLeafFailure(
     move noncriticalOutcome,
     ValidationReason.InvalidName,
-    Option.some<usize>(3),
+    Option<usize>.some(3),
     noncriticalOffset,
   ) { return 308 }
   let emptySanOffset = match move extensionOffset(&emptyCritical, 3, true) {
@@ -482,7 +482,7 @@ ${decoded('emptyCritical', emptySubjectEmptyCriticalSan, 304)}
   if !exactLeafFailure(
     move emptyCriticalOutcome,
     ValidationReason.InvalidName,
-    Option.some<usize>(3),
+    Option<usize>.some(3),
     emptySanOffset,
   ) { return 310 }
   return 0
@@ -542,10 +542,10 @@ fn noLimit(limit: Option<ValidationLimit>) -> bool {
 
 fn extensionOffset<'a>(certificate: &'a Certificate, index: usize, value: bool) -> Option<usize> {
   return match move Certificate.extension(certificate, index) {
-    Option<ExtensionView<'a>>.None => Option.none<usize>()
+    Option<ExtensionView<'a>>.None => Option<usize>.none()
     Option<ExtensionView<'a>>.Some {value: extension} => {
-      if value { return Option.some<usize>(extension.valueOffset) }
-      return Option.some<usize>(extension.offset)
+      if value { return Option<usize>.some(extension.valueOffset) }
+      return Option<usize>.some(extension.offset)
     }
   }
 }

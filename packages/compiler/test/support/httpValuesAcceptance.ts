@@ -1195,7 +1195,7 @@ fn rejectsReason<'headers, 'reason>(
   return reasonByteFailure(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(move reason),
+    Option<&[u8]>.some(move reason),
     headers.*,
     configured,
   ), usize.ZERO)
@@ -1300,28 +1300,28 @@ fn inspectHostAndHeads<'headers, 'reason>(
   if !responseSucceeded(ResponseHead.make(
     Version.Http11,
     status,
-    Option.none<&[u8]>(),
+    Option<&[u8]>.none(),
     headers,
     configured,
   )) { return false }
   if !responseSucceeded(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(move validReason),
+    Option<&[u8]>.some(move validReason),
     headers,
     configured,
   )) { return false }
   if !responseSucceeded(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(move emptyReason),
+    Option<&[u8]>.some(move emptyReason),
     headers,
     configured,
   )) { return false }
   if !reasonByteFailure(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(move badReason),
+    Option<&[u8]>.some(move badReason),
     headers,
     configured,
   ), 3) { return false }
@@ -1330,14 +1330,14 @@ fn inspectHostAndHeads<'headers, 'reason>(
   if !responseSucceeded(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(b"abc"),
+    Option<&[u8]>.some(b"abc"),
     headers,
     short,
   )) { return false }
   if !reasonLimitFailure(ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(move longReason),
+    Option<&[u8]>.some(move longReason),
     headers,
     short,
   ), 3, 4) { return false }
@@ -1496,7 +1496,7 @@ effect fn copiedHeaders<'value>(
   let configured = limits(4096)
   let made = Header.make(move name, move bytes, configured)
   return match move made {
-    Result<Header<'value>, ValueError>.Failure {error} => Result.failResult<OwnedHeaders, ValueError>(move error)
+    Result<Header<'value>, ValueError>.Failure {error} => Result<OwnedHeaders, ValueError>.failResult(move error)
     Result<Header<'value>, ValueError>.Success {value: header} => {
       let entries = [header]
       return run copyMade(Headers.make(&entries, configured), configured)
@@ -1762,10 +1762,10 @@ effect fn copyMade<'value>(
   configured: Limits,
 ) -> Result<OwnedHeaders, ValueError> ! OutOfMemoryError ? &mut Allocator {
   return match move made {
-    Result<Headers<'value>, ValueError>.Failure {error} => Result.failResult<
+    Result<Headers<'value>, ValueError>.Failure {error} => Result<
       OwnedHeaders,
       ValueError,
-    >(move error)
+    >.failResult(move error)
     Result<Headers<'value>, ValueError>.Success {value} => run Headers.copy(&value, configured)
   }
 }
@@ -1778,13 +1778,13 @@ effect fn copyRequestMade<'value>(
 ) -> Result<OwnedRequestHead, ValueError> ! OutOfMemoryError ? &mut Allocator {
   let headers = match move made {
     Result<Headers<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<Headers<'value>, ValueError>.Success {value} => value
   }
   let method = match move Method.parse(move methodText, configured.maxMethodBytes) {
     Result<Method<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<Method<'value>, ValueError>.Success {value} => value
   }
@@ -1794,13 +1794,13 @@ effect fn copyRequestMade<'value>(
     configured.maxTargetBytes,
   ) {
     Result<RequestTarget<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<RequestTarget<'value>, ValueError>.Success {value} => value
   }
   let head = match move RequestHead.make(Version.Http11, method, target, headers) {
     Result<RequestHead<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<RequestHead<'value>, ValueError>.Success {value} => value
   }
@@ -1815,7 +1815,7 @@ effect fn copiedRequestHead<'value>(
   let configured = limits(4096)
   let header = match move Header.make("Host", move hostBytes, configured) {
     Result<Header<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<Header<'value>, ValueError>.Success {value} => value
   }
@@ -1846,25 +1846,25 @@ effect fn copyResponseMade<'value>(
 ) -> Result<OwnedResponseHead, ValueError> ! OutOfMemoryError ? &mut Allocator {
   let headers = match move made {
     Result<Headers<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Headers<'value>, ValueError>.Success {value} => value
   }
   let status = match move Status.fromCode(299) {
     Result<Status, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Status, ValueError>.Success {value} => value
   }
   let head = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'value [u8]>(move reason),
+    Option<&'value [u8]>.some(move reason),
     headers,
     configured,
   ) {
     Result<ResponseHead<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<ResponseHead<'value>, ValueError>.Success {value} => move value
   }
@@ -1878,7 +1878,7 @@ effect fn copiedResponseHead<'value>(
   let configured = limits(4096)
   let header = match move Header.make("X-Owned", move fieldValue, configured) {
     Result<Header<'value>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Header<'value>, ValueError>.Success {value} => value
   }
@@ -1906,7 +1906,7 @@ effect fn requestCopyWithLimits(
   let configured = limits(4096)
   let host = match move Header.make("Host", b"host.example", configured) {
     Result<Header<'static>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<Header<'static>, ValueError>.Success {value} => value
   }
@@ -1920,7 +1920,7 @@ effect fn requestCopyFromHeaders<'headers>(
 ) -> Result<OwnedRequestHead, ValueError> ! OutOfMemoryError ? &mut Allocator {
   let headers = match move made {
     Result<Headers<'headers>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<Headers<'headers>, ValueError>.Success {value} => value
   }
@@ -1928,13 +1928,13 @@ effect fn requestCopyFromHeaders<'headers>(
   let method = Method.patch()
   let target = match move RequestTarget.parse(&method, "/owned", configured.maxTargetBytes) {
     Result<RequestTarget<'static>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<RequestTarget<'static>, ValueError>.Success {value} => value
   }
   let head = match move RequestHead.make(Version.Http11, method, target, headers) {
     Result<RequestHead<'headers>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedRequestHead, ValueError>(move error)
+      return Result<OwnedRequestHead, ValueError>.failResult(move error)
     }
     Result<RequestHead<'headers>, ValueError>.Success {value} => value
   }
@@ -1947,7 +1947,7 @@ effect fn responseCopyWithLimits(
   let configured = limits(4096)
   let header = match move Header.make("X-Owned", b"field", configured) {
     Result<Header<'static>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Header<'static>, ValueError>.Success {value} => value
   }
@@ -1961,26 +1961,26 @@ effect fn responseCopyFromHeaders<'headers>(
 ) -> Result<OwnedResponseHead, ValueError> ! OutOfMemoryError ? &mut Allocator {
   let headers = match move made {
     Result<Headers<'headers>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Headers<'headers>, ValueError>.Success {value} => value
   }
   let configured = limits(4096)
   let status = match move Status.fromCode(299) {
     Result<Status, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<Status, ValueError>.Success {value} => value
   }
   let head = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&[u8]>(b"why"),
+    Option<&[u8]>.some(b"why"),
     headers,
     configured,
   ) {
     Result<ResponseHead<'headers>, ValueError>.Failure {error} => {
-      return Result.failResult<OwnedResponseHead, ValueError>(move error)
+      return Result<OwnedResponseHead, ValueError>.failResult(move error)
     }
     Result<ResponseHead<'headers>, ValueError>.Success {value} => move value
   }
