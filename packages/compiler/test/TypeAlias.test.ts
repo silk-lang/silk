@@ -207,19 +207,28 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
-it.effect('rejects an omitted lifetime in an alias target at the alias', () =>
+it.effect('elides a lifetime an alias target omits at each use, as a struct header does', () =>
   Effect.gen(function* () {
-    const source = `type Plain = &i32
+    const source = `type Borrow = &i32
+type Bytes = &[u8]
+type Use = fn(i32) -> i32
 type Generic<T> = &T
-fn plain(value: Plain) -> i32 { return 0 }
-fn generic(value: Generic<i32>) -> i32 { return 0 }
+fn same(value: Borrow) -> Borrow { return value }
+fn first(bytes: Bytes) -> u8 { return bytes[0] }
+fn call(callback: Use) -> i32 { return callback(1) }
+fn generic(value: Generic<i32>) -> i32 { return value.* }
+fn two(left: Borrow, right: Borrow) -> Borrow { return left }
+fn twoWritten(left: &i32, right: &i32) -> &i32 { return left }
 pub fn main() -> i32 { return 0 }`
     const self = yield* analyze(source)
+    // Each use elides as the written-out target would. An ambiguous output is reported like one
+    // on a struct header: the elision failure, then the use's missing lifetime argument.
     assert.deepEqual(
       Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
       [
-        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32')],
-        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&T')],
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32 { return left }')],
       ],
       Json.stringify(messages(self)),
     )

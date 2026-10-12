@@ -3349,19 +3349,23 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
     )
     diagnostics.push(...typeParameters.diagnostics)
     if (header._tag === 'AliasHeader') {
-      // A generic alias's target is analyzed over the alias's own written parameters (TYPE-004);
-      // each use substitutes its written arguments for them. An alias has no inputs to elide a
-      // lifetime from, so an omitted one in its target is rejected rather than made implicit.
-      const target = analyzeDeclaredType(context, header.target, typeParameters.environment)
+      // An alias's target is analyzed over the alias's own parameters (TYPE-004); each use
+      // substitutes its written arguments for them. A lifetime the target omits becomes an
+      // implicit alias lifetime parameter that each use elides, as a struct header's does.
+      const target = analyzeDeclaredType(
+        context,
+        header.target,
+        typeParameters.environment,
+        false,
+        typeParameters.lifetimeContext,
+      )
       diagnostics.push(...target.diagnostics)
       return {
         _tag: 'AliasDeclaration',
         id,
         canonical,
         visibility,
-        typeParameters: typeParameters.facts.filter(
-          (parameter) => parameter.implicitLifetime !== true,
-        ),
+        typeParameters: typeParameters.facts,
         name,
         target: target.fact,
         anchor: header.anchor,
@@ -4791,6 +4795,8 @@ export const finalizeLifetimeHeader = (
   implHead?: InherentImplFact | ConformanceFact,
   // An anonymous callable is its own owner and is not listed among the module's declarations.
   authored?: AuthoredHir.Declaration,
+  // Whether a path names an alias of one borrow, which header elision counts as a borrowed input.
+  borrowedAlias?: (path: TypePathFact) => boolean,
 ):
   | DeclarationFact
   | ServiceOperationFact
@@ -4829,6 +4835,12 @@ export const finalizeLifetimeHeader = (
             : undefined) ?? Type.intrinsicNominalParameters(fact.type)
         )
       return fact._tag === 'Unresolved' ? nominalParameters(fact.path) : undefined
+    },
+    (type) => {
+      if (borrowedAlias === undefined) return false
+      const analyzed = analyzeDeclaredType(context, type, environment, true, prior)
+      const fact = analyzed.fact._tag === 'Applied' ? analyzed.fact.target : analyzed.fact
+      return fact._tag === 'Unresolved' && borrowedAlias(fact.path)
     },
   )
   const parameters = new Map(environment)
