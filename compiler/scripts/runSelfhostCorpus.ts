@@ -1,6 +1,6 @@
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { availableParallelism, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
@@ -58,11 +58,65 @@ const buildErrorPrefix = 'SILK_BUILD_ERROR='
 const buildTimeoutMs = 120_000
 const runTimeoutMs = 30_000
 
-const text = (value: string | null): string => value ?? ''
+const outputLimit = 4 * 1024 * 1024
 
-const processFailure = (process: SpawnSyncReturns<string>): string => {
+/** A finished child process, with `error` set when it could not start, timed out, or overflowed. */
+interface ProcessResult {
+  readonly stdout: string
+  readonly stderr: string
+  readonly status: number | null
+  readonly signal: NodeJS.Signals | null
+  readonly error?: Error
+}
+
+/**
+ * Runs a child to completion with `spawnSync`'s contract: an empty closed standard input, both
+ * outputs captured as UTF-8, and SIGTERM with an `ETIMEDOUT` or `ENOBUFS` error past the deadline
+ * or the output limit. Unlike `spawnSync`, other cases keep running meanwhile.
+ */
+const runProcess = (
+  command: string,
+  args: ReadonlyArray<string>,
+  timeout: number,
+  cwd?: string,
+): Promise<ProcessResult> =>
+  new Promise((resolveResult) => {
+    const child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+    const output = { stdout: '', stderr: '' }
+    let bytes = 0
+    let failure: Error | undefined
+    const stop = (code: string): void => {
+      failure ??= Object.assign(new Error(`spawn ${command} ${code}`), { code })
+      child.kill('SIGTERM')
+    }
+    const timer = setTimeout(() => stop('ETIMEDOUT'), timeout)
+    for (const stream of ['stdout', 'stderr'] as const) {
+      child[stream].setEncoding('utf8')
+      child[stream].on('data', (chunk: string) => {
+        output[stream] += chunk
+        bytes += Buffer.byteLength(chunk)
+        if (bytes > outputLimit) stop('ENOBUFS')
+      })
+    }
+    child.stdin.on('error', () => undefined)
+    child.stdin.end()
+    child.on('error', (error) => {
+      failure ??= error
+    })
+    child.on('close', (status, signal) => {
+      clearTimeout(timer)
+      resolveResult({
+        ...output,
+        status,
+        signal,
+        ...(failure === undefined ? {} : { error: failure }),
+      })
+    })
+  })
+
+const processFailure = (process: ProcessResult): string => {
   const error = process.error?.message
-  const detail = text(process.stderr).trim()
+  const detail = process.stderr.trim()
   return [error, detail, `exit=${process.status ?? 'none'} signal=${process.signal ?? 'none'}`]
     .filter((part) => part !== undefined && part !== '')
     .join('; ')
@@ -200,23 +254,25 @@ export const defaultCCompiler = '/usr/bin/clang'
  * Compiles each corpus C unit to an object beside the package with the C driver the compiler links
  * with, as the bootstrap's `compileCObject` does, and returns the manifest's link input entries.
  */
-const nativeLinkInputs = (
+const nativeLinkInputs = async (
   directory: string,
   program: CorpusProgram,
   cCompiler: string,
-): ReadonlyArray<string> => {
-  const objects = Object.entries(program.nativeCSources ?? {}).map(([unit, contents]) => {
+): Promise<ReadonlyArray<string>> => {
+  const objects: string[] = []
+  for (const [unit, contents] of Object.entries(program.nativeCSources ?? {})) {
     if (!safeName.test(unit)) throw new Error(`unsafe corpus C unit name: ${unit}`)
     writeFileSync(join(directory, `${unit}.c`), contents)
-    const compiled = spawnSync(
+    const compiled = await runProcess(
       cCompiler,
       ['-c', '-x', 'c', `${unit}.c`, '-O2', '-fPIC', '-fvisibility=hidden', '-o', `${unit}.o`],
-      { cwd: directory, encoding: 'utf8', timeout: buildTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      buildTimeoutMs,
+      directory,
     )
     if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
       throw new Error(`C unit ${unit}: ${processFailure(compiled)}`)
-    return `{ object = ${JSON.stringify(`${unit}.o`)} }`
-  })
+    objects.push(`{ object = ${JSON.stringify(`${unit}.o`)} }`)
+  }
   const libraries = (program.nativeDynamicLibraries ?? []).map((library) => {
     if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
     return `{ library = ${JSON.stringify(library)}, mode = "dynamic" }`
@@ -278,16 +334,16 @@ const componentComposition = (program: CorpusProgram, stdlib: string): string | 
 // package directory as the module directory, where the program's imports resolve.
 const programModule = 'memory/driver.silk'
 
-const writeProgram = (
+const writeProgram = async (
   directory: string,
   program: CorpusProgram,
   cCompiler: string,
   stdlib: string,
-): void => {
+): Promise<void> => {
   const source = join(directory, programModule)
   mkdirSync(dirname(source), { recursive: true })
   writeFileSync(source, program.nativeSource ?? program.source)
-  const linkInputs = nativeLinkInputs(directory, program, cCompiler)
+  const linkInputs = await nativeLinkInputs(directory, program, cCompiler)
   const composition = componentComposition(program, stdlib)
   const build = [
     ...(linkInputs.length === 0 ? [] : [`native-link-inputs = [${linkInputs.join(', ')}]`]),
@@ -308,9 +364,9 @@ const writeProgram = (
   }
 }
 
-const runExecutable = (executable: string, invocation: NativeRun): SpawnSyncReturns<string> =>
+const runExecutable = (executable: string, invocation: NativeRun): Promise<ProcessResult> =>
   invocation.closeStderr
-    ? spawnSync(
+    ? runProcess(
         'sh',
         [
           '-c',
@@ -319,28 +375,24 @@ const runExecutable = (executable: string, invocation: NativeRun): SpawnSyncRetu
           executable,
           ...(invocation.arguments ?? []),
         ],
-        { encoding: 'utf8', timeout: runTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
+        runTimeoutMs,
       )
-    : spawnSync(executable, invocation.arguments ?? [], {
-        encoding: 'utf8',
-        timeout: runTimeoutMs,
-        maxBuffer: 4 * 1024 * 1024,
-      })
+    : runProcess(executable, invocation.arguments ?? [], runTimeoutMs)
 
 const compareRun = (
   program: CorpusProgram,
   invocation: NativeRun,
-  run: SpawnSyncReturns<string>,
+  run: ProcessResult,
 ): string | undefined => {
   if (run.error !== undefined) return run.error.message
-  if (program.nativeStdout !== undefined && text(run.stdout) !== program.nativeStdout)
-    return `stdout: expected ${JSON.stringify(program.nativeStdout)}, got ${JSON.stringify(text(run.stdout))}`
+  if (program.nativeStdout !== undefined && run.stdout !== program.nativeStdout)
+    return `stdout: expected ${JSON.stringify(program.nativeStdout)}, got ${JSON.stringify(run.stdout)}`
   if (
     !invocation.closeStderr &&
     program.nativeStderr !== undefined &&
-    text(run.stderr) !== program.nativeStderr
+    run.stderr !== program.nativeStderr
   )
-    return `stderr: expected ${JSON.stringify(program.nativeStderr)}, got ${JSON.stringify(text(run.stderr))}`
+    return `stderr: expected ${JSON.stringify(program.nativeStderr)}, got ${JSON.stringify(run.stderr)}`
   if (program.expected._tag === 'Trap') {
     if (run.signal !== null || (run.status !== null && run.status !== 0)) return undefined
     return 'expected a trap or nonzero exit, got exit 0'
@@ -351,15 +403,15 @@ const compareRun = (
   return undefined
 }
 
-export const runCase = (
+export const runCase = async (
   silkc: string,
   program: CorpusProgram,
   stdlib = fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
   cCompiler = defaultCCompiler,
-): CaseResult => {
+): Promise<CaseResult> => {
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
   try {
-    writeProgram(directory, program, cCompiler, stdlib)
+    await writeProgram(directory, program, cCompiler, stdlib)
     const executable = join(directory, 'program')
     const profiles = program.nativeProfiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
@@ -367,7 +419,7 @@ export const runCase = (
     // Every profile checks the same bodies, so the first build's gap stands for the program.
     let borrowGap: BorrowGap | undefined
     for (const profile of profiles) {
-      const built = spawnSync(
+      const built = await runProcess(
         silkc,
         [
           'build',
@@ -381,15 +433,11 @@ export const runCase = (
           '--debug',
           String(profile.debug),
         ],
-        {
-          cwd: directory,
-          encoding: 'utf8',
-          timeout: buildTimeoutMs,
-          maxBuffer: 4 * 1024 * 1024,
-        },
+        buildTimeoutMs,
+        directory,
       )
       if (built.error !== undefined || built.status !== 0 || built.signal !== null) {
-        const stderr = text(built.stderr)
+        const stderr = built.stderr
         // A semantic rejection is a failure even when the build also reached gaps beside it.
         const rejected = stderr.split('\n').some((line) => line.startsWith(buildErrorPrefix))
         const gaps = built.error === undefined && !rejected ? parseUnsupported(stderr) : undefined
@@ -404,10 +452,14 @@ export const runCase = (
           reason: `profile ${profile.name}: build: ${processFailure(built)}`,
         }
       }
-      borrowGap ??= parseBorrowGap(text(built.stderr))
+      borrowGap ??= parseBorrowGap(built.stderr)
 
       for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
-        const mismatch = compareRun(program, invocation, runExecutable(executable, invocation))
+        const mismatch = compareRun(
+          program,
+          invocation,
+          await runExecutable(executable, invocation),
+        )
         if (mismatch !== undefined)
           return {
             name: program.name,
@@ -469,15 +521,20 @@ export const summarize = (
   }
 }
 
-/** Runs already-materialized scenarios against the requested compiler and its live standard library. */
-export const runCorpus = (
+/**
+ * Runs already-materialized scenarios against the requested compiler and its live standard library,
+ * up to `concurrency` cases at once. Every case owns its directory and processes, so the log is the
+ * sequential one: timings, results, and the summary all follow corpus order.
+ */
+export const runCorpus = async (
   silkc: string,
   corpus: ReadonlyArray<CorpusProgram>,
   required: ReadonlyArray<string>,
   selected?: ReadonlyArray<string>,
   stdlib?: string,
   cCompiler?: string,
-): number => {
+  concurrency = availableParallelism(),
+): Promise<number> => {
   const selectedSet = selected === undefined ? undefined : new Set(selected)
   const programs =
     selectedSet === undefined ? corpus : corpus.filter((program) => selectedSet.has(program.name))
@@ -485,14 +542,24 @@ export const runCorpus = (
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
   const track = required.filter((name) => selectedSet === undefined || selectedSet.has(name))
   const executable = silkc.includes('/') ? resolve(silkc) : silkc
-  const results = programs.map((program) => {
-    const started = performance.now()
-    const result = runCase(executable, program, stdlib, cCompiler)
-    process.stdout.write(
-      `SELFHOST_CASE_TIMING=${JSON.stringify({ name: program.name, elapsedMs: Math.round(performance.now() - started) })}\n`,
-    )
-    return result
-  })
+  const finished: Array<{ readonly result: CaseResult; readonly elapsedMs: number }> = []
+  let reported = 0
+  // The workers share one iterator, so each takes the next unstarted case. A timing prints once
+  // every earlier case has finished.
+  const queue = programs.entries()
+  const worker = async (): Promise<void> => {
+    for (const [index, program] of queue) {
+      const started = performance.now()
+      const result = await runCase(executable, program, stdlib, cCompiler)
+      finished[index] = { result, elapsedMs: Math.round(performance.now() - started) }
+      for (let ready = finished[reported]; ready !== undefined; ready = finished[++reported])
+        process.stdout.write(
+          `SELFHOST_CASE_TIMING=${JSON.stringify({ name: ready.result.name, elapsedMs: ready.elapsedMs })}\n`,
+        )
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker))
+  const results = finished.map(({ result }) => result)
   for (const result of results) {
     let detail = ''
     if (result.status === 'fail')
