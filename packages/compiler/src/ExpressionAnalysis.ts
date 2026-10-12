@@ -1261,13 +1261,25 @@ export const borrowSubject = (
     if (Type.isSlice(sourceType))
       BodyLifetime.constrain(resolution.bodyLifetimes, sourceType.lifetime, lifetime)
   }
+  // Without a reference context, `&mut x` still reborrows when `x` is an immutable binding holding
+  // an exclusive loan: borrowing the binding itself would need it to be `mut`, so the referent is
+  // the only valid place (BORROW-005), as when an interface operation's `Self` is still open.
+  const contextFreeReborrow =
+    parentReference !== undefined &&
+    access === 'Exclusive' &&
+    parentReference.access === 'Exclusive' &&
+    (expected === undefined || (!Type.isReference(expected) && !Type.isSlice(expected))) &&
+    !exclusiveBorrowRoot(root)
   if (
     parentReference !== undefined &&
-    (projectedReference !== undefined || (expected !== undefined && Type.isReference(expected)))
+    (projectedReference !== undefined ||
+      (expected !== undefined && Type.isReference(expected)) ||
+      contextFreeReborrow)
   ) {
     const target = parentReference.target
     if (
       (expected !== undefined &&
+        !contextFreeReborrow &&
         (!Type.isReference(expected) ||
           !TypeInference.infer(expected.target, target, new Map()) ||
           expected.access !== access)) ||
