@@ -318,17 +318,50 @@ export const parseTypeAliasDeclaration = (initial: State): NodeResult => {
     ...typeStarts,
     ...topLevelFollowing,
   ])
-  const target = parseType(equals.state, topLevelFollowing)
+  const target = parseType(equals.state, ['Plus', ...topLevelFollowing])
+  const boundList = parseAliasBoundListTail(target.state)
+  const state = boundList?.state ?? target.state
   return {
-    state: target.state,
-    node: syntaxNode(target.state, 'TypeAliasDeclaration', [
+    state,
+    node: syntaxNode(state, 'TypeAliasDeclaration', [
       ...pubKeyword.elements,
       ...keyword.elements,
       ...name.elements,
       ...(typeParameters === undefined ? [] : [typeParameters.node]),
       ...equals.elements,
       target.node,
+      ...(boundList?.elements ?? []),
     ]),
+  }
+}
+
+/**
+ * An alias names one type or interface application, so `type Both = A + B` is a bound list outside
+ * a generic parameter list. The `+ B` tail is retained as one error node with one diagnostic.
+ */
+const parseAliasBoundListTail = (initial: State): ElementsResult | undefined => {
+  if (nextSignificantKind(initial) !== 'Plus') return undefined
+  const leading = consumeTrivia(initial)
+  let state = leading.state
+  const children: Array<SyntaxTree.Element> = []
+  while (nextSignificantKind(state) === 'Plus') {
+    const plus = expect(state, 'Plus', typeStarts)
+    const bound = parseType(plus.state, ['Plus', ...topLevelFollowing])
+    children.push(...plus.elements, bound.node)
+    state = bound.state
+  }
+  const node = syntaxNode(state, 'Error', children)
+  return {
+    state: addDiagnostic(
+      state,
+      Diagnostic.unexpectedTokens(
+        ['Plus'],
+        'syntax',
+        ['one type or interface application'],
+        node.span,
+      ),
+    ),
+    elements: [...leading.elements, node],
   }
 }
 

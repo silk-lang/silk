@@ -1217,6 +1217,8 @@ type ExpressionNode =
       readonly _tag: 'CallableSection'
       /** Original explicit marked inputs; independently formed lexical captures are excluded. */
       readonly invocationParameters?: ReadonlyArray<number>
+      /** An anonymous callable's environment: its captures are lexical, not staged arguments. */
+      readonly lexical?: true
       readonly site: CallableSiteId
       readonly target: CallableTarget
       readonly remainingParameters: ReadonlyArray<number>
