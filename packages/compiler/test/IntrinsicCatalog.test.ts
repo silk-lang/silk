@@ -23,6 +23,7 @@ import * as ProjectAnalysis from '../src/ProjectAnalysis.js'
 import * as Scalar from '../src/Scalar.js'
 import * as Type from '../src/Type.js'
 import * as SourceResolver from '../src/SourceResolver.js'
+import * as Stdlib from '../src/Stdlib.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Mir from '../src/Mir.js'
 import * as MirLinearization from '../src/MirLinearization.js'
@@ -368,6 +369,17 @@ pub effect fn main() -> () ! WriterError {
   return ()
 }`,
 ])
+
+it('keeps sealed operator members disjoint from intrinsic operations and types', () => {
+  const taken = new Set([
+    ...Intrinsic.inventory().map((entry) => entry.operation.replace(/^Intrinsic\./, '')),
+    ...[...Type.intrinsicNominals.keys()].map((spelling) => spelling.replace(/^Intrinsic\./, '')),
+  ])
+  assert.deepEqual(
+    [...Stdlib.sealedModule.members].filter((member) => taken.has(member)),
+    [],
+  )
+})
 
 it('models enumValue as a sealed declaration-dependent rule with no generic type hole', () => {
   const operation = Intrinsic.findOperation('Intrinsic', 'enumValue')

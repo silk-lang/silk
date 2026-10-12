@@ -12,6 +12,7 @@ import type * as ModuleClosure from './ModuleClosure.js'
 import * as ResolutionSeams from './ResolutionSeams.js'
 import * as ResolutionWork from './ResolutionWork.js'
 import * as SemanticContext from './SemanticContext.js'
+import * as Stdlib from './Stdlib.js'
 import * as Type from './Type.js'
 
 export type IntrinsicActor = Intrinsic.Actor['spelling']
@@ -490,6 +491,12 @@ export const lookupQualified = (
 ): Lookup => {
   const span = Location.at(anchor)
   const qualifier = lookup(scope, index, namespace, initiator)
+  // A public declaration of the sealed operator source is an `Intrinsic` member (INTR-008).
+  if (qualifier._tag === 'Intrinsic' && qualifier.actor === 'Intrinsic') {
+    const sealed = canonicalDeclaration(index, Stdlib.sealedModule.module, member)
+    if (sealed !== undefined && sealed.visibility === 'Public')
+      return { _tag: 'Resolved', spelling: member, declaration: sealed }
+  }
   if (
     qualifier._tag === 'Intrinsic' ||
     qualifier._tag === 'Conflict' ||
