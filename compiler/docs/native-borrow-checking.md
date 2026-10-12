@@ -297,10 +297,14 @@ cover first:
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
-  exclusive views included, are proved; region and contents obligations wait for later slices.
+  exclusive views included, are proved, but the body is not region-closed (below), or retains a
+  region relation or capture contents; later slices prove those.
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
-  place that is not rooted in a local.
+  place that is not rooted in a local. One such form must reject rather than stay unchecked: a
+  view of a temporary receiver used past its statement, such as `let left = make().left()`, is
+  OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
+  and counts the body here; the slice that lifts these exits rejects it.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -379,6 +383,34 @@ callee's own loans, until the Effect's last run or drop (EFFECT-OWN-001). A run 
 invokes it with the access its contract grants: a shared Effect is read, a `mut Effect` place is
 borrowed exclusively, and a `once Effect` is moved, so the loans its environment holds stay live
 through the run (EFFECT-OWN-002, CALLABLE-003).
+
+A body the walk clears is `Checked` when it is region-closed and typing left nothing pending. It is
+region-closed when every region its locals and values name is `'static` or a loan region of the
+body itself. A call result keeps an operand's region only by naming it, and conformance holds an
+interface witness to exactly the regions its operation names, so a result typed by an open
+parameter keeps no loan of the body. Such a body's
+loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
+root's scope:
+
+- A loan lives past the expression that creates it only through a `let` holder. Every binding has
+  an initializer, so the holder is bound after its root, in the same scope or a nested one, and is
+  released no later than its root; releases run in reverse declaration order, so a holder whose
+  cleanup observes the loan is released first (LIFE-005).
+- Every value that would carry a loan across a scope boundary leaves the walk with `stored-loans`:
+  a block, branch or arm result, a subject that carries a loan, a return, an assignment and a
+  `let mut` holder.
+- A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
+  literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
+
+Pending means a region relation or capture contents typing retained. `Checked` is a claim about
+one body: its own loans and regions are sound. A rule that blames a body for its callers' context
+is not part of that claim. OWN0016 (SHARED-003) blames a suspending callee reached under a
+local-shared access, such as a value-free `fn parks()` that runs `Execution.park`. Such a callee
+can be `Checked` while every boundary caller, which takes the access's `&mut T` parameter region,
+stays `regions` until local sharing lands (§10), so no violating program is ever fully checked.
+Scope ends as events,
+OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
+the first point at which a loan can outlive its root.
 
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
@@ -479,14 +511,14 @@ rejects is never accepted.
    - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
-   - Scope-end storage ends as events: at a match arm's end, at a block's end and at body exit.
-     Until then a loan can outlive its root's scope unseen. For example, a consuming match arm can
-     yield `&value` of its arm-local binding. Every such body answers `regions` or `stored-loans`,
-     never `Checked`; this slice rejects that program with OWN0019.
-   - The failure edge from each `run` to body exit, beside the one `fail` already takes. Exit
-     carries no events before this slice, so the edge cannot change a verdict yet. Add it here with
-     a program whose failure path reaches a scope-end drop of a root whose loan is held across the
-     run.
+   - Region-closed bodies are `Checked` (§6). Then universal regions (lifetime parameters,
+     invocation lifetimes, outlives assumptions), then region relations and returned regions.
+   - With the slice that lifts the `stored-loans` exits for joins and assignments: scope-end storage
+     ends as events at a match arm's end, a block's end and body exit, OWN0019 at the first required
+     point outside the root's scope (a consuming arm yielding `&value` of its arm-local binding is
+     rejected at the `match`), and the failure edge from each `run` to body exit, beside the one
+     `fail` already takes, with a program whose failure path alone releases a root while a holder
+     whose cleanup observes its loan is still live.
 4. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
    through the per-declaration summaries of v2 P5(a); this slice adds the summary for whatever it
    needs if v2 has not landed it yet.
