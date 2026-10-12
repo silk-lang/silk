@@ -1373,6 +1373,10 @@ export function parsePattern(
     : parseNominalPattern(initial)
 }
 
+/** A field's nested pattern is a qualified nominal-union variant or a nominal pattern (PATT-021). */
+const parseNestedFieldPattern = (initial: State): NodeResult =>
+  hasAppliedMember(initial) ? parseUnionVariantPattern(initial) : parseNominalPattern(initial)
+
 export function parseUnionVariantPattern(initial: State): NodeResult {
   const selector = parseAppliedMemberSelector(initial, [
     'LeftBrace',
@@ -1425,9 +1429,7 @@ export function parseUnionVariantPattern(initial: State): NodeResult {
         ])
         state = colon.state
         if (isNominalPatternStart(state)) {
-          const nested = hasAppliedMember(state)
-            ? parseUnionVariantPattern(state)
-            : parseNominalPattern(state)
+          const nested = parseNestedFieldPattern(state)
           fieldChildren = [...fieldChildren, ...colon.elements, nested.node]
           state = nested.state
         } else {
@@ -1511,7 +1513,7 @@ export function parseNominalPattern(initial: State): NodeResult {
         ])
         state = colon.state
         if (isNominalPatternStart(state)) {
-          const nested = parseNominalPattern(state)
+          const nested = parseNestedFieldPattern(state)
           fieldChildren = [...fieldChildren, ...colon.elements, nested.node]
           state = nested.state
         } else {
