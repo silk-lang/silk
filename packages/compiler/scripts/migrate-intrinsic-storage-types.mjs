@@ -62,14 +62,7 @@ const rewriteFile = (text, kind) => {
     .join('\n')
 }
 
-const kindOf = (path) =>
-  path.endsWith('.silk')
-    ? 'silk'
-    : path.endsWith('.ts')
-      ? 'ts'
-      : path.endsWith('.md')
-        ? 'md'
-        : undefined
+const kindOf = (path) => ['silk', 'ts', 'md'].find((kind) => path.endsWith(`.${kind}`))
 
 const files = (path) => {
   if (statSync(path).isDirectory())
@@ -88,8 +81,10 @@ for (const path of paths.flatMap(files)) {
   if (after === before) continue
   const changed = before.split('\n').filter((line, at) => line !== after.split('\n')[at]).length
   sites += changed
-  console.log(`${relative(process.cwd(), path)}: ${changed} line${changed === 1 ? '' : 's'}`)
+  process.stdout.write(
+    `${relative(process.cwd(), path)}: ${changed} line${changed === 1 ? '' : 's'}\n`,
+  )
   if (flags.has('--write')) writeFileSync(path, after)
 }
-console.log(sites === 0 ? 'no sites' : `${sites} line${sites === 1 ? '' : 's'}`)
+process.stdout.write(sites === 0 ? 'no sites\n' : `${sites} line${sites === 1 ? '' : 's'}\n`)
 if (flags.has('--check') && sites !== 0) process.exitCode = 1
