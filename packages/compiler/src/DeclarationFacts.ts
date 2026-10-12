@@ -310,6 +310,17 @@ export type ArrayLengthFact =
   | { readonly _tag: 'Unavailable'; readonly anchor: AuthoredHir.Anchor }
 
 /** The resolved, unresolved, or unavailable declared type. */
+/**
+ * The parameters of a generic alias (TYPE-004) and the memo of its expansions, keyed by the
+ * canonical keys of the written arguments, so each distinct instantiation is substituted and
+ * normalized once.
+ */
+export interface GenericAliasParameters {
+  readonly alias: string
+  readonly parameters: ReadonlyArray<Type.Parameter>
+  readonly expansions: Map<string, Type.Type>
+}
+
 export type DeclaredTypeFact =
   | {
       readonly _tag: 'Lifetime'
@@ -322,6 +333,8 @@ export type DeclaredTypeFact =
       readonly type: SemanticType
       readonly spelling: string
       readonly anchor: AuthoredHir.Anchor
+      /** A generic alias's target over the alias's own parameters, applied at each use. */
+      readonly aliasParameters?: GenericAliasParameters
       readonly path?: TypePathFact
       readonly components?: ReadonlyArray<DeclaredTypeFact>
       readonly exposureCause?: Diagnostic.Identity<Location.Location>
@@ -661,8 +674,6 @@ export interface AliasFact {
   readonly typeParameters: ReadonlyArray<TypeParameterFact>
   readonly name: DeclaredName
   readonly target: DeclaredTypeFact
-  /** Retained only so semantic analysis can reject a parameterized alias at its exact span. */
-  readonly parameterList?: AuthoredHir.Anchor
   readonly anchor: AuthoredHir.Anchor
 }
 
