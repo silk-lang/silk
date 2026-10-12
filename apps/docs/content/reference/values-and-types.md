@@ -259,8 +259,9 @@ the target's own bounds are proven at the expanded application with their usual 
 distinct instantiation is expanded once.
 
 An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
-in a generic parameter list, the interface of an `impl` head, and the qualifier of a static member
-or interface operation call. A type alias cannot stand where only an interface is valid, and an
+in a generic parameter list, the interface of an `impl` head, the qualifier of a static member or
+interface operation call, and the qualifier of an enum member in an expression or a pattern
+(`type Tier = Level` makes `Tier.High` the member `Level.High`). A type alias cannot stand where only an interface is valid, and an
 interface alias cannot stand where a value type is required.
 
 An alias is transparent. Resolution replaces it with its target before any other analysis, and it

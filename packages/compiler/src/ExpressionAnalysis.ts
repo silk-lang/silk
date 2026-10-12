@@ -671,11 +671,11 @@ export const analyzeEnumMember = (
 ): ExpressionResult | undefined => {
   const identifiers = nameSegments(node)
   const qualifierToken = identifiers.at(0)
-  const memberToken = identifiers.at(1)
-  if (qualifierToken === undefined || memberToken === undefined || identifiers.length !== 2)
+  const memberToken = identifiers.at(-1)
+  if (qualifierToken === undefined || memberToken === undefined || identifiers.length < 2)
     return undefined
-  const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
-  const enumLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifier = writtenQualifier(context, identifiers)
+  const enumLookup = resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
   if (enumLookup._tag !== 'Resolved' || enumLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const enum_ = enumLookup.declaration
@@ -760,12 +760,12 @@ const analyzeEnumValueCall = (
 ): ExpressionResult | undefined => {
   const identifiers = referenceNames(node)
   const qualifierToken = identifiers.at(0)
-  const operationToken = identifiers.at(1)
-  if (qualifierToken === undefined || operationToken === undefined || identifiers.length !== 2)
+  const operationToken = identifiers.at(-1)
+  if (qualifierToken === undefined || operationToken === undefined || identifiers.length < 2)
     return undefined
-  const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
+  const qualifier = writtenQualifier(context, identifiers)
   const operationName = SemanticContext.nameText(context, operationToken) ?? ''
-  const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifierLookup = resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
   if (qualifierLookup._tag !== 'Resolved' || qualifierLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const operation = qualifierLookup.declaration.associatedOperations.find(
@@ -2256,15 +2256,12 @@ export const analyzePattern = (
   if (node._tag === 'EnumPattern' && bareUnionPatternTarget === undefined) {
     const identifiers = nameSegments(node)
     const qualifierToken = identifiers.at(0)
-    const memberToken = identifiers.at(1)
-    const qualifier =
-      qualifierToken === undefined
-        ? undefined
-        : (SemanticContext.nameText(context, qualifierToken) ?? '')
+    const memberToken = identifiers.length < 2 ? undefined : identifiers.at(-1)
+    const qualifier = memberToken === undefined ? undefined : writtenQualifier(context, identifiers)
     const enumLookup =
-      qualifier === undefined
+      memberToken === undefined
         ? undefined
-        : Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+        : resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
     const enum_ =
       enumLookup?._tag === 'Resolved' && enumLookup.declaration._tag === 'EnumDeclaration'
         ? enumLookup.declaration
@@ -4860,8 +4857,10 @@ import {
   isSectionArity,
   ownedProviderCaptureAccess,
   recoveryInvocationRecipe,
+  resolveMemberQualifier,
   serviceOperation,
   sourceCallable,
+  writtenQualifier,
 } from './CallResolution.js'
 export function analyzePlaceReplace(
   context: SemanticContext.SemanticContext,
@@ -11076,12 +11075,8 @@ function analyzeExpressionDecision(
     if (intrinsicOperationTarget(context, node)?.rule._tag === 'PlaceRule') {
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
-    const named = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
     // A transparent alias qualifier names its target declaration (TYPE-004).
-    const qualifierLookup =
-      named._tag === 'Resolved'
-        ? { ...named, declaration: NameResolution.erasedOwner(resolution.index, named.declaration) }
-        : named
+    const qualifierLookup = resolveMemberQualifier(context, resolution, [qualifierToken])
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,
