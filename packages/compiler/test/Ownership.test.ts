@@ -1865,6 +1865,49 @@ pub fn main() -> i32 { return 0 }`
   }),
 )
 
+it.effect('requires &mut or move to stage an exclusive view into a section', () =>
+  Effect.gen(function* () {
+    const source = `fn bump(by: i32, value: &mut i32) -> i32 {
+  value.* = value.* + by
+  return value.*
+}
+fn staged(first: &mut i32) -> i32 {
+  let mut next = bump(first)
+  return next(1)
+}
+fn reborrowed(second: &mut i32) -> i32 {
+  let mut next = bump(&mut second)
+  return next(1)
+}
+fn moved(third: &mut i32) -> i32 {
+  let mut next = bump(move third)
+  return next(1)
+}
+fn invoke<F: fn<'static>(i32, &'static mut i32) -> i32>(callback: F, target: &'static mut i32) -> i32 {
+  let mut next = callback(target)
+  return next(40)
+}
+fn forwarded<F: fn<'static>(i32, &'static mut i32) -> i32>(callback: F, owned: &'static mut i32) -> i32 {
+  let mut next = callback(move owned)
+  return next(40)
+}
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* Analysis.ofSource('ownership/staged-exclusive-view', ascii(source))
+    const at = (text: string, after: string) => source.indexOf(text, source.indexOf(after))
+
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [
+        { code: 'OWN0003', start: at('first)', 'bump(first') },
+        { code: 'OWN0003', start: at('target)', 'callback(target') },
+      ],
+    )
+  }),
+)
+
 it('requires explicit transfer at mutable owned parameter boundaries and rejects overlap', () => {
   const caller = check(
     'ownership/mutable-owned-parameter-caller-move',

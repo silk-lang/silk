@@ -1232,6 +1232,17 @@ const checkExpressionOperation = (
     }
     return true
   }
+  // A staged argument is captured into the section's environment. An exclusive reference or slice
+  // staged by value is consumed like any other by-value forward: it is written `&mut values` or
+  // `move values` (BORROW-005, CALLABLE-002).
+  const captureConsumes = (
+    capture: { readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take' },
+    value: Tir.Expression,
+  ): boolean =>
+    capture.access === 'Take' ||
+    (value._tag !== 'Unavailable' &&
+      (Type.isReference(value.type) || Type.isSlice(value.type)) &&
+      value.type.access === 'Exclusive')
   // An interface operation borrows an owned argument for a reference or slice operand. An
   // argument that already is an exclusive reference or slice is forwarded by value instead, so it
   // is consumed: forwarding is written `&mut values` (BORROW-005).
@@ -1474,7 +1485,14 @@ const checkExpressionOperation = (
       }
       for (const capture of expression.captures) {
         if (
-          !checkExpression(state, live, capture.value, capture.access === 'Take', guard, escaping)
+          !checkExpression(
+            state,
+            live,
+            capture.value,
+            captureConsumes(capture, capture.value),
+            guard,
+            escaping,
+          )
         )
           return false
       }
@@ -1529,7 +1547,9 @@ const checkExpressionOperation = (
               state,
               live,
               argument,
-              capture === undefined ? argumentConsumes(argument) : capture.access === 'Take',
+              capture === undefined
+                ? argumentConsumes(argument)
+                : captureConsumes(capture, argument),
               guard,
               escaping,
             )
