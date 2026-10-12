@@ -49,15 +49,15 @@ import silk.u64
 effect fn build() -> i32
 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut set = HashSet.make<Word>(Hash.seed(17))
-  let mut inserting = HashSet.insert<Word>(&mut set, Hash.word(42))
+  let mut set = HashSet<Word>.make(Hash.seed(17))
+  let mut inserting = HashSet<Word>.insert(&mut set, Hash.word(42))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let existed = run inserting
-  if existed || !HashSet.contains<Word>(&set, Hash.word(42)) {
+  if existed || !HashSet<Word>.contains(&set, Hash.word(42)) {
     return 0
   }
-  let removed = HashSet.remove<Word>(&mut set, Hash.word(42))
-    |> Option.unwrapOr<Word>(Hash.word(0))
+  let removed = HashSet<Word>.remove(&mut set, Hash.word(42))
+    |> Option<Word>.unwrapOr(Hash.word(0))
   return u64.toI32(removed.value)
 }
 

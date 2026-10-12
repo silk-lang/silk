@@ -376,13 +376,13 @@ fn admittedReference<'a>(bytes: &'a [u8]) -> bool {
 }
 ${groups.join('\n')}
 effect fn vectors() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut manyOwner = Vector.make<PresentedIdentity<'static>>()
+  let mut manyOwner = Vector<PresentedIdentity<'static>>.make()
   let mut count = usize.ZERO
   while count < 257 {
-    let appended = run Vector.append<PresentedIdentity<'static>>(&mut manyOwner, PresentedIdentity<'static>.Dns { bytes: b"www.example" })
+    let appended = run Vector<PresentedIdentity<'static>>.append(&mut manyOwner, PresentedIdentity<'static>.Dns { bytes: b"www.example" })
     count = count + usize.ONE
   }
-  let many = Vector.asSlice<PresentedIdentity<'static>>(&manyOwner)
+  let many = Vector<PresentedIdentity<'static>>.asSlice(&manyOwner)
   // Unsupported payload semantics are outside the matcher; zero octets exercise byte accounting.
   let paddingOwner = run Bytes.zeroed(65526)
   let padding = Bytes.asSlice(&paddingOwner)

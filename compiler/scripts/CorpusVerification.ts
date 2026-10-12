@@ -129,7 +129,7 @@ export const execute = Effect.fn('CorpusVerification.execute')(function* (
   FileSystem.FileSystem | Path.Path
 > {
   const path = yield* Path.Path
-  const result = yield* Effect.try({
+  const result = yield* Effect.tryPromise({
     try: () =>
       runCorpus(
         self.compiler,

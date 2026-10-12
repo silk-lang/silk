@@ -691,7 +691,7 @@ fn replace(source: &mut MemoryTrustSource, next: TrustSnapshot) -> TrustSnapshot
   return MemoryTrustSource.replace(move source, move next)
 }
 fn forged() -> TrustSnapshot {
-  return TrustSnapshot { anchorsValue: Vector.make<TrustAnchor>() }
+  return TrustSnapshot { anchorsValue: Vector<TrustAnchor>.make() }
 }
 fn limitFailure(result: Result<TrustSnapshot, TrustSourceError>) -> bool {
   return match move result {
@@ -722,7 +722,7 @@ pub fn main() -> i32 { return 0 }`
         { code: 'OWN0019', text: 'anchors' },
         {
           code: 'SEM0021',
-          text: 'TrustSnapshot { anchorsValue: Vector.make<TrustAnchor>() }',
+          text: 'TrustSnapshot { anchorsValue: Vector<TrustAnchor>.make() }',
         },
       ],
     )

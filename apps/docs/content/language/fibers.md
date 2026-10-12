@@ -59,8 +59,8 @@ effect fn work() -> i32 {
 effect fn program() -> i32
 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
 ? &mut Scheduler | &mut MonotonicClock {
-  let child = run Fiber.forkChild<i32, never>(work())
-  return run Fiber.join<i32, never>(move child)
+  let child = run Fiber<i32, never>.forkChild(work())
+  return run Fiber<i32, never>.join(move child)
 }
 
 effect fn recover(
