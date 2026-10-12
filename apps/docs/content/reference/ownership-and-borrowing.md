@@ -510,6 +510,12 @@ fn invalid() -> i32 {
 argument. Argument evaluation order does not shorten an earlier loan to the end of that argument's
 evaluation; the callee receives all arguments together.
 
+Reading `.length` of any place while an exclusive loan of it is live is an access, whether the
+place is a fixed-size array, a slice or a `Vector`, even though a fixed array's length is part of
+its type. For `values: [i32; 2]`, `replace(&mut values, values.length - 1)` reports `OWN0011` at
+the length read and relates the first argument's loan. Bind the length before the call instead:
+`let last = values.length - 1` and then `replace(&mut values, last)`.
+
 **Diagnostics:** Conflicting slice arguments report `OWN0010` at the later borrow and relate the
 earlier loan. Directly reading the owner in a later argument while an exclusive loan is active
 reports `OWN0011`.
@@ -1648,7 +1654,9 @@ A valid hook is synchronous, infallible, non-allocating, and requirement-free. I
 which permits containers to destroy initialized values hidden in raw storage before automatic field
 cleanup releases that storage.
 
-**Boundary:** A type with a `Drop` hook is affine and cannot implement `Copy`. The hook cannot add a
+**Boundary:** A type with a `Drop` hook is affine and cannot implement `Copy`. The `Drop` head
+gives each region position its own unbounded binder (IMPL-007), so the same hook runs for every
+region a value carries. The hook cannot add a
 typed failure, run an open Effect, acquire services, or perform asynchronous work. Cleanup that
 needs any of those capabilities is an explicit operation under CLOSE-001.
 

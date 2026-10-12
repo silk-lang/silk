@@ -223,12 +223,9 @@ fn helper() -> () { let value = 2 drop value }`)
         fingerprints(before).get('Cases:alpha'),
         fingerprints(movedAndTriviaEdit).get('Cases:alpha'),
       )
-      assert.notStrictEqual(
-        before.testCatalog?.entries[0]?.info.line,
-        movedAndTriviaEdit.testCatalog?.entries[0]?.info.line,
-      )
       assert.notStrictEqual(before.testCatalog?.identity, bodyAndHelperEdit.testCatalog?.identity)
-      assert.notStrictEqual(before.testCatalog?.identity, movedAndTriviaEdit.testCatalog?.identity)
+      // The catalog holds no source position (TEST-004): moving a test keeps the catalog.
+      assert.strictEqual(before.testCatalog?.identity, movedAndTriviaEdit.testCatalog?.identity)
     }),
 )
 
