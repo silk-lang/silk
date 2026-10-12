@@ -8,15 +8,17 @@
 // `Allocation` becomes `Intrinsic.RawBuffer<...>`, `Intrinsic.Slot<...>` or `Intrinsic.Allocation`.
 // Member calls such as `RawBuffer.fill(...)` and `Slot.view(...)` name the ordinary standard-library
 // actors and are left alone, as is a name already qualified by any owner. `Allocation` is a type
-// position only after `:`, `->`, `<`, `,`, `(`, `&`, `|` or `mut`. Only source text is migrated:
-// `.silk` code outside `//` comments, `.ts` lines that are not `//` comments, and `silk` fences in
-// `.md` files. A line whose `//` comment contains `invalid:` or `ordinary:` is an intentional
-// counterexample or a user declaration of a bare name and is left alone. The script is idempotent.
+// position only after `:`, `->`, `<`, `,`, `(`, `[`, `&`, `|` or `mut`; the `<` opening a
+// declaration's binder list declares a binder and is not a type position. Only source text is
+// migrated: `.silk` code outside `//` comments, `.ts` lines that are not `//` comments, and `silk`
+// fences in `.md` files. A line whose `//` comment contains `invalid:` or `ordinary:` is an
+// intentional counterexample or a user declaration of a bare name and is left alone. The script is
+// idempotent.
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
 const generic = /(?<![\w.])(RawBuffer|Slot)</g
-const allocation = /((?:[:<,(&|]|->|\bmut)\s*)Allocation\b(?![\w.{])/g
+const allocation = /((?:[:,(&|[]|(?<!\b(?:fn\s+\w+|impl))<|->|\bmut)\s*)Allocation\b(?![\w.{])/g
 
 const rewriteCode = (code) =>
   code.replace(generic, 'Intrinsic.$1<').replace(allocation, '$1Intrinsic.Allocation')
