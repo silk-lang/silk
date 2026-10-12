@@ -168,7 +168,7 @@ it.effect('substitutes the owner binders a receiver fixes in hover and completio
   Effect.gen(function* () {
     const source = `${option}
 pub fn main() -> i32 {
-  let value = Option.some<i32>(41)
+  let value = Option<i32>.some(41)
   let mapped = value.map(addOne)
   let more = value.
   return mapped.unwrapOr(0)
@@ -234,7 +234,7 @@ it.effect('hovers the explicit form with the complete contract', () =>
   Effect.gen(function* () {
     const source = `${option}
 pub fn main() -> i32 {
-  let value = Option.some<i32>(41)
+  let value = Option<i32>.some(41)
   let mapped = Option.map(move value, addOne)
   return mapped.unwrapOr(0)
 }`

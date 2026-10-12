@@ -757,7 +757,7 @@ import silk.option { Option }
 import silk.shared { Shared }
 import silk.vector { Vector }
 pub fn main() -> () {
-  let value = Option.none<Shared<Vector<Option<Bytes>>>>()
+  let value = Option<Shared<Vector<Option<Bytes>>>>.none()
   drop value
   return ()
 }`)
@@ -790,7 +790,7 @@ import silk.shared { Shared }
 import silk.vector { Vector }
 ${types}effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let outer = run (Shared.make<Outer>(Outer { heads: Vector.make<Shared<Head>>() })
+  let outer = run (Shared<Outer>.make(Outer { heads: Vector<Shared<Head>>.make() })
     |> Effect.provideMut<Allocator>(&mut allocator))
   drop outer
   return 0
@@ -800,7 +800,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`)
     const measured = yield* snapshot(`import silk.shared { Shared }
 import silk.vector { Vector }
 ${types}pub fn main() -> i32 {
-  let outer = Vector.make<Shared<Outer>>()
+  let outer = Vector<Shared<Outer>>.make()
   drop outer
   return 0
 }`)
@@ -833,7 +833,7 @@ struct Evidence { value: Bytes }
 struct Cached { items: Vector<Shared<Evidence>> }
 struct Root { answer: Shared<Cached> }
 pub fn main() -> () {
-  let roots = Vector.make<Root>()
+  let roots = Vector<Root>.make()
   drop roots
   return ()
 }`)
@@ -880,7 +880,7 @@ union Argument {
 }
 struct Binding { value: Argument }
 pub fn main() -> () {
-  let bindings = Vector.make<Binding>()
+  let bindings = Vector<Binding>.make()
   drop bindings
   return ()
 }`)
@@ -922,7 +922,7 @@ struct Machine<'a> {
   active: Vector<Frame>
 }
 fn hold<'a>(anchor: &'a i32) -> () {
-  let machines = Vector.make<Machine<'a>>()
+  let machines = Vector<Machine<'a>>.make()
   drop machines
   return ()
 }
@@ -1183,7 +1183,7 @@ struct Machine<'a> {
   holder: Holder
 }
 fn hold<'a>(anchor: &'a i32) -> () {
-  let machines = Vector.make<Machine<'a>>()
+  let machines = Vector<Machine<'a>>.make()
   drop machines
   return ()
 }
@@ -1217,7 +1217,7 @@ service Source { effect fn load() -> Owner ? &mut Source }
 struct Provider {}
 impl Provider {
   effect fn load(self: &mut Self) -> Owner {
-    return Owner { leaves: Vector.make<Leaf>() }
+    return Owner { leaves: Vector<Leaf>.make() }
   }
 }
 impl Source for Provider { load: Provider.load }
@@ -1392,7 +1392,7 @@ import silk.vector { Vector }
 struct Left<T> { next: Box<Right<Box<T>>> }
 struct Right<T> { next: Box<Left<Box<T>>> }
 pub fn main() -> i32 {
-  let held = Vector.make<Left<i32>>()
+  let held = Vector<Left<i32>>.make()
   return 0
 }`)
     assert.deepEqual(
@@ -1410,7 +1410,7 @@ import silk.vector { Vector }
 struct Outer<T> { next: Box<Middle<T>> }
 struct Middle<T> { next: Box<T> }
 pub fn main() -> i32 {
-  let held = Vector.make<Outer<Outer<i32>>>()
+  let held = Vector<Outer<Outer<i32>>>.make()
   return 0
 }`)
     assert.deepEqual(Analysis.diagnostics(result), [])
@@ -1496,7 +1496,7 @@ fn make<'a, 'b>(left: &'a i32, right: &'b i32)
     marker: right,
     whole: Outer { value: 1 },
     part: 2,
-    next: Option.none<Box<Chain<'a, &'a i32, i32, i32>>>()
+    next: Option<Box<Chain<'a, &'a i32, i32, i32>>>.none()
   }
 }
 pub fn main() -> i32 {

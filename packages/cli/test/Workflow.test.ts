@@ -38,16 +38,16 @@ import silk.vector { Vector }
 
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<i32>()
-  let appended = run Vector.append<i32>(&mut values, 41)
+  let mut values = Vector<i32>.make()
+  let appended = run Vector<i32>.append(&mut values, 41)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let appendedTwo = run Vector.append<i32>(&mut values, 0)
+  let appendedTwo = run Vector<i32>.append(&mut values, 0)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let appendedThree = run Vector.append<i32>(&mut values, 0)
+  let appendedThree = run Vector<i32>.append(&mut values, 0)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let appendedFour = run Vector.append<i32>(&mut values, 0)
+  let appendedFour = run Vector<i32>.append(&mut values, 0)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let appendedFive = run Vector.append<i32>(&mut values, 0)
+  let appendedFive = run Vector<i32>.append(&mut values, 0)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let one = run Effect.suspend(effect { return 1 })
   let text = "silk"
@@ -56,8 +56,8 @@ effect fn program() -> i32 ! OutOfMemoryError {
   if Intrinsic.stringByteLength(text) != 4 { return 2 }
   if bytes.length != 4 { return 3 }
   if u8.toI32(bytes[0]) != 115 { return 4 }
-  if Vector.length<i32>(&values) != 5 { return 5 }
-  return Vector.get<i32>(&values, 0) + one
+  if Vector<i32>.length(&values) != 5 { return 5 }
+  return Vector<i32>.get(&values, 0) + one
 }
 
 effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }

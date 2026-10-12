@@ -150,7 +150,12 @@ chmod +x program
   assert.match(corpus.stdout, /PASS trivial-features/)
   assert.match(corpus.stdout, /PASS scalar-reference-argument-order/)
   assert.match(corpus.stdout, /pass=2 fail=0 unsupported=0 track=2/)
-  assert.strictEqual(readFileSync(calls, 'utf8'), 'none:true\nspeed:false\nspeed:false\n')
+  // The two cases build concurrently, so their profile calls may interleave.
+  assert.deepStrictEqual(readFileSync(calls, 'utf8').trimEnd().split('\n').sort(), [
+    'none:true',
+    'speed:false',
+    'speed:false',
+  ])
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
   assert.strictEqual(existsSync(sentinel), false)

@@ -22,7 +22,7 @@ interface Stream<Item, E, ?R> {
 struct SliceStream<'data, A> { items: &'data [A] index: usize }
 impl<'data, A> Stream<&'data A, never ? Without<&Unused, Unused>> for SliceStream<'data, A> {
   effect fn take<'call>(self: &'call mut SliceStream<'data, A>) -> Option<&'data A> {
-    if self.index >= self.items.length { return Option.none<&'data A>() }
+    if self.index >= self.items.length { return Option<&'data A>.none() }
     let result = &self.items[self.index]
     self.index = self.index + 1
     return Option.some(result)
@@ -70,7 +70,7 @@ impl<'data> Drop for Item<'data> { fn drop(self: &mut Item<'data>) -> () { self.
 struct OnceStream<'data> { pending: Option<Item<'data>> }
 impl<'data> Stream<Item<'data>> for OnceStream<'data> {
   effect fn take<'call>(self: &'call mut OnceStream<'data>) -> Option<Item<'data>> {
-    return Intrinsic.replace(self.pending, Option.none<Item<'data>>())
+    return Intrinsic.replace(self.pending, Option<Item<'data>>.none())
   }
 }
 pub fn main() -> i32 {
