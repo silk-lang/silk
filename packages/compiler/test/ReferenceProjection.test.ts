@@ -56,7 +56,7 @@ fn invalid(box: &Box) -> () { mutate(&mut box) }`),
 
     assert.deepEqual(
       Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.code),
-      ['SEM0056'],
+      ['SEM0058'],
     )
   }),
 )

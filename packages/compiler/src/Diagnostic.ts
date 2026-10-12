@@ -152,7 +152,8 @@ export const polymorphicRecursionCode = 'SEM0053' as const
 /** Stable code for an operand that cannot form a borrowed view. */
 export const invalidBorrowOperandCode = 'SEM0056' as const
 export const exclusiveBorrowRequiresMutableCode = 'SEM0057' as const
-export const invalidSliceReborrowCode = 'SEM0058' as const
+/** Stable code for an exclusive reborrow of a shared reference or slice. */
+export const invalidReborrowCode = 'SEM0058' as const
 export const implicitSliceDecayCode = 'SEM0059' as const
 /** Stable code for a negative decimal literal contextualized as unsigned `usize`. */
 export const usizeNegativeCode = 'SEM0060' as const
@@ -563,7 +564,7 @@ export type Code =
   | typeof polymorphicRecursionCode
   | typeof invalidBorrowOperandCode
   | typeof exclusiveBorrowRequiresMutableCode
-  | typeof invalidSliceReborrowCode
+  | typeof invalidReborrowCode
   | typeof implicitSliceDecayCode
   | typeof usizeNegativeCode
   | typeof invalidFailureTypeCode
@@ -1359,7 +1360,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
   | { readonly _tag: 'InvalidBorrowOperand' }
   | { readonly _tag: 'ExclusiveBorrowRequiresMutable'; readonly spelling: string }
   | {
-      readonly _tag: 'InvalidSliceReborrow'
+      readonly _tag: 'InvalidReborrow'
       readonly parent: 'Shared' | 'Exclusive'
       readonly requested: 'Shared' | 'Exclusive'
     }
@@ -5069,17 +5070,17 @@ export const exclusiveBorrowRequiresMutable = <L>(spelling: string, span: L): Di
   span,
 })
 
-export const invalidSliceReborrow = <L>(
+export const invalidReborrow = <L>(
   parent: 'Shared' | 'Exclusive',
   requested: 'Shared' | 'Exclusive',
   span: L,
 ): Diagnostic<L> => ({
   _tag: 'Diagnostic',
   phase: 'semantic',
-  code: invalidSliceReborrowCode,
+  code: invalidReborrowCode,
   severity: 'error',
-  message: 'A shared slice cannot be reborrowed exclusively',
-  reason: { _tag: 'InvalidSliceReborrow' as const, parent, requested },
+  message: 'A shared view cannot be reborrowed exclusively',
+  reason: { _tag: 'InvalidReborrow' as const, parent, requested },
   span,
 })
 
