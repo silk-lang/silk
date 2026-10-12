@@ -72,10 +72,13 @@ function ensureImport(text, name) {
 // Step 2: the compiler names each unhandled site.
 const silkc = process.env.SILKC
 if (silkc === undefined) throw new Error('set SILKC to a native silkc')
-// The CI test shards' roots, read from the workflow so the two lists cannot drift apart.
+// The entries CI builds and its test shards' roots, read from the workflow so the lists cannot
+// drift apart.
 const workflow = readFileSync(join(compiler, '../.github/workflows/selfhost.yml'), 'utf8')
+const entries = new Set(['src/main.silk'])
+for (const match of workflow.matchAll(/"\$SILKC" build "[^"]*\/compiler\/(src\/[\w/]+\.silk)"/g)) entries.add(match[1])
 const testRoots = [...workflow.matchAll(/roots: >-\n((?:[ \t]+src\/\S.*\n)+)/g)].flatMap((match) => match[1].trim().split(/\s+/))
-const roots = [{ kind: 'build', root: 'src/main.silk' }, ...testRoots.map((root) => ({ kind: 'test', root }))]
+const roots = [...[...entries].map((root) => ({ kind: 'build', root })), ...testRoots.map((root) => ({ kind: 'test', root }))]
 
 // Build outputs go to a scratch directory, removed on exit.
 const scratch = mkdtempSync(join(tmpdir(), 'types-codemod-'))
