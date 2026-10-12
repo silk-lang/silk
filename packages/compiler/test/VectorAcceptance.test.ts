@@ -12,6 +12,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const source = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.ownership { Drop }
 import silk.vector { Vector }
 struct Entry<'a> { value: &'a mut i32 }
 impl<'a> Drop for Entry<'a> { fn drop(self: &mut Entry<'a>) -> () { return () } }
@@ -106,6 +107,7 @@ it.effect('lowers element cleanup before vector backing-storage cleanup', () =>
       'vector-acceptance/drop-order',
       ascii(`import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.vector { Vector }
 struct Entry { value: i32 }
 impl Drop for Entry { fn drop(self: &mut Entry) -> () { return () } }
