@@ -11556,14 +11556,14 @@ fn increment(value: &mut Counter) -> i32 {
   return value.value
 }
 fn nested(value: ${outerReference}, alias: Shared<Counter>) -> i32 {
-  return Shared.${inner}<Counter, i32>(&alias, ${innerCallback})
+  return Shared<Counter>.${inner}<i32>(&alias, ${innerCallback})
 }
 effect fn conflictCase() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let first = run (Shared<Counter>.make(Counter { value: 41 })
     |> Effect.provideMut<Allocator>(&mut allocator))
   let alias = Shared<Counter>.clone(&first)
-  return Shared.${outer}<Counter, i32>(&first, nested(move alias))
+  return Shared<Counter>.${outer}<i32>(&first, nested(move alias))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
 pub fn main() -> i32 {
