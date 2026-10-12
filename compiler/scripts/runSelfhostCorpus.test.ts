@@ -5,6 +5,7 @@ import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
 import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
 import {
+  parseBorrowGap,
   parseBuildDiagnostics,
   parseUnsupported,
   runCase,
@@ -129,6 +130,34 @@ exit 2`,
   )
   assert.strictEqual(parseUnsupported('SILK_UNSUPPORTED_JSON={"gaps":[]}'), undefined)
   assert.strictEqual(parseUnsupported('unsupported: aggregates'), undefined)
+})
+
+void it('records the per-reason borrow-check gap of a successful build', () => {
+  assert.deepStrictEqual(
+    parseBorrowGap(
+      'SILK_GAP borrow-check: 3 bodies not borrow-checked (regions 2, stored-loans 1; native borrow checking is roadmap step 14)\n',
+    ),
+    { total: 3, reasons: { regions: 2, 'stored-loans': 1 } },
+  )
+  assert.deepStrictEqual(
+    parseBorrowGap(
+      'SILK_GAP borrow-check: 4 bodies not borrow-checked (native borrow checking is roadmap step 14)',
+    ),
+    { total: 4, reasons: {} },
+  )
+  assert.strictEqual(parseBorrowGap('SILK_GAP test-result-cache: off'), undefined)
+  assert.throws(() => parseBorrowGap('SILK_GAP borrow-check: many'))
+  withStub(
+    `echo 'SILK_GAP borrow-check: 1 bodies not borrow-checked (captures 1; native borrow checking is roadmap step 14)' >&2
+${compiled}`,
+    (silkc) => {
+      assert.deepStrictEqual(runCase(silkc, literal), {
+        name: 'literal',
+        status: 'pass',
+        borrowGap: { total: 1, reasons: { captures: 1 } },
+      })
+    },
+  )
 })
 
 void it('retains exact gap source locations and rejects malformed location records', () => {
