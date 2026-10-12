@@ -171,8 +171,8 @@ calls `free` on its context, a raw buffer drops only its allocation, and shared-
 references and drops the value and allocation with the last handle. Raw-buffer and slot contents
 stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
 standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
-Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
-reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
+Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary, with
+a per-reason breakdown, when reached bodies are not yet borrow-checked. The TypeScript bootstrap compiler still builds it.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
 referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
