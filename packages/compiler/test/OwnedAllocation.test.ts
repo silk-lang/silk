@@ -15,9 +15,9 @@ it.effect(
       const source = `import silk.raw_buffer { RawBuffer }
 import silk.slot { Slot }
 fn select<'a, T>(buffer: &'a mut Intrinsic.RawBuffer<T>) -> Intrinsic.Slot<'a, T> { return RawBuffer.slot<T>(move buffer, 0) }
-fn take<'a, T>(slot: Intrinsic.Slot<'a, T>) -> T { return Slot.take<T>(move slot) }
+fn take<'a, T>(slot: Intrinsic.Slot<'a, T>) -> T { return unsafe Slot.take<T>(move slot) }
 fn invalid<'a>(allocation: Intrinsic.Allocation) -> Intrinsic.Slot<'a, i32> {
-  let mut buffer = RawBuffer.from<i32>(move allocation, 1)
+  let mut buffer = unsafe RawBuffer.from<i32>(move allocation, 1)
   return select(&mut buffer)
 }
 fn smuggle<'long, 'short>(slot: Intrinsic.Slot<'short, &'long i32>, value: &'short i32) -> () {
@@ -44,6 +44,28 @@ fn smuggle<'long, 'short>(slot: Intrinsic.Slot<'short, &'long i32>, value: &'sho
         ),
       )
     }),
+)
+it.effect('requires an unsafe boundary for each caller-precondition storage operation', () =>
+  Effect.gen(function* () {
+    const source = `import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+fn read(buffer: &Intrinsic.RawBuffer<u8>) -> u8 { return RawBuffer.read<u8>(buffer, 0) }
+fn take(buffer: &mut Intrinsic.RawBuffer<u8>) -> u8 {
+  return Slot.take<u8>(RawBuffer.slot<u8>(&mut buffer.*, 0))
+}
+fn acknowledged(buffer: &mut Intrinsic.RawBuffer<u8>) -> u8 {
+  RawBuffer.fill(&mut buffer.*, 0, 1, 7)
+  return unsafe RawBuffer.read<u8>(&buffer.*, 0)
+}`
+    const self = yield* Analysis.ofSource('allocation/unsafe-storage', ascii(source))
+    const missing = Analysis.diagnostics(self)
+      .filter((diagnostic) => diagnostic.span.sourceId === 'allocation/unsafe-storage')
+      .map((diagnostic) => [diagnostic.code, diagnostic.span.start])
+    assert.deepStrictEqual(missing, [
+      ['SEM0082', source.indexOf('RawBuffer.read')],
+      ['SEM0082', source.indexOf('Slot.take')],
+    ])
+  }),
 )
 const sharedReadSource = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
