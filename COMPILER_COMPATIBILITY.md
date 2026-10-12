@@ -1223,6 +1223,26 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
 - **Evidence:** `parser/ParserCases.referencesToFixedArrays` asserts the reference, its fixed-array
   operand, the following parameter and a slice parameter, with no diagnostics.
 
+### Bootstrap rejections of valid compiler sources
+
+- **Status:** Verified on 2026-10-12 (#1508). These are known bootstrap divergences. Compiling
+  `compiler/src` with the bootstrap is no longer a gate (retired with #1467).
+- **Rule:** OWN-004 keeps disjoint initialized siblings usable, so an exclusive loan of
+  `resource.*.owner.*` passed to a call leaves the sibling Copy field `resource.key` readable in a
+  later argument. BORROW-004's OWN0011 covers reading the borrowed owner itself. An `if let`
+  scrutinee may be any expression, including `move Shared.with<Lifetime, Option<DeclarationId>>(...)`.
+- **Compilers:** the native frontend accepts both forms, which is correct. The bootstrap reports
+  OWN0011 for the sibling read, because it treats a field loan as a loan of its parent. It
+  misparses the generic-call scrutinee (PAR0002 with a cascade).
+- **Source migration:** none required. #1508 respells the three affected sites
+  (`semantic/Query.silk` twice, `semantic/RuntimeEncoding.silk` once) so the bootstrap can still
+  compile the compiler for diagnosis.
+- **Diagnostics and limits:** only those two bootstrap behaviors. Retire this entry when the
+  bootstrap accepts disjoint sibling reads under a field loan and parses the scrutinee.
+- **Evidence:** on `selfhost` fc7582f a bootstrap Cases root failed to compile with 13 errors at the
+  three sites; with #1508, bootstrap CallableResultCases passes 60/0.
+- **Open questions:** none.
+
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or
