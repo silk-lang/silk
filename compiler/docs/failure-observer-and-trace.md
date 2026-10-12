@@ -331,8 +331,8 @@ All structured and cheap, in `SemanticCallableCases.silk`, one shared source per
   callback indirectly with null diagnostics; without observation nothing is threaded and it is `0`.
 - **Emission.** The ABI order, the `%context` stores and the caller's fixed-size companion.
 
-No corpus program changes status (§3), so `selfhostTrack.ts` and `baselinePasses` stay as they are;
-CI must still show 0 FAIL and no lost PASS.
+No corpus program changes status (§3), so the pinned track stays as it is; CI must still show 0 FAIL
+and every pinned program passing.
 
 ## 7. Implementation order
 
