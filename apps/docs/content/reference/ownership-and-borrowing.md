@@ -549,7 +549,8 @@ child call returns, the parent becomes available with its original access.
 
 **Boundary:** Reborrowing never strengthens access. `&mut values` is invalid when `values` is only
 `&[T]`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
-exclusive reborrow.
+exclusive reborrow. Forwarding an exclusive reference is written `&mut values`; passing the binding
+by value without `move` reports `OWN0003`.
 
 **Diagnostics:** Attempting to strengthen a shared slice into an exclusive reborrow reports
 `SEM0058`. Accessing a suspended parent during a child loan reports the applicable loan conflict.
