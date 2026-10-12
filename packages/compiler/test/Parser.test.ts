@@ -4080,6 +4080,20 @@ it('recovers a type alias without a target at the next declaration', () => {
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })
 
+it('rejects a bound list as a type alias target at the first plus', () => {
+  const source = 'type Both = A + B'
+  const result = parseText('memory/bound-list-type-alias', source)
+
+  assert.deepEqual(
+    diagnosticView(result)
+      .slice(0, 1)
+      .map((diagnostic) => [diagnostic.code, diagnostic.start]),
+    [['PAR0002', source.indexOf('+')]],
+  )
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('retains a type alias parameter list for semantic rejection', () => {
   const source = 'type Pair<T> = Point<T>'
   const result = parseText('memory/parameterized-type-alias', source)

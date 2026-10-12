@@ -141,6 +141,90 @@ fields `SEM0025`, array elements `SEM0030`, assignments `SEM0037`, and incompati
 [callable modes](functions-callables-and-control-flow.md#callable-003--invocation-mode-describes-access-to-the-callable-environment),
 [Effect access](ownership-and-borrowing.md#effect-own-002--run-access-derives-from-use-of-the-effect-environment).
 
+### TYPE-004 — A `type` alias is a transparent name for one type or interface
+
+**Status:** Confirmed
+
+`type Name = Target` declares a module-level name for one existing type or one interface
+application. `pub type` publishes the name like any other declaration. The target is anything the
+use site could spell directly: a primitive or nominal type, an applied generic such as `Point<i32>`,
+a union, a reference type, or an interface.
+
+```silk
+interface Measured {
+  fn size(value: &Self) -> i32
+}
+
+type Sized = Measured
+type Count = i32
+
+struct Pair {
+  left: Count
+  right: Count
+}
+
+impl Pair {
+  fn total(pair: &Pair) -> Count {
+    return pair.left + pair.right
+  }
+}
+
+impl Sized for Pair {
+  size: Pair.total
+}
+
+fn measure<T: Sized>(value: &T) -> Count {
+  return Sized.size(value)
+}
+```
+
+An interface alias names one complete interface application, including its arguments:
+
+```silk
+import silk.ops { Add }
+
+type AddInt = Add<i32, i32>
+
+fn sum<T: AddInt>(left: T, right: i32) -> i32 {
+  return move left + right
+}
+```
+
+An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
+in a generic parameter list, the interface of an `impl` head, and the qualifier of a static member
+or interface operation call. A type alias cannot stand where only an interface is valid, and an
+interface alias cannot stand where a value type is required.
+
+An alias is transparent. Resolution replaces it with its target before any other analysis, and it
+has no nominal identity of its own. Conformance, coherence, specialization, layout and runtime
+encoding see only the target. `impl Sized for Pair` above is the same conformance as
+`impl Measured for Pair`, so the single-canonical-conformance rule applies across spellings.
+Diagnostics name the target's canonical identity and also cite the alias spelling as the source
+origin.
+
+An alias is resolved where it is used, through ordinary name lookup. A module that neither declares
+nor imports the alias cannot use it, and the target's own visibility is checked where the alias is
+declared. The alias binding itself is ordinary. Its visibility, import, publication, collision and
+shadowing follow the rules for any module-scoped name; a generic binder or local declaration with
+the same spelling shadows it. Naming an `Intrinsic` member through an alias names that member only.
+It does not alias, import, shadow or extend the `Intrinsic` namespace (INTR-001), and it grants no
+privilege the member's own contract does not already give.
+
+**Boundary:** An alias is not a new type: it cannot carry its own conformances, fields or inherent
+members distinct from its target. An alias is not generic; alias an applied type instead. An
+interface alias names one interface application, not a bound set: `type Both = A + B` is invalid.
+Union aliases in failure rows (typed failures) are this same rule.
+
+**Diagnostics:** A target that is not visible at the alias declaration receives the existing
+unresolved-name diagnostic at the target spelling. A cyclic alias reports `SEM0183` at each member
+of the cycle. Alias type parameters report `SEM0184` at the parameter list. An alias used in a
+position of the wrong kind receives that position's existing wrong-kind diagnostic, citing the alias
+origin. `type Both = A + B` receives the parser diagnostic `PAR0002` at the first `+`, because a
+bound list is valid only in a generic parameter list.
+
+**Evidence:** [alias resolution](../../../../packages/compiler/src/NameResolution.ts),
+[alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).
+
 ## Scalar values and literals
 
 ### INT-001 — Integer types have exact signedness and width

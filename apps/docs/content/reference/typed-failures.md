@@ -339,10 +339,10 @@ Here `S` is `NotFoundError | InvalidInputError`. Either selected type invokes `r
 `OfflineError` remains as the result's failure type. Selecting one type is the same rule with a
 one-alternative `S`.
 
-A `type` alias names a union once and is erased wherever it is used. A failure row spelled through
-a union alias has the same members the union spells directly, so `Effect.catch<KnownError>` is
-exactly `Effect.catch<NotFoundError | InvalidInputError>`. A nominal `union` inside the alias stays
-one member: `catch` removes it whole or not at all.
+A `type` alias names a union once and is erased wherever it is used (TYPE-004). A failure row
+spelled through a union alias has the same members the union spells directly, so
+`Effect.catch<KnownError>` is exactly `Effect.catch<NotFoundError | InvalidInputError>`. A nominal
+`union` inside the alias stays one member: `catch` removes it whole or not at all.
 
 ```silk
 import silk.effect { Effect }

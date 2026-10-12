@@ -261,3 +261,42 @@ pub fn main() -> i32 { return 0 }`,
     assert.include(codes(hidden), Diagnostic.inaccessibleImportedMemberCode)
   }),
 )
+
+it.effect('names an interface through an alias in bounds, impl heads and operation calls', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`interface Label { fn label(value: &Self) -> i32 }
+interface Combine<Right, Output> { fn combine(left: Self, right: Right) -> Output }
+type Labeled = Label
+type CombineTag = Combine<i32, i32>
+struct Tag { value: i32 }
+impl Tag {
+  fn tagLabel(value: &Tag) -> i32 { return value.value }
+  fn tagCombine(left: Tag, right: i32) -> i32 { return left.value + right }
+}
+impl Labeled for Tag { label: Tag.tagLabel }
+impl CombineTag for Tag { combine: Tag.tagCombine }
+fn bounded<T: Labeled>(value: &T) -> i32 { return Labeled.label(value) }
+pub fn main() -> i32 {
+  let tag = Tag { value: 1 }
+  return bounded(&tag) + Labeled.label(&tag) + CombineTag.combine(move tag, 2)
+}`)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
+
+it.effect('calls through an applied interface alias with the alias arguments', () =>
+  Effect.gen(function* () {
+    const program = (qualifier: string) => `interface Combine<Right, Output> {
+  fn combine(left: Self, right: Right) -> Output
+}
+type CombineTag = Combine<i32, i32>
+struct Tag { value: i32 }
+impl Tag { fn tagCombine(left: Tag, right: i32) -> i32 { return left.value + right } }
+impl CombineTag for Tag { combine: Tag.tagCombine }
+pub fn main() -> i32 { return ${qualifier}.combine(Tag { value: 1 }, true) }`
+    const aliased = yield* analyze(program('CombineTag'))
+    const direct = yield* analyze(program('Combine<i32, i32>'))
+    assert.deepEqual(codes(aliased), codes(direct))
+    assert.deepEqual(codes(aliased), [Diagnostic.argumentTypeMismatchCode])
+  }),
+)
