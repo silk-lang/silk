@@ -31,6 +31,9 @@ export interface Nominal {
   readonly arguments: ReadonlyArray<GenericArgument>
   /** Compiler-minted provenance for sealed nominal identities unavailable to source declarations. */
   readonly sealed?:
+    | 'Intrinsic.Allocation'
+    | 'Intrinsic.RawBuffer'
+    | 'Intrinsic.Slot'
     | 'Intrinsic.SharedCore'
     | 'Intrinsic.Execution'
     | 'Intrinsic.ExecutionRef'
@@ -723,6 +726,30 @@ export const nominal = (
   arguments: Array.from(arguments_),
 })
 
+const sealedAllocation = (): Nominal => ({
+  _tag: 'NominalType',
+  module: 'Intrinsic',
+  name: 'Allocation',
+  arguments: [],
+  sealed: 'Intrinsic.Allocation',
+})
+
+const sealedRawBuffer = (arguments_: ReadonlyArray<GenericArgument>): Nominal => ({
+  _tag: 'NominalType',
+  module: 'Intrinsic',
+  name: 'RawBuffer',
+  arguments: Array.from(arguments_),
+  sealed: 'Intrinsic.RawBuffer',
+})
+
+const sealedSlot = (arguments_: ReadonlyArray<GenericArgument>): Nominal => ({
+  _tag: 'NominalType',
+  module: 'Intrinsic',
+  name: 'Slot',
+  arguments: Array.from(arguments_),
+  sealed: 'Intrinsic.Slot',
+})
+
 const sealedSharedCore = (arguments_: ReadonlyArray<GenericArgument>): Nominal => ({
   _tag: 'NominalType',
   module: 'Intrinsic',
@@ -817,6 +844,12 @@ export const specializeNominal = (
   arguments_: ReadonlyArray<GenericArgument>,
 ): Nominal => {
   switch (self.sealed) {
+    case 'Intrinsic.Allocation':
+      return sealedAllocation()
+    case 'Intrinsic.RawBuffer':
+      return sealedRawBuffer(arguments_)
+    case 'Intrinsic.Slot':
+      return sealedSlot(arguments_)
     case 'Intrinsic.SharedCore':
       return sealedSharedCore(arguments_)
     case 'Intrinsic.Execution':
@@ -848,7 +881,7 @@ export const layout: Nominal = nominal('silk/layout', 'Layout')
 export const invalidAlignment: Nominal = nominal('silk/layout', 'InvalidAlignment')
 export const layoutOverflow: Nominal = nominal('silk/layout', 'LayoutOverflow')
 /** A self-contained affine owner carrying one private active reclaim ticket. */
-export const allocation: Nominal = nominal('silk/core', 'Allocation')
+export const allocation: Nominal = sealedAllocation()
 /** Opaque affine native file-or-directory handle used only by unsafe OS intrinsics. */
 /** Compiler-sealed cleanup capability used only by restricted impl declarations. */
 export const dropCapability: Nominal = nominal('silk/core', 'Drop')
@@ -857,10 +890,10 @@ export const copyCapability: Nominal = nominal('silk/core', 'Copy')
 /** The canonical empty success value used by effect-free cleanup operations. */
 export const unit: Nominal = nominal('silk/core', 'Unit')
 /** Compiler-checked typed raw storage owned independently from its allocator provider. */
-export const rawBuffer = (element: Type): Nominal => nominal('silk/core', 'RawBuffer', [element])
+export const rawBuffer = (element: Type): Nominal => sealedRawBuffer([element])
 /** A lexical exclusive projection into one RawBuffer element. */
 export const slot = (element: Type, lifetime: Lifetime.Lifetime): Nominal =>
-  nominal('silk/core', 'Slot', [lifetime, element])
+  sealedSlot([lifetime, element])
 /** The compiler-sealed local strong handle identity. Its representation is intentionally opaque. */
 export const sharedCore = (element: Type): Nominal => sealedSharedCore([element])
 /** Opaque affine owner-neutral execution identity. Runtime layout belongs to the packaging slice. */
@@ -895,11 +928,10 @@ export const failureValue = (failures: ReadonlyArray<Type>): Type => {
 export const isRawBuffer = (
   self: Type,
 ): self is Nominal & {
-  readonly module: 'silk/core'
-  readonly name: 'RawBuffer'
+  readonly sealed: 'Intrinsic.RawBuffer'
   readonly arguments: readonly [Type]
 } => {
-  if (!isNominal(self) || self.module !== 'silk/core' || self.name !== 'RawBuffer') return false
+  if (!isNominal(self) || self.sealed !== 'Intrinsic.RawBuffer') return false
   const argument = self.arguments.at(0)
   return self.arguments.length === 1 && argument !== undefined && isTypeArgument(argument)
 }
@@ -907,11 +939,10 @@ export const isRawBuffer = (
 export const isSlot = (
   self: Type,
 ): self is Nominal & {
-  readonly module: 'silk/core'
-  readonly name: 'Slot'
+  readonly sealed: 'Intrinsic.Slot'
   readonly arguments: readonly [Lifetime.Lifetime, Type]
 } => {
-  if (!isNominal(self) || self.module !== 'silk/core' || self.name !== 'Slot') return false
+  if (!isNominal(self) || self.sealed !== 'Intrinsic.Slot') return false
   const lifetime = self.arguments.at(0)
   const argument = self.arguments.at(1)
   return (
@@ -1013,11 +1044,11 @@ export const containsStaticPhaseOnly = (self: Type): boolean => {
 }
 
 export const intrinsicNominals: ReadonlyMap<string, Nominal> = new Map([
-  [allocation.name, allocation],
+  ['Intrinsic.Allocation', allocation],
   [copyCapability.name, copyCapability],
   [dropCapability.name, dropCapability],
-  ['RawBuffer', nominal('silk/core', 'RawBuffer')],
-  ['Slot', nominal('silk/core', 'Slot')],
+  ['Intrinsic.RawBuffer', sealedRawBuffer([])],
+  ['Intrinsic.Slot', sealedSlot([])],
   ['Intrinsic.SharedCore', sealedSharedCore([])],
   ['Intrinsic.Execution', sealedExecution([])],
   ['Intrinsic.ExecutionRef', sealedExecutionRef()],
@@ -1033,10 +1064,10 @@ export const intrinsicNominals: ReadonlyMap<string, Nominal> = new Map([
 
 /** Returns the compiler-known generic arity of an intrinsic nominal actor. */
 export const intrinsicNominalArity = (self: Nominal): number => {
-  if (self.module === 'silk/core' && self.name === 'Slot') return 2
+  if (self.sealed === 'Intrinsic.Slot') return 2
   if (self.sealed === 'Intrinsic.Field') return 2
   if (
-    (self.module === 'silk/core' && self.name === 'RawBuffer') ||
+    self.sealed === 'Intrinsic.RawBuffer' ||
     self.sealed === 'Intrinsic.SharedCore' ||
     self.sealed === 'Intrinsic.Execution' ||
     self.sealed === 'Intrinsic.Type' ||
@@ -1050,7 +1081,7 @@ export const intrinsicNominalArity = (self: Nominal): number => {
 
 /** Declared binders of the sealed lexical slot, used by ordinary header elaboration. */
 export const intrinsicNominalParameters = (self: Nominal): ReadonlyArray<Parameter> | undefined =>
-  self.module === 'silk/core' && self.name === 'Slot'
+  self.sealed === 'Intrinsic.Slot'
     ? [parameter(self, 0, "'storage", 'Lifetime'), parameter(self, 1, 'T')]
     : undefined
 export const intrinsicNominalOrdinal = (self: Nominal): number =>
