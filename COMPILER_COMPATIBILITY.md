@@ -1243,30 +1243,6 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   three sites; with #1508, bootstrap CallableResultCases passes 60/0.
 - **Open questions:** none.
 
-### Owner type-argument placement
-
-- **Status:** Approved by Julia on 2026-10-11; the reference states it as GEN-008 (#1510).
-  Implemented in both compilers; rejecting the old spelling is unimplemented.
-- **Rule:** GEN-008 writes a generic owner's arguments on the owner and a member's own arguments on
-  the member: `Option<i32>.map<String>(f)`, not `Option.map<i32, String>(f)`. A written owner
-  application is a complete type except that it may omit the owner's lifetimes, which the call
-  infers. An owner parameter the member does not name takes any type that satisfies the impl's
-  bounds.
-- **Compilers:** the bootstrap binds an owner application to the impl's or service's binders by
-  position and reports an incomplete one (SEM0051). The native frontend accepts complete owner
-  applications on inherent members and services, infers the lifetimes an inherent owner application
-  omits (#1496), and takes a section's impl binders from the application (#1513). A service
-  application cannot omit a lifetime natively. Both still accept the member-prefix spelling.
-- **Source migration:** `packages/compiler/scripts/migrate-type-argument-placement.mjs` rewrites the
-  member-prefix spelling and reports every site it cannot write without guessing. The stdlib, tests,
-  documentation and examples are migrated; `compiler/src` migrates on `selfhost` next.
-- **Diagnostics and limits:** the placement diagnostic that rejects the member-prefix spelling is not
-  implemented yet; retire this entry when both compilers report it.
-- **Evidence:** `InherentImpl.test.ts`; `SemanticLoweringCases::ownerApplicationInfersOmittedLifetimes`
-  and `ownerApplicationSectionsTakeImplBindersFromTheApplication`; corpus program
-  `owner-application-member-calls`.
-- **Open questions:** none.
-
 ## Maintaining this file
 
 - Add an entry when a language change is approved that existing library or program source, or

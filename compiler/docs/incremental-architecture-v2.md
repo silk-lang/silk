@@ -325,12 +325,14 @@ Differences from Zig, each deliberate:
 
 **Hash.** 128 bits, non-cryptographic, word at a time, streaming over tokens. The backend already
 names symbols by two seeded 64-bit hashes (`backend/InstanceKey.silk:676-678`, byte at a time
-through `InternIndex.hashBytes`, `semantic/InternIndex.silk:100`). The fingerprint hash should be
-a new stdlib function that processes eight bytes per step. **[assumption]** At 128 bits, the
-chance of any collision among 10^7 fingerprints is about 10^14 / 2^129, below 10^-24. The threat
-model is accidental collision; a deliberately colliding source file is out of scope, as it is for
-Zig's truncated BLAKE3 (audit §2). If Julia wants adversarial resistance, BLAKE3 truncated to 128
-bits is the alternative, at several times the cost per byte.
+through `InternIndex.hashBytes`, `semantic/InternIndex.silk:100`). The fingerprint hash is
+`semantic/ContentHash.silk`: SipHash-1-3 with a 128-bit output and a zero key, eight bytes per
+step, as rustc's stable hasher uses. It was pulled forward from slice 4 to name emission subjects in
+place of SHA-256. **[assumption]** At 128 bits, the chance of any accidental collision among 10^7
+fingerprints is about 10^14 / 2^129, below 10^-24. A collision means wrong artifact reuse, so
+crafted inputs matter too. MurmurHash3 was faster but has seed-independent multicollision
+constructions (Aumasson and Bernstein, 2012); SipHash has no known practical collision
+construction, so a crafted collision costs a generic 2^64 search.
 
 **Cost.** **[measured]** The self-build reads 184 modules totalling 7.3 MB (the compiler's
 non-test sources plus the stdlib modules it imports). A grep approximation counts about 7,700 named
@@ -1119,8 +1121,13 @@ it. **Expected [measured upper bound]:** about 16% of the remaining user time an
 (§1.3); skipping `BodyInput` work may add to it.
 
 **Slice 3, the session and the graph at module granularity.** The `Recorder` with its early return,
-unit states and revision stamps, the edge array, dependee maps and free list, and update steps 1 to
-5 with one input kind, `SourceFile(M)` by file fingerprint. It deletes the evidence machinery that
+the edge array, dependee maps and free list, and `Semantic.update` with one input kind,
+`SourceFile(M)`. Until slice 4 brings the fingerprint hash, a changed file is detected by comparing
+its exact bytes, which the source store retains anyway; `SourceRevision.Observation` survives only
+as that record of a module's bytes or absence. Without cutoff a rerun result always counts as
+changed, so every transitive consumer of an outdated unit would rerun after pull verification:
+slice 3 marks them outdated at once (push marking), and units have three states, absent, up to date
+and outdated, with no revision stamps. `silkc build --stats` prints the §9.4 counters. It deletes the evidence machinery that
 slice 2 only stopped recording: `Answer.sources`, `Answer.footprint`, `Answer.identity`,
 `Answer.answerId`, `Answer.bodyEvidence`, `SourceFrame`, `mergeEvidence`, `appendObservation`,
 `validAnswer`, `BodyDependency`, `BodyCandidate`, `reuseBody`, `priorCandidate`, `BodyInput`'s text
@@ -1145,7 +1152,11 @@ equal a fresh store's.
   even when byte offsets stay equal, without rerunning the body.
 
 **Slice 5, semantic cutoff.** `HeaderOf`, `ValueOf`, `Realization` and `LayoutOf` comparisons,
-backdating, potentially-outdated verification. Acceptance:
+backdating, potentially-outdated verification. Cutoff is what makes pull verification pay, so the
+`potentiallyOutdated` state, the `changedAt` and `verifiedAt` stamps of §6.2 and step 4 of §6.1
+arrive here. Verifying a unit re-demands each unit it consumed by that unit's interned key, so the
+key's demand context (application, profile slot, static condition and origin context) must be
+restored for the re-demand. Acceptance:
 
 - `memberRevisionClaims` (`SemanticSignatureCases.silk` on #1359's branch): exactly 5 `Body` starts;
 - `sealedProfileQueriesSelectStaticIf`: an appended unrelated `fn` does not restart a `static if`

@@ -441,6 +441,8 @@ export const invalidTestDeclarationCode = 'SEM0218' as const
 export const unsupportedLoweringCode = 'SEM0219' as const
 /** A sealed Drop or Copy head names `'static`, repeats one region, or bounds a region. */
 export const regionSelectiveConformanceCode = 'SEM0220' as const
+/** A member list follows an unwritten owner whose parameters the member uses (GEN-008). */
+export const ownerArgumentPlacementCode = 'SEM0221' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -485,6 +487,7 @@ export type Code =
   | typeof invalidTestDeclarationCode
   | typeof unsupportedLoweringCode
   | typeof regionSelectiveConformanceCode
+  | typeof ownerArgumentPlacementCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -980,6 +983,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly head: string
       readonly selection: string
     }
+  | { readonly _tag: 'OwnerArgumentPlacement'; readonly owner: string; readonly member: string }
   | {
       readonly _tag: 'UnprovenConformance'
       readonly goal: string
@@ -4737,6 +4741,23 @@ export const regionSelectiveConformance = <L>(
   span,
   notes: [
     'A sealed Drop or Copy head gives every region position its own unbounded binder, because lifetimes never decide which code runs.',
+  ],
+})
+
+export const ownerArgumentPlacement = <L>(
+  owner: string,
+  member: string,
+  span: L,
+): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: ownerArgumentPlacementCode,
+  severity: 'error',
+  message: `${owner}.${member} uses ${owner}'s parameters, so its type arguments follow a written owner: ${owner}<...>.${member}<...>`,
+  reason: { _tag: 'OwnerArgumentPlacement' as const, owner, member },
+  span,
+  notes: [
+    "A member's written list binds only its own parameters, and the owner's arguments are written on the owner.",
   ],
 })
 
