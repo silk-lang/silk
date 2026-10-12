@@ -9769,6 +9769,8 @@ const analyzeAnonymousCallable = (
     initial.fact,
     (path) => {
       const resolved = resolvers.type(AuthoredWalk.moduleName(context), path)
+      const aliased = DeclarationResolution.aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -9787,6 +9789,10 @@ const analyzeAnonymousCallable = (
     node._tag === 'CallableExpression'
       ? DeclarationCollection.anonymousDeclaration(node)
       : undefined,
+    (path) =>
+      DeclarationResolution.borrowedAliasUse(
+        resolvers.type(AuthoredWalk.moduleName(context), path).fact,
+      ),
   )
   const collected = {
     ...initial,
