@@ -2721,7 +2721,7 @@ effect fn runLimitCase<'a>(
 ? &mut Allocator | &mut Random {
   if id <= 9 {
     return run limitsCase(id, master, accepted, rejected)
-      |> Effect.provideMut<Allocator>(audit)
+      |> Effect.provideMut<Allocator>(&mut audit)
   }
   return run limitsCase(id, master, accepted, rejected)
 }

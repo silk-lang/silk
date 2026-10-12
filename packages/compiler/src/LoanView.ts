@@ -193,7 +193,15 @@ export type Expression =
       readonly _tag: 'Match'
       readonly access: Match.Access
       readonly scrutinee: Expression
-      readonly arms: ReadonlyArray<{ readonly guard?: Expression; readonly body: ArmBody }>
+      readonly arms: ReadonlyArray<{
+        readonly guard?: Expression
+        readonly body: ArmBody
+        /** Each binding the arm's pattern declares and its field path from the scrutinee. */
+        readonly bindings: ReadonlyArray<{
+          readonly id: Tir.LocalId
+          readonly path: ReadonlyArray<DeclarationFacts.FieldId>
+        }>
+      }>
     })
   | (Base & {
       readonly _tag: 'Operator'
@@ -964,6 +972,7 @@ export const ofTir = (
           scrutinee: expression(node.scrutinee),
           arms: node.arms.map((arm) => ({
             ...(arm.guard === undefined ? {} : { guard: expression(arm.guard) }),
+            bindings: arm.bindings.map((binding) => ({ id: binding.id, path: binding.path })),
             body:
               arm.body._tag === 'Expression'
                 ? { _tag: 'Expression' as const, expression: expression(arm.body.expression) }
