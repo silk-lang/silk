@@ -227,14 +227,12 @@ const templateRanges = (text) => {
   return ranges
 }
 
-const files = (path) =>
-  statSync(path).isDirectory()
-    ? readdirSync(path).flatMap((entry) =>
-        entry === 'node_modules' || entry === 'dist' ? [] : files(join(path, entry)),
-      )
-    : /\.(silk|tsx?|md)$/.test(path)
-      ? [path]
-      : []
+const files = (path) => {
+  if (!statSync(path).isDirectory()) return /\.(silk|tsx?|md)$/.test(path) ? [path] : []
+  return readdirSync(path).flatMap((entry) =>
+    entry === 'node_modules' || entry === 'dist' ? [] : files(join(path, entry)),
+  )
+}
 
 const program = Effect.gen(function* () {
   const write = process.argv.includes('--write')
