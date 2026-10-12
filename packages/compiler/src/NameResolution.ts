@@ -494,7 +494,7 @@ export const lookupQualified = (
 ): Lookup => {
   const span = Location.at(anchor)
   const qualifier = lookup(scope, index, namespace, initiator)
-  // A public declaration of the sealed operator source is an `Intrinsic` member (INTR-008).
+  // A public declaration of the sealed operator source is an `Intrinsic` member (INTR-007).
   if (qualifier._tag === 'Intrinsic' && qualifier.actor === 'Intrinsic') {
     const sealed = canonicalDeclaration(index, Stdlib.sealedModule.module, member)
     if (sealed !== undefined && sealed.visibility === 'Public')

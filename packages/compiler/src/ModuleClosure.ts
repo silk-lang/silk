@@ -288,7 +288,7 @@ const analyzeModule = Effect.fnUntraced(function* (
     if (sourceSpelling === undefined)
       throw new RangeError('Available import path lost its source spelling')
     const span = context.spanOf(anchor)
-    // The sealed Intrinsic operator source is not a module path (INTR-008).
+    // The sealed Intrinsic operator source is not a module path (INTR-007).
     if (Stdlib.isSealed(module)) {
       const diagnostic = Diagnostic.unknownModule(module, span)
       diagnostics.push(diagnostic)

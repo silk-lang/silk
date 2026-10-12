@@ -500,7 +500,7 @@ let text = unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
 The namespace is sealed. Source cannot declare, import as, alias as, shadow, reopen, or extend
 `Intrinsic`. A `type` alias may name an individual member under TYPE-004; that names the member and
 does not alias the namespace. A provider may conform to a sealed interface member under that
-interface's own rule (INTR-008); the conformance adds no member to the namespace. Its operations have canonical compiler identities
+interface's own rule (INTR-007); the conformance adds no member to the namespace. Its operations have canonical compiler identities
 independent of source paths or packages.
 
 An ordinary actor or function with a matching member spelling receives no privilege:
@@ -742,7 +742,7 @@ of the same name.
 
 **Evidence:** [type alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).
 
-### INTR-008 — The operator interfaces are sealed `Intrinsic` interfaces with ordinary conformance
+### INTR-007 — The operator interfaces are sealed `Intrinsic` interfaces with ordinary conformance
 
 **Status:** Confirmed
 
@@ -814,7 +814,7 @@ members.
 **Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),
 [module closure tests](../../../../packages/compiler/test/ModuleClosure.test.ts).
 
-### INTR-009 — Scalar operator conformances are sealed built-ins
+### INTR-008 — Scalar operator conformances are sealed built-ins
 
 **Status:** Confirmed
 
@@ -832,7 +832,7 @@ while `Order.compare` is total.
 because IMPL-004 places it in the interface's module. When it overlaps a sealed conformance, the
 duplicate is also reported as `SEM0083`.
 
-**Current compiler:** Partially aligned, as INTR-008.
+**Current compiler:** Partially aligned, as INTR-007.
 
 **Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts).
 

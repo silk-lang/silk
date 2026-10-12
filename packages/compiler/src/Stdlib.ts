@@ -71,7 +71,7 @@ export const sources: ReadonlyMap<string, Uint8Array> = new Map(
 )
 
 /**
- * The sealed `Intrinsic` operator source (INTR-008). It is compiler-owned rather than a manifest
+ * The sealed `Intrinsic` operator source (INTR-007). It is compiler-owned rather than a manifest
  * module: a closure loads it from these embedded bytes, no resolver is consulted for it, and no
  * import may name it. Its public declarations are reachable only as `Intrinsic.<Name>`.
  */
