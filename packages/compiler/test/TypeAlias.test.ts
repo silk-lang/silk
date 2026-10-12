@@ -503,3 +503,34 @@ pub fn main() -> i32 {
     )
   }),
 )
+
+it.effect('names enum members through an alias and a module qualifier', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`import silk.order
+import silk.order { Order, Ordering }
+enum Level { Low, High }
+type Tier = Level
+type Ord = Ordering
+fn pick(flag: bool) -> Tier {
+  if flag { return Tier.High }
+  return Tier.Low
+}
+fn rank(tier: Tier) -> i32 {
+  return match tier {
+    Tier.Low => 1
+    Tier.High => 2
+  }
+}
+fn compared(left: &i32, right: &i32) -> bool {
+  let ordering = Order.compare(left, right)
+  return ordering == Ord.Less || ordering == order.Ordering.Greater
+}
+pub fn main() -> i32 {
+  let low = 1
+  let high = 2
+  if compared(&low, &high) { return rank(pick(true)) + 40 }
+  return 0
+}`)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
