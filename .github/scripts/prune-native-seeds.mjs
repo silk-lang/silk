@@ -22,7 +22,12 @@ const lines = (text) => text.split('\n').filter(Boolean)
 // A historical pin may predate the Release-only shape; only a release tag names a seed.
 const pinnedTag = (commit) => {
   try {
-    const tag = JSON.parse(run('git', ['show', `${commit}:${pinPath}`])).seed?.tag
+    // A commit older than the pin file has no pin; git's complaint about the missing path is noise.
+    const pin = execFileSync('git', ['show', `${commit}:${pinPath}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const tag = JSON.parse(pin).seed?.tag
     return typeof tag === 'string' && candidateTag.test(tag) ? tag : undefined
   } catch {
     return undefined
