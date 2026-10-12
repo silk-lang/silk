@@ -3257,6 +3257,32 @@ pub fn inspect(result: Result<i32, bool>) -> i32 {
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })
 
+it('nests applied union variant patterns inside nominal and variant field patterns', () => {
+  const source = `fn inspect(slot: Slot, form: Form) -> i32 {
+  let first = match move slot {
+    Slot { choice: Choice<i32>.Held { value }, marker } => value
+    Slot { choice: Choice<i32>.Vacant, .. } => 0
+  }
+  return match move form {
+    Form.Move { value: moved, consumed: Option<Place>.None } => first
+    Form.Move { consumed: Option<Place>.Some { value: place }, .. } => 1
+    Form.Other => 2
+  }
+}`
+  const result = parseText('memory/nested-variant-patterns', source)
+  const nestedVariants = descendants(result.root).filter(
+    (element): element is SyntaxTree.Node =>
+      SyntaxTree.isNode(element) &&
+      element.kind === 'PatternField' &&
+      SyntaxTree.directNode(element, 'UnionVariantPattern') !== undefined,
+  )
+
+  assert.strictEqual(nestedVariants.length, 4)
+  assert.deepEqual(result.parserDiagnostics, [])
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('accepts empty field blocks and recovers at sibling variants and declarations', () => {
   const source =
     'union Broken { Empty {}, Good, Bad { value: }, Last { value: i32 } } pub fn after() -> i32 { return 1 }'
