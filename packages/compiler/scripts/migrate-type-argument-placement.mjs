@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 // Moves owner type arguments from `Owner.member<...>(...)` onto the owner (GEN-008).
 //
-//   node scripts/migrate-type-argument-placement.mjs [--write] <file or directory>...
+//   node scripts/migrate-type-argument-placement.mjs [--write | --check] <file or directory>...
 //
-// Without --write it only reports. A site `Owner.member<Args>(` is rewritten when `Owner.member`
-// is an inherent member or service operation of a generic owner and the written list starts with
-// owner arguments: `Option.map<i32, i64>(f)` becomes `Option<i32>.map<i64>(f)`. Standard-library
-// owners are classified from a semantic analysis of the stdlib (run `pnpm build` first). Owners
-// declared in the file being migrated, such as test fixtures, are classified from their `impl` and
-// `service` headers in that file, and shadow a standard-library owner of the same name there.
+// Without --write it only reports. With --check it also exits nonzero when any site remains to be
+// rewritten or reported, so a migrated tree prints `no sites` and exits zero. A site
+// `Owner.member<Args>(` is rewritten when `Owner.member` is an inherent member or service operation
+// of a generic owner and the written list starts with owner arguments: `Option.map<i32, i64>(f)`
+// becomes `Option<i32>.map<i64>(f)`. Standard-library owners are classified from a semantic
+// analysis of the stdlib (run `pnpm build` first). Owners declared in the file being migrated, such
+// as test fixtures, are classified from their `impl` and `service` headers in that file, and shadow
+// a standard-library owner of the same name there.
 //
 // A site whose rewrite would need an owner argument the call does not write is reported and left
 // unchanged: a member that does not name every owner parameter, a written list that covers only
 // part of the owner, or an owner with conflicting declarations in one file. In a TypeScript file
-// only template literals, which hold the embedded Silk sources, are migrated. A site on a line whose
-// `//` comment contains `invalid:` is an intentional counterexample and is left alone. The script
-// is idempotent. Format rewritten `.silk` files with the native formatter afterwards.
+// only template literals, which hold the embedded Silk sources, are migrated. A site on a line
+// whose `//` comment contains `invalid:` is an intentional counterexample and is left alone. The
+// script is idempotent. Format rewritten `.silk` files with the native formatter afterwards.
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import * as Effect from 'effect/Effect'
@@ -236,7 +238,10 @@ const files = (path) => {
 
 const program = Effect.gen(function* () {
   const write = process.argv.includes('--write')
-  const roots = process.argv.slice(2).filter((argument) => argument !== '--write')
+  const check = process.argv.includes('--check')
+  const roots = process.argv
+    .slice(2)
+    .filter((argument) => argument !== '--write' && argument !== '--check')
   const stdlib = yield* stdlibMembers
   const counts = new Map()
   const reported = []
@@ -289,6 +294,10 @@ const program = Effect.gen(function* () {
   process.stdout.write(
     [...reported, ...(summary.length === 0 ? ['no sites'] : summary)].join('\n') + '\n',
   )
+  if (check && summary.length > 0) {
+    process.stderr.write('check failed: unmigrated owner type arguments remain\n')
+    process.exitCode = 1
+  }
 })
 
 Effect.runPromise(program).catch((error) => {
