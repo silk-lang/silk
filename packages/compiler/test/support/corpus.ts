@@ -10457,6 +10457,34 @@ pub fn main() -> i32 {
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'method-receiver-reference-reborrow',
+    source: `struct Counter { value: i32 }
+impl Counter {
+  fn read(self: &Self) -> i32 { return self.value }
+  fn bump(self: &mut Self) -> () { self.value = self.value + 1 }
+  fn slot(self: &mut Self) -> &mut i32 { return &mut self.value }
+}
+struct Pair { left: i32 right: i32 }
+impl Copy for Pair {}
+impl Pair { fn sum(self: Self) -> i32 { return self.left + self.right } }
+fn step(counter: &mut Counter) -> i32 {
+  counter.bump()
+  counter.bump()
+  let slot = counter.slot()
+  slot.* = slot.* + 1
+  return counter.read()
+}
+fn inspect(counter: &Counter, pair: &Pair) -> i32 { return counter.read() + pair.sum() + pair.sum() }
+pub fn main() -> i32 {
+  let mut counter = Counter { value: 30 }
+  let stepped = step(&mut counter)
+  let pair = Pair { left: 1, right: 2 }
+  if stepped != 33 || inspect(&counter, &pair) != 39 { return 1 }
+  return 42
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'runtime-slice-shared-subranges',
     source: `import silk.slice { Slice }
 fn rebind<'a>(flag: bool, original: &'a [i32], replacement: &'a [i32]) -> bool {
