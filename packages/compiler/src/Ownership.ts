@@ -1298,6 +1298,16 @@ const checkExpressionOperation = (
       )
         return false
       return true
+    // Comparisons and enum or string views read their operands without consuming them, so a
+    // moved operand is a use after move (OWN-003).
+    case 'EnumEquality':
+    case 'StringEquality':
+      if (!checkExpression(state, live, expression.left, false, guard, escaping)) return false
+      return checkExpression(state, live, expression.right, false, guard, escaping)
+    case 'EnumValue':
+      return checkExpression(state, live, expression.value, false, guard, escaping)
+    case 'RuntimeStringView':
+      return checkExpression(state, live, expression.source, false, guard, escaping)
     case 'ShortCircuit': {
       if (!checkExpression(state, live, expression.left, false, guard, escaping)) return false
       const rightLive = new Map(live)
@@ -2467,11 +2477,16 @@ const analyzeLoans = (
   }
   const viewRoots = new Map<number, ReadonlyArray<LoanReferent>>()
   const viewAliases = new Map<number, ReadonlyArray<number>>()
+  // A binding of `match place`, `&` or `&mut` names the selected payload in the scrutinee's own
+  // place (MATCH-002), so its borrows and loans are rooted there.
+  const patternRoots = new Map<string, ReadonlyArray<LoanReferent>>()
   const rootsOf = (
     root: BindingSite,
     path: ReadonlyArray<ReferentSelector> = [],
   ): ReadonlyArray<LoanReferent> => {
-    const sources = root._tag === 'Let' ? viewRoots.get(root.binding.ordinal) : undefined
+    let sources: ReadonlyArray<LoanReferent> | undefined
+    if (root._tag === 'Let') sources = viewRoots.get(root.binding.ordinal)
+    else if (root._tag === 'Pattern') sources = patternRoots.get(siteKey(root))
     return sources === undefined
       ? [{ root, path }]
       : sources.map((source) => ({ root: source.root, path: [...source.path, ...path] }))
@@ -2554,7 +2569,8 @@ const analyzeLoans = (
       // it retains. Only reborrow formations inherit the descriptor's referent authority.
       return projectedReferent ||
         formation._tag === 'ValueReborrow' ||
-        formation._tag === 'SliceReborrow'
+        formation._tag === 'SliceReborrow' ||
+        root._tag === 'Pattern'
         ? rootsOf(root, formation.root.path)
         : [{ root, path: formation.root.path }]
     }
@@ -2670,6 +2686,27 @@ const analyzeLoans = (
     // No type-keyed origin or guessed physical-cell loan completes it here.
     return []
   }
+  LoanView.visitExpressions(fn.statements, (expression) => {
+    if (
+      expression._tag !== 'Match' ||
+      (expression.access !== 'Shared' &&
+        expression.access !== 'Exclusive' &&
+        expression.access !== 'Place')
+    )
+      return
+    const place = physicalPlace(expression.scrutinee)
+    if (place === undefined) return
+    const span = context.spanOf(expression.scrutinee.anchor)
+    for (const arm of expression.arms)
+      for (const binding of arm.bindings)
+        patternRoots.set(
+          siteKey({ _tag: 'Pattern', binding: binding.id }),
+          rootsOf(place.root, [
+            ...place.path,
+            ...binding.path.map((field) => ({ _tag: 'Field' as const, field, span })),
+          ]),
+        )
+  })
   for (const binding of bindings) {
     if (
       binding.inferredType._tag !== 'Available' ||

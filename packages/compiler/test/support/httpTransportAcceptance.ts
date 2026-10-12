@@ -75,16 +75,16 @@ fn limits() -> Limits {
 effect fn providerFor(inputBytes: &[u8], writeCount: usize) -> MemoryByteDuplex
 ! OutOfMemoryError ? &mut Allocator {
  let input = run Bytes.copy(inputBytes)
- let mut reads = Vector.make<MemoryReadEvent>()
+ let mut reads = Vector<MemoryReadEvent>.make()
  run Vector.append(&mut reads, MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move input})
  run Vector.append(&mut reads, MemoryReadEvent.End {readyAt: SystemClock.make(0, 0)})
- let mut writes = Vector.make<MemoryWriteEvent>()
+ let mut writes = Vector<MemoryWriteEvent>.make()
  let mut index = usize.ZERO
  while index < writeCount {
   run Vector.append(&mut writes, MemoryWriteEvent {readyAt: SystemClock.make(0, 0), action: MemoryWriteAction.Accept {count: 65535}})
   index = index + usize.ONE
  }
- return run MemoryByteDuplex.make(move reads, move writes, 4096, 128, Option.none<i32>())
+ return run MemoryByteDuplex.make(move reads, move writes, 4096, 128, Option<i32>.none())
 }
 struct TlsClock {}
 impl MonotonicClock for TlsClock {
@@ -135,7 +135,7 @@ impl ConnectionHandler<TlsTransport, i32, ClientError | RequestError | OutOfMemo
   let headers = match move Headers.make(&entries, valueLimits()) { Result.Failure {error} => { drop error return 32 } Result.Success {value} => value }
   let policy = HeaderPolicy.defaults()
   let request = run Request.fromUri(&uri, Version.Http11, Method.get(), &headers, &policy, BodyMode.Empty, false, valueLimits(), 1024, 512)
-  let options = RequestOptions {deadline: Option.none<Instant>(), continuePolicy: ContinuePolicy.Disabled}
+  let options = RequestOptions {deadline: Option<Instant>.none(), continuePolicy: ContinuePolicy.Disabled}
   return run Client.withExchange(&mut connection.*, &request, move options, exchange)
  }
 }
@@ -170,7 +170,7 @@ effect fn authenticatedExchange() -> i32 ! ClientError | RequestError | Connecti
    |> Effect.provideMut<Allocator>(&mut allocator)
  let uri = match move Uri.parse("https://example.com/") { Result.Failure {error} => { drop error return 36 } Result.Success {value} => value }
  let origin = match move Origin.fromUri(&uri) { Result.Failure {error} => { drop error return 37 } Result.Success {value} => value }
- return run Client.withOwned(TlsTransport {inner: move authenticated}, origin, Version.Http11, limits(), Option.none<Instant>(), Handler {})
+ return run Client.withOwned(TlsTransport {inner: move authenticated}, origin, Version.Http11, limits(), Option<Instant>.none(), Handler {})
    |> Effect.provideMut<Random>(&mut random)
    |> Effect.provideMut<MonotonicClock>(&mut clock)
    |> Effect.provideMut<Allocator>(&mut allocator)
