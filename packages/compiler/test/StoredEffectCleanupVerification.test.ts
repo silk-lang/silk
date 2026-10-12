@@ -86,7 +86,7 @@ it.effect('rejects incomplete cleanup inside nested Effect and callable captures
   Effect.gen(function* () {
     const { catalog, module } = yield* lowerStored(
       'stored-effect-cleanup-verification/nested-executables',
-      `import silk.ownership { Drop }
+      `import silk.ownership {Drop}
 struct Token<F: once fn<'static>(i32) -> i32> { value: i32 marker: F }
 struct Deferred<F: once Effect<'static; i32>> { operation: F }
 fn marker(value: i32) -> i32 { return value }

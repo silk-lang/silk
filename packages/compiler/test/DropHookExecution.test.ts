@@ -39,7 +39,7 @@ pub fn main() -> i32 {
 }`
 
 /** A parametric Drop over a struct that is all-Copy at some instantiation. */
-const copyInstantiation = `import silk.ownership { Copy, Drop }
+const copyInstantiation = `import silk.ownership {Copy, Drop}
 struct Holder<T> {
   value: T
 }

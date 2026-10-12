@@ -1568,7 +1568,7 @@ it.effect('admits conditional interface-owned nominal heads and checks their ove
       [
         'contracts',
         `import model { Wrapper }
-import silk.ownership { Copy }
+import silk.ownership {Copy}
 interface Present { fn present(value: &Self) -> i32 }
 impl<T: Copy> Present for Wrapper<T> {
   fn present(value: &Self) -> i32 { return 1 }
@@ -1682,7 +1682,7 @@ it.effect('accepts Drop for unmarked structs and rejects malformed headers', () 
     const index = yield* collect('drop-hooks', [
       [
         'drop-hooks',
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Guard { allocation: Intrinsic.Allocation }
 struct CopyValue { value: i32 }
 struct Left { value: i32 }
@@ -1762,7 +1762,7 @@ it.effect('rejects user Copy and Drop conformances for sealed scalar enums', () 
     const index = yield* collect('root', [
       [
         'root',
-        `import silk.ownership { Copy, Drop }
+        `import silk.ownership {Copy, Drop}
 enum State { Ready }
 impl Copy for State {}
 impl Drop for State { fn drop(self: &mut State) -> () { return () } }`,
@@ -1791,7 +1791,7 @@ it.effect('rejects source Copy implementations for reference and structural prov
     const index = yield* collect('reference-copy', [
       [
         'reference-copy',
-        `import silk.ownership { Copy }
+        `import silk.ownership {Copy}
 impl Copy for &u32 {}
 impl Copy for &mut u32 {}
 impl Copy for u32 {}`,
@@ -1822,7 +1822,7 @@ it.effect('publishes Copy only from one valid empty sealed impl', () =>
     const index = yield* collect('copy-property', [
       [
         'copy-property',
-        `import silk.ownership { Copy, Drop }
+        `import silk.ownership {Copy, Drop}
 struct Point { x: i32, y: i32 }
 impl Copy for Point {}
 struct Token { value: i32 }
@@ -1886,12 +1886,11 @@ it.effect('validates Copy over every specialized nominal union variant field', (
     const index = yield* collect('union-copy', [
       [
         'union-copy',
-        `import silk.ownership { Copy }
-union Choice<T> { Empty, Present { value: T } }
-impl<T: Copy> Copy for Choice<T> {}
+        `union Choice<T> { Empty, Present { value: T } }
+impl<T: Intrinsic.Copy> Intrinsic.Copy for Choice<T> {}
 union Implicit { Left { value: i32 }, Right }
 union Owned { Empty, Present { allocation: Intrinsic.Allocation } }
-impl Copy for Owned {}`,
+impl Intrinsic.Copy for Owned {}`,
       ],
     ])
     const choice = (element: Type.Type): Type.Nominal =>
@@ -1917,7 +1916,7 @@ it.effect('indexes parametric conformances with bound parameters', () =>
     const index = yield* collect('parametric', [
       [
         'parametric',
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }
 pub fn main() -> i32 { return 0 }`,
@@ -1948,7 +1947,7 @@ it.effect('rejects unbound, duplicate, and overlapping parametric conformances',
     const unbound = yield* collect('parametric-unbound', [
       [
         'parametric-unbound',
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T, U> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }`,
       ],
@@ -1960,7 +1959,7 @@ impl<T, U> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () 
     const duplicate = yield* collect('parametric-duplicate', [
       [
         'parametric-duplicate',
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T, T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }`,
       ],
@@ -1973,7 +1972,7 @@ impl<T, T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () 
     const overlapping = yield* collect('parametric-overlap', [
       [
         'parametric-overlap',
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }
 impl<U> Drop for Vector<U> { fn drop(self: &mut Vector<U>) -> () { return () } }`,
@@ -2271,7 +2270,7 @@ it.effect('resolves raw pointer types in every position and proves them Copy wit
     const index = yield* collect('pointers', [
       [
         'pointers',
-        `import silk.ownership { Copy }
+        `import silk.ownership {Copy}
 struct Opaque {}
 struct Handle { raw: *mut Opaque }
 impl Copy for Handle {}
@@ -2844,7 +2843,7 @@ it.effect(
   'keeps ordinary exclusive access, abstract Drop storage, and callable invocation outcomes admitted',
   () =>
     Effect.gen(function* () {
-      const source = `import silk.ownership { Drop }
+      const source = `import silk.ownership {Drop}
 struct Cell { value: i32 }
 fn inspect(value: &mut Cell) -> i32 { return value.value }
 struct Guard<T> { value: T }

@@ -454,7 +454,7 @@ effect fn redirectReplayRowWitness(factory: &mut RedirectFactory) -> i32
 
 `
 
-const httpRedirectBehaviorSupport = `import silk.ownership { Copy }
+const httpRedirectBehaviorSupport = `import silk.ownership {Copy}
 fn redirectStatus(code: u16) -> Status {
   return match move Status.fromCode(code) {
     Result.Failure {error} => {

@@ -266,7 +266,7 @@ pub fn main() -> i32 { return run application(42) }`
 
 it.effect('preserves partial owner state across suspension and cancellation', () =>
   Effect.gen(function* () {
-    const source = `import silk.ownership { Drop }
+    const source = `import silk.ownership {Drop}
 struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Pair { left: Token right: Token }

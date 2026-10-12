@@ -72,7 +72,7 @@ const ownershipSource = `import silk.byte_duplex {ByteDuplex, ByteIoError}
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, AcceptedContext, AcceptedView, Connection, Listener, NativeSocketError, PeerAddress, accept, withAccepted, withAcceptedContext, withListener}
 import silk.option {Option}
-import silk.ownership { Copy }
+import silk.ownership {Copy}
 import silk.system_clock {Instant}
 
 impl Copy for Listener {}

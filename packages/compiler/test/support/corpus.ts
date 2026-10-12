@@ -752,7 +752,7 @@ pub fn main() -> i32 {
 }`
 
 /** Explicit referent projection preserves runtime-indexed reads and writes in native execution. */
-export const referenceProjectionAcceptance = `import silk.ownership { Copy }
+export const referenceProjectionAcceptance = `import silk.ownership {Copy}
 import silk.usize
 
 struct Empty {}
@@ -2560,7 +2560,7 @@ pub fn main() -> i32 {
   },
   {
     name: 'nominal-union-represented-copy-drop',
-    source: `import silk.ownership { Copy, Drop }
+    source: `import silk.ownership {Copy, Drop}
 union Parser<F: once fn<'static>(i32) -> i32> { Empty, Ready { parse: F } }
 union Deferred<F: once Effect<'static; i32>> { Empty, Ready { operation: F } }
 union Flag { Empty, Value { value: i32 } }
@@ -2698,7 +2698,7 @@ pub fn main() -> i32 { return run outer(Flag.No) }`,
   // changing the original Copy value after construction must not change its captured snapshot.
   {
     name: 'finite-effect-join-capture-arity',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct First {}
 struct Second {}
 struct Payload { a: i32 b: i32 c: i32 }
@@ -3544,7 +3544,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
   // matches, all-diverging arms, loop control from arms, whole-member bindings and a Copy bare match.
   {
     name: 'match-arm-blocks-and-bindings',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct Left { value: i32 }
 struct Right {}
 struct Token { value: i32 }
@@ -3611,7 +3611,7 @@ pub fn main() -> i32 {
   // redundant irrefutable `if let`, a nominal variant `if let`, and an irrefutable `let` record pattern.
   {
     name: 'pattern-conditionals-and-destructuring',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct Left { value: i32 }
 struct Right {}
 struct Point {
@@ -3682,7 +3682,7 @@ pub fn main() -> i32 {
   // through an explicit dereference, reborrowed exclusive references, and borrows of dereferences.
   {
     name: 'reference-projection-places',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct Empty {}
 impl Copy for Empty {}
 struct Buffer { values: [i32; 3] }
@@ -3718,7 +3718,7 @@ pub fn main() -> i32 {
   // value, and a consuming match with an empty-record arm.
   {
     name: 'structural-union-copy-members',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct Left { value: i32 }
 impl Copy for Left {}
 struct Right { marker: i32 value: i32 }
@@ -7274,7 +7274,7 @@ pub fn main() -> i32 {
     // EFF-013: distinct return sites join under the declared `once Effect<i32>`; each call runs
     // the alternative its own branch constructed.
     name: 'effect-return-site-join-once',
-    source: `import silk.ownership { Drop }
+    source: `import silk.ownership {Drop}
 struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
@@ -8525,7 +8525,7 @@ int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expec
     // 'static and local patterns each run the outer hook before the nested Token hook, and the
     // counters reject omitted or repeated cleanup.
     name: 'generic-lifetime-selected-cleanup',
-    source: `import silk.ownership { Drop }
+    source: `import silk.ownership {Drop}
 struct Token<'data> { value: i32 counter: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
   fn drop(self: &mut Token<'data>) -> () {
@@ -8594,7 +8594,7 @@ pub fn main() -> i32 {
   },
   {
     name: 'generic-record-instances',
-    source: `import silk.ownership { Copy, Drop }
+    source: `import silk.ownership {Copy, Drop}
 struct Token<'data> { drops: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
   fn drop(self: &mut Token<'data>) -> () {
@@ -9150,7 +9150,7 @@ int32_t silk_verify_drops(void) { puts(events); return 42; }
   },
   {
     name: 'partial-owner-cleanup-and-refinement',
-    source: `import silk.ownership { Drop }
+    source: `import silk.ownership {Drop}
 unsafe extern "C" fn silk_record_drop(value: i32) -> ()
 unsafe extern "C" fn silk_verify_drops() -> i32
 struct Token { value: i32 }
@@ -10546,7 +10546,7 @@ pub fn main() -> i32 {
   },
   {
     name: 'method-receiver-reference-reborrow',
-    source: `import silk.ownership { Copy }
+    source: `import silk.ownership {Copy}
 struct Counter { value: i32 }
 impl Counter {
   fn read(self: &Self) -> i32 { return self.value }

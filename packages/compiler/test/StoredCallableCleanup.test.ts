@@ -182,7 +182,7 @@ it.effect('classifies a captured Drop hook as effective without a reclaim ticket
     const module = 'stored-callable-cleanup/hook-only'
     const snapshot = yield* realized(
       module,
-      `import silk.ownership { Drop }
+      `import silk.ownership {Drop}
 struct Guard<F: once fn<'static>(i32) -> i32> {
   tag: i32
   marker: F

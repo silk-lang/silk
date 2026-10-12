@@ -92,7 +92,7 @@ const source = `//! Coordinates recoverable work.
 //! - Operations preserve source order.
 //! - See [\`Recovery\`] for the provider contract.
 
-import silk.ownership { Copy }
+import silk.ownership {Copy}
 /// Recovers one numeric problem.
 ///
 /// # Details

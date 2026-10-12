@@ -183,7 +183,7 @@ it.effect('rejects sealed Drop and Copy heads that depend on regions', () =>
     // A bound the provider's declaration already requires holds for every value of the type, so a
     // head may repeat it. An interface bound is a region bound in disguise: `Box<Tag<'x>>` would
     // run its hook only when `'x` is `'static`.
-    const source = `import silk.ownership { Copy, Drop }
+    const source = `import silk.ownership {Copy, Drop}
 interface Mark {}
 struct Lasting<'a> { value: &'a i32 }
 struct Pair<'a, 'b> { left: &'a i32 right: &'b i32 }

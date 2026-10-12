@@ -403,8 +403,8 @@ const analyzeConformance = (text: string) =>
 it.effect('replays conformance owner lifetimes and inherits them in inline operations', () =>
   Effect.gen(function* () {
     for (const head of [
-      "impl<'data, A: Copy> Read<A> for SliceStream<'data, A>",
-      'impl<A: Copy> Read<A> for SliceStream<A>',
+      "impl<'data, A: Intrinsic.Copy> Read<A> for SliceStream<'data, A>",
+      'impl<A: Intrinsic.Copy> Read<A> for SliceStream<A>',
     ]) {
       const snapshot = yield* analyzeConformance(`${elidedSliceStream}
 interface Read<A> { fn first(self: &Self) -> A }
@@ -456,7 +456,7 @@ impl Read for Holder { pub fn value(self: &Self) -> i32 { return 0 } }`
       Analysis.diagnostics(arity).find((entry) => entry.code === 'SEM0051') ??
       unreachable('expected missing ordinary argument diagnostic')
     assert.strictEqual(diagnostic.span.start, aritySource.indexOf('Holder {'))
-    const bound = yield* analyzeConformance(`import silk.ownership { Copy }
+    const bound = yield* analyzeConformance(`import silk.ownership {Copy}
 struct Token { value: i32 }
 struct Holder<A> { value: &A }
 interface Read { fn value(self: &Self) -> i32 }

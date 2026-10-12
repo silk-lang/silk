@@ -81,7 +81,7 @@ it.effect(
     Effect.gen(function* () {
       const snapshot = yield* AnalysisFixture.retainingMain(
         'input-view/stored-producer',
-        bytes(`import silk.ownership { Drop }
+        bytes(`import silk.ownership {Drop}
 struct Owner { value: i32 }
 struct Guard { offset: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }

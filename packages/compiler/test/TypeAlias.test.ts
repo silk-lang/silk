@@ -434,7 +434,7 @@ pub fn main() -> i32 { return 0 }`
 fn keep(value: Copy) -> i32 { return value.value }
 pub fn main() -> i32 { return keep(Copy { value: 42 }) }`)
     assert.deepEqual(codes(declared), [], Json.stringify(messages(declared)))
-    const bound = yield* analyze(`import silk.ownership { Copy }
+    const bound = yield* analyze(`import silk.ownership {Copy}
 fn identity<Copy>(value: Copy) -> Copy { return move value }
 pub fn main() -> i32 { return identity(42) }`)
     assert.deepEqual(codes(bound), [], Json.stringify(messages(bound)))
