@@ -3091,7 +3091,19 @@ export const analyzeFunctionItem = (
     if (qualifierLookup._tag !== 'Namespace') return undefined
     const memberLookup = DeclarationFacts.lookup(resolution.index, qualifierLookup.module, member)
     let diagnostic: Diagnostic.Located | undefined
-    if (memberLookup._tag !== 'Resolved') {
+    const typeMember = DeclarationFacts.member(resolution.index, qualifierLookup.module, member)
+    if (
+      memberLookup._tag !== 'Resolved' &&
+      typeMember._tag === 'Resolved' &&
+      typeMember.declaration.visibility === 'Public' &&
+      NameResolution.isNominalOwner(typeMember.declaration)
+    ) {
+      diagnostic = Diagnostic.namespaceQualifiedType(
+        qualifierLookup.module,
+        member,
+        Location.at(memberToken.anchor),
+      )
+    } else if (memberLookup._tag !== 'Resolved') {
       diagnostic = Diagnostic.unknownImportedMember(
         qualifierLookup.module,
         member,
