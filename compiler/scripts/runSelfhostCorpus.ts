@@ -59,20 +59,23 @@ const buildTimeoutMs = 120_000
 const runTimeoutMs = 30_000
 
 const outputLimit = 4 * 1024 * 1024
+// A child that ignores SIGTERM past its deadline gets SIGKILL this much later.
+const killGraceMs = 5_000
 
 /** A finished child process, with `error` set when it could not start, timed out, or overflowed. */
 interface ProcessResult {
   readonly stdout: string
   readonly stderr: string
   readonly status: number | null
-  readonly signal: NodeJS.Signals | null
+  readonly signal: string | null
   readonly error?: Error
 }
 
 /**
  * Runs a child to completion with `spawnSync`'s contract: an empty closed standard input, both
  * outputs captured as UTF-8, and SIGTERM with an `ETIMEDOUT` or `ENOBUFS` error past the deadline
- * or the output limit. Unlike `spawnSync`, other cases keep running meanwhile.
+ * or the output limit, then SIGKILL if it outlives the grace period. Unlike `spawnSync`, other
+ * cases keep running meanwhile.
  */
 const runProcess = (
   command: string,
@@ -85,9 +88,11 @@ const runProcess = (
     const output = { stdout: '', stderr: '' }
     let bytes = 0
     let failure: Error | undefined
+    let kill: ReturnType<typeof setTimeout> | undefined
     const stop = (code: string): void => {
       failure ??= Object.assign(new Error(`spawn ${command} ${code}`), { code })
       child.kill('SIGTERM')
+      kill ??= setTimeout(() => child.kill('SIGKILL'), killGraceMs)
     }
     const timer = setTimeout(() => stop('ETIMEDOUT'), timeout)
     for (const stream of ['stdout', 'stderr'] as const) {
@@ -105,6 +110,7 @@ const runProcess = (
     })
     child.on('close', (status, signal) => {
       clearTimeout(timer)
+      clearTimeout(kill)
       resolveResult({
         ...output,
         status,
