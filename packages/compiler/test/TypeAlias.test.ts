@@ -207,6 +207,25 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
+it.effect('rejects an omitted lifetime in an alias target at the alias', () =>
+  Effect.gen(function* () {
+    const source = `type Plain = &i32
+type Generic<T> = &T
+fn plain(value: Plain) -> i32 { return 0 }
+fn generic(value: Generic<i32>) -> i32 { return 0 }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&T')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
 it.effect('rejects bounded, row-kind and unused generic alias parameters at the parameter', () =>
   Effect.gen(function* () {
     const source = `interface Marker {}

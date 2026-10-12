@@ -3349,22 +3349,19 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
     )
     diagnostics.push(...typeParameters.diagnostics)
     if (header._tag === 'AliasHeader') {
-      // A generic alias's target is analyzed over the alias's own parameters (TYPE-004); each use
-      // substitutes its written arguments for them.
-      const target = analyzeDeclaredType(
-        context,
-        header.target,
-        typeParameters.environment,
-        false,
-        typeParameters.lifetimeContext,
-      )
+      // A generic alias's target is analyzed over the alias's own written parameters (TYPE-004);
+      // each use substitutes its written arguments for them. An alias has no inputs to elide a
+      // lifetime from, so an omitted one in its target is rejected rather than made implicit.
+      const target = analyzeDeclaredType(context, header.target, typeParameters.environment)
       diagnostics.push(...target.diagnostics)
       return {
         _tag: 'AliasDeclaration',
         id,
         canonical,
         visibility,
-        typeParameters: typeParameters.facts,
+        typeParameters: typeParameters.facts.filter(
+          (parameter) => parameter.implicitLifetime !== true,
+        ),
         name,
         target: target.fact,
         anchor: header.anchor,

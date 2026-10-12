@@ -255,8 +255,10 @@ so `type Same<T> = Combine<T, T>` may stand in a bound, an `impl` head or an ope
 `Same<i32>`. Alias parameters are never inferred. A use cannot omit them, and a generic function
 whose parameter is spelled `Fallible<T>` sees the expansion `T | IoError`; GEN-003 never solves a
 union member backwards, so the caller writes `take<Left>(...)`. Alias parameters carry no bounds:
-the target's own bounds are proven at the expanded application with their usual diagnostics. Each
-distinct instantiation is expanded once.
+the target's own bounds are proven at the expanded application with their usual diagnostics.
+
+An alias has no inputs to elide a lifetime from, so its target writes every lifetime it uses:
+`type Ref<'a, T> = &'a T` is valid, and `type Ref<T> = &T` is not.
 
 An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
 in a generic parameter list, the interface of an `impl` head, and the qualifier of a static member
@@ -291,7 +293,8 @@ Union aliases in failure rows (typed failures) are this same rule.
 **Diagnostics:** A target that is not visible at the alias declaration receives the existing
 unresolved-name diagnostic at the target spelling. A cyclic alias reports `SEM0183` at each member
 of the cycle. A generic alias parameter that is bounded, of a row or representation kind, or
-absent from the target reports `SEM0184` at that parameter. A generic alias used with missing or
+absent from the target reports `SEM0184` at that parameter. An omitted lifetime in an alias
+target reports `SEM0210` at the type that omits it. A generic alias used with missing or
 extra arguments receives the type-argument arity diagnostic, `SEM0051`, at the use. An alias used in a
 position of the wrong kind receives that position's existing wrong-kind diagnostic, citing the alias
 origin. An unapplied generic alias used with missing or extra arguments receives the target's
