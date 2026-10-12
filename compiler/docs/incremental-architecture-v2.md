@@ -1119,8 +1119,13 @@ it. **Expected [measured upper bound]:** about 16% of the remaining user time an
 (§1.3); skipping `BodyInput` work may add to it.
 
 **Slice 3, the session and the graph at module granularity.** The `Recorder` with its early return,
-unit states and revision stamps, the edge array, dependee maps and free list, and update steps 1 to
-5 with one input kind, `SourceFile(M)` by file fingerprint. It deletes the evidence machinery that
+the edge array, dependee maps and free list, and `Semantic.update` with one input kind,
+`SourceFile(M)`. Until slice 4 brings the fingerprint hash, a changed file is detected by comparing
+its exact bytes, which the source store retains anyway; `SourceRevision.Observation` survives only
+as that record of a module's bytes or absence. Without cutoff a rerun result always counts as
+changed, so every transitive consumer of an outdated unit would rerun after pull verification:
+slice 3 marks them outdated at once (push marking), and units have three states, absent, up to date
+and outdated, with no revision stamps. `silkc build --stats` prints the §9.4 counters. It deletes the evidence machinery that
 slice 2 only stopped recording: `Answer.sources`, `Answer.footprint`, `Answer.identity`,
 `Answer.answerId`, `Answer.bodyEvidence`, `SourceFrame`, `mergeEvidence`, `appendObservation`,
 `validAnswer`, `BodyDependency`, `BodyCandidate`, `reuseBody`, `priorCandidate`, `BodyInput`'s text
@@ -1145,7 +1150,11 @@ equal a fresh store's.
   even when byte offsets stay equal, without rerunning the body.
 
 **Slice 5, semantic cutoff.** `HeaderOf`, `ValueOf`, `Realization` and `LayoutOf` comparisons,
-backdating, potentially-outdated verification. Acceptance:
+backdating, potentially-outdated verification. Cutoff is what makes pull verification pay, so the
+`potentiallyOutdated` state, the `changedAt` and `verifiedAt` stamps of §6.2 and step 4 of §6.1
+arrive here. Verifying a unit re-demands each unit it consumed by that unit's interned key, so the
+key's demand context (application, profile slot, static condition and origin context) must be
+restored for the re-demand. Acceptance:
 
 - `memberRevisionClaims` (`SemanticSignatureCases.silk` on #1359's branch): exactly 5 `Body` starts;
 - `sealedProfileQueriesSelectStaticIf`: an appended unrelated `fn` does not restart a `static if`
