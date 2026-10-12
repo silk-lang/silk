@@ -46,8 +46,8 @@ struct Unhashed { tag: i32 }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Unhashed, i32>(Hash.seed(1))
-  let placed = run HashMap.insert<Unhashed, i32>(&mut map, Unhashed { tag: 1 }, 2)
+  let mut map = HashMap<Unhashed, i32>.make(Hash.seed(1))
+  let placed = run HashMap<Unhashed, i32>.insert(&mut map, Unhashed { tag: 1 }, 2)
     |> Effect.provideMut(&mut allocator)
   drop placed
   return 0

@@ -53,7 +53,7 @@ impl MonotonicClock for ParkingClock {
 effect fn acceptOnce(listener: &mut Listener) -> i32
 ! NativeSocketError
 ? &mut MonotonicClock {
-  let accepted = run accept(&mut listener.*, Option.none<Instant>())
+  let accepted = run accept(&mut listener.*, Option<Instant>.none())
   drop accepted
   return 42
 }
@@ -101,8 +101,8 @@ effect fn escapeConnection<'env>(accepted: Accepted) -> &'env mut Connection {
 effect fn overlappingAccepts(listener: &mut Listener) -> ()
 ! NativeSocketError
 ? &mut MonotonicClock {
-  let first = accept(&mut listener.*, Option.none<Instant>())
-  let second = accept(&mut listener.*, Option.none<Instant>())
+  let first = accept(&mut listener.*, Option<Instant>.none())
+  let second = accept(&mut listener.*, Option<Instant>.none())
   drop first
   drop second
   return ()
@@ -112,7 +112,7 @@ effect<'call> fn useAmbient<'call>(view: &'call mut AcceptedView<'call>) -> ()
 ! ByteIoError
 ? &mut ByteDuplex | &mut MonotonicClock {
   drop view
-  return run ByteDuplex.flush(Option.none<Instant>())
+  return run ByteDuplex.flush(Option<Instant>.none())
 }
 
 effect fn aliasAmbient(accepted: Accepted) -> ()
@@ -142,7 +142,7 @@ impl AmbientAcceptedContext {
   ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
     drop context
     drop view
-    return run ByteDuplex.flush(Option.none<Instant>())
+    return run ByteDuplex.flush(Option<Instant>.none())
   }
 }
 impl AcceptedContext<

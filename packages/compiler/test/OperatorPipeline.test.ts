@@ -112,8 +112,8 @@ it.effect('pipes into a section of an ordinary function whose capture carries a 
       'pipe/section-owned',
       `import silk.option { Option }
 pub fn main() -> i32 {
-  let present = Option.some<string>("Silk")
-  let name = move present |> Option.unwrapOr<string>("")
+  let present = Option<string>.some("Silk")
+  let name = move present |> Option<string>.unwrapOr("")
   drop name
   return 0
 }`,
@@ -129,9 +129,9 @@ it.effect('pipes a chained accessor pipeline ending in a section without splitti
       `import silk.option { Option }
 fn label<'a>(value: i32) -> string<'a> { return "leaf" }
 pub fn main() -> i32 {
-  let text = Option.some<i32>(7)
-    |> Option.map<i32, string>(label)
-    |> Option.unwrapOr<string>("")
+  let text = Option<i32>.some(7)
+    |> Option<i32>.map<string>(label)
+    |> Option<string>.unwrapOr("")
   drop text
   return 0
 }`,
@@ -146,7 +146,7 @@ it.effect('pipes a borrow-returning accessor into a section', () =>
       'pipe/section-borrow',
       `import silk.option { Option }
 struct Doc { value: i32 }
-fn field<'a>(doc: &'a Doc, key: string) -> Option<&'a Doc> { return Option.some<&'a Doc>(doc) }
+fn field<'a>(doc: &'a Doc, key: string) -> Option<&'a Doc> { return Option<&'a Doc>.some(doc) }
 fn fieldAt<'a>(self: Option<&'a Doc>, key: string) -> Option<&'a Doc> { return move self }
 pub fn main() -> i32 {
   let doc = Doc { value: 1 }
@@ -168,7 +168,7 @@ import silk.box { Box }
 struct Node { label: string<'static> next: Option<Box<Node>> }
 fn named<'a>(node: &Node, fallback: string<'a>) -> string<'a> { return fallback }
 pub fn main() -> i32 {
-  let node = Node { label: "head", next: Option.none<Box<Node>>() }
+  let node = Node { label: "head", next: Option<Box<Node>>.none() }
   let name = &node |> named("anonymous")
   drop name
   drop node

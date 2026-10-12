@@ -58,7 +58,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   return run BufferedDuplex.writeVecAll(
     &mut session.*,
     move values,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
 }
 
@@ -147,7 +147,7 @@ effect<'call> fn useAmbient<'call, P>(
   session: &'call mut BufferedDuplex<'call, P>,
 ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
   drop session
-  return run ByteDuplex.flush(Option.none<Instant>())
+  return run ByteDuplex.flush(Option<Instant>.none())
 }
 
 effect fn aliasAmbient<'env, P>(transport: &'env mut P) -> ()
@@ -294,7 +294,7 @@ import silk.bytes { Bytes }`,
           '  let filled = run BufferedDuplex.fill(',
           `  let outputs: [Bytes; 0] = []
   run writeVectors(&mut session.*, &outputs)
-  run shutdownBufferedWrite(&mut session.*, Option.none<Instant>())
+  run shutdownBufferedWrite(&mut session.*, Option<Instant>.none())
   let filled = run BufferedDuplex.fill(`,
         )
       const sourceId = 'buffered-byte-io/reference-and-public-surface'

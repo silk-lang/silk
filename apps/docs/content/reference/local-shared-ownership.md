@@ -29,13 +29,13 @@ effect fn useCounter() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
 
   // make allocates the Counter. clone adds an owner without copying the Counter.
-  let counter = run Shared.make<Counter>(Counter { value: 41 })
+  let counter = run Shared<Counter>.make(Counter { value: 41 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let observer = Shared.clone<Counter>(&counter)
+  let observer = Shared<Counter>.clone(&counter)
 
   // withMut allows one update. with allows one read.
-  let updated = Shared.withMut<Counter, i32>(&counter, increment)
-  let observed = Shared.with<Counter, i32>(&observer, read)
+  let updated = Shared<Counter>.withMut<i32>(&counter, increment)
+  let observed = Shared<Counter>.with<i32>(&observer, read)
   drop observer
   drop counter
   if updated != observed { return -1 }

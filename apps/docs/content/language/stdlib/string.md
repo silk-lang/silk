@@ -36,9 +36,9 @@ import silk.usize
 
 pub fn main() -> i32 {
   let valid = String.fromUtf8(b"Silk")
-    |> Result.unwrapOr<string, InvalidUtf8>("")
+    |> Result<string, InvalidUtf8>.unwrapOr("")
   let rejected = String.fromUtf8(b"a\x80")
-    |> Result.unwrapOr<string, InvalidUtf8>("")
+    |> Result<string, InvalidUtf8>.unwrapOr("")
   let length = String.byteLength(valid)
     |> usize.toI32
   let rejectedLength = String.byteLength(rejected)
@@ -78,8 +78,8 @@ effect fn build() -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let appended = run appending
   let stepped = String.nextScalar(String.view(&text), String.scalarCursor())
-  let mapped = Option.map<ScalarStep, i32>(move stepped, scalarCode)
-  let scalar = Option.unwrapOr<i32>(move mapped, 0)
+  let mapped = Option<ScalarStep>.map<i32>(move stepped, scalarCode)
+  let scalar = Option<i32>.unwrapOr(move mapped, 0)
   return scalar - 191
 }
 

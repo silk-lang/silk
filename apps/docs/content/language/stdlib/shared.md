@@ -50,12 +50,12 @@ fn read(value: &Counter) -> i32 { return value.value }
 effect fn useCell() -> i32
 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let creating = Shared.make<Counter>(Counter { value: 20 })
+  let creating = Shared<Counter>.make(Counter { value: 20 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let cell = run creating
-  let alias = Shared.clone<Counter>(&cell)
-  let updated = Shared.withMut<Counter, i32>(&alias, increment)
-  return Shared.with<Counter, i32>(&cell, read)
+  let alias = Shared<Counter>.clone(&cell)
+  let updated = Shared<Counter>.withMut<i32>(&alias, increment)
+  return Shared<Counter>.with<i32>(&cell, read)
 }
 
 effect fn recover(error: OutOfMemoryError) -> i32 {
