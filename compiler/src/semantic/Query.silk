@@ -10,29 +10,33 @@
 //!
 //! # Gotchas
 //! A recursive demand for an active key reports [`Cycle`]. Fatal traps stop the process;
-//! they do not run reservation cleanup.
+//! they do not run reservation cleanup. Keys are dense interned ordinals: the store holds one
+//! slot for every word up to the largest it has seen.
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.effect {Effect}
-import silk.hash {Hash, HashKey}
-import silk.hash_map {HashMap}
+import silk.hash {Word}
 import silk.option {Option}
 import silk.result {Result}
 import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
 
 /// A recursive demand for a key whose provider is still active.
 pub struct Cycle {}
 
-/// One reserved or completed query entry.
+/// One absent, reserved or completed query entry.
 union Entry<A, R> {
+  Absent,
   Active,
   Complete {answer: Shared<Result<A, R>>},
 }
 
 /// A reservation whose release removes only an unpublished active entry.
-struct Reservation<'a, K, A, R> {
-  owner: &'a mut Query<K, A, R>
-  key: K
+struct Reservation<'a, A, R> {
+  owner: &'a mut Query<A, R>
+  key: Word
   published: bool
 }
 
@@ -41,57 +45,53 @@ struct Reservation<'a, K, A, R> {
 /// # Details
 ///
 /// The store retains a completed semantic rejection like a completed success.
-/// Typed provider failures and structured cancellation remove the active key.
-pub struct Query<K, A, R> {
-  entries: HashMap<K, Entry<A, R>>
+/// Typed provider failures and structured cancellation remove the active key. Entries are
+/// indexed directly by their word, so a lookup neither hashes nor probes.
+pub struct Query<A, R> {
+  entries: Vector<Entry<A, R>>
+  present: usize
 }
 
-impl<K, A, R> Query<K, A, R> {
-  /// Creates an empty query store with deterministic key hashing.
-  pub fn make() -> Query<K, A, R> {
-    return Query<K, A, R> {entries: HashMap.make<K, Entry<A, R>>(Hash.seed(0))}
+// The slot of one key.
+fn slotOf(key: Word) -> usize {
+  return u64.toUsize(key.value)
+}
+
+impl<A, R> Query<A, R> {
+  /// Creates an empty query store.
+  pub fn make() -> Query<A, R> {
+    return Query<A, R> {entries: Vector.make<Entry<A, R>>(), present: usize.ZERO}
   }
   /// Returns the number of active and completed keys in the store.
   pub fn length(self: &Self) -> usize {
-    return HashMap.length<K, Entry<A, R>>(&self.entries)
+    return self.present
   }
   /// Reports whether `key` has a published success or semantic rejection.
-  pub fn isComplete<K: HashKey + Copy>(self: &mut Self, key: K) -> bool {
-    let mut complete = false
-    let found = HashMap.withMut(
-      &mut self.entries,
-      key,
-      fn(entry: &mut Entry<A, R>) -> () {
-        if let Entry<A, R>.Complete {answer: _} = &entry.* {
-          complete = true
-        }
-        return ()
-      },
-    )
-    return found && complete
+  pub fn isComplete(self: &mut Self, key: Word) -> bool {
+    let slot = slotOf(key)
+    let listed = Vector.asSlice<Entry<A, R>>(&self.entries)
+    if slot >= listed.length { return false }
+    return match & listed[slot] {
+      Entry<A, R>.Complete {..} => true
+      _ => false
+    }
   }
   /// Returns a completed answer without running its provider, or `None` for an absent or active key.
-  pub fn completed<K: HashKey + Copy>(self: &mut Self, key: K) -> Option<Shared<Result<A, R>>> {
-    let mut answer = Option.none<Shared<Result<A, R>>>()
-    let found = HashMap.withMut(
-      &mut self.entries,
-      key,
-      fn(entry: &mut Entry<A, R>) -> () {
-        if let Entry<A, R>.Complete {answer: value} = &entry.* {
-          answer = Option.some<Shared<Result<A, R>>>(Shared.clone<Result<A, R>>(&value))
-        }
-        return ()
-      },
-    )
-    return move answer
+  pub fn completed(self: &mut Self, key: Word) -> Option<Shared<Result<A, R>>> {
+    let slot = slotOf(key)
+    let listed = Vector.asSlice<Entry<A, R>>(&self.entries)
+    if slot >= listed.length { return Option.none<Shared<Result<A, R>>>() }
+    return match & listed[slot] {
+      Entry<A, R>.Complete {answer} => Option.some<Shared<Result<A, R>>>(Shared.clone<Result<A, R>>(&answer))
+      _ => Option.none<Shared<Result<A, R>>>()
+    }
   }
   /// Removes one completed key so its provider can run against a later revision.
-  pub fn forget<K: HashKey + Copy>(self: &mut Self, key: K) -> () {
+  pub fn forget(self: &mut Self, key: Word) -> () {
     if !Query.isComplete(&mut self.*, key) {
       return ()
     }
-    let removed = HashMap.remove<K, Entry<A, R>>(&mut self.entries, key)
-    drop removed
+    vacate<A, R>(&mut self.*, key)
     return ()
   }
   /// Runs the provider for an absent key and returns an owned handle to its completed answer.
@@ -106,61 +106,83 @@ impl<K, A, R> Query<K, A, R> {
   ///
   /// The caller must keep the returned `Shared` handle while it reads the answer.
   /// Fatal traps stop the process and do not run cleanup.
-  pub effect<'owner & 'env> fn demand<'owner, 'env, K: HashKey + Copy + 'env, E, ?Requirements>(
+  pub effect<'owner & 'env> fn demand<'owner, 'env, E, ?Requirements>(
     self: &'owner mut Self,
-    key: K,
-    provide: for<'scope> once fn<'env>(&'scope mut Self, K) -> once Effect<'scope & 'env; Result<
+    key: Word,
+    provide: for<'scope> once fn<'env>(&'scope mut Self, Word) -> once Effect<'scope & 'env; Result<
       A,
       R,
     > ! E ? Requirements>,
   ) -> Shared<Result<A, R>> ! Cycle | E | OutOfMemoryError ? Requirements | &mut Allocator {
-    let mut completed = Option.none<Shared<Result<A, R>>>()
-    let active = HashMap.withMut(
-      &mut self.entries,
-      key,
-      fn(entry: &mut Entry<A, R>) -> () {
-        match & entry.* {
-          Entry<A, R>.Active => {}
-          Entry<A, R>.Complete {answer} => {
-            completed = Option.some<Shared<Result<A, R>>>(Shared.clone<Result<A, R>>(&answer))
-          }
+    let slot = slotOf(key)
+    let mut active = false
+    let listed = Vector.asSlice<Entry<A, R>>(&self.entries)
+    if slot < listed.length {
+      match & listed[slot] {
+        Entry<A, R>.Absent => {}
+        Entry<A, R>.Active => { active = true }
+        Entry<A, R>.Complete {answer} => {
+          let completed = Shared.clone<Result<A, R>>(&answer)
+          drop move provide
+          return move completed
         }
-        return ()
-      },
-    )
-    if let Option<Shared<Result<A, R>>>.Some {value} = move completed {
-      drop move provide
-      return move value
+      }
     }
     if active {
       drop move provide
       fail Cycle {}
     }
-    let previous = run HashMap.insert<K, Entry<A, R>>(&mut self.entries, key, Entry<A, R>.Active)
-    drop previous
-    let reservation = Reservation<'owner, K, A, R> {owner: move self, key: key, published: false}
-    let use = effect fn(resource: &mut Reservation<'owner, K, A, R>) -> Shared<Result<A, R>>
+    run occupy<A, R>(&mut self.*, key, Entry<A, R>.Active)
+    let reservation = Reservation<'owner, A, R> {owner: move self, key: key, published: false}
+    let use = effect fn(resource: &mut Reservation<'owner, A, R>) -> Shared<Result<A, R>>
     ! E | OutOfMemoryError
     ? Requirements | &mut Allocator {
       let selected = resource.key
       let answer = run provide(&mut resource.*.owner.*, selected)
       let shared = run Shared.make<Result<A, R>>(move answer)
-      let prior = run HashMap.insert<K, Entry<A, R>>(
-        &mut resource.*.owner.*.entries,
-        resource.key,
-        Entry<A, R>.Complete {answer: Shared.clone<Result<A, R>>(&shared)},
-      )
-      drop prior
+      run occupy<A, R>(&mut resource.*.owner.*, resource.key, Entry<A, R>.Complete {answer: Shared.clone<Result<A, R>>(&shared)})
       resource.*.published = true
       return move shared
     }
-    let release = effect fn(resource: &mut Reservation<'owner, K, A, R>) -> () {
+    let release = effect fn(resource: &mut Reservation<'owner, A, R>) -> () {
       if !resource.published {
-        let removed = HashMap.remove<K, Entry<A, R>>(&mut resource.*.owner.*.entries, resource.key)
-        drop removed
+        vacate<A, R>(&mut resource.*.owner.*, resource.key)
       }
       return ()
     }
     return run Effect.useReleaseNonParking(move reservation, move use, move release)
   }
+}
+
+// Stores `entry` in the key's slot, growing the store with absent slots up to it.
+effect fn occupy<A, R>(query: &mut Query<A, R>, key: Word, entry: Entry<A, R>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slot = slotOf(key)
+  while Vector.length<Entry<A, R>>(&query.entries) <= slot {
+    run Vector.append<Entry<A, R>>(&mut query.entries, Entry<A, R>.Absent)
+  }
+  let listed = Vector.asSlice<Entry<A, R>>(&query.entries)
+  let vacant = match & listed[slot] {
+    Entry<A, R>.Absent => true
+    _ => false
+  }
+  if vacant {
+    query.present = query.present + usize.ONE
+  }
+  Vector.set<Entry<A, R>>(&mut query.entries, slot, move entry)
+  return ()
+}
+
+// Empties the key's slot when it holds an entry.
+fn vacate<A, R>(query: &mut Query<A, R>, key: Word) -> () {
+  let slot = slotOf(key)
+  let listed = Vector.asSlice<Entry<A, R>>(&query.entries)
+  if slot >= listed.length { return () }
+  let vacant = match & listed[slot] {
+    Entry<A, R>.Absent => true
+    _ => false
+  }
+  if vacant { return () }
+  query.present = query.present - usize.ONE
+  Vector.set<Entry<A, R>>(&mut query.entries, slot, Entry<A, R>.Absent)
+  return ()
 }
