@@ -1907,7 +1907,7 @@ import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
 import silk.effect { Effect }
 struct Selected { code: i32 }
-struct Owned { storage: Allocation }
+struct Owned { storage: Intrinsic.Allocation }
 struct Wide { code: f64 }
 effect fn risky() -> i32 ! Selected | Owned | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -1917,7 +1917,7 @@ effect fn risky() -> i32 ! Selected | Owned | OutOfMemoryError {
   fail Owned { storage: move storage }
 }
 effect fn recoverSelected(problem: Selected) -> i32 ! Wide { return problem.code }
-fn release(storage: Allocation) -> i32 {
+fn release(storage: Intrinsic.Allocation) -> i32 {
   drop storage
   return 42
 }
@@ -1945,7 +1945,7 @@ import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
 import silk.effect { Effect }
 struct Selected { code: i32 }
-struct Owned { storage: Allocation }
+struct Owned { storage: Intrinsic.Allocation }
 struct Wide { code: f64 }
 effect fn risky() -> i32 ! Selected | Owned | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -2727,7 +2727,7 @@ import silk.shared { Shared }
 struct First {}
 struct Second {}
 struct Counter { value: i32 }
-struct Guard { storage: Allocation counter: Shared<Counter> }
+struct Guard { storage: Intrinsic.Allocation counter: Shared<Counter> }
 fn increment(counter: &mut Counter) -> i32 {
   counter.value = counter.value + 1
   return counter.value
@@ -3906,7 +3906,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.string { String }
 struct QuotaAllocator { remaining: i32 }
-effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   if self.remaining == 0 { fail OutOfMemoryError {} }
   self.remaining = self.remaining - 1
   let mut inner = Allocator.systemAllocatorProvider()
@@ -3961,7 +3961,7 @@ import silk.layout { Layout }
 import silk.unicode { Unicode }
 
 struct EmptyAllocator {}
-effect fn allocate(self: &mut EmptyAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut EmptyAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   fail OutOfMemoryError {}
 }
 impl Allocator for EmptyAllocator { allocate: EmptyAllocator.allocate }
@@ -4135,9 +4135,9 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
 import silk.effect { Effect }
 import silk.layout { Layout }
 struct Empty {}
-struct Full { storage: Allocation }
+struct Full { storage: Intrinsic.Allocation }
 fn wrap(cell: Full) -> Empty | Full { return move cell }
-fn takeStorage(full: Full) -> Allocation {
+fn takeStorage(full: Full) -> Intrinsic.Allocation {
   return match move full { Full { storage } => move storage }
 }
 effect fn fallback() -> Full ! OutOfMemoryError { fail OutOfMemoryError {} }
@@ -4954,7 +4954,7 @@ import silk.usize
 
 struct Budget { inner: SystemAllocator remaining: usize }
 
-effect fn allocate(self: &mut Budget, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut Budget, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   if self.remaining == usize.ZERO { fail OutOfMemoryError {} }
   self.remaining = self.remaining - usize.ONE
   return run Allocator.allocate(move layout) |> Effect.provideMut(&mut self.inner)
@@ -5002,6 +5002,7 @@ effect fn recover(error: OutOfMemoryError) -> i32 { return 99 }
 pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // INTR-005: Slot, RawBuffer and Allocation are ordinary names beside the sealed storage types.
   // folded from VectorAcceptance.test.ts: growth past the initial capacity with boundary reads.
   {
     name: 'vector-growth-reads',
@@ -5093,7 +5094,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.vector { Vector }
 struct QuotaAllocator { remaining: i32 }
-effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   if self.remaining == 0 { fail OutOfMemoryError {} }
   self.remaining = self.remaining - 1
   let mut inner = Allocator.systemAllocatorProvider()
@@ -5364,7 +5365,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct QuotaAllocator { remaining: i32 }
 
-effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   if self.remaining == 0 { fail OutOfMemoryError {} }
   self.remaining = self.remaining - 1
   let mut inner = Allocator.systemAllocatorProvider()
@@ -5693,7 +5694,7 @@ import silk.effect { Effect }
 import silk.filesystem { FileError, Path }
 import silk.layout { Layout }
 struct QuotaAllocator {}
-effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   fail OutOfMemoryError {}
 }
 impl Allocator for QuotaAllocator { allocate: QuotaAllocator.allocate }
@@ -6051,7 +6052,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct Guard {
   tag: i32
-  storage: Allocation
+  storage: Intrinsic.Allocation
 }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
@@ -6371,7 +6372,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct Guard {
   tag: i32
-  storage: Allocation
+  storage: Intrinsic.Allocation
 }
 
 impl Drop for Guard {
@@ -6380,7 +6381,7 @@ impl Drop for Guard {
 
 struct ExhaustedAllocator { tag: i32 }
 
-effect fn allocate(self: &mut ExhaustedAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut ExhaustedAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   fail OutOfMemoryError {}
 }
 
@@ -8998,7 +8999,7 @@ import silk.effect { Effect }
 import silk.vector { Vector }
 import silk.layout { Layout }
 struct Quota { remaining: i32 }
-effect fn allocate(self: &mut Quota, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut Quota, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   if self.remaining == 0 { fail OutOfMemoryError {} }
   self.remaining = self.remaining - 1
   let mut system = Allocator.systemAllocatorProvider()
@@ -9379,13 +9380,13 @@ pub fn main() -> i32 {
 import silk.effect { Effect }
 import silk.layout { Layout }
 struct CountingAllocator { hits: i32 }
-effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.hits = self.hits + 1
   let mut inner = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(move layout) |> Effect.provideMut(&mut inner)
 }
 impl Allocator for CountingAllocator { allocate: CountingAllocator.allocate }
-effect fn forwarded(layout: Layout) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+effect fn forwarded(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? &mut Allocator {
   return run Allocator.allocate(move layout)
 }
 effect fn build() -> i32 ! OutOfMemoryError {
@@ -9423,7 +9424,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
 import silk.effect { Effect }
 import silk.layout { Layout }
 struct QuotaAllocator { remaining: i32 calls: i32 }
-effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + 1
   if self.remaining == 0 { fail OutOfMemoryError {} }
   self.remaining = self.remaining - 1
@@ -9766,14 +9767,14 @@ fn recordEndpoint(audit: &mut Audit) -> i32 {
   return audit.endpoint
 }
 fn readAudit(audit: &Audit) -> i32 { return audit.body * 10 + audit.endpoint }
-struct BodyGuard { storage: Allocation audit: Shared<Audit> }
+struct BodyGuard { storage: Intrinsic.Allocation audit: Shared<Audit> }
 impl Drop for BodyGuard {
   fn drop(self: &mut BodyGuard) -> () {
     let count = Shared<Audit>.withMut<i32>(&self.audit, recordBody)
     return ()
   }
 }
-struct EndpointGuard { storage: Allocation audit: Shared<Audit> }
+struct EndpointGuard { storage: Intrinsic.Allocation audit: Shared<Audit> }
 impl Drop for EndpointGuard {
   fn drop(self: &mut EndpointGuard) -> () {
     let count = Shared<Audit>.withMut<i32>(&self.audit, recordEndpoint)
@@ -11625,7 +11626,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.shared { Shared }
 struct Empty {}
-struct Token { storage: Allocation }
+struct Token { storage: Intrinsic.Allocation }
 struct Mailbox { state: Empty | Token }
 fn take(self: &mut Mailbox) -> Empty | Token {
   return Intrinsic.replace(self.state, Empty {})
@@ -11636,7 +11637,7 @@ fn consume(value: Empty | Token) -> i32 {
     Token { storage } => release(move storage)
   }
 }
-fn release(storage: Allocation) -> i32 { drop storage return 42 }
+fn release(storage: Intrinsic.Allocation) -> i32 { drop storage return 42 }
 effect fn useCell() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let storage = run (Allocator.allocate(Layout.of<i32>())
@@ -11680,9 +11681,9 @@ import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.shared { Shared }
-struct Token { storage: Allocation }
+struct Token { storage: Intrinsic.Allocation }
 struct Exhausted {}
-effect fn reject(self: &mut Exhausted, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn reject(self: &mut Exhausted, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   fail OutOfMemoryError {}
 }
 impl Allocator for Exhausted { allocate: Exhausted.reject }
@@ -11955,7 +11956,7 @@ fn increment(counter: &mut Counter) -> i32 {
   return counter.value
 }
 fn read(counter: &Counter) -> i32 { return counter.value }
-struct Guard { left: i8 right: i8 storage: Allocation counter: Shared<Counter> }
+struct Guard { left: i8 right: i8 storage: Intrinsic.Allocation counter: Shared<Counter> }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
