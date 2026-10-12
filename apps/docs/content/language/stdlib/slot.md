@@ -89,7 +89,7 @@ reaches `Slot.write(...)` and the rest. It is unrelated to the builtin `Slot<'st
 ### Associated function `Slot.address`
 
 ```silk
-pub fn address<'storage, T>(slot: silk/core.Slot<'storage, T>) -> *mut T
+pub fn address<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> *mut T
 ```
 
 Forms a non-null writable address without reading or initializing the selected storage.
@@ -104,7 +104,7 @@ A later memory access must prove its own lifetime, initialization, and access re
 ### Associated function `Slot.write`
 
 ```silk
-pub fn write<'storage, T>(slot: silk/core.Slot<'storage, T>, value: T) -> ()
+pub fn write<'storage, T>(slot: Intrinsic.Slot<'storage, T>, value: T) -> ()
 ```
 
 Moves one value into a selected uninitialized raw slot.
@@ -119,7 +119,7 @@ invalid. The value must satisfy the unchanged slot type, including every payload
 ### Associated function `Slot.take`
 
 ```silk
-pub fn take<'storage, T>(slot: silk/core.Slot<'storage, T>) -> T
+pub fn take<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> T
 ```
 
 Moves a value out of a selected initialized raw slot and leaves the slot uninitialized.
@@ -137,7 +137,7 @@ The slot must be in bounds and initialized.
 ### Associated function `Slot.copy`
 
 ```silk
-pub fn copy<'storage, T>(slot: silk/core.Slot<'storage, T>) -> T
+pub fn copy<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> T
 ```
 
 Copies a `Copy` value from a selected initialized raw slot without changing its state.
@@ -151,7 +151,7 @@ The slot must be in bounds and initialized.
 ### Associated function `Slot.dropValue`
 
 ```silk
-pub fn dropValue<'storage, T>(slot: silk/core.Slot<'storage, T>) -> ()
+pub fn dropValue<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> ()
 ```
 
 Drops a value in a selected initialized raw slot and leaves the slot uninitialized.

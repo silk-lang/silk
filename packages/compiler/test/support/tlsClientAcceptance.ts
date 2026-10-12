@@ -2477,7 +2477,7 @@ effect fn cases() -> i32 ! OutOfMemoryError ? &mut Allocator {
 const tlsClientResourcePolicyCases = `${tlsClientNativeCommon}
 struct CountingAllocator {calls: usize}
 
-effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + usize.ONE
   let mut system = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut system)

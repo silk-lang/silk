@@ -6563,7 +6563,7 @@ const computeVerify = Effect.fnUntraced(function* (
               function: fn.id,
               region: region.id,
               detail:
-                'allocation does not preserve Layout, Allocation, or sealed storage-failure contracts',
+                'allocation does not preserve Layout, Intrinsic.Allocation, or sealed storage-failure contracts',
             })
         }
         if (operation._tag === 'ForeignStaticLoad') {

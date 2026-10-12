@@ -655,6 +655,40 @@ verified to remain ordinary source.
 [intrinsic boundary specification](../../../../openspec/specs/bootstrap-intrinsic-boundary/spec.md),
 [standard-library source](../../../../packages/compiler/stdlib).
 
+### INTR-005 — Core storage types are sealed `Intrinsic` members, not reserved names
+
+**Status:** Confirmed
+
+The compiler-owned storage types are members of the sealed namespace and are spelled through it:
+
+- `Intrinsic.Allocation`: one affine owner of a raw allocation and its reclaim authority.
+- `Intrinsic.RawBuffer<T>`: typed raw storage owned independently of its allocator provider.
+- `Intrinsic.Slot<'storage, T>`: a lexical exclusive projection into one buffer element.
+
+`Slot`, `RawBuffer` and `Allocation` are ordinary names. Source may declare, import and use types,
+actors and bindings with those spellings, and they never denote the storage types:
+
+```silk
+struct Slot { value: i32 }
+
+fn read(slot: Slot) -> i32 { return slot.value }
+
+fn length(buffer: &Intrinsic.RawBuffer<i32>) -> usize { return Intrinsic.rawBufferCount<i32>(buffer) }
+```
+
+The standard library's `silk.raw_buffer.RawBuffer` and `silk.slot.Slot` actors are such ordinary
+declarations: their sibling functions take `Intrinsic.RawBuffer<T>` and `Intrinsic.Slot<'s, T>`.
+
+**Boundary:** There is no alias or fallback. A bare `Slot<'s, T>` where no `Slot` is declared or
+imported does not resolve to the storage type.
+
+**Diagnostics:** An unknown `Intrinsic` type member reports an unknown-intrinsic diagnostic. A bare
+storage spelling with no ordinary declaration in scope reports an ordinary unknown-type diagnostic.
+
+**Current compiler:** Aligned.
+
+**Evidence:** [intrinsic catalog tests](../../../../packages/compiler/test/IntrinsicCatalog.test.ts).
+
 ## Target availability
 
 ### TARGET-001 — Intrinsic availability is checked only for the selected executable closure
