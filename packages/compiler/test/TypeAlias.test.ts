@@ -331,3 +331,28 @@ pub fn main() -> i32 {
     assert.strictEqual(memberType(self, 'root', 'first'), 'root.Point<i32>')
   }),
 )
+
+it.effect('applies use-site arguments to a public alias of a generic interface', () =>
+  Effect.gen(function* () {
+    const source = `pub interface Add0<Right, Output> {
+  fn add(left: Self, right: Right) -> Output
+}
+pub type Add = Add0
+struct Tag { value: i32 }
+impl Tag { fn tagAdd(left: Tag, right: i32) -> i32 { return left.value + right } }
+impl Add<i32, i32> for Tag { add: Tag.tagAdd }
+fn sum<T: Add<i32, i32>>(left: T, right: i32) -> i32 { return Add.add(move left, right) }
+fn miscounted<T: Add<i32>>(left: T) -> i32 { return 0 }
+fn unapplied<T: Add>(left: T) -> i32 { return 0 }
+pub fn main() -> i32 { return sum(Tag { value: 1 }, 2) }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Add<i32>>')],
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Add>(')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
