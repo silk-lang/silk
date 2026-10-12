@@ -300,8 +300,11 @@ cover first:
   not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
   reference.
-- `imprecise`: a conflict or a moved-place use is decided only by an unknown index or a partial
-  replacement.
+- `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
+  replacement, or a loan a retaining result carries approximately. It is an unchecked status: such
+  a body is never `FullyChecked`, counts in the baseline like any other reason, and a rise in it
+  fails the corpus guard like a rise in any reason. Not rejecting a body never means accepting it
+  as checked.
 
 A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
 the form.
