@@ -360,6 +360,15 @@ fn endedLoan(choice: Choice) -> i32 {
     Choice.Right {..} => {}
   }
   return seen
+}
+fn referentLoan(held: &mut Choice) -> i32 {
+  let mut seen = 0
+  if let Choice.Left {value} = &mut held.* {
+    let other = &held.*
+    increment(&mut value)
+    seen = inspect(other)
+  }
+  return seen
 }`
     const snapshot = yield* Analysis.ofSource('ownership/borrowed-match-binding', ascii(source))
     // An exclusive binding is the selected payload of the scrutinee's place (MATCH-002), so
@@ -369,7 +378,11 @@ fn endedLoan(choice: Choice) -> i32 {
         code: diagnostic.code,
         start: diagnostic.span.start,
       })),
-      [{ code: 'OWN0010', start: source.indexOf('&mut value') }],
+      [
+        { code: 'OWN0010', start: source.indexOf('&mut value') },
+        { code: 'OWN0010', start: source.lastIndexOf('&held.*') },
+        { code: 'OWN0011', start: source.lastIndexOf('other)') },
+      ],
     )
   }),
 )

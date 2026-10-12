@@ -545,6 +545,21 @@ pub fn inspect(event: Token) -> i32 { return match &mut event { Token { kind } =
     ownership(exclusive).diagnostics.map((diagnostic) => diagnostic.code),
     'OWN0007',
   )
+
+  // An exclusive view's referent is an exclusive scrutinee place (BORROW-005, PATT-002).
+  const referent = analyze(
+    'exclusive-referent',
+    `pub union Choice { Held { kind: i32 }, Vacant }
+pub fn matched(slot: &mut Choice) -> i32 {
+  return match &mut slot.* { Choice.Held { kind } => kind Choice.Vacant => 0 }
+}
+pub fn tested(slot: &mut Choice) -> i32 {
+  if let Choice.Held { kind } = &mut slot.* { return kind }
+  return 0
+}`,
+  )
+  assert.deepEqual(referent.diagnostics, [])
+  assert.deepEqual(ownership(referent).diagnostics, [])
 })
 
 it('requires move for a bare by-value use of a consuming pattern owner', () => {
