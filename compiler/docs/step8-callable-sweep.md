@@ -99,7 +99,7 @@ the later closure or cleanup operations.
 | finite-effect-join-capture-arity            | effect-form, 406–431, `choose(First {}, payload)`                      | Step 9 Effect-valued producer; later operations unmeasured                     |
 | foreign-libc-qsort-callback                 | c-abi-callback, 247–490; intrinsic-member, silk/pointer.silk 5029–5046 | C callback and pointer intrinsic follow-ups                                    |
 | bound-method-values                         | receiver-capturing sections, expected result 58                         | Shared, mutable and consuming receivers use their original parameter ordinals |
-| method-call-matrix                          | typed-form, 1819–1850, `Option.some<i32>(4).map(addOne)`               | Generic inherent-method inference follow-up; rejected before argument checking |
+| method-call-matrix                          | typed-form, 1819–1850, `Option<i32>.some(4).map(addOne)`               | Generic inherent-method inference follow-up; rejected before argument checking |
 | constrained-section-owned-capture-lifecycle | CORPUS_NATIVE_LINK_INPUT before compilation                            | Runner/link-input follow-up; callable behavior unmeasured                      |
 
 No program in the complete 393-program receipt reports `pipeline-callable`. A separate lexical
