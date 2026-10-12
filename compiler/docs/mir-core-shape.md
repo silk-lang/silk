@@ -317,7 +317,7 @@ types we already know); a separate `InstanceKey.Closure` (duplicates `Declaratio
 let mut current = Chain { step: Step { kind: End {} } }
 while remaining > 0 {
   let taken = Intrinsic.replace(current, Chain { step: Step { kind: End {} } })
-  let boxed = run Box.make<Chain>(move taken)
+  let boxed = run Box<Chain>.make(move taken)
   current = Chain { step: Step { kind: Link { next: move boxed, counter: Shared.clone(counter) } } }
   remaining = remaining - 1
 }
@@ -329,7 +329,7 @@ bb_loop:  _c = Gt(remaining, 0); Branch(_c, bb_body, bb_exit)
 bb_body:  _fresh = Aggregate Chain{...End}
           _taken = move current         // Intrinsic.replace lowers to two moves
           current = move _fresh
-          Call Box.make<Chain>(move _taken) providers [allocator] -> _boxed,
+          Call Box<Chain>.make(move _taken) providers [allocator] -> _boxed,
                normal bb_ok, failure { _err: OutOfMemoryError -> bb_fail }
 bb_ok:    Call Shared.clone(counter) -> _counter, normal bb_ok2
 bb_ok2:   _new = Aggregate Chain{ Variant Link{ move _boxed, move _counter } }

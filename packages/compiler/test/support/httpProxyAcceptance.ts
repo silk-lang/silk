@@ -145,7 +145,7 @@ effect fn proxyFilled(length: usize) -> Bytes ! OutOfMemoryError ? &mut Allocato
 fn proxyCheckedOrigin<'text>(text: string<'text>) -> Result<Origin, ProxyError> {
   let uri = match move Uri.parse(text) {
     Result<Uri<'text>, ParseError>.Failure {error} => {
-      return Result.failResult<Origin, ProxyError>(ProxyError.Admission {error: ProxyAdmissionError {
+      return Result<Origin, ProxyError>.failResult(ProxyError.Admission {error: ProxyAdmissionError {
         component: ProxyComponent.Configuration,
         reason: ProxyReason.InvalidProxyUri,
       }})
@@ -153,13 +153,13 @@ fn proxyCheckedOrigin<'text>(text: string<'text>) -> Result<Origin, ProxyError> 
     Result<Uri<'text>, ParseError>.Success {value} => value
   }
   return match move Origin.fromUri(&uri) {
-    Result<Origin, OriginError>.Failure {error} => Result.failResult<Origin, ProxyError>(
+    Result<Origin, OriginError>.Failure {error} => Result<Origin, ProxyError>.failResult(
       ProxyError.Admission {error: ProxyAdmissionError {
         component: ProxyComponent.Configuration,
         reason: ProxyReason.InvalidProxyUri,
       }},
     )
-    Result<Origin, OriginError>.Success {value} => Result.succeed<Origin, ProxyError>(value)
+    Result<Origin, OriginError>.Success {value} => Result<Origin, ProxyError>.succeed(value)
   }
 }
 
@@ -372,7 +372,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let successHead = match move ValueResponseHead.make(
     Version.Http11,
     successStatus,
-    Option.none<&'static [u8]>(),
+    Option<&'static [u8]>.none(),
     emptyHeaders,
     proxyConnectInputLimits(),
   ) {
@@ -396,7 +396,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let upgradeHead = match move ValueResponseHead.make(
     Version.Http11,
     upgradeStatus,
-    Option.none<&'static [u8]>(),
+    Option<&'static [u8]>.none(),
     upgradeHeaders,
     proxyConnectInputLimits(),
   ) {
@@ -435,7 +435,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let authenticationHead = match move ValueResponseHead.make(
     Version.Http11,
     authenticationStatus,
-    Option.some<&'static [u8]>(b"Proxy Authentication Required"),
+    Option<&'static [u8]>.some(b"Proxy Authentication Required"),
     challengeHeaders,
     proxyConnectInputLimits(),
   ) {
@@ -489,7 +489,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let rejectionHead = match move ValueResponseHead.make(
     Version.Http11,
     rejectionStatus,
-    Option.some<&'static [u8]>(b"Bad Gateway"),
+    Option<&'static [u8]>.some(b"Bad Gateway"),
     rejectionHeaders,
     proxyConnectInputLimits(),
   ) {
@@ -553,7 +553,7 @@ export const verifyProxyPolicy = `effect fn verifyProxyPolicy() -> bool ! OutOfM
   let overflowHead = match move ValueResponseHead.make(
     Version.Http11,
     rejectionStatus,
-    Option.none<&'static [u8]>(),
+    Option<&'static [u8]>.none(),
     overflowHeaders,
     proxyConnectInputLimits(),
   ) {
