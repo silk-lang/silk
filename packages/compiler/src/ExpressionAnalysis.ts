@@ -1270,6 +1270,21 @@ export const borrowSubject = (
     parentReference.access === 'Exclusive' &&
     (expected === undefined || (!Type.isReference(expected) && !Type.isSlice(expected))) &&
     !exclusiveBorrowRoot(root)
+  // A view context reborrows the referent, and reborrowing never strengthens access (BORROW-005).
+  if (
+    parentReference !== undefined &&
+    parentReference.access === 'Shared' &&
+    access === 'Exclusive' &&
+    (projectedReference !== undefined ||
+      (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))
+  )
+    return unavailableBorrow(
+      node,
+      access,
+      subject,
+      diagnostics,
+      Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
+    )
   if (
     parentReference !== undefined &&
     (projectedReference !== undefined ||
@@ -1277,15 +1292,6 @@ export const borrowSubject = (
       contextFreeReborrow)
   ) {
     const target = parentReference.target
-    // Reborrowing never strengthens access (BORROW-005).
-    if (parentReference.access === 'Shared' && access === 'Exclusive')
-      return unavailableBorrow(
-        node,
-        access,
-        subject,
-        diagnostics,
-        Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
-      )
     if (
       expected !== undefined &&
       !contextFreeReborrow &&
