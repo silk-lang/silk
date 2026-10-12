@@ -493,12 +493,12 @@ effect fn prepareOnly() -> PendingPublication<i32, never>
 effect fn program() -> i32
 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
 ? &mut Scheduler | &mut MonotonicClock {
-  let childFiber = run Fiber.forkChild<i32, never>(child())
-  return run Fiber.join<i32, never>(move childFiber)
+  let childFiber = run Fiber<i32, never>.forkChild(child())
+  return run Fiber<i32, never>.join(move childFiber)
 }
 
 effect fn observe(fiber: Fiber<i32, never>) -> Outcome<i32, never> {
-  return run Fiber.await<i32, never>(move fiber)
+  return run Fiber<i32, never>.await(move fiber)
 }
 
 fn inspectErrors(
@@ -578,8 +578,8 @@ pub fn main() -> i32 {
             '/// A typed failure that reports exhaustion of the task identity space.',
           ],
           [
-            'Fiber.forkChild',
-            'Fiber.'.length,
+            'Fiber<i32, never>.forkChild',
+            'Fiber<i32, never>.'.length,
             'silk/fiber',
             "pub effect<'static> fn forkChild<A: 'static, E: 'static>",
             '/// Prepares and atomically publishes one child task, then returns its affine Fiber.',
@@ -639,9 +639,9 @@ it.effect('navigates and presents the source-defined Vector lexical view accesso
   const source = `import silk.usize
 import silk.vector { Vector }
 pub fn main() -> i32 {
-  let mut values = Vector.make<i32>()
-  let shared = Vector.asSlice<i32>(&values)
-  let exclusive = Vector.asMutSlice<i32>(&mut values)
+  let mut values = Vector<i32>.make()
+  let shared = Vector<i32>.asSlice(&values)
+  let exclusive = Vector<i32>.asMutSlice(&mut values)
   return usize.toI32(shared.length + exclusive.length)
 }`
   return Analysis.ofSource('main', encoder.encode(source)).pipe(
@@ -939,8 +939,8 @@ impl<T> Option<T> {
   pub fn some(value: T) -> Self { return Option.Some { value: move value } }
   pub fn map<U>(self: Self, transform: once fn(T) -> U) -> Option<U> {
     return match move self {
-      Option<T>.Some { value } => Option.some<U>(transform(move value))
-      Option<T>.None => Option.none<U>()
+      Option<T>.Some { value } => Option<U>.some(transform(move value))
+      Option<T>.None => Option<U>.none()
     }
   }
 }
