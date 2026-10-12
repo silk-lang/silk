@@ -401,7 +401,13 @@ root's scope:
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
 
-Pending means a region relation or capture contents typing retained. Scope ends as events,
+Pending means a region relation or capture contents typing retained. `Checked` is a claim about
+one body: its own loans and regions are sound. A rule that blames a body for its callers' context
+is not part of that claim. OWN0016 (SHARED-003) blames a suspending callee reached under a
+local-shared access, such as a value-free `fn parks()` that runs `Execution.park`. Such a callee
+can be `Checked` while every boundary caller, which takes the access's `&mut T` parameter region,
+stays `regions` until local sharing lands (§10), so no violating program is ever fully checked.
+Scope ends as events,
 OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
 the first point at which a loan can outlive its root.
 
