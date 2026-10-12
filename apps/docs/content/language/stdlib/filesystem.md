@@ -40,13 +40,15 @@ import silk.effect { Effect }
 
 import silk.filesystem { FileSystem, FileError, Path }
 
+import silk.option { Option }
+
 effect fn example() -> i32
 ! FileError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let path = run Path.make("/workspace")
     |> Effect.provideMut(&mut allocator)
-  if Path.name(&path) == "workspace" {
-    return 42
+  if let Option<string>.Some {value: name} = move Path.name(&path) {
+    if name == "workspace" { return 42 }
   }
   return 0
 }
@@ -144,15 +146,15 @@ bytes are not well-formed text, which the `string` view cannot promise.
 ### Method `Path.view`
 
 ```silk
-pub fn view<'life0>(self: &'life0 Path) -> string<'life0>
+pub fn view<'life0>(self: &'life0 Path) -> silk/option.Option<string<'life0>>
 ```
 
-Borrows the complete path as text when its bytes are known to be valid UTF-8.
+Borrows the complete path as text, or answers `None` when its bytes are not valid UTF-8.
 
 #### Details
 
-Paths from [`make`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6d616b65), [`join`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e), [`joinUtf8`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e55746638), and [`resolve`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e7265736f6c7665) satisfy that precondition. A path
-created with [`fromBytes`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e66726f6d4279746573) may not; use [`rawBytes`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e7261774279746573) unless the source bytes were validated.
+Paths from [`make`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6d616b65), [`join`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e), [`joinUtf8`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e55746638), and [`resolve`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e7265736f6c7665) are always valid UTF-8. A path
+created with [`fromBytes`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e66726f6d4279746573) or [`joinBytes`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e4279746573) may not be; [`rawBytes`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e7261774279746573) is the lossless view.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a506174682e6973526f6f74"></a>
 
@@ -169,14 +171,15 @@ Returns `true` exactly when this path is the portable root `/`.
 ### Method `Path.name`
 
 ```silk
-pub fn name<'life0>(self: &'life0 Path) -> string<'life0>
+pub fn name<'life0>(self: &'life0 Path) -> silk/option.Option<string<'life0>>
 ```
 
-Borrows the final component as text; root returns empty text.
+Borrows the final component as text, or answers `None` when its bytes are not valid UTF-8.
 
 #### Details
 
-This has the same UTF-8 precondition as [`view`](#declaration-73696c6b2f66696c6573797374656d3a3a506174682e76696577). It does not allocate or include a separator.
+Root answers empty text. The component never includes a separator, and borrowing it does not
+allocate.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a506174682e6a6f696e"></a>
 
