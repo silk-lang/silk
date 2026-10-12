@@ -8576,6 +8576,20 @@ const aliasedInterfaceOperationTarget = (
     SemanticContext.nameText(context, qualifier) ?? '',
   )
   if (lookup._tag !== 'Resolved' || lookup.declaration._tag !== 'AliasDeclaration') return undefined
+  // A generic alias qualifier must write its arguments (`Alias<Args>.member`), which the applied
+  // owner path resolves; written bare it names no application.
+  if (lookup.declaration.typeParameters.length > 0)
+    return {
+      _tag: 'Invalid',
+      diagnostics: [
+        Diagnostic.typeArgumentArity(
+          SemanticContext.nameText(context, qualifier) ?? '',
+          lookup.declaration.typeParameters.length,
+          0,
+          Location.at(qualifier.anchor),
+        ),
+      ],
+    }
   // An alias without arguments is its target's spelling, so the plain qualified path takes it.
   const target = lookup.declaration.target
   if (
