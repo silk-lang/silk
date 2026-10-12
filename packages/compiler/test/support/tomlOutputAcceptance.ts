@@ -160,11 +160,11 @@ effect fn check() -> i32 ! TomlError | OutOfMemoryError | WriterError {
   }
   let invalidText = run String.copy("oops") |> Effect.provideMut<Allocator>(&mut allocator)
   let invalidKey = run String.copy("bad") |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut entries = Vector.make<TomlChild>()
-  run Vector.append<TomlChild>(&mut entries, TomlChild.Member {
+  let mut entries = Vector<TomlChild>.make()
+  run Vector<TomlChild>.append(&mut entries, TomlChild.Member {
     entry: TomlEntry { key: move invalidKey, value: Value.Integer { text: move invalidText } }
   }) |> Effect.provideMut<Allocator>(&mut allocator)
-  let boxed = run Box.make<Vector<TomlChild>>(move entries)
+  let boxed = run Box<Vector<TomlChild>>.make(move entries)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let invalidValue = Value.Table { entries: move boxed, kind: TableKind.Explicit }
   let mut rejectedOutput = capture()

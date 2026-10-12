@@ -813,15 +813,15 @@ effect fn copyBorrowed<'value>(
 ) -> Option<OwnedRequestHead> ! OutOfMemoryError ? &mut Allocator {
   let borrowed = match move result {
     Result<RequestHead<'value>, ParseError>.Failure {error} => {
-      return Option.none<OwnedRequestHead>()
+      return Option<OwnedRequestHead>.none()
     }
     Result<RequestHead<'value>, ParseError>.Success {value} => value
   }
   let copied = run RequestHead.copy(&borrowed, valueLimits())
   return match move copied {
-    Result<OwnedRequestHead, ValueError>.Failure {error} => Option.none<OwnedRequestHead>()
+    Result<OwnedRequestHead, ValueError>.Failure {error} => Option<OwnedRequestHead>.none()
     Result<OwnedRequestHead, ValueError>.Success {value} => {
-      return Option.some<OwnedRequestHead>(move value)
+      return Option<OwnedRequestHead>.some(move value)
     }
   }
 }
@@ -831,15 +831,15 @@ effect fn copyResponseBorrowed<'value>(
 ) -> Option<OwnedResponseHead> ! OutOfMemoryError ? &mut Allocator {
   let borrowed = match move result {
     Result<ResponseHead<'value>, ParseError>.Failure {error} => {
-      return Option.none<OwnedResponseHead>()
+      return Option<OwnedResponseHead>.none()
     }
     Result<ResponseHead<'value>, ParseError>.Success {value} => value
   }
   let copied = run ResponseHead.copy(&borrowed, valueLimits())
   return match move copied {
-    Result<OwnedResponseHead, ValueError>.Failure {error} => Option.none<OwnedResponseHead>()
+    Result<OwnedResponseHead, ValueError>.Failure {error} => Option<OwnedResponseHead>.none()
     Result<OwnedResponseHead, ValueError>.Success {value} => {
-      return Option.some<OwnedResponseHead>(move value)
+      return Option<OwnedResponseHead>.some(move value)
     }
   }
 }

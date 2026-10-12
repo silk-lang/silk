@@ -38,8 +38,8 @@ pub fn main() -> i32 { return 0 }`
 const shared = `import silk.vector { Vector }
 
 pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let count = Vector.length<i32>(&values)
+  let values = Vector<i32>.make()
+  let count = Vector<i32>.length(&values)
   drop values
   if count == 0 { return 0 }
   return 1
@@ -49,10 +49,10 @@ pub fn main() -> i32 {
 const exclusive = `import silk.vector { Vector }
 
 pub fn main() -> i32 {
-  let mut values = Vector.make<i32>()
-  let slice = Vector.asMutSlice<i32>(&mut values)
+  let mut values = Vector<i32>.make()
+  let slice = Vector<i32>.asMutSlice(&mut values)
   drop slice
-  let count = Vector.length<i32>(&values)
+  let count = Vector<i32>.length(&values)
   drop values
   if count == 0 { return 0 }
   return 1
@@ -62,8 +62,8 @@ pub fn main() -> i32 {
 const ownedPosition = `import silk.vector { Vector }
 
 pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let taken = Vector.get<i32>(&values, &values)
+  let values = Vector<i32>.make()
+  let taken = Vector<i32>.get(&values, &values)
   drop taken
   drop values
   return 0
@@ -98,7 +98,7 @@ struct Provider {}
 struct Connection<P> { value: i32 provider: P }
 struct View<'a> { value: &'a i32 }
 fn view<'a, P>(self: &'a Connection<P>) -> Option<View<'a>> {
-  return Option.some<View<'a>>(View<'a> { value: &self.value })
+  return Option<View<'a>>.some(View<'a> { value: &self.value })
 }
 fn valid(value: &View) -> bool { return value.value.* == 0 }
 effect fn use<P>(connection: &mut Connection<P>) -> i32 {
