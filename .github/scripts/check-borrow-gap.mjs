@@ -10,7 +10,8 @@
 //     Rewrites the baseline from a corpus log, with one line for every program that ran. A line whose
 //     program did not run is kept and listed as "not run", so regenerating from CI's log never loses
 //     a line declared ahead of main's bundle; `--prune` drops those lines instead, for programs the
-//     corpus no longer has. It is the only writer of the file. CI's corpus job
+//     corpus no longer has. It refuses to write from a run with a failed program or with no program
+//     at all, since such a run measures nothing. It is the only writer of the file. CI's corpus job
 //     builds its corpus from main's verification harness, which can differ from a local run on this
 //     branch's corpus.ts; the baseline must match CI, so regenerate from the job's
 //     `selfhost-corpus-timings` artifact (or its log) whenever the two disagree.
@@ -68,10 +69,20 @@ const parseBaseline = (text, where) => {
   return { retired, programs }
 }
 
-// The nonzero per-reason counts of every program receipt in a corpus log.
-const parseReceipts = (log) => {
+// Why a corpus log cannot become a baseline, or undefined when it can: a failed program, or a run
+// without a single program, measures nothing. A log copied from the job view prefixes each line
+// with a timestamp.
+const refusal = (text, programs) => {
+  const failed = text.split('\n').filter((line) => /^(?:\S+Z )?FAIL /.test(line)).length
+  if (failed > 0) return `the corpus run failed ${failed} program(s); fix the run before updating`
+  if (programs.size === 0) return 'the corpus log has no program receipts; nothing ran'
+  return undefined
+}
+
+// The nonzero per-reason counts of every program receipt in a corpus log's text.
+const receiptsOf = (text) => {
   const programs = new Map()
-  for (const line of readFileSync(log, 'utf8').split('\n')) {
+  for (const line of text.split('\n')) {
     // A log copied from the job view prefixes each line with a timestamp.
     const at = line.indexOf(receiptPrefix)
     if (at < 0) continue
@@ -83,6 +94,8 @@ const parseReceipts = (log) => {
   }
   return programs
 }
+
+const parseReceipts = (log) => receiptsOf(readFileSync(log, 'utf8'))
 
 const format = (reasons) =>
   Object.keys(reasons)
@@ -149,7 +162,13 @@ if (mode === 'corpus') {
   // Repeated lines are what `update` repairs, so only the retired reasons can fail it.
   const current = parseBaseline(readFileSync(baselineUrl, 'utf8'), 'compiler/borrow-check-gap.txt')
   failures.length = 0
-  const actual = parseReceipts(first)
+  const text = readFileSync(first, 'utf8')
+  const actual = receiptsOf(text)
+  const refused = refusal(text, actual)
+  if (refused !== undefined) {
+    process.stderr.write(`::error title=Borrow-check gap::update refused: ${refused}\n`)
+    process.exit(1)
+  }
   for (const [name, reasons] of actual) checkRetired(current.retired, name, reasons)
   const header = readFileSync(baselineUrl, 'utf8')
     .split('\n')
@@ -243,6 +262,17 @@ if (mode === 'corpus') {
     throw new Error(`update keeps a line whose program did not run: ${kept.lines.join('|')}`)
   if (pruned.lines.join('|') !== 'beta regions=1' || pruned.absent.join('|') !== 'alpha')
     throw new Error(`update --prune drops it: ${pruned.lines.join('|')}`)
+  const receipt = (name) =>
+    `SELFHOST_BORROW_GAP=${JSON.stringify({ name, reasons: { regions: 1 } })}`
+  const passing = `PASS alpha\n${receipt('alpha')}\n`
+  if (refusal(passing, receiptsOf(passing)) !== undefined)
+    throw new Error('update accepts a run whose programs all passed')
+  const failing = `${passing}2026-10-12T18:00:00.0000000Z FAIL beta: code=X\n${receipt('beta')}\n`
+  if (refusal(failing, receiptsOf(failing)) === undefined)
+    throw new Error('update refuses a run with a failed program')
+  const empty = 'Selfhost corpus: pass=0 fail=0 unsupported=0 track=0\n'
+  if (refusal(empty, receiptsOf(empty)) === undefined)
+    throw new Error('update refuses a run with no program receipts')
   failures.length = 0
   notices.length = 0
   print('borrow-gap guard self-test passed')
