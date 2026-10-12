@@ -10,7 +10,9 @@
 //! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
 //! numbers evaluation points in evaluation order and links them into a control-flow graph. A loan
 //! comes from a written borrow, a shared or mutable receiver pass, or a borrowed capture of a
-//! constructed callable or section, which carries it like any value. A loan carried by a value
+//! constructed callable or section, which carries it like any value. A place behind a reference
+//! names the referent's storage, so a reborrow is a loan of that place and carries the parent
+//! reference's loans (BORROW-005). A loan carried by a value
 //! stays live until the node that consumes that value, so a call argument's loan lasts for the
 //! whole call (BORROW-004). A loan bound by `let` to a reference local stays live while that local
 //! is live, by backward liveness over the graph, so loans end at their last use. An access that
@@ -22,16 +24,16 @@
 //! are places of the subject (MATCH-001, MATCH-002).
 //!
 //! # Gotchas
-//! A body that runs an Effect or invokes an `effect fn` value, uses a storage primitive,
-//! reborrows through a reference, stores a loan anywhere but an immutable `let` (or a `let mut` of a
-//! callable, which holds its capture loans until its last use), or lets a loan
-//! reach a return, a branch or match result, or a match binding answers [`Outcome.NotChecked`]
-//! with the [`BorrowStatus`] reason: it is neither accepted nor rejected here. A call result that
-//! retains a region carries every operand loan approximately, because typing does not say which
-//! argument it retains. An overlap that depends on an unknown index, a partial replacement of a
-//! moved place, or a conflict with an approximate loan is `Imprecise` rather than a conflict, so
-//! the stage never rejects a body the bootstrap accepts. `Imprecise` is unchecked like every other
-//! reason.
+//! A body that runs an Effect or invokes an `effect fn` value, uses a storage primitive, borrows a
+//! place that is not rooted in a local, stores a loan anywhere but an immutable `let` (or a `let
+//! mut` of a callable, which holds its capture loans until its last use), or lets a loan reach a
+//! return, a branch or match result, or a match binding answers [`Outcome.NotChecked`] with the
+//! [`BorrowStatus`] reason: it is neither accepted nor rejected here. A call result that retains a
+//! region carries every operand loan approximately, because typing does not say which argument it
+//! retains. An overlap that depends on an unknown index, a partial replacement of a moved place, a
+//! conflict with an approximate loan, or a move of a reference whose referent is reborrowed is
+//! `Imprecise` rather than a conflict, so the stage never rejects a body the bootstrap accepts.
+//! `Imprecise` is unchecked like every other reason.
 
 import hir.Hir {Access, CallableMode}
 import lexer.Span {Span}
@@ -91,6 +93,33 @@ fn verdict(outcome: Outcome, status: BorrowStatus) -> Verdict {
 // An index step whose value is unknown overlaps every element step.
 fn anyElement() -> usize {
   return usize.MAX
+}
+
+// The step from a reference to its referent. A place through a reference names the referent's
+// storage, so a reborrow is a loan of that place (BORROW-005).
+fn referent() -> usize {
+  return usize.MAX - usize.ONE
+}
+
+// Whether `inner` lies behind a reference stored at `outer`: `outer`'s steps are a strict prefix of
+// `inner`'s and the next step dereferences. Replacing the reference leaves its old referent alone.
+fn behind(outer: &Place, inner: &Place) -> bool {
+  if outer.root != inner.root {
+    return false
+  }
+  let first = Vector<usize>.asSlice(&outer.steps)
+  let second = Vector<usize>.asSlice(&inner.steps)
+  if first.length >= second.length || second[first.length] != referent() {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at] != second[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 // A body local and its static projection path: field ordinals, or `anyElement` for an index.
@@ -191,8 +220,9 @@ struct Flow {
   carried: Vector<Carry>
 }
 
-// The written place a node names: its root local, whether it is reached through a reference
-// local, its projection path, and the index operands to evaluate first, in order.
+// The written place a node names: its root local, whether it is reached through a reference, its
+// projection path with a `referent` step per dereference, and the index operands to evaluate
+// first, in order.
 struct Path {
   root: usize
   through: bool
@@ -321,7 +351,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfM
       }
       Expression.Field {value, index} => {
         run extendPath(nodes, value, &mut path.*)
-        if path.root != usize.MAX && !path.through {
+        if path.root != usize.MAX {
           run Vector<usize>.append(&mut path.steps, index)
         }
         return ()
@@ -329,20 +359,16 @@ effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfM
       Expression.Index {value, index} => {
         run extendPath(nodes, value, &mut path.*)
         if path.root != usize.MAX {
-          if !path.through {
-            run Vector<usize>.append(&mut path.steps, anyElement())
-          }
+          run Vector<usize>.append(&mut path.steps, anyElement())
           run Vector<NodeId>.append(&mut path.indexes, index)
         }
         return ()
       }
       Expression.Dereference {value} => {
-        if let NodeKind.Expression {form: inner, ..} = &nodes[value.index].kind {
-          if let Expression.Local {local} = &inner {
-            path.root = local.index
-            path.through = true
-            return ()
-          }
+        run extendPath(nodes, value, &mut path.*)
+        if path.root != usize.MAX {
+          run Vector<usize>.append(&mut path.steps, referent())
+          path.through = true
         }
         return ()
       }
@@ -384,9 +410,6 @@ effect fn bindingPath(nodes: &[Node], subject: NodeId, steps: &[PlaceStep], acce
   }
   if path.root == usize.MAX {
     path.root = subjectRoot(subject)
-  }
-  if path.through {
-    return ()
   }
   let mut at = usize.ZERO
   while at < steps.length {
@@ -497,11 +520,11 @@ fn markConsumedTarget(walker: &mut Walker, since: usize, point: usize, statement
   return ()
 }
 
-// A read of a reference local to reach its referent: the local itself is read.
-effect fn useRoot(walker: &mut Walker, local: usize, span: Span, at: usize) -> Flow ! OutOfMemoryError ? &mut Allocator {
-  let used = run useHolder(&mut walker.*, local, at)
-  let path = Path {root: local, through: false, steps: Vector<usize>.make(), indexes: Vector<NodeId>.make()}
-  let point = run access(&mut walker.*, &path, Kind.Read, span, used.at, usize.MAX)
+// An access to a place behind a reference. Reaching it reads the root holder, whose loans the
+// result carries, and the access is recorded at the referent place.
+effect fn throughReference(walker: &mut Walker, path: &Path, kind: Kind, span: Span, at: usize) -> Flow ! OutOfMemoryError ? &mut Allocator {
+  let used = run useHolder(&mut walker.*, path.root, at)
+  let point = run access(&mut walker.*, path, kind, span, used.at, usize.MAX)
   return Flow {at: point, carried: move used.carried}
 }
 
@@ -535,19 +558,22 @@ effect fn indexes(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
   return current
 }
 
-// Creates a loan of a written place at a fresh point, carried by the borrowing value.
+// Creates a loan of a written place at a fresh point, carried by the borrowing value. A reborrow
+// through a reference is a loan of the referent place (BORROW-005): while it lives, an access
+// through the parent reference conflicts with it as with any loan of that place.
 effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, place: NodeId, exclusive: bool, span: Span, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator {
   let path = run pathOf(nodes, place)
-  if path.root == usize.MAX || path.through {
+  if path.root == usize.MAX {
     leave(&mut walker.*, BorrowStatus.StoredLoans)
     return flowAt(at)
   }
   let mut evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
-  // A reference to a whole holder reaches what its loans borrow, so the holder's loans travel
-  // with the reference: borrowing a callable to invoke it keeps its capture loans live.
+  // A reference to a whole holder, or a reborrow through one, reaches what its loans borrow, so
+  // the holder's loans travel with the reference: the parent loan outlives every reborrow of it,
+  // and borrowing a callable to invoke it keeps its capture loans live.
   let mut carried = Vector<Carry>.make()
-  if Vector<usize>.length(&path.steps) == usize.ZERO && holds(&walker.*, path.root) {
+  if (path.through || Vector<usize>.length(&path.steps) == usize.ZERO) && holds(&walker.*, path.root) {
     let used = run useHolder(&mut walker.*, path.root, evaluated)
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&used.carried))
     evaluated = used.at
@@ -578,8 +604,8 @@ effect fn place(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
 ! OutOfMemoryError ? &mut Allocator {
   let evaluated = run indexes(nodes, locals, owner, &mut walker.*, path, at)
   if path.through {
-    let used = run useRoot(&mut walker.*, path.root, span, evaluated)
-    return flowAt(used.at)
+    let reached = run throughReference(&mut walker.*, path, kind, span, evaluated)
+    return flowAt(reached.at)
   }
   let whole = Vector<usize>.length(&path.steps) == usize.ZERO
   if whole && holds(&walker.*, path.root) {
@@ -677,9 +703,6 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
         let mut flow = flowAt(current)
         if receiver == 3 {
           flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Read, span, current)
-        } else if path.through {
-          let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, current)
-          flow = run useRoot(&mut walker.*, path.root, span, evaluated)
         } else {
           flow = run borrow(nodes, locals, owner, &mut walker.*, argument, receiver == 2, span, current)
         }
@@ -759,11 +782,6 @@ effect fn calleeAccess(nodes: &[Node], locals: &[Local], owner: &DeclarationId, 
   let path = run pathOf(nodes, callee)
   if path.root == usize.MAX {
     return run visit(nodes, locals, owner, &mut walker.*, callee, at)
-  }
-  if path.through {
-    let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
-    let span = nodes[callee.index].origin.span
-    return run useRoot(&mut walker.*, path.root, span, evaluated)
   }
   let span = nodes[callee.index].origin.span
   return run borrow(nodes, locals, owner, &mut walker.*, callee, true, span, at)
@@ -881,6 +899,19 @@ effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut
           return Shape.Construct {values: run fieldValues(Vector<AggregateField>.asSlice(&fields))}
         }
       }
+      // An immediate run is exactly the one call it executes (EFF-003): the Effect that call
+      // constructs is a temporary only this run consumes, so its operands are the call's arguments
+      // and the run node is the call's result (EFFECT-OWN-001, BORROW-004).
+      if let Expression.Run {value, immediate} = &form {
+        if immediate {
+          if let NodeKind.Expression {form: operand, ..} = &nodes[value.index].kind {
+            if let Expression.CallableCall {constructs, ..} = &operand {
+              if constructs { return Shape.Outside {reason: BorrowStatus.Effects} }
+            }
+            return run expressionShape(&operand)
+          }
+        }
+      }
       return run expressionShape(&form)
     }
     NodeKind.LocalBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: false}
@@ -989,6 +1020,7 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
       return Shape.Invoke {callee: callee, arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), pipeline: pipeline,
         exclusive: mode == CallableMode.Mutable}
     }
+    // A stored Effect's run uses the environment its value holds (EFFECT-OWN-002).
     Expression.Run {..} => Shape.Outside {reason: BorrowStatus.Effects}
     Expression.Match {subject, access, arms, ..} => Shape.Match {
       subject: subject, access: scrutineeOf(&access), arms: run armShapes(Vector<MatchArm>.asSlice(&arms)),
@@ -1123,8 +1155,9 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       let targetSpan = nodes[target.index].origin.span
       let mut point = usize.MAX
       if path.through {
-        let used = run useRoot(&mut walker.*, path.root, targetSpan, flow.at)
-        point = used.at
+        let reached = run throughReference(&mut walker.*, &path, Kind.Write, targetSpan, flow.at)
+        run consume(&mut walker.*, Vector<Carry>.asSlice(&reached.carried), reached.at)
+        point = reached.at
       } else {
         point = run access(&mut walker.*, &path, Kind.Write, targetSpan, flow.at, usize.MAX)
         markConsumedTarget(&mut walker.*, since, point, span)
@@ -1649,6 +1682,8 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   if Vector<Carry>.length(&flow.carried) > usize.ZERO {
     return verdict(Outcome.NotChecked, BorrowStatus.StoredLoans)
   }
+  // Exit carries no events: scope-end storage ends are not modeled yet, so a `run`'s failure path
+  // needs no edge to it. The regions slice adds both.
   let exit = walker.exit
   run edge(&mut walker, flow.at, exit)
   let mut bits = Vector<usize>.make()
@@ -1719,7 +1754,8 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
           if !ends && (event.kind != Kind.Write || !covers(&event.place, &source.place)) {
             // Inspecting the tag of an owner reads none of its moved parts.
             let partial = event.kind == Kind.Inspect && !covers(&source.place, &event.place)
-            if shared == usize.ONE && event.kind != Kind.Write && !partial {
+            // A write behind a moved reference uses the reference to reach its referent.
+            if shared == usize.ONE && (event.kind != Kind.Write || behind(&source.place, &event.place)) && !partial {
               return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Span>.some(source.span)}
             }
             // A partial replacement of a moved place, or an overlap decided by an unknown index.
@@ -1736,7 +1772,16 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
       if index != event.loan {
         let code = conflictCode(event.kind, loans[index].exclusive)
         if let Option<RejectionCode>.Some {value} = move code {
-          let shared = overlap(&loans[index].place, &event.place)
+          let mut shared = overlap(&loans[index].place, &event.place)
+          if shared != usize.ZERO && behind(&event.place, &loans[index].place) {
+            // Replacing a reference leaves the referent it lent untouched. Moving or dropping it
+            // while its referent is reborrowed is not decided here.
+            if event.kind == Kind.Write {
+              shared = usize.ZERO
+            } else if event.kind == Kind.Move || event.kind == Kind.Drop {
+              shared = 2
+            }
+          }
           if shared != usize.ZERO {
             let mut live = inFlight(&loans[index], event.point)
             if !live && width > usize.ZERO {
