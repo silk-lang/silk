@@ -146,7 +146,8 @@ fields `SEM0025`, array elements `SEM0030`, assignments `SEM0037`, and incompati
 **Status:** Confirmed
 
 `type Name = Target` declares a module-level name for one existing type, one interface
-application, or one unapplied generic declaration. `pub type` publishes the name like any other
+application, or one unapplied generic declaration. `type Name<Parameters> = Target` declares a
+generic alias, which names a family of such types over its own parameters. `pub type` publishes the name like any other
 declaration. The target is anything the use site could spell directly: a primitive or nominal type,
 an applied generic such as `Point<i32>`, a union, a reference type, an interface, or the bare name of
 a generic struct, union, enum or interface.
@@ -205,6 +206,58 @@ fn sum<T: Add<i32, i32>>(left: T, right: i32) -> i32 {
 }
 ```
 
+A generic alias declares type and lifetime parameters, and every one of them must occur in the
+target. Each use writes every argument, and the use denotes the target with those arguments
+substituted. The result is normalized like any written type, so a union target is flattened,
+deduplicated and canonically ordered after substitution, and it may collapse to a single member:
+
+```silk
+struct Pair<A, B> {
+  first: A
+  second: B
+}
+
+struct IoError {}
+struct Left {}
+struct Right {}
+
+type IntPair<V> = Pair<i32, V>
+type Fallible<T> = T | IoError
+type Ref<'a, T> = &'a T
+
+// IntPair<bool> is Pair<i32, bool>.
+fn first(pair: IntPair<bool>) -> i32 {
+  return pair.first
+}
+
+// Fallible<IoError> is IoError.
+fn collapsed(value: Fallible<IoError>) -> i32 {
+  return 0
+}
+
+// Fallible<Left | Right> is Left | Right | IoError.
+fn widened(value: Fallible<Left | Right>) -> i32 {
+  return 0
+}
+
+// Fallible<Fallible<Left>> is Left | IoError.
+fn nested(value: Fallible<Fallible<Left>>) -> i32 {
+  return 0
+}
+
+fn borrowed<'a>(value: Ref<'a, i32>) -> &'a i32 {
+  return value
+}
+```
+
+A generic alias of an interface application names one interface application per instantiation,
+so `type Same<T> = Combine<T, T>` may stand in a bound, an `impl` head or an operation qualifier as
+`Same<i32>`. Alias parameters are never inferred. A use cannot omit them, and a generic function
+whose parameter is spelled `Fallible<T>` sees the expansion `T | IoError`; GEN-003 never solves a
+union member backwards, so the caller writes `take<Left>(...)`. Alias parameters carry no bounds:
+the target's own bounds are proven at the expanded application with their usual diagnostics. Each
+distinct instantiation is expanded once.
+
 An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
 in a generic parameter list, the interface of an `impl` head, and the qualifier of a static member
 or interface operation call. A type alias cannot stand where only an interface is valid, and an
@@ -226,15 +279,20 @@ It does not alias, import, shadow or extend the `Intrinsic` namespace (INTR-001)
 privilege the member's own contract does not already give.
 
 **Boundary:** An alias is not a new type: it cannot carry its own conformances, fields or inherent
-members distinct from its target. An alias declares no type parameters of its own: it either fixes
-every argument (`type Pair = Point<i32>`, which accepts no further arguments) or fixes none
-(`type Pointed = Point`, which takes the target's full argument list at each use). An interface alias
-names one interface, not a bound set: `type Both = A + B` is invalid.
+members distinct from its target. An alias without parameters either fixes every argument
+(`type Pair = Point<i32>`, which accepts no further arguments) or fixes none (`type Pointed = Point`,
+which takes the target's full argument list at each use). The unapplied-declaration alias is a
+name-only forward and is not a generic alias. A generic alias declares no bounds, row or
+representation parameters, and no parameter its target does not use (`type Phantom<T> = i32` is
+invalid). A generic alias cannot be passed unapplied as an argument. An interface alias names one
+interface, not a bound set: `type Both = A + B` is invalid.
 Union aliases in failure rows (typed failures) are this same rule.
 
 **Diagnostics:** A target that is not visible at the alias declaration receives the existing
 unresolved-name diagnostic at the target spelling. A cyclic alias reports `SEM0183` at each member
-of the cycle. Alias type parameters report `SEM0184` at the parameter list. An alias used in a
+of the cycle. A generic alias parameter that is bounded, of a row or representation kind, or
+absent from the target reports `SEM0184` at that parameter. A generic alias used with missing or
+extra arguments receives the type-argument arity diagnostic, `SEM0051`, at the use. An alias used in a
 position of the wrong kind receives that position's existing wrong-kind diagnostic, citing the alias
 origin. An unapplied generic alias used with missing or extra arguments receives the target's
 type-argument arity diagnostic at the use. `type Both = A + B` receives one parser diagnostic,

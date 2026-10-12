@@ -3354,22 +3354,24 @@ const collectModule = (module: ModuleClosure.Module): ModuleHeaders => {
     )
     diagnostics.push(...typeParameters.diagnostics)
     if (header._tag === 'AliasHeader') {
-      // A parameterized alias is rejected as a whole, so its target is never analyzed: analyzing
-      // it would only report the parameters it names as unknown types on top of the rejection.
-      const parameterized = header.generics.length > 0
-      const target = parameterized
-        ? unavailableResolution(header.anchor)
-        : analyzeDeclaredType(context, header.target)
+      // A generic alias's target is analyzed over the alias's own parameters (TYPE-004); each use
+      // substitutes its written arguments for them.
+      const target = analyzeDeclaredType(
+        context,
+        header.target,
+        typeParameters.environment,
+        false,
+        typeParameters.lifetimeContext,
+      )
       diagnostics.push(...target.diagnostics)
       return {
         _tag: 'AliasDeclaration',
         id,
         canonical,
         visibility,
-        typeParameters: [],
+        typeParameters: typeParameters.facts,
         name,
         target: target.fact,
-        ...(parameterized ? { parameterList: header.generics[0]?.anchor ?? header.anchor } : {}),
         anchor: header.anchor,
       }
     }
