@@ -39,7 +39,7 @@ export const derive = (index: DeclarationIndex.Index): NominalVariance => {
   const summaries = new Map<string, ReadonlyArray<Variance>>()
   // A Slot transfers exclusive access to one raw destination; only its outer access can
   // shorten. Its payload remains invariant, just like the destination of &mut T.
-  summaries.set(TypeCompatibility.nominalVarianceKey(Type.nominal('silk/core', 'Slot')), [
+  summaries.set(TypeCompatibility.nominalVarianceKey(Type.slot('never', Lifetime.staticLifetime)), [
     'Covariant',
     'Invariant',
   ])

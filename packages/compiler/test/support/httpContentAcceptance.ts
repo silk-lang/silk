@@ -78,7 +78,7 @@ impl MonotonicClock for FixedClock {
 effect fn allocateUntilFailure(
   self: &mut FailingAllocator,
   layout: Layout,
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + usize.ONE
   if self.failAt > usize.ZERO && self.calls == self.failAt {
     fail OutOfMemoryError {}

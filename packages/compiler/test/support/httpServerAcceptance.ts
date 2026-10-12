@@ -50,7 +50,7 @@ import silk.vector {Vector}
 
 struct RefusingAllocator {calls: usize}
 impl Allocator for RefusingAllocator {
-  effect fn allocate(self: &mut Self, layout: Layout) -> Allocation ! OutOfMemoryError {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
     drop layout
     self.calls = self.calls + usize.ONE
     fail OutOfMemoryError {}
