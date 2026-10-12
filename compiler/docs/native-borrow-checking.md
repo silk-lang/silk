@@ -297,7 +297,13 @@ cover first:
   compile-time prefixes static evaluation copies).
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
   exclusive views included, are proved; region and contents obligations wait for later slices.
-- `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
+- `storage`: the body uses a storage operation the loan and move walk does not enter yet:
+  `slotAddress`, `replace`, `sharedWithMut`, `executionNotify` (an external readiness callback,
+  which a local-shared access callback must not run: OWN0016), `executionFromAllocation`,
+  `executionDrive`, `relinquish` or `executionCurrent`. Every other storage operation is checked as a call to its
+  contract. Each such contract names the operand region every result view reaches (a raw-buffer
+  view or slot carries its buffer reference's region, a string view its text's region), and
+  `unsafe` discharges only the operation's memory obligations, never its aliasing.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
