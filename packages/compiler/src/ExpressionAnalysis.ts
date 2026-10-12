@@ -675,7 +675,7 @@ export const analyzeEnumMember = (
   if (qualifierToken === undefined || memberToken === undefined || identifiers.length !== 2)
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
-  const enumLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const enumLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (enumLookup._tag !== 'Resolved' || enumLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const enum_ = enumLookup.declaration
@@ -765,7 +765,7 @@ const analyzeEnumValueCall = (
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
   const operationName = SemanticContext.nameText(context, operationToken) ?? ''
-  const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (qualifierLookup._tag !== 'Resolved' || qualifierLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const operation = qualifierLookup.declaration.associatedOperations.find(
@@ -2262,9 +2262,9 @@ export const analyzePattern = (
         ? undefined
         : (SemanticContext.nameText(context, qualifierToken) ?? '')
     const enumLookup =
-      qualifier === undefined
+      qualifierToken === undefined
         ? undefined
-        : Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+        : resolveMemberQualifier(context, resolution, qualifierToken)
     const enum_ =
       enumLookup?._tag === 'Resolved' && enumLookup.declaration._tag === 'EnumDeclaration'
         ? enumLookup.declaration
@@ -4860,6 +4860,7 @@ import {
   isSectionArity,
   ownedProviderCaptureAccess,
   recoveryInvocationRecipe,
+  resolveMemberQualifier,
   serviceOperation,
   sourceCallable,
 } from './CallResolution.js'
@@ -8576,6 +8577,20 @@ const aliasedInterfaceOperationTarget = (
     SemanticContext.nameText(context, qualifier) ?? '',
   )
   if (lookup._tag !== 'Resolved' || lookup.declaration._tag !== 'AliasDeclaration') return undefined
+  // A generic alias qualifier must write its arguments (`Alias<Args>.member`), which the applied
+  // owner path resolves; written bare it names no application.
+  if (lookup.declaration.typeParameters.length > 0)
+    return {
+      _tag: 'Invalid',
+      diagnostics: [
+        Diagnostic.typeArgumentArity(
+          SemanticContext.nameText(context, qualifier) ?? '',
+          lookup.declaration.typeParameters.length,
+          0,
+          Location.at(qualifier.anchor),
+        ),
+      ],
+    }
   // An alias without arguments is its target's spelling, so the plain qualified path takes it.
   const target = lookup.declaration.target
   if (
@@ -9756,6 +9771,8 @@ const analyzeAnonymousCallable = (
     initial.fact,
     (path) => {
       const resolved = resolvers.type(AuthoredWalk.moduleName(context), path)
+      const aliased = DeclarationResolution.aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -9774,6 +9791,10 @@ const analyzeAnonymousCallable = (
     node._tag === 'CallableExpression'
       ? DeclarationCollection.anonymousDeclaration(node)
       : undefined,
+    (path) =>
+      DeclarationResolution.borrowedAliasUse(
+        resolvers.type(AuthoredWalk.moduleName(context), path).fact,
+      ),
   )
   const collected = {
     ...initial,
@@ -11062,12 +11083,8 @@ function analyzeExpressionDecision(
     if (intrinsicOperationTarget(context, node)?.rule._tag === 'PlaceRule') {
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
-    const named = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
     // A transparent alias qualifier names its target declaration (TYPE-004).
-    const qualifierLookup =
-      named._tag === 'Resolved'
-        ? { ...named, declaration: NameResolution.erasedOwner(resolution.index, named.declaration) }
-        : named
+    const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,
