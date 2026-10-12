@@ -325,8 +325,9 @@ Differences from Zig, each deliberate:
 
 **Hash.** 128 bits, non-cryptographic, word at a time, streaming over tokens. The backend already
 names symbols by two seeded 64-bit hashes (`backend/InstanceKey.silk:676-678`, byte at a time
-through `InternIndex.hashBytes`, `semantic/InternIndex.silk:100`). The fingerprint hash should be
-a new stdlib function that processes eight bytes per step. **[assumption]** At 128 bits, the
+through `InternIndex.hashBytes`, `semantic/InternIndex.silk:100`). The fingerprint hash is
+`semantic/ContentHash.silk`: MurmurHash3 x64-128 with seed zero, sixteen bytes per step. It was
+pulled forward from slice 4 to name emission subjects in place of SHA-256. **[assumption]** At 128 bits, the
 chance of any collision among 10^7 fingerprints is about 10^14 / 2^129, below 10^-24. The threat
 model is accidental collision; a deliberately colliding source file is out of scope, as it is for
 Zig's truncated BLAKE3 (audit §2). If Julia wants adversarial resistance, BLAKE3 truncated to 128
