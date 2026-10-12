@@ -427,6 +427,71 @@ conflicting evidence before TIR lowering.
 [struct literal analysis](../../../../packages/compiler/src/ExpressionAnalysis.ts),
 [generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
 
+### GEN-008 — A qualified member call writes its owner's arguments on the owner
+
+**Status:** Confirmed
+
+A generic type's parameters are written on the type and a function's own parameters on the
+function. In `Owner<A>.member<B>(...)`, `A` applies the owner and `B` is the member's own explicit
+prefix under GEN-003.
+
+```silk
+union Maybe<T> {
+  Some { value: T },
+  None
+}
+
+impl<T> Maybe<T> {
+  fn some(value: T) -> Maybe<T> { return Maybe<T>.Some { value: move value } }
+  fn pair<U>(value: T, other: U) -> Maybe<U> {
+    drop value
+    return Maybe<U>.some(move other)
+  }
+}
+
+let present = Maybe<i32>.some(1)
+let paired = Maybe<i32>.pair<bool>(1, true)
+let unwritten = Maybe.some(1) // T inferred as i32
+```
+
+A written owner application is a type, so it supplies every type, row, and representation
+argument of the owner, in the owner's order (GEN-002). It may omit the owner's lifetime arguments,
+which the call infers from its operands like the regions a call prefix omits. When no owner
+application is written, every owner argument is inferred from the call under GEN-003.
+
+```silk
+struct Lent<'a, T> { value: &'a T }
+
+impl<'a, T> Lent<'a, T> {
+  fn read(lent: &Lent<'a, T>) -> &'a T { return lent.value }
+}
+
+fn first<'r>(lent: &Lent<'r, i32>) -> &'r i32 {
+  return Lent<i32>.read(lent) // 'a inferred as 'r
+}
+```
+
+**Boundary:** The member's written list never names the owner's parameters, and an owner
+application never names the member's. A partial owner application is an incomplete type and is
+invalid.
+
+```silk,ignore
+let prefixed = Maybe.some<i32>(1)    // invalid: T belongs to Maybe
+struct Pair<A, B> { first: A second: B }
+let partial = Pair<i32>.make(1, true) // invalid: Pair<i32> is incomplete
+```
+
+**Diagnostics:** A member list that writes owner arguments reports the owner-argument placement
+diagnostic at the list, with the corrected spelling `Owner<...>.member<...>`. An incomplete owner
+application reports the GEN-002 arity diagnostic.
+
+**Current compiler:** Both compilers accept owner applications, including omitted owner
+lifetimes. Until the migration finishes, both also still accept the member-prefix spelling
+`Owner.member<OwnerArguments..., OwnArguments...>`; the placement diagnostic is unimplemented.
+
+**Evidence:** [call specialization](../../../../packages/compiler/src/CallResolution.ts),
+[generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
+
 ## Executable representation parameters
 
 ### REP-001 — A callable or Effect representation parameter preserves one exact implementation

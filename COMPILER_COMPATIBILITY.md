@@ -14,6 +14,22 @@ The fixture now declares both functions in `impl Vector`, retaining its expected
 The bootstrap is frozen during backend development; retire this entry when it enforces the
 same owner lookup rule.
 
+## Owner type-argument placement
+
+GEN-008 writes a generic owner's arguments on the owner and a member's own arguments on the member:
+`Option<i32>.map<String>(f)`, not `Option.map<i32, String>(f)`. An owner application may omit the
+owner's lifetimes, which the call infers; it is otherwise a complete type.
+
+- **Bootstrap:** binds an owner application to the impl's or service's binders by position and
+  reports an incomplete one (SEM0051). It still accepts the member-prefix spelling.
+- **Native:** accepts complete owner applications on inherent members and services, and infers the
+  lifetimes an inherent owner application omits. A service application cannot omit a lifetime yet.
+  It still accepts the member-prefix spelling.
+- **Source migration:** `packages/compiler/scripts/migrate-type-argument-placement.mjs` rewrites the
+  member-prefix spelling and reports every site it cannot write without guessing. The stdlib, tests
+  and documentation are migrated on main; `compiler/src` migrates on `selfhost`.
+- Retire this entry when both compilers reject the member-prefix spelling with a diagnostic.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
