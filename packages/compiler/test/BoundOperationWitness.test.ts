@@ -118,13 +118,13 @@ pub fn main() -> i32 {
 
       const adapted = yield* analyzed(
         'bound-operation-witness/effect-operator-boundary',
-        `interface Combined { operator + effect fn add(left: &Self, right: &Self) -> Self }
+        `interface Combined { effect fn add(left: &Self, right: &Self) -> Self }
 struct Cell { code: i32 }
 fn cellAdd(left: &Cell, right: &Cell) -> Cell {
   return Cell { code: left.code + right.code }
 }
 impl Combined for Cell { add: Cell.cellAdd }
-fn combined<T: Combined>(left: T, right: T) -> T { return run ((&left) + (&right)) }
+fn combined<T: Combined>(left: T, right: T) -> T { return run Combined.add(&left, &right) }
 pub fn main() -> i32 {
   let cell = combined<Cell>(Cell { code: 20 }, Cell { code: 1 })
   return cell.code + 21
@@ -451,9 +451,7 @@ it.effect('requires explicit moves for operator-spelled value operands', () =>
   Effect.gen(function* () {
     const snapshot = yield* analyzed(
       'bound-operation-witness/operator-value-ownership',
-      `interface Combined {
-  operator + fn add(left: Self, right: Self) -> Self
-}
+      `import silk.ops { Add }
 
 struct Token { code: i32 }
 
@@ -461,9 +459,9 @@ fn tokenAdd(left: Token, right: Token) -> Token {
   return Token { code: left.code + right.code }
 }
 
-impl Combined for Token { add: Token.tokenAdd }
+impl Add<Token, Token> for Token { add: Token.tokenAdd }
 
-fn implicitTwice<T: Combined>(left: T, right: T) -> T {
+fn implicitTwice<T: Add<T, T>>(left: T, right: T) -> T {
   let first = left + right
   return left + right
 }
@@ -538,7 +536,7 @@ it.effect('reports a bound operation whose selected witness cannot be lowered', 
 it.effect('reports nothing for either witness kind a conformance may name', () =>
   Effect.gen(function* () {
     // The check must not fire on source that lowers: a source witness, an intrinsic witness, and
-    // the operator spelling of both.
+    // the operator spelling of the intrinsic one.
     const sourceWitness = yield* analyzed(module, witnessed)
     const intrinsicWitness = yield* analyzed(
       'bound-operation-witness/intrinsic-unlowerable',
@@ -767,11 +765,11 @@ pub fn main() -> i32 { return 0 }`,
   }),
 )
 
-it.effect('lowers weakened source-witness loans across operators and exclusive branches', () =>
+it.effect('lowers weakened source-witness loans across bound calls and exclusive branches', () =>
   Effect.gen(function* () {
     const weakened = yield* analyzed(
       'bound-operation-witness/weaker-operator-access',
-      `interface Combined { operator + fn add(left: &mut Self, right: &mut Self) -> Self }
+      `interface Combined { fn add(left: &mut Self, right: &mut Self) -> Self }
 struct Cell { code: i32 }
 fn cellAdd(left: &Cell, right: &Cell) -> Cell {
   return Cell { code: left.code + right.code }
@@ -780,7 +778,7 @@ impl Combined for Cell { add: Cell.cellAdd }
 fn combine<T: Combined>(left: T, right: T) -> T {
   let mut ownedLeft = move left
   let mut ownedRight = move right
-  return (&mut ownedLeft) + (&mut ownedRight)
+  return Combined.add(&mut ownedLeft, &mut ownedRight)
 }
 pub fn main() -> i32 {
   let out = combine<Cell>(Cell { code: 20 }, Cell { code: 22 })
@@ -800,7 +798,7 @@ pub fn main() -> i32 {
 struct Fixed {}
 effect fn read(self: &Fixed, number: i32) -> i32 { return number }
 impl Counter for Fixed { read: Fixed.read }
-interface Combined { operator + fn add(left: &mut Self, right: &mut Self) -> i32 }
+interface Combined { fn add(left: &mut Self, right: &mut Self) -> i32 }
 struct Cell { code: i32 }
 fn cellAdd(left: &Cell, right: &Cell) -> i32 { return left.code + right.code }
 impl Combined for Cell { add: Cell.cellAdd }
@@ -808,7 +806,7 @@ effect<'env> fn branch<T: Combined + 'env, 'env>(flag: bool, left: T, right: T) 
   let fixed = Fixed {}
   let mut ownedLeft = move left
   let mut ownedRight = move right
-  let number = (&mut ownedLeft) + (&mut ownedRight)
+  let number = Combined.add(&mut ownedLeft, &mut ownedRight)
   let pending = Intrinsic.bindRequirement<Counter>(Counter.read(number), &fixed)
   if flag { return run move pending }
   return run move pending

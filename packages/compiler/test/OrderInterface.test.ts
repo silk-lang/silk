@@ -13,8 +13,9 @@ const snapshot = (source: string) =>
 it.effect('rejects a type with no Order witness', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.order { Order }
+fn less<T: Order>(left: &T, right: &T) -> bool { return left < right }
 pub fn main() -> bool {
-  return Order.less(true, false)
+  return less(&true, &false)
 }`)
     assert.isTrue(
       Analysis.diagnostics(self).some((diagnostic) =>
@@ -28,8 +29,11 @@ pub fn main() -> bool {
 it.effect('selects one concrete comparison with no runtime dispatch', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.order { Order }
+fn less<T: Order>(left: &T, right: &T) -> bool { return left < right }
 pub fn main() -> i32 {
-  let ordered = Order.less<i32>(1, 2)
+  let low: i32 = 1
+  let high: i32 = 2
+  let ordered = less<i32>(&low, &high)
   if ordered { return 42 }
   return 0
 }`)
@@ -38,8 +42,9 @@ pub fn main() -> i32 {
     const comparisons = operations.filter(
       (operation) => operation._tag === 'Binary' && operation.operator === 'LessThan',
     )
-    // One comparison, and it results in bool rather than in the bound's type parameter.
-    assert.strictEqual(comparisons.length, 1)
+    // The selected witness compares twice (before, then after) and results in bool rather than in
+    // the bound's type parameter.
+    assert.strictEqual(comparisons.length, 2)
     if (comparisons[0]?._tag === 'Binary') assert.deepEqual(comparisons[0].type, { _tag: 'bool' })
     // Interface selection is static: no provider slot and no dispatch reaches the lowered program.
     assert.isFalse(
@@ -53,9 +58,14 @@ pub fn main() -> i32 {
 it.effect('specializes one bound per conforming integer width', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.order { Order }
+fn less<T: Order>(left: &T, right: &T) -> bool { return left < right }
 pub fn main() -> i32 {
-  let narrow = Order.less<u8>(1, 2)
-  let wide = Order.less<i64>(1, 2)
+  let narrowLow: u8 = 1
+  let narrowHigh: u8 = 2
+  let wideLow: i64 = 1
+  let wideHigh: i64 = 2
+  let narrow = less<u8>(&narrowLow, &narrowHigh)
+  let wide = less<i64>(&wideLow, &wideHigh)
   if narrow { if wide { return 42 } }
   return 0
 }`)
@@ -64,9 +74,9 @@ pub fn main() -> i32 {
     const comparisons = operations.filter(
       (operation) => operation._tag === 'Binary' && operation.operator === 'LessThan',
     )
-    // One comparison per width: the two instantiations lower to two separate primitives rather
-    // than sharing one dispatch through a provider.
-    assert.strictEqual(comparisons.length, 2)
+    // Two comparisons per width: the two instantiations lower to separate primitives rather than
+    // sharing one dispatch through a provider.
+    assert.strictEqual(comparisons.length, 4)
     assert.isFalse(
       operations.some((operation) =>
         ['Switch', 'Provide', 'ServiceCall', 'ServiceEffectConstruct'].includes(operation._tag),

@@ -864,9 +864,27 @@ export interface OperatorExpressionDecision {
   readonly contract: CallContractFact
   readonly interfaceOperation?: InterfaceOperationFact
   readonly witnessEffectSite?: Tir.EffectSiteId
+  /** How a comparison turns its interface operation's result into `bool` (OP-009). */
+  readonly predicate?: OperatorPredicate
   readonly type: ExpressionTypeFact
   readonly anchor: AuthoredHir.Anchor
 }
+
+/**
+ * The comparison an operator applies to its interface operation's result, in written operand
+ * order: `!=` negates `Equal.equals`, and the ordering operators test `Order.compare` against one
+ * `Ordering` member.
+ */
+export type OperatorPredicate =
+  | { readonly _tag: 'NegatedOperatorResult' }
+  | {
+      readonly _tag: 'OrderingOperatorResult'
+      readonly enum: DeclarationFacts.CanonicalId
+      readonly member: DeclarationFacts.CanonicalEnumMemberId
+      readonly discriminant: bigint
+      readonly enumType: Type.Nominal
+      readonly negated: boolean
+    }
 
 /**
  * The bound contract one operator resolves through inside a generic body.

@@ -1654,7 +1654,9 @@ A valid hook is synchronous, infallible, non-allocating, and requirement-free. I
 which permits containers to destroy initialized values hidden in raw storage before automatic field
 cleanup releases that storage.
 
-**Boundary:** A type with a `Drop` hook is affine and cannot implement `Copy`. The hook cannot add a
+**Boundary:** A type with a `Drop` hook is affine and cannot implement `Copy`. The `Drop` head
+gives each region position its own unbounded binder (IMPL-007), so the same hook runs for every
+region a value carries. The hook cannot add a
 typed failure, run an open Effect, acquire services, or perform asynchronous work. Cleanup that
 needs any of those capabilities is an explicit operation under CLOSE-001.
 

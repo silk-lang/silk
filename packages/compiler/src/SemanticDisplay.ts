@@ -5,7 +5,6 @@ import type * as Intrinsic from './Intrinsic.js'
 import * as IntrinsicCatalog from './Intrinsic.js'
 import type * as NameResolution from './NameResolution.js'
 import * as Lifetime from './Lifetime.js'
-import * as Operator from './Operator.js'
 import * as RequirementRow from './RequirementRow.js'
 import * as RowAlgebra from './RowAlgebra.js'
 import * as Type from './Type.js'
@@ -451,8 +450,6 @@ export const roleDeclaration = (self: DeclarationFacts.RoleFact): Presentation =
 export const serviceOperation = (self: DeclarationFacts.ServiceOperationFact): Presentation => {
   const name = self.name._tag === 'Present' ? self.name.spelling : '_'
   const kind = `${self.unsafe ? 'unsafe ' : ''}${self.functionKind === 'Effect' ? `effect<${Lifetime.display(DeclarationFacts.executableLifetimes(self).environment)}> fn` : 'fn'}`
-  const operator =
-    self.operator === undefined ? '' : `operator ${Operator.spelling(self.operator.operator)} `
   const parameterNames = executableParameterNames(self)
   const typeParameters = parameterNames.length === 0 ? '' : `<${parameterNames.join(', ')}>`
   const parameters = self.parameters
@@ -471,7 +468,7 @@ export const serviceOperation = (self: DeclarationFacts.ServiceOperationFact): P
   return {
     _tag: 'ServiceOperationPresentation',
     name,
-    text: `${operator}${kind} ${name}${typeParameters}(${parameters}) -> ${declaredType(self.returnType)}${failureRow(self.failureRow)}${requirementRow(self.requirementRow)}${constraints(self.constraints)}${properties}`,
+    text: `${kind} ${name}${typeParameters}(${parameters}) -> ${declaredType(self.returnType)}${failureRow(self.failureRow)}${requirementRow(self.requirementRow)}${constraints(self.constraints)}${properties}`,
   }
 }
 

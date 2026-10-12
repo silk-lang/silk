@@ -163,7 +163,7 @@ A compile-time equivalence and seeded-hash contract for hashed collection keys.
 
 ### Details
 
-The `==` operator selects `equals`. A hashed collection calls `hash` with its own seed.
+A hashed collection calls `equals` to compare keys and `hash` with its own seed.
 
 ### Gotchas
 
@@ -175,7 +175,7 @@ If a witness breaks the rule, a present key can become unreachable.
 ### Operation `equals`
 
 ```silk
-operator == fn equals<'life0, 'life1>(left: &'life0 Self, right: &'life1 Self) -> bool
+fn equals<'life0, 'life1>(left: &'life0 Self, right: &'life1 Self) -> bool
 ```
 
 Reports whether two keys name the same collection entry.

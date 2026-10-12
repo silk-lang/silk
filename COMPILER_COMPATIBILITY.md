@@ -1127,29 +1127,35 @@ The fixture now declares both functions in `impl Vector`, retaining its expected
 The bootstrap is frozen during backend development; retire this entry when it enforces the
 same owner lookup rule.
 
-### Borrowed operator operand inference in selfhost
+### Operators bind to fixed standard-library interfaces
 
-- **Status:** focused native verification passed on 2026-10-07; optimized N0, actual self-build
-  and integrated verification are pending.
-- **Rule:** OP-009 uses ordinary interface operation contracts after operand-only selection.
-  Written borrowed operands infer the operation's own lifetime parameters; fixed lifetimes,
-  caller parameters, reference access and interface/provider arguments remain rigid. Expected
-  results and operation obligations do not select between competing suppliers.
-- **Compilers:** the bootstrap instantiates operation references and checks their operand
-  contracts. Selfhost previously compared applied operation parameters by exact equality before
-  inferring operation-owned lifetimes, refusing both bounded and concrete borrowed operators.
-  Concrete discovery now distinguishes open runtime type/row shape from retained caller
-  validity lifetimes. The native source probes each complete operand list privately, publishes
-  canonical operation/ordinal bindings, applies them to the result and callable witness recipe, and proves
-  instantiated bounds using actual caller premises. Unsafe operations require a lexical unsafe
-  boundary. Generic type/row, static-argument and Effect operator applications remain explicit
-  gaps; an operation lifetime that no operand determines also remains an explicit gap.
-- **Evidence:** the existing-root actor `borrowedOperatorsInferOnlyTheirLifetimesAndProveBounds`
-  asserts target and binding identities, borrowed results, caller-proven and unproved bounds,
-  fixed static/access/unsafe boundaries and repeated-lifetime consistency. The new actor passed
-  in 23 ms with five related/global controls passing (46 ms total); the timing guard passed.
-- **Open questions:** reference operands do not yet contribute their referent's owner module to
-  concrete discovery. This separate provider-bucket limitation is unchanged by operand inference.
+- **Status:** Approved by Julia on 2026-10-11 (v2 proposal P6). The bootstrap implemented it in
+  #1440. Selfhost implemented it in #1459, which also brings the stdlib change.
+- **Rule:** OP-009 binds each overloadable operator to one standard-library interface operation.
+  The arithmetic, bitwise and logical operators bind to `silk.ops`, `==` and `!=` bind to
+  `silk.equal.Equal.equals`, and `<`, `<=`, `>` and `>=` bind to `silk.order.Order.compare`,
+  whose `Ordering` result is compared with one member in written operand order. Conformances are
+  found by IMPL-004. Concrete scalar operands always use the built-in operators. There is no
+  `operator` declaration marker.
+- **Compilers:**
+  - Both compilers bind through the same fixed table.
+  - The bootstrap reports `SEM0010` for a concrete named call `Order.compare(&a, &b)` whose
+    operands are scalars, although `silk/order.silk` declares the scalar conformances. The
+    operator form `&a < &b` and calls on user types work. Selfhost has not been checked for this
+    named-call case.
+  - Selfhost derives a reference operand's owner module from its referent. A comparison operand
+    is written as a reference, so concrete discovery reads the module of the type it points to.
+- **Source migration:** compare scalars with the built-in operators instead of calling
+  `Order.compare` on them by name.
+- **Evidence:** the bootstrap `OperatorContracts` and `OrderInterface` tests. Selfhost
+  `boundOperatorsSelectOneBoundOrConcreteCall`, `borrowedOperatorsInferOnlyTheirLifetimes`,
+  `competingOperatorConformancesRejectWithoutResultContextChoice`, `operatorsNeedNoInterfaceImport`
+  and `operatorBodiesShareOneDiscovery`. The native corpus programs `operator-interface-contract`,
+  `nominal-union-operator-provider`, `vector-sort-search-stability` and
+  `vector-move-only-sort-and-cleanup`.
+- **Open questions:** none. The bootstrap's `SEM0010` on a scalar `Order.compare` named call
+  contradicts IMPL-004, so it is a bootstrap defect. A follow-up `main` PR fixes it and retires
+  that part of this entry.
 
 ### Struct declaration fields use whitespace separators
 

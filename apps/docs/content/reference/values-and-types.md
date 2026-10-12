@@ -637,6 +637,8 @@ reference rather than by field shape alone.
 
 **Boundary:** A field-only scalar struct does not become Copy automatically. An owner of allocated
 memory cannot request Copy merely because its physical representation contains a copyable pointer.
+A `Copy` head may not depend on regions: it may not name `'static`, repeat one region, or bound a
+region, so every region a struct carries copies alike (IMPL-007; `SEM0220`).
 
 **Diagnostics:** Invalid implicit copying reports `OWN0003`. An invalid `impl Copy` reports
 `SEM0083` and identifies the first affine, cleanup-bearing, cyclic, or unavailable reason.

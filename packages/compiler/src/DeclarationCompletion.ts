@@ -173,6 +173,119 @@ const foreignFunctionPointerAdmission = (
   ])
 }
 
+// A binder's representation contract when it names a region, such as `once fn<'static>(i32) -> i32`.
+const regionContract = (parameter: TypeParameterFact): Type.Type | undefined => {
+  const contract = parameter.representationBound?.contract
+  return contract?._tag === 'Resolved' && Type.regionOccurrences(contract.type).length > 0
+    ? contract.type
+    : undefined
+}
+
+const parameterArgumentKey = (parameter: Type.Parameter): string =>
+  parameter.kind === 'Lifetime'
+    ? Lifetime.key(Lifetime.bound(parameter.owner, parameter.ordinal, parameter.name))
+    : Type.key(parameter)
+
+// The head binder an argument of the provider names directly, keyed as `parameterArgumentKey`.
+const argumentBinder = (argument: Type.GenericArgument): string | undefined => {
+  if (Lifetime.isLifetime(argument)) return Lifetime.key(argument)
+  if (Type.isRepresentationParameterArgument(argument)) return Type.key(argument.parameter)
+  return Type.isTypeArgument(argument) && Type.isParameter(argument)
+    ? Type.key(argument)
+    : undefined
+}
+
+// The provider declaration's parameters, the substitution of the provider's arguments for them,
+// and the declared parameter that a head binder stands for as a direct provider argument.
+const providerDeclaration = (modules: ReadonlyArray<ModuleHeaders>, provider: Type.Type) => {
+  const declared = Type.isNominal(provider)
+    ? (memberByNominal(modules, provider)?.typeParameters ?? [])
+    : []
+  const substitution: Type.Substitution = new Map(
+    Type.isNominal(provider)
+      ? declared.flatMap((parameter, index) => {
+          const argument = provider.arguments[index]
+          return argument === undefined ? [] : [[parameterArgumentKey(parameter.type), argument]]
+        })
+      : [],
+  )
+  const counterpart = (binder: Type.Parameter): TypeParameterFact | undefined => {
+    if (!Type.isNominal(provider)) return undefined
+    const own = parameterArgumentKey(binder)
+    return declared[provider.arguments.findIndex((argument) => argumentBinder(argument) === own)]
+  }
+  return { substitution, counterpart }
+}
+
+/**
+ * Spells the interface bounds of a sealed head that the provider's declaration does not imply. A
+ * conformance may hold for some regions of a type and not others, so an interface bound decides
+ * cleanup or copying by region unless every value of the provider type already satisfies it.
+ * Sealed `Copy` bounds are region-independent under the same rule and stay allowed.
+ */
+const unimpliedInterfaceBounds = (
+  modules: ReadonlyArray<ModuleHeaders>,
+  provider: Type.Type,
+  requirements: ReadonlyArray<ConformanceHead.Requirement>,
+): ReadonlyArray<string> => {
+  const { substitution, counterpart } = providerDeclaration(modules, provider)
+  return requirements.flatMap((requirement) => {
+    if (Type.equals(requirement.capability, Type.copyCapability)) return []
+    const declared = Type.isParameter(requirement.provider)
+      ? counterpart(requirement.provider)
+      : undefined
+    const implied = (declared?.bounds ?? []).some(
+      (bound) =>
+        bound._tag === 'ResolvedBound' &&
+        Type.equals(
+          Type.substitute(bound.application.capability, substitution),
+          requirement.capability,
+        ),
+    )
+    return implied
+      ? []
+      : [`${Type.display(requirement.provider)}: ${Type.display(requirement.capability)}`]
+  })
+}
+
+/**
+ * Names the head binders whose region-carrying bounds the provider's declaration does not already
+ * imply. A binder that stands as argument `i` of the provider is implied when declared parameter
+ * `i` carries the same bounds under the provider's arguments: every well-formed value of the
+ * provider type already satisfies them, so no region pattern of that type can miss the head.
+ */
+const unimpliedRegionBinders = (
+  modules: ReadonlyArray<ModuleHeaders>,
+  provider: Type.Type,
+  parameters: ReadonlyArray<TypeParameterFact>,
+): ReadonlyArray<string> => {
+  const { substitution, counterpart: declaredFor } = providerDeclaration(modules, provider)
+  const implied = (parameter: TypeParameterFact, contract: Type.Type | undefined): boolean => {
+    const counterpart = declaredFor(parameter.type)
+    if (counterpart === undefined) return false
+    const lifetimesImplied = (parameter.lifetimeBounds ?? []).every((required) =>
+      (counterpart.lifetimeBounds ?? []).some((available) =>
+        Lifetime.equals(Type.substituteLifetime(available, substitution), required),
+      ),
+    )
+    if (contract === undefined) return lifetimesImplied
+    const declaredContract = counterpart.representationBound?.contract
+    return (
+      lifetimesImplied &&
+      counterpart.representationBound?.kind === parameter.representationBound?.kind &&
+      declaredContract?._tag === 'Resolved' &&
+      Type.equals(Type.substitute(declaredContract.type, substitution), contract)
+    )
+  }
+  return parameters.flatMap((parameter) => {
+    const contract = regionContract(parameter)
+    const carriesRegion = (parameter.lifetimeBounds?.length ?? 0) > 0 || contract !== undefined
+    return !carriesRegion || implied(parameter, contract) || parameter.name._tag !== 'Present'
+      ? []
+      : [parameter.name.spelling]
+  })
+}
+
 export const complete = (
   self: DeclarationIndex.Index,
   resolvers: ResolutionSeams.ResolutionSeams,
@@ -1317,6 +1430,28 @@ export const complete = (
         ).includes(module.module)
       )
         return { ...conformance, head }
+      // Lifetimes never decide which code runs: a sealed Drop or Copy head is selected per type
+      // during lowering, with no typing proof behind it, so it may not depend on regions.
+      // Conformance heads may: coherence erases lifetimes and typing proves their relations.
+      const sealed =
+        Type.equals(conformance.capability.type, Type.dropCapability) ||
+        Type.equals(conformance.capability.type, Type.copyCapability)
+      const regionSelection = !sealed
+        ? undefined
+        : ConformanceHead.regionSelection(
+            conformance.capability.type,
+            conformance.provider.type,
+            unimpliedRegionBinders(modules, conformance.provider.type, conformance.typeParameters),
+            unimpliedInterfaceBounds(modules, conformance.provider.type, requirements),
+          )
+      if (regionSelection !== undefined)
+        diagnostics.push(
+          Diagnostic.regionSelectiveConformance(
+            ConformanceHead.encode(head),
+            ConformanceHead.describeRegionSelection(regionSelection),
+            Location.at(conformance.anchor),
+          ),
+        )
       const failures = ConformanceHead.terminationFailures(head)
       if (failures.length > 0)
         diagnostics.push(

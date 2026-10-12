@@ -14,7 +14,6 @@ import type { Index } from './DeclarationIndex.js'
 import * as Diagnostic from './Diagnostic.js'
 import * as TypeInference from './internal/TypeInference.js'
 import * as Presentation from './SemanticDisplay.js'
-import type * as Operator from './Operator.js'
 import * as RequirementRow from './RequirementRow.js'
 import * as RowAlgebra from './RowAlgebra.js'
 import type * as Scalar from './Scalar.js'
@@ -933,10 +932,6 @@ export interface ServiceOperationFact {
   readonly typeParameters: ReadonlyArray<TypeParameterFact>
   readonly parameterCount: number
   readonly parameters: ReadonlyArray<ParameterFact>
-  readonly operator?: {
-    readonly operator: Operator.Eligible
-    readonly anchor: AuthoredHir.Anchor
-  }
   readonly name: DeclaredName
   readonly returnType: ReturnTypeFact
   readonly opaqueResult?: OpaqueResultFact

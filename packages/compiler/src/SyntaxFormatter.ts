@@ -5,7 +5,6 @@ import type * as Diagnostic from './Diagnostic.js'
 import * as FormattedDocument from './FormattedDocument.js'
 import * as FormatDocument from './internal/FormatDocument.js'
 import * as LiteralForm from './LiteralForm.js'
-import * as Operator from './Operator.js'
 import * as SourceFile from './SourceFile.js'
 import type * as SyntaxFile from './SyntaxFile.js'
 import * as SyntaxTree from './SyntaxTree.js'
@@ -580,13 +579,6 @@ const printServiceOperation = (
   node: SyntaxTree.Node,
   prefix: FormatDocument.Document,
 ): FormatDocument.Document => {
-  const operatorMarker = directNodes(node).find((child) => child.kind === 'OperatorMarker')
-  const operatorKeyword =
-    operatorMarker === undefined ? undefined : tokenOf(operatorMarker, 'Identifier')
-  const operatorToken =
-    operatorMarker === undefined
-      ? undefined
-      : directTokens(operatorMarker).find((token) => Operator.isDeclarationToken(token.kind))
   const effectKeyword = directTokens(node).find((token) => token.kind === 'EffectKeyword')
   const effectEnvironment = directNodes(node).find((child) => child.kind === 'EffectEnvironment')
   const unsafeKeyword = directTokens(node).find((token) => token.kind === 'UnsafeKeyword')
@@ -597,32 +589,16 @@ const printServiceOperation = (
   const properties = directNodes(node).filter((child) => child.kind === 'FunctionPropertyClause')
   const body = directNodes(node).find((child) => child.kind === 'Block')
   return FormatDocument.concat(
-    ...(operatorKeyword === undefined || operatorToken === undefined
-      ? []
-      : [
-          printToken(context, operatorKeyword, prefix),
-          printToken(context, operatorToken, FormatDocument.text(' ')),
-          FormatDocument.text(' '),
-        ]),
     ...(unsafeKeyword === undefined
       ? []
-      : [
-          printToken(
-            context,
-            unsafeKeyword,
-            operatorKeyword === undefined ? prefix : FormatDocument.empty,
-          ),
-          FormatDocument.text(' '),
-        ]),
+      : [printToken(context, unsafeKeyword, prefix), FormatDocument.text(' ')]),
     ...(effectKeyword === undefined
       ? []
       : [
           printToken(
             context,
             effectKeyword,
-            operatorKeyword === undefined && unsafeKeyword === undefined
-              ? prefix
-              : FormatDocument.empty,
+            unsafeKeyword === undefined ? prefix : FormatDocument.empty,
           ),
           ...(effectEnvironment === undefined ? [] : [printNode(context, effectEnvironment)]),
           FormatDocument.text(' '),
@@ -630,9 +606,7 @@ const printServiceOperation = (
     printToken(
       context,
       tokenOf(node, 'FnKeyword'),
-      effectKeyword === undefined && unsafeKeyword === undefined && operatorKeyword === undefined
-        ? prefix
-        : FormatDocument.empty,
+      effectKeyword === undefined && unsafeKeyword === undefined ? prefix : FormatDocument.empty,
     ),
     printToken(context, tokenOf(node, 'Identifier'), FormatDocument.text(' ')),
     ...(typeParameters === undefined ? [] : [printNode(context, typeParameters)]),
@@ -1174,8 +1148,6 @@ const printNode = (
     }
     case 'ServiceOperation':
       return printServiceOperation(context, node, prefix)
-    case 'OperatorMarker':
-      return printTokenSequence(context, node, prefix, FormatDocument.text(' '), preserveBlank)
     case 'ServiceInvalidMember':
       throw new SyntaxFormatterImplementationError(
         'Damaged service member reached the syntax printer',

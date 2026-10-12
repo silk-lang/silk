@@ -443,8 +443,8 @@ lookup, service requirement, provider slot, truthiness conversion, numeric promo
 execution, or hidden allocation.
 
 **Boundary:** The closed concrete contracts on this page require no user declaration. An ordinary
-user-defined type participates only through an interface operation explicitly marked under OP-009;
-an operation named `add` or `lessThan` does not automatically acquire operator syntax.
+user-defined type participates only through the operator's standard-library interface under OP-009;
+an operation named `add` or `lessThan` on another interface does not acquire operator syntax.
 
 **Diagnostics:** When no admitted concrete operation accepts the operands, the current compiler
 reports `SEM0012` at the incompatible operand using the selected operation's expected and received
@@ -686,94 +686,91 @@ results themselves do not produce arithmetic traps.
 [operator metadata](../../../../packages/compiler/src/Operator.ts),
 [integer actor modules](../../../../packages/compiler/stdlib/silk).
 
-### OP-009 — An interface operation may opt into one existing operator explicitly
+### OP-009 — Each overloadable operator is bound to one standard-library interface
 
 **Status:** Confirmed
 
-An interface operation may declare that it supplies one operator from Silk's closed spelling table.
-The relationship is explicit in the operation declaration; an ordinary function name such as
-`add`, `multiply`, or `lessThan` has no operator meaning by itself.
+A user-defined type gets an operator by implementing that operator's interface from the standard
+library. The table is closed and fixed; no declaration can bind an operator, and no other interface
+or operation name has operator meaning.
+
+| Operator                             | Interface operation                                                          |
+| ------------------------------------ | ---------------------------------------------------------------------------- |
+| `a + b`                              | `silk.ops.Add<Right, Output>.add(left: Self, right: Right) -> Output`        |
+| `a - b`                              | `silk.ops.Subtract<Right, Output>.subtract`                                  |
+| `a * b`                              | `silk.ops.Multiply<Right, Output>.multiply`                                  |
+| `a / b`                              | `silk.ops.Divide<Right, Output>.divide`                                      |
+| `a % b`                              | `silk.ops.Remainder<Right, Output>.remainder`                                |
+| `a & b`, `a \| b`, `a ^ b`           | `silk.ops.BitAnd`, `BitOr`, `BitXor` `<Right, Output>`                       |
+| `-a`, `~a`, `!a`                     | `silk.ops.Negate<Output>.negate`, `BitNot<Output>.bitNot`, `Not<Output>.not` |
+| `a == b`, `a != b`                   | `silk.equal.Equal.equals(left: &Self, right: &Self) -> bool`                 |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | `silk.order.Order.compare(left: &Self, right: &Self) -> Ordering`            |
+
+The left (or only) operand is the provider: `a * b` means `Multiply<B, Output>.multiply(a, b)` for
+the conformance of `a`'s type, where `B` is `b`'s type and `Output` is whatever that conformance
+declares. The conformance is found like any other (IMPL-004): in the interface's module or in the
+module that declares the provider. No imported module is scanned for operator declarations, so
+importing a module or declaring an interface elsewhere cannot change which operation an existing
+use selects.
 
 ```silk,ignore
-interface Multiply<Right, Output> {
-  operator * fn multiply(left: Self, right: Right) -> Output
-}
+import silk.ops { Multiply }
+
+impl Multiply<f64, Vector> for Vector { multiply: Vector.scale }
+impl Multiply<Vector, f64> for Vector { multiply: Vector.dot }
+impl Multiply<Vector, Vector> for Matrix { multiply: Matrix.apply }
+impl Multiply<Matrix, Matrix> for Matrix { multiply: Matrix.multiply }
 ```
 
-`operator *` grants this operation permission to participate in `*` selection. Everything after
-that eligibility check is ordinary interface machinery: complete parameter and result types,
-ownership modes, Effect channels, conformance mapping, coherence, static specialization, and
-diagnostics.
+These conformances permit `Vector * f64 -> Vector`, `Vector * Vector -> f64`, `Matrix * Vector ->
+Vector`, and `Matrix * Matrix -> Matrix`. The types are ordinary library types; they need not become
+compiler-built-in merely to use mathematical notation.
 
-The operand and result types may differ. A mathematical library can therefore declare distinct,
-non-overlapping conformances such as:
+Comparison operators evaluate both operands once, in written order, then test one result. `!=` is
+the negation of `Equal.equals`. The ordering operators compare `Order.compare(a, b)` with one
+`Ordering` member: `<` tests `== Less`, `<=` tests `!= Greater`, `>` tests `== Greater`, and `>=`
+tests `!= Less`. Their result is `bool`.
 
-```silk,ignore
-impl Multiply<f64, Vector> for Vector {
-  multiply: Vector.scale
-}
+Operator selection uses the precise operand types. It does not use the expected result type,
+perform implicit conversion, inspect runtime tags, or choose by import order. Exactly one
+conformance must accept the operands. Its declared result becomes the expression's type. Inside a
+generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation.
 
-impl Multiply<Vector, f64> for Vector {
-  multiply: Vector.dot
-}
+Concrete scalar and `string` operands always use the built-in operators of OP-002 to OP-008; the
+standard library's own conformances for scalars, such as `Add<i32, i32> for i32`, serve generic
+bounds.
 
-impl Multiply<Vector, Vector> for Matrix {
-  multiply: Matrix.apply
-}
-
-impl Multiply<Matrix, Matrix> for Matrix {
-  multiply: Matrix.multiply
-}
-```
-
-These contracts permit `Vector * f64 -> Vector`, `Vector * Vector -> f64`, `Matrix * Vector ->
-Vector`, and `Matrix * Matrix -> Matrix`. The types shown are ordinary library types; they need not
-become compiler-built-in merely to use mathematical notation.
-
-Operator selection uses the precise operand types and the statically visible conformances. It does
-not use the expected result type, perform implicit conversion, inspect runtime tags, or choose by
-import order. Exactly one operation must match. Its declared result becomes the expression's type.
-
-The mapped actor operation remains available independently of the operator:
+The interface operation remains available by name, independently of the operator:
 
 ```silk,ignore
-let direct = Vector.scale(move vector, 2.0)
+let direct = Multiply<f64, Vector>.multiply(move vector, 2.0)
 let symbolic = move vector * 2.0
 ```
 
 Both select the same conformance and operation.
 
-**Boundary:** A type may overload one operator for different operand types, as in `Vector * f64`
-and `Vector * Vector`. It may not define two operations that accept the same precise operand types
-and rely on an expected result type to distinguish them.
+**Boundary:** Arithmetic, bitwise, and logical operators take their operands by value; comparisons
+take shared references, so the source writes `&a < &b` for an affine type. Operator syntax adds no
+implicit borrowing, copying, or consumption; an affine operand is written with `move`. The
+operator interfaces are ordinary, non-Effect operations. Short-circuit `&&` and `||`, `|>`, `run`,
+assignment, and other control forms are not overloadable. A type may implement one operator
+interface for several `Right` types, but two conformances that accept the same operand types are
+ambiguous; the expected result type never chooses between them.
 
-Operator syntax follows the operation's literal ownership contract. If an affine operation owns an
-operand, the expression must say `move`. If it accepts a shared or exclusive reference, the source
-must supply `&` or `&mut` under the ordinary borrowing rules. Declaring an operator does not add
-implicit borrowing, copying, or consumption.
+This table is the one place the compiler knows standard-library declarations by name (the operator
+exception to minimal compiler privilege). Conformance selection after the binding is ordinary.
 
-```silk,ignore
-move vector * 2.0 // consuming multiplication
-&vector * 2.0     // valid only for a contract whose left operand is &Vector
-```
+**Diagnostics:** No conformance accepting the operands reports `SEM0135` at the operator. More than
+one reports `SEM0136`, listing the competing conformances. A missing bound in a generic body reports
+the ordinary unsatisfied-bound diagnostic. The former `operator` declaration marker is not syntax;
+writing one reports the parser's unexpected-token diagnostic.
 
-Only an interface operation may opt into an existing operator. A free function cannot declare a
-new spelling, precedence level, associativity rule, or conditional evaluation policy. In
-particular, user declarations cannot redefine `&&`, `||`, `|>`, `run`, assignment, or another
-control form.
+**Current compiler:** Aligned. Generic bounds and concrete conformances use the same fixed binding
+and static witness selection.
 
-**Diagnostics:** An operator declaration with the wrong arity or a spelling outside its prefix or
-infix category reports `SEM0134` at that interface operation. No matching conformance reports
-`SEM0135` at the operator. Multiple matching operations report `SEM0136`, listing the competing
-interface operations. Ordinary argument diagnostics remain attached to the operand after a unique
-contract is selected.
-
-**Current compiler:** Aligned. Generic bounds and concrete conformances use the same explicit
-marker, applied interface contract, and static witness selection. Operation spelling has no role in
-eligibility.
-
-**Evidence:** [complete interface contracts](../../../../openspec/specs/bootstrap-complete-interface-contracts/spec.md),
-[static conformance specialization](../../../../openspec/specs/bootstrap-conditional-interface-conformance/spec.md),
+**Evidence:** [operator interfaces](../../../../packages/compiler/stdlib/silk/ops.silk),
+[equality](../../../../packages/compiler/stdlib/silk/equal.silk),
+[ordering](../../../../packages/compiler/stdlib/silk/order.silk),
 [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),
 [conformance implementation forms](requirements-and-services.md#serv-001--a-conformance-may-define-or-map-each-operation).
 

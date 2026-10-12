@@ -84,6 +84,10 @@ definition and reference live in `apps/docs/content/reference/`.
 - All source-callable compiler operations belong to the sealed `Intrinsic` namespace. Do not add a
   compiler-known standard-library actor or recognize a library declaration by spelling in semantic
   analysis, HIR, MIR, evaluation, or a backend.
+- The one documented exception is operator syntax (OP-009): the compiler binds each overloadable
+  operator to one named standard-library interface operation (`silk.ops`, `silk.equal.Equal`,
+  `silk.order.Order`) and knows nothing else about those interfaces. Conformance selection after
+  that binding is ordinary. Do not extend the binding table to other declarations.
 - A new compiler feature exposes only the smallest target-neutral primitive needed to build its
   public API in ordinary Silk source. Keep validation, policy, generic selection, provider types,
   and safe reusable wrappers in the standard library.

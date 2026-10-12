@@ -4,19 +4,19 @@
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`.
 
-Shared compile-time addition witness for generic algorithms over primitive integers.
+Generic helpers for algorithms over primitive integers.
 
 ## When to use
 
-Add an [`Integer`](#declaration-73696c6b2f6e756d657269633a3a496e7465676572) bound when a generic function needs the `+` operator. Use the concrete integer
-modules directly when an algorithm also needs width-specific conversion, overflow, bitwise, or
-formatting operations.
+Call [`Numeric.add`](#declaration-73696c6b2f6e756d657269633a3a4e756d657269632e616464) to add two values of any primitive integer type from generic code. Use the
+concrete integer modules directly when an algorithm also needs width-specific conversion,
+overflow, bitwise, or formatting operations.
 
 ## Details
 
-Witnesses are selected during specialization and create no Effect requirement, provider slot, or
-runtime dispatch. The interface intentionally exposes only the operation spelled by `+`; it does
-not attempt to erase the distinct ranges and conversion rules of each integer type.
+The helpers bound their type parameter with the operator interfaces of `silk.ops`, such as
+`T: Add<T, T>`. Witnesses are selected during specialization and create no Effect requirement,
+provider slot, or runtime dispatch.
 
 ## Gotchas
 
@@ -35,9 +35,9 @@ pub fn main() -> i32 {
 }
 ```
 
-Import as `Integer` with `import silk.numeric { Integer }`.
+Import as `Numeric` with `import silk.numeric { Numeric }`.
 
-Public declarations: 2.
+Public declarations: 1.
 
 <a id="declaration-73696c6b2f6e756d657269633a3a4e756d65726963"></a>
 
@@ -52,8 +52,7 @@ The owner of the generic numeric helpers.
 ### Details
 
 This struct carries no data and is never constructed by the library. The helpers are inherent
-members declared in `impl Numeric`, reached through `import silk.numeric { Numeric }`, and
-leave the [`Integer`](#declaration-73696c6b2f6e756d657269633a3a496e7465676572) interface's name to the interface.
+members declared in `impl Numeric`, reached through `import silk.numeric { Numeric }`.
 
 <a id="declaration-73696c6b2f6e756d657269633a3a4e756d657269632e616464"></a>
 
@@ -68,192 +67,3 @@ Adds two values and traps if the selected integer type cannot represent the resu
 #### When to use
 
 Use this function to call ordinary integer addition from generic code.
-
-<a id="declaration-73696c6b2f6e756d657269633a3a496e7465676572"></a>
-
-## `Integer`
-
-```silk
-pub interface Integer
-```
-
-Static addition contract for primitive integer values.
-
-### When to use
-
-Use this interface when a generic algorithm needs only ordinary integer addition.
-
-### Details
-
-Interfaces select compiler-known operations during specialization. They do not create
-effect requirements, provider slots, or runtime dispatch.
-
-<a id="declaration-73696c6b2f6e756d657269633a3a496e74656765723a3a6f7065726174696f6e3a616464"></a>
-
-### Operation `add`
-
-```silk
-operator + fn add(left: Self, right: Self) -> Self
-```
-
-Adds two values and traps if the selected integer type cannot represent the result.
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a30"></a>
-
-## Implementation `Integer for u8`
-
-```silk
-impl Integer for u8
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a303a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u8Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a31"></a>
-
-## Implementation `Integer for u16`
-
-```silk
-impl Integer for u16
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a313a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u16Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a32"></a>
-
-## Implementation `Integer for u32`
-
-```silk
-impl Integer for u32
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a323a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u32Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a33"></a>
-
-## Implementation `Integer for u64`
-
-```silk
-impl Integer for u64
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a333a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u64Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a34"></a>
-
-## Implementation `Integer for usize`
-
-```silk
-impl Integer for usize
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a343a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.usizeAdd
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a35"></a>
-
-## Implementation `Integer for i8`
-
-```silk
-impl Integer for i8
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a353a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i8Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a36"></a>
-
-## Implementation `Integer for i16`
-
-```silk
-impl Integer for i16
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a363a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i16Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a37"></a>
-
-## Implementation `Integer for i32`
-
-```silk
-impl Integer for i32
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a373a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i32Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a38"></a>
-
-## Implementation `Integer for i64`
-
-```silk
-impl Integer for i64
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a383a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i64Add
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a39"></a>
-
-## Implementation `Integer for isize`
-
-```silk
-impl Integer for isize
-```
-
-<a id="declaration-73696c6b2f6e756d657269633a3a696d706c656d656e746174696f6e3a393a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.isizeAdd
-```

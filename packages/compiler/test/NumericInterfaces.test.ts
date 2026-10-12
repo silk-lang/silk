@@ -8,7 +8,7 @@ const encoder = new TextEncoder()
 const snapshot = (source: string) =>
   AnalysisFixture.retainingMain('numeric-interface/main', encoder.encode(source))
 
-it.effect('rejects a type without the static Integer conformance', () =>
+it.effect('rejects a type without the static Add conformance', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.numeric { Numeric }
 pub fn main() -> bool {
@@ -16,7 +16,7 @@ pub fn main() -> bool {
 }`)
     assert.isTrue(
       Analysis.diagnostics(self).some((diagnostic) =>
-        diagnostic.message.includes('bool does not implement Integer'),
+        diagnostic.message.includes('bool does not implement Add'),
       ),
     )
   }),

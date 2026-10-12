@@ -30,50 +30,8 @@ export type Infix =
  */
 export type ShortCircuit = 'And' | 'Or'
 
-/** Operators an interface operation may supply through an explicit declaration marker. */
+/** Operators a user type may supply through its conformance to the operator's stdlib interface. */
 export type Eligible = Exclude<Prefix | Infix, ShortCircuit>
-
-/** Token kinds retained after the contextual `operator` marker, including rejected control forms. */
-export const declarationTokenKinds: ReadonlyArray<Token.TokenKind> = [
-  'Minus',
-  'Bang',
-  'Tilde',
-  'Star',
-  'Slash',
-  'Percent',
-  'Plus',
-  'Ampersand',
-  'Caret',
-  'Pipe',
-  'Less',
-  'LessEqual',
-  'Greater',
-  'GreaterEqual',
-  'EqualEqual',
-  'BangEqual',
-  'AmpersandAmpersand',
-  'PipePipe',
-  'PipeGreater',
-  'Equals',
-  'RunKeyword',
-]
-
-/** True when a token can be retained for operator-marker validation. */
-export const isDeclarationToken = (kind: Token.TokenKind): boolean =>
-  declarationTokenKinds.includes(kind)
-
-/** Resolves a valid eager marker using the operation arity to disambiguate `-`. */
-export const declaration = (kind: Token.TokenKind, arity: number): Eligible | undefined => {
-  let selected: Prefix | Infix | undefined
-  if (arity === 1) {
-    selected = prefix(kind)
-  } else if (arity === 2) {
-    selected = infix(kind)?.operator
-  } else {
-    selected = undefined
-  }
-  return selected === undefined || isShortCircuit(selected) ? undefined : selected
-}
 
 /** True only for the operators whose right operand is conditionally evaluated. */
 export const isShortCircuit = (self: Prefix | Infix): self is ShortCircuit =>

@@ -75,7 +75,6 @@ export const coverage = {
   RoleDeclaration: 'RoleHeader',
   RequirementSelector: 'RequirementSelector',
   ServiceOperation: 'OperationHeader',
-  OperatorMarker: { container: 'OperationHeader.operator preserves the operation marker' },
   ServiceInvalidMember: {
     recovery: ['InvalidDeclarationHeader'],
     reason: 'Retain the local recovery cause and healthy member structure',
@@ -2803,23 +2802,8 @@ const callableParts = (
   const common = { ...base, name, public: hasToken(syntax, 'PubKeyword') }
   const causes = damage(draft, header, syntax)
   if (operation) {
-    const marker = nodes(syntax).find((n) => n.kind === 'OperatorMarker')
-    const operatorToken = marker?.children.find(
-      (element): element is Token.Token =>
-        isToken(element) && Operator.isDeclarationToken(element.kind),
-    )
-    const operatorOf = (): AuthoredHir.Name | undefined => {
-      if (marker === undefined) return undefined
-      if (operatorToken === undefined)
-        return missingName(draft, child(header, 'operator'), spanOf(marker))
-      return nameFromToken(draft, child(header, 'operator'), operatorToken)
-    }
-    const operator = operatorOf()
     return {
-      header: withCauses(
-        { ...common, _tag: 'OperationHeader', contract, operator, properties },
-        causes,
-      ),
+      header: withCauses({ ...common, _tag: 'OperationHeader', contract, properties }, causes),
       body,
     }
   }

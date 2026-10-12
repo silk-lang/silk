@@ -11,7 +11,6 @@ import {
   peek,
   syntaxNode,
 } from '../internal/ParseState.js'
-import * as Operator from '../Operator.js'
 import * as SyntaxTree from '../SyntaxTree.js'
 import * as Token from '../Token.js'
 import {
@@ -679,26 +678,7 @@ export const serviceOperationFollowing: ReadonlyArray<Token.TokenKind> = [
 export const startsServiceOperation = (state: State): boolean =>
   nextSignificantKind(state) === 'FnKeyword' ||
   nextSignificantKind(state) === 'EffectKeyword' ||
-  nextSignificantKind(state) === 'UnsafeKeyword' ||
-  hasContextualSpelling(state, 'operator')
-
-export const parseOperatorMarker = (initial: State): NodeResult => {
-  const keyword = expect(initial, 'Identifier', [
-    ...Operator.declarationTokenKinds,
-    'EffectKeyword',
-    'FnKeyword',
-    ...serviceOperationFollowing,
-  ])
-  const kind = nextSignificantKind(keyword.state)
-  const token =
-    kind !== undefined && Operator.isDeclarationToken(kind)
-      ? expect(keyword.state, kind, ['EffectKeyword', 'FnKeyword', ...serviceOperationFollowing])
-      : expect(keyword.state, 'Star', ['EffectKeyword', 'FnKeyword', ...serviceOperationFollowing])
-  return {
-    state: token.state,
-    node: syntaxNode(token.state, 'OperatorMarker', [...keyword.elements, ...token.elements]),
-  }
-}
+  nextSignificantKind(state) === 'UnsafeKeyword'
 
 interface CallableContractTail {
   readonly state: State
@@ -763,19 +743,16 @@ const parseEffectDeclarationEnvironment = (initial: State): NodeResult => {
 }
 
 export const parseServiceOperation = (initial: State): NodeResult => {
-  const operatorMarker = hasContextualSpelling(initial, 'operator')
-    ? parseOperatorMarker(initial)
-    : undefined
   const unsafeKeyword =
-    nextSignificantKind(operatorMarker?.state ?? initial) === 'UnsafeKeyword'
-      ? expect(operatorMarker?.state ?? initial, 'UnsafeKeyword', [
+    nextSignificantKind(initial) === 'UnsafeKeyword'
+      ? expect(initial, 'UnsafeKeyword', [
           'EffectKeyword',
           'FnKeyword',
           'Identifier',
           ...serviceOperationFollowing,
         ])
       : {
-          state: operatorMarker?.state ?? initial,
+          state: initial,
           elements: [],
         }
   const effectKeyword =
@@ -814,7 +791,6 @@ export const parseServiceOperation = (initial: State): NodeResult => {
   return {
     state,
     node: syntaxNode(state, 'ServiceOperation', [
-      ...(operatorMarker === undefined ? [] : [operatorMarker.node]),
       ...unsafeKeyword.elements,
       ...effectKeyword.elements,
       ...(effectEnvironment === undefined ? [] : [effectEnvironment.node]),
@@ -840,8 +816,7 @@ export const parseServiceInvalidMember = (initial: State): NodeResult => {
   while (
     token !== undefined &&
     token.kind !== 'EndOfFile' &&
-    !serviceOperationFollowing.includes(token.kind) &&
-    !hasContextualSpelling(state, 'operator')
+    !serviceOperationFollowing.includes(token.kind)
   ) {
     unexpected = [...unexpected, token]
     state = advance(state)
