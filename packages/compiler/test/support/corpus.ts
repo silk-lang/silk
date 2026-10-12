@@ -9725,6 +9725,34 @@ pub fn read(counter: &Counter) -> i32 { return counter.value }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'owner-application-member-calls',
+    source: `import silk.u8
+struct Lent<'a, T> { value: &'a T }
+impl<'a, T> Lent<'a, T> {
+  fn read(lent: &Lent<'a, T>) -> &'a T { return lent.value }
+  fn pick<U>(lent: &Lent<'a, T>, other: U) -> &'a T { drop other return lent.value }
+}
+struct Holder<T> { held: T }
+impl<T> Holder<T> { fn wrap(held: T) -> Holder<T> { return Holder { held: move held } } }
+struct Pair<A, B> {
+  left: A
+  right: B
+}
+impl<A, B> Pair<A, B> { fn second(value: B) -> B { return move value } }
+fn total<'r>(lent: &Lent<'r, i32>) -> i32 {
+  let read = Lent<i32>.read(lent)
+  let picked = Lent<i32>.pick<bool>(lent, true)
+  let holder = Holder<&i32>.wrap(read)
+  return holder.held.* + picked.* + u8.toI32(Pair<i64, u8>.second(2))
+}
+pub fn main() -> i32 {
+  let value = 20
+  let lent = Lent { value: &value }
+  return total(&lent)
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'execution-body-and-endpoint-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
