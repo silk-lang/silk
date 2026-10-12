@@ -221,7 +221,8 @@ it.effect('duplicates an explicitly Copy aggregate whose realized Effect capture
   Effect.gen(function* () {
     const snapshot = yield* analyzed(
       'stored-effect-ownership/copy-realization',
-      `struct Offset { value: i32 }
+      `import silk.ownership { Copy }
+struct Offset { value: i32 }
 impl Copy for Offset {}
 struct Deferred<'env, F: Effect<'env; i32>> { operation: F }
 impl<'env, F: Effect<'env; i32>> Copy for Deferred<'env, F> {}
@@ -245,7 +246,8 @@ it.effect('keeps an executable aggregate affine when its realized Effect owns a 
   Effect.gen(function* () {
     const snapshot = yield* analyzed(
       'stored-effect-ownership/affine-realization',
-      `struct Token { value: i32 }
+      `import silk.ownership { Copy, Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Deferred<'env, F: once Effect<'env; i32>> { operation: F }
 impl<'env, F: once Effect<'env; i32>> Copy for Deferred<'env, F> {}

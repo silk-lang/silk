@@ -1275,18 +1275,6 @@ export const analyzeDeclaredType = (
       fact: { _tag: 'Resolved', type: bare, spelling: bare, anchor, path },
       diagnostics: noDiagnostics,
     }
-  const intrinsicNominal = bare === undefined ? undefined : Type.intrinsicNominals.get(bare)
-  if (intrinsicNominal !== undefined && bare !== undefined)
-    return {
-      fact: {
-        _tag: 'Resolved',
-        type: intrinsicNominal,
-        spelling: bare,
-        anchor,
-        path,
-      },
-      diagnostics: noDiagnostics,
-    }
   const parameterType = bare === undefined ? undefined : typeParameters.get(bare)
   if (parameterType !== undefined && bare !== undefined) {
     if (

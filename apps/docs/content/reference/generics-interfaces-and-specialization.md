@@ -1602,6 +1602,8 @@ allowed. The one exception is a bound the provider's declaration already places 
 parameter: every value of the type satisfies it, so repeating it on the head selects nothing.
 
 ```silk,ignore
+import silk.ownership { Drop }
+
 struct Guard<'a> { value: &'a i32 }
 
 impl<'a> Drop for Guard<'a> { /* ... */ }        // valid

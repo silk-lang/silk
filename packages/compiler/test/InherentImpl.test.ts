@@ -456,7 +456,8 @@ impl Read for Holder { pub fn value(self: &Self) -> i32 { return 0 } }`
       Analysis.diagnostics(arity).find((entry) => entry.code === 'SEM0051') ??
       unreachable('expected missing ordinary argument diagnostic')
     assert.strictEqual(diagnostic.span.start, aritySource.indexOf('Holder {'))
-    const bound = yield* analyzeConformance(`struct Token { value: i32 }
+    const bound = yield* analyzeConformance(`import silk.ownership { Copy }
+struct Token { value: i32 }
 struct Holder<A> { value: &A }
 interface Read { fn value(self: &Self) -> i32 }
 impl<A: Copy> Read for Holder<A> { pub fn value(self: &Self) -> i32 { return 0 } }

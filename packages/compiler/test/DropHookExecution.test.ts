@@ -11,6 +11,7 @@ const ascii = (value: string): Uint8Array =>
 const parametric = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard<T> {
   value: T
   storage: Intrinsic.Allocation
@@ -38,7 +39,8 @@ pub fn main() -> i32 {
 }`
 
 /** A parametric Drop over a struct that is all-Copy at some instantiation. */
-const copyInstantiation = `struct Holder<T> {
+const copyInstantiation = `import silk.ownership { Copy, Drop }
+struct Holder<T> {
   value: T
 }
 

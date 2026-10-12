@@ -717,7 +717,8 @@ pub fn main() -> i32 { return expand<i32>(0, 1) }`)
 
 it.effect('discovers cleanup hooks called by source failure recovery', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`struct SomeError { storage: Intrinsic.RawBuffer<i32> }
+    const result = yield* snapshot(`import silk.ownership { Drop }
+struct SomeError { storage: Intrinsic.RawBuffer<i32> }
 impl Drop for SomeError {
   fn drop(self: &mut SomeError) -> () { return () }
 }
@@ -1308,7 +1309,8 @@ pub fn main() -> i32 { return left<i32>(0) }`)
 
 it.effect('rejects hidden callable identity growth reached through cleanup', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`struct Guard {}
+    const result = yield* snapshot(`import silk.ownership { Drop }
+struct Guard {}
 fn invoke(value: i32, callback: once fn(i32) -> i32) -> i32 { return callback(value) }
 fn loop(seed: i32, callback: once fn(i32) -> i32) -> i32 {
   let wrapped = invoke(move callback)
@@ -1338,7 +1340,8 @@ pub fn main() -> i32 {
 
 it.effect('keeps composite Effect representations guarded at a terminal cleanup callable', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`struct First {}
+    const result = yield* snapshot(`import silk.ownership { Drop }
+struct First {}
 struct Second {}
 struct Guard {}
 
@@ -1478,6 +1481,7 @@ it.effect('erases nested lifetimes while one cleanup type position descends', ()
   Effect.gen(function* () {
     const result = yield* snapshot(`import silk.box { Box }
 import silk.option { Option }
+import silk.ownership { Drop }
 struct Outer<T> { value: T }
 struct Chain<'a, A, Whole, Part> {
   anchor: &'a i32
@@ -2225,7 +2229,8 @@ pub fn main() -> i32 {
 
 it.effect('shares runtime instances and layouts across distinct proven lifetime arguments', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`struct View<'a> { value: &'a i32 }
+    const result = yield* snapshot(`import silk.ownership { Drop }
+struct View<'a> { value: &'a i32 }
 struct Exclusive<'a> { value: &'a mut i32 }
 impl<'a> Drop for Exclusive<'a> { fn drop(self: &mut Exclusive<'a>) -> () { return () } }
 fn guard<'a>(value: &'a mut i32) -> Exclusive<'a> { return Exclusive { value: move value } }
@@ -2855,7 +2860,8 @@ fn helper() -> () {
       'helper() return Intrinsic.pointerNull<u8>()',
     )
   const observedProvider =
-    `struct Guard {}
+    `import silk.ownership { Drop }
+struct Guard {}
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { helper() } }
 fn observe(state: &mut Guard, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 0 }
 fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
@@ -2919,7 +2925,7 @@ fn allocateOnly() -> () {
       'DependencyCycle',
     ],
     [
-      'struct Guard {}\nimpl Drop for Guard { fn drop(self: &mut Guard) -> () { helper() } }\n' +
+      'import silk.ownership { Drop }\nstruct Guard {}\nimpl Drop for Guard { fn drop(self: &mut Guard) -> () { helper() } }\n' +
         drivenProvider.replace(
           'helper() return Intrinsic.pointerNull<u8>()',
           'let guard = Guard {} drop guard return Intrinsic.pointerNull<u8>()',

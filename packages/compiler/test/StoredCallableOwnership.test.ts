@@ -243,7 +243,8 @@ it.effect('duplicates an explicitly Copy aggregate whose realized callable captu
   Effect.gen(function* () {
     const snapshot = yield* analyzed(
       'stored-callable-ownership/copy-realization',
-      `struct Offset { value: i32 }
+      `import silk.ownership { Copy }
+struct Offset { value: i32 }
 impl Copy for Offset {}
 struct Parser<'env, F: fn<'env>(i32) -> i32> { parse: F }
 impl<'env, F: fn<'env>(i32) -> i32> Copy for Parser<'env, F> {}
@@ -267,7 +268,8 @@ it.effect('keeps an executable aggregate affine when its realized callable owns 
   Effect.gen(function* () {
     const snapshot = yield* analyzed(
       'stored-callable-ownership/affine-realization',
-      `struct Token { value: i32 }
+      `import silk.ownership { Copy, Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Parser<'env, F: once fn<'env>(i32) -> i32> { parse: F }
 impl<'env, F: once fn<'env>(i32) -> i32> Copy for Parser<'env, F> {}

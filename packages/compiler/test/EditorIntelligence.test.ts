@@ -70,7 +70,7 @@ pub fn main() -> i32 {
       const effectFn = source.indexOf('fn(error')
       assert.strictEqual(
         Analysis.hoverSubjectAt(snapshot, 'main', ordinaryFn)?.presentation.text,
-        'fn(value: i32) -> i32\nmode: fn\ncaptures: offset (Copy)',
+        'import silk.ownership { Copy }\nfn(value: i32) -> i32\nmode: fn\ncaptures: offset (Copy)',
       )
       assert.strictEqual(
         Analysis.hoverSubjectAt(snapshot, 'main', exclusiveFn)?.presentation.text,

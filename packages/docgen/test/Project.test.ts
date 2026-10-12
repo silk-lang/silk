@@ -18,6 +18,7 @@ it.effect('builds public-first project JSON with first-class child documentation
   Effect.gen(function* () {
     const source = `//! Recovery utilities.
 
+import silk.ownership { Copy }
 /// Default recovery code.
 pub const defaultCode: i32 = 7
 
