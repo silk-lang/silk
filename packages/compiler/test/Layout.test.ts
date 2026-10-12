@@ -537,7 +537,7 @@ fn consume(problem: Problem) -> i32 {
 
 pub fn main() -> i32 {
   let problem = Problem.Limit { kind: 1, limit: 0 }
-  let result = Result.failResult<i32, Problem>(move problem)
+  let result = Result<i32, Problem>.failResult(move problem)
   let extracted = extract(move result)
   return consume(move extracted)
 }`),

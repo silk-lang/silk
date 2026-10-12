@@ -322,7 +322,7 @@ fn nativeAdmissionChecks() -> i32 {
   let numeric = nativeOrigin("http://127.0.0.1/")
   let dns = nativeOrigin("https://example.com/")
   let mut options = Options.defaults()
-  options.deadline = Option.some<Instant>(SystemClock.make(7, 0))
+  options.deadline = Option<Instant>.some(SystemClock.make(7, 0))
   match move preflight(&numeric, &options) {
     Result.Success {value} => {
       drop value
@@ -343,7 +343,7 @@ fn nativeAdmissionChecks() -> i32 {
       }
     }
   }
-  options.deadline = Option.none<Instant>()
+  options.deadline = Option<Instant>.none()
   return match move preflight(&dns, &options) {
     Result.Success {value} => 0
     Result.Failure {error} => 4
@@ -359,13 +359,13 @@ effect fn nativeOwnedAcquisitionChecks() -> i32
 ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
     let direct = nativeOrigin("http://127.0.0.1/")
     let mut directOptions = Options.defaults()
-    directOptions.deadline = Option.some<Instant>(SystemClock.make(10, 0))
+    directOptions.deadline = Option<Instant>.some(SystemClock.make(10, 0))
     let directAttempt = run Effect.result(acquireOwned(
       direct,
       move directOptions,
       ClientLimits.defaults(),
-      Option.none<TrustSnapshot>(),
-      Option.some<Instant>(SystemClock.make(0, 0)),
+      Option<TrustSnapshot>.none(),
+      Option<Instant>.some(SystemClock.make(0, 0)),
     ))
     match move directAttempt {
       Result.Success {value} => {
@@ -383,14 +383,14 @@ effect fn nativeOwnedAcquisitionChecks() -> i32
 
     let unix = nativeOrigin("http://unix.invalid/")
     let mut unixOptions = Options.defaults()
-    unixOptions.deadline = Option.some<Instant>(SystemClock.make(0, 0))
+    unixOptions.deadline = Option<Instant>.some(SystemClock.make(0, 0))
     let unixAttempt = run Effect.result(acquireUnixOwned(
       b"/tmp/silk-owned-acquisition",
       unix,
       move unixOptions,
       ClientLimits.defaults(),
-      Option.none<TrustSnapshot>(),
-      Option.some<Instant>(SystemClock.make(10, 0)),
+      Option<TrustSnapshot>.none(),
+      Option<Instant>.some(SystemClock.make(10, 0)),
     ))
     match move unixAttempt {
       Result.Success {value} => {
@@ -411,8 +411,8 @@ effect fn nativeOwnedAcquisitionChecks() -> i32
       secure,
       Options.defaults(),
       ClientLimits.defaults(),
-      Option.none<TrustSnapshot>(),
-      Option.none<Instant>(),
+      Option<TrustSnapshot>.none(),
+      Option<Instant>.none(),
     ))
     return match move secureAttempt {
       Result.Success {value} => {
@@ -591,7 +591,7 @@ effect fn nativeProxyAdmissionChecks() -> i32 ! OutOfMemoryError ? &mut Allocato
   }
   let dnsRoute = selectRoute(&dnsConfig, firstForward)
   let mut deadlineOptions = Options.defaults()
-  deadlineOptions.deadline = Option.some<Instant>(SystemClock.make(7, 0))
+  deadlineOptions.deadline = Option<Instant>.some(SystemClock.make(7, 0))
   match move preflightProxyRoute(&dnsRoute, &deadlineOptions) {
     Result.Success {value} => { return 17 }
     Result.Failure {error} => match move error {
@@ -1022,12 +1022,12 @@ effect fn budgetProgram() -> i32
   let bytes = run Bytes.copy(
     b"HTTP/1.1 202 Budget\\r\\nContent-Length: 25\\r\\nContent-Encoding: gzip\\r\\n\\r\\n",
   )
-  let mut reads = Vector.make<MemoryReadEvent>()
+  let mut reads = Vector<MemoryReadEvent>.make()
   run Vector.append(
     &mut reads,
     MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move bytes},
   )
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   run Vector.append(
     &mut writes,
     MemoryWriteEvent {
@@ -1035,13 +1035,13 @@ effect fn budgetProgram() -> i32
       action: MemoryWriteAction.Accept {count: 1024},
     },
   )
-  let memory = run MemoryByteDuplex.make(move reads, move writes, 1024, 128, Option.none<i32>())
+  let memory = run MemoryByteDuplex.make(move reads, move writes, 1024, 128, Option<i32>.none())
   return run Client.withOwned(
     BudgetTransport {memory: move memory},
     endpoint,
     Version.Http11,
     ClientLimits.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     BudgetHandler {request: move request},
   )
 }

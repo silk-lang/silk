@@ -1026,7 +1026,7 @@ fn outer() -> Effect<'static; i32> {
   return effect { return n }
 }
 pub fn main() -> i32 {
-  let mut m = Vector.make<i32>()
+  let mut m = Vector<i32>.make()
 ${line}
   return run outer()
 }`

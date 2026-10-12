@@ -440,17 +440,111 @@ const explicitSourceCallTypeParameters = (
 }
 
 /**
- * The type arguments an applied qualifier supplies ahead of the call's own list: for an inherent
- * member `Option<i32>.map<i64>(...)` the owner's `<i32>` binds the owner binders, so the complete
- * explicit prefix reads as `Option.map<i32, i64>`.
+ * The owner arguments an applied qualifier fixes on its inherent member, in the member's order
+ * (GEN-008). `Owner<Args>` supplies the impl's binders positionally, lifetimes and other kinds
+ * counted separately, and may omit the lifetimes. The member keeps only the impl binders its
+ * signature names, so they lead its explicit parameters in impl order; an argument for a binder
+ * the member does not name fixes nothing in this call. For `Option<i32>.map<i64>(...)` the
+ * complete explicit prefix reads as `Option.map<i32, i64>`. An application is a type, so it must
+ * be complete apart from omitted lifetimes (GEN-002).
  */
 export const appliedOwnerTypeArgumentNodes = (
+  context: SemanticContext.SemanticContext,
   call: AuthoredHir.Expression,
-): ReadonlyArray<AuthoredHir.GenericArgument> => {
+  resolution: ResolutionContext,
+): {
+  readonly nodes: ReadonlyArray<AuthoredHir.GenericArgument>
+  readonly diagnostics: ReadonlyArray<Diagnostic.Located>
+} => {
   const callee = callCallee(call)
-  if (callee._tag !== 'MemberExpression') return []
+  if (callee._tag !== 'MemberExpression') return { nodes: [], diagnostics: [] }
   const owner = callee.selector.subject
-  return owner._tag === 'AppliedType' ? owner.arguments.arguments : []
+  if (owner._tag !== 'AppliedType') return { nodes: [], diagnostics: [] }
+  const written = owner.arguments.arguments
+  const selected = appliedOwnerBinders(context, call, resolution)
+  if (selected === undefined) return { nodes: written, diagnostics: [] }
+  const key = (parameter: Type.Parameter) => `${parameter.kind === 'Lifetime'}:${parameter.name}`
+  const listed = new Set(selected.listed.map(key))
+  const lifetimes = selected.binders.filter((binder) => binder.type.kind === 'Lifetime')
+  const ordinary = selected.binders.filter((binder) => binder.type.kind !== 'Lifetime')
+  const writtenLifetimes = written.filter((node) => node._tag === 'Lifetime').length
+  const writtenOrdinary = written.length - writtenLifetimes
+  const diagnostics: Array<Diagnostic.Located> = []
+  if (writtenOrdinary !== ordinary.length)
+    diagnostics.push(
+      Diagnostic.typeArgumentArity(
+        selected.owner,
+        ordinary.length,
+        writtenOrdinary,
+        Location.at(owner.anchor),
+      ),
+    )
+  else if (writtenLifetimes !== 0 && writtenLifetimes !== lifetimes.length)
+    diagnostics.push(
+      Diagnostic.typeArgumentArity(
+        selected.owner,
+        lifetimes.length,
+        writtenLifetimes,
+        Location.at(owner.anchor),
+      ),
+    )
+  let lifetimeOrdinal = 0
+  let ordinaryOrdinal = 0
+  const nodes = written.filter((node) => {
+    const binder =
+      node._tag === 'Lifetime' ? lifetimes.at(lifetimeOrdinal++) : ordinary.at(ordinaryOrdinal++)
+    return binder !== undefined && listed.has(key(binder.type))
+  })
+  return { nodes, diagnostics }
+}
+
+/**
+ * The binders an owner application supplies for a qualified call, and the ones the selected
+ * member lists. An inherent member lists the impl binders its signature names; a service
+ * operation is applied under every binder of its service.
+ */
+const appliedOwnerBinders = (
+  context: SemanticContext.SemanticContext,
+  call: AuthoredHir.Expression,
+  resolution: ResolutionContext,
+):
+  | {
+      readonly owner: string
+      readonly binders: ReadonlyArray<DeclarationFacts.TypeParameterFact>
+      readonly listed: ReadonlyArray<Type.Parameter>
+    }
+  | undefined => {
+  const [first, second] = referenceNames(call)
+  if (first === undefined || second === undefined) return undefined
+  const owner = SemanticContext.nameText(context, first) ?? ''
+  const qualifier = Semantic.resolveName(resolution.semantic, resolution.scope, owner)
+  if (qualifier._tag !== 'Resolved') return undefined
+  const member = SemanticContext.nameText(context, second) ?? ''
+  if (qualifier.declaration._tag === 'ServiceDeclaration') {
+    if (serviceOperation(qualifier.declaration, member) === undefined) return undefined
+    const binders = qualifier.declaration.typeParameters
+    return { owner, binders, listed: binders.map((binder) => binder.type) }
+  }
+  const associated = Semantic.resolveAssociatedName(
+    resolution.semantic,
+    qualifier.declaration,
+    member,
+    resolution.scope.module,
+  )
+  if (associated._tag !== 'Inherent') return undefined
+  const declaration = associated.declaration
+  const association = declaration.associatedMember
+  if (association === undefined) return undefined
+  const module = declaration.lifetimeElaboration?.owner.module
+  const implementation = resolution.index.modules
+    .find((candidate) => candidate.module === module)
+    ?.inherentImpls.find((candidate) => candidate.ordinal === association.ordinal)
+  if (implementation === undefined) return undefined
+  return {
+    owner,
+    binders: implementation.typeParameters,
+    listed: declaration.typeParameters.map((parameter) => parameter.type),
+  }
 }
 
 export const analyzeCallTypeArguments = (

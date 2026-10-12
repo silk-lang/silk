@@ -255,7 +255,7 @@ effect fn domainRequest(family: FamilySelection, maximum: usize) -> ResolveReque
     Port.fromU16(443),
     move family,
     maximum,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
     Result<ResolveRequest, ResolverError>.Success {value} => move value
@@ -308,7 +308,7 @@ effect fn policyProgram() -> i32
 ! ResolverError | OutOfMemoryError {
   let request = run numericRequest(
     FamilySelection.Any,
-    Option.some<Instant>(SystemClock.make(20, 0)),
+    Option<Instant>.some(SystemClock.make(20, 0)),
   )
   let mut resolver = ProbeResolver {calls: usize.ZERO}
   let mut clock = ProbeClock {nowValue: SystemClock.make(10, 0), calls: usize.ZERO}
@@ -323,7 +323,7 @@ effect fn policyProgram() -> i32
 
   let equal = run numericRequest(
     FamilySelection.Any,
-    Option.some<Instant>(SystemClock.make(20, 0)),
+    Option<Instant>.some(SystemClock.make(20, 0)),
   )
   clock.nowValue = SystemClock.make(20, 0)
   let equalResult = run Effect.result(
@@ -336,7 +336,7 @@ effect fn policyProgram() -> i32
 
   let past = run numericRequest(
     FamilySelection.Any,
-    Option.some<Instant>(SystemClock.make(20, 0)),
+    Option<Instant>.some(SystemClock.make(20, 0)),
   )
   clock.nowValue = SystemClock.make(21, 0)
   let pastResult = run Effect.result(
@@ -347,7 +347,7 @@ effect fn policyProgram() -> i32
   )
   if !timedOut(move pastResult) { return 5 }
 
-  let filtered = run numericRequest(FamilySelection.V6, Option.none<Instant>())
+  let filtered = run numericRequest(FamilySelection.V6, Option<Instant>.none())
   let filteredResult = run Effect.result(
     Resolver.resolve(&filtered)
       |> Effect.provideMut<Resolver>(&mut resolver)
@@ -403,7 +403,7 @@ effect fn nativeProgram() -> i32
     Port.fromU16(443),
     FamilySelection.Any,
     4,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
     Result<ResolveRequest, ResolverError>.Success {value} => move value
@@ -536,7 +536,7 @@ effect fn fixtureRequest(deadline: Instant) -> ResolveRequest ! ResolverError {
     Port.fromU16(80),
     FamilySelection.Any,
     1,
-    Option.some<Instant>(move deadline),
+    Option<Instant>.some(move deadline),
   ) {
     Result<ResolveRequest, ResolverError>.Failure {error} => { fail move error }
     Result<ResolveRequest, ResolverError>.Success {value} => move value
@@ -940,7 +940,7 @@ effect fn resolveSystem(
 }
 
 effect fn resolveRefused() -> ResolvedEndpoints ! ResolverError | OutOfMemoryError {
-  let admitted = run request(FamilySelection.Any, 2, Option.none<Instant>())
+  let admitted = run request(FamilySelection.Any, 2, Option<Instant>.none())
   let mut resolver = NativeSystemResolver.make()
   let mut clock = StubClock {}
   let mut allocator = RefusingAllocator {}
@@ -970,7 +970,7 @@ effect fn nativeCases() -> i32 {
   }
 
   unsafe { silk_resolver_stub_reset(0) }
-  let success = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let success = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move success {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => {
       drop error
@@ -983,7 +983,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 3 }
 
   unsafe { silk_resolver_stub_reset(1) }
-  let malformed = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let malformed = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move malformed {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => {
       drop value
@@ -999,7 +999,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 6 }
 
   unsafe { silk_resolver_stub_reset(2) }
-  let limited = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let limited = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move limited {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => {
       drop value
@@ -1013,7 +1013,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 10 }
 
   unsafe { silk_resolver_stub_reset(3) }
-  let system = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let system = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move system {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => {
       drop value
@@ -1039,7 +1039,7 @@ effect fn nativeCases() -> i32 {
   let deadline = run Effect.result(resolveSystem(
     FamilySelection.Any,
     2,
-    Option.some<Instant>(SystemClock.make(10, 0)),
+    Option<Instant>.some(SystemClock.make(10, 0)),
   ))
   match move deadline {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => {
@@ -1068,7 +1068,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 20 }
 
   unsafe { silk_resolver_stub_reset(4) }
-  let unknown = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let unknown = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move unknown {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => { drop value return 25 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
@@ -1081,7 +1081,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 27 }
 
   unsafe { silk_resolver_stub_reset(5) }
-  let nullAddress = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let nullAddress = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move nullAddress {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => { drop value return 28 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
@@ -1094,7 +1094,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 1, 1) { return 30 }
 
   unsafe { silk_resolver_stub_reset(6) }
-  let nullChain = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let nullChain = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move nullChain {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => { drop value return 31 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
@@ -1107,7 +1107,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 33 }
 
   unsafe { silk_resolver_stub_reset(7) }
-  let noname = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let noname = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move noname {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
       ResolverError.NameNotFound => {}
@@ -1118,7 +1118,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 35 }
 
   unsafe { silk_resolver_stub_reset(8) }
-  let again = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let again = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move again {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
       ResolverError.TemporaryFailure => {}
@@ -1129,7 +1129,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 44 }
 
   unsafe { silk_resolver_stub_reset(9) }
-  let family = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let family = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move family {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
       ResolverError.FamilyUnsupported => {}
@@ -1140,7 +1140,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 45 }
 
   unsafe { silk_resolver_stub_reset(10) }
-  let memory = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let memory = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move memory {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
       ResolverError.SystemResources => {}
@@ -1151,7 +1151,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 46 }
 
   unsafe { silk_resolver_stub_reset(13) }
-  let unknownStatus = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option.none<Instant>()))
+  let unknownStatus = run Effect.result(resolveSystem(FamilySelection.Any, 2, Option<Instant>.none()))
   match move unknownStatus {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => { drop value return 47 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => match move error {
@@ -1169,7 +1169,7 @@ effect fn nativeCases() -> i32 {
   if !counters(1, 0, 1) { return 49 }
 
   unsafe { silk_resolver_stub_reset(11) }
-  let v4Result = run Effect.result(resolveSystem(FamilySelection.V4, 2, Option.none<Instant>()))
+  let v4Result = run Effect.result(resolveSystem(FamilySelection.V4, 2, Option<Instant>.none()))
   let v4 = match move v4Result {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => { drop error return 39 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => move value
@@ -1180,7 +1180,7 @@ effect fn nativeCases() -> i32 {
   if !IpAddress.isV4(&v4Address) || !counters(1, 1, 1) { return 40 }
 
   unsafe { silk_resolver_stub_reset(12) }
-  let v6Result = run Effect.result(resolveSystem(FamilySelection.V6, 2, Option.none<Instant>()))
+  let v6Result = run Effect.result(resolveSystem(FamilySelection.V6, 2, Option<Instant>.none()))
   let v6 = match move v6Result {
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Failure {error} => { drop error return 41 }
     Result<ResolvedEndpoints, ResolverError | OutOfMemoryError>.Success {value} => move value

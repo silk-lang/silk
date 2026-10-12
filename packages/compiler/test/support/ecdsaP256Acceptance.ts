@@ -24,8 +24,8 @@ fn ecdsaMetadataOk(key: &[u8], message: &[u8], signature: &[u8]) -> bool {
   let sigOid: [u8; 8] = [42, 134, 72, 206, 61, 4, 3, 2]
   let curve: [u8; 10] = [6, 8, 42, 134, 72, 206, 61, 3, 1, 7]
   let empty: [u8; 0] = []
-  let keyAlg = AlgorithmView {der: &empty, oid: &ecOid, parametersDer: Option.some<&[u8]>(&curve)}
-  let sigAlg = AlgorithmView {der: &empty, oid: &sigOid, parametersDer: Option.none<&[u8]>()}
+  let keyAlg = AlgorithmView {der: &empty, oid: &ecOid, parametersDer: Option<&[u8]>.some(&curve)}
+  let sigAlg = AlgorithmView {der: &empty, oid: &sigOid, parametersDer: Option<&[u8]>.none()}
   let keyBits = BitStringView {bytes: key, unusedBits: 0}
   let sigBits = BitStringView {bytes: signature, unusedBits: 0}
   return ecdsaOk(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, message, &sigAlg, &sigBits))
@@ -101,24 +101,24 @@ let curve: [u8; 10] = [6, 8, 42, 134, 72, 206, 61, 3, 1, 7]
 let null: [u8; 2] = [5, 0]
 let explicit: [u8; 2] = [48, 0]
 let emptyDer: [u8; 0] = []
-let mut keyAlg = AlgorithmView {der: &emptyDer, oid: &ecOid, parametersDer: Option.some<&[u8]>(&curve)}
-let mut sigAlg = AlgorithmView {der: &emptyDer, oid: &sigOid, parametersDer: Option.none<&[u8]>()}
+let mut keyAlg = AlgorithmView {der: &emptyDer, oid: &ecOid, parametersDer: Option<&[u8]>.some(&curve)}
+let mut sigAlg = AlgorithmView {der: &emptyDer, oid: &sigOid, parametersDer: Option<&[u8]>.none()}
 let mut keyBits = BitStringView {bytes: &key, unusedBits: 0}
 let mut sigBits = BitStringView {bytes: &emptyDer, unusedBits: 0}
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidEncoding) { return 40 }
-sigAlg.parametersDer = Option.some<&[u8]>(&null)
+sigAlg.parametersDer = Option<&[u8]>.some(&null)
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 41 }
-sigAlg.parametersDer = Option.none<&[u8]>()
-keyAlg.parametersDer = Option.none<&[u8]>()
+sigAlg.parametersDer = Option<&[u8]>.none()
+keyAlg.parametersDer = Option<&[u8]>.none()
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 43 }
-keyAlg.parametersDer = Option.some<&[u8]>(&null)
+keyAlg.parametersDer = Option<&[u8]>.some(&null)
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 44 }
-keyAlg.parametersDer = Option.some<&[u8]>(&explicit)
+keyAlg.parametersDer = Option<&[u8]>.some(&explicit)
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 45 }
 let otherCurve: [u8; 10] = [6, 8, 42, 134, 72, 206, 61, 3, 1, 1]
-keyAlg.parametersDer = Option.some<&[u8]>(&otherCurve)
+keyAlg.parametersDer = Option<&[u8]>.some(&otherCurve)
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 46 }
-keyAlg.parametersDer = Option.some<&[u8]>(&curve)
+keyAlg.parametersDer = Option<&[u8]>.some(&curve)
 keyBits.unusedBits = 1
 if !ecdsaError(EcdsaP256Sha256.verifyCertificate(&keyAlg, &keyBits, &message, &sigAlg, &sigBits), P256SignatureError.InvalidParameters) { return 47 }
 keyBits.unusedBits = 0

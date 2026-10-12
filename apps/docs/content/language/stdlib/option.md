@@ -30,19 +30,19 @@ fn double(value: i32) -> i32 {
 
 fn positive(value: i32) -> Option<i32> {
   if value > 0 {
-    return Option.some<i32>(value)
+    return Option<i32>.some(value)
   }
-  return Option.none<i32>()
+  return Option<i32>.none()
 }
 
 pub fn main() -> i32 {
-  let initial = Option.some<i32>(21)
-  let doubled = Option.map<i32, i32>(move initial, double)
-  let answer = Option.flatMap<i32, i32>(move doubled, positive)
-  let absent = Option.none<i32>()
-  let missing = Option.map<i32, i32>(move absent, double)
-  let presentValue = Option.unwrapOr<i32>(move answer, 0)
-  let absentValue = Option.unwrapOr<i32>(move missing, 0)
+  let initial = Option<i32>.some(21)
+  let doubled = Option<i32>.map<i32>(move initial, double)
+  let answer = Option<i32>.flatMap<i32>(move doubled, positive)
+  let absent = Option<i32>.none()
+  let missing = Option<i32>.map<i32>(move absent, double)
+  let presentValue = Option<i32>.unwrapOr(move answer, 0)
+  let absentValue = Option<i32>.unwrapOr(move missing, 0)
   return presentValue + absentValue
 }
 ```
@@ -170,12 +170,12 @@ two owned values leaves this call and the other drops.
 import silk.option { Option }
 
 pub fn main() -> i32 {
-  let present = Option.some<i32>(7)
-  let absent = Option.none<i32>()
+  let present = Option<i32>.some(7)
+  let absent = Option<i32>.none()
   let first = move present
-    |> Option.unwrapOr<i32>(0)
+    |> Option<i32>.unwrapOr(0)
   let second = move absent
-    |> Option.unwrapOr<i32>(5)
+    |> Option<i32>.unwrapOr(5)
   return first + second
 }
 ```
