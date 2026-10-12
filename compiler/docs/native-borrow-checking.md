@@ -293,10 +293,11 @@ whose body is not `Checked`, with one count per reason. A body is `Checked` exac
 is `FullyChecked`. Every other body carries the `BorrowStatus` that names what a later slice must
 cover first:
 
-- `awaiting`: no checker covers the unit yet (selected static bodies and member bodies).
+- `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
+  compile-time prefixes static evaluation copies).
 - `regions`: loans and moves are proved; region and contents obligations wait for slice 3.
-- `captures`, `effects`, `patterns`, `storage`: the body uses that form, which the loan and move
-  walk does not enter yet.
+- `effects`, `patterns`, `storage`: the body uses that form, which the loan and move walk does
+  not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
   reference.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index or a partial
@@ -314,6 +315,13 @@ CI holds the count in two ways. Both read `compiler/borrow-check-gap.json`.
 - A reason that a slice retires is listed under `retired` and must be zero everywhere. The corpus
   job and the N2 self-build step both fail if a retired reason reappears. The self-build totals
   grow with the compiler, so they are printed as a receipt and never compared.
+
+`captures` is retired. The walk checks callable construction, sections and invocation, and each
+anonymous body is checked where it is built: a borrowed capture's loan begins at construction and
+travels with the callable value, a moved capture leaves its place there, a shared invocation reads
+its callee, a `mut fn` invocation borrows it exclusively for the call, and a `once fn` invocation
+moves it (CAPTURE-001, CAPTURE-002, CALLABLE-002, CALLABLE-003). A callable that carries a loan
+anywhere but an immutable `let` answers `stored-loans`, as any loan-carrying value does.
 
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.

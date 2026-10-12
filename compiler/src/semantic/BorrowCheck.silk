@@ -9,7 +9,8 @@
 //! # Details
 //! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
 //! numbers evaluation points in evaluation order and links them into a control-flow graph. A loan
-//! comes from a written borrow or from a shared or mutable receiver pass. A loan carried by a value
+//! comes from a written borrow, a shared or mutable receiver pass, or a borrowed capture of a
+//! constructed callable or section, which carries it like any value. A loan carried by a value
 //! stays live until the node that consumes that value, so a call argument's loan lasts for the
 //! whole call (BORROW-004). A loan bound by `let` to a reference local stays live while that local
 //! is live, by backward liveness over the graph, so loans end at their last use. An access that
@@ -19,14 +20,14 @@
 //! each loop compares the moved places of its outer locals at entry and on every back edge.
 //!
 //! # Gotchas
-//! A body that matches, builds or calls a callable, runs an Effect, uses a storage primitive,
+//! A body that matches, runs an Effect or invokes an `effect fn` value, uses a storage primitive,
 //! reborrows through a reference, stores a loan anywhere but an immutable `let`, or lets a loan
 //! reach a call result, a return or a branch result answers [`Outcome.NotChecked`] with the
 //! [`BorrowStatus`] reason: it is neither accepted nor rejected here. An overlap that depends on an
 //! unknown index, or a partial replacement of a moved place, is `Imprecise` rather than a
 //! conflict, so the stage never rejects a body the bootstrap accepts.
 
-import hir.Hir {Access}
+import hir.Hir {Access, CallableMode}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
@@ -272,10 +273,14 @@ fn expressionType(nodes: &[Node], id: NodeId) -> Option<Shared<Type>> {
   return Option.none<Shared<Type>>()
 }
 
-// Whether `id`'s value can retain a non-static region; a statement node retains nothing.
+// Whether `id`'s value can retain a non-static region; a statement node retains nothing. A callable
+// value may hold capture loans its type does not name, so it always counts as retaining.
 effect fn nodeRetains(nodes: &[Node], id: NodeId, owner: &DeclarationId) -> bool ! OutOfMemoryError ? &mut Allocator {
   let found = expressionType(nodes, id)
   if let Option<Shared<Type>>.Some {value} = move found {
+    if Shared.with<Type, bool>(&value, callableValue) {
+      return true
+    }
     let retained = run retains(&value, owner)
     return retained
   }
@@ -467,7 +472,15 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     leave(&mut walker.*, BorrowStatus.StoredLoans)
     return flowAt(at)
   }
-  let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+  let mut evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+  // A reference to a whole holder reaches what its loans borrow, so the holder's loans travel
+  // with the reference: borrowing a callable to invoke it keeps its capture loans live.
+  let mut carried = Vector.make<Carry>()
+  if Vector.length<usize>(&path.steps) == usize.ZERO && holds(&walker.*, path.root) {
+    let used = run useHolder(&mut walker.*, path.root, evaluated)
+    run appendCarried(&mut carried, Vector.asSlice<Carry>(&used.carried))
+    evaluated = used.at
+  }
   let created = Vector.length<Loan>(&walker.loans)
   run Vector.append<Loan>(
     &mut walker.loans,
@@ -484,7 +497,6 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     kind = Kind.ExclusiveBorrow
   }
   let point = run access(&mut walker.*, &path, kind, span, evaluated, created)
-  let mut carried = Vector.make<Carry>()
   run Vector.append<Carry>(&mut carried, Carry {loan: created, since: point})
   return Flow {at: point, carried: move carried}
 }
@@ -601,6 +613,77 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
   return run finish(nodes, owner, &mut walker.*, result, current, &carried)
 }
 
+// Constructs a callable or section from its captured operands, in order (CAPTURE-001). A borrowed capture's
+// loan begins here and travels with the callable value, so it stays live while the callable can
+// still be invoked (CALLABLE-003); a moved capture leaves its place here (CAPTURE-002). A section
+// copies or takes its base callable's environment, so it carries the loans that callee holds.
+effect fn construct(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, values: &[NodeId], at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector.make<Carry>()
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < values.length {
+    let flow = run visit(nodes, locals, owner, &mut walker.*, values[index], current)
+    run appendCarried(&mut carried, Vector.asSlice<Carry>(&flow.carried))
+    current = flow.at
+    index = index + usize.ONE
+  }
+  // The loans travel with the callable whatever regions its type names: holding them longer is
+  // conservative, and the region slice proves the environment's own regions.
+  let point = run newPoint(&mut walker.*, current)
+  return Flow {at: point, carried: move carried}
+}
+
+// An invocation of a callable value (CALLABLE-002). A pipeline's input is evaluated before the
+// callee. Reading the callee keeps the loans its environment holds live for the whole call
+// (CALLABLE-003). A `mut fn` callee is accessed exclusively for the call; a `once fn` callee is
+// already a typed move of its place, so a second invocation uses a moved place.
+effect fn invoke(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, callee: NodeId, arguments: &[NodeId],
+  pipeline: bool, exclusive: bool, result: NodeId, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector.make<Carry>()
+  let mut current = at
+  let mut first = usize.ZERO
+  if pipeline && arguments.length > usize.ZERO {
+    let input = run visit(nodes, locals, owner, &mut walker.*, arguments[0], current)
+    run appendCarried(&mut carried, Vector.asSlice<Carry>(&input.carried))
+    current = input.at
+    first = usize.ONE
+  }
+  let target = run calleeAccess(nodes, locals, owner, &mut walker.*, callee, exclusive, current)
+  run appendCarried(&mut carried, Vector.asSlice<Carry>(&target.carried))
+  current = target.at
+  let mut index = first
+  while index < arguments.length {
+    let flow = run visit(nodes, locals, owner, &mut walker.*, arguments[index], current)
+    run appendCarried(&mut carried, Vector.asSlice<Carry>(&flow.carried))
+    current = flow.at
+    index = index + usize.ONE
+  }
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried)
+}
+
+// The callee of an invocation. A shared or consuming callee is an ordinary read or move of its
+// value. A `mut fn` callee written as a place is borrowed exclusively for the call, which reads its
+// held loans, so another live loan of that place conflicts with the invocation.
+effect fn calleeAccess(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, callee: NodeId, exclusive: bool, at: usize) -> Flow
+! OutOfMemoryError ? &mut Allocator {
+  if !exclusive {
+    return run visit(nodes, locals, owner, &mut walker.*, callee, at)
+  }
+  let path = run pathOf(nodes, callee)
+  if path.root == usize.MAX {
+    return run visit(nodes, locals, owner, &mut walker.*, callee, at)
+  }
+  if path.through {
+    let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+    let span = nodes[callee.index].origin.span
+    return run useRoot(&mut walker.*, path.root, span, evaluated)
+  }
+  let span = nodes[callee.index].origin.span
+  return run borrow(nodes, locals, owner, &mut walker.*, callee, true, span, at)
+}
+
 fn isBorrow(nodes: &[Node], id: NodeId) -> bool {
   if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
     if let Expression.Borrow {..} = &form {
@@ -608,6 +691,21 @@ fn isBorrow(nodes: &[Node], id: NodeId) -> bool {
     }
   }
   return false
+}
+
+// Whether a local of this type is a callable value in any of its typed forms.
+fn callableValue(ty: &Type) -> bool {
+  return match &ty.* {
+    Type.Callable {..} => true
+    Type.CallableValue {..} => true
+    Type.CallableSchema {..} => true
+    Type.CallableStage {..} => true
+    Type.CallableResult {..} => true
+    Type.CallableOrigin {..} => true
+    Type.CallableWitnessResult {..} => true
+    Type.CallableView {..} => true
+    _ => false
+  }
 }
 
 fn localType(locals: &[Local], local: usize) -> Shared<Type> {
@@ -624,6 +722,8 @@ union Shape {
   Operands {values: Vector<NodeId>},
   PassThrough {value: NodeId},
   Call {arguments: Vector<NodeId>, receiver: usize},
+  Invoke {callee: NodeId, arguments: Vector<NodeId>, pipeline: bool, exclusive: bool},
+  Construct {values: Vector<NodeId>},
   Binding {local: usize, initializer: NodeId, mutable: bool},
   Assignment {local: usize, value: NodeId},
   PlaceAssignment {target: NodeId, value: NodeId},
@@ -638,7 +738,15 @@ union Shape {
 
 effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut Allocator {
   return match &nodes[id.index].kind {
-    NodeKind.Expression {form, ..} => run expressionShape(&form)
+    NodeKind.Expression {form, ty} => {
+      // A named function's section is an aggregate of its captured operands (CALLABLE-001).
+      if let Expression.Aggregate {fields} = &form {
+        if Shared.with<Type, bool>(&ty, callableValue) {
+          return Shape.Construct {values: run fieldValues(Vector.asSlice<AggregateField>(&fields))}
+        }
+      }
+      return run expressionShape(&form)
+    }
     NodeKind.LocalBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: false}
     NodeKind.MutableBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: true}
     NodeKind.Assignment {local, value} => Shape.Assignment {local: local.index, value: value}
@@ -728,9 +836,23 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
     Expression.Constant {..} => Shape.Leaf
     Expression.ForeignStatic {..} => Shape.Leaf
     Expression.ForeignAddress {..} => Shape.Leaf
-    Expression.Callable {..} => Shape.Outside {reason: BorrowStatus.Captures}
-    Expression.StagedCallable {..} => Shape.Outside {reason: BorrowStatus.Captures}
-    Expression.CallableCall {..} => Shape.Outside {reason: BorrowStatus.Captures}
+    Expression.Callable {fields, ..} => Shape.Construct {values: run fieldValues(Vector.asSlice<AggregateField>(&fields))}
+    Expression.StagedCallable {callee, arguments, ..} => {
+      let mut values = run single(callee)
+      let supplied = Vector.asSlice<NodeId>(&arguments)
+      let mut at = usize.ZERO
+      while at < supplied.length {
+        run Vector.append<NodeId>(&mut values, supplied[at])
+        at = at + usize.ONE
+      }
+      return Shape.Construct {values: move values}
+    }
+    Expression.CallableCall {callee, mode, arguments, pipeline, constructs, ..} => {
+      // Invoking an `effect fn` value constructs an Effect that stores its operands (EFF-001).
+      if constructs { return Shape.Outside {reason: BorrowStatus.Effects} }
+      return Shape.Invoke {callee: callee, arguments: run copyIds(Vector.asSlice<NodeId>(&arguments)), pipeline: pipeline,
+        exclusive: mode == CallableMode.Mutable}
+    }
     Expression.Run {..} => Shape.Outside {reason: BorrowStatus.Effects}
     Expression.Match {..} => Shape.Outside {reason: BorrowStatus.Patterns}
     Expression.PatternBinding {..} => Shape.Outside {reason: BorrowStatus.Patterns}
@@ -799,6 +921,12 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
     Shape.Call {arguments, receiver} => {
       return run call(nodes, locals, owner, &mut walker.*, Vector.asSlice<NodeId>(&arguments), receiver, id, at)
     }
+    Shape.Construct {values} => {
+      return run construct(nodes, locals, owner, &mut walker.*, Vector.asSlice<NodeId>(&values), at)
+    }
+    Shape.Invoke {callee, arguments, pipeline, exclusive} => {
+      return run invoke(nodes, locals, owner, &mut walker.*, callee, Vector.asSlice<NodeId>(&arguments), pipeline, exclusive, id, at)
+    }
     Shape.Binding {local, initializer, mutable} => {
       let flow = run visit(nodes, locals, owner, &mut walker.*, initializer, at)
       let point = run newPoint(&mut walker.*, flow.at)
@@ -807,9 +935,12 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if Vector.length<Carry>(&flow.carried) > usize.ZERO {
         run consume(&mut walker.*, Vector.asSlice<Carry>(&flow.carried), point)
         let ty = localType(locals, local)
-        let retained = run retains(&ty, owner)
+        let callable = Shared.with<Type, bool>(&ty, callableValue)
+        let retained = callable || run retains(&ty, owner)
         if retained {
-          if mutable {
+          // A `mut fn` is invoked through a mutable binding. Its capture loans stay held until the
+          // local's last use even if it is replaced, and a replacement that carries loans leaves.
+          if mutable && !callable {
             leave(&mut walker.*, BorrowStatus.StoredLoans)
             return flowAt(point)
           }
