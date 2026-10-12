@@ -5,9 +5,12 @@
 // - a read of a key's declaration as a position becomes `declarationPosition(key)`;
 // - a `Key { ... }` literal becomes `internDeclaration(Key { ... })`.
 //
+// Only a receiver that is a `Key` where it is read is rewritten: a binding the enclosing function
+// annotates `: Key`, initializes with a `Key { ... }` literal, or binds to a `ScopedKey`'s `.key`.
+// Any other struct's `declaration` field is never touched.
+//
 // Identity uses stay raw, because they compare or copy whatever the field holds: `sameKey`,
 // `sameExactKey`, `hashKey`, `dependency`, and a literal whose `declaration` copies another key's.
-// In `sameDependency` the same binding names hold dependencies, not keys.
 // Both accessors still return positions, so the rewrite changes no behavior.
 //
 // The rewrite is idempotent. After a conflict in Semantic.silk, take the other side and rerun:
@@ -20,9 +23,7 @@ import { fileURLToPath } from 'node:url'
 const path = join(dirname(fileURLToPath(import.meta.url)), '../src/semantic/Semantic.silk')
 const check = process.argv.includes('--check')
 
-// Bindings that hold a `Key` wherever `.declaration` is read from them in Semantic.silk.
-const keyBindings = ['key', 'left', 'right', 'parent', 'existing', 'constant', 'context']
-const rawFunctions = new Set(['sameKey', 'sameExactKey', 'hashKey', 'dependency', 'sameDependency'])
+const rawFunctions = new Set(['sameKey', 'sameExactKey', 'hashKey', 'dependency'])
 
 const accessors = `
 // The declaration position a key names. Every read of a key's declaration as a position goes
@@ -89,7 +90,30 @@ const declarationValue = (literal) => {
   return undefined
 }
 
-const copiedDeclaration = new RegExp(`^(?:${keyBindings.join('|')})\\.declaration$`)
+const functionStarts = [...text.matchAll(/^\s*(?:pub )?(?:test )?(?:effect(?:<[^>]*>)? )?fn (\w+)/gm)].map((m) => ({
+  at: m.index,
+  name: m[1],
+}))
+// The function whose text contains `at`.
+const enclosing = (at) => {
+  let found = { at: 0, name: '' }
+  for (const entry of functionStarts) {
+    if (entry.at > at) break
+    found = entry
+  }
+  return found
+}
+// Whether `name` holds a `Key` where it is read at `at`, from its binding in the enclosing function.
+const keyTyped = (name, at) => {
+  const scope = text.slice(enclosing(at).at, at)
+  return new RegExp(`\\b${name}\\s*:\\s*Key\\b`).test(scope)
+    || new RegExp(`let (?:mut )?${name}\\s*=\\s*(?:internDeclaration\\()?Key \\{`).test(scope)
+    || new RegExp(`let (?:mut )?${name}\\s*=[^\\n]*\\.key\\n`).test(scope)
+}
+const copied = (value, at) => {
+  const match = /^(\w+)\.declaration$/.exec(value)
+  return match !== null && keyTyped(match[1], at)
+}
 
 // Pass 1: literals. Edits are collected first, then applied from the end.
 const edits = []
@@ -101,7 +125,7 @@ for (const match of text.matchAll(/(?<![\w.])Key \{/g)) {
   if (/(?:struct |impl |for |-> )$/.test(before)) continue
   const end = closing(text, start + 'Key '.length)
   const field = declarationValue(text.slice(start + 'Key '.length, end + 1))
-  if (field !== undefined && copiedDeclaration.test(field.value)) {
+  if (field !== undefined && copied(field.value, start)) {
     const offset = start + 'Key '.length
     copiedFields.push([offset + field.start, offset + field.end])
     continue
@@ -112,26 +136,15 @@ for (const match of text.matchAll(/(?<![\w.])Key \{/g)) {
 }
 
 // Pass 2: position reads.
-const functionStarts = [...text.matchAll(/^\s*(?:pub )?(?:test )?(?:effect )?fn (\w+)/gm)].map((m) => ({
-  at: m.index,
-  name: m[1],
-}))
-const enclosing = (at) => {
-  let found = ''
-  for (const entry of functionStarts) {
-    if (entry.at > at) break
-    found = entry.name
-  }
-  return found
-}
-const read = new RegExp(`(?<![\\w.])(${keyBindings.join('|')})\\.declaration\\b(?!\\s*:)`, 'g')
+const read = /(?<![\w.])(\w+)\.declaration\b(?!\s*:)/g
 let reads = 0
 for (const match of text.matchAll(read)) {
   const at = match.index
-  if (rawFunctions.has(enclosing(at))) continue
+  if (rawFunctions.has(enclosing(at).name)) continue
+  if (!keyTyped(match[1], at)) continue
   if (copiedFields.some(([from, to]) => at >= from && at < to)) continue
   if (text.slice(Math.max(0, at - 20), at).endsWith('declarationPosition(')) continue
-  if (enclosing(at) === 'declarationPosition') continue
+  if (enclosing(at).name === 'declarationPosition') continue
   reads += 1
   edits.push({ at, remove: match[0].length, insert: `declarationPosition(${match[1]})` })
 }
