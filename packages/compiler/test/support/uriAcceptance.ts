@@ -396,7 +396,7 @@ effect fn componentsModified() -> bool ! OutOfMemoryError ? &mut Allocator {
   if !(run serializedMatches(&components, Serialization.WithoutAuthentication, "x://EXAMPLE.com:0007/a%2f?#")) { return false }
   if !(run serializedMatches(&components, Serialization.PathAndQuery, "/a%2f?")) { return false }
   components.path = ComponentValue<'static>.Raw { bytes: b"/a b/c?d" }
-  components.query = Option.some<ComponentValue<'static>>(ComponentValue<'static>.Encoded { text: "%2f" })
+  components.query = Option<ComponentValue<'static>>.some(ComponentValue<'static>.Encoded { text: "%2f" })
   let built = run UriComponents.buildOwned(&components)
   return match move built {
     Result<OwnedUriReference, ParseError>.Failure { error } => false
@@ -408,27 +408,27 @@ effect fn componentsModified() -> bool ! OutOfMemoryError ? &mut Allocator {
 }
 
 effect fn constructedAuthority() -> bool ! OutOfMemoryError ? &mut Allocator {
-  let mut components = UriComponents.make<'static>()
-  components.authority = Option.some<Authority<'static>>(Authority<'static> {
-    userinfo: Option.some<ComponentValue<'static>>(ComponentValue<'static>.Raw { bytes: b"u@:p" }),
+  let mut components = UriComponents<'static>.make()
+  components.authority = Option<Authority<'static>>.some(Authority<'static> {
+    userinfo: Option<ComponentValue<'static>>.some(ComponentValue<'static>.Raw { bytes: b"u@:p" }),
     host: Host<'static>.RegName { value: ComponentValue<'static>.Raw { bytes: b"name:host" } },
-    port: Option.some<string<'static>>("")
+    port: Option<string<'static>>.some("")
   })
   components.path = ComponentValue<'static>.Raw { bytes: b"/a?b" }
   if !(run serializedMatches(&components, Serialization.Full, "//u%40:p@name%3Ahost:/a%3Fb")) { return false }
-  components.authority = Option.some<Authority<'static>>(Authority<'static> {
-    userinfo: Option.none<ComponentValue<'static>>(),
+  components.authority = Option<Authority<'static>>.some(Authority<'static> {
+    userinfo: Option<ComponentValue<'static>>.none(),
     host: Host<'static>.IpLiteral { text: "[::1]" },
-    port: Option.none<string<'static>>()
+    port: Option<string<'static>>.none()
   })
   return run serializedMatches(&components, Serialization.Full, "//[::1]/a%3Fb")
 }
 
 effect fn componentBoundaries() -> bool ! OutOfMemoryError ? &mut Allocator {
-  let mut components = UriComponents.make<'static>()
+  let mut components = UriComponents<'static>.make()
   components.path = ComponentValue<'static>.Raw { bytes: b"a:b/c:d" }
   if !(run serializedMatches(&components, Serialization.Full, "a%3Ab/c:d")) { return false }
-  components.query = Option.some<ComponentValue<'static>>(ComponentValue<'static>.Encoded { text: "a#b" })
+  components.query = Option<ComponentValue<'static>>.some(ComponentValue<'static>.Encoded { text: "a#b" })
   let mut output = run Bytes.copy(b"unchanged")
   let rejected = run UriComponents.serializeInto(&mut output, &components, Serialization.Full)
   let correct = match move rejected {
@@ -436,7 +436,7 @@ effect fn componentBoundaries() -> bool ! OutOfMemoryError ? &mut Allocator {
     Result<(), ParseError>.Failure { error } => error.component == Component.Query && error.offset == 1
   }
   if !correct || !bytesText(&output, "unchanged") { return false }
-  components.query = Option.none<ComponentValue<'static>>()
+  components.query = Option<ComponentValue<'static>>.none()
   let reused = run UriComponents.serializeInto(&mut output, &components, Serialization.Full)
   if !parsedUnit(move reused) || !bytesText(&output, "a%3Ab/c:d") { return false }
   components.path = ComponentValue<'static>.Encoded { text: "a:b" }

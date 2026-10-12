@@ -169,7 +169,7 @@ effect fn inspectCases() -> i32 ! OutOfMemoryError ? &mut Allocator {
   return 0
 }
 
-fn deadline() -> Option<Instant> { return Option.some<Instant>(SystemClock.make(7, 9)) }
+fn deadline() -> Option<Instant> { return Option<Instant>.some(SystemClock.make(7, 9)) }
 fn sameDeadline(value: &Option<Instant>) -> bool {
   return match &value.* {
     Option.None => false
@@ -326,29 +326,29 @@ impl<'config> DecisionHandler<UpgradeError | PolicyError ? &mut MonotonicClock> 
   let observed = run MonotonicClock.now()
   drop observed
   // Origin is an explicit application policy; absence is intentionally allowed for this fixture.
-  let mut selected: Option<Headers<'call>> = Option.none<Headers<'call>>()
+  let mut selected: Option<Headers<'call>> = Option<Headers<'call>>.none()
   let origin = Offer.origin(&offer.*)
   match move origin {
     Option.None => {}
     Option.Some {value: suppliedOrigin} => {
       if equal(suppliedOrigin, b"null") {
-        return Decision.Accept {protocol: Option.none<string<'call>>(), headers: Option.none<Headers<'call>>(), extensions: true}
+        return Decision.Accept {protocol: Option<string<'call>>.none(), headers: Option<Headers<'call>>.none(), extensions: true}
       }
       if equal(suppliedOrigin, b"https://failed.test") { fail PolicyError.Denied }
       if equal(suppliedOrigin, b"https://headers.test") {
-        selected = Option.some<Headers<'call>>(handler.forbidden)
+        selected = Option<Headers<'call>>.some(handler.forbidden)
       } else if equal(suppliedOrigin, b"https://example.test") {
-        selected = Option.some<Headers<'call>>(handler.headers)
+        selected = Option<Headers<'call>>.some(handler.headers)
       } else {
         let status = match move Status.fromCode(403) {
           Result.Failure {error} => { fail UpgradeError.Value {error: move error} }
           Result.Success {value} => value
         }
-        return Decision.Reject {status: status, headers: Option.none<Headers<'call>>()}
+        return Decision.Reject {status: status, headers: Option<Headers<'call>>.none()}
       }
     }
   }
-  return Decision.Accept {protocol: Option.some<string<'call>>("chat"), headers: move selected, extensions: false}
+  return Decision.Accept {protocol: Option<string<'call>>.some("chat"), headers: move selected, extensions: false}
   }
 }
 
@@ -422,7 +422,7 @@ effect<'call> fn request<'call, 'request: 'call, 'connection: 'request, 'transpo
   let head = run Request.head(&exchange.*)
   let checked = inspect(&head, Limits.default())
   let mut configured = Limits.default()
-  let mut invalid = Option.none<UpgradeError>()
+  let mut invalid = Option<UpgradeError>.none()
   match move checked {
     Result.Success {value: offer} => {
       match move Offer.protocolAt(&offer, usize.ONE) {
@@ -434,7 +434,7 @@ effect<'call> fn request<'call, 'request: 'call, 'connection: 'request, 'transpo
       }
       drop offer
     }
-    Result.Failure {error} => { invalid = Option.some<UpgradeError>(move error) }
+    Result.Failure {error} => { invalid = Option<UpgradeError>.some(move error) }
   }
   drop head
   match move invalid {
@@ -514,7 +514,7 @@ effect fn runtimeCase(input: &[u8], expected: &[u8], mode: i32) -> i32
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = FixedClock {}
   let inner = run provider(input, mode) |> Effect.provideMut<Allocator>(&mut allocator)
-  let auditState = run Shared.make<TransportAudit>(TransportAudit {closes: usize.ZERO, flushes: usize.ZERO, deadlines: true, complete: false, handoffs: usize.ZERO})
+  let auditState = run Shared<TransportAudit>.make(TransportAudit {closes: usize.ZERO, flushes: usize.ZERO, deadlines: true, complete: false, handoffs: usize.ZERO})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut auditProvider = AuditProvider {state: Shared.clone(&auditState)}
   let mut transport = UpgradeTransport {inner: move inner, mode: mode, state: Shared.clone(&auditState)}
@@ -608,7 +608,7 @@ fn cancelParked(state: &mut i32, execution: Intrinsic.Execution<i32>) -> () {
 }
 effect fn canceledHandshake() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<TransportAudit>(TransportAudit {closes: usize.ZERO, flushes: usize.ZERO, deadlines: true, complete: false, handoffs: usize.ZERO})
+  let state = run Shared<TransportAudit>.make(TransportAudit {closes: usize.ZERO, flushes: usize.ZERO, deadlines: true, complete: false, handoffs: usize.ZERO})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let body = Effect.catchAll(suspended(Shared.clone(&state)), recover)
   let execution = run Execution.make(move body, (), ready) |> Effect.provideMut<Allocator>(&mut allocator)

@@ -54,11 +54,11 @@ effect<'session> fn aggregate<'session>(
 effect fn providedResultCollision() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut transport = run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryReadEvent>.make(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     1,
-    Option.none<i32>(),
+    Option<i32>.none(),
   ) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut clock = FixedClock {}
   let scalarResult = run Effect.result(
@@ -118,7 +118,7 @@ effect<'call> fn mutateWithMetadataBorrowed<
   let mut output: [u8; 1] = [0]
   let mut clock = FixedClock {}
   let attempted = run Effect.result(
-    ContentReader.readSome(&mut reader.*, &mut output, Option.none<Instant>())
+    ContentReader.readSome(&mut reader.*, &mut output, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   drop metadata

@@ -106,13 +106,13 @@ effect fn transport(bytes: &[u8]) -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let copied = run Bytes.copy(bytes)
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move copied,
   })
   return run MemoryByteDuplex.make(
-    move reads, Vector.make<MemoryWriteEvent>(), usize.ONE, bytes.length + usize.ONE, Option.none<i32>(),
+    move reads, Vector<MemoryWriteEvent>.make(), usize.ONE, bytes.length + usize.ONE, Option<i32>.none(),
   )
 }
 
@@ -130,7 +130,7 @@ effect fn compare(bytes: &[u8]) -> bool
   let mut count = usize.ZERO
   while true {
     let token = run JsonReader.next(
-      &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+      &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
     )
       |> Effect.provideMut<ByteDuplex>(&mut source)
       |> Effect.provideMut<MonotonicClock>(&mut clock)
@@ -148,7 +148,7 @@ effect fn compare(bytes: &[u8]) -> bool
   }
   if count != 18 { return false }
   let again = run JsonReader.next(
-    &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+    &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut source)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
@@ -172,7 +172,7 @@ effect fn capacity() -> bool
   let mut exactScratch: [u8; 5] = [0, 0, 0, 0, 0]
   let mut clock = FixedClock {}
   let exact = run JsonReader.next(
-    &mut exactReader, &mut exactInput, &mut exactScratch, Option.none<Instant>(),
+    &mut exactReader, &mut exactInput, &mut exactScratch, Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut exactSource)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
@@ -188,14 +188,14 @@ effect fn capacity() -> bool
   let mut reader = JsonReader.make()
   let mut scratch: [u8; 3] = [0, 0, 0]
   let first = run JsonReader.next(
-    &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+    &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut source)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   if !isArrayBegin(&first.token) || first.raw.length != usize.ZERO { return false }
   drop first
   let attempted = run Effect.result(JsonReader.next(
-    &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+    &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut source)
     |> Effect.provideMut<MonotonicClock>(&mut clock))
@@ -213,7 +213,7 @@ effect fn capacity() -> bool
   }
   if !failed { return false }
   let terminal = run Effect.result(JsonReader.next(
-    &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+    &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut source)
     |> Effect.provideMut<MonotonicClock>(&mut clock))
@@ -247,7 +247,7 @@ effect fn syntax() -> bool
   let mut scratch: [u8; 1] = [0]
   while true {
     let stepped = run Effect.result(JsonReader.next(
-      &mut reader, &mut input, &mut scratch, Option.none<Instant>(),
+      &mut reader, &mut input, &mut scratch, Option<Instant>.none(),
     )
       |> Effect.provideMut<ByteDuplex>(&mut source)
       |> Effect.provideMut<MonotonicClock>(&mut clock))
