@@ -283,11 +283,15 @@ const program = Effect.gen(function* () {
     }
     if (write && copied > 0) writeFileSync(file, output + text.slice(copied))
   }
-  for (const line of reported) console.log(line)
-  console.log(JSON.stringify(Object.fromEntries([...counts].sort((a, b) => b[1] - a[1]))))
+  const summary = [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([category, count]) => `${category}: ${count}`)
+  process.stdout.write(
+    [...reported, ...(summary.length === 0 ? ['no sites'] : summary)].join('\n') + '\n',
+  )
 })
 
 Effect.runPromise(program).catch((error) => {
-  console.error(error)
+  process.stderr.write(`${error}\n`)
   process.exit(1)
 })

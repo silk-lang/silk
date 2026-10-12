@@ -471,6 +471,25 @@ fn first<'r>(lent: &Lent<'r, i32>) -> &'r i32 {
 }
 ```
 
+A member keeps only the owner parameters its signature names. When a call writes the owner, an
+owner parameter the member does not use takes any type that satisfies the impl's bounds on it. It
+cannot change what runs: the member's instance is keyed only by the parameters it names. A call
+that writes no owner leaves nothing to choose.
+
+```silk
+struct Pair<A, B> {
+  left: A
+  right: B
+}
+
+impl<A, B> Pair<A, B> {
+  fn second(value: B) -> B { return move value }
+}
+
+fn unwritten() -> i32 { return Pair.second(42) }           // A is not a parameter of second
+fn written() -> i32 { return Pair<bool, i32>.second(42) }  // any A selects the same instance
+```
+
 **Boundary:** The member's written list never names the owner's parameters, and an owner
 application never names the member's. A partial owner application is an incomplete type and is
 invalid.
