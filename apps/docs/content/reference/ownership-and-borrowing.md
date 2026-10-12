@@ -1389,12 +1389,36 @@ Effect service provision follows the same rule. Providing `&clock`, `&mut logger
 provider` captures a shared loan, exclusive loan, or owner respectively; service providers do not
 receive a separate ownership model.
 
+Invoking a callable value to construct an Effect captures the callee the same way. A `fn` value is
+borrowed shared and a `mut fn` value exclusively, from construction until the Effect's last possible
+run or drop. A `once fn` value moves into the Effect.
+
+```silk,ignore
+effect fn twice() -> i32 {
+  let mut count = 0
+  let mut counting = effect fn(extra: i32) -> i32 {
+    count = count + extra
+    return count
+  }
+  let mut pending = counting(1)
+  let direct = run counting(2)
+  return direct + run pending
+}
+```
+
+`pending` holds an exclusive loan of `counting` until its run, so invoking `counting` again before
+then reports `OWN0010`. Dropping `pending` after `run counting(2)` instead of running it is the same
+conflict. Running or dropping `pending` before `counting(2)` ends the loan first, and the program is
+valid.
+
 **Boundary:** The Effect's success, failure, and requirement channels describe execution outcomes
 and dependencies. They do not expose or replace the captured environment. Two Effects with the same
 channels may still require different run access because their captures differ.
 
 **Diagnostics:** Mutating, moving, or dropping a captured root while an Effect may still run reports
-`OWN0011`. Reusing a source moved into an Effect reports `OWN0001`. A capture that would outlive its
+`OWN0011`. Borrowing a callee exclusively while an Effect constructed from it may still run, or
+borrowing a `mut fn` callee while any such Effect may run, reports `OWN0010`. Reusing a source moved
+into an Effect reports `OWN0001`. A capture that would outlive its
 root reports an ownership escape at Effect construction or transfer.
 
 **Evidence:** [Effect execution rules](effects-and-execution.md),
