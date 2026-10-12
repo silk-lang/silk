@@ -298,8 +298,8 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
   exclusive views forwarded without `&mut` and region and contents obligations wait for later
   slices.
-- `effects`, `patterns`, `storage`: the body uses that form, which the loan and move walk does
-  not enter yet.
+- `effects`, `storage`: the body uses that form, which the loan and move walk does not enter
+  yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
   reference.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
@@ -329,6 +329,19 @@ moves it (CAPTURE-001, CAPTURE-002, CALLABLE-002, CALLABLE-003). A callable valu
 its capture loans, whatever regions its type names, and a `let` or `let mut` binding of a callable
 holds them until its last use. A callable that carries a loan anywhere else answers `stored-loans`,
 as any loan-carrying value does.
+
+`patterns` is retired. The walk enters every match: the subject is accessed once as its form
+declares, then the arms are tried in written order, each pattern before its guard and the guard
+before its result, and every selected arm joins after the match (MATCH-001). A bare match reads the
+subject, `match move` moves it, `match &` reads its place, `match &mut` updates it (a write that
+replaces nothing), and `match place` inspects its tag, which conflicts with every loan but only a
+move of the whole owner makes it a use after move. As in the bootstrap's loan pass, a borrowing
+match holds no loan across its arms. A binding of `match place`, `&` or `&mut` is a projection of
+the subject place, so a read, write, borrow or move of it is that access to the subject's part; a
+copied or moved binding, or a binding of a subject with no place, is a projection of the subject's
+own storage, bound at the match (MATCH-002). Whether a binding's view outlives a later access is the
+region slice's to prove. A subject or arm result that carries a loan answers `stored-loans`, as a
+branch does.
 
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
