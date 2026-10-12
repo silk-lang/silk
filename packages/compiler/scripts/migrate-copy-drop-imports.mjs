@@ -13,7 +13,8 @@
 // Each unit gains `import silk.ownership { ... }` naming exactly the properties it uses, inside its
 // first import block or, without one, before its first declaration. An existing
 // `import silk.ownership { ... }` is extended instead. A unit that declares, binds or imports its
-// own `Copy` or `Drop` is left alone and reported. A template interpolation `${...}` is kept as
+// own `Copy` or `Drop`, or that carries a `// bare:` comment because it tests the unimported
+// spelling, is left alone and reported. A template interpolation `${...}` is kept as
 // written; a fragment interpolated into another program is migrated like any unit and the program
 // that embeds it must be checked by its tests. The script is idempotent.
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
@@ -80,6 +81,7 @@ const statementStart = (all, index) => {
 
 // The properties one unit uses bare, or the reason the unit owns one of the spellings.
 const classify = (text) => {
+  if (/\/\/ bare:/.test(text)) return { conflict: 'is marked `// bare:`' }
   const blanked = text.replace(ownershipImport, (whole) => ' '.repeat(whole.length))
   const all = tokens(blanked)
   const used = new Set()
@@ -127,13 +129,24 @@ const migrateUnit = (text, separator, spacing) => {
     }
   const lines = text.split(separator)
   const statement = (indent) => `${indent}import silk.ownership { ${names.join(', ')} }`
-  const firstImport = lines.findIndex((line) => importPath(line) !== undefined)
-  if (firstImport >= 0) {
-    let end = firstImport
-    while (end + 1 < lines.length && importPath(lines[end + 1]) !== undefined) end += 1
-    let at = firstImport
-    while (at <= end && importPath(lines[at]) < 'silk.ownership') at += 1
-    const indent = /^\s*/.exec(lines[firstImport])[0]
+  // Import statements as [first line, last line]; a braced list may span several lines.
+  const statements = []
+  for (let at = 0; at < lines.length; at += 1) {
+    if (importPath(lines[at]) === undefined) continue
+    let end = at
+    if (lines[at].includes('{') && !lines[at].includes('}'))
+      while (end + 1 < lines.length && !lines[end].includes('}')) end += 1
+    statements.push([at, end])
+    at = end
+  }
+  if (statements.length > 0) {
+    // The first block is the run of statements with nothing but statements between them.
+    let last = 0
+    while (last + 1 < statements.length && statements[last + 1][0] === statements[last][1] + 1) last += 1
+    const block = statements.slice(0, last + 1)
+    const before = block.find(([start]) => importPath(lines[start]) > 'silk.ownership')
+    const at = before === undefined ? block[last][1] + 1 : before[0]
+    const indent = /^\s*/.exec(lines[block[0][0]])[0]
     lines.splice(at, 0, statement(indent))
     return { text: lines.join(separator), sites: missing.length }
   }
