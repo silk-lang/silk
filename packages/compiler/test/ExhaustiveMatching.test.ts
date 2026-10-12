@@ -961,6 +961,52 @@ fn conflict(value: Holder) { match value { Holder { item } => { let item = 1 dro
   )
 })
 
+it.effect('joins arm views of distinct regions into one view that keeps both loans live', () =>
+  Effect.gen(function* () {
+    const source = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.option { Option }
+import silk.vector { Vector }
+enum Side { Left, Right }
+fn count(items: &[i32]) -> usize { return items.length }
+fn edges(implied: Option<Vector<i32>>, assumptions: &[i32]) -> usize {
+  let joined = match &implied {
+    Option<Vector<i32>>.Some {value} => Vector<i32>.asSlice(&value)
+    Option<Vector<i32>>.None => assumptions
+  }
+  return count(joined)
+}
+effect fn pick(side: Side, write: Side) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut left = Vector<i32>.make()
+  let mut right = Vector<i32>.make()
+  let joined = match side {
+    Side.Left => Vector<i32>.asSlice(&left)
+    Side.Right => Vector<i32>.asSlice(&right)
+  }
+  match write {
+    Side.Left => { run Vector<i32>.append(&mut left, 1) }
+    Side.Right => { run Vector<i32>.append(&mut right, 1) }
+  }
+  let size = count(joined)
+  run Vector<i32>.append(&mut left, 2)
+  run Vector<i32>.append(&mut right, 2)
+  return size
+}`
+    const snapshot = yield* Analysis.ofSource('view-region-join', new TextEncoder().encode(source))
+    // Writing either borrowed source while the joined view is live conflicts; after its last use
+    // both owners are free again (MATCH-005).
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [
+        { code: 'OWN0010', start: source.indexOf('&mut left, 1') },
+        { code: 'OWN0010', start: source.indexOf('&mut right, 1') },
+      ],
+    )
+  }),
+)
+
 it.effect('borrows exclusive match payloads from the original projected owner', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
