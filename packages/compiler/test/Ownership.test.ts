@@ -1066,6 +1066,42 @@ pub fn main() -> i32 {
   )
 })
 
+it('rejects a field read after the whole value moves', () => {
+  const source = (body: string) => `enum Reason { First, Second }
+struct Problem {
+  reason: Reason
+  offset: usize
+}
+struct Mapped { offset: usize }
+fn consume(value: Problem) -> Mapped { return Mapped {offset: value.offset} }
+pub fn main() -> usize {
+  let problem = Problem {reason: Reason.Second, offset: 3}
+${body}
+}`
+  const after = checkPartial(
+    'ownership/field-read-after-move',
+    source(`  let mapped = consume(move problem)
+  if problem.reason == Reason.Second { return 1 }
+  return mapped.offset`),
+  )
+  assert.deepEqual(
+    after.diagnostics.map((diagnostic) => diagnostic.code),
+    ['OWN0001'],
+  )
+
+  const before = checkPartial(
+    'ownership/field-read-before-move',
+    source(`  let exhausted = problem.reason == Reason.Second
+  let mapped = consume(move problem)
+  if exhausted { return 1 }
+  return mapped.offset`),
+  )
+  assert.deepEqual(
+    before.diagnostics.map((diagnostic) => diagnostic.code),
+    [],
+  )
+})
+
 it('accepts an ordinary read before the consuming move', () => {
   const facts = check(
     'golden/read-then-move',
