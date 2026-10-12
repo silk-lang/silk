@@ -1127,7 +1127,7 @@ same owner lookup rule.
 ### Operators bind to fixed standard-library interfaces
 
 - **Status:** Approved by Julia on 2026-10-11 (v2 proposal P6). The bootstrap implemented it in
-  #1440. Selfhost implemented it in #1459, which also brings the stdlib change.
+  #1440 and #1472. Selfhost implemented it in #1459, which also brings the stdlib change.
 - **Rule:** OP-009 binds each overloadable operator to one standard-library interface operation.
   The arithmetic, bitwise and logical operators bind to `silk.ops`, `==` and `!=` bind to
   `silk.equal.Equal.equals`, and `<`, `<=`, `>` and `>=` bind to `silk.order.Order.compare`,
@@ -1136,23 +1136,20 @@ same owner lookup rule.
   `operator` declaration marker.
 - **Compilers:**
   - Both compilers bind through the same fixed table.
-  - The bootstrap reports `SEM0010` for a concrete named call `Order.compare(&a, &b)` whose
-    operands are scalars, although `silk/order.silk` declares the scalar conformances. The
-    operator form `&a < &b` and calls on user types work. Selfhost has not been checked for this
+  - A concrete named call such as `Order.compare(&a, &b)` selects a scalar conformance in the
+    bootstrap, as it selects a nominal one (#1472). Selfhost has not been checked for this
     named-call case.
   - Selfhost derives a reference operand's owner module from its referent. A comparison operand
     is written as a reference, so concrete discovery reads the module of the type it points to.
-- **Source migration:** compare scalars with the built-in operators instead of calling
-  `Order.compare` on them by name.
-- **Evidence:** the bootstrap `OperatorContracts` and `OrderInterface` tests. Selfhost
+- **Source migration:** none.
+- **Evidence:** the bootstrap `OperatorContracts` and `OrderInterface` tests, including a scalar
+  `Order.compare` named call. Selfhost
   `boundOperatorsSelectOneBoundOrConcreteCall`, `borrowedOperatorsInferOnlyTheirLifetimes`,
   `competingOperatorConformancesRejectWithoutResultContextChoice`, `operatorsNeedNoInterfaceImport`
   and `operatorBodiesShareOneDiscovery`. The native corpus programs `operator-interface-contract`,
   `nominal-union-operator-provider`, `vector-sort-search-stability` and
   `vector-move-only-sort-and-cleanup`.
-- **Open questions:** none. The bootstrap's `SEM0010` on a scalar `Order.compare` named call
-  contradicts IMPL-004, so it is a bootstrap defect. A follow-up `main` PR fixes it and retires
-  that part of this entry.
+- **Open questions:** none.
 
 ### Struct declaration fields use whitespace separators
 
