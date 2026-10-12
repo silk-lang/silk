@@ -181,7 +181,8 @@ const rewrite = (owner, name, written, entry, layout) => {
   if (namedOrdinary.length < ownerOrdinary.length)
     return { _tag: 'Reported', reason: 'unmentioned-owner-parameter' }
   const keepLifetimes =
-    writtenOwnerLifetimes === ownerLifetimes.length && namedLifetimes.length === ownerLifetimes.length
+    writtenOwnerLifetimes === ownerLifetimes.length &&
+    namedLifetimes.length === ownerLifetimes.length
   if (writtenOwnerLifetimes > 0 && !keepLifetimes)
     return { _tag: 'Reported', reason: 'unmentioned-owner-lifetime' }
   const ownerList = []
@@ -272,7 +273,9 @@ const program = Effect.gen(function* () {
       if (result._tag === 'Unchanged') continue
       if (result._tag === 'Reported') {
         note(result.reason)
-        reported.push(`${result.reason}\t${location}\t${text.slice(match.index, close + 1).replace(/\s+/g, ' ')}`)
+        reported.push(
+          `${result.reason}\t${location}\t${text.slice(match.index, close + 1).replace(/\s+/g, ' ')}`,
+        )
         continue
       }
       note('rewritten')

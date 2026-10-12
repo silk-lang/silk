@@ -578,8 +578,8 @@ pub fn main() -> i32 {
             '/// A typed failure that reports exhaustion of the task identity space.',
           ],
           [
-            'Fiber.forkChild',
-            'Fiber.'.length,
+            'Fiber<i32, never>.forkChild',
+            'Fiber<i32, never>.'.length,
             'silk/fiber',
             "pub effect<'static> fn forkChild<A: 'static, E: 'static>",
             '/// Prepares and atomically publishes one child task, then returns its affine Fiber.',

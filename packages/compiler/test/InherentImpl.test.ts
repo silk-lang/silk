@@ -345,7 +345,10 @@ fn partial() -> i32 {
 `
     const snapshot = yield* Analysis.ofSource('root', ascii(source))
     assert.deepEqual(codes(snapshot), ['SEM0051'])
-    assert.strictEqual(Analysis.diagnostics(snapshot).at(0)?.span.start, source.indexOf('Pair<i64>.make'))
+    assert.strictEqual(
+      Analysis.diagnostics(snapshot).at(0)?.span.start,
+      source.indexOf('Pair<i64>.make'),
+    )
   }),
 )
 
