@@ -54,10 +54,10 @@ const archive = Effect.fnUntraced(
 )
 const json = Schema.decodeEffect(Schema.fromJsonString(InputSnapshotSchema))
 
-export const committedFiles = Effect.fn('SourceSnapshot.committedFiles')(
-  /** @param {string} repository @param {string} revision @param {string[]} paths */
-  function* (repository, revision, paths = roots) {
-    const listing = yield* git(repository, ['ls-tree', '-r', '-z', revision, '--', ...paths])
+const committedFiles = Effect.fnUntraced(
+  /** @param {string} repository @param {string} revision */
+  function* (repository, revision) {
+    const listing = yield* git(repository, ['ls-tree', '-r', '-z', revision, '--', ...roots])
     const files = []
     for (const entry of listing.toString().split('\0').filter(Boolean)) {
       const [header, path] = entry.split('\t')

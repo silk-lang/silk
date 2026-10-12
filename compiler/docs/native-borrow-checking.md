@@ -1,7 +1,7 @@
 # Native borrow checking
 
 Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). Nothing here is
-implemented yet. It relies on [`region-sensitive-identity.md`](region-sensitive-identity.md) and
+implemented yet. It relies on [`region-erased-identity.md`](region-erased-identity.md) and
 follows [`incremental-architecture-v2.md`](incremental-architecture-v2.md) (§8.3, the
 checking-unit rule).
 
@@ -36,7 +36,7 @@ The first version of this note proposed a separate `BorrowCheck` family over a n
   a callee's body, MIR or checking answer. An edit re-checks only the edited body and the callers
   of a changed signature or type summary.
 - Until every body is checked, `SILK_GAP borrow-check` keeps counting unchecked emitted bodies, now
-  split by reason, and CI fails on any increase. When the count reaches zero on the self-build and
+  split by reason, and the corpus job fails when any reason rises (§6). When the count reaches zero on the self-build and
   the parity corpus agrees with the bootstrap, the gap becomes a hard error and TypeScript can be
   deleted.
 
@@ -138,15 +138,15 @@ bodies are checked per selection, including type-specific selections when a stat
 generic types"). A non-generic body is simply the case of an abstract body with no parameters, so
 it needs no separate path.
 
-**Why instances need no re-check.** Region-sensitive identity already establishes that a body's
+**Why instances need no re-check.** Region-erased identity already establishes that a body's
 generic bounds (`'b: 'a`, `T: 'a`) are premises proved against its own parameters, that caller
 regions reach an instance only as a numbering (`Lifetime.Supplied`), and that relations between
 distinct caller-local regions are obligations of the caller's body, proved before the call is
 selected. A loan conflict depends on the body's places and control flow, which substitution does
 not change. A static selection that changes the body produces a new selection key, which is its own
-unit. A region-sensitive application selects different callees by region pattern, but each callee
-is checked against its own contract, and the caller's arguments are checked against the selected
-callee's signature in the caller's unit.
+unit. Every region pattern of an application selects the same callees, each callee is checked
+against its own contract, and the caller's arguments are checked against the selected callee's
+signature in the caller's unit.
 
 **Interaction with `needsStaticResidualization`.** Today `lowerMir` derives the selected body key
 from `InstanceKey.selected` and `internSelectedApplication`. That key names the `Body` unit whose
@@ -272,7 +272,7 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
   callee's `Body`, MIR or checking answer. That keeps the G3 to G5 rule (callers depend only on
   callee signatures and identities).
 - **Answer.** `Checked`, `Rejected{first, further}` with the same `Rejection` records typing uses,
-  or `NotChecked{reason}` for a form the checker does not handle yet (§6). Spans are relative to
+  or a `BorrowStatus` reason for a form the checker does not handle yet (§6). Spans are relative to
   the declaration (v2 §3.5), so an edit elsewhere in the file never changes a cached answer. The
   answer is part of the `Body` result, compared by v2's cutoff (§6.3 there); only the build verdict
   reads it.
@@ -288,19 +288,35 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
 
 ## 6. Counting unchecked bodies until it lands
 
-The current rule stays: `SILK_GAP borrow-check: N bodies not borrow-checked`, where N counts emitted
-definitions whose unit is not `Checked`. On the self-build that is 18,009 today. During the rollout:
+`SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...)` counts emitted definitions
+whose body is not `Checked`, with one count per reason. A body is `Checked` exactly when its stage
+is `FullyChecked`. Every other body carries the `BorrowStatus` that names what a later slice must
+cover first:
 
-- `NotChecked` carries a reason: `awaiting` (no checker yet for this unit) or a named unsupported
-  form (`captures`, `effects`, `abstract-generic`, `selected-static`, `local-shared`,
-  `suspension`). The CLI prints the total and a per-reason breakdown, and the corpus runner records
-  both, so each slice shows which bodies it moved.
-- A unit is `Checked` only when every loan, region and obligation in it was proved. A slice that
-  meets an unsupported form answers `NotChecked{form}`. It never answers `Checked` and skips the
-  form.
-- CI fails on any increase of the count (Q6), from the first slice on, and the count must reach
-  zero on the self-build before the TypeScript compiler is deleted. At zero, the gap becomes a
-  hard build error, and `borrow-check` leaves the gap catalog.
+- `awaiting`: no checker covers the unit yet (selected static bodies and member bodies).
+- `regions`: loans and moves are proved; region and contents obligations wait for slice 3.
+- `captures`, `effects`, `patterns`, `storage`: the body uses that form, which the loan and move
+  walk does not enter yet.
+- `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
+  reference.
+- `imprecise`: a conflict or a moved-place use is decided only by an unknown index or a partial
+  replacement.
+
+A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
+the form.
+
+CI holds the count in two ways. Both read `compiler/borrow-check-gap.json`.
+
+- The selfhost corpus job sums each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
+  receipts) and fails when any reason rises above its baseline. The corpus is a fixed program set,
+  so its counts change only when checking changes or a program is added. A PR that adds a corpus
+  program, or a slice that checks more bodies, updates the baseline in the same diff.
+- A reason that a slice retires is listed under `retired` and must be zero everywhere. The corpus
+  job and the N2 self-build step both fail if a retired reason reappears. The self-build totals
+  grow with the compiler, so they are printed as a receipt and never compared.
+
+The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
+the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
 
 ## 7. Diagnostic parity with the bootstrap
 
@@ -382,7 +398,8 @@ rejects is never accepted.
 1. **Loans and conflicts in plain bodies.** The smallest slice that rejects a real class of unsafe
    programs.
    - The checking answer inside the `Body` result, `borrowStatus()` reading it, the per-reason
-     breakdown in `SILK_GAP borrow-check`, and CI failing on an increase.
+     breakdown in `SILK_GAP borrow-check`, and the corpus guard of §6. These landed after the move
+     flow of slice 2.
    - The evaluation graph, places and loans of §3 for non-generic, non-selected bodies without
      captures, Effects or local sharing, plus the scalar fast path.
    - OWN0010 and OWN0011 (BORROW-001 to BORROW-005, BORROW-007, CALL-001), with structured cases
@@ -432,5 +449,5 @@ Julia decided the open questions in the joint review with #1433 (2026-10-11):
 7. **Diagnostic spelling.** During the transition the native CLI prints native names together with
    bootstrap codes.
 8. **Region-sensitive applications.** No instance is re-checked: instances are never checking
-   units. The accepted v2 proposal P3(a) also removes lifetime-selective heads, so region-sensitive
-   applications disappear.
+   units. P3 removed region-dependent sealed heads, so region-sensitive applications no longer
+   exist.
