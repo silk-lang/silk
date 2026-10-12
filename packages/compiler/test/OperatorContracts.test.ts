@@ -1,11 +1,13 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import * as Diagnostic from '../src/Diagnostic.js'
 import * as Lexer from '../src/Lexer.js'
 import * as Parser from '../src/Parser.js'
 import * as SourceFile from '../src/SourceFile.js'
+import * as SourceResolver from '../src/SourceResolver.js'
 
 const encoder = new TextEncoder()
 
@@ -220,6 +222,43 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('reaches the sealed operator source from a module that never spells Intrinsic', () =>
+  Effect.gen(function* () {
+    // Only `numeric` names the sealed member; the closure must still hold the sealed source for
+    // the root's bound, conformance and scalar instantiation.
+    const root = 'operator-contracts/reached'
+    const selected = AnalysisFixture.configuration(root)
+    const self = yield* Analysis.make({ root, configuration: selected }).pipe(
+      Effect.flatMap((frontend) => Analysis.realize(frontend, selected)),
+      Effect.provide(
+        SourceResolver.overlay([
+          SourceFile.make(
+            root,
+            encoder.encode(`import numeric { Plus }
+struct Meters { value: i32 }
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
+}
+impl Plus<Meters, Meters> for Meters { add: Meters.plus }
+fn sum<T: Plus<T, T>>(left: T, right: T) -> T { return Plus<T, T>.add(move left, move right) }
+pub fn main() -> i32 {
+  let total = sum(Meters { value: 40 }, Meters { value: 2 })
+  return total.value + sum<i32>(1, 2) - 3
+}`),
+          ),
+        ]).pipe(
+          Layer.provideMerge(
+            SourceResolver.memory(
+              new Map([['numeric', encoder.encode('pub type Plus = Intrinsic.Add\n')]]),
+            ),
+          ),
+        ),
+      ),
+    )
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
 it.effect(
   'seals the operator source against imports, unknown members and scalar conformances',
   () =>
@@ -235,9 +274,8 @@ pub fn main() -> i32 { return 0 }`
         [
           [Diagnostic.unknownModuleCode, source.indexOf('intrinsic.operators')],
           [Diagnostic.invalidConformanceCode, source.indexOf('T: Intrinsic.Plus')],
-          // The sealed i32 conformance already exists, and IMPL-004 places no source conformance
-          // of a scalar provider outside the interface's module.
-          [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Add')],
+          // IMPL-004 places no source conformance of a scalar provider outside the interface's
+          // module; the sealed i32 conformance it would duplicate is not reported again.
           [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Add')],
         ],
       )

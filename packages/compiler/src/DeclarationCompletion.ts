@@ -1419,10 +1419,11 @@ export const complete = (
       // be shortened into a zero-obligation head. Header validation below reports the source
       // error; leaving termination unavailable keeps the fact out of coherence and proof search.
       if (requirements.length !== conformance.requirements.length) return { ...conformance, head }
+      // A conformance the ownership rule rejects below takes no part in coherence, so it is
+      // reported once, as misplaced, and never as a duplicate of the conformance it would shadow.
       const contract = memberByNominal(modules, conformance.capability.type)
       if (
         (contract?._tag === 'InterfaceDeclaration' || contract?._tag === 'ServiceDeclaration') &&
-        Type.isNominal(conformance.provider.type) &&
         !sourceConformanceOwners(
           conformance.capability.type,
           conformance.provider.type,
