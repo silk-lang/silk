@@ -480,7 +480,7 @@ fn options(
   precision: Option<usize>,
 ) -> FormatOptions {
   return FormatOptions {
-    width: Option.some<usize>(width), alignment: alignment, fill: fill, sign: sign,
+    width: Option<usize>.some(width), alignment: alignment, fill: fill, sign: sign,
     alternate: true, zeroPad: zeroPad, precision: move precision, color: true,
   }
 }
@@ -498,7 +498,7 @@ fn accessorsHold() -> bool {
   if Format.precision(&defaults) != usize.ZERO { return false }
   if Format.color(&defaults) { return false }
   let explicit = Format.make(
-    options(12, Alignment.Left, '*', Sign.Space, true, Option.some<usize>(9)),
+    options(12, Alignment.Left, '*', Sign.Space, true, Option<usize>.some(9)),
   )
   if !Format.hasWidth(&explicit) { return false }
   if Format.width(&explicit) != 12 { return false }
@@ -516,35 +516,35 @@ effect fn render() -> () ! WriterError ? &mut Writer {
   let negative = 0 - 42
   run Format.displayWith(
     &negative,
-    options(8, Alignment.Right, '*', Sign.NegativeOnly, false, Option.some<usize>(4)),
+    options(8, Alignment.Right, '*', Sign.NegativeOnly, false, Option<usize>.some(4)),
   )
   run Writer.writeAll(b"|")
   let positive = 42
   run Format.displayWith(
     &positive,
-    options(6, Alignment.Left, '.', Sign.Always, false, Option.none<usize>()),
+    options(6, Alignment.Left, '.', Sign.Always, false, Option<usize>.none()),
   )
   run Writer.writeAll(b"|")
   let zero = 0
   run Format.displayWith(
     &zero,
-    options(7, Alignment.Center, '\u{e9}', Sign.NegativeOnly, false, Option.some<usize>(3)),
+    options(7, Alignment.Center, '\u{e9}', Sign.NegativeOnly, false, Option<usize>.some(3)),
   )
   run Writer.writeAll(b"|")
   run Format.displayWith(
     &negative,
-    options(7, Alignment.Default, ' ', Sign.NegativeOnly, true, Option.none<usize>()),
+    options(7, Alignment.Default, ' ', Sign.NegativeOnly, true, Option<usize>.none()),
   )
   run Writer.writeAll(b"|")
   let seven = 0 - 7
   run Format.displayWith(
     &seven,
-    options(5, Alignment.Center, '\u{b7}', Sign.NegativeOnly, false, Option.none<usize>()),
+    options(5, Alignment.Center, '\u{b7}', Sign.NegativeOnly, false, Option<usize>.none()),
   )
   run Writer.writeAll(b"|")
   return run Format.displayWith(
     &positive,
-    options(35, Alignment.Right, '_', Sign.NegativeOnly, false, Option.none<usize>()),
+    options(35, Alignment.Right, '_', Sign.NegativeOnly, false, Option<usize>.none()),
   )
 }
 
@@ -602,16 +602,16 @@ fn capture() -> Capture {
 
 fn fixed(precision: usize) -> FormatOptions {
   return FormatOptions {
-    width: Option.none<usize>(), alignment: Alignment.Default, fill: ' ',
+    width: Option<usize>.none(), alignment: Alignment.Default, fill: ' ',
     sign: Sign.NegativeOnly, alternate: false, zeroPad: false,
-    precision: Option.some<usize>(precision), color: false,
+    precision: Option<usize>.some(precision), color: false,
   }
 }
 
 fn padded(width: usize, alignment: Alignment, fill: char, sign: Sign, precision: Option<usize>)
   -> FormatOptions {
   return FormatOptions {
-    width: Option.some<usize>(width), alignment: alignment, fill: fill, sign: sign,
+    width: Option<usize>.some(width), alignment: alignment, fill: fill, sign: sign,
     alternate: false, zeroPad: true, precision: move precision, color: false,
   }
 }
@@ -692,18 +692,18 @@ effect fn check() -> i32 ! WriterError {
   if !(run rendersF64(f64.fromBits(9223372036854775808), fixed(0), b"-0")) { return 15 }
   // Default output preserves signed zero without a fractional part.
   if !(run rendersF64(f64.fromBits(9223372036854775808),
-    padded(0, Alignment.Default, ' ', Sign.NegativeOnly, Option.none<usize>()), b"-0")) { return 16 }
+    padded(0, Alignment.Default, ' ', Sign.NegativeOnly, Option<usize>.none()), b"-0")) { return 16 }
   // Special values ignore precision and keep only the sign policy.
   if !(run rendersF64(f64.fromBits(9218868437227405312), fixed(4), b"Infinity")) { return 17 }
   if !(run rendersF64(f64.fromBits(18442240474082181120), fixed(4), b"-Infinity")) { return 18 }
   if !(run rendersF64(f64.fromBits(9221120237041090560), fixed(4), b"NaN")) { return 19 }
   // Sign policy and width apply to the fixed form; float padding uses the fill, not zeroes.
   if !(run rendersF64(1.25,
-    padded(8, Alignment.Right, '*', Sign.Always, Option.some<usize>(1)), b"****+1.2")) { return 20 }
+    padded(8, Alignment.Right, '*', Sign.Always, Option<usize>.some(1)), b"****+1.2")) { return 20 }
   if !(run rendersF64(0.0 - 1.25,
-    padded(8, Alignment.Left, '.', Sign.NegativeOnly, Option.some<usize>(3)), b"-1.250..")) { return 21 }
+    padded(8, Alignment.Left, '.', Sign.NegativeOnly, Option<usize>.some(3)), b"-1.250..")) { return 21 }
   if !(run rendersF64(1.0,
-    padded(7, Alignment.Center, '-', Sign.Space, Option.some<usize>(1)), b"- 1.0--")) { return 22 }
+    padded(7, Alignment.Center, '-', Sign.Space, Option<usize>.some(1)), b"- 1.0--")) { return 22 }
   // f32 rounds its own exact expansion, which differs from the f64 nearest to the same literal.
   if !(run rendersF32(f32.fromBits(1), fixed(3), b"0.000")) { return 23 }
   if !(run rendersF32(0.1, fixed(10), b"0.1000000015")) { return 24 }
@@ -933,7 +933,7 @@ effect fn driveOnce<
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let owner = run Shared.make<Owner>(Owner { slot: Empty {} })
+  let owner = run Shared<Owner>.make(Owner { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&owner)
   let suspensionOwner = Shared.clone(&owner)
@@ -1083,10 +1083,10 @@ effect fn driveOnce(execution: Intrinsic.Execution<i32>, state: &mut ()) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mailbox = run Shared.make<Mailbox>(Mailbox { slot: Empty {} })
+  let mailbox = run Shared<Mailbox>.make(Mailbox { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let registrationMailbox = Shared.clone(&mailbox)
-  let readyState = run Shared.make<ReadyState>(ReadyState { called: 0 })
+  let readyState = run Shared<ReadyState>.make(ReadyState { called: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&readyState)
   let execution = run Execution.make(body(move registrationMailbox), move endpoint, ready)
@@ -1145,7 +1145,7 @@ effect fn finish(selected: Empty | Stored, owner: &mut Owner) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let ledger = run Shared.make<Ledger>(Ledger { ready: 0 })
+  let ledger = run Shared<Ledger>.make(Ledger { ready: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&ledger)
   let execution = run Execution.make(body(), move endpoint, ready)
@@ -1258,9 +1258,9 @@ fn forceEligible(selected: Empty | Held) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let ledger = run Shared.make<Ledger>(Ledger { ready: 0 })
+  let ledger = run Shared<Ledger>.make(Ledger { ready: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mailbox = run Shared.make<Mailbox>(Mailbox { first: Empty {}, second: Empty {}, held: Empty {} })
+  let mailbox = run Shared<Mailbox>.make(Mailbox { first: Empty {}, second: Empty {}, held: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&ledger)
   let bodyMailbox = Shared.clone(&mailbox)
@@ -1297,7 +1297,7 @@ struct Guard { ledger: Shared<Ledger> }
 fn countGuard(ledger: &mut Ledger) -> () { ledger.guards = ledger.guards + 1 return () }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
-    Shared.withMut<Ledger, ()>(&self.ledger, countGuard)
+    Shared<Ledger>.withMut<()>(&self.ledger, countGuard)
     return ()
   }
 }
@@ -1339,9 +1339,9 @@ effect fn driveOnce(execution: Intrinsic.Execution<i32>, state: &mut ()) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let ledger = run Shared.make<Ledger>(Ledger { ready: 0, guards: 0 })
+  let ledger = run Shared<Ledger>.make(Ledger { ready: 0, guards: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mailbox = run Shared.make<Mailbox>(Mailbox { slot: Empty {} })
+  let mailbox = run Shared<Mailbox>.make(Mailbox { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&ledger)
   let guardLedger = Shared.clone(&ledger)
@@ -1413,7 +1413,7 @@ effect fn driveOnce<
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let owner = run Shared.make<Owner>(Owner { slot: Empty {} })
+  let owner = run Shared<Owner>.make(Owner { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let endpoint = Shared.clone(&owner)
   let suspensionOwner = Shared.clone(&owner)
@@ -1482,7 +1482,7 @@ effect fn finish(selected: Empty | Stored, owner: &mut Owner) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let reactor = run Shared.make<Reactor>(Reactor { slot: Empty {} })
+  let reactor = run Shared<Reactor>.make(Reactor { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let bodyReactor = Shared.clone(&reactor)
   let execution = run Execution.make(body(move bodyReactor), (), ready)
@@ -2089,15 +2089,15 @@ import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 
 effect fn exercise() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let safe = run Uninitialized.make<i32>()
-  let written = Uninitialized.initialize<i32>(move safe, 20)
-  let first = Initialized.into<i32>(move written)
-  let mut foreign = run Uninitialized.make<i32>()
-  let address = Uninitialized.address<i32>(&mut foreign)
+  let safe = run Uninitialized<i32>.make()
+  let written = Uninitialized<i32>.initialize(move safe, 20)
+  let first = Initialized<i32>.into(move written)
+  let mut foreign = run Uninitialized<i32>.make()
+  let address = Uninitialized<i32>.address(&mut foreign)
   unsafe {
     Pointer.writeUnaligned<i32>(address, 22)
-    let initialized = Uninitialized.assumeInitialized<i32>(move foreign)
-    let second = Initialized.into<i32>(move initialized)
+    let initialized = Uninitialized<i32>.assumeInitialized(move foreign)
+    let second = Initialized<i32>.into(move initialized)
     return first + second
   }
 }
@@ -2131,19 +2131,19 @@ import silk.usize
 
 effect fn seededOrderDigest(seed: u64) -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Word, i32>(Hash.seed(seed))
+  let mut map = HashMap<Word, i32>.make(Hash.seed(seed))
   let mut key = 0
   while key < 12 {
-    let previous = run HashMap.insert<Word, i32>(&mut map, Hash.word(i32.toU64(key * 7 + 1)), key)
+    let previous = run HashMap<Word, i32>.insert(&mut map, Hash.word(i32.toU64(key * 7 + 1)), key)
       |> Effect.provideMut(&mut allocator)
     drop previous
     key = key + 1
   }
   let mut index = usize.ZERO
   let mut folded = u64.toU64(0)
-  while index < HashMap.bucketCount<Word, i32>(&map) {
-    if HashMap.occupiedAt<Word, i32>(&map, index) {
-      let held = HashMap.keyAt<Word, i32>(&map, index)
+  while index < HashMap<Word, i32>.bucketCount(&map) {
+    if HashMap<Word, i32>.occupiedAt(&map, index) {
+      let held = HashMap<Word, i32>.keyAt(&map, index)
       folded = u64.wrappingAdd(u64.wrappingMultiply(folded, 131), held.value)
     }
     index = index + usize.ONE
@@ -2735,7 +2735,7 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -2750,14 +2750,14 @@ effect fn store() -> i32 ! OutOfMemoryError {
   let layout = Layout.of<i32>()
   let recipe = Allocator.allocate(move layout) |> Effect.provideMut(&mut allocator)
   let storage = run recipe
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let selected = choose(Second {}, Guard {
     storage: move storage,
-    counter: Shared.clone<Counter>(&counter),
+    counter: Shared<Counter>.clone(&counter),
   })
   drop selected
-  let count = Shared.with<Counter, i32>(&counter, read)
+  let count = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if count != 1 { return 1 }
   return 42
@@ -3307,10 +3307,10 @@ pub fn main() -> i32 {
 import silk.option { Option }
 pub fn main() -> i32 {
   let minimum = i32.subtract(-2147483647, 1)
-  if Option.unwrapOr<i32>(i32.checkedRemainder(minimum, -1), 42) != 42 { return 1 }
-  if Option.unwrapOr<i32>(i32.checkedRemainder(7, -1), -1) != 0 { return 2 }
-  if Option.unwrapOr<i32>(i32.checkedRemainder(minimum, 2), -1) != 0 { return 3 }
-  if Option.unwrapOr<i32>(i32.checkedRemainder(7, 0), 42) != 42 { return 4 }
+  if Option<i32>.unwrapOr(i32.checkedRemainder(minimum, -1), 42) != 42 { return 1 }
+  if Option<i32>.unwrapOr(i32.checkedRemainder(7, -1), -1) != 0 { return 2 }
+  if Option<i32>.unwrapOr(i32.checkedRemainder(minimum, 2), -1) != 0 { return 3 }
+  if Option<i32>.unwrapOr(i32.checkedRemainder(7, 0), 42) != 42 { return 4 }
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
@@ -3503,7 +3503,7 @@ fn largest(values: &[Outer]) -> usize {
   let mut at: usize = 0
   while at < values.length {
     if let Outer.Pair { count, items } = &values[at] {
-      let written = Vector.asSlice<Arm>(&items)
+      let written = Vector<Arm>.asSlice(&items)
       let mut best = count
       let mut arm: usize = 0
       while arm < written.length {
@@ -3520,13 +3520,13 @@ fn largest(values: &[Outer]) -> usize {
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut items = Vector.make<Arm>()
-  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Selected { tag: 1 } }) |> Effect.provideMut(&mut allocator)
-  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Unit }) |> Effect.provideMut(&mut allocator)
-  run Vector.append<Arm>(&mut items, Arm { pattern: Selector.Selected { tag: 7 } }) |> Effect.provideMut(&mut allocator)
-  let mut values = Vector.make<Outer>()
-  run Vector.append<Outer>(&mut values, Outer.Pair { count: 3, items: move items }) |> Effect.provideMut(&mut allocator)
-  if largest(Vector.asSlice<Outer>(&values)) == 7 { return 42 }
+  let mut items = Vector<Arm>.make()
+  run Vector<Arm>.append(&mut items, Arm { pattern: Selector.Selected { tag: 1 } }) |> Effect.provideMut(&mut allocator)
+  run Vector<Arm>.append(&mut items, Arm { pattern: Selector.Unit }) |> Effect.provideMut(&mut allocator)
+  run Vector<Arm>.append(&mut items, Arm { pattern: Selector.Selected { tag: 7 } }) |> Effect.provideMut(&mut allocator)
+  let mut values = Vector<Outer>.make()
+  run Vector<Outer>.append(&mut values, Outer.Pair { count: 3, items: move items }) |> Effect.provideMut(&mut allocator)
+  if largest(Vector<Outer>.asSlice(&values)) == 7 { return 42 }
   return 1
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }
@@ -4224,13 +4224,13 @@ struct Wide { code: i32 }
 struct Token { code: i32 }
 fn double(value: i32) -> i32 { return value * 2 }
 fn halve(value: i32) -> Option<i32> {
-  if value == 0 { return Option.none<i32>() }
-  return Option.some<i32>(value / 2)
+  if value == 0 { return Option<i32>.none() }
+  return Option<i32>.some(value / 2)
 }
 fn addTwo(value: i32) -> i32 { return value + 2 }
 fn halfResult(value: i32) -> Result<i32, i32> {
-  if value == 0 { return Result.failResult<i32, i32>(9) }
-  return Result.succeed<i32, i32>(value / 2)
+  if value == 0 { return Result<i32, i32>.failResult(9) }
+  return Result<i32, i32>.succeed(value / 2)
 }
 fn widen(error: i32) -> Wide { return Wide { code: error + 30 } }
 fn advance(token: Token) -> Token { return Token { code: token.code + 1 } }
@@ -4242,27 +4242,27 @@ fn observeWide(self: Result<i32, Wide>) -> i32 {
 }
 
 pub fn main() -> i32 {
-  let mappedSome = Option.map<i32, i32>(Option.some<i32>(20), double)
-  let mappedNone = Option.map<i32, i32>(Option.none<i32>(), double)
-  let chainedSome = Option.flatMap<i32, i32>(Option.some<i32>(80), halve)
-  let chainedNone = Option.flatMap<i32, i32>(Option.some<i32>(0), halve)
-  if Option.unwrapOr<i32>(move mappedSome, 0) != 40 { return 1 }
-  if Option.unwrapOr<i32>(move mappedNone, 2) != 2 { return 2 }
-  if Option.unwrapOr<i32>(move chainedSome, 0) != 40 { return 3 }
-  if Option.unwrapOr<i32>(move chainedNone, 2) != 2 { return 4 }
+  let mappedSome = Option<i32>.map<i32>(Option<i32>.some(20), double)
+  let mappedNone = Option<i32>.map<i32>(Option<i32>.none(), double)
+  let chainedSome = Option<i32>.flatMap<i32>(Option<i32>.some(80), halve)
+  let chainedNone = Option<i32>.flatMap<i32>(Option<i32>.some(0), halve)
+  if Option<i32>.unwrapOr(move mappedSome, 0) != 40 { return 1 }
+  if Option<i32>.unwrapOr(move mappedNone, 2) != 2 { return 2 }
+  if Option<i32>.unwrapOr(move chainedSome, 0) != 40 { return 3 }
+  if Option<i32>.unwrapOr(move chainedNone, 2) != 2 { return 4 }
 
-  let mapped = Result.map<i32, i32, i32>(Result.succeed<i32, i32>(36), addTwo)
-  let chained = Result.flatMap<i32, i32, i32>(move mapped, halfResult)
-  if Result.unwrapOr<i32, i32>(move chained, 0) != 19 { return 5 }
-  let carriedFailure = Result.map<i32, i32, i32>(Result.failResult<i32, i32>(7), addTwo)
-  if Result.unwrapOr<i32, i32>(move carriedFailure, 23) != 23 { return 6 }
-  let changed = Result.mapError<i32, i32, Wide>(Result.failResult<i32, i32>(4), widen)
+  let mapped = Result<i32, i32>.map<i32>(Result<i32, i32>.succeed(36), addTwo)
+  let chained = Result<i32, i32>.flatMap<i32>(move mapped, halfResult)
+  if Result<i32, i32>.unwrapOr(move chained, 0) != 19 { return 5 }
+  let carriedFailure = Result<i32, i32>.map<i32>(Result<i32, i32>.failResult(7), addTwo)
+  if Result<i32, i32>.unwrapOr(move carriedFailure, 23) != 23 { return 6 }
+  let changed = Result<i32, i32>.mapError<Wide>(Result<i32, i32>.failResult(4), widen)
   if observeWide(move changed) != 34 { return 7 }
-  let movedOption = Option.map<Token, Token>(Option.some<Token>(Token { code: 40 }), advance)
-  let optionToken = Option.unwrapOr<Token>(move movedOption, Token { code: 0 })
+  let movedOption = Option<Token>.map<Token>(Option<Token>.some(Token { code: 40 }), advance)
+  let optionToken = Option<Token>.unwrapOr(move movedOption, Token { code: 0 })
   if optionToken.code != 41 { return 8 }
-  let movedResult = Result.map<Token, i32, Token>(
-    Result.succeed<Token, i32>(move optionToken),
+  let movedResult = Result<Token, i32>.map<Token>(
+    Result<Token, i32>.succeed(move optionToken),
     advance,
   )
   let resultToken = match move movedResult {
@@ -4465,7 +4465,7 @@ effect fn trackedClockValue(self: &TrackedClock) -> i32 { return self.value }
 impl Clock for TrackedClock { value: TrackedClock.trackedClockValue }
 impl Drop for TrackedClock {
   fn drop(self: &mut TrackedClock) -> () {
-    let changed = Shared.withMut<Lifecycle, i32>(&self.lifecycle, release)
+    let changed = Shared<Lifecycle>.withMut<i32>(&self.lifecycle, release)
     return ()
   }
 }
@@ -4478,8 +4478,8 @@ effect fn nestedRead(inner: &FixedClock) -> i32 ? &Clock {
 }
 effect fn makeClock() -> FixedClock { return FixedClock { value: 42 } }
 effect fn makeTrackedClock(lifecycle: &Shared<Lifecycle>) -> TrackedClock {
-  let changed = Shared.withMut<Lifecycle, i32>(lifecycle, acquire)
-  return TrackedClock { value: 42, lifecycle: Shared.clone<Lifecycle>(lifecycle) }
+  let changed = Shared<Lifecycle>.withMut<i32>(lifecycle, acquire)
+  return TrackedClock { value: 42, lifecycle: Shared<Lifecycle>.clone(lifecycle) }
 }
 effect fn readAndFail() -> i32 ! Problem ? &Clock {
   let value = run Clock.value()
@@ -4521,7 +4521,7 @@ effect fn scenario() -> i32 ! OutOfMemoryError {
   let nested = run nestedRead(&inner) |> Effect.provide(&outer)
   if nested != 42 { return 5 }
   let mut allocator = Allocator.systemAllocatorProvider()
-  let lifecycle = run Shared.make<Lifecycle>(Lifecycle {
+  let lifecycle = run Shared<Lifecycle>.make(Lifecycle {
     acquired: 0,
     released: 0,
     valid: true,
@@ -4531,7 +4531,7 @@ effect fn scenario() -> i32 ! OutOfMemoryError {
     |> Effect.retry(2)
   let trackedResult = run Effect.result(move tracked)
   if observe(move trackedResult) != 42 { return 6 }
-  let balanced = Shared.with<Lifecycle, bool>(&lifecycle, lifecycleAccepted)
+  let balanced = Shared<Lifecycle>.with<bool>(&lifecycle, lifecycleAccepted)
   drop lifecycle
   if !balanced { return 7 }
   let recoveredMapped = run (
@@ -4702,70 +4702,70 @@ fn mustNotRun(value: &mut Counter) -> () {
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Word, i32>(Hash.seed(12345))
-  let first = run HashMap.insert<Word, i32>(&mut map, Hash.word(7), 20)
+  let mut map = HashMap<Word, i32>.make(Hash.seed(12345))
+  let first = run HashMap<Word, i32>.insert(&mut map, Hash.word(7), 20)
     |> Effect.provideMut(&mut allocator)
-  let second = run HashMap.insert<Word, i32>(&mut map, Hash.word(9), 22)
+  let second = run HashMap<Word, i32>.insert(&mut map, Hash.word(9), 22)
     |> Effect.provideMut(&mut allocator)
   drop first
   drop second
-  if HashMap.length<Word, i32>(&map) != 2 { return 1 }
-  if !HashMap.contains<Word, i32>(&map, Hash.word(7)) { return 2 }
-  let taken = HashMap.remove<Word, i32>(&mut map, Hash.word(7))
-  let removed = Option.unwrapOr<i32>(move taken, 0)
-  let held = Option.unwrapOr<i32>(HashMap.get<Word, i32>(&map, Hash.word(9)), 0)
+  if HashMap<Word, i32>.length(&map) != 2 { return 1 }
+  if !HashMap<Word, i32>.contains(&map, Hash.word(7)) { return 2 }
+  let taken = HashMap<Word, i32>.remove(&mut map, Hash.word(7))
+  let removed = Option<i32>.unwrapOr(move taken, 0)
+  let held = Option<i32>.unwrapOr(HashMap<Word, i32>.get(&map, Hash.word(9)), 0)
   if removed + held != 42 { return 3 }
-  if HashMap.contains<Word, i32>(&map, Hash.word(7)) { return 4 }
+  if HashMap<Word, i32>.contains(&map, Hash.word(7)) { return 4 }
 
-  let mut counters = HashMap.make<Word, Counter>(Hash.seed(17))
+  let mut counters = HashMap<Word, Counter>.make(Hash.seed(17))
   let initial = Counter { value: 20, calls: 0 }
-  let inserted = run HashMap.insert<Word, Counter>(&mut counters, Hash.word(7), move initial)
+  let inserted = run HashMap<Word, Counter>.insert(&mut counters, Hash.word(7), move initial)
     |> Effect.provideMut(&mut allocator)
   drop inserted
   if HashMap.withMut(&mut counters, Hash.word(9), mustNotRun) { return 5 }
   if !HashMap.withMut(&mut counters, Hash.word(7), setFortyTwo) { return 6 }
   let fallback = Counter { value: 0, calls: 0 }
-  let changed = Option.unwrapOr<Counter>(
-    HashMap.get<Word, Counter>(&counters, Hash.word(7)),
+  let changed = Option<Counter>.unwrapOr(
+    HashMap<Word, Counter>.get(&counters, Hash.word(7)),
     move fallback,
   )
   if changed.value != 42 || changed.calls != 1 { return 7 }
 
-  let mut collisions = HashMap.make<Key, i32>(Hash.seed(1))
-  let keyOne = run HashMap.insert<Key, i32>(&mut collisions, Key { value: 1 }, 10)
+  let mut collisions = HashMap<Key, i32>.make(Hash.seed(1))
+  let keyOne = run HashMap<Key, i32>.insert(&mut collisions, Key { value: 1 }, 10)
     |> Effect.provideMut(&mut allocator)
-  let keyTwo = run HashMap.insert<Key, i32>(&mut collisions, Key { value: 2 }, 20)
+  let keyTwo = run HashMap<Key, i32>.insert(&mut collisions, Key { value: 2 }, 20)
     |> Effect.provideMut(&mut allocator)
-  let keyThree = run HashMap.insert<Key, i32>(&mut collisions, Key { value: 3 }, 30)
+  let keyThree = run HashMap<Key, i32>.insert(&mut collisions, Key { value: 3 }, 30)
     |> Effect.provideMut(&mut allocator)
   drop keyOne
   drop keyTwo
   drop keyThree
-  let tombstone = HashMap.remove<Key, i32>(&mut collisions, Key { value: 2 })
+  let tombstone = HashMap<Key, i32>.remove(&mut collisions, Key { value: 2 })
   drop tombstone
-  let beyondTombstone = Option.unwrapOr<i32>(
-    HashMap.get<Key, i32>(&collisions, Key { value: 3 }),
+  let beyondTombstone = Option<i32>.unwrapOr(
+    HashMap<Key, i32>.get(&collisions, Key { value: 3 }),
     0,
   )
   if beyondTombstone != 30 { return 11 }
-  let replaced = run HashMap.insert<Key, i32>(&mut collisions, Key { value: 1 }, 41)
+  let replaced = run HashMap<Key, i32>.insert(&mut collisions, Key { value: 1 }, 41)
     |> Effect.provideMut(&mut allocator)
-  if Option.unwrapOr<i32>(move replaced, 0) != 10 { return 12 }
-  if HashMap.length<Key, i32>(&collisions) != 2 { return 13 }
+  if Option<i32>.unwrapOr(move replaced, 0) != 10 { return 12 }
+  if HashMap<Key, i32>.length(&collisions) != 2 { return 13 }
 
-  let mut set = HashSet.make<Word>(Hash.seed(99))
-  let setFirst = run HashSet.insert<Word>(&mut set, Hash.word(7))
+  let mut set = HashSet<Word>.make(Hash.seed(99))
+  let setFirst = run HashSet<Word>.insert(&mut set, Hash.word(7))
     |> Effect.provideMut(&mut allocator)
-  let setAgain = run HashSet.insert<Word>(&mut set, Hash.word(7))
+  let setAgain = run HashSet<Word>.insert(&mut set, Hash.word(7))
     |> Effect.provideMut(&mut allocator)
   if setFirst || !setAgain { return 8 }
-  if !HashSet.contains<Word>(&set, Hash.word(7)) { return 9 }
-  let setTaken = HashSet.remove<Word>(&mut set, Hash.word(7))
+  if !HashSet<Word>.contains(&set, Hash.word(7)) { return 9 }
+  let setTaken = HashSet<Word>.remove(&mut set, Hash.word(7))
   let gone = match move setTaken {
     Option<Word>.Some { value } => u64.toI32(value.value)
     Option<Word>.None => 0
   }
-  if gone != 7 || HashSet.contains<Word>(&set, Hash.word(7)) { return 10 }
+  if gone != 7 || HashSet<Word>.contains(&set, Hash.word(7)) { return 10 }
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 99 }
@@ -4805,21 +4805,21 @@ fn keyHash(value: &Key, seed: &HashSeed) -> u64 { return i32.toU64(value.id) }
 impl HashKey for Key { equals: Key.keyEquals hash: Key.keyHash }
 impl Drop for Key {
   fn drop(self: &mut Key) -> () {
-    let changed = Shared.withMut<Counts, i32>(&self.counts, countKey)
+    let changed = Shared<Counts>.withMut<i32>(&self.counts, countKey)
     return ()
   }
 }
 impl Drop for Held {
   fn drop(self: &mut Held) -> () {
-    let changed = Shared.withMut<Counts, i32>(&self.counts, countValue)
+    let changed = Shared<Counts>.withMut<i32>(&self.counts, countValue)
     return ()
   }
 }
 fn key(id: i32, counts: &Shared<Counts>) -> Key {
-  return Key { id: id, counts: Shared.clone<Counts>(counts) }
+  return Key { id: id, counts: Shared<Counts>.clone(counts) }
 }
 fn held(id: i32, counts: &Shared<Counts>) -> Held {
-  return Held { id: id, counts: Shared.clone<Counts>(counts) }
+  return Held { id: id, counts: Shared<Counts>.clone(counts) }
 }
 fn extractInto(cell: &mut Cell, output: &mut Capture) -> () {
   let previous = Intrinsic.replace(cell.slot, Empty {})
@@ -4831,10 +4831,10 @@ fn heldTag(value: Held) -> i32 { return value.id }
 effect fn fillAndDrop(counts: Shared<Counts>) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut map = HashMap.make<Key, Held>(Hash.seed(9))
+  let mut map = HashMap<Key, Held>.make(Hash.seed(9))
   let mut index = 0
   while index < 10 {
-    let previous = run HashMap.insert<Key, Held>(
+    let previous = run HashMap<Key, Held>.insert(
       &mut map,
       key(index, &counts),
       held(index, &counts),
@@ -4849,23 +4849,23 @@ effect fn fillAndDrop(counts: Shared<Counts>) -> ()
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counts = run Shared.make<Counts>(Counts { keys: 0, values: 0 })
+  let counts = run Shared<Counts>.make(Counts { keys: 0, values: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut map = HashMap.make<Key, Held>(Hash.seed(3))
-  let first = run HashMap.insert<Key, Held>(&mut map, key(7, &counts), held(11, &counts))
+  let mut map = HashMap<Key, Held>.make(Hash.seed(3))
+  let first = run HashMap<Key, Held>.insert(&mut map, key(7, &counts), held(11, &counts))
     |> Effect.provideMut(&mut allocator)
   drop first
-  let displaced = run HashMap.insert<Key, Held>(&mut map, key(7, &counts), held(31, &counts))
+  let displaced = run HashMap<Key, Held>.insert(&mut map, key(7, &counts), held(31, &counts))
     |> Effect.provideMut(&mut allocator)
   drop displaced
-  if HashMap.length<Key, Held>(&map) != 1 { return 1 }
-  let removed = HashMap.remove<Key, Held>(&mut map, key(7, &counts))
+  if HashMap<Key, Held>.length(&map) != 1 { return 1 }
+  let removed = HashMap<Key, Held>.remove(&mut map, key(7, &counts))
   drop removed
-  if HashMap.length<Key, Held>(&map) != 0 { return 2 }
+  if HashMap<Key, Held>.length(&map) != 0 { return 2 }
   drop map
 
-  let mut cells = HashMap.make<Key, Cell>(Hash.seed(6))
-  let insertedCell = run HashMap.insert<Key, Cell>(
+  let mut cells = HashMap<Key, Cell>.make(Hash.seed(6))
+  let insertedCell = run HashMap<Key, Cell>.insert(
     &mut cells,
     key(8, &counts),
     Cell { slot: Filled { payload: held(42, &counts) } },
@@ -4887,10 +4887,10 @@ effect fn build() -> i32 ! OutOfMemoryError {
   drop cells
   if extracted != 42 { return 4 }
 
-  let fillingCounts = Shared.clone<Counts>(&counts)
+  let fillingCounts = Shared<Counts>.clone(&counts)
   let filled = run fillAndDrop(move fillingCounts) |> Effect.provideMut(&mut allocator)
   drop filled
-  let result = Shared.with<Counts, bool>(&counts, accepted)
+  let result = Shared<Counts>.with<bool>(&counts, accepted)
   drop counts
   if result { return 42 }
   return 5
@@ -4913,20 +4913,20 @@ import silk.option { Option }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Word, i32>(Hash.seed(4242))
+  let mut map = HashMap<Word, i32>.make(Hash.seed(4242))
   let mut key = 0
   while key < 40 {
-    let previous = run HashMap.insert<Word, i32>(&mut map, Hash.word(i32.toU64(key)), key * 3)
+    let previous = run HashMap<Word, i32>.insert(&mut map, Hash.word(i32.toU64(key)), key * 3)
       |> Effect.provideMut(&mut allocator)
     drop previous
     key = key + 1
   }
-  if HashMap.length<Word, i32>(&map) != 40 { return 1 }
-  if HashMap.bucketCount<Word, i32>(&map) <= 40 { return 2 }
+  if HashMap<Word, i32>.length(&map) != 40 { return 1 }
+  if HashMap<Word, i32>.bucketCount(&map) <= 40 { return 2 }
   let mut probe = 0
   let mut total = 0
   while probe < 40 {
-    let found = Option.unwrapOr<i32>(HashMap.get<Word, i32>(&map, Hash.word(i32.toU64(probe))), -1)
+    let found = Option<i32>.unwrapOr(HashMap<Word, i32>.get(&map, Hash.word(i32.toU64(probe))), -1)
     if found != probe * 3 { return 3 }
     total = total + found
     probe = probe + 1
@@ -4962,7 +4962,7 @@ effect fn allocate(self: &mut Budget, layout: Layout) -> Allocation ! OutOfMemor
 impl Allocator for Budget { allocate: Budget.allocate }
 
 effect fn grow(map: &mut HashMap<Word, i32>) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let previous = run HashMap.insert<Word, i32>(move map, Hash.word(6), 106)
+  let previous = run HashMap<Word, i32>.insert(move map, Hash.word(6), 106)
   drop previous
   return 0
 }
@@ -4970,25 +4970,25 @@ effect fn noRoom(error: OutOfMemoryError) -> i32 { return 1 }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Budget { inner: Allocator.systemAllocatorProvider(), remaining: 2 }
-  let mut map = HashMap.make<Word, i32>(Hash.seed(5))
+  let mut map = HashMap<Word, i32>.make(Hash.seed(5))
   let mut key = 0
   while key < 6 {
-    let previous = run HashMap.insert<Word, i32>(&mut map, Hash.word(i32.toU64(key)), key + 100)
+    let previous = run HashMap<Word, i32>.insert(&mut map, Hash.word(i32.toU64(key)), key + 100)
       |> Effect.provideMut(&mut allocator)
     drop previous
     key = key + 1
   }
-  if HashMap.length<Word, i32>(&map) != 6 { return 2 }
+  if HashMap<Word, i32>.length(&map) != 6 { return 2 }
   let refused = run Effect.catchAll(grow(&mut map), noRoom) |> Effect.provideMut(&mut allocator)
   if refused != 1 { return 3 }
-  if HashMap.length<Word, i32>(&map) != 6 { return 4 }
-  if HashMap.bucketCount<Word, i32>(&map) != 8 { return 5 }
-  if HashMap.contains<Word, i32>(&map, Hash.word(6)) { return 6 }
+  if HashMap<Word, i32>.length(&map) != 6 { return 4 }
+  if HashMap<Word, i32>.bucketCount(&map) != 8 { return 5 }
+  if HashMap<Word, i32>.contains(&map, Hash.word(6)) { return 6 }
   let mut probe = 0
   let mut total = 0
   while probe < 6 {
-    let found = Option.unwrapOr<i32>(
-      HashMap.get<Word, i32>(&map, Hash.word(i32.toU64(probe))),
+    let found = Option<i32>.unwrapOr(
+      HashMap<Word, i32>.get(&map, Hash.word(i32.toU64(probe))),
       -1,
     )
     if found != probe + 100 { return 7 }
@@ -5013,23 +5013,23 @@ import silk.vector { Vector }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<i32>()
-  let mut pending0 = Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  let mut values = Vector<i32>.make()
+  let mut pending0 = Vector<i32>.append(&mut values, 10) |> Effect.provideMut(&mut allocator)
   let appended0 = run pending0
-  let mut pending1 = Vector.append<i32>(&mut values, 11) |> Effect.provideMut(&mut allocator)
+  let mut pending1 = Vector<i32>.append(&mut values, 11) |> Effect.provideMut(&mut allocator)
   let appended1 = run pending1
-  let mut pending2 = Vector.append<i32>(&mut values, 12) |> Effect.provideMut(&mut allocator)
+  let mut pending2 = Vector<i32>.append(&mut values, 12) |> Effect.provideMut(&mut allocator)
   let appended2 = run pending2
-  let mut pending3 = Vector.append<i32>(&mut values, 13) |> Effect.provideMut(&mut allocator)
+  let mut pending3 = Vector<i32>.append(&mut values, 13) |> Effect.provideMut(&mut allocator)
   let appended3 = run pending3
-  let mut pending4 = Vector.append<i32>(&mut values, 14) |> Effect.provideMut(&mut allocator)
+  let mut pending4 = Vector<i32>.append(&mut values, 14) |> Effect.provideMut(&mut allocator)
   let appended4 = run pending4
-  let mut pending5 = Vector.append<i32>(&mut values, 15) |> Effect.provideMut(&mut allocator)
+  let mut pending5 = Vector<i32>.append(&mut values, 15) |> Effect.provideMut(&mut allocator)
   let appended5 = run pending5
-  if Vector.length<i32>(&values) == 6 {} else { return 0 }
-  if Vector.capacity<i32>(&values) == 8 {} else { return 1 }
-  let first = Vector.get<i32>(&values, 0)
-  let last = Vector.get<i32>(&values, 5)
+  if Vector<i32>.length(&values) == 6 {} else { return 0 }
+  if Vector<i32>.capacity(&values) == 8 {} else { return 1 }
+  let first = Vector<i32>.get(&values, 0)
+  let last = Vector<i32>.get(&values, 5)
   return first + last + 17
 }
 
@@ -5048,35 +5048,35 @@ import silk.vector { Vector }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<i32>()
-  let a = run Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
-  let b = run Vector.append<i32>(&mut values, 20) |> Effect.provideMut(&mut allocator)
-  let c = run Vector.append<i32>(&mut values, 30) |> Effect.provideMut(&mut allocator)
-  let d = run Vector.append<i32>(&mut values, 40) |> Effect.provideMut(&mut allocator)
-  let originalCapacity = Vector.capacity<i32>(&values)
-  let mutable = Vector.asMutSlice<i32>(&mut values)
+  let mut values = Vector<i32>.make()
+  let a = run Vector<i32>.append(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  let b = run Vector<i32>.append(&mut values, 20) |> Effect.provideMut(&mut allocator)
+  let c = run Vector<i32>.append(&mut values, 30) |> Effect.provideMut(&mut allocator)
+  let d = run Vector<i32>.append(&mut values, 40) |> Effect.provideMut(&mut allocator)
+  let originalCapacity = Vector<i32>.capacity(&values)
+  let mutable = Vector<i32>.asMutSlice(&mut values)
   mutable[usize.ONE] = 22
-  Vector.set<i32>(&mut values, usize.ONE + usize.ONE, 33)
-  let shared = Vector.asSlice<i32>(&values)
+  Vector<i32>.set(&mut values, usize.ONE + usize.ONE, 33)
+  let shared = Vector<i32>.asSlice(&values)
   if shared[usize.ZERO] != 10 { return 1 }
   if shared[usize.ONE] != 22 { return 2 }
   if shared[usize.ONE + usize.ONE] != 33 { return 3 }
-  let removed = Vector.remove<i32>(&mut values, usize.ONE)
+  let removed = Vector<i32>.remove(&mut values, usize.ONE)
   if removed != 22 { return 4 }
-  if Vector.get<i32>(&values, usize.ONE) != 33 { return 5 }
-  let popped = Vector.pop<i32>(&mut values)
+  if Vector<i32>.get(&values, usize.ONE) != 33 { return 5 }
+  let popped = Vector<i32>.pop(&mut values)
   let poppedValue = match move popped {
     Option<i32>.Some { value } => value
     Option<i32>.None => 0
   }
   if poppedValue != 40 { return 6 }
-  if Vector.length<i32>(&values) != 2 { return 10 }
-  Vector.truncate<i32>(&mut values, usize.ONE)
-  if Vector.length<i32>(&values) != usize.ONE { return 7 }
-  Vector.clear<i32>(&mut values)
-  if Vector.length<i32>(&values) != usize.ZERO { return 8 }
-  if Vector.capacity<i32>(&values) != originalCapacity { return 9 }
-  let empty = Vector.pop<i32>(&mut values)
+  if Vector<i32>.length(&values) != 2 { return 10 }
+  Vector<i32>.truncate(&mut values, usize.ONE)
+  if Vector<i32>.length(&values) != usize.ONE { return 7 }
+  Vector<i32>.clear(&mut values)
+  if Vector<i32>.length(&values) != usize.ZERO { return 8 }
+  if Vector<i32>.capacity(&values) != originalCapacity { return 9 }
+  let empty = Vector<i32>.pop(&mut values)
   return match move empty {
     Option<i32>.Some { value } => 10
     Option<i32>.None => 42
@@ -5101,15 +5101,15 @@ effect fn allocate(self: &mut QuotaAllocator, layout: Layout) -> Allocation ! Ou
 }
 impl Allocator for QuotaAllocator { allocate: QuotaAllocator.allocate }
 effect fn append(values: &mut Vector<i32>, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
-  return run Vector.append<i32>(move values, value)
+  return run Vector<i32>.append(move values, value)
 }
 effect fn reserve(values: &mut Vector<i32>) -> () ! OutOfMemoryError ? &mut Allocator {
-  return run Vector.reserve<i32>(move values, 100)
+  return run Vector<i32>.reserve(move values, 100)
 }
 effect fn rejected(error: OutOfMemoryError) -> () { return () }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = QuotaAllocator { remaining: 1 }
-  let mut values = Vector.make<i32>()
+  let mut values = Vector<i32>.make()
   let a = run append(&mut values, 10) |> Effect.provideMut(&mut allocator)
   let b = run append(&mut values, 11) |> Effect.provideMut(&mut allocator)
   let c = run append(&mut values, 12) |> Effect.provideMut(&mut allocator)
@@ -5119,15 +5119,15 @@ effect fn build() -> i32 ! OutOfMemoryError {
     rejected,
   )
   drop growth
-  if Vector.length<i32>(&values) != 4 || Vector.capacity<i32>(&values) != 4 { return 2 }
-  if Vector.get<i32>(&values, 0) != 10 || Vector.get<i32>(&values, 3) != 13 { return 3 }
+  if Vector<i32>.length(&values) != 4 || Vector<i32>.capacity(&values) != 4 { return 2 }
+  if Vector<i32>.get(&values, 0) != 10 || Vector<i32>.get(&values, 3) != 13 { return 3 }
   let reserved = run Effect.catchAll(
     reserve(&mut values) |> Effect.provideMut(&mut allocator),
     rejected,
   )
   drop reserved
-  if Vector.length<i32>(&values) != 4 || Vector.capacity<i32>(&values) != 4 { return 5 }
-  if Vector.get<i32>(&values, 0) != 10 || Vector.get<i32>(&values, 3) != 13 { return 6 }
+  if Vector<i32>.length(&values) != 4 || Vector<i32>.capacity(&values) != 4 { return 5 }
+  if Vector<i32>.get(&values, 0) != 10 || Vector<i32>.get(&values, 3) != 13 { return 6 }
   return 42
 }
 effect fn outer(error: OutOfMemoryError) -> i32 { return 0 }
@@ -5153,29 +5153,29 @@ impl Order for Item { compare: Item.itemCompare }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut items = Vector.make<Item>()
-  let a = run Vector.append<Item>(&mut items, Item { key: 1, tag: 1 }) |> Effect.provideMut(&mut allocator)
-  let b = run Vector.append<Item>(&mut items, Item { key: 0, tag: 2 }) |> Effect.provideMut(&mut allocator)
-  let c = run Vector.append<Item>(&mut items, Item { key: 1, tag: 3 }) |> Effect.provideMut(&mut allocator)
-  let d = run Vector.append<Item>(&mut items, Item { key: 0, tag: 4 }) |> Effect.provideMut(&mut allocator)
-  let ordered = run Vector.sort<Item>(&mut items) |> Effect.provideMut(&mut allocator)
-  let view = Vector.asSlice<Item>(&items)
+  let mut items = Vector<Item>.make()
+  let a = run Vector<Item>.append(&mut items, Item { key: 1, tag: 1 }) |> Effect.provideMut(&mut allocator)
+  let b = run Vector<Item>.append(&mut items, Item { key: 0, tag: 2 }) |> Effect.provideMut(&mut allocator)
+  let c = run Vector<Item>.append(&mut items, Item { key: 1, tag: 3 }) |> Effect.provideMut(&mut allocator)
+  let d = run Vector<Item>.append(&mut items, Item { key: 0, tag: 4 }) |> Effect.provideMut(&mut allocator)
+  let ordered = run Vector<Item>.sort(&mut items) |> Effect.provideMut(&mut allocator)
+  let view = Vector<Item>.asSlice(&items)
   let folded = view[usize.ZERO].tag * 1000 + view[usize.ONE].tag * 100
     + view[usize.ONE + usize.ONE].tag * 10 + view[usize.ONE + usize.ONE + usize.ONE].tag
   if folded != 2413 { return 1 }
 
-  let mut numbers = Vector.make<i32>()
-  let n0 = run Vector.append<i32>(&mut numbers, 9) |> Effect.provideMut(&mut allocator)
-  let n1 = run Vector.append<i32>(&mut numbers, 2) |> Effect.provideMut(&mut allocator)
-  let n2 = run Vector.append<i32>(&mut numbers, 7) |> Effect.provideMut(&mut allocator)
-  let n3 = run Vector.append<i32>(&mut numbers, 2) |> Effect.provideMut(&mut allocator)
-  let n4 = run Vector.append<i32>(&mut numbers, 5) |> Effect.provideMut(&mut allocator)
-  let sorted = run Vector.sort<i32>(&mut numbers) |> Effect.provideMut(&mut allocator)
-  let hit = Vector.binarySearch<i32>(&numbers, 7)
-  let miss = Vector.binarySearch<i32>(&numbers, 4)
-  let duplicate = Vector.binarySearch<i32>(&numbers, 2)
-  let below = Vector.binarySearch<i32>(&numbers, -1)
-  let above = Vector.binarySearch<i32>(&numbers, 10)
+  let mut numbers = Vector<i32>.make()
+  let n0 = run Vector<i32>.append(&mut numbers, 9) |> Effect.provideMut(&mut allocator)
+  let n1 = run Vector<i32>.append(&mut numbers, 2) |> Effect.provideMut(&mut allocator)
+  let n2 = run Vector<i32>.append(&mut numbers, 7) |> Effect.provideMut(&mut allocator)
+  let n3 = run Vector<i32>.append(&mut numbers, 2) |> Effect.provideMut(&mut allocator)
+  let n4 = run Vector<i32>.append(&mut numbers, 5) |> Effect.provideMut(&mut allocator)
+  let sorted = run Vector<i32>.sort(&mut numbers) |> Effect.provideMut(&mut allocator)
+  let hit = Vector<i32>.binarySearch(&numbers, 7)
+  let miss = Vector<i32>.binarySearch(&numbers, 4)
+  let duplicate = Vector<i32>.binarySearch(&numbers, 2)
+  let below = Vector<i32>.binarySearch(&numbers, -1)
+  let above = Vector<i32>.binarySearch(&numbers, 10)
   let hitIndex = match move hit { Option<usize>.Some { value } => usize.toI32(value) _ => -1 }
   let missIndex = match move miss { Option<usize>.Some { value } => usize.toI32(value) _ => -1 }
   let duplicateIndex = match move duplicate { Option<usize>.Some { value } => usize.toI32(value) _ => -1 }
@@ -5186,22 +5186,22 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let aboveIndex = match move above { Option<usize>.Some { value } => usize.toI32(value) _ => -1 }
   if belowIndex != -1 || aboveIndex != -1 { return 6 }
 
-  let mut already = Vector.make<i32>()
-  let a0 = run Vector.append<i32>(&mut already, 1) |> Effect.provideMut(&mut allocator)
-  let a1 = run Vector.append<i32>(&mut already, 2) |> Effect.provideMut(&mut allocator)
-  let a2 = run Vector.append<i32>(&mut already, 3) |> Effect.provideMut(&mut allocator)
-  let alreadySorted = run Vector.sort<i32>(&mut already) |> Effect.provideMut(&mut allocator)
-  if Vector.get<i32>(&already, usize.ZERO) != 1 { return 7 }
-  if Vector.get<i32>(&already, usize.ONE) != 2 { return 7 }
-  if Vector.get<i32>(&already, usize.ONE + usize.ONE) != 3 { return 7 }
+  let mut already = Vector<i32>.make()
+  let a0 = run Vector<i32>.append(&mut already, 1) |> Effect.provideMut(&mut allocator)
+  let a1 = run Vector<i32>.append(&mut already, 2) |> Effect.provideMut(&mut allocator)
+  let a2 = run Vector<i32>.append(&mut already, 3) |> Effect.provideMut(&mut allocator)
+  let alreadySorted = run Vector<i32>.sort(&mut already) |> Effect.provideMut(&mut allocator)
+  if Vector<i32>.get(&already, usize.ZERO) != 1 { return 7 }
+  if Vector<i32>.get(&already, usize.ONE) != 2 { return 7 }
+  if Vector<i32>.get(&already, usize.ONE + usize.ONE) != 3 { return 7 }
 
-  let mut empty = Vector.make<i32>()
-  let emptyMiss = Vector.binarySearch<i32>(&empty, 1)
-  let emptySorted = run Vector.sort<i32>(&mut empty) |> Effect.provideMut(&mut allocator)
-  let mut singleton = Vector.make<i32>()
-  let one = run Vector.append<i32>(&mut singleton, 42) |> Effect.provideMut(&mut allocator)
-  let singletonSorted = run Vector.sort<i32>(&mut singleton) |> Effect.provideMut(&mut allocator)
-  if Vector.get<i32>(&singleton, usize.ZERO) != 42 { return 8 }
+  let mut empty = Vector<i32>.make()
+  let emptyMiss = Vector<i32>.binarySearch(&empty, 1)
+  let emptySorted = run Vector<i32>.sort(&mut empty) |> Effect.provideMut(&mut allocator)
+  let mut singleton = Vector<i32>.make()
+  let one = run Vector<i32>.append(&mut singleton, 42) |> Effect.provideMut(&mut allocator)
+  let singletonSorted = run Vector<i32>.sort(&mut singleton) |> Effect.provideMut(&mut allocator)
+  if Vector<i32>.get(&singleton, usize.ZERO) != 42 { return 8 }
   return match move emptyMiss { Option<usize>.Some { value } => 5 _ => 42 }
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 99 }
@@ -5232,47 +5232,47 @@ fn countDrop(counts: &mut Counts) -> i32 {
 fn readDrops(counts: &Counts) -> i32 { return counts.dropped }
 impl Drop for Tracked {
   fn drop(self: &mut Tracked) -> () {
-    let changed = Shared.withMut<Counts, i32>(&self.counts, countDrop)
+    let changed = Shared<Counts>.withMut<i32>(&self.counts, countDrop)
     return ()
   }
 }
 effect fn hold(key: i32, counts: &Shared<Counts>) -> Tracked
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut payload = Vector.make<i32>()
-  let filled = run Vector.append<i32>(&mut payload, key)
+  let mut payload = Vector<i32>.make()
+  let filled = run Vector<i32>.append(&mut payload, key)
   return Tracked {
     key: key,
     payload: move payload,
-    counts: Shared.clone<Counts>(counts),
+    counts: Shared<Counts>.clone(counts),
   }
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counts = run Shared.make<Counts>(Counts { dropped: 0 })
+  let counts = run Shared<Counts>.make(Counts { dropped: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut items = Vector.make<Tracked>()
+  let mut items = Vector<Tracked>.make()
   let first = run hold(3, &counts) |> Effect.provideMut(&mut allocator)
-  let a = run Vector.append<Tracked>(&mut items, move first) |> Effect.provideMut(&mut allocator)
+  let a = run Vector<Tracked>.append(&mut items, move first) |> Effect.provideMut(&mut allocator)
   let second = run hold(1, &counts) |> Effect.provideMut(&mut allocator)
-  let b = run Vector.append<Tracked>(&mut items, move second) |> Effect.provideMut(&mut allocator)
+  let b = run Vector<Tracked>.append(&mut items, move second) |> Effect.provideMut(&mut allocator)
   let third = run hold(2, &counts) |> Effect.provideMut(&mut allocator)
-  let c = run Vector.append<Tracked>(&mut items, move third) |> Effect.provideMut(&mut allocator)
+  let c = run Vector<Tracked>.append(&mut items, move third) |> Effect.provideMut(&mut allocator)
   let fourth = run hold(5, &counts) |> Effect.provideMut(&mut allocator)
-  let d = run Vector.append<Tracked>(&mut items, move fourth) |> Effect.provideMut(&mut allocator)
+  let d = run Vector<Tracked>.append(&mut items, move fourth) |> Effect.provideMut(&mut allocator)
   let fifth = run hold(4, &counts) |> Effect.provideMut(&mut allocator)
-  let e = run Vector.append<Tracked>(&mut items, move fifth) |> Effect.provideMut(&mut allocator)
-  let ordered = run Vector.sort<Tracked>(&mut items) |> Effect.provideMut(&mut allocator)
-  let view = Vector.asSlice<Tracked>(&items)
+  let e = run Vector<Tracked>.append(&mut items, move fifth) |> Effect.provideMut(&mut allocator)
+  let ordered = run Vector<Tracked>.sort(&mut items) |> Effect.provideMut(&mut allocator)
+  let view = Vector<Tracked>.asSlice(&items)
   let mut folded = 0
   let mut index = usize.ZERO
-  while index < Vector.length<Tracked>(&items) {
+  while index < Vector<Tracked>.length(&items) {
     folded = folded * 10 + view[index].key
     index = index + usize.ONE
   }
   if folded != 12345 { return 1 }
   drop items
-  let dropped = Shared.with<Counts, i32>(&counts, readDrops)
+  let dropped = Shared<Counts>.with<i32>(&counts, readDrops)
   drop counts
   if dropped != 5 { return 2 }
   return 42
@@ -5459,11 +5459,11 @@ fn read(value: &Counter) -> i32 { return value.value }
 
 effect fn construct() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let first = run (Shared.make<Counter>(Counter { value: 41 })
+  let first = run (Shared<Counter>.make(Counter { value: 41 })
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let second = Shared.clone<Counter>(&first)
-  let updated = Shared.withMut<Counter, i32>(&second, increment)
-  let answer = Shared.with<Counter, i32>(&first, read)
+  let second = Shared<Counter>.clone(&first)
+  let updated = Shared<Counter>.withMut<i32>(&second, increment)
+  let answer = Shared<Counter>.with<i32>(&first, read)
   drop second
   drop first
   return answer
@@ -5854,29 +5854,29 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
 fn replace(values: &mut [Token], index: usize, counter: &Shared<Counter>) -> i32 {
-  values[index] = Token { value: 42, counter: Shared.clone<Counter>(counter) }
+  values[index] = Token { value: 42, counter: Shared<Counter>.clone(counter) }
   return usize.toI32(values.length)
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut values = [
-    Token { value: 1, counter: Shared.clone<Counter>(&counter) },
-    Token { value: 2, counter: Shared.clone<Counter>(&counter) },
+    Token { value: 1, counter: Shared<Counter>.clone(&counter) },
+    Token { value: 2, counter: Shared<Counter>.clone(&counter) },
   ]
   let length = replace(&mut values, 0, &counter)
   if length != 2 { return 0 }
   if values[0].value != 42 { return 1 }
-  let replacementCount = Shared.with<Counter, i32>(&counter, read)
+  let replacementCount = Shared<Counter>.with<i32>(&counter, read)
   if replacementCount != 1 { return 2 }
   drop values
-  let finalCount = Shared.with<Counter, i32>(&counter, read)
+  let finalCount = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if finalCount != 3 { return 3 }
   return 42
@@ -6088,7 +6088,7 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -6096,16 +6096,16 @@ fn consume(token: Token) -> i32 { return token.value }
 fn add(value: i32, token: Token) -> i32 { return value + consume(move token) }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let sectionToken = Token { value: 2, counter: Shared.clone<Counter>(&counter) }
+  let sectionToken = Token { value: 2, counter: Shared<Counter>.clone(&counter) }
   let section = add(move sectionToken)
   if section(40) != 42 { return 1 }
-  let effectToken = Token { value: 42, counter: Shared.clone<Counter>(&counter) }
+  let effectToken = Token { value: 42, counter: Shared<Counter>.clone(&counter) }
   let pending = effect { return consume(move effectToken) }
   let effectResult = run pending
   if effectResult != 42 { return 2 }
-  let count = Shared.with<Counter, i32>(&counter, read)
+  let count = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if count != 2 { return 3 }
   return 42
@@ -6130,7 +6130,7 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -6144,11 +6144,11 @@ fn forward(step: once fn() -> i32) -> i32 {
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let token = Token { counter: Shared.clone<Counter>(&counter) }
+  let token = Token { counter: Shared<Counter>.clone(&counter) }
   if forward(fn() -> i32 { return consume(move token) }) != 42 { return 1 }
-  let count = Shared.with<Counter, i32>(&counter, read)
+  let count = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if count != 1 { return 2 }
   return 42
@@ -6172,12 +6172,12 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 impl Drop for Owner {
   fn drop(self: &mut Owner) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
 fn owner(counter: &Shared<Counter>) -> Owner {
-  return Owner { counter: Shared.clone<Counter>(counter) }
+  return Owner { counter: Shared<Counter>.clone(counter) }
 }
 effect fn acquiring<A, E>(self: once Effect<A ! E>, counter: &Shared<Counter>) -> A ! E {
   let held = owner(counter)
@@ -6195,7 +6195,7 @@ effect fn succeeding() -> i32 ! Problem { return 7 }
 effect fn recover(error: Problem) -> i32 { return error.code }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let a = run Effect.catchAll(acquiring(failing(), &counter), recover)
   let b = run Effect.catchAll(acquiring(succeeding(), &counter), recover)
@@ -6203,7 +6203,7 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let d = run Effect.catchAll(holding(succeeding(), owner(&counter)), recover)
   let retried = acquiring(failing(), &counter) |> Effect.retry(2)
   let e = run Effect.catchAll(move retried, recover)
-  let count = Shared.with<Counter, i32>(&counter, read)
+  let count = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if a + b + c + d + e != 35 { return 1 }
   if count != 7 { return 2 }
@@ -6233,12 +6233,12 @@ fn readSum(counter: &Counter) -> i32 { return counter.sum }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     let value = self.value
-    let changed = Shared.withMut<Counter, i32>(&self.counter, record(value))
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, record(value))
     return ()
   }
 }
 fn guard(value: i32, counter: &Shared<Counter>) -> Guard {
-  return Guard { value: value, counter: Shared.clone<Counter>(counter) }
+  return Guard { value: value, counter: Shared<Counter>.clone(counter) }
 }
 fn consume(held: Guard) -> i32 { return held.value }
 fn defer<A, E, ?R, F: once Effect<'static; A ! E ? R>>(operation: F) -> Deferred<A, E, R, F> {
@@ -6267,7 +6267,7 @@ effect fn runSuspended(counter: &Shared<Counter>) -> i32 {
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0, sum: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0, sum: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let unrunGuard = guard(1, &counter)
   let unrun = defer(effect { return consume(move unrunGuard) })
@@ -6275,8 +6275,8 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let failureResult = run Effect.catchAll(runFailure(&counter), recover)
   let movedResult = run Effect.catchAll(runMovedField(&counter), recover)
   let suspensionResult = run runSuspended(&counter)
-  let count = Shared.with<Counter, i32>(&counter, read)
-  let sum = Shared.with<Counter, i32>(&counter, readSum)
+  let count = Shared<Counter>.with<i32>(&counter, read)
+  let sum = Shared<Counter>.with<i32>(&counter, readSum)
   drop counter
   if failureResult != 7 || suspensionResult != 42 { return 1 }
   if movedResult != 4 { return 4 }
@@ -6313,20 +6313,20 @@ fn accepted(counts: &Counts) -> bool {
 }
 impl Drop for Field {
   fn drop(self: &mut Field) -> () {
-    let changed = Shared.withMut<Counts, i32>(&self.counts, field)
+    let changed = Shared<Counts>.withMut<i32>(&self.counts, field)
     return ()
   }
 }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
-    let changed = Shared.withMut<Counts, i32>(&self.counts, hook)
+    let changed = Shared<Counts>.withMut<i32>(&self.counts, hook)
     return ()
   }
 }
 fn guard(counts: &Shared<Counts>) -> Guard {
   return Guard {
-    counts: Shared.clone<Counts>(counts),
-    field: Field { counts: Shared.clone<Counts>(counts) },
+    counts: Shared<Counts>.clone(counts),
+    field: Field { counts: Shared<Counts>.clone(counts) },
   }
 }
 fn fallthrough(counts: &Shared<Counts>) -> () { let held = guard(counts) return () }
@@ -6343,14 +6343,14 @@ effect fn failing(counts: &Shared<Counts>) -> () ! Problem {
 effect fn recover(error: Problem) -> () { return () }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counts = run Shared.make<Counts>(Counts {
+  let counts = run Shared<Counts>.make(Counts {
     hooks: 0, fields: 0, open: 0, valid: true,
   }) |> Effect.provideMut<Allocator>(&mut allocator)
   fallthrough(&counts)
   early(&counts)
   run Effect.catchAll(failing(&counts), recover)
   recurse(&counts, 2)
-  let result = Shared.with<Counts, bool>(&counts, accepted)
+  let result = Shared<Counts>.with<bool>(&counts, accepted)
   drop counts
   if !result { return 1 }
   return 42
@@ -6503,12 +6503,12 @@ fn readSum(counter: &Counter) -> i32 { return counter.sum }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     let id = self.id
-    let changed = Shared.withMut<Counter, i32>(&self.counter, record(id))
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, record(id))
     return ()
   }
 }
 fn guard(id: i32, counter: &Shared<Counter>) -> Guard {
-  return Guard { id: id, counter: Shared.clone<Counter>(counter) }
+  return Guard { id: id, counter: Shared<Counter>.clone(counter) }
 }
 effect fn succeed() -> i32 ! Selected | Residual { return 10 }
 effect fn failResidual(counter: &Shared<Counter>) -> i32 ! Selected | Residual {
@@ -6518,7 +6518,7 @@ effect fn recoverSelected(error: Selected, held: Guard) -> i32 { return held.id 
 effect fn recoverResidual(error: Residual) -> i32 { return 22 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { count: 0, sum: 0 })
+  let counter = run Shared<Counter>.make(Counter { count: 0, sum: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
 
   let successHandler = guard(1, &counter)
@@ -6537,8 +6537,8 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let second = run Effect.catchAll(move residualCatch, recoverResidual)
   drop live
 
-  let count = Shared.with<Counter, i32>(&counter, readCount)
-  let sum = Shared.with<Counter, i32>(&counter, readSum)
+  let count = Shared<Counter>.with<i32>(&counter, readCount)
+  let sum = Shared<Counter>.with<i32>(&counter, readSum)
   drop counter
   if first != 10 || second != 22 { return 1 }
   if count != 4 || sum != 15 { return 2 }
@@ -6829,7 +6829,7 @@ effect fn driveOnce(execution: Intrinsic.Execution<i32>, state: &mut ()) -> () {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mailbox = run Shared.make<Mailbox>(Mailbox { slot: Empty {} })
+  let mailbox = run Shared<Mailbox>.make(Mailbox { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let bodyMailbox = Shared.clone(&mailbox)
   let parked = run Execution.make(dormant(move bodyMailbox), (), ready)
@@ -7075,19 +7075,19 @@ fn increment(counter: &mut Counter) -> i32 {
 fn read(counter: &Counter) -> i32 { return counter.value }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let captured = Shared.clone<Counter>(&counter)
+  let captured = Shared<Counter>.clone(&counter)
   let token = Token { value: 42 }
   let deferred = effect fn() -> i32 {
-    let changed = Shared.withMut<Counter, i32>(&captured, increment)
+    let changed = Shared<Counter>.withMut<i32>(&captured, increment)
     return consume(move token)
   }
   let pending = deferred()
-  let before = Shared.with<Counter, i32>(&counter, read)
+  let before = Shared<Counter>.with<i32>(&counter, read)
   if before != 0 { return 1 }
   let result = run pending
-  let after = Shared.with<Counter, i32>(&counter, read)
+  let after = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if after != 1 { return 2 }
   return result
@@ -7116,12 +7116,12 @@ fn markObserved(observation: &mut Observation) -> i32 {
 fn readObservation(observation: &Observation) -> i32 { return observation.value }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
-    let next = Shared.clone<Cell>(&self.replacement)
+    let next = Shared<Cell>.clone(&self.replacement)
     let previous = Intrinsic.replace(self.primary, move next)
     drop previous
-    let selected = Shared.with<Cell, i32>(&self.primary, readCell)
+    let selected = Shared<Cell>.with<i32>(&self.primary, readCell)
     if selected == 2 {
-      let observed = Shared.withMut<Observation, i32>(&self.observation, markObserved)
+      let observed = Shared<Observation>.withMut<i32>(&self.observation, markObserved)
     }
     return ()
   }
@@ -7130,13 +7130,13 @@ struct Holder<F: once fn<'static>(i32) -> i32> { step: F }
 fn consume(value: i32, guard: Guard) -> i32 { return value }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let primary = run (Shared.make<Cell>(Cell { value: 1 })
+  let primary = run (Shared<Cell>.make(Cell { value: 1 })
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let replacement = run (Shared.make<Cell>(Cell { value: 2 })
+  let replacement = run (Shared<Cell>.make(Cell { value: 2 })
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let observation = run (Shared.make<Observation>(Observation { value: 0 })
+  let observation = run (Shared<Observation>.make(Observation { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let retainedObservation = Shared.clone<Observation>(&observation)
+  let retainedObservation = Shared<Observation>.clone(&observation)
   let guard = Guard {
     primary: move primary,
     replacement: move replacement,
@@ -7144,7 +7144,7 @@ effect fn build() -> i32 ! OutOfMemoryError {
   }
   let holder = Holder { step: consume(move guard) }
   drop holder
-  let selected = Shared.with<Observation, i32>(&retainedObservation, readObservation)
+  let selected = Shared<Observation>.with<i32>(&retainedObservation, readObservation)
   drop retainedObservation
   if selected != 2 { return 1 }
   return 42
@@ -7463,7 +7463,7 @@ fn balanced(state: &mut State) -> i32 {
 }
 effect fn exercise(again: bool) -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<State>(State { live: 0, produced: 0, released: 0, handled: 0, bad: 0, closed: 0 })
+  let state = run Shared<State>.make(State { live: 0, produced: 0, released: 0, handled: 0, bad: 0, closed: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   if again {
     let value = run observing(Observer { state: Shared.clone(&state) }, observe, caughtAgain(Shared.clone(&state)))
@@ -7566,7 +7566,7 @@ fn inspect(state: &mut State) -> i32 {
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<State>(State { live: 0, produced: 0, released: 0, parked: 0, dropped: 0, bad: 0, closed: 0 })
+  let state = run Shared<State>.make(State { live: 0, produced: 0, released: 0, parked: 0, dropped: 0, bad: 0, closed: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let execution = run Execution.make(observed(Shared.clone(&state)), Shared.clone(&state), ready)
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -7935,7 +7935,7 @@ fn record(log: &mut Log, id: i32) -> i32 {
 impl Drop for Tracer {
   fn drop(self: &mut Tracer) -> () {
     let id = self.id
-    let r = Shared.withMut<Log, i32>(&self.log, record(id))
+    let r = Shared<Log>.withMut<i32>(&self.log, record(id))
     return ()
   }
 }
@@ -7949,16 +7949,16 @@ fn encode(log: &Log) -> i32 {
   return r
 }
 fn tracer(id: i32, log: &Shared<Log>) -> Tracer {
-  return Tracer { id: id, log: Shared.clone<Log>(log) }
+  return Tracer { id: id, log: Shared<Log>.clone(log) }
 }
 effect fn printLog(log: &Shared<Log>) -> () ! WriterError {
-  let code = Shared.with<Log, i32>(log, encode)
+  let code = Shared<Log>.with<i32>(log, encode)
   let mut writer = StdoutWriter.make()
   return run (Format.display(&code) |> Effect.provideMut<Writer>(&mut writer))
 }
 effect fn makeLog() -> Shared<Log> ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run (Shared.make<Log>(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
+  return run (Shared<Log>.make(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
 }
 effect fn recoverAny(e: OutOfMemoryError | WriterError) -> i32 { return -1 }
 struct Pair {
@@ -8027,7 +8027,7 @@ fn record(log: &mut Log, id: i32) -> i32 {
 impl Drop for Tracer {
   fn drop(self: &mut Tracer) -> () {
     let id = self.id
-    let r = Shared.withMut<Log, i32>(&self.log, record(id))
+    let r = Shared<Log>.withMut<i32>(&self.log, record(id))
     return ()
   }
 }
@@ -8041,16 +8041,16 @@ fn encode(log: &Log) -> i32 {
   return r
 }
 fn tracer(id: i32, log: &Shared<Log>) -> Tracer {
-  return Tracer { id: id, log: Shared.clone<Log>(log) }
+  return Tracer { id: id, log: Shared<Log>.clone(log) }
 }
 effect fn printLog(log: &Shared<Log>) -> () ! WriterError {
-  let code = Shared.with<Log, i32>(log, encode)
+  let code = Shared<Log>.with<i32>(log, encode)
   let mut writer = StdoutWriter.make()
   return run (Format.display(&code) |> Effect.provideMut<Writer>(&mut writer))
 }
 effect fn makeLog() -> Shared<Log> ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run (Shared.make<Log>(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
+  return run (Shared<Log>.make(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
 }
 effect fn recoverAny(e: OutOfMemoryError | WriterError) -> i32 { return -1 }
 fn replaceAndDrop(log: &Shared<Log>) -> i32 {
@@ -8097,7 +8097,7 @@ fn record(log: &mut Log, id: i32) -> i32 {
 impl Drop for Tracer {
   fn drop(self: &mut Tracer) -> () {
     let id = self.id
-    let r = Shared.withMut<Log, i32>(&self.log, record(id))
+    let r = Shared<Log>.withMut<i32>(&self.log, record(id))
     return ()
   }
 }
@@ -8111,7 +8111,7 @@ fn encode(log: &Log) -> i32 {
   return r
 }
 fn tracer(id: i32, log: &Shared<Log>) -> Tracer {
-  return Tracer { id: id, log: Shared.clone<Log>(log) }
+  return Tracer { id: id, log: Shared<Log>.clone(log) }
 }
 union Held { Empty, Pair { kept: Tracer, rest: Tracer } }
 struct Stop {}
@@ -8162,13 +8162,13 @@ fn fallthrough(held: Held, log: &Shared<Log>) -> i32 {
 }
 effect fn stopped(problem: Stop) -> i32 { return 0 }
 effect fn printLog(log: &Shared<Log>) -> () ! WriterError {
-  let code = Shared.with<Log, i32>(log, encode)
+  let code = Shared<Log>.with<i32>(log, encode)
   let mut writer = StdoutWriter.make()
   return run (Format.display(&code) |> Effect.provideMut<Writer>(&mut writer))
 }
 effect fn makeLog() -> Shared<Log> ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run (Shared.make<Log>(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
+  return run (Shared<Log>.make(Log { slots: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], count: 0 }) |> Effect.provideMut<Allocator>(&mut allocator))
 }
 effect fn recoverAny(e: OutOfMemoryError | WriterError) -> i32 { return -1 }
 effect fn body() -> i32 ! OutOfMemoryError | WriterError {
@@ -8638,7 +8638,7 @@ fn sameMode(payload: &Payload, expected: Mode) -> bool {
   return false
 }
 pub fn main() -> i32 {
-  let payload = Payload { mode: Option.some<Mode>(Mode.Write) }
+  let payload = Payload { mode: Option<Mode>.some(Mode.Write) }
   if sameMode(&payload, Mode.Write) { return 42 }
   return 1
 }`,
@@ -8657,12 +8657,12 @@ fn mark(audit: &mut Audit) -> () { audit.drops = audit.drops + 1 }
 fn count(audit: &Audit) -> i32 { return audit.drops }
 impl Drop for Node {
   fn drop(self: &mut Node) -> () {
-    let ignored = Shared.withMut<Audit, ()>(&self.audit, mark)
+    let ignored = Shared<Audit>.withMut<()>(&self.audit, mark)
   }
 }
 effect fn verdict(root: &Shared<Node>) -> i32 {
-  let promised = Option.some<Shared<Node>>(Shared.clone<Node>(root))
-  let provided = Option.some<Shared<Node>>(Shared.clone<Node>(root))
+  let promised = Option<Shared<Node>>.some(Shared<Node>.clone(root))
+  let provided = Option<Shared<Node>>.some(Shared<Node>.clone(root))
   if let Option<Shared<Node>>.Some {value: left} = move promised {
     if let Option<Shared<Node>>.Some {value: right} = move provided {
       let compatible = true
@@ -8672,13 +8672,13 @@ effect fn verdict(root: &Shared<Node>) -> i32 {
   return 1
 }
 effect fn exercise() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let audit = run Shared.make<Audit>(Audit {drops: 0})
-  let root = run Shared.make<Node>(Node {audit: Shared.clone<Audit>(&audit)})
+  let audit = run Shared<Audit>.make(Audit {drops: 0})
+  let root = run Shared<Node>.make(Node {audit: Shared<Audit>.clone(&audit)})
   let answer = run verdict(&root)
   if answer != 1 { return 3 }
-  if Shared.with<Audit, i32>(&audit, count) != 0 { return 4 }
+  if Shared<Audit>.with<i32>(&audit, count) != 0 { return 4 }
   drop root
-  if Shared.with<Audit, i32>(&audit, count) != 1 { return 5 }
+  if Shared<Audit>.with<i32>(&audit, count) != 1 { return 5 }
   return 42
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 1 }
@@ -9012,17 +9012,17 @@ impl<'a> Drop for Entry<'a> {
 }
 struct Outer<'a> { entry: Entry<'a> code: i32 }
 effect fn exercise<'a>(a: &'a mut i32, b: &'a mut i32, c: &'a mut i32, d: &'a mut i32, e: &'a mut i32, f: &'a mut i32) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut values = Vector.make<Entry<'a>>()
-  run Vector.append<Entry<'a>>(&mut values, Entry { value: move a })
-  run Vector.append<Entry<'a>>(&mut values, Entry { value: move b })
-  run Vector.insert<Entry<'a>>(&mut values, 1, Entry { value: move c })
-  run Vector.append<Entry<'a>>(&mut values, Entry { value: move d })
-  run Vector.append<Entry<'a>>(&mut values, Entry { value: move e })
-  Vector.set<Entry<'a>>(&mut values, 0, Entry { value: move f })
-  let outer = Outer { entry: Vector.remove<Entry<'a>>(&mut values, 1), code: 7 }
+  let mut values = Vector<Entry<'a>>.make()
+  run Vector<Entry<'a>>.append(&mut values, Entry { value: move a })
+  run Vector<Entry<'a>>.append(&mut values, Entry { value: move b })
+  run Vector<Entry<'a>>.insert(&mut values, 1, Entry { value: move c })
+  run Vector<Entry<'a>>.append(&mut values, Entry { value: move d })
+  run Vector<Entry<'a>>.append(&mut values, Entry { value: move e })
+  Vector<Entry<'a>>.set(&mut values, 0, Entry { value: move f })
+  let outer = Outer { entry: Vector<Entry<'a>>.remove(&mut values, 1), code: 7 }
   let extracted = move outer.entry
   drop outer
-  let last = Vector.pop<Entry<'a>>(&mut values)
+  let last = Vector<Entry<'a>>.pop(&mut values)
   drop values
   drop extracted
   drop last
@@ -9040,9 +9040,9 @@ effect fn build() -> i32 ! OutOfMemoryError {
   let mut quota = Quota { remaining: 1 }
   run Effect.catchAll(exercise(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f), ignoreFailure)
     |> Effect.provideMut(&mut quota)
-  let mut references = Vector.make<&i32>()
-  run Vector.append<&i32>(&mut references, &a) |> Effect.provideMut(&mut allocator)
-  let saved = Vector.remove<&i32>(&mut references, 0)
+  let mut references = Vector<&i32>.make()
+  run Vector<&i32>.append(&mut references, &a) |> Effect.provideMut(&mut allocator)
+  let saved = Vector<&i32>.remove(&mut references, 0)
   drop references
   if saved.* == 1 && b == 1 && c == 1 && d == 1 && e == 1 && f == 0 { return 42 }
   return 0
@@ -9202,7 +9202,7 @@ impl Drop for Guard {
   }
 }
 fn guard(counts: &Shared<Counts>, digit: i32) -> Guard {
-  return Guard { counts: Shared.clone<Counts>(counts), digit: digit }
+  return Guard { counts: Shared<Counts>.clone(counts), digit: digit }
 }
 fn uncalled(first: Guard, value: i32) -> i32 { return 99 }
 fn early(counts: &Shared<Counts>) -> i32 {
@@ -9237,25 +9237,25 @@ fn receiver(counts: &Shared<Counts>) -> i32 {
 }
 fn ordered(counts: Shared<Counts>, result: i32) -> i32 {
   if result != 17 { return -1 }
-  let order = Shared.with<Counts, i32>(&counts, read)
+  let order = Shared<Counts>.with<i32>(&counts, read)
   drop counts
   return order
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counts = run Shared.make<Counts>(Counts { order: 0 })
+  let counts = run Shared<Counts>.make(Counts { order: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let result = early(&counts)
   if ordered(move counts, result) != 4231 { return 2 }
-  let fieldCounts = run Shared.make<Counts>(Counts { order: 0 })
+  let fieldCounts = run Shared<Counts>.make(Counts { order: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let fieldResult = field(&fieldCounts)
   if ordered(move fieldCounts, fieldResult) != 231 { return 3 }
-  let elementCounts = run Shared.make<Counts>(Counts { order: 0 })
+  let elementCounts = run Shared<Counts>.make(Counts { order: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let elementResult = element(&elementCounts)
   if ordered(move elementCounts, elementResult) != 231 { return 4 }
-  let receiverCounts = run Shared.make<Counts>(Counts { order: 0 })
+  let receiverCounts = run Shared<Counts>.make(Counts { order: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let receiverResult = receiver(&receiverCounts)
   if ordered(move receiverCounts, receiverResult) != 231 { return 5 }
@@ -9409,9 +9409,9 @@ impl Copy for Marker {}
 fn observe(value: Marker) -> i32 { return 42 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<Marker>()
-  run Vector.append<Marker>(&mut values, Marker {}) |> Effect.provideMut(&mut allocator)
-  return observe(Vector.get<Marker>(&values, 0))
+  let mut values = Vector<Marker>.make()
+  run Vector<Marker>.append(&mut values, Marker {}) |> Effect.provideMut(&mut allocator)
+  return observe(Vector<Marker>.get(&values, 0))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 1 }
 pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
@@ -9725,6 +9725,34 @@ pub fn read(counter: &Counter) -> i32 { return counter.value }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'owner-application-member-calls',
+    source: `import silk.u8
+struct Lent<'a, T> { value: &'a T }
+impl<'a, T> Lent<'a, T> {
+  fn read(lent: &Lent<'a, T>) -> &'a T { return lent.value }
+  fn pick<U>(lent: &Lent<'a, T>, other: U) -> &'a T { drop other return lent.value }
+}
+struct Holder<T> { held: T }
+impl<T> Holder<T> { fn wrap(held: T) -> Holder<T> { return Holder { held: move held } } }
+struct Pair<A, B> {
+  left: A
+  right: B
+}
+impl<A, B> Pair<A, B> { fn second(value: B) -> B { return move value } }
+fn total<'r>(lent: &Lent<'r, i32>) -> i32 {
+  let read = Lent<i32>.read(lent)
+  let picked = Lent<i32>.pick<bool>(lent, true)
+  let holder = Holder<&i32>.wrap(read)
+  return holder.held.* + picked.* + u8.toI32(Pair<i64, u8>.second(2))
+}
+pub fn main() -> i32 {
+  let value = 20
+  let lent = Lent { value: &value }
+  return total(&lent)
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'execution-body-and-endpoint-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
@@ -9741,14 +9769,14 @@ fn readAudit(audit: &Audit) -> i32 { return audit.body * 10 + audit.endpoint }
 struct BodyGuard { storage: Allocation audit: Shared<Audit> }
 impl Drop for BodyGuard {
   fn drop(self: &mut BodyGuard) -> () {
-    let count = Shared.withMut<Audit, i32>(&self.audit, recordBody)
+    let count = Shared<Audit>.withMut<i32>(&self.audit, recordBody)
     return ()
   }
 }
 struct EndpointGuard { storage: Allocation audit: Shared<Audit> }
 impl Drop for EndpointGuard {
   fn drop(self: &mut EndpointGuard) -> () {
-    let count = Shared.withMut<Audit, i32>(&self.audit, recordEndpoint)
+    let count = Shared<Audit>.withMut<i32>(&self.audit, recordEndpoint)
     return ()
   }
 }
@@ -9767,7 +9795,7 @@ effect fn body(guard: BodyGuard) -> i32 {
 effect fn exercise(audit: &Shared<Audit>) -> () ! OutOfMemoryError ? &mut Allocator {
   let bodyStorage = run Allocator.allocate(Layout.of<i32>())
   let bodyExecution = run Execution.make(
-    body(BodyGuard { storage: move bodyStorage, audit: Shared.clone<Audit>(audit) }),
+    body(BodyGuard { storage: move bodyStorage, audit: Shared<Audit>.clone(audit) }),
     (), readyUnit
   )
   drop bodyExecution
@@ -9776,7 +9804,7 @@ effect fn exercise(audit: &Shared<Audit>) -> () ! OutOfMemoryError ? &mut Alloca
     effect { return 42 },
     Ready {
       guard: EndpointGuard {
-        storage: move endpointStorage, audit: Shared.clone<Audit>(audit),
+        storage: move endpointStorage, audit: Shared<Audit>.clone(audit),
       },
     },
     ready
@@ -9786,10 +9814,10 @@ effect fn exercise(audit: &Shared<Audit>) -> () ! OutOfMemoryError ? &mut Alloca
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<Audit>(Audit { body: 0, endpoint: 0 })
+  let audit = run Shared<Audit>.make(Audit { body: 0, endpoint: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let exercised = run exercise(&audit) |> Effect.provideMut<Allocator>(&mut allocator)
-  let observed = Shared.with<Audit, i32>(&audit, readAudit)
+  let observed = Shared<Audit>.with<i32>(&audit, readAudit)
   drop audit
   if observed != 11 { return 1 }
   return 42
@@ -9900,20 +9928,20 @@ struct Step { pc: usize opcode: u8 depth: usize top: i32 }
 struct VmDiagnostic { pc: usize code: usize }
 struct Returned { first: Vector<Step> second: Vector<VmDiagnostic> result: i32 fingerprint: i32 }
 effect fn pushStep(values: &mut Vector<Step>, step: Step) -> () ! OutOfMemoryError ? &mut Allocator {
-  return run Vector.append<Step>(move values, move step)
+  return run Vector<Step>.append(move values, move step)
 }
 fn finish(first: Vector<Step>, second: Vector<VmDiagnostic>, result: i32, fingerprint: i32) -> Returned {
   return Returned { first: move first, second: move second, result: result, fingerprint: fingerprint }
 }
 effect fn build() -> Returned ! OutOfMemoryError ? &mut Allocator {
-  let mut first = Vector.make<Step>()
+  let mut first = Vector<Step>.make()
   let mut index = usize.add(0, 0)
   while index < 6 {
     let step = Step { pc: index, opcode: 1, depth: index + 1, top: usize.toI32(index) }
     run pushStep(&mut first, move step)
     index = index + 1
   }
-  let second = Vector.make<VmDiagnostic>()
+  let second = Vector<VmDiagnostic>.make()
   return finish(move first, move second, 5, 7)
 }
 fn observeValues(
@@ -9922,8 +9950,8 @@ fn observeValues(
   result: i32,
   fingerprint: i32
 ) -> i32 {
-  if Vector.length<Step>(&first) != 6 { return 1 }
-  if Vector.length<VmDiagnostic>(&second) != 0 { return 2 }
+  if Vector<Step>.length(&first) != 6 { return 1 }
+  if Vector<VmDiagnostic>.length(&second) != 0 { return 2 }
   return result + fingerprint + 30
 }
 fn observe(returned: Returned) -> i32 {
@@ -9989,14 +10017,14 @@ struct Guard { left: i8 right: i8 counter: Shared<Counter> }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
 union Choice { Small { marker: i8, guard: Guard }, Wide { value: i64 } }
 effect fn store() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let allocation = run Allocator.allocate(Layout.of<[Choice; 1]>())
     |> Effect.provideMut(&mut allocator)
@@ -10005,13 +10033,13 @@ effect fn store() -> i32 ! OutOfMemoryError {
     let value = Choice.Small {
       marker: i8.toI8(7),
       guard: Guard {
-        left: i8.toI8(19), right: i8.toI8(23), counter: Shared.clone<Counter>(&counter),
+        left: i8.toI8(19), right: i8.toI8(23), counter: Shared<Counter>.clone(&counter),
       },
     }
     let written = Slot.write(RawBuffer.slot(&mut buffer, 0), move value)
     let cleared = Slot.dropValue(RawBuffer.slot(&mut buffer, 0))
     drop buffer
-    let count = Shared.with<Counter, i32>(&counter, read)
+    let count = Shared<Counter>.with<i32>(&counter, read)
     drop counter
     if count != 1 { return 2 }
     return 42
@@ -10170,18 +10198,18 @@ fn record(audit: &mut Audit, value: i32) -> i32 {
 }
 fn read(audit: &Audit) -> i32 { return audit.trace }
 effect fn ordered(audit: Shared<Audit>) -> () ! Stop {
-  let first = Shared.withMut<Audit, i32>(&audit, record(1))
-  run effect { let second = Shared.withMut<Audit, i32>(&audit, record(2)) return () }
+  let first = Shared<Audit>.withMut<i32>(&audit, record(1))
+  run effect { let second = Shared<Audit>.withMut<i32>(&audit, record(2)) return () }
   fail Stop {}
-  let forbidden = Shared.withMut<Audit, i32>(&audit, record(9))
+  let forbidden = Shared<Audit>.withMut<i32>(&audit, record(9))
   return ()
 }
 effect fn recover(error: Stop) -> () { return () }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<Audit>(Audit { trace: 0 }) |> Effect.provideMut(&mut allocator)
-  run Effect.catchAll(ordered(Shared.clone<Audit>(&audit)), recover)
-  let trace = Shared.with<Audit, i32>(&audit, read)
+  let audit = run Shared<Audit>.make(Audit { trace: 0 }) |> Effect.provideMut(&mut allocator)
+  run Effect.catchAll(ordered(Shared<Audit>.clone(&audit)), recover)
+  let trace = Shared<Audit>.with<i32>(&audit, read)
   drop audit
   if trace != 12 { return trace }
   return 42
@@ -10206,7 +10234,7 @@ struct Shape { kind: Leaf | Branch }
 struct Tree { shape: Shape value: i32 counter: Shared<Counter> }
 impl Drop for Tree {
   fn drop(self: &mut Tree) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -10215,8 +10243,8 @@ fn leaf(value: i32, counter: &Shared<Counter>) -> Tree {
 }
 effect fn branch(left: Tree, right: Tree, value: i32, counter: &Shared<Counter>)
   -> Tree ! OutOfMemoryError ? &mut Allocator {
-  let boxedLeft = run Box.make<Tree>(move left)
-  let boxedRight = run Box.make<Tree>(move right)
+  let boxedLeft = run Box<Tree>.make(move left)
+  let boxedRight = run Box<Tree>.make(move right)
   return Tree {
     shape: Shape { kind: Branch { left: move boxedLeft, right: move boxedRight } },
     value: value,
@@ -10227,7 +10255,7 @@ fn total(tree: &Tree) -> i32 { return tree.value + shapeTotal(&tree.shape) }
 fn shapeTotal(shape: &Shape) -> i32 {
   return match &shape.kind {
     Leaf nothing => 0
-    Branch { left, right } => boxTotal(Box.get<Tree>(&left)) + boxTotal(Box.get<Tree>(&right))
+    Branch { left, right } => boxTotal(Box<Tree>.get(&left)) + boxTotal(Box<Tree>.get(&right))
   }
 }
 fn boxTotal(view: &[Tree]) -> i32 {
@@ -10240,11 +10268,11 @@ effect fn build(counter: &Shared<Counter>) -> Tree ! OutOfMemoryError ? &mut All
 }
 effect fn measure() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 }) |> Effect.provideMut(&mut allocator)
+  let counter = run Shared<Counter>.make(Counter { value: 0 }) |> Effect.provideMut(&mut allocator)
   let built = run build(&counter) |> Effect.provideMut(&mut allocator)
   if total(&built) != 127 { return 1 }
   drop built
-  let released = Shared.with<Counter, i32>(&counter, read)
+  let released = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if released != 7 { return 2 }
   return 42
@@ -10271,7 +10299,7 @@ struct Entry { value: i32 audit: Shared<Audit> }
 impl Drop for Entry {
   fn drop(self: &mut Entry) -> () {
     let value = self.value
-    let changed = Shared.withMut<Audit, i32>(&self.audit, record(value))
+    let changed = Shared<Audit>.withMut<i32>(&self.audit, record(value))
     return ()
   }
 }
@@ -10280,34 +10308,34 @@ fn entry(value: i32, audit: &Shared<Audit>) -> Entry {
 }
 effect fn append(values: &mut Vector<Entry>, value: i32, audit: &Shared<Audit>)
   -> () ! OutOfMemoryError ? &mut Allocator {
-  let appended = run Vector.append<Entry>(move values, entry(value, audit))
+  let appended = run Vector<Entry>.append(move values, entry(value, audit))
   return ()
 }
 effect fn measure() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<Audit>(Audit { count: 0, trace: 0 }) |> Effect.provideMut(&mut allocator)
-  let mut dropped = Vector.make<Entry>()
+  let audit = run Shared<Audit>.make(Audit { count: 0, trace: 0 }) |> Effect.provideMut(&mut allocator)
+  let mut dropped = Vector<Entry>.make()
   run append(&mut dropped, 3, &audit) |> Effect.provideMut(&mut allocator)
   run append(&mut dropped, 5, &audit) |> Effect.provideMut(&mut allocator)
   run append(&mut dropped, 7, &audit) |> Effect.provideMut(&mut allocator)
   drop dropped
-  if Shared.with<Audit, i32>(&audit, trace) != 357 { return 1 }
-  let mut replaced = Vector.make<Entry>()
+  if Shared<Audit>.with<i32>(&audit, trace) != 357 { return 1 }
+  let mut replaced = Vector<Entry>.make()
   run append(&mut replaced, 3, &audit) |> Effect.provideMut(&mut allocator)
   run append(&mut replaced, 5, &audit) |> Effect.provideMut(&mut allocator)
-  Vector.set<Entry>(&mut replaced, 0, entry(9, &audit))
-  if Shared.with<Audit, i32>(&audit, trace) != 3573 { return 2 }
+  Vector<Entry>.set(&mut replaced, 0, entry(9, &audit))
+  if Shared<Audit>.with<i32>(&audit, trace) != 3573 { return 2 }
   drop replaced
-  if Shared.with<Audit, i32>(&audit, trace) != 357395 { return 3 }
-  let mut truncated = Vector.make<Entry>()
+  if Shared<Audit>.with<i32>(&audit, trace) != 357395 { return 3 }
+  let mut truncated = Vector<Entry>.make()
   run append(&mut truncated, 3, &audit) |> Effect.provideMut(&mut allocator)
   run append(&mut truncated, 5, &audit) |> Effect.provideMut(&mut allocator)
   run append(&mut truncated, 7, &audit) |> Effect.provideMut(&mut allocator)
-  Vector.truncate<Entry>(&mut truncated, 1)
-  if Shared.with<Audit, i32>(&audit, trace) != 35739557 { return 4 }
+  Vector<Entry>.truncate(&mut truncated, 1)
+  if Shared<Audit>.with<i32>(&audit, trace) != 35739557 { return 4 }
   drop truncated
-  let finalTrace = Shared.with<Audit, i32>(&audit, trace)
-  let finalCount = Shared.with<Audit, i32>(&audit, count)
+  let finalTrace = Shared<Audit>.with<i32>(&audit, trace)
+  let finalCount = Shared<Audit>.with<i32>(&audit, count)
   drop audit
   if finalTrace != 357395573 || finalCount != 9 { return 5 }
   return 42
@@ -10330,7 +10358,7 @@ struct End {}
 struct Link { next: Box<Chain> counter: Shared<Counter> }
 impl Drop for Link {
   fn drop(self: &mut Link) -> () {
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -10339,7 +10367,7 @@ struct Chain { step: Step }
 fn stepDepth(step: &Step) -> i32 {
   return match &step.kind {
     End nothing => 0
-    Link { next, counter } => viewDepth(Box.get<Chain>(&next))
+    Link { next, counter } => viewDepth(Box<Chain>.get(&next))
   }
 }
 fn viewDepth(view: &[Chain]) -> i32 {
@@ -10351,7 +10379,7 @@ effect fn build(depth: i32, counter: &Shared<Counter>)
   let mut remaining = depth
   while remaining > 0 {
     let taken = Intrinsic.replace(current, Chain { step: Step { kind: End {} } })
-    let boxed = run Box.make<Chain>(move taken)
+    let boxed = run Box<Chain>.make(move taken)
     current = Chain { step: Step { kind: Link {
       next: move boxed,
       counter: Shared.clone(counter)
@@ -10362,11 +10390,11 @@ effect fn build(depth: i32, counter: &Shared<Counter>)
 }
 effect fn measure() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 }) |> Effect.provideMut(&mut allocator)
+  let counter = run Shared<Counter>.make(Counter { value: 0 }) |> Effect.provideMut(&mut allocator)
   let built = run build(64, &counter) |> Effect.provideMut(&mut allocator)
   if stepDepth(&built.step) != 64 { return 1 }
   drop built
-  let released = Shared.with<Counter, i32>(&counter, read)
+  let released = Shared<Counter>.with<i32>(&counter, read)
   drop counter
   if released != 64 { return 2 }
   return 42
@@ -10518,13 +10546,13 @@ import silk.effect { Effect }
 import silk.usize
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut boxed = run Box.make<i32>(20) |> Effect.provideMut(&mut allocator)
-  let borrowed = Box.get<i32>(&boxed)
+  let mut boxed = run Box<i32>.make(20) |> Effect.provideMut(&mut allocator)
+  let borrowed = Box<i32>.get(&boxed)
   if borrowed[usize.ZERO] != 20 { return 1 }
-  let mut exclusive = Box.getMut<i32>(&mut boxed)
+  let mut exclusive = Box<i32>.getMut(&mut boxed)
   exclusive[usize.ZERO] = 22
-  if Box.get<i32>(&boxed)[usize.ZERO] != 22 { return 2 }
-  let taken = Box.into<i32>(move boxed)
+  if Box<i32>.get(&boxed)[usize.ZERO] != 22 { return 2 }
+  let taken = Box<i32>.into(move boxed)
   if taken != 22 { return 3 }
   return 42
 }
@@ -10556,13 +10584,13 @@ struct Token { marker: i32 audit: Shared<Audit> }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
     let marker = self.marker
-    let count = Shared.withMut<Audit, i32>(&self.audit, dropped(marker))
+    let count = Shared<Audit>.withMut<i32>(&self.audit, dropped(marker))
     return ()
   }
 }
 fn present(value: u8, token: Token) -> Checked<u8> {
   let marker = token.marker
-  let observed = Shared.withMut<Audit, i32>(&token.audit, selected(marker))
+  let observed = Shared<Audit>.withMut<i32>(&token.audit, selected(marker))
   return Checked<u8>.Present { value: value }
 }
 fn absent() -> Checked<u8> { return Checked<u8>.Absent }
@@ -10577,7 +10605,7 @@ fn value(checked: Checked<u8>) -> i32 {
 }
 effect fn measure() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<Audit>(Audit { selected: 0, dropped: 0, sum: 0 })
+  let audit = run Shared<Audit>.make(Audit { selected: 0, dropped: 0, sum: 0 })
     |> Effect.provideMut(&mut allocator)
   let succeeded = Intrinsic.u8CheckedAdd<Checked<u8>>(
     40, 2, presentWith(Token { marker: 1, audit: Shared.clone(&audit) }), absent,
@@ -10586,9 +10614,9 @@ effect fn measure() -> i32 ! OutOfMemoryError {
     255, 1, presentWith(Token { marker: 2, audit: Shared.clone(&audit) }), absent,
   )
   if value(move succeeded) != 42 || value(move failed) != 0 { return 1 }
-  let selectedCount = Shared.with<Audit, i32>(&audit, readSelected)
-  let dropCount = Shared.with<Audit, i32>(&audit, readDropped)
-  let dropSum = Shared.with<Audit, i32>(&audit, readSum)
+  let selectedCount = Shared<Audit>.with<i32>(&audit, readSelected)
+  let dropCount = Shared<Audit>.with<i32>(&audit, readDropped)
+  let dropSum = Shared<Audit>.with<i32>(&audit, readSum)
   drop audit
   if selectedCount != 1 || dropCount != 2 || dropSum != 3 { return 2 }
   return 42
@@ -10616,7 +10644,7 @@ struct Token { marker: i32 audit: Shared<Audit> }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
     let marker = self.marker
-    let changed = Shared.withMut<Audit, i32>(&self.audit, record(marker))
+    let changed = Shared<Audit>.withMut<i32>(&self.audit, record(marker))
     return ()
   }
 }
@@ -10628,22 +10656,22 @@ effect fn failWith(audit: &Shared<Audit>) -> () ! Problem {
 }
 effect fn measure() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<Audit>(Audit { count: 0, trace: 0 })
+  let audit = run Shared<Audit>.make(Audit { count: 0, trace: 0 })
     |> Effect.provideMut(&mut allocator)
   let uncalled = consume(Token { marker: 1, audit: Shared.clone(&audit) })
   drop uncalled
-  if Shared.with<Audit, i32>(&audit, trace) != 1 { return 1 }
+  if Shared<Audit>.with<i32>(&audit, trace) != 1 { return 1 }
   let called = consume(Token { marker: 2, audit: Shared.clone(&audit) })
   if called(40) != 42 { return 2 }
-  if Shared.with<Audit, i32>(&audit, trace) != 12 { return 3 }
+  if Shared<Audit>.with<i32>(&audit, trace) != 12 { return 3 }
   let moved = consume(Token { marker: 3, audit: Shared.clone(&audit) })
   let holder = Holder { step: move moved }
   drop holder
-  if Shared.with<Audit, i32>(&audit, trace) != 123 { return 4 }
+  if Shared<Audit>.with<i32>(&audit, trace) != 123 { return 4 }
   let failure = run Effect.result(failWith(&audit))
   drop failure
-  let finalTrace = Shared.with<Audit, i32>(&audit, trace)
-  let finalCount = Shared.with<Audit, i32>(&audit, count)
+  let finalTrace = Shared<Audit>.with<i32>(&audit, trace)
+  let finalCount = Shared<Audit>.with<i32>(&audit, count)
   drop audit
   if finalTrace != 1234 || finalCount != 4 { return 5 }
   return 42
@@ -10826,11 +10854,11 @@ fn digits(log: &Log) -> i32 { return log.digits }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () {
     let id = self.id
-    let written = Shared.withMut<Log, i32>(&self.log, append(id))
+    let written = Shared<Log>.withMut<i32>(&self.log, append(id))
     return ()
   }
 }
-fn token(id: i32, log: &Shared<Log>) -> Token { return Token { id: id, log: Shared.clone<Log>(log) } }
+fn token(id: i32, log: &Shared<Log>) -> Token { return Token { id: id, log: Shared<Log>.clone(log) } }
 effect fn hold(owned: Token, value: i32) -> i32 {
   let kept = token(2, &owned.log)
   let next = run Effect.suspend(effect { return value + 1 })
@@ -10846,9 +10874,9 @@ effect fn relay(log: &Shared<Log>) -> i32 {
 }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let log = run Shared.make<Log>(Log { digits: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let log = run Shared<Log>.make(Log { digits: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
   let result = run relay(&log)
-  let order = Shared.with<Log, i32>(&log, digits)
+  let order = Shared<Log>.with<i32>(&log, digits)
   if result != 9 { return 1 }
   if order != 3214 { return 2 }
   return 42
@@ -11532,9 +11560,9 @@ fn nested(value: ${outerReference}, alias: Shared<Counter>) -> i32 {
 }
 effect fn conflictCase() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let first = run (Shared.make<Counter>(Counter { value: 41 })
+  let first = run (Shared<Counter>.make(Counter { value: 41 })
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let alias = Shared.clone<Counter>(&first)
+  let alias = Shared<Counter>.clone(&first)
   return Shared.${outer}<Counter, i32>(&first, nested(move alias))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
@@ -11563,16 +11591,16 @@ fn apply<T, F: once fn(&mut T) -> () + Intrinsic.NonParking>(value: &mut T, use:
 }
 
 effect fn exercise() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let retained = run Shared.make<Bytes>(run Bytes.copy(b"retained"))
-  let mut first = run Shared.make<Result<Answer, Rejection>>(
-    Result.succeed<Answer, Rejection>(Answer {
+  let retained = run Shared<Bytes>.make(run Bytes.copy(b"retained"))
+  let mut first = run Shared<Result<Answer, Rejection>>.make(
+    Result<Answer, Rejection>.succeed(Answer {
       marker: run Bytes.copy(b"marker"),
       retained: move retained,
     }),
   )
-  let mut completed = Shared.clone<Result<Answer, Rejection>>(&first)
+  let mut completed = Shared<Result<Answer, Rejection>>.clone(&first)
   apply(&mut first, fn(entry: &mut Shared<Result<Answer, Rejection>>) -> () {
-      completed = Shared.clone<Result<Answer, Rejection>>(&entry.*)
+      completed = Shared<Result<Answer, Rejection>>.clone(&entry.*)
       return ()
     })
   drop completed
@@ -11613,10 +11641,10 @@ effect fn useCell() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let storage = run (Allocator.allocate(Layout.of<i32>())
     |> Effect.provideMut<Allocator>(&mut allocator))
-  let mailbox = run (Shared.make<Mailbox>(Mailbox {
+  let mailbox = run (Shared<Mailbox>.make(Mailbox {
     state: Token { storage: move storage }
   }) |> Effect.provideMut<Allocator>(&mut allocator))
-  let token = Shared.withMut<Mailbox, Empty | Token>(&mailbox, take)
+  let token = Shared<Mailbox>.withMut<Empty | Token>(&mailbox, take)
   drop mailbox
   return consume(move token)
 }
@@ -11664,7 +11692,7 @@ effect fn construct() -> i32 ! OutOfMemoryError {
     |> Effect.provideMut<Allocator>(&mut system))
   let token = Token { storage: move payload }
   let mut exhausted = Exhausted {}
-  let shared = run (Shared.make<Token>(move token)
+  let shared = run (Shared<Token>.make(move token)
     |> Effect.provideMut<Allocator>(&mut exhausted))
   drop shared
   return 0
@@ -11931,7 +11959,7 @@ struct Guard { left: i8 right: i8 storage: Allocation counter: Shared<Counter> }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
     if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
-    let changed = Shared.withMut<Counter, i32>(&self.counter, increment)
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
     return ()
   }
 }
@@ -11953,18 +11981,18 @@ effect fn packaged(counter: &Shared<Counter>) -> i32 ! OutOfMemoryError ? &mut A
     marker: i8.toI8(7),
     guard: Guard {
       left: i8.toI8(19), right: i8.toI8(23), storage: move storage,
-      counter: Shared.clone<Counter>(counter),
+      counter: Shared<Counter>.clone(counter),
     },
   }
   let execution = run Execution.make(effect { return 42 }, (), ready)
   let driven = run Execution.drive(move execution, (), complete, suspendWith(move choice))
-  let count = Shared.with<Counter, i32>(counter, read)
+  let count = Shared<Counter>.with<i32>(counter, read)
   if count != 1 { return 1 }
   return 42
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let counter = run Shared.make<Counter>(Counter { value: 0 })
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let result = run packaged(&counter) |> Effect.provideMut<Allocator>(&mut allocator)
   drop counter

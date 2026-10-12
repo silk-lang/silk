@@ -47,7 +47,7 @@ struct Provider<H> {}
 impl<H> Dispatch<H> for Provider<H> {
   effect<'env> fn with<'env>(self: &mut Self, handler: H) -> i32 { drop handler return 5 }
 }
-effect fn useDispatch() -> i32 ? &mut Dispatch<i32> { return run Dispatch.with<i32>(5) }
+effect fn useDispatch() -> i32 ? &mut Dispatch<i32> { return run Dispatch<i32>.with(5) }
 pub fn main() -> i32 {
   let mut provider = Provider<i32> {}
   return run useDispatch() |> Effect.provideMut<Dispatch<i32>>(&mut provider)

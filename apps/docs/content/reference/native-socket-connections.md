@@ -26,7 +26,7 @@ effect fn sendRequest(connection: &mut Connection) -> ()
 ? &mut MonotonicClock {
   let accepted = run ByteDuplex.writeSome(
     b"status\n",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   drop accepted
   return ()
@@ -38,7 +38,7 @@ pub effect fn notifyLocalAgent() -> ()
   return run connectUnix(
     b"/tmp/local-agent.sock",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     sendRequest,
   )
 }
@@ -60,7 +60,7 @@ filesystem pathname.
 one millisecond. `ConnectOptions.make` admits intervals from 1 through 1,000,000,000 nanoseconds and
 attempt counts from 1 through 1024. `connectResolved` receives already-resolved numeric endpoints;
 DNS is deliberately outside its deadline. One supplied absolute deadline covers setup and every
-candidate without renewal. `Option.none<Instant>()` permits a pending operation to wait indefinitely,
+candidate without renewal. `Option<Instant>.none()` permits a pending operation to wait indefinitely,
 subject to the active `MonotonicClock` provider.
 
 Readiness uses zero-time `poll` followed by a positive clock wait, so a local scheduler can run peer

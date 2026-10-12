@@ -257,21 +257,21 @@ effect fn selectionMatrixProbe() -> i32 ! OutOfMemoryError ? &mut Allocator {
 
 effect fn decoderFor(input: &[u8], limits: Limits) -> Option<Decoder> ! OutOfMemoryError ? &mut Allocator {
   let parsed = match move (run parseRequest(input, headLimits())) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => value
   }
   let selection = match move selectRequest(head, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
-    Result.Failure {error} => Option.none<Decoder>()
-    Result.Success {value} => Option.some<Decoder>(move value)
+    Result.Failure {error} => Option<Decoder>.none()
+    Result.Success {value} => Option<Decoder>.some(move value)
   }
 }
 
@@ -281,25 +281,25 @@ effect fn decoderForResponse(
   limits: Limits,
 ) -> Option<Decoder> ! OutOfMemoryError ? &mut Allocator {
   let method = match move Method.parse(methodText, 16) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => value
   }
   let parsed = match move (run parseResponse(input, headLimits())) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let head = match move ResponseParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => value
   }
   let selection = match move selectResponse(head, &method, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
-    Result.Failure {error} => Option.none<Decoder>()
-    Result.Success {value} => Option.some<Decoder>(move value)
+    Result.Failure {error} => Option<Decoder>.none()
+    Result.Success {value} => Option<Decoder>.some(move value)
   }
 }
 
@@ -309,41 +309,41 @@ effect fn decoderForHeadPolicy<'names>(
   policy: TrailerPolicy<'names>,
 ) -> Option<Decoder> ! OutOfMemoryError ? &mut Allocator {
   let parsed = match move (run parseRequest(input, headLimits())) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => value
   }
   let selection = match move selectRequest(head, policy) {
-    Result.Failure {error} => { return Option.none<Decoder>() }
+    Result.Failure {error} => { return Option<Decoder>.none() }
     Result.Success {value} => move value
   }
   let made = run Decoder.make(move selection, limits, policy)
   return match move made {
-    Result.Failure {error} => Option.none<Decoder>()
-    Result.Success {value} => Option.some<Decoder>(move value)
+    Result.Failure {error} => Option<Decoder>.none()
+    Result.Success {value} => Option<Decoder>.some(move value)
   }
 }
 
 effect fn encoderFor(input: &[u8]) -> Option<Encoder> ! OutOfMemoryError ? &mut Allocator {
   let parsed = match move (run parseRequest(input, headLimits())) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => value
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => move value
   }
   let made = run Encoder.make(move selection, bodyLimits(), TrailerPolicy.defaultPolicy())
   return match move made {
-    Result.Failure {error} => Option.none<Encoder>()
-    Result.Success {value} => Option.some<Encoder>(move value)
+    Result.Failure {error} => Option<Encoder>.none()
+    Result.Success {value} => Option<Encoder>.some(move value)
   }
 }
 
@@ -352,21 +352,21 @@ effect fn encoderForLimits(
   limits: Limits,
 ) -> Option<Encoder> ! OutOfMemoryError ? &mut Allocator {
   let parsed = match move (run parseRequest(input, headLimits())) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => value
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.none<Encoder>() }
+    Result.Failure {error} => { return Option<Encoder>.none() }
     Result.Success {value} => move value
   }
   let made = run Encoder.make(move selection, limits, TrailerPolicy.defaultPolicy())
   return match move made {
-    Result.Failure {error} => Option.none<Encoder>()
-    Result.Success {value} => Option.some<Encoder>(move value)
+    Result.Failure {error} => Option<Encoder>.none()
+    Result.Success {value} => Option<Encoder>.some(move value)
   }
 }
 
@@ -375,7 +375,7 @@ effect fn encoderForResponse(
   methodText: string,
 ) -> Result<Encoder, BodyError> ! OutOfMemoryError ? &mut Allocator {
   let method = match move Method.parse(methodText, 16) {
-    Result.Failure {error} => { return Result.failResult<Encoder, BodyError>(BodyError {
+    Result.Failure {error} => { return Result<Encoder, BodyError>.failResult(BodyError {
       reason: BodyReason.InvalidState,
       component: BodyComponent.Encoder,
       wireOffset: u64.MIN,
@@ -383,12 +383,12 @@ effect fn encoderForResponse(
       written: usize.ZERO,
       totalWire: u64.MIN,
       totalPayload: u64.MIN,
-      fieldIndex: Option.none<usize>(),
+      fieldIndex: Option<usize>.none(),
     }) }
     Result.Success {value} => value
   }
   let parsed = match move (run parseResponse(input, headLimits())) {
-    Result.Failure {error} => { return Result.failResult<Encoder, BodyError>(BodyError {
+    Result.Failure {error} => { return Result<Encoder, BodyError>.failResult(BodyError {
       reason: BodyReason.InvalidState,
       component: BodyComponent.Encoder,
       wireOffset: u64.MIN,
@@ -396,12 +396,12 @@ effect fn encoderForResponse(
       written: usize.ZERO,
       totalWire: u64.MIN,
       totalPayload: u64.MIN,
-      fieldIndex: Option.none<usize>(),
+      fieldIndex: Option<usize>.none(),
     }) }
     Result.Success {value} => move value
   }
   let head = match move ResponseParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Result.failResult<Encoder, BodyError>(BodyError {
+    Result.Failure {error} => { return Result<Encoder, BodyError>.failResult(BodyError {
       reason: BodyReason.InvalidState,
       component: BodyComponent.Encoder,
       wireOffset: u64.MIN,
@@ -409,7 +409,7 @@ effect fn encoderForResponse(
       written: usize.ZERO,
       totalWire: u64.MIN,
       totalPayload: u64.MIN,
-      fieldIndex: Option.none<usize>(),
+      fieldIndex: Option<usize>.none(),
     }) }
     Result.Success {value} => value
   }
@@ -418,7 +418,7 @@ effect fn encoderForResponse(
     &method,
     TrailerPolicy.defaultPolicy(),
   ) {
-    Result.Failure {error} => { return Result.failResult<Encoder, BodyError>(move error) }
+    Result.Failure {error} => { return Result<Encoder, BodyError>.failResult(move error) }
     Result.Success {value} => move value
   }
   return run Encoder.make(
@@ -433,15 +433,15 @@ effect fn decoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     b"POST / HTTP/1.1\\r\\nHost: example.com\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n",
     headLimits(),
   )) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => value
   }
   let selection = match move selectRequest(head, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.some<BodyError>(move error) }
+    Result.Failure {error} => { return Option<BodyError>.some(move error) }
     Result.Success {value} => move value
   }
   return match move (run Decoder.make(
@@ -449,8 +449,8 @@ effect fn decoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     limits,
     TrailerPolicy.defaultPolicy(),
   )) {
-    Result.Success {value} => Option.none<BodyError>()
-    Result.Failure {error} => Option.some<BodyError>(move error)
+    Result.Success {value} => Option<BodyError>.none()
+    Result.Failure {error} => Option<BodyError>.some(move error)
   }
 }
 
@@ -459,15 +459,15 @@ effect fn encoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     b"POST / HTTP/1.1\\r\\nHost: example.com\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n",
     headLimits(),
   )) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => move value
   }
   let head = match move RequestParser.head(&parsed.parser) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => value
   }
   let selection = match move validateOutgoingRequest(head, TrailerPolicy.defaultPolicy()) {
-    Result.Failure {error} => { return Option.some<BodyError>(move error) }
+    Result.Failure {error} => { return Option<BodyError>.some(move error) }
     Result.Success {value} => move value
   }
   return match move (run Encoder.make(
@@ -475,8 +475,8 @@ effect fn encoderMakeError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     limits,
     TrailerPolicy.defaultPolicy(),
   )) {
-    Result.Success {value} => Option.none<BodyError>()
-    Result.Failure {error} => Option.some<BodyError>(move error)
+    Result.Success {value} => Option<BodyError>.none()
+    Result.Failure {error} => Option<BodyError>.some(move error)
   }
 }
 
@@ -535,7 +535,7 @@ effect fn trailerStepError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     limits,
   )
   let mut decoder = match move made {
-    Option.None => { return Option.none<BodyError>() }
+    Option.None => { return Option<BodyError>.none() }
     Option.Some {value} => move value
   }
   let mut output: [u8; 0] = []
@@ -545,8 +545,8 @@ effect fn trailerStepError(limits: Limits) -> Option<BodyError> ! OutOfMemoryErr
     &mut output,
     false,
   ) {
-    Result.Success {value} => Option.none<BodyError>()
-    Result.Failure {error} => Option.some<BodyError>(move error)
+    Result.Success {value} => Option<BodyError>.none()
+    Result.Failure {error} => Option<BodyError>.some(move error)
   }
 }
 
@@ -559,7 +559,7 @@ effect fn chunkStepError(
     limits,
   )
   let mut decoder = match move made {
-    Option.None => { return Option.none<BodyError>() }
+    Option.None => { return Option<BodyError>.none() }
     Option.Some {value} => move value
   }
   let mut output: [u8; 16] = [
@@ -567,8 +567,8 @@ effect fn chunkStepError(
     165, 165, 165, 165, 165, 165, 165, 165,
   ]
   return match move Decoder.step(&mut decoder, body, &mut output, false) {
-    Result.Success {value} => Option.none<BodyError>()
-    Result.Failure {error} => Option.some<BodyError>(move error)
+    Result.Success {value} => Option<BodyError>.none()
+    Result.Failure {error} => Option<BodyError>.some(move error)
   }
 }
 
@@ -1577,21 +1577,21 @@ effect fn encoderFinishError(limits: Limits) -> Option<BodyError> ! OutOfMemoryE
     limits,
   )
   let mut encoder = match move made {
-    Option.None => { return Option.none<BodyError>() }
+    Option.None => { return Option<BodyError>.none() }
     Option.Some {value} => move value
   }
   let field = match move Header.make("Content-Digest", b"abc", valueLimits()) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => value
   }
   let entries = [field]
   let trailers = match move Headers.make(&entries, valueLimits()) {
-    Result.Failure {error} => { return Option.none<BodyError>() }
+    Result.Failure {error} => { return Option<BodyError>.none() }
     Result.Success {value} => value
   }
   return match move Encoder.beginFinish(&mut encoder, &trailers) {
-    Result.Success {value} => Option.none<BodyError>()
-    Result.Failure {error} => Option.some<BodyError>(move error)
+    Result.Success {value} => Option<BodyError>.none()
+    Result.Failure {error} => Option<BodyError>.some(move error)
   }
 }
 
