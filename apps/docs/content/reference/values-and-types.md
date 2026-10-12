@@ -145,10 +145,11 @@ fields `SEM0025`, array elements `SEM0030`, assignments `SEM0037`, and incompati
 
 **Status:** Confirmed
 
-`type Name = Target` declares a module-level name for one existing type or one interface
-application. `pub type` publishes the name like any other declaration. The target is anything the
-use site could spell directly: a primitive or nominal type, an applied generic such as `Point<i32>`,
-a union, a reference type, or an interface.
+`type Name = Target` declares a module-level name for one existing type, one interface
+application, or one unapplied generic declaration. `pub type` publishes the name like any other
+declaration. The target is anything the use site could spell directly: a primitive or nominal type,
+an applied generic such as `Point<i32>`, a union, a reference type, an interface, or the bare name of
+a generic struct, union, enum or interface.
 
 ```silk
 interface Measured {
@@ -190,6 +191,20 @@ fn sum<T: AddInt>(left: T, right: i32) -> i32 {
 }
 ```
 
+An alias of an unapplied generic declaration takes its arguments at each use site, exactly as the
+target's own name does. `Add<i32, i32>` below denotes `silk.ops.Add<i32, i32>`, and a use that
+omits or miscounts the arguments receives the target's ordinary arity diagnostic at that use:
+
+```silk
+import silk.ops
+
+type Add = ops.Add
+
+fn sum<T: Add<i32, i32>>(left: T, right: i32) -> i32 {
+  return move left + right
+}
+```
+
 An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
 in a generic parameter list, the interface of an `impl` head, and the qualifier of a static member
 or interface operation call. A type alias cannot stand where only an interface is valid, and an
@@ -211,16 +226,19 @@ It does not alias, import, shadow or extend the `Intrinsic` namespace (INTR-001)
 privilege the member's own contract does not already give.
 
 **Boundary:** An alias is not a new type: it cannot carry its own conformances, fields or inherent
-members distinct from its target. An alias is not generic; alias an applied type instead. An
-interface alias names one interface application, not a bound set: `type Both = A + B` is invalid.
+members distinct from its target. An alias declares no type parameters of its own: it either fixes
+every argument (`type Pair = Point<i32>`, which accepts no further arguments) or fixes none
+(`type Pointed = Point`, which takes the target's full argument list at each use). An interface alias
+names one interface, not a bound set: `type Both = A + B` is invalid.
 Union aliases in failure rows (typed failures) are this same rule.
 
 **Diagnostics:** A target that is not visible at the alias declaration receives the existing
 unresolved-name diagnostic at the target spelling. A cyclic alias reports `SEM0183` at each member
 of the cycle. Alias type parameters report `SEM0184` at the parameter list. An alias used in a
 position of the wrong kind receives that position's existing wrong-kind diagnostic, citing the alias
-origin. `type Both = A + B` receives the parser diagnostic `PAR0002` at the first `+`, because a
-bound list is valid only in a generic parameter list.
+origin. An unapplied generic alias used with missing or extra arguments receives the target's
+type-argument arity diagnostic at the use. `type Both = A + B` receives one parser diagnostic,
+`PAR0002`, spanning the `+ B` tail, because a bound list is valid only in a generic parameter list.
 
 **Evidence:** [alias resolution](../../../../packages/compiler/src/NameResolution.ts),
 [alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).

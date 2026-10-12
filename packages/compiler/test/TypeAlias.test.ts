@@ -300,3 +300,34 @@ pub fn main() -> i32 { return ${qualifier}.combine(Tag { value: 1 }, true) }`
     assert.deepEqual(codes(aliased), [Diagnostic.argumentTypeMismatchCode])
   }),
 )
+
+it.effect('applies use-site arguments to an alias of an unapplied generic declaration', () =>
+  Effect.gen(function* () {
+    const source = `interface Combine<Right, Output> {
+  fn combine(left: Self, right: Right) -> Output
+}
+struct Point<T> { x: T y: T }
+type Combining = Combine
+type Pointed = Point
+struct Tag { value: i32 }
+impl Tag { fn tagCombine(left: Tag, right: i32) -> i32 { return left.value + right } }
+impl Combining<i32, i32> for Tag { combine: Tag.tagCombine }
+fn bounded<T: Combining<i32, i32>>(value: T) -> i32 { return Combining<i32, i32>.combine(move value, 1) }
+fn first(point: Pointed<i32>) -> i32 { return point.x }
+fn bare(point: Pointed) -> i32 { return 0 }
+fn extra(point: Pointed<i32, i32>) -> i32 { return 0 }
+pub fn main() -> i32 {
+  return bounded(Tag { value: 1 }) + first(Pointed<i32> { x: 2, y: 3 }) + Combining.combine(Tag { value: 4 }, 5)
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Pointed) ->')],
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Pointed<i32, i32>')],
+      ],
+      Json.stringify(messages(self)),
+    )
+    assert.strictEqual(memberType(self, 'root', 'first'), 'root.Point<i32>')
+  }),
+)
