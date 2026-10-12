@@ -19,15 +19,74 @@ permissions:
   actions: read
 
 concurrency:
-  group: selfhost-${{ github.event.pull_request.number || github.ref }}
-  # A newer PR head supersedes the old one. Pushes to a branch finish instead, so the branch's
-  # full shard run completes; GitHub keeps only the newest pending run behind the running one.
+  # A newer PR head supersedes the old one. Every selfhost push gets its own group, so no merge's
+  # run is replaced while it waits; a push whose tree a green PR run already tested reuses it.
+  group: selfhost-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A selfhost merge usually has exactly the tree its PR's last green run tested (the coordinator
+  # merges selfhost into a PR and gets it green right before merging). A push or dispatch on a merge
+  # commit whose full tree equals the tree a fully green pull_request run of its second parent
+  # checked out reuses that run's verdict and N2 instead of running the gate again. Anything else,
+  # including a missing or unverifiable artifact, runs the full gate.
+  reuse:
+    name: Reuse a green PR run of the same tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      reused: ${{ steps.find.outputs.reused }}
+      run-id: ${{ steps.find.outputs.run-id }}
+      n1-sha256: ${{ steps.find.outputs.n1-sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - name: Find a fully green PR run that tested this tree
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          full() {
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+            printf '### Full gate\n%s\n\nTree `%s`.\n' "$1" "$tree" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          [ "$EVENT" = pull_request ] && full 'Pull request runs always run the full gate.'
+          head=$(git rev-parse --verify --quiet 'HEAD^2') || full 'HEAD is not a merge commit.'
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/selfhost.yml/runs?event=pull_request&head_sha=$head&per_page=20" \
+            --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')
+          for id in $runs; do
+            dir="$RUNNER_TEMP/reuse-$id"
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selfhost-tested-tree --dir "$dir/tree" 2> /dev/null || continue
+            [ "$(cat "$dir/tree/tree")" = "$tree" ] || continue
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selfhost-native-candidate --dir "$dir/candidate" 2> /dev/null || continue
+            cd "$dir/candidate"
+            sha=$(sha256sum silk-compiler-x86_64-unknown-linux-gnu | cut -d' ' -f1)
+            if [ "$sha" = "$(jq -er .seed.sha256 native-seed.json)" ] && [ "$sha" = "$(jq -er .output.sha256 chain-receipt.json)" ] \
+                && [ "$(jq -er .fixpoint.producerIrSha256 chain-receipt.json)" = "$(jq -er .fixpoint.outputIrSha256 chain-receipt.json)" ]; then
+              url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+              {
+                echo "reused=true"
+                echo "run-id=$id"
+                echo "n1-sha256=$(jq -er .producer.sha256 chain-receipt.json)"
+              } >> "$GITHUB_OUTPUT"
+              printf '### Reused a green PR run\nRun [%s](%s) tested PR head `%s` with the same tree `%s`. Its verdict and N2 `%s` stand for this commit; the gate jobs are skipped.\n' \
+                "$id" "$url" "$head" "$tree" "$sha" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            cd "$GITHUB_WORKSPACE"
+          done
+          full "No fully green pull_request run of \`$head\` has this tree and a verifiable N2."
+
   # The pinned seed builds N1 from the exact committed inputs. See compiler/docs/native-seed-chain.md.
   native-n1:
     name: Native N1 from pinned seed
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
@@ -91,6 +150,17 @@ jobs:
         with:
           name: selfhost-native-n1
           path: ${{ runner.temp }}/n1/N1
+          if-no-files-found: error
+          retention-days: 7
+      # A pull_request run checks out refs/pull/N/merge; a later push of that tree may reuse the run.
+      - name: Record the tested tree
+        run: |
+          mkdir "$RUNNER_TEMP/tested-tree"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/tested-tree/tree"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-tested-tree
+          path: ${{ runner.temp }}/tested-tree/tree
           if-no-files-found: error
           retention-days: 7
       - name: Preserve N1 receipts and logs
@@ -405,8 +475,10 @@ jobs:
   # pushes and manual dispatches only, which keeps PR latency and macOS runner minutes down.
   macos-ir:
     name: macOS arm64 compiler IR from N1
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    needs: native-n1
+    if: >-
+      !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (needs.native-n1.result == 'success' || needs.reuse.outputs.reused == 'true')
+    needs: [reuse, native-n1]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -415,13 +487,22 @@ jobs:
         with:
           node-version: 24
       - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused != 'true'
         with:
           name: selfhost-native-n1
           path: ${{ runner.temp }}/n1-download
+      # A reused tree has no N1 of its own; the reused run's N1 is the one its N2 receipt names.
+      - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused == 'true'
+        with:
+          name: selfhost-native-n1
+          path: ${{ runner.temp }}/n1-download
+          run-id: ${{ needs.reuse.outputs.run-id }}
+          github-token: ${{ github.token }}
       - name: Cross-emit the compiler for aarch64-apple-darwin
         working-directory: compiler
         env:
-          N1_SHA256: ${{ needs.native-n1.outputs.sha256 }}
+          N1_SHA256: ${{ needs.native-n1.outputs.sha256 || needs.reuse.outputs.n1-sha256 }}
         run: |
           set -euo pipefail
           install -D -m 0555 "$RUNNER_TEMP/n1-download/N1" "$RUNNER_TEMP/compilers/N1"
@@ -442,6 +523,8 @@ jobs:
 
   macos:
     name: macOS arm64 native chain and corpus
+    # A reused tree skips native-n1 upstream of macos-ir; an implicit success() would skip this too.
+    if: ${{ !cancelled() && needs.macos-ir.result == 'success' }}
     needs: macos-ir
     runs-on: macos-15
     timeout-minutes: 60
@@ -514,20 +597,43 @@ jobs:
   # to compiler/native-seed.json makes a candidate the pinned seed.
   publish-seed:
     name: Publish native seed candidate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/selfhost'
-    needs: [native-fixpoint, corpus, native-cases]
+    if: >-
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/selfhost'
+      && (needs.reuse.outputs.reused == 'true' || (needs.native-fixpoint.result == 'success'
+      && needs.corpus.result == 'success' && needs.native-cases.result == 'success'))
+    needs: [reuse, native-fixpoint, corpus, native-cases]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused != 'true'
         with:
           name: selfhost-native-candidate
           path: ${{ runner.temp }}/candidate
+      - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused == 'true'
+        with:
+          name: selfhost-native-candidate
+          path: ${{ runner.temp }}/candidate
+          run-id: ${{ needs.reuse.outputs.run-id }}
+          github-token: ${{ github.token }}
+      # The reused N2 was built from this exact tree under the PR's merge ref; the pin names this commit.
+      - name: Name this commit in the reused pin
+        if: needs.reuse.outputs.reused == 'true'
+        working-directory: ${{ runner.temp }}/candidate
+        run: |
+          set -euo pipefail
+          jq --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            '.seed.tag = "native-seed-" + $sha | .seed.sourceCommit = $sha | .seed.runId = $run' \
+            native-seed.json > pin.json
+          mv pin.json native-seed.json
       - name: Create the immutable candidate release
         working-directory: ${{ runner.temp }}/candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSED_RUN: ${{ needs.reuse.outputs.run-id }}
         run: |
           set -euo pipefail
           asset=silk-compiler-x86_64-unknown-linux-gnu
@@ -543,7 +649,7 @@ jobs:
           else
             gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --prerelease --title "Native seed candidate ${GITHUB_SHA:0:12}" \
-              --notes "N2 of selfhost $GITHUB_SHA (run $GITHUB_RUN_ID), at an N1/N2 compiler IR fixpoint. To pin it, commit native-seed.json as compiler/native-seed.json."
+              --notes "N2 of selfhost $GITHUB_SHA (run $GITHUB_RUN_ID${REUSED_RUN:+, reusing the N2 of PR run $REUSED_RUN, which tested the same tree}), at an N1/N2 compiler IR fixpoint. To pin it, commit native-seed.json as compiler/native-seed.json."
           fi
           {
             echo "### Native seed candidate"
@@ -553,20 +659,25 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The required check: green only when every shard is green.
+  # The required check: green only when every shard is green, or when the run reused a fully green
+  # PR run of the same tree.
   silk:
     name: Focused Linux Silk
     if: always()
-    needs: [native-fixpoint, corpus, native-cases]
+    needs: [reuse, native-fixpoint, corpus, native-cases]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every shard
         env:
+          REUSE: ${{ needs.reuse.result }}
+          REUSED: ${{ needs.reuse.outputs.reused }}
           CHAIN: ${{ needs.native-fixpoint.result }}
           CORPUS: ${{ needs.corpus.result }}
           NATIVE_CASES: ${{ needs.native-cases.result }}
         run: |
-          echo "chain=$CHAIN corpus=$CORPUS native-cases=$NATIVE_CASES"
+          echo "reuse=$REUSE reused=$REUSED chain=$CHAIN corpus=$CORPUS native-cases=$NATIVE_CASES"
+          test "$REUSE" = success
+          if [ "$REUSED" = true ]; then exit 0; fi
           # One test per line: under `bash -e` a failing test before the last `&&` does not end the step.
           test "$CHAIN" = success
           test "$CORPUS" = success

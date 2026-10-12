@@ -338,6 +338,16 @@ resolution, run the focused native checks below, and target the synchronization 
 bootstrap patch stream or reset `selfhost` onto another history. Update native feature branches
 from the synchronized `selfhost` tip as needed.
 
+### The native seed pin
+
+`compiler/native-seed.json` names the published native compiler that builds N1 (see
+[the native seed chain](docs/native-seed-chain.md)). Advance it weekly, and immediately after any
+soundness or code generation fix that N1 must not be built without. Pin only a candidate whose
+`selfhost` push run summary says **Full gate**; never pin a candidate published from a run that
+reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a pull request to
+`selfhost`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
+the corpus.
+
 For each bootstrap build, record the `selfhost` commit, the downloaded main compiler commit and CI
 run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified
 `silk-bootstrap` artifact using `.github/actions/download-bootstrap` and records its provenance in

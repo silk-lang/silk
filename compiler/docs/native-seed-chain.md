@@ -83,6 +83,19 @@ N1 and N2 are compiled from the same source by different compilers, so identical
 seed and N1 agree on the meaning of the compiler. A change to code generation still reaches a
 fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
+### Reusing a pull request run
+
+Every `selfhost` push runs in its own concurrency group, so no merge's run is replaced while it
+waits. A pull request run records the full Git tree it tested (`refs/pull/N/merge`). The first job
+of a push or dispatch, **Reuse a green PR run of the same tree**, looks for a completed, fully green
+pull request run of the merge commit's second parent whose recorded tree equals `HEAD^{tree}` and
+whose N2 artifact verifies by SHA-256 against its pin and receipt. When it finds one, the gate jobs
+are skipped, the required check passes on that verdict, the macOS leg runs from the reused run's
+N1, and publication uses the reused N2: its pin names the push commit, while its
+`chain-receipt.json` still names the pull request merge ref that N2 was built from, whose tree is
+identical. The run summary names the reused run. Otherwise, including an expired or unverifiable
+artifact, the full gate runs.
+
 ## Publication
 
 A successful `selfhost` push run (every job above green) runs **Publish native seed candidate**. It
