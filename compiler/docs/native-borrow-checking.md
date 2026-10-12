@@ -298,10 +298,11 @@ cover first:
 - `regions`: loans and moves are proved; region and contents obligations wait for slice 3.
 - `effects`, `patterns`, `storage`: the body uses that form, which the loan and move walk does
   not enter yet.
-- `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
-  reference.
+- `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
+  place that is not rooted in a local.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
-  replacement, or a loan a retaining result carries approximately. It is an unchecked status: such
+  replacement, a loan a retaining result carries approximately, or a move of a reference whose
+  referent is reborrowed. It is an unchecked status: such
   a body is never `FullyChecked`, counts in the baseline like any other reason, and a rise in it
   fails the corpus guard like a rise in any reason. Not rejecting a body never means accepting it
   as checked.
