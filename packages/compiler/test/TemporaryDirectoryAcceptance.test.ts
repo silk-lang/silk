@@ -102,8 +102,16 @@ effect fn releasesScopes() -> i32 ! FileError | OutOfMemoryError | HostInputErro
     &mut allocator
   )
 
-  // Two makes, two paths.
-  if Path.view(&first.path) == Path.view(&second.path) { return 1 }
+  // Two makes, two paths. Both are built from UTF-8 text, so each has a text view.
+  let firstView = match move Path.view(&first.path) {
+    Option<string>.Some {value} => value
+    Option<string>.None => { return 3 }
+  }
+  let secondView = match move Path.view(&second.path) {
+    Option<string>.Some {value} => value
+    Option<string>.None => { return 3 }
+  }
+  if firstView == secondView { return 1 }
 
   // The made directory is there.
   if run Intrinsic.bindRequirementMut(FileSystem.exists(&first.path), &mut fs) {} else { return 2 }
