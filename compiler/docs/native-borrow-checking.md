@@ -302,8 +302,8 @@ cover first:
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local. One such form must reject rather than stay unchecked: a
-  view of a temporary receiver bound past its statement, such as `let left = make().left()`, is
-  `SEM0056` under CALL-003 ("binding a borrowed temporary"). The native compiler accepts it today
+  view of a temporary receiver used past its statement, such as `let left = make().left()`, is
+  OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
   and counts the body here; the slice that lifts these exits rejects it.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
