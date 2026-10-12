@@ -89,7 +89,7 @@ const classify = (text) => {
     const next = all[index + 1]?.text
     if (previous === '.' || next === '.') continue
     if (previous !== undefined && declarers.has(previous)) return { conflict: `declares ${token.text}` }
-    if (previous === '<' || previous === ',' || previous === '{') {
+    if (previous === '<' || previous === ',' || previous === '{' || previous === '(') {
       const opener = enclosing(all, index)
       if (opener?.text === '<') return { conflict: `binds ${token.text}` }
       if (opener?.text === '{' && all[statementStart(all, opener.index)]?.text === 'import')
@@ -185,7 +185,8 @@ const migrateFences = (text, prefix, report) => {
   return output.join('\n')
 }
 
-const declarationLine = /(^|\n|\\n)\s*(pub\s+)?(fn|struct|impl|enum|interface|union|type|effect|test|service|import)\b/
+const declarationLine =
+  /(^|\n|\\n)\s*(pub\s+)?(fn|struct|impl|enum|interface|union|type|effect|test|service|import)[\s<]/
 
 // Finds the content span of every TypeScript string and template literal, skipping comments. A
 // template is one span, interpolations included, so a program assembled around `${...}` stays one
