@@ -116,7 +116,7 @@ effect fn second() -> Payload ! SecondFailure ? &mut Input {
   return Payload { value: value }
 }
 effect fn append() -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut values = Vector.make<i32>()
+  let mut values = Vector<i32>.make()
   run Vector.append(&mut values, 42)
   drop values
   return ()
