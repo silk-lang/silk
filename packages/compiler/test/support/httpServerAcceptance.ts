@@ -192,13 +192,13 @@ effect fn providerFor(inputBytes: &[u8], writeCount: usize) -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let input = run Bytes.copy(inputBytes)
-  let mut reads = Vector.make<MemoryReadEvent>()
+  let mut reads = Vector<MemoryReadEvent>.make()
   run Vector.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move input,
   })
   run Vector.append(&mut reads, MemoryReadEvent.End {readyAt: SystemClock.make(0, 0)})
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   let mut index = usize.ZERO
   while index < writeCount {
     run Vector.append(&mut writes, MemoryWriteEvent {
@@ -209,7 +209,7 @@ effect fn providerFor(inputBytes: &[u8], writeCount: usize) -> MemoryByteDuplex
   }
   // Tiny buffers can produce one read per byte; retain writes, flushes, and lifecycle events too.
   let auditCapacity = inputBytes.length + 2 * writeCount + 8
-  return run MemoryByteDuplex.make(move reads, move writes, 256, auditCapacity, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 256, auditCapacity, Option<i32>.none())
 }
 
 effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8], writeCount: usize)
@@ -218,7 +218,7 @@ effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8], writeCount: usize
 ? &mut Allocator {
   let first = run Bytes.copy(firstBytes)
   let second = run Bytes.copy(secondBytes)
-  let mut reads = Vector.make<MemoryReadEvent>()
+  let mut reads = Vector<MemoryReadEvent>.make()
   run Vector.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move first,
@@ -228,7 +228,7 @@ effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8], writeCount: usize
     bytes: move second,
   })
   run Vector.append(&mut reads, MemoryReadEvent.End {readyAt: SystemClock.make(0, 0)})
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   let mut index = usize.ZERO
   while index < writeCount {
     run Vector.append(&mut writes, MemoryWriteEvent {
@@ -237,7 +237,7 @@ effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8], writeCount: usize
     })
     index = index + usize.ONE
   }
-  return run MemoryByteDuplex.make(move reads, move writes, 256, 32, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 256, 32, Option<i32>.none())
 }
 
 effect fn failingOutputProvider(inputBytes: &[u8], successfulWrites: usize, code: i32)
@@ -245,13 +245,13 @@ effect fn failingOutputProvider(inputBytes: &[u8], successfulWrites: usize, code
 ! OutOfMemoryError
 ? &mut Allocator {
   let input = run Bytes.copy(inputBytes)
-  let mut reads = Vector.make<MemoryReadEvent>()
+  let mut reads = Vector<MemoryReadEvent>.make()
   run Vector.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move input,
   })
   run Vector.append(&mut reads, MemoryReadEvent.End {readyAt: SystemClock.make(0, 0)})
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   let mut index = usize.ZERO
   while index < successfulWrites {
     run Vector.append(&mut writes, MemoryWriteEvent {
@@ -264,7 +264,7 @@ effect fn failingOutputProvider(inputBytes: &[u8], successfulWrites: usize, code
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Failure {code: code},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 256, 256, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 256, 256, Option<i32>.none())
 }
 
 effect<'call> fn finishResponse<
@@ -289,7 +289,7 @@ effect<'call> fn finishResponse<
     Result.Failure {error} => { fail ServerError.Value {error: move error} }
     Result.Success {value} => value
   }
-  run ResponseWriter.finish(&mut writer.*, &headers, Option.none<Instant>())
+  run ResponseWriter.finish(&mut writer.*, &headers, Option<Instant>.none())
   return 0
 }
 
@@ -309,7 +309,7 @@ effect<'call> fn handleRequest<
 ! ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock {
   let mut body: [u8; 4] = [0, 0, 0, 0]
-  let count = run readSome(&mut request.*, &mut body, Option.none<Instant>())
+  let count = run readSome(&mut request.*, &mut body, Option<Instant>.none())
   if count != 4 || !equal(&body, b"Wiki") || !(run Request.bodyComplete(&request.*)) { return 31 }
   let callerConnection = match move Header.make("Connection", b"keep-alive", valueLimits()) {
     Result.Failure {error} => { return 32 }
@@ -327,7 +327,7 @@ effect<'call> fn handleRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"No Content"),
+    Option<&'static [u8]>.some(b"No Content"),
     headers,
     valueLimits(),
   ) {
@@ -340,7 +340,7 @@ effect<'call> fn handleRequest<
     BodyMode.NoBody,
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   )
 }
@@ -356,7 +356,7 @@ effect<'call> fn handleConnection<
 ? &mut Allocator | &mut MonotonicClock {
   let handled = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     handleRequest,
   )
   let code = match move handled {
@@ -399,14 +399,14 @@ effect<'call> fn rejectExpectation<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"Expectation Failed"),
+    Option<&'static [u8]>.some(b"Expectation Failed"),
     headers,
     valueLimits(),
   ) {
     Result.Failure {error} => { return 74 }
     Result.Success {value} => move value
   }
-  run reject(&mut request.*, &response, Option.none<Instant>())
+  run reject(&mut request.*, &response, Option<Instant>.none())
   return 0
 }
 
@@ -438,7 +438,7 @@ effect<'call> fn handleZeroBody<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"No Content"),
+    Option<&'static [u8]>.some(b"No Content"),
     headers,
     valueLimits(),
   ) {
@@ -451,7 +451,7 @@ effect<'call> fn handleZeroBody<
     BodyMode.NoBody,
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   )
 }
@@ -467,7 +467,7 @@ effect<'call> fn zeroConnection<
 ? &mut Allocator | &mut MonotonicClock {
   let handled = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     handleZeroBody,
   )
   let code = match move handled {
@@ -489,7 +489,7 @@ effect<'call> fn reuseConnection<
 ? &mut Allocator | &mut MonotonicClock {
   let first = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     handleZeroBody,
   )
   let firstCode = match move first {
@@ -502,7 +502,7 @@ effect<'call> fn reuseConnection<
   }
   let second = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     handleZeroBody,
   )
   let secondCode = match move second {
@@ -526,7 +526,7 @@ effect<'call> fn rejectConnection<
 ? &mut Allocator | &mut MonotonicClock {
   let handled = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     rejectExpectation,
   )
   let code = match move handled {
@@ -557,7 +557,7 @@ effect<'call> fn writeFixedResponse<
   let progress = run ResponseWriter.writeAll(
     &mut writer.*,
     b"Hello",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if progress.consumed != 5
     || progress.totalPayload != u64.toU64(5)
@@ -567,12 +567,12 @@ effect<'call> fn writeFixedResponse<
     Result.Failure {error} => { drop error return 102 }
     Result.Success {value} => value
   }
-  run ResponseWriter.finish(&mut writer.*, &trailers, Option.none<Instant>())
+  run ResponseWriter.finish(&mut writer.*, &trailers, Option<Instant>.none())
   let empty: [u8; 0] = []
   let emptyWrite = run Effect.result(ResponseWriter.writeAll(
     &mut writer.*,
     &empty,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   match move emptyWrite {
     Result.Success {value} => { drop value return 231 }
@@ -586,7 +586,7 @@ effect<'call> fn writeFixedResponse<
   let repeated = run Effect.result(ResponseWriter.finish(
     &mut writer.*,
     &trailers,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move repeated {
     Result.Success {value} => { drop value return 107 }
@@ -631,7 +631,7 @@ effect<'call> fn fixedResponseRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"OK"),
+    Option<&'static [u8]>.some(b"OK"),
     headers,
     valueLimits(),
   ) {
@@ -644,7 +644,7 @@ effect<'call> fn fixedResponseRequest<
     BodyMode.ContentLength {length: u64.toU64(5)},
     ReusePolicy.CloseAfterResponse,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeFixedResponse,
   )
 }
@@ -669,7 +669,7 @@ effect<'call> fn writeChunkedResponse<
   let progress = run ResponseWriter.writeAll(
     &mut writer.*,
     b"Wiki",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if progress.consumed != 4
     || progress.totalPayload != u64.toU64(4)
@@ -683,7 +683,7 @@ effect<'call> fn writeChunkedResponse<
     Result.Failure {error} => { drop error return 113 }
     Result.Success {value} => value
   }
-  run ResponseWriter.finish(&mut writer.*, &trailers, Option.none<Instant>())
+  run ResponseWriter.finish(&mut writer.*, &trailers, Option<Instant>.none())
   return 0
 }
 
@@ -722,7 +722,7 @@ effect<'call> fn chunkedResponseRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"OK"),
+    Option<&'static [u8]>.some(b"OK"),
     headers,
     valueLimits(),
   ) {
@@ -735,7 +735,7 @@ effect<'call> fn chunkedResponseRequest<
     BodyMode.Chunked,
     ReusePolicy.CloseAfterResponse,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeChunkedResponse,
   )
 }
@@ -756,7 +756,7 @@ effect<'call> fn informationalRequest<
 ! ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock {
   let mut body: [u8; 4] = [0, 0, 0, 0]
-  let count = run readSome(&mut request.*, &mut body, Option.none<Instant>())
+  let count = run readSome(&mut request.*, &mut body, Option<Instant>.none())
   if count != 4 || !equal(&body, b"Wiki") || !(run Request.bodyComplete(&request.*)) { return 120 }
   let entries: [Header<'static>; 0] = []
   let headers = match move Headers.make(&entries, valueLimits()) {
@@ -770,7 +770,7 @@ effect<'call> fn informationalRequest<
   let continued = match move ResponseHead.make(
     Version.Http11,
     continueStatus,
-    Option.some<&'static [u8]>(b"Continue"),
+    Option<&'static [u8]>.some(b"Continue"),
     headers,
     valueLimits(),
   ) {
@@ -780,7 +780,7 @@ effect<'call> fn informationalRequest<
   let duplicateContinue = run Effect.result(sendInformational(
     &mut request.*,
     &continued,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   match move duplicateContinue {
     Result.Success {value} => { drop value return 236 }
@@ -798,7 +798,7 @@ effect<'call> fn informationalRequest<
   let switching = match move ResponseHead.make(
     Version.Http11,
     switchingStatus,
-    Option.some<&'static [u8]>(b"Switching Protocols"),
+    Option<&'static [u8]>.some(b"Switching Protocols"),
     headers,
     valueLimits(),
   ) {
@@ -808,7 +808,7 @@ effect<'call> fn informationalRequest<
   let invalid = run Effect.result(sendInformational(
     &mut request.*,
     &switching,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   match move invalid {
     Result.Success {value} => { drop value return 129 }
@@ -835,7 +835,7 @@ effect<'call> fn informationalRequest<
   let framedInformational = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"Early Hints"),
+    Option<&'static [u8]>.some(b"Early Hints"),
     trailerHeaders,
     valueLimits(),
   ) {
@@ -845,7 +845,7 @@ effect<'call> fn informationalRequest<
   let framed = run Effect.result(sendInformational(
     &mut request.*,
     &framedInformational,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   match move framed {
     Result.Success {value} => { drop value return 130 }
@@ -857,18 +857,18 @@ effect<'call> fn informationalRequest<
   let informational = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"Early Hints"),
+    Option<&'static [u8]>.some(b"Early Hints"),
     headers,
     valueLimits(),
   ) {
     Result.Failure {error} => { drop error return 123 }
     Result.Success {value} => move value
   }
-  run sendInformational(&mut request.*, &informational, Option.none<Instant>())
+  run sendInformational(&mut request.*, &informational, Option<Instant>.none())
   let repeated = run Effect.result(sendInformational(
     &mut request.*,
     &informational,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   match move repeated {
     Result.Success {value} => { drop value return 124 }
@@ -900,9 +900,9 @@ effect<'call> fn discardChunkedRequest<
 ! ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock {
   let mut prefix: [u8; 1] = [0]
-  let read = run readSome(&mut request.*, &mut prefix, Option.none<Instant>())
+  let read = run readSome(&mut request.*, &mut prefix, Option<Instant>.none())
   if read != usize.ONE || prefix[usize.ZERO] != 87 { return 130 }
-  run discardRemaining(&mut request.*, u64.toU64(10), Option.none<Instant>())
+  run discardRemaining(&mut request.*, u64.toU64(10), Option<Instant>.none())
   if !(run Request.bodyComplete(&request.*)) { return 131 }
   return run handleZeroBody(move request)
 }
@@ -938,7 +938,7 @@ effect<'call> fn recoverBeforeOutput<
   let invalid = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"OK"),
+    Option<&'static [u8]>.some(b"OK"),
     headers,
     valueLimits(),
   ) {
@@ -951,7 +951,7 @@ effect<'call> fn recoverBeforeOutput<
     BodyMode.ContentLength {length: u64.toU64(1)},
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   ))
   match move attempted {
@@ -984,7 +984,7 @@ effect<'call> fn writeShortFixedResponse<
   let progress = run ResponseWriter.writeAll(
     &mut writer.*,
     b"xy",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   drop progress
   return 151
@@ -1021,7 +1021,7 @@ effect<'call> fn failAfterOutput<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"OK"),
+    Option<&'static [u8]>.some(b"OK"),
     headers,
     valueLimits(),
   ) {
@@ -1034,7 +1034,7 @@ effect<'call> fn failAfterOutput<
     BodyMode.ContentLength {length: u64.toU64(2)},
     ReusePolicy.CloseAfterResponse,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeShortFixedResponse,
   )
 }
@@ -1058,7 +1058,7 @@ effect<'call> fn consumeBodyFailureProgress<
   let attempted = run Effect.result(readSome(
     &mut request.*,
     &mut output,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move attempted {
     Result.Success {value} => { drop value return 152 }
@@ -1116,7 +1116,7 @@ effect<'call> fn upgradeRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"Switching Protocols"),
+    Option<&'static [u8]>.some(b"Switching Protocols"),
     headers,
     valueLimits(),
   ) {
@@ -1127,7 +1127,7 @@ effect<'call> fn upgradeRequest<
     &mut request.*,
     "websocket",
     &response,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     inspectUpgradeSuffix,
   )
   if code != 0 { return code }
@@ -1185,7 +1185,7 @@ effect<'call> fn tunnelRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"Connection Established"),
+    Option<&'static [u8]>.some(b"Connection Established"),
     headers,
     valueLimits(),
   ) {
@@ -1195,14 +1195,14 @@ effect<'call> fn tunnelRequest<
   let code = run withTunnel<i32, never>(
     &mut request.*,
     &response,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     inspectTunnelSuffix,
   )
   if code != 0 { return code }
   let resumed = run Effect.result(discardRemaining(
     &mut request.*,
     u64.toU64(1),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move resumed {
     Result.Success {value} => { drop value return 175 }
@@ -1244,7 +1244,7 @@ effect<'call> fn http10Request<
   let response = match move ResponseHead.make(
     Version.Http10,
     status,
-    Option.some<&'static [u8]>(b"No Content"),
+    Option<&'static [u8]>.some(b"No Content"),
     headers,
     valueLimits(),
   ) {
@@ -1257,7 +1257,7 @@ effect<'call> fn http10Request<
     BodyMode.NoBody,
     ReusePolicy.Http10KeepAlive,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   )
 }
@@ -1290,7 +1290,7 @@ effect<'call> fn unreadBodyRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"No Content"),
+    Option<&'static [u8]>.some(b"No Content"),
     headers,
     valueLimits(),
   ) {
@@ -1303,7 +1303,7 @@ effect<'call> fn unreadBodyRequest<
     BodyMode.NoBody,
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   )
 }
@@ -1328,7 +1328,7 @@ effect<'call> fn writeCloseDelimitedResponse<
   let progress = run ResponseWriter.writeAll(
     &mut writer.*,
     b"bye",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if progress.consumed != 3
     || progress.totalPayload != u64.toU64(3)
@@ -1338,7 +1338,7 @@ effect<'call> fn writeCloseDelimitedResponse<
     Result.Failure {error} => { drop error return 222 }
     Result.Success {value} => value
   }
-  run ResponseWriter.finish(&mut writer.*, &trailers, Option.none<Instant>())
+  run ResponseWriter.finish(&mut writer.*, &trailers, Option<Instant>.none())
   return 0
 }
 
@@ -1369,7 +1369,7 @@ effect<'call> fn closeDelimitedRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"OK"),
+    Option<&'static [u8]>.some(b"OK"),
     headers,
     valueLimits(),
   ) {
@@ -1382,7 +1382,7 @@ effect<'call> fn closeDelimitedRequest<
     BodyMode.CloseDelimited,
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeCloseDelimitedResponse,
   )
 }
@@ -1401,7 +1401,7 @@ effect<'call> fn matrixConnection<
     let mut refusing = RefusingAllocator {calls: usize.ZERO}
     let attempted = run Effect.result(withRequest(
       &mut connection.*,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       handleZeroBody,
     ) |> Effect.provideMut<Allocator>(&mut refusing))
     match move attempted {
@@ -1417,7 +1417,7 @@ effect<'call> fn matrixConnection<
     let unread = connection.unread()
     let retried = run Effect.result(withRequest(
       &mut connection.*,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       handleZeroBody,
     ))
     match move retried {
@@ -1435,7 +1435,7 @@ effect<'call> fn matrixConnection<
   if scenario == 6 {
     let outcome = run Effect.result(withRequest(
       &mut connection.*,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       failAfterOutput,
     ))
     match move outcome {
@@ -1468,7 +1468,7 @@ effect<'call> fn matrixConnection<
   if scenario == 13 {
     let outcome = run withRequest(
       &mut connection.*,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       consumeBodyFailureProgress,
     )
     let code = match move outcome {
@@ -1482,7 +1482,7 @@ effect<'call> fn matrixConnection<
     return 0
   }
   if scenario == 9 {
-    let first = run withRequest(&mut connection.*, Option.none<Instant>(), http10Request)
+    let first = run withRequest(&mut connection.*, Option<Instant>.none(), http10Request)
     let firstCode = match move first {
       Option.None => 205
       Option.Some {value} => value
@@ -1491,7 +1491,7 @@ effect<'call> fn matrixConnection<
     if connection.phase() != ConnectionPhase.Ready || connection.requests() != usize.ONE {
       return 206
     }
-    let second = run withRequest(&mut connection.*, Option.none<Instant>(), http10Request)
+    let second = run withRequest(&mut connection.*, Option<Instant>.none(), http10Request)
     let secondCode = match move second {
       Option.None => 207
       Option.Some {value} => value
@@ -1502,7 +1502,7 @@ effect<'call> fn matrixConnection<
     return 0
   }
   if scenario == 11 {
-    let absent = run withRequest(&mut connection.*, Option.none<Instant>(), handleZeroBody)
+    let absent = run withRequest(&mut connection.*, Option<Instant>.none(), handleZeroBody)
     match move absent {
       Option.None => {}
       Option.Some {value} => { drop value return 226 }
@@ -1513,25 +1513,25 @@ effect<'call> fn matrixConnection<
     run finishConnection(&mut connection.*, usize.ZERO, SystemClock.make(7, 9))
     return 0
   }
-  let mut handled: Option<i32> = Option.none<i32>()
+  let mut handled: Option<i32> = Option<i32>.none()
   if scenario == 1 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), fixedResponseRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), fixedResponseRequest)
   } else if scenario == 2 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), chunkedResponseRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), chunkedResponseRequest)
   } else if scenario == 3 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), informationalRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), informationalRequest)
   } else if scenario == 4 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), discardChunkedRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), discardChunkedRequest)
   } else if scenario == 5 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), recoverBeforeOutput)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), recoverBeforeOutput)
   } else if scenario == 7 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), upgradeRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), upgradeRequest)
   } else if scenario == 8 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), tunnelRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), tunnelRequest)
   } else if scenario == 10 {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), unreadBodyRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), unreadBodyRequest)
   } else {
-    handled = run withRequest(&mut connection.*, Option.none<Instant>(), closeDelimitedRequest)
+    handled = run withRequest(&mut connection.*, Option<Instant>.none(), closeDelimitedRequest)
   }
   let code = match move handled {
     Option.None => 178
