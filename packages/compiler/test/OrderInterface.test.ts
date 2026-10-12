@@ -55,6 +55,22 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('calls a scalar conformance by name like a nominal one', () =>
+  Effect.gen(function* () {
+    // IMPL-004: `impl Order for i32` in silk.order serves a concrete named call, as it serves `<`.
+    const self = yield* snapshot(`import silk.order { Order, Ordering }
+pub fn main() -> i32 {
+  let low: i32 = 2
+  let high: i32 = 7
+  return match Order.compare(&low, &high) {
+    Ordering.Less => 42
+    _ => 0
+  }
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
 it.effect('specializes one bound per conforming integer width', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.order { Order }
