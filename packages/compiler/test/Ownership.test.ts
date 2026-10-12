@@ -1612,6 +1612,23 @@ pub fn main() -> i32 { return 0 }`,
   )
 })
 
+it('requires &mut to forward an exclusive view to an interface operation', () => {
+  const source = `interface Bump { fn bump(value: &mut Self) -> i32 }
+fn implicit<T: Bump>(item: &mut T) -> i32 { return Bump.bump(item) }
+fn explicit<T: Bump>(item: &mut T) -> i32 { return Bump.bump(&mut item) }
+fn shared<T: Bump>(item: &T, other: &mut T) -> i32 { return Bump.bump(&mut other) }
+pub fn main() -> i32 { return 0 }`
+  const facts = check('ownership/interface-exclusive-forwarding', source)
+
+  assert.deepEqual(
+    facts.diagnostics.map((diagnostic) => ({
+      code: diagnostic.code,
+      start: diagnostic.span.start,
+    })),
+    [{ code: 'OWN0003', start: source.indexOf('item)', source.indexOf('fn implicit')) }],
+  )
+})
+
 it('requires explicit transfer at mutable owned parameter boundaries and rejects overlap', () => {
   const caller = check(
     'ownership/mutable-owned-parameter-caller-move',
