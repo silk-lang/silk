@@ -403,8 +403,8 @@ root's scope:
   literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
 
 Pending means a region relation or capture contents typing retained, or an exclusive view a section
-stages without `&mut`: OWN0003 holds every other by-value operand to `move`, but not a staged
-argument. Scope ends as events,
+stages without `&mut`: OWN0003 holds by-value operands to `move`, but not yet every staged argument
+(a generic callable parameter's section stages one unchecked). Scope ends as events,
 OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
 the first point at which a loan can outlive its root.
 
