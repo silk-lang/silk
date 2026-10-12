@@ -36,6 +36,8 @@ import * as DeclarationCollection from './DeclarationCollection.js'
 import * as DeclarationIndex from './DeclarationIndex.js'
 import * as NameResolution from './NameResolution.js'
 import {
+  aliasUseParameters,
+  borrowedAliasUse,
   attachExposure,
   canonicalKey,
   closeOpaqueReturnType,
@@ -309,6 +311,9 @@ export const complete = (
   ): ReadonlyArray<Type.Parameter> | undefined => {
     if (module === undefined) return undefined
     const resolved = resolvers.type(module, path)
+    // An alias's parameters, implicit lifetimes included, are elided at a use like a nominal's.
+    const aliased = aliasUseParameters(resolved.fact)
+    if (aliased !== undefined) return aliased
     if (
       resolved.fact._tag !== 'Resolved' ||
       !Type.isNominal(resolved.fact.type) ||
@@ -396,6 +401,8 @@ export const complete = (
             member,
             (path) => nominalParameters(module, path),
             conformance !== undefined ? finalizeConformance(conformance) : completedHead,
+            undefined,
+            (path) => module !== undefined && borrowedAliasUse(resolvers.type(module, path).fact),
           )
         : member
     const closed =
@@ -427,6 +434,8 @@ export const complete = (
   let modules = headers.map((module): ModuleHeaders => {
     const nominalParameters = (path: TypePathFact): ReadonlyArray<Type.Parameter> | undefined => {
       const resolved = resolvers.type(module.module, path)
+      const aliased = aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -697,6 +706,9 @@ export const complete = (
                   operationContext,
                   collectedOperation,
                   nominalParameters,
+                  undefined,
+                  undefined,
+                  (path) => borrowedAliasUse(resolvers.type(module.module, path).fact),
                 )
           const operation =
             finalizedOperation._tag === 'ServiceOperation' ? finalizedOperation : collectedOperation
@@ -2189,6 +2201,63 @@ export const complete = (
         (member): member is ConstantFact =>
           member._tag === 'ConstantDeclaration' || member._tag === 'PackageParameterDeclaration',
       ),
+    }
+  })
+
+  // GEN-005: an interface is a compile-time contract, not a storable existential value, and a
+  // service is an interface in every respect but requirement eligibility (SERV-003). No field,
+  // parameter or result type may mention either (SEM0018). Bounds, impl heads and requirement
+  // rows name contracts through their own facts and never reach this pass.
+  const rejectInterfaceValue = (fact: DeclaredTypeFact): DeclaredTypeFact => {
+    if (fact._tag !== 'Resolved') return fact
+    const contract = Type.valueNominals(fact.type).find((nominal) => {
+      const declaration = memberByNominal(modules, nominal)
+      return (
+        declaration?._tag === 'InterfaceDeclaration' || declaration?._tag === 'ServiceDeclaration'
+      )
+    })
+    if (contract === undefined) return fact
+    const diagnostic = Diagnostic.expectedType(fact.spelling, Location.at(fact.anchor))
+    diagnostics.push(diagnostic)
+    return { _tag: 'Unavailable', anchor: fact.anchor, cause: Diagnostic.identity(diagnostic) }
+  }
+  modules = modules.map((module): ModuleHeaders => {
+    const fields = (declared: StructFact['fields']): StructFact['fields'] =>
+      declared.map((field) => ({
+        ...field,
+        declaredType: rejectInterfaceValue(field.declaredType),
+      }))
+    const members = module.members.map((member): MemberFact => {
+      if (member._tag === 'FunctionDeclaration')
+        return {
+          ...member,
+          parameters: member.parameters.map((parameter) => ({
+            ...parameter,
+            declaredType: rejectInterfaceValue(parameter.declaredType),
+          })),
+          returnType: rejectInterfaceValue(member.returnType),
+        }
+      if (member._tag === 'StructDeclaration') return { ...member, fields: fields(member.fields) }
+      if (member._tag === 'UnionDeclaration')
+        return {
+          ...member,
+          variants: member.variants.map((variant) => ({
+            ...variant,
+            fields: fields(variant.fields),
+          })),
+        }
+      return member
+    })
+    return {
+      ...module,
+      members,
+      declarations: members.filter(
+        (member): member is DeclarationFact => member._tag === 'FunctionDeclaration',
+      ),
+      structs: members.filter(
+        (member): member is StructFact => member._tag === 'StructDeclaration',
+      ),
+      unions: members.filter((member): member is UnionFact => member._tag === 'UnionDeclaration'),
     }
   })
 

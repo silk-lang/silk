@@ -12,6 +12,7 @@ import type * as ModuleClosure from './ModuleClosure.js'
 import * as ResolutionSeams from './ResolutionSeams.js'
 import * as ResolutionWork from './ResolutionWork.js'
 import * as SemanticContext from './SemanticContext.js'
+import * as Lifetime from './Lifetime.js'
 import * as Type from './Type.js'
 
 export type IntrinsicActor = Intrinsic.Actor['spelling']
@@ -405,7 +406,9 @@ export const erasedOwner = (
   index: DeclarationIndex.Index,
   declaration: DeclarationFacts.MemberFact,
 ): DeclarationFacts.MemberFact => {
-  if (declaration._tag !== 'AliasDeclaration') return declaration
+  // A generic alias names its target only once a use supplies its arguments.
+  if (declaration._tag !== 'AliasDeclaration' || declaration.typeParameters.length > 0)
+    return declaration
   const target = declaration.target
   if (target._tag !== 'Resolved' || !Type.isNominal(target.type)) return declaration
   return (
@@ -670,7 +673,14 @@ const resolveAliasUse = (
     target.fact._tag === 'Resolved'
       ? resolvedType(path, target.fact.type)
       : unavailable(path, 'cause' in target.fact ? target.fact.cause : undefined)
-  return { fact: base.fact, diagnostics: target.diagnostics }
+  // A generic alias resolves to its target over its own parameters; the use applies it.
+  const fact =
+    target.fact._tag === 'Resolved' &&
+    target.fact.aliasParameters !== undefined &&
+    base.fact._tag === 'Resolved'
+      ? { ...base.fact, aliasParameters: target.fact.aliasParameters }
+      : base.fact
+  return { fact, diagnostics: target.diagnostics }
 }
 
 /** Looks one retained one- or two-segment type path up through a module scope. */
@@ -732,6 +742,10 @@ export const resolveType = (
     ) {
       const intrinsicType = Type.intrinsicNominals.get(`Intrinsic.${second.spelling}`)
       if (intrinsicType !== undefined) return resolvedType(path, intrinsicType)
+    }
+    if (result.actor === 'Intrinsic' && path.segments.length === 2) {
+      if (second?.spelling === 'Copy') return resolvedType(path, Type.copyCapability)
+      if (second?.spelling === 'Drop') return resolvedType(path, Type.dropCapability)
     }
     if (Type.isBuiltin(result.actor)) return resolvedType(path, result.actor)
     return unresolved(
@@ -914,29 +928,65 @@ export const makeResolvers = (
       })
       return withDiagnostics(unavailableAlias(named, cycleCauses.get(named)), diagnostics)
     }
-    if (named.parameterList !== undefined) {
+    // A generic alias takes only unbounded type and lifetime parameters (TYPE-004).
+    const rejectParameter = (
+      parameter: DeclarationFacts.TypeParameterFact,
+      problem: Diagnostic.TypeAliasParameterProblem,
+    ): DeclarationFacts.TypeResolution => {
       const diagnostic = Diagnostic.typeAliasParameters(
         named.name.spelling,
-        Location.at(named.parameterList),
+        parameter.name._tag === 'Present' ? parameter.name.spelling : parameter.type.name,
+        problem,
+        Location.at(parameter.anchor),
       )
       const result = unavailableAlias(named, Diagnostic.identity(diagnostic))
       memo.set(named, result)
       return withDiagnostics(result, [diagnostic])
     }
+    for (const parameter of named.typeParameters) {
+      if (
+        (parameter.type.kind !== 'Value' && parameter.type.kind !== 'Lifetime') ||
+        parameter.representationBound !== undefined ||
+        parameter.staticProperties.length > 0
+      )
+        return rejectParameter(parameter, 'Kind')
+      if (parameter.bounds.length > 0 || (parameter.lifetimeBounds?.length ?? 0) > 0)
+        return rejectParameter(parameter, 'Bounded')
+    }
     active.push(named)
-    const resolved = DeclarationResolution.resolveDeclaredType(
-      resolution.contexts.spanOf,
-      named.canonical.id.module,
-      named.target,
-      resolvers,
-      index.modules,
-    )
+    // A bare path target of a parameterless alias may name an unapplied generic declaration; each
+    // use site then supplies the arguments and receives the ordinary arity diagnostic when it
+    // omits them.
+    const resolved =
+      named.target._tag === 'Unresolved' && named.typeParameters.length === 0
+        ? resolvers.type(named.canonical.id.module, named.target.path)
+        : DeclarationResolution.resolveDeclaredType(
+            resolution.contexts.spanOf,
+            named.canonical.id.module,
+            named.target,
+            resolvers,
+            index.modules,
+          )
     active.pop()
     const diagnostics: Array<Diagnostic.Located> = [...resolved.diagnostics]
     const cycleCause = cycleCauses.get(named)
     let result: DeclarationFacts.TypeResolution
+    const target = resolved.fact
+    const unused =
+      target._tag === 'Resolved'
+        ? named.typeParameters.find((parameter) => {
+            const identity = Type.key(parameter.type)
+            return (
+              !Type.parameters(target.type).some((used) => Type.key(used) === identity) &&
+              !Type.lifetimes(target.type).some((used) => Lifetime.key(used) === identity)
+            )
+          })
+        : undefined
     if (cycleCause !== undefined) result = unavailableAlias(named, cycleCause)
-    else if (resolved.fact._tag !== 'Resolved') result = withDiagnostics(resolved, [])
+    else if (unused !== undefined) {
+      const rejected = rejectParameter(unused, 'Unused')
+      return withDiagnostics(rejected, [...diagnostics, ...rejected.diagnostics])
+    } else if (resolved.fact._tag !== 'Resolved') result = withDiagnostics(resolved, [])
     else {
       const exposed =
         named.visibility === 'Public'
@@ -950,7 +1000,20 @@ export const makeResolvers = (
       result =
         exposed._tag === 'Resolved' && exposed.exposureCause !== undefined
           ? unavailableAlias(named, exposed.exposureCause)
-          : { fact: exposed, diagnostics: [] }
+          : {
+              fact:
+                named.typeParameters.length === 0 || exposed._tag !== 'Resolved'
+                  ? exposed
+                  : {
+                      ...exposed,
+                      aliasParameters: {
+                        alias: named.name.spelling,
+                        parameters: named.typeParameters.map((parameter) => parameter.type),
+                        expansions: new Map(),
+                      },
+                    },
+              diagnostics: [],
+            }
     }
     memo.set(named, result)
     return withDiagnostics(result, diagnostics)

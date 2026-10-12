@@ -252,7 +252,7 @@ service Counter<E, ?R, Value> {
 }
 
 struct Fixed<S, E, ?R> {}
-effect fn get<S: Marker, E, ?R>(self: &Fixed<S, E, R>, value: &S) -> i32 ! E ? R {
+effect fn get<S: Marker<S>, E, ?R>(self: &Fixed<S, E, R>, value: &S) -> i32 ! E ? R {
   return 42
 }
 impl<S: Marker<S>, E, ?R> Counter<E, R, S> for Fixed<S, E, R> { get: Fixed.get }

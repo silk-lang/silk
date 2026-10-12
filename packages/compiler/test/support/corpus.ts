@@ -5005,6 +5005,43 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
   // INTR-005: Slot, RawBuffer and Allocation are ordinary names beside the sealed storage types.
   // folded from VectorAcceptance.test.ts: growth past the initial capacity with boundary reads.
   {
+    name: 'user-declared-storage-names',
+    source: `import silk.allocator { OutOfMemoryError }
+import silk.allocator { Allocator }
+import silk.effect { Effect }
+import silk.vector { Vector }
+
+struct Slot {
+  index: usize
+  weight: i32
+}
+struct RawBuffer { bytes: i32 }
+struct Allocation { granted: bool }
+
+fn measure(buffer: &RawBuffer, allocation: &Allocation) -> i32 { // ordinary: user types
+  if allocation.granted { return buffer.bytes }
+  return 0
+}
+
+effect fn build() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut slots = Vector<Slot>.make()
+  let first = Vector<Slot>.append(&mut slots, Slot { index: 0, weight: 20 }) |> Effect.provideMut(&mut allocator)
+  let appendedFirst = run first
+  let second = Vector<Slot>.append(&mut slots, Slot { index: 1, weight: 12 }) |> Effect.provideMut(&mut allocator)
+  let appendedSecond = run second
+  let view = Vector<Slot>.asSlice(&slots)
+  let buffer = RawBuffer { bytes: 10 }
+  let allocation = Allocation { granted: true }
+  return view[0].weight + view[1].weight + measure(&buffer, &allocation)
+}
+
+effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
+
+pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'vector-growth-reads',
     source: `import silk.allocator { OutOfMemoryError }
 import silk.allocator { Allocator }

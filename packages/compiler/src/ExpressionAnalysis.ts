@@ -675,7 +675,7 @@ export const analyzeEnumMember = (
   if (qualifierToken === undefined || memberToken === undefined || identifiers.length !== 2)
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
-  const enumLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const enumLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (enumLookup._tag !== 'Resolved' || enumLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const enum_ = enumLookup.declaration
@@ -765,7 +765,7 @@ const analyzeEnumValueCall = (
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
   const operationName = SemanticContext.nameText(context, operationToken) ?? ''
-  const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (qualifierLookup._tag !== 'Resolved' || qualifierLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const operation = qualifierLookup.declaration.associatedOperations.find(
@@ -2262,9 +2262,9 @@ export const analyzePattern = (
         ? undefined
         : (SemanticContext.nameText(context, qualifierToken) ?? '')
     const enumLookup =
-      qualifier === undefined
+      qualifierToken === undefined
         ? undefined
-        : Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+        : resolveMemberQualifier(context, resolution, qualifierToken)
     const enum_ =
       enumLookup?._tag === 'Resolved' && enumLookup.declaration._tag === 'EnumDeclaration'
         ? enumLookup.declaration
@@ -4860,6 +4860,7 @@ import {
   isSectionArity,
   ownedProviderCaptureAccess,
   recoveryInvocationRecipe,
+  resolveMemberQualifier,
   serviceOperation,
   sourceCallable,
 } from './CallResolution.js'
@@ -8530,6 +8531,10 @@ const isInterfaceFact = (
 ): declaration is DeclarationFacts.InterfaceFact =>
   declaration._tag === 'InterfaceDeclaration' && declaration.dependencyEligible === false
 
+/**
+ * The interface operation `Owner.member` names: `Owner<Args>.member`, or a transparent alias
+ * qualifier `Alias.member` that names the interface application the alias's target spells.
+ */
 const resolveAppliedInterfaceOperationTarget = (
   context: SemanticContext.SemanticContext,
   node: AuthoredHir.Expression,
@@ -8537,7 +8542,7 @@ const resolveAppliedInterfaceOperationTarget = (
   resolution: ResolutionContext,
 ): AppliedInterfaceOperationTarget | undefined => {
   const parts = appliedMemberParts(node)
-  if (parts === undefined) return undefined
+  if (parts === undefined) return aliasedInterfaceOperationTarget(context, node, resolution)
   const ownerResult = resolvePatternType(
     context,
     parts.owner,
@@ -8545,7 +8550,82 @@ const resolveAppliedInterfaceOperationTarget = (
     caller,
     parts.owner.anchor,
   )
-  const ownerType = ownerResult.type
+  return interfaceOperationTarget(
+    context,
+    {
+      type: ownerResult.type,
+      declared: ownerResult.declared,
+      diagnostics: ownerResult.diagnostics,
+      anchor: parts.owner.anchor,
+      fallback: () => appliedInterfaceOwnerDeclaration(context, parts.owner, resolution),
+    },
+    parts.member,
+    resolution,
+  )
+}
+
+const aliasedInterfaceOperationTarget = (
+  context: SemanticContext.SemanticContext,
+  node: AuthoredHir.Expression,
+  resolution: ResolutionContext,
+): AppliedInterfaceOperationTarget | undefined => {
+  const [qualifier, member] = referenceNames(node)
+  if (qualifier === undefined || member === undefined) return undefined
+  const lookup = Semantic.resolveName(
+    resolution.semantic,
+    resolution.scope,
+    SemanticContext.nameText(context, qualifier) ?? '',
+  )
+  if (lookup._tag !== 'Resolved' || lookup.declaration._tag !== 'AliasDeclaration') return undefined
+  // A generic alias qualifier must write its arguments (`Alias<Args>.member`), which the applied
+  // owner path resolves; written bare it names no application.
+  if (lookup.declaration.typeParameters.length > 0)
+    return {
+      _tag: 'Invalid',
+      diagnostics: [
+        Diagnostic.typeArgumentArity(
+          SemanticContext.nameText(context, qualifier) ?? '',
+          lookup.declaration.typeParameters.length,
+          0,
+          Location.at(qualifier.anchor),
+        ),
+      ],
+    }
+  // An alias without arguments is its target's spelling, so the plain qualified path takes it.
+  const target = lookup.declaration.target
+  if (
+    target._tag !== 'Resolved' ||
+    !Type.isNominal(target.type) ||
+    target.type.arguments.length === 0
+  )
+    return undefined
+  return interfaceOperationTarget(
+    context,
+    {
+      type: target.type,
+      declared: target,
+      diagnostics: [],
+      anchor: qualifier.anchor,
+      fallback: () => undefined,
+    },
+    member,
+    resolution,
+  )
+}
+
+const interfaceOperationTarget = (
+  context: SemanticContext.SemanticContext,
+  owner: {
+    readonly type: Type.Type | undefined
+    readonly declared: DeclarationFacts.DeclaredTypeFact
+    readonly diagnostics: ReadonlyArray<Diagnostic.Located>
+    readonly anchor: AuthoredHir.Anchor
+    readonly fallback: () => DeclarationFacts.ContractFact | undefined
+  },
+  memberName: AuthoredHir.Name,
+  resolution: ResolutionContext,
+): AppliedInterfaceOperationTarget | undefined => {
+  const ownerType = owner.type
   const resolvedDeclaration =
     ownerType !== undefined && Type.isNominal(ownerType)
       ? DeclarationFacts.byCanonical(resolution.index, {
@@ -8558,17 +8638,17 @@ const resolveAppliedInterfaceOperationTarget = (
     resolvedDeclaration?._tag === 'InterfaceDeclaration' ||
     resolvedDeclaration?._tag === 'ServiceDeclaration'
       ? resolvedDeclaration
-      : appliedInterfaceOwnerDeclaration(context, parts.owner, resolution)
+      : owner.fallback()
   if (ownerDeclaration === undefined) return undefined
-  const member = SemanticContext.nameText(context, parts.member) ?? ''
+  const member = SemanticContext.nameText(context, memberName) ?? ''
   if (ownerDeclaration._tag === 'ServiceDeclaration') {
     return {
       _tag: 'Invalid',
-      diagnostics: Diagnostic.collect(ownerResult.diagnostics, [
+      diagnostics: Diagnostic.collect(owner.diagnostics, [
         Diagnostic.unknownActorOperation(
           Type.encode(ownerType ?? ownerDeclaration.self),
           member,
-          Location.at(parts.member.anchor),
+          Location.at(memberName.anchor),
         ),
       ]),
     }
@@ -8578,14 +8658,14 @@ const resolveAppliedInterfaceOperationTarget = (
     return {
       _tag: 'Invalid',
       diagnostics:
-        ownerResult.diagnostics.length > 0
-          ? ownerResult.diagnostics
+        owner.diagnostics.length > 0
+          ? owner.diagnostics
           : [
               Diagnostic.typeArgumentInference(
                 ownerDeclaration.canonical._tag === 'Canonical'
                   ? ownerDeclaration.canonical.id.name
                   : 'interface',
-                Location.at(parts.owner.anchor),
+                Location.at(owner.anchor),
               ),
             ],
     }
@@ -8604,11 +8684,11 @@ const resolveAppliedInterfaceOperationTarget = (
   if (application === undefined || operation === undefined || contract === undefined) {
     return {
       _tag: 'Invalid',
-      diagnostics: Diagnostic.collect(ownerResult.diagnostics, [
+      diagnostics: Diagnostic.collect(owner.diagnostics, [
         Diagnostic.unknownActorOperation(
           Type.encode(ownerType),
           member,
-          Location.at(parts.member.anchor),
+          Location.at(memberName.anchor),
         ),
       ]),
     }
@@ -8617,11 +8697,11 @@ const resolveAppliedInterfaceOperationTarget = (
     _tag: 'Resolved',
     interface: ownerDeclaration,
     capability: ownerType,
-    application: ownerResult.declared,
+    application: owner.declared,
     reference: {
       _tag: 'ResolvedInterfaceOperation' as const,
       spelling: `${Type.encode(ownerType)}.${member}`,
-      anchor: parts.member.anchor,
+      anchor: memberName.anchor,
       capability: ownerType,
       provider: ownerDeclaration.self,
       operation: member,
@@ -8630,7 +8710,7 @@ const resolveAppliedInterfaceOperationTarget = (
       parameters: contract.parameters,
       result: contract.result,
     },
-    diagnostics: ownerResult.diagnostics,
+    diagnostics: owner.diagnostics,
   }
 }
 
@@ -9691,6 +9771,8 @@ const analyzeAnonymousCallable = (
     initial.fact,
     (path) => {
       const resolved = resolvers.type(AuthoredWalk.moduleName(context), path)
+      const aliased = DeclarationResolution.aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -9709,6 +9791,10 @@ const analyzeAnonymousCallable = (
     node._tag === 'CallableExpression'
       ? DeclarationCollection.anonymousDeclaration(node)
       : undefined,
+    (path) =>
+      DeclarationResolution.borrowedAliasUse(
+        resolvers.type(AuthoredWalk.moduleName(context), path).fact,
+      ),
   )
   const collected = {
     ...initial,
@@ -10997,7 +11083,8 @@ function analyzeExpressionDecision(
     if (intrinsicOperationTarget(context, node)?.rule._tag === 'PlaceRule') {
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
-    const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+    // A transparent alias qualifier names its target declaration (TYPE-004).
+    const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,
