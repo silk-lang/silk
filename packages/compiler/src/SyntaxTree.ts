@@ -28,7 +28,6 @@ export type NodeKind =
   | 'RoleDeclaration'
   | 'RequirementSelector'
   | 'ServiceOperation'
-  | 'OperatorMarker'
   | 'ServiceInvalidMember'
   | 'ConstantDeclaration'
   | 'PackageParameterDeclaration'
