@@ -74,6 +74,9 @@ definition and reference live in `apps/docs/content/reference/`.
   new session when that is simpler. A session may therefore receive a request to fix a failure in
   work it already shipped; fix it in a new PR the same way. Bootstrap inputs still land on `main`
   first and reach `selfhost` through a sync merge.
+- Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
+  `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, and put the table that
+  `check-borrow-gap.mjs diff <old> <new>` prints in the PR description.
 - CI, review, PR updates, and handoff are workflow gates, not implementation tasks. Do not add
   OpenSpec task-list items whose sole action is running or recording checks, obtaining approval,
   waiting for CI, or reporting the handoff. A passing gate never requires a follow-up repository
