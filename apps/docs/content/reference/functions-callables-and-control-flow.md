@@ -288,11 +288,11 @@ the temporary. A receiver of a generic parameter type resolves only through the 
 
 **Diagnostics:** Calling or naming an associated function on a value reports `SEM0198`. An unknown
 member keeps the field diagnostic `SEM0027`. Receiver ownership uses the ordinary loan and move
-diagnostics (`SEM0057`, `OWN0001`); binding a borrowed temporary reports `SEM0056`. Through a
-reference receiver, the diagnostics are those of the explicit spelling: a `self: &mut Self` method
-called through a shared reference reports `SEM0058` as `&mut counter` does, a `self: Self` method on
-an affine referent reports `OWN0012`, and an outstanding loan of the referent that conflicts with
-the reborrow reports `OWN0010`.
+diagnostics (`SEM0057`, `OWN0001`); a view of a borrowed temporary receiver used after its statement
+reports `OWN0019` at the use (BORROW-006). Through a reference receiver, the diagnostics are those
+of the explicit spelling: a `self: &mut Self` method called through a shared reference reports
+`SEM0058` as `&mut counter` does, a `self: Self` method on an affine referent reports `OWN0012`, and
+an outstanding loan of the referent that conflicts with the reborrow reports `OWN0010`.
 
 **Evidence:** [method call semantics](../../../../packages/compiler/src/ExpressionAnalysis.ts),
 [method-call specification](../../../../openspec/specs/bootstrap-method-calls/spec.md),
