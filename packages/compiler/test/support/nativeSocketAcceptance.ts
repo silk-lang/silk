@@ -144,7 +144,7 @@ effect fn exerciseConnection(connection: &mut Connection) -> i32
 ? &mut MonotonicClock {
   if Connection.phase(&connection.*) != ConnectionPhase.Open { return 1 }
   let mut output: [u8; 4] = [0, 0, 0, 0]
-  let first = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let first = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move first {
     ReadTransfer.Data {count} => {
@@ -152,36 +152,36 @@ effect fn exerciseConnection(connection: &mut Connection) -> i32
     }
     ReadTransfer.End => { return 3 }
   }
-  let second = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let second = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move second {
     ReadTransfer.Data {count} => { return 4 }
     ReadTransfer.End => {}
   }
-  let third = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let third = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move third {
     ReadTransfer.Data {count} => { return 5 }
     ReadTransfer.End => {}
   }
-  let written = run ByteDuplex.writeSome(b"hello", Option.none<Instant>())
+  let written = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   if written != 2 { return 6 }
-  run ByteDuplex.flush(Option.none<Instant>())
+  run ByteDuplex.flush(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
-  run ByteDuplex.shutdownWrite(Option.none<Instant>())
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
-  run ByteDuplex.shutdownWrite(Option.none<Instant>())
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   if Connection.phase(&connection.*) != ConnectionPhase.WriteClosed { return 7 }
-  let afterShutdown = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let afterShutdown = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move afterShutdown {
     ReadTransfer.Data {count} => { return 8 }
     ReadTransfer.End => {}
   }
   let laterWrite = run Effect.result(
-    ByteDuplex.writeSome(b"later", Option.none<Instant>())
+    ByteDuplex.writeSome(b"later", Option<Instant>.none())
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   match move laterWrite {
@@ -211,7 +211,7 @@ effect fn runResolved(mode: i32, two: bool, expectedWaits: usize) -> i32
     result = run connectResolved(
       &endpoints,
       ConnectOptions.defaults(),
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       exerciseConnection,
     ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   } else {
@@ -219,7 +219,7 @@ effect fn runResolved(mode: i32, two: bool, expectedWaits: usize) -> i32
     result = run connectResolved(
       &endpoints,
       ConnectOptions.defaults(),
-      Option.none<Instant>(),
+      Option<Instant>.none(),
       exerciseConnection,
     ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   }
@@ -241,7 +241,7 @@ effect fn runUnixRetry() -> i32 ! NativeSocketError | ByteIoError {
   let result = run connectUnix(
     b"/tmp/silk-jul-146.sock",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     exerciseConnection,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if result != 42 { return result }
@@ -332,7 +332,7 @@ effect fn invalidCases() -> i32 {
   let attempted = run Effect.result(connectUnix(
     b"relative.sock",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -349,7 +349,7 @@ effect fn invalidCases() -> i32 {
   let empty = run Effect.result(connectUnix(
     b"",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   if !invalidUnixMatches(move empty, InvalidEndpointReason.EmptyPath, usize.ZERO)
@@ -357,7 +357,7 @@ effect fn invalidCases() -> i32 {
   let nul = run Effect.result(connectUnix(
     b"/tmp/\\x00socket",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   if !invalidUnixMatches(move nul, InvalidEndpointReason.NulPath, 5)
@@ -365,7 +365,7 @@ effect fn invalidCases() -> i32 {
   let abstract = run Effect.result(connectUnix(
     b"\\x00silk",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   if !invalidUnixMatches(move abstract, InvalidEndpointReason.AbstractPath, usize.ZERO)
@@ -373,7 +373,7 @@ effect fn invalidCases() -> i32 {
   let oversized = run Effect.result(connectUnix(
     b"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   if !invalidUnixMatches(move oversized, InvalidEndpointReason.PathTooLong, 108)
@@ -384,7 +384,7 @@ effect fn invalidCases() -> i32 {
   let emptyAttempt = run Effect.result(connectResolved(
     &emptyEndpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move emptyAttempt {
@@ -406,7 +406,7 @@ effect fn invalidCases() -> i32 {
   let tooMany = run Effect.result(connectResolved(
     &endpoints,
     bounded,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move tooMany {
@@ -467,7 +467,7 @@ effect fn reachedDeadlineCases() -> i32 {
   let resolved = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.some<Instant>(SystemClock.make(7, 123)),
+    Option<Instant>.some(SystemClock.make(7, 123)),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move resolved {
@@ -486,7 +486,7 @@ effect fn reachedDeadlineCases() -> i32 {
   let unix = run Effect.result(connectUnix(
     b"/tmp/silk-jul-146.sock",
     ConnectOptions.defaults(),
-    Option.some<Instant>(move deadline),
+    Option<Instant>.some(move deadline),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move unix {
@@ -507,7 +507,7 @@ effect fn attemptPolicyCases() -> i32 {
   let exhausted = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move exhausted {
@@ -533,7 +533,7 @@ effect fn attemptPolicyCases() -> i32 {
   let terminal = run Effect.result(connectResolved(
     &terminalEndpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move terminal {
@@ -553,14 +553,14 @@ effect fn emptyTransfers(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   unsafe { silk_socket_stub_mark_callback() }
   let mut output: [u8; 0] = []
-  let read = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let read = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   match move read {
     ReadTransfer.Data {count} => { if count != usize.ZERO { return 1 } }
     ReadTransfer.End => { return 2 }
   }
   let input: [u8; 0] = []
-  let written = run ByteDuplex.writeSome(&input, Option.none<Instant>())
+  let written = run ByteDuplex.writeSome(&input, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   if written != usize.ZERO { return 3 }
   if unsafe silk_socket_stub_recvs() != 0 || unsafe silk_socket_stub_sends() != 0 { return 4 }
@@ -571,7 +571,7 @@ effect fn readOne(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   unsafe { silk_socket_stub_mark_callback() }
   let mut output: [u8; 4] = [0, 0, 0, 0]
-  let read = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let read = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   return match move read {
     ReadTransfer.Data {count} => {
@@ -585,7 +585,7 @@ effect fn readOne(connection: &mut Connection) -> i32 ! ByteIoError
 effect fn writeOne(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   unsafe { silk_socket_stub_mark_callback() }
-  let written = run ByteDuplex.writeSome(b"hello", Option.none<Instant>())
+  let written = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   if written != 2 { return 1 }
   return 42
@@ -595,7 +595,7 @@ effect fn readForError(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   unsafe { silk_socket_stub_mark_callback() }
   let mut output: [u8; 4] = [0, 0, 0, 0]
-  let transfer = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let transfer = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   drop move transfer
   return 1
@@ -604,7 +604,7 @@ effect fn readForError(connection: &mut Connection) -> i32 ! ByteIoError
 effect fn writeForError(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   unsafe { silk_socket_stub_mark_callback() }
-  let count = run ByteDuplex.writeSome(b"hello", Option.none<Instant>())
+  let count = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   drop count
   return 1
@@ -618,7 +618,7 @@ effect fn runReadRetry(mode: i32, expectedWaits: usize, expectedRecvs: i32) -> i
   let value = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     readOne,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if value != 42 || clock.waits != expectedWaits { return 1 }
@@ -635,7 +635,7 @@ effect fn runWriteRetry(mode: i32, expectedWaits: usize, expectedSends: i32) -> 
   let value = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeOne,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if value != 42 || clock.waits != expectedWaits { return 1 }
@@ -651,7 +651,7 @@ effect fn expectReadError(mode: i32, operation: ByteIoOperation, code: i32, inva
   let attempted = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     readForError,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -677,7 +677,7 @@ effect fn expectWriteCountError(mode: i32, expectedCount: usize) -> i32 {
   let attempted = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeForError,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -700,7 +700,7 @@ effect fn expectWriteProvider(mode: i32, expectedCode: i32) -> i32 {
   let attempted = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     writeForError,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -759,7 +759,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let setup = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     markedSuccess,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move setup {
@@ -780,7 +780,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let success = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     markedSuccess,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if success != 42 || unsafe silk_socket_stub_callbacks() != 1 { return 124 }
@@ -791,7 +791,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let protected = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     markedFailure,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move protected {
@@ -810,7 +810,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let explicit = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     explicitClose,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if explicit != 42 || unsafe silk_socket_stub_close_attempts() != 1 { return 130 }
@@ -819,7 +819,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let byteClose = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     explicitByteClose,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if byteClose != 42 || unsafe silk_socket_stub_close_attempts() != 1 { return 134 }
@@ -832,7 +832,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let configured = run connectResolved(
     &endpoints,
     noDelay,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if configured != 42 || unsafe silk_socket_stub_nodelay() != 1 { return 132 }
@@ -841,7 +841,7 @@ effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
   let empty = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     emptyTransfers,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if empty != 42 { return 133 }
@@ -852,7 +852,7 @@ effect fn timedRead(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   let mut output: [u8; 1] = [0]
   let attempted = run Effect.result(
-    ByteDuplex.readSome(&mut output, Option.some<Instant>(SystemClock.make(0, 1)))
+    ByteDuplex.readSome(&mut output, Option<Instant>.some(SystemClock.make(0, 1)))
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   return match move attempted {
@@ -870,7 +870,7 @@ effect fn timedRead(connection: &mut Connection) -> i32 ! ByteIoError
 effect fn timedShutdown(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
   let attempted = run Effect.result(
-    ByteDuplex.shutdownWrite(Option.some<Instant>(SystemClock.make(0, 1)))
+    ByteDuplex.shutdownWrite(Option<Instant>.some(SystemClock.make(0, 1)))
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   return match move attempted {
@@ -892,7 +892,7 @@ effect fn runSequencedNoTransfer(mode: i32, expireAt: usize) -> i32 ! NativeSock
   return run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.some<Instant>(SystemClock.make(0, 1)),
+    Option<Instant>.some(SystemClock.make(0, 1)),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
 }
@@ -905,7 +905,7 @@ effect fn runSequencedRead(mode: i32, expireAt: usize) -> i32
   return run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.some<Instant>(SystemClock.make(0, 1)),
+    Option<Instant>.some(SystemClock.make(0, 1)),
     timedRead,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
 }
@@ -918,7 +918,7 @@ effect fn runSequencedShutdown(mode: i32, expireAt: usize) -> i32
   return run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.some<Instant>(SystemClock.make(0, 1)),
+    Option<Instant>.some(SystemClock.make(0, 1)),
     timedShutdown,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
 }
@@ -930,7 +930,7 @@ effect fn deadlineBoundaryCases() -> i32 ! NativeSocketError | ByteIoError {
   let first = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.some<Instant>(SystemClock.make(0, 1)),
+    Option<Instant>.some(SystemClock.make(0, 1)),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut beforeConfigure))
   match move first {
@@ -955,7 +955,7 @@ effect fn deadlineBoundaryCases() -> i32 ! NativeSocketError | ByteIoError {
   let configured = run Effect.result(connectResolved(
     &endpoints,
     move noDelay,
-    Option.some<Instant>(SystemClock.make(0, 1)),
+    Option<Instant>.some(SystemClock.make(0, 1)),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut betweenConfigure))
   match move configured {
@@ -1023,7 +1023,7 @@ effect fn deadlineBoundaryCases() -> i32 ! NativeSocketError | ByteIoError {
 
 effect fn shutdownOnce(connection: &mut Connection) -> i32 ! ByteIoError
 ? &mut MonotonicClock {
-  run ByteDuplex.shutdownWrite(Option.none<Instant>())
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   return 42
 }
@@ -1035,7 +1035,7 @@ effect fn expectShutdown(mode: i32, expectedWaits: usize, expectedCalls: i32, ex
   let attempted = run Effect.result(connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     shutdownOnce,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -1063,7 +1063,7 @@ effect fn afterExplicitClose(connection: &mut Connection) -> i32
   run ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   let mut output: [u8; 1] = [0]
   let read = run Effect.result(
-    ByteDuplex.readSome(&mut output, Option.none<Instant>())
+    ByteDuplex.readSome(&mut output, Option<Instant>.none())
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   match move read {
@@ -1074,7 +1074,7 @@ effect fn afterExplicitClose(connection: &mut Connection) -> i32
     _ => { return 3 }
   }
   let write = run Effect.result(
-    ByteDuplex.writeSome(b"hello", Option.none<Instant>())
+    ByteDuplex.writeSome(b"hello", Option<Instant>.none())
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   match move write {
@@ -1085,7 +1085,7 @@ effect fn afterExplicitClose(connection: &mut Connection) -> i32
     _ => { return 6 }
   }
   let flush = run Effect.result(
-    ByteDuplex.flush(Option.none<Instant>()) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    ByteDuplex.flush(Option<Instant>.none()) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   match move flush {
     Result<(), ByteIoError>.Failure {error} => match move error {
@@ -1095,7 +1095,7 @@ effect fn afterExplicitClose(connection: &mut Connection) -> i32
     _ => { return 9 }
   }
   let shutdown = run Effect.result(
-    ByteDuplex.shutdownWrite(Option.none<Instant>())
+    ByteDuplex.shutdownWrite(Option<Instant>.none())
       |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   )
   match move shutdown {
@@ -1123,7 +1123,7 @@ effect fn expectSetupFailure(
   let attempted = run Effect.result(connectResolved(
     &endpoints,
     move options,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move attempted {
@@ -1165,7 +1165,7 @@ effect fn lifecycleEdgeCases() -> i32 ! NativeSocketError | ByteIoError {
   let closed = run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     afterExplicitClose,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if closed != 42 { return closed }
@@ -1179,7 +1179,7 @@ effect fn lifecycleEdgeCases() -> i32 ! NativeSocketError | ByteIoError {
   let ordered = run connectResolved(
     &orderedEndpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     noTransfer,
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if ordered != 42 || unsafe silk_socket_stub_first_close_event() <= 0
@@ -1264,7 +1264,7 @@ effect fn ownedAcquisitionCases() -> i32 ! NativeSocketError {
   let resolved = run connectResolvedOwned(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   if unsafe silk_socket_stub_closes() != 0
     || unsafe silk_socket_stub_sockets() != 1
@@ -1277,7 +1277,7 @@ effect fn ownedAcquisitionCases() -> i32 ! NativeSocketError {
     let unix = run connectUnixOwned(
       b"/tmp/silk-jul-146.sock",
       ConnectOptions.defaults(),
-      Option.none<Instant>(),
+      Option<Instant>.none(),
     ) |> Effect.provideMut<MonotonicClock>(&mut clock)
     if unsafe silk_socket_stub_closes() != 0
       || unsafe silk_socket_stub_sockets() != 1
@@ -1290,7 +1290,7 @@ effect fn ownedAcquisitionCases() -> i32 ! NativeSocketError {
   let rejected = run Effect.result(connectResolvedOwned(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) |> Effect.provideMut<MonotonicClock>(&mut clock))
   match move rejected {
     Result<Connection, NativeSocketError>.Success {value} => { return 266 }
@@ -1318,7 +1318,7 @@ effect fn parkedOwnedAcquisition() -> i32 ! NativeSocketError {
   let connection = run connectResolvedOwned(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ) |> Effect.provideMut<MonotonicClock>(&mut clock)
   unsafe { silk_socket_stub_mark_callback() }
   drop connection
@@ -1379,7 +1379,7 @@ effect fn cancellationRead(connection: &mut Connection) -> i32
   unsafe { silk_socket_stub_mark_callback() }
   let lifetime = CancellationLifetime {active: true}
   let mut output: [u8; 2] = [0, 0]
-  let transfer = run ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let transfer = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   unsafe { silk_socket_stub_mark_completion() }
   drop transfer
@@ -1394,7 +1394,7 @@ effect fn suspendedConnection() -> i32
   return run connectResolved(
     &endpoints,
     ConnectOptions.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     cancellationRead,
   )
 }
@@ -1402,10 +1402,10 @@ effect fn suspendedConnection() -> i32
 effect fn cancellationRoot() -> i32
 ! OutOfMemoryError | TaskIdExhaustedError
 ? &mut Scheduler | &mut MonotonicClock {
-  let child = run Fiber.forkChild<
+  let child = run Fiber<
     i32,
     NativeSocketError | ByteIoError,
-  >(suspendedConnection())
+  >.forkChild(suspendedConnection())
   drop child
   run Fiber.yieldNow()
   run Fiber.yieldNow()
@@ -1499,13 +1499,13 @@ effect fn nativeCases() -> i32 ! NativeSocketError | ByteIoError | OutOfMemoryEr
   let timed = run runTimed(
     4,
     SystemClock.make(0, 0),
-    Option.some<Instant>(SystemClock.make(0, 2000000)),
+    Option<Instant>.some(SystemClock.make(0, 2000000)),
   )
   if timed != 42 { return timed }
   let overflow = run runTimed(
     4,
     SystemClock.make(i64.MAX, 999500000),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if overflow != 42 { return overflow }
   static if Intrinsic.targetOperatingSystem() == "linux" {

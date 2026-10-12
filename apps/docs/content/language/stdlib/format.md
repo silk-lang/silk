@@ -56,13 +56,13 @@ effect fn render() -> () ! WriterError ? &mut Writer {
   let value = 42
   run Format.display(&value)
   let options = FormatOptions {
-    width: Option.some<usize>(5),
+    width: Option<usize>.some(5),
     alignment: Alignment.Right,
     fill: '.',
     sign: Sign.Always,
     alternate: false,
     zeroPad: false,
-    precision: Option.none<usize>(),
+    precision: Option<usize>.none(),
     color: false,
   }
   return run Format.displayWith(&value, move options)

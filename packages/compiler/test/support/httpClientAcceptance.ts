@@ -81,7 +81,7 @@ const protocolHandler = `impl ConnectionHandler<TestTransport, i32, ClientError 
     }
     if scenario == 1 {
       let selectedOptions = RequestOptions {
-        deadline: Option.none<Instant>(),
+        deadline: Option<Instant>.none(),
         continuePolicy: ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)},
       }
       let result = run invokeExchange(
@@ -97,7 +97,7 @@ const protocolHandler = `impl ConnectionHandler<TestTransport, i32, ClientError 
     }
     if scenario == 2 {
       let selectedOptions = RequestOptions {
-        deadline: Option.none<Instant>(),
+        deadline: Option<Instant>.none(),
         continuePolicy: ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)},
       }
       let result = run invokeExchange(
@@ -191,7 +191,7 @@ const protocolHandler = `impl ConnectionHandler<TestTransport, i32, ClientError 
       return 0
     }
     let options = RequestOptions {
-      deadline: Option.none<Instant>(),
+      deadline: Option<Instant>.none(),
       continuePolicy: ContinuePolicy.Disabled,
     }
     let result = run invokeExchange(&mut connection.*, &request, move options, scenario)
@@ -202,7 +202,7 @@ const protocolHandler = `impl ConnectionHandler<TestTransport, i32, ClientError 
       return 12
     }
     let options2 = RequestOptions {
-      deadline: Option.none<Instant>(),
+      deadline: Option<Instant>.none(),
       continuePolicy: ContinuePolicy.Disabled,
     }
     let second = run invokeExchange(&mut connection.*, &request, move options2, scenario)
@@ -223,7 +223,7 @@ const boundaryHandler = `impl ConnectionHandler<TestTransport, i32, ClientError 
       options.continuePolicy = ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)}
     }
     if scenario == 13 || scenario == 18 {
-      options.deadline = Option.some<Instant>(SystemClock.make(5, 0))
+      options.deadline = Option<Instant>.some(SystemClock.make(5, 0))
     }
     let attempted = run Effect.result(
       invokeExchange(&mut connection.*, &request, move options, scenario),
@@ -812,7 +812,7 @@ effect fn runOwned(transport: TestTransport, origin: Origin, scenario: i32, hand
       origin,
       Version.Http11,
       limits(),
-      Option.none<Instant>(),
+      Option<Instant>.none(),
     )
     let result = run Effect.result(
       ConnectionHandler<TestTransport, i32, ClientError | OutOfMemoryError | CallbackFailure ? &mut Allocator | &mut MonotonicClock | &mut Random>.handle(
@@ -836,9 +836,9 @@ effect fn runOwned(transport: TestTransport, origin: Origin, scenario: i32, hand
   if scenario == 12 {
     selectedLimits.maxInformationalWireBytes = 10
   }
-  let mut overall = Option.none<Instant>()
+  let mut overall = Option<Instant>.none()
   if scenario == 8 {
-    overall = Option.some<Instant>(SystemClock.make(0, 0))
+    overall = Option<Instant>.some(SystemClock.make(0, 0))
   }
   return run Client.withOwned(
     move transport,
@@ -926,7 +926,7 @@ effect fn runCase(scenario: i32) -> i32 ! ClientError | RequestError | OutOfMemo
     shutdownCount: usize.ZERO,
     writeShutdown: false,
     closed: false,
-${routeTransportFields.length > 0 ? '    routeAudit: Option.none<Shared<RouteAudit>>(),' : ''}
+${routeTransportFields.length > 0 ? '    routeAudit: Option<Shared<RouteAudit>>.none(),' : ''}
   }
 ${routeWitness}
   let handler = Handler {request: move request, scenario: scenario}
@@ -1119,7 +1119,7 @@ effect<'call> fn transferredTunnel<'call, 'tunnel: 'call>(
   channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
 ) -> i32 ? &mut MonotonicClock {
   let mut output: [u8; 4] = [0, 0, 0, 0]
-  let reading = ByteDuplex.readSome(&mut output, Option.none<Instant>())
+  let reading = ByteDuplex.readSome(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut channel.*)
   let attempted = run Effect.result(move reading)
   return match move attempted {
@@ -1508,7 +1508,7 @@ effect<'call> fn discardExchange<'call, 'exchange: 'call>(
   let attempted = run Effect.result(Client.discardRemainingAtMost(
     &mut exchangeValue.*,
     budget,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move attempted {
     Result.Success {value} => match move value {
@@ -1700,7 +1700,7 @@ fn appendRouteOutput(state: &mut RouteAudit, input: &[u8]) -> bool {
 fn recordRouteOutput(audit: &Option<Shared<RouteAudit>>, input: &[u8]) -> bool {
   return match & audit.* {
     Option.None => true
-    Option.Some {value} => Shared.withMut<RouteAudit, bool>(&value, fn(state: &mut RouteAudit) -> bool {
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
       return appendRouteOutput(&mut state.*, input)
     })
   }
@@ -1713,7 +1713,7 @@ fn recordRouteTlsOutput(
 ) -> bool {
   return match & audit.* {
     Option.None => true
-    Option.Some {value} => Shared.withMut<RouteAudit, bool>(&value, fn(state: &mut RouteAudit) -> bool {
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
       if scenario == 23 {
         state.concreteWriteCount = state.concreteWriteCount + usize.ONE
         return true
@@ -1728,7 +1728,7 @@ fn recordProxyConcreteRead(audit: &Option<Shared<RouteAudit>>, scenario: i32) ->
   if scenario != 23 { return () }
   match & audit.* {
     Option.None => {}
-    Option.Some {value} => Shared.withMut<RouteAudit, ()>(&value, fn(state: &mut RouteAudit) -> () {
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
       state.concreteReadCount = state.concreteReadCount + usize.ONE
       return ()
     })
@@ -1740,7 +1740,7 @@ fn recordProxyConcreteFlush(audit: &Option<Shared<RouteAudit>>, scenario: i32) -
   if scenario != 23 { return () }
   match & audit.* {
     Option.None => {}
-    Option.Some {value} => Shared.withMut<RouteAudit, ()>(&value, fn(state: &mut RouteAudit) -> () {
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
       state.concreteFlushCount = state.concreteFlushCount + usize.ONE
       return ()
     })
@@ -1752,7 +1752,7 @@ fn recordProxyConcreteShutdown(audit: &Option<Shared<RouteAudit>>, scenario: i32
   if scenario != 23 { return () }
   match & audit.* {
     Option.None => {}
-    Option.Some {value} => Shared.withMut<RouteAudit, ()>(&value, fn(state: &mut RouteAudit) -> () {
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
       state.concreteShutdownCount = state.concreteShutdownCount + usize.ONE
       return ()
     })
@@ -1764,7 +1764,7 @@ fn recordProxyConcreteClose(audit: &Option<Shared<RouteAudit>>, scenario: i32) -
   if scenario != 23 { return false }
   return match & audit.* {
     Option.None => false
-    Option.Some {value} => Shared.withMut<RouteAudit, bool>(&value, fn(state: &mut RouteAudit) -> bool {
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
       state.concreteCloseCount = state.concreteCloseCount + usize.ONE
       return true
     })
@@ -1780,7 +1780,7 @@ fn recordRouteConnectAccepted(
   if readOffset < head.length || !sameRouteBytes(input, usize.ZERO, head) { return () }
   match & audit.* {
     Option.None => {}
-    Option.Some {value} => Shared.withMut<RouteAudit, ()>(&value, fn(state: &mut RouteAudit) -> () {
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
       state.connectAccepted = true
       return ()
     })
@@ -1808,7 +1808,7 @@ impl<A, E, ?R> ScriptedRouteClient<A, E, R> {
     drop deadline
     let ScriptedRouteClient<A, E, R> {provider, settingsValue} = move client
     drop settingsValue
-    return run AcquiredRouteContext.use<TestTransport, A, E, R>(move provider)
+    return run AcquiredRouteContext<TestTransport, A, E, R>.use(move provider)
   }
 }
 
@@ -1838,7 +1838,7 @@ impl RoutedNoop {
     >,
   ) -> i32 {
     if let Option.Some {value} = &handler.audit {
-      Shared.withMut<RouteAudit, ()>(&value, fn(state: &mut RouteAudit) -> () {
+      Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
         state.handlerCount = state.handlerCount + usize.ONE
         return ()
       })
@@ -1949,7 +1949,7 @@ struct SelectedProxyLifecycle { value: Shared<RouteAudit> }
 
 impl ProxyLifecycle for SelectedProxyLifecycle {
   effect fn audit(self: &Self) -> Shared<RouteAudit> {
-    return Shared.clone<RouteAudit>(&self.value)
+    return Shared<RouteAudit>.clone(&self.value)
   }
 }
 
@@ -1987,7 +1987,7 @@ effect<'call> fn rejectedProxyExchange<'call, 'exchange: 'call>(
 ) -> i32 ? &ProxyLifecycle {
   drop exchange
   let audit = run ProxyLifecycle.audit()
-  Shared.withMut<RouteAudit, ()>(&audit, fn(state: &mut RouteAudit) -> () {
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
     state.rejectedExchangeCallbackCount = state.rejectedExchangeCallbackCount + usize.ONE
     return ()
   })
@@ -1999,7 +1999,7 @@ effect<'call> fn unexpectedProxyPublication<'call, 'tunnel: 'call>(
 ) -> i32 ? &ProxyLifecycle {
   drop channel
   let audit = run ProxyLifecycle.audit()
-  Shared.withMut<RouteAudit, ()>(&audit, fn(state: &mut RouteAudit) -> () {
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
     state.publicationCount = state.publicationCount + usize.ONE
     return ()
   })
@@ -2010,12 +2010,12 @@ effect<'call> fn exerciseProxyDuplex<'call, 'tunnel: 'call>(
   channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
 ) -> i32 ! CallbackFailure ? &ProxyLifecycle | &mut MonotonicClock {
   let audit = run ProxyLifecycle.audit()
-  Shared.withMut<RouteAudit, ()>(&audit, fn(state: &mut RouteAudit) -> () {
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
     state.publicationCount = state.publicationCount + usize.ONE
     return ()
   })
 
-  let writing = ByteDuplex.writeSome(b"PING", Option.none<Instant>())
+  let writing = ByteDuplex.writeSome(b"PING", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut channel.*)
   match move run Effect.result(move writing) {
     Result.Failure {error} => { return 163 }
@@ -2023,14 +2023,14 @@ effect<'call> fn exerciseProxyDuplex<'call, 'tunnel: 'call>(
       if value != 4 { return 164 }
     }
   }
-  let flushing = ByteDuplex.flush(Option.none<Instant>())
+  let flushing = ByteDuplex.flush(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut channel.*)
   let flushed = run Effect.result(move flushing)
   if let Result.Failure {error} = move flushed {
     drop error
     return 165
   }
-  let shutdown = ByteDuplex.shutdownWrite(Option.none<Instant>())
+  let shutdown = ByteDuplex.shutdownWrite(Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut channel.*)
   let shutDown = run Effect.result(move shutdown)
   if let Result.Failure {error} = move shutDown {
@@ -2039,7 +2039,7 @@ effect<'call> fn exerciseProxyDuplex<'call, 'tunnel: 'call>(
   }
 
   let mut remaining: [u8; 4] = [0, 0, 0, 0]
-  let remainingRead = ByteDuplex.readSome(&mut remaining, Option.none<Instant>())
+  let remainingRead = ByteDuplex.readSome(&mut remaining, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut channel.*)
   match move run Effect.result(move remainingRead) {
     Result.Failure {error} => { return 167 }
@@ -2110,7 +2110,7 @@ impl ProxyLifecycleHandler {
   ! ClientError | OutOfMemoryError | CallbackFailure
   ? &mut Allocator | &mut MonotonicClock | &mut Random {
     let ProxyLifecycleHandler {ordinary, connect, audit} = move handler
-    let selected = SelectedProxyLifecycle {value: Shared.clone<RouteAudit>(&audit)}
+    let selected = SelectedProxyLifecycle {value: Shared<RouteAudit>.clone(&audit)}
     let rejected = Client.withExchange(
       &mut connection.*,
       &ordinary,
@@ -2126,7 +2126,7 @@ impl ProxyLifecycleHandler {
         OutOfMemoryError allocation => { fail move allocation }
       }
     }
-    if !Shared.with<RouteAudit, bool>(&audit, proxyNoOutputOrCallback) { return 182 }
+    if !Shared<RouteAudit>.with<bool>(&audit, proxyNoOutputOrCallback) { return 182 }
     let connected = Client.withExchange(
       &mut connection.*,
       &connect,
@@ -2232,7 +2232,7 @@ effect fn verifyProxyHeadLimit(
     shutdownCount: usize.ZERO,
     writeShutdown: false,
     closed: false,
-    routeAudit: Option.none<Shared<RouteAudit>>(),
+    routeAudit: Option<Shared<RouteAudit>>.none(),
   }
   let mut selectedLimits = limits()
   selectedLimits.head.maxHeadBytes = 160
@@ -2241,7 +2241,7 @@ effect fn verifyProxyHeadLimit(
     peer,
     Version.Http11,
     move selectedLimits,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     ProxyHeadLimitHandler {request: move request},
   ))
   return match move attempted {
@@ -2258,7 +2258,7 @@ effect fn routedProxyLifecycle() -> i32 ! OutOfMemoryError {
   let policyVerification = verifyProxyPolicy()
     |> Effect.provideMut<Allocator>(&mut allocator)
   if !run move policyVerification { return 183 }
-  let audit = run Shared.make<RouteAudit>(emptyRouteAudit())
+  let audit = run Shared<RouteAudit>.make(emptyRouteAudit())
     |> Effect.provideMut<Allocator>(&mut allocator)
   let emptyOrigins: [Origin; 0] = []
   let bypass = match move run BypassPolicy.copy(&emptyOrigins)
@@ -2359,7 +2359,7 @@ effect fn routedProxyLifecycle() -> i32 ! OutOfMemoryError {
     shutdownCount: usize.ZERO,
     writeShutdown: false,
     closed: false,
-    routeAudit: Option.some<Shared<RouteAudit>>(Shared.clone<RouteAudit>(&audit)),
+    routeAudit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit)),
   }
   let mut selectedLimits = limits()
   selectedLimits.readCapacity = ${proxyLifecycleHead.length}
@@ -2368,11 +2368,11 @@ effect fn routedProxyLifecycle() -> i32 ! OutOfMemoryError {
     peer,
     Version.Http11,
     move selectedLimits,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     ProxyLifecycleHandler {
       ordinary: move ordinary,
       connect: move connect,
-      audit: Shared.clone<RouteAudit>(&audit),
+      audit: Shared<RouteAudit>.clone(&audit),
     },
   ))
     |> Effect.provideMut<Random>(&mut random)
@@ -2386,13 +2386,13 @@ effect fn routedProxyLifecycle() -> i32 ! OutOfMemoryError {
     }
   }
   if !preserved { return 196 }
-  if !Shared.with<RouteAudit, bool>(&audit, proxyLifecycleAuditPassed) { return 197 }
+  if !Shared<RouteAudit>.with<bool>(&audit, proxyLifecycleAuditPassed) { return 197 }
   return 0
 }
 
 effect fn routedWrongName() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<RouteAudit>(emptyRouteAudit())
+  let audit = run Shared<RouteAudit>.make(emptyRouteAudit())
     |> Effect.provideMut<Allocator>(&mut allocator)
   let provider = TestTransport {
     scenario: 22,
@@ -2404,7 +2404,7 @@ effect fn routedWrongName() -> i32 ! OutOfMemoryError {
     shutdownCount: usize.ZERO,
     writeShutdown: false,
     closed: false,
-    routeAudit: Option.some<Shared<RouteAudit>>(Shared.clone<RouteAudit>(&audit)),
+    routeAudit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit)),
   }
   let empty: [Origin; 0] = []
   let bypass = match move run BypassPolicy.copy(&empty)
@@ -2468,9 +2468,9 @@ effect fn routedWrongName() -> i32 ! OutOfMemoryError {
   let attempted = run Effect.result(Client.withRoute(
     move client,
     route,
-    Option.some<TrustSnapshot>(move trust),
-    Option.none<Instant>(),
-    RoutedNoop {audit: Option.some<Shared<RouteAudit>>(Shared.clone<RouteAudit>(&audit))},
+    Option<TrustSnapshot>.some(move trust),
+    Option<Instant>.none(),
+    RoutedNoop {audit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit))},
   ))
     |> Effect.provideMut<SystemClock>(&mut wall)
     |> Effect.provideMut<Random>(&mut random)
@@ -2484,7 +2484,7 @@ effect fn routedWrongName() -> i32 ! OutOfMemoryError {
     }
   }
   if !failedByIdentity { return 157 }
-  if !Shared.with<RouteAudit, bool>(&audit, routedAuditPassed) { return 158 }
+  if !Shared<RouteAudit>.with<bool>(&audit, routedAuditPassed) { return 158 }
   return 0
 }
 
@@ -2549,9 +2549,9 @@ effect fn typecheckRoute(transport: TestTransport) -> i32
   return run Client.withRoute(
     move client,
     route,
-    Option.none<TrustSnapshot>(),
-    Option.none<Instant>(),
-    RoutedNoop {audit: Option.none<Shared<RouteAudit>>()},
+    Option<TrustSnapshot>.none(),
+    Option<Instant>.none(),
+    RoutedNoop {audit: Option<Shared<RouteAudit>>.none()},
   )
 }
 `

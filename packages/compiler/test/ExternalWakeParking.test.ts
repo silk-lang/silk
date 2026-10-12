@@ -130,7 +130,7 @@ effect fn program() -> () ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let guardStorage = run Allocator.allocate(Layout.of<i32>())
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let state = run Shared.make<WaiterState>(WaiterState { slot: Empty {} })
+  let state = run Shared<WaiterState>.make(WaiterState { slot: Empty {} })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut execution = run Execution.make(parked(move guardStorage, move state), (), ready)
     |> Effect.provideMut<Allocator>(&mut allocator)
