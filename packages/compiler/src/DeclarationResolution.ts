@@ -2140,10 +2140,10 @@ type InlineParameters = ReadonlyMap<string, ReadonlySet<number>>
  * Walks the nominals and parameters whose layout one type's layout actually requires.
  *
  * A struct embeds its fields, so a field reaches everything its type names outside an indirecting
- * position. `RawBuffer<T>`, `Slot<T>`, and `SharedCore<T>` are compiler-owned indirections: their
- * representations do not embed `T`, so the walk names them and stops rather than descending into
- * the element. Every other nominal is entered only through the arguments its own declaration
- * reaches inline, which `inlineParameters` supplies.
+ * position. `Intrinsic.RawBuffer<T>`, `Intrinsic.Slot<T>`, and `SharedCore<T>` are compiler-owned
+ * indirections: their representations do not embed `T`, so the walk names them and stops rather
+ * than descending into the element. Every other nominal is entered only through the arguments its
+ * own declaration reaches inline, which `inlineParameters` supplies.
  * References and slices store addresses, so their pointee layouts are also indirect. Arrays,
  * callables, effects, and unions descend exactly as `Type.nominals` does, so this graph is
  * narrower than the reported dependency graph and never wider.

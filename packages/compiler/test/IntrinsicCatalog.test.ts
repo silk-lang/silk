@@ -2063,17 +2063,17 @@ it.effect(
       const ordinary = `struct Slot { value: i32 }
 struct RawBuffer { count: i32 }
 struct Allocation { size: i32 }
-fn total(slot: Slot, buffer: RawBuffer, allocation: Allocation) -> i32 {
+fn total(slot: Slot, buffer: RawBuffer, allocation: Allocation) -> i32 { // ordinary: user types
   return slot.value + buffer.count + allocation.size
 }
 fn length(buffer: &Intrinsic.RawBuffer<i32>) -> usize { return Intrinsic.rawBufferCount<i32>(buffer) }
-pub fn main() -> i32 { return total(Slot {value: 40}, RawBuffer {count: 1}, Allocation {size: 1}) }`
+pub fn main() -> i32 { return total(Slot {value: 40}, RawBuffer {count: 1}, Allocation {size: 1}) } // ordinary: user types`
       const declared = yield* AnalysisFixture.frontend(
         'intrinsic/ordinary-storage-names',
         encoder.encode(ordinary),
       )
       assert.deepEqual(Analysis.diagnostics(declared), [])
-      const bare = `fn view<'s>(slot: Slot<'s, i32>) -> i32 { return 0 }
+      const bare = `fn view<'s>(slot: Slot<'s, i32>) -> i32 { return 0 } // ordinary: no declaration
 pub fn main() -> i32 { return 0 }`
       const unresolved = yield* AnalysisFixture.frontend(
         'intrinsic/bare-storage-name',
