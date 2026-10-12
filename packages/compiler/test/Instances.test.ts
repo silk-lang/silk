@@ -1445,7 +1445,7 @@ struct Fork { first: Box<Leaf> second: Vector<Leaf> }
     ]
     const program = (held: ReadonlyArray<string>) =>
       snapshot(`${declarations}pub fn main() -> i32 {
-${held.map((owner, ordinal) => `  let held${ordinal} = Vector.make<${owner}>()`).join('\n')}
+${held.map((owner, ordinal) => `  let held${ordinal} = Vector<${owner}>.make()`).join('\n')}
   return 0
 }`)
     const keys = (result: Analysis.Snapshot): ReadonlyArray<string> =>

@@ -287,9 +287,9 @@ fn pointers(value: &mut i32, values: &mut [u8], shared: &i32, view: &[u8]) -> i3
   let missing = Intrinsic.pointerIsNull<?*mut Opaque>(empty)
   let address = Intrinsic.pointerAddress<?*mut Opaque>(empty)
   let constant = Intrinsic.pointerFromRef<i32>(shared)
-  let mutable = Intrinsic.pointerFromMutRef<i32>(value)
+  let mutable = Intrinsic.pointerFromMutRef<i32>(&mut value)
   let first = Intrinsic.pointerFromSlice<u8>(view)
-  let firstMut = Intrinsic.pointerFromMutSlice<u8>(values)
+  let firstMut = Intrinsic.pointerFromMutSlice<u8>(&mut values)
   unsafe {
     let bytes = Intrinsic.pointerBytes<i32>(constant)
     let many = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(first)

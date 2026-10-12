@@ -1834,6 +1834,37 @@ pub fn main() -> i32 { return 0 }`,
   )
 })
 
+it.effect('requires &mut to forward an exclusive view to an interface operation', () =>
+  Effect.gen(function* () {
+    const source = `interface Bump { fn bump(value: &mut Self) -> i32 }
+fn implicit<T: Bump>(item: &mut T) -> i32 { return Bump.bump(item) }
+fn explicit<T: Bump>(item: &mut T) -> i32 { return Bump.bump(&mut item) }
+fn shared<T: Bump>(item: &T, other: &mut T) -> i32 { return Bump.bump(&mut other) }
+struct Cell { value: i32 }
+interface Take { effect fn take(self: &mut Self) -> i32 }
+effect fn takeCell(self: &mut Cell) -> i32 { return self.value }
+impl Take for Cell { take: Cell.takeCell }
+interface Show { effect fn show(self: &Self, into: &mut Cell) -> i32 }
+effect fn showCell(self: &Cell, into: &mut Cell) -> i32 { return into.value }
+impl Show for Cell { show: Cell.showCell }
+effect fn concrete(cell: &mut Cell) -> i32 { return run Take.take(&mut cell) }
+effect fn operand(cell: &Cell, into: &mut Cell) -> i32 { return run Show.show(cell, &mut into) }
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* Analysis.ofSource(
+      'ownership/interface-exclusive-forwarding',
+      ascii(source),
+    )
+
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [{ code: 'OWN0003', start: source.indexOf('item)', source.indexOf('fn implicit')) }],
+    )
+  }),
+)
+
 it('requires explicit transfer at mutable owned parameter boundaries and rejects overlap', () => {
   const caller = check(
     'ownership/mutable-owned-parameter-caller-move',

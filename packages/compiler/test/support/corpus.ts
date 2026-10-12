@@ -10477,7 +10477,7 @@ interface Decoder { effect fn decode(value: &mut Self) -> i32 ! Problem }
 struct Cell { code: i32 }
 effect fn decodeCell(value: &Cell) -> i32 ! Problem { fail Problem { code: 1 } }
 impl Decoder for Cell { decode: Cell.decodeCell }
-fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(value) }
+fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ! Problem> { return Decoder.decode(&mut value) }
 fn observe(result: Result<i32, Problem>) -> i32 {
   return match move result {
     Result<i32, Problem>.Success { value } => value
@@ -11594,14 +11594,14 @@ fn increment(value: &mut Counter) -> i32 {
   return value.value
 }
 fn nested(value: ${outerReference}, alias: Shared<Counter>) -> i32 {
-  return Shared.${inner}<Counter, i32>(&alias, ${innerCallback})
+  return Shared<Counter>.${inner}<i32>(&alias, ${innerCallback})
 }
 effect fn conflictCase() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let first = run (Shared<Counter>.make(Counter { value: 41 })
     |> Effect.provideMut<Allocator>(&mut allocator))
   let alias = Shared<Counter>.clone(&first)
-  return Shared.${outer}<Counter, i32>(&first, nested(move alias))
+  return Shared<Counter>.${outer}<i32>(&first, nested(move alias))
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 0 }
 pub fn main() -> i32 {
