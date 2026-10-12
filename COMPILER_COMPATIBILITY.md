@@ -30,6 +30,19 @@ owner's lifetimes, which the call infers; it is otherwise a complete type.
   arguments on the owner, and the migration codemod is deleted.
 - Retire this entry when both compilers reject the member-prefix spelling with a diagnostic.
 
+## Generic type aliases
+
+TYPE-004 now admits `type Name<Parameters> = Target`, with type and lifetime parameters that each
+occur in the target, every argument written at the use, no inference, no bounds, and union
+re-normalization after substitution (`Fallible<IoError>` is `IoError`).
+
+- **Bootstrap:** implemented. Each distinct instantiation is expanded once per alias.
+- **Native:** not implemented yet. It still rejects alias parameters. The native half follows the
+  hash-consed type table, so expansion can be memoized on interned handles.
+- **Source migration:** none. No standard-library module or corpus program uses a generic alias
+  until the native half lands.
+- Retire this entry when the native compiler accepts the same rules with the same conformance cases.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
