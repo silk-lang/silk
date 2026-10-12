@@ -65,7 +65,7 @@ import semantic.ProfileBinding {
 }
 import semantic.SourceIndex {NoRejection, RevisionMismatch, SourceIndex}
 import semantic.ContentHash {ContentHash}
-import semantic.Rejection {Rejection, RejectionCode}
+import semantic.Rejection {RelatedSite, Rejection, RejectionCode}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
 import semantic.TypedBody {
   BorrowStatus,
@@ -2110,6 +2110,183 @@ pub fn main() -> i32 { return unsafe first(Intrinsic.pointerNull<i32>(), Intrins
     |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(nativeCallbackSymbolConflict(&noCaptureMismatch), "different noCapture ordinals conflict despite identical C machine declarations")
   return ()
+}
+
+// The number of reports a refused build carries.
+fn reportCount(build: &BackendBuild) -> usize {
+  return match & build.* {
+    BackendBuild.Rejected {further, ..} => Vector<Shared<Rejection>>.length(&further) + usize.ONE
+    _ => usize.ZERO
+  }
+}
+
+fn escapeReportedAt(build: &BackendBuild, module: &ModuleId, span: Span, relatedModule: &ModuleId, related: Span) -> bool {
+  if let BackendBuild.Rejected {first, further, ..} = &build.* {
+    if escapeIs(&first, module, span, relatedModule, related) { return true }
+    let rest = Vector<Shared<Rejection>>.asSlice(&further)
+    let mut index = usize.ZERO
+    while index < rest.length {
+      if escapeIs(&rest[index], module, span, relatedModule, related) { return true }
+      index = index + usize.ONE
+    }
+  }
+  return false
+}
+
+fn escapeIs(selected: &Shared<Rejection>, module: &ModuleId, span: Span, relatedModule: &ModuleId, related: Span) -> bool {
+  return Shared<Rejection>.with<bool>(selected, fn(value: &Rejection) -> bool {
+    if let Option<RelatedSite>.Some {value: site} = &value.related {
+      return value.code == RejectionCode.LocalSharedAccessEscape && ModuleId.equals(&value.module, module)
+        && value.span.start == span.start && value.span.end == span.end && ModuleId.equals(&site.module, relatedModule)
+        && site.span.start == related.start && site.span.end == related.end
+    }
+    return false
+  })
+}
+
+fn spanOf(text: string, spelling: string, occurrence: usize) -> Span {
+  let start = offsetOf(text, spelling, occurrence)
+  return Span.make(start, start + String.utf8Bytes(spelling).length)
+}
+
+test effect fn localSharedAccessRejectsEveryReachedEscape() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run localSharedEscapeClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// SHARED-003: nothing a held access's callback reaches may run an Effect or notify an execution.
+// The build reports each escape at its own span, in its own module, related to the call that named
+// the callback, once per pair; no artifact is produced.
+effect fn localSharedEscapeClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let id = run module("local-shared-escapes.silk")
+  let parkingId = run module("parking.silk")
+  let text = """
+import parking { parks }
+struct Empty {}
+struct Armed { reference: Intrinsic.ExecutionRef }
+struct Cell { value: i32 slot: Empty | Armed }
+effect fn pause() -> () { return run Intrinsic.relinquish() }
+fn suspends(cell: &mut Cell) -> i32 {
+  run pause()
+  return cell.value
+}
+fn indirect(cell: &mut Cell) -> i32 { return parks() }
+fn spin(n: i32) -> i32 {
+  if n > 0 { return spin(n - 1) }
+  run pause()
+  return 0
+}
+fn recursive(cell: &mut Cell) -> i32 { return spin(3) }
+fn signals(cell: &mut Cell) -> i32 {
+  let selected = Intrinsic.replace(cell.slot, Empty {})
+  return match move selected {
+    Empty {} => 0
+    Armed { reference } => {
+      Intrinsic.executionNotify(&reference)
+      return 1
+    }
+  }
+}
+fn calm(cell: &mut Cell) -> i32 { return cell.value }
+fn busy() -> i32 { return 0 }
+fn wrap(core: &Intrinsic.SharedCore<Cell>, use: once fn(&mut Cell) -> i32) -> i32 {
+  return Intrinsic.sharedWithMut<Cell, i32>(core, move use, busy)
+}
+// Never called: the build only needs a core to name the accesses below.
+fn unavailable() -> Intrinsic.SharedCore<Cell> { return unavailable() }
+pub fn main() -> i32 {
+  let core = unavailable()
+  let direct = Intrinsic.sharedWithMut<Cell, i32>(&core, suspends, busy)
+  let forwarded = wrap(&core, indirect)
+  let looping = wrap(&core, recursive)
+  let notified = wrap(&core, signals)
+  let clean = wrap(&core, calm)
+  drop core
+  return direct + forwarded + looping + notified + clean
+}
+"""
+  let parkingText = """
+pub fn parks() -> i32 {
+  run Intrinsic.relinquish()
+  return 1
+}
+"""
+  let withParking = run Revision.publish(&Revision.make(), &parkingId, &run present(parkingText))
+  let revision = run Revision.publish(&withParking, &id, &run present(text))
+  let mut store = Semantic.traced(run withEntryRuntime(&revision), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let mut request = Request.forApplication(ModuleId.copy(&id))
+  let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
+  run Testing.expect(reportCount(&built) == 4,
+    "a refused build reports each escaping access once and emits no artifact; a calm callback adds nothing")
+  run Testing.expect(escapeReportedAt(&built, &id, spanOf(text, "run pause()", usize.ZERO),
+    &id, spanOf(text, "Intrinsic.sharedWithMut<Cell, i32>(&core, suspends, busy)", usize.ZERO)),
+    "a callback's own run escapes, related to the access that names it")
+  run Testing.expect(escapeReportedAt(&built, &parkingId, spanOf(parkingText, "run Intrinsic.relinquish()", usize.ZERO),
+    &id, spanOf(text, "wrap(&core, indirect)", usize.ZERO)),
+    "a run in a plain callee in another module escapes there, related to the call that named the callback through a wrapper")
+  run Testing.expect(escapeReportedAt(&built, &id, spanOf(text, "run pause()", usize.ONE),
+    &id, spanOf(text, "wrap(&core, recursive)", usize.ZERO)),
+    "a recursive callee is walked exactly: the run its cycle reaches escapes")
+  run Testing.expect(escapeReportedAt(&built, &id, spanOf(text, "Intrinsic.executionNotify(&reference)", usize.ZERO),
+    &id, spanOf(text, "wrap(&core, signals)", usize.ZERO)),
+    "a direct readiness notification inside the callback escapes")
+}
+
+
+test effect fn localSharedAccessRejectsDiscoveredTests() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run discoveredEscapeClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The `silkc test` entry builds a runner application over the discovery root's catalog; the same
+// build pass judges the accesses the discovered tests reach, so a refused test yields no runner.
+effect fn discoveredEscapeClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let runner = run module("runner.silk")
+  let checks = run module("checks.silk")
+  let runnerText = """
+pub fn main() -> i32 {
+  static for descriptor in Intrinsic.tests() {
+    let body = Intrinsic.testFunction(descriptor)
+    body()
+  }
+  return 0
+}
+"""
+  let checksText = """
+struct Cell { value: i32 }
+effect fn pause() -> () { return run Intrinsic.relinquish() }
+fn parked(cell: &mut Cell) -> i32 {
+  run pause()
+  return cell.value
+}
+fn busy() -> i32 { return 0 }
+fn wrap(core: &Intrinsic.SharedCore<Cell>, use: once fn(&mut Cell) -> i32) -> i32 {
+  return Intrinsic.sharedWithMut<Cell, i32>(core, move use, busy)
+}
+// Never called: the build only needs a core to name the access below.
+fn unavailable() -> Intrinsic.SharedCore<Cell> { return unavailable() }
+test fn heldAccessParks() {
+  let core = unavailable()
+  let value = wrap(&core, parked)
+  drop core
+  drop value
+}
+"""
+  let withChecks = run Revision.publish(&Revision.make(), &checks, &run present(checksText))
+  let revision = run Revision.publish(&withChecks, &runner, &run present(runnerText))
+  let mut store = Semantic.traced(run withEntryRuntime(&revision), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  Semantic.selectDiscovery(&mut store, ModuleId.copy(&checks), Bytes.make())
+  let mut request = Request.forApplication(ModuleId.copy(&runner))
+  let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
+  run Testing.expect(reportCount(&built) == usize.ONE && escapeReportedAt(&built, &checks, spanOf(checksText, "run pause()", usize.ZERO),
+    &checks, spanOf(checksText, "wrap(&core, parked)", usize.ZERO)),
+    "a discovered test's escaping access refuses the runner build at the escape, related to the test's call")
 }
 
 test effect fn nativeIndirectCallbacksRequireUnsafeAndUseCAbiLanes() -> ()

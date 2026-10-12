@@ -256,8 +256,19 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
 - A returned callable or Effect whose region contains a loan of a local is OWN0018.
 - A run or invocation through an aggregate place weaker than the environment's access is OWN0015 or
   OWN0014, checked at the `Call` that runs it.
-- A local-shared access callback gets a region bounded by the access call. A loan into the shared
-  contents that outlives it is OWN0016.
+- A local-shared access callback gets a region bounded by the access call; a loan into the shared
+  contents cannot outlive it, which typing already enforces on the callback's result.
+- OWN0016 (SHARED-003) is not part of the per-body verdict. Whether an access escapes depends on
+  every function its callback reaches, which a body's checking unit never reads. The build enforces
+  it once over the reached instances, in the same pass that rejects suspending foreign callbacks,
+  before any code is emitted. Each held access walks its callback's call graph; every `run` outside
+  an Effect block and every execution readiness notification it reaches is reported at its own span
+  and module, related to the call where the callback entered its access wrappers, once per pair.
+  Both code-producing entries, `silkc build` and `silkc test`, build through that pass. A body's
+  `Checked` verdict therefore covers loans and regions only.
+- Only reached accesses are judged. An access in a declaration no root reaches is judged once the
+  native compiler checks every loaded declaration (MODULE-004), and that work must include this
+  pass.
 - OWN0020 (ownership across suspension) is out of scope until suspension lowering exists
   (`mir-core-shape.md` §6), and is reported as a named gap if reached.
 
@@ -386,10 +397,10 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
 
 - **One `RejectionCode` per bootstrap code**, documented with the bootstrap code it mirrors, as the
   existing ownership codes are: `LoanConflict` (OWN0010), `AccessDuringLoan` (OWN0011),
-  `StoredCallableAccess` (OWN0014), `StoredEffectAccess` (OWN0015), `SharedAccessEscape` (OWN0016),
-  `CaptureEscape` (OWN0018) and `LifetimeInvalidAtUse` (OWN0019). The bootstrap's own wording and
-  the generated diagnostic catalog stay authoritative for text. OWN0017 has no bootstrap call site
-  and is dropped from the catalog (Q5).
+  `StoredCallableAccess` (OWN0014), `StoredEffectAccess` (OWN0015), `LocalSharedAccessEscape`
+  (OWN0016), `CaptureEscape` (OWN0018) and `LifetimeInvalidAtUse` (OWN0019). The bootstrap's own
+  wording and the generated diagnostic catalog stay authoritative for text. OWN0017 has no
+  bootstrap call site and is dropped from the catalog (Q5).
 - **Spelling.** During the transition the native CLI prints each native name together with its
   bootstrap code, for example `AccessDuringLoan (OWN0011)` (Q7).
 - **Spans:** the primary span is the later conflicting access for OWN0010 and OWN0011, relating
@@ -492,7 +503,8 @@ rejects is never accepted.
 5. **Selected static bodies**, per interned selection, including type-specific ones.
 6. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
    EFFECT-OWN-002, provider loans).
-7. **Local sharing** (OWN0016). Suspension stays a named reason until suspension lowering lands.
+7. **Local sharing** (OWN0016), enforced at build scope over the reached instances (§4.5), not in
+   the per-body verdict.
 8. **Parity and closure.**
    - Expected-diagnostic corpus mode (`main` first), the invalid-ownership set, zero unchecked on
      the self-build.
