@@ -1,9 +1,8 @@
 // Applies the native seed retention rule from compiler/docs/native-seed-chain.md to the
 // `native-seed-<commit>` prereleases. Keeps the release named by the current `selfhost` pin, every
 // release named by a pin in effect during the last 30 days of `selfhost` history, and the 20 newest
-// candidates. Reports everything else; deletes it only with --delete.
+// candidates. Prints a Markdown report of everything else; deletes it only with --delete.
 import { execFileSync } from 'node:child_process'
-import { appendFileSync } from 'node:fs'
 
 const usage = 'usage: node prune-native-seeds.mjs <repository> <selfhost-ref> [--delete]\n'
 const [repository, ref, ...flags] = process.argv.slice(2)
@@ -85,7 +84,6 @@ const report = [
   '',
 ].join('\n')
 process.stdout.write(report)
-if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, report)
 
 // The current pin must name a published release; otherwise the listing is wrong, so delete nothing.
 // An older window pin may name a release already pruned by hand; that is only reported.
