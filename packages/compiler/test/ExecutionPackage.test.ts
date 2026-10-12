@@ -247,7 +247,7 @@ pub fn main() -> i32 {
         'pub fn main()',
         `import silk.layout { Layout }
 struct WrongAllocator {}
-effect fn wrongAllocate(self: &mut WrongAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn wrongAllocate(self: &mut WrongAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   let mut inner = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(Intrinsic.sharedLayout<i32>()) |> Effect.provideMut<Allocator>(&mut inner)
 }
