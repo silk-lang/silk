@@ -1139,7 +1139,7 @@ struct Item { kind: Kind }
 union Outcome { Done { items: Vector<Item> }, Empty }
 fn firstIs(answer: &Outcome) -> bool {
   if let Outcome.Done {items} = &answer.* {
-    let listed = Vector.asSlice<Item>(&items)
+    let listed = Vector<Item>.asSlice(&items)
     if listed.length == 1 {
       return match &listed[0].kind { Kind.First => true _ => false }
     }
@@ -1148,7 +1148,7 @@ fn firstIs(answer: &Outcome) -> bool {
 }
 fn takesFirst(answer: &Outcome) -> bool {
   if let Outcome.Done {items} = &answer.* {
-    let listed = Vector.asSlice<Item>(&items)
+    let listed = Vector<Item>.asSlice(&items)
     return match move listed[0].kind { Kind.First => true _ => false }
   }
   return false

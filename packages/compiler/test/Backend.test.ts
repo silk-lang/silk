@@ -739,7 +739,7 @@ struct Payload {
 }
 pub effect fn main() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let shared = run (Shared.make<Payload>(Payload { first: 1, second: 2, third: 3, fourth: 4 })
+  let shared = run (Shared<Payload>.make(Payload { first: 1, second: 2, third: 3, fourth: 4 })
     |> Effect.provideMut<Allocator>(&mut allocator))
   drop shared
   return 1
@@ -765,12 +765,12 @@ import silk.effect { Effect }
 import silk.vector { Vector }
 struct Pair { left: Vector<i32> right: Vector<i32> }
 effect fn fill(values: &mut Vector<i32>, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
-  let appended = run Vector.append<i32>(move values, value)
+  let appended = run Vector<i32>.append(move values, value)
   return ()
 }
 pub effect fn main() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut pair = Pair { left: Vector.make<i32>(), right: Vector.make<i32>() }
+  let mut pair = Pair { left: Vector<i32>.make(), right: Vector<i32>.make() }
   run fill(&mut pair.left, 1) |> Effect.provideMut(&mut allocator)
   run fill(&mut pair.right, 2) |> Effect.provideMut(&mut allocator)
   return 1

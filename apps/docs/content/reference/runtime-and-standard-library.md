@@ -128,7 +128,7 @@ types—enter a module scope only through explicit imports.
 import silk.option { Option }
 
 pub fn main() -> i32 {
-  let value = Option.some<i32>(42)
+  let value = Option<i32>.some(42)
   drop value
   return 0
 }
@@ -272,7 +272,7 @@ import silk.allocator { Allocator, OutOfMemoryError }
 import silk.vector { Vector }
 
 effect fn copyValues(values: &[i32]) -> Vector<i32> ! OutOfMemoryError ? &mut Allocator {
-  let mut result = Vector.make<i32>()
+  let mut result = Vector<i32>.make()
   // append operations state their allocation contract
   return move result
 }
