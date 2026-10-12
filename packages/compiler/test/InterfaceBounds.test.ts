@@ -2,6 +2,7 @@ import * as Layer from 'effect/Layer'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as Diagnostic from '../src/Diagnostic.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 
@@ -359,6 +360,26 @@ it.effect('records the resolved bound contract on the declaration it belongs to'
           : 'Unavailable',
       ),
       ['add', 'subtract'],
+    )
+  }),
+)
+
+it.effect('rejects an interface in a field, parameter or result type', () =>
+  Effect.gen(function* () {
+    const source = `interface Label { fn label(value: &Self) -> i32 }
+type Labeled = Label
+struct Holder { label: Label }
+fn take(value: &Labeled) -> i32 { return 0 }
+fn give() -> Label { return () }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* snapshot(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.expectedTypeCode, source.indexOf('Label }')],
+        [Diagnostic.expectedTypeCode, source.indexOf('&Labeled')],
+        [Diagnostic.expectedTypeCode, source.indexOf('Label { return')],
+      ],
     )
   }),
 )
