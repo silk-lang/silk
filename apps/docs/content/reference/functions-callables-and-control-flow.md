@@ -413,9 +413,14 @@ parameter zero and awaits the rest.
 **Boundary:** Supplying all parameters invokes the function. Supplying none denotes no application;
 use the function name as a callable value. Supplying more than the remaining arity is invalid.
 
+A staged argument is captured by value. Staging an exclusive reference or slice therefore forwards
+it as any by-value argument does (BORROW-005): `bump(&mut first)` reborrows it for the section's
+lifetime and `bump(move first)` transfers it.
+
 **Diagnostics:** Too many arguments report the ordinary arity diagnostic. A partially applied
 callable used where its eventual result is required reports a type mismatch naming the remaining
-callable contract. Capture ownership errors occur when the section is constructed.
+callable contract. Capture ownership errors occur when the section is constructed; staging an
+exclusive reference or slice without `&mut` or `move` reports `OWN0003`.
 
 The compiler carries every remaining leading parameter and captured trailing argument through
 semantic facts, TIR, MIR, and each execution engine. `combine(3)(2)(1)` therefore preserves both
