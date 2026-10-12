@@ -905,7 +905,7 @@ struct Audit {value: i32}
 fn read(audit: &Audit) -> i32 { return audit.value }
 
 effect fn runCases() -> i32 ! OutOfMemoryError ? &mut Allocator | &mut Marker {
-  let allocation = Shared.make<Audit>(Audit {value: 42})
+  let allocation = Shared<Audit>.make(Audit {value: 42})
   let audit = run move allocation
   let value = Shared.with(&audit, read)
   let marked = run Marker.mark()
