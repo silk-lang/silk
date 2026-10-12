@@ -75,14 +75,28 @@ void test('development watcher refreshes identity and terminates with its compil
     for (let attempt = 0; attempt < 100 && !(await condition()); attempt++) await setTimeout(50)
     assert.ok(await condition())
   }
+  const current = () => {
+    try {
+      generate('--check')
+      return true
+    } catch {
+      return false
+    }
+  }
+  // An edit can reach the watcher as several events, such as a truncation and then the bytes, and
+  // each may trigger its own refresh. Only the identity of the final inputs is a refresh.
   const refreshes = async (edit) => {
     const original = await readFile(output, 'utf8')
     await edit()
-    await eventually(async () => (await readFile(output, 'utf8')) !== original)
-    generate('--check')
+    await eventually(async () => (await readFile(output, 'utf8')) !== original && current())
   }
   await once(child.stdout, 'data')
-  await refreshes(() => writeFile(source, 'export const version = 2\n'))
+  // The truncation refreshes on its own before the bytes land; the watcher still converges.
+  await refreshes(async () => {
+    await writeFile(source, '')
+    await setTimeout(120)
+    await writeFile(source, 'export const version = 2\n')
+  })
   await refreshes(() => writeFile(encoder, 'export const version = 2\n'))
   // An llvm build cleans `dist` before re-emitting it: the failed refresh is reported, the session
   // survives, and the recreated directory is watched again.
