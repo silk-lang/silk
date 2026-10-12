@@ -98,7 +98,7 @@ effect fn overlap<'request, 'connection, 'transport, P>(
 where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
   let head = run Request.head(&request.*)
   let mut bytes: [u8; 1] = [0]
-  let progress = run readSome(&mut request.*, &mut bytes, Option.none<Instant>())
+  let progress = run readSome(&mut request.*, &mut bytes, Option<Instant>.none())
   drop progress
   drop head
   return ()
@@ -117,7 +117,7 @@ effect fn escape<'loan, 'connection: 'loan, 'transport: 'connection, P>(
 ? &mut Allocator | &mut MonotonicClock
 where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
   return run withRequest<&'loan mut Request<'loan, 'connection, 'transport, P>, never>(
-    move connection, Option.none<Instant>(), leak,
+    move connection, Option<Instant>.none(), leak,
   )
 }
 

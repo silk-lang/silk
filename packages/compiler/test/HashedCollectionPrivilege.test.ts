@@ -38,19 +38,19 @@ import silk.option { Option }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut map = HashMap.make<Word, i32>(Hash.seed(12345))
+  let mut map = HashMap<Word, i32>.make(Hash.seed(12345))
   let mut key = 0
   while key < 20 {
-    let previous = run HashMap.insert<Word, i32>(&mut map, Hash.word(i32.toU64(key)), key)
+    let previous = run HashMap<Word, i32>.insert(&mut map, Hash.word(i32.toU64(key)), key)
       |> Effect.provideMut(&mut allocator)
     drop previous
     key = key + 1
   }
-  let taken = HashMap.remove<Word, i32>(&mut map, Hash.word(3))
-  let removed = Option.unwrapOr<i32>(move taken, -1)
+  let taken = HashMap<Word, i32>.remove(&mut map, Hash.word(3))
+  let removed = Option<i32>.unwrapOr(move taken, -1)
   if removed != 3 { return 1 }
-  if !HashMap.contains<Word, i32>(&map, Hash.word(4)) { return 2 }
-  let held = Option.unwrapOr<i32>(HashMap.get<Word, i32>(&map, Hash.word(4)), -1)
+  if !HashMap<Word, i32>.contains(&map, Hash.word(4)) { return 2 }
+  let held = Option<i32>.unwrapOr(HashMap<Word, i32>.get(&map, Hash.word(4)), -1)
   if held != 4 { return 3 }
   return 42
 }

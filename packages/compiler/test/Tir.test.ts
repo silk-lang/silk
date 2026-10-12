@@ -496,7 +496,7 @@ it.effect('preserves contextual conversions across generic and service calls', (
     const service = yield* elaborateWithStdlib(
       'tir://service-argument-conversion.silk',
       `service Sink<'a, ?R> { effect fn put(value: i32 | bool) -> i32 ? R | &Sink<'a, R> }
-effect fn use() -> i32 ? &Sink<'static, never> { return run Sink.put<'static, never>(1) }
+effect fn use() -> i32 ? &Sink<'static, never> { return run Sink<'static, never>.put(1) }
 pub fn main() -> i32 { return 42 }`,
     )
     assert.deepEqual(service.diagnostics, [])

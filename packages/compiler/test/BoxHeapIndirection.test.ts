@@ -50,8 +50,8 @@ effect fn leaf(value: i32) -> Tree ! OutOfMemoryError ? &mut Allocator {
 }
 
 effect fn branch(left: Tree, right: Tree, value: i32) -> Tree ! OutOfMemoryError ? &mut Allocator {
-  let boxedLeft = run Box.make<Tree>(move left)
-  let boxedRight = run Box.make<Tree>(move right)
+  let boxedLeft = run Box<Tree>.make(move left)
+  let boxedRight = run Box<Tree>.make(move right)
   return Tree {
     shape: Shape { kind: Branch { left: move boxedLeft, right: move boxedRight } },
     value: value
@@ -65,7 +65,7 @@ fn total(self: &Tree) -> i32 {
 fn shapeTotal(self: &Shape) -> i32 {
   return match &self.kind {
     Leaf nothing => 0
-    Branch { left, right } => boxTotal(Box.get<Tree>(&left)) + boxTotal(Box.get<Tree>(&right))
+    Branch { left, right } => boxTotal(Box<Tree>.get(&left)) + boxTotal(Box<Tree>.get(&right))
   }
 }
 
@@ -113,18 +113,18 @@ import silk.box { Box }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut boxed = run Box.make<i32>(20) |> Effect.provideMut(&mut allocator)
+  let mut boxed = run Box<i32>.make(20) |> Effect.provideMut(&mut allocator)
 
-  let borrowed = Box.get<i32>(&boxed)
+  let borrowed = Box<i32>.get(&boxed)
   if borrowed[usize.ZERO] == 20 {} else { return 1 }
 
-  let mut exclusive = Box.getMut<i32>(&mut boxed)
+  let mut exclusive = Box<i32>.getMut(&mut boxed)
   exclusive[usize.ZERO] = 22
 
-  let confirmed = Box.get<i32>(&boxed)
+  let confirmed = Box<i32>.get(&boxed)
   if confirmed[usize.ZERO] == 22 {} else { return 2 }
 
-  let taken = Box.into<i32>(move boxed)
+  let taken = Box<i32>.into(move boxed)
   return taken + 20
 }
 
@@ -351,7 +351,7 @@ pub struct Bad<T> {
 }
 
 pub fn main() -> i32 {
-  let held = Vector.make<Bad<i32>>()
+  let held = Vector<Bad<i32>>.make()
   return 0
 }`
     const snapshot = yield* AnalysisFixture.retainingMain(
