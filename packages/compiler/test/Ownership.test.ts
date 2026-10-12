@@ -1701,7 +1701,7 @@ pub fn main() -> i32 { return 0 }`,
 it('assigns Allocation one private active reclaim ticket', () => {
   const facts = check(
     'ownership/allocation-ticket',
-    `fn consume(allocation: Allocation) -> i32 { return 42 }
+    `fn consume(allocation: Intrinsic.Allocation) -> i32 { return 42 }
 pub fn main() -> i32 { return 0 }`,
   )
   const release = facts.functions.at(0)?.exits.at(0)?.releases.at(0)
@@ -1719,7 +1719,7 @@ pub fn main() -> i32 { return 0 }`,
 it('plans cleanup only through the active nominal union variant', () => {
   const facts = check(
     'ownership/nominal-union-cleanup',
-    `union MaybeAllocation { None, Some { value: Allocation } }
+    `union MaybeAllocation { None, Some { value: Intrinsic.Allocation } }
 fn consume(value: MaybeAllocation) -> i32 { return 42 }
 pub fn main() -> i32 { return 0 }`,
   )
@@ -1803,7 +1803,7 @@ it('ends unsafe lexical owners at the explicit boundary', () => {
 it('keeps a Slot loan active until the lexical Slot is consumed', () => {
   const facts = check(
     'ownership/slot-loan',
-    `fn misuse(buffer: RawBuffer<i32>) -> i32 {
+    `fn misuse(buffer: Intrinsic.RawBuffer<i32>) -> i32 {
   let mut owner = move buffer
   unsafe {
     let slot = Intrinsic.rawBufferSlot(&mut owner, 0)

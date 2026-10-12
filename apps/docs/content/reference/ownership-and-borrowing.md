@@ -1636,7 +1636,7 @@ owner is dropped.
 An affine nominal type may declare one restricted cleanup hook:
 
 ```silk
-struct Guard { allocation: Allocation }
+struct Guard { allocation: Intrinsic.Allocation }
 
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
@@ -1718,21 +1718,20 @@ allocation may then move independently.
 
 ```silk
 struct Layout {}
-struct Allocation {}
 struct OutOfMemoryError {}
 
 service Allocator {
-  effect fn allocate(layout: Layout) -> Allocation
+  effect fn allocate(layout: Layout) -> Intrinsic.Allocation
     ! OutOfMemoryError
     ? &mut Allocator
 }
 ```
 
 A failed request creates no storage owner and no cleanup obligation. Dropping a successful
-`Allocation` consumes its reclaim authority exactly once. Silk exposes no public `free` operation
+`Intrinsic.Allocation` consumes its reclaim authority exactly once. Silk exposes no public `free` operation
 derived from that authority.
 
-Safe containers are ordinary affine owners built above allocations. `RawBuffer<T>` is a narrow
+Safe containers are ordinary affine owners built above allocations. `Intrinsic.RawBuffer<T>` is a narrow
 unsafe storage owner: releasing it releases its allocation but does not discover initialized
 elements. A safe container's restricted `Drop` hook must destroy its initialized elements before
 its buffer field cleans.
