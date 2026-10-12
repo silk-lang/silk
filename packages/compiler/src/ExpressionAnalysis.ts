@@ -1270,6 +1270,21 @@ export const borrowSubject = (
     parentReference.access === 'Exclusive' &&
     (expected === undefined || (!Type.isReference(expected) && !Type.isSlice(expected))) &&
     !exclusiveBorrowRoot(root)
+  // A view context reborrows the referent, and reborrowing never strengthens access (BORROW-005).
+  if (
+    parentReference !== undefined &&
+    parentReference.access === 'Shared' &&
+    access === 'Exclusive' &&
+    (projectedReference !== undefined ||
+      (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))
+  )
+    return unavailableBorrow(
+      node,
+      access,
+      subject,
+      diagnostics,
+      Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
+    )
   if (
     parentReference !== undefined &&
     (projectedReference !== undefined ||
@@ -1278,12 +1293,11 @@ export const borrowSubject = (
   ) {
     const target = parentReference.target
     if (
-      (expected !== undefined &&
-        !contextFreeReborrow &&
-        (!Type.isReference(expected) ||
-          !TypeInference.infer(expected.target, target, new Map()) ||
-          expected.access !== access)) ||
-      (parentReference.access === 'Shared' && access === 'Exclusive')
+      expected !== undefined &&
+      !contextFreeReborrow &&
+      (!Type.isReference(expected) ||
+        !TypeInference.infer(expected.target, target, new Map()) ||
+        expected.access !== access)
     ) {
       return unavailableBorrow(
         node,
@@ -1446,7 +1460,7 @@ export const borrowSubject = (
         access,
         subject,
         diagnostics,
-        Diagnostic.invalidSliceReborrow(sourceType.access, access, Location.at(node.anchor)),
+        Diagnostic.invalidReborrow(sourceType.access, access, Location.at(node.anchor)),
       )
     }
     const type = Type.slice(access, sourceType.element, lifetime)
@@ -4761,6 +4775,15 @@ export const analyzeReferentProjection = (
   )
   if (subject === undefined)
     throw new RangeError(`Cannot analyze referent projection ${subjectNode._tag}`)
+  return referentOf(context, node.anchor, subject)
+}
+
+/** The referent `subject.*` of an analyzed subject, anchored at `anchor`. */
+const referentOf = (
+  context: SemanticContext.SemanticContext,
+  anchor: AuthoredHir.Anchor,
+  subject: ExpressionResult,
+): ExpressionResult => {
   const diagnostics: Array<Diagnostic.Located> = [...subject.diagnostics]
   const reference =
     subject.type !== undefined && Type.isReference(subject.type) ? subject.type : undefined
@@ -4768,7 +4791,7 @@ export const analyzeReferentProjection = (
   if (reference === undefined && subject.type !== undefined) {
     const diagnostic = Diagnostic.invalidReferentProjection(
       Type.encode(subject.type),
-      Location.at(node.anchor),
+      Location.at(anchor),
     )
     diagnostics.push(diagnostic)
     state = { _tag: 'Unavailable', cause: Diagnostic.identity(diagnostic) }
@@ -4799,7 +4822,7 @@ export const analyzeReferentProjection = (
       ...(reference === undefined ? {} : { reference, borrowAccess: reference.access }),
       state,
       type,
-      anchor: node.anchor,
+      anchor,
     },
     diagnostics: diagnostics,
     type: type._tag === 'Available' ? type.type : undefined,
@@ -8048,12 +8071,14 @@ const synthesizeReceiver = (
     return { ...result, node }
   }
   if (parameterType !== undefined && Type.isReference(parameterType)) {
-    // A reference receiver of the declared access passes through; any other reference reborrows
-    // through the ordinary rules, so `&mut` reaches a `&Self` method and `&` never reaches `&mut`.
+    // A reference place reborrows its referent for the call under the declared access, as the
+    // explicit `&mut counter` would (CALL-003), so `&mut` reaches a `&Self` method and `&` never
+    // reaches `&mut`. Only a reference rvalue of the declared access passes through.
     if (
       subjectType !== undefined &&
       Type.isReference(subjectType) &&
-      subjectType.access === parameterType.access
+      subjectType.access === parameterType.access &&
+      borrowRoot(context, subjectResult.fact) === undefined
     )
       return publishReceiver(subjectResult)
     return publishReceiver(
@@ -8069,6 +8094,10 @@ const synthesizeReceiver = (
       ),
     )
   }
+  // A by-value receiver through a reference reads its referent as the explicit `counter.*` would:
+  // a Copy referent is copied, and an affine one is a move out of borrowed storage.
+  if (subjectType !== undefined && Type.isReference(subjectType))
+    return publishReceiver(referentOf(context, subjectNode.anchor, subjectResult))
   if (borrowRoot(context, subjectResult.fact) === undefined) return publishReceiver(subjectResult)
   const callableMetadata = (() => {
     const fact = subjectResult.fact
