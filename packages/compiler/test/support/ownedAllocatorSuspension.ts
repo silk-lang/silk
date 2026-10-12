@@ -5,8 +5,8 @@ import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.result { Result }
-struct OwnedAllocator { storage: Allocation }
-effect fn allocate(self: &mut OwnedAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+struct OwnedAllocator { storage: Intrinsic.Allocation }
+effect fn allocate(self: &mut OwnedAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   let mut inner = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(move layout) |> Effect.provideMut(&mut inner)
 }
@@ -49,8 +49,8 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.result { Result }
 struct Problem { code: i32 }
-struct OwnedAllocator { storage: Allocation }
-effect fn allocate(self: &mut OwnedAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+struct OwnedAllocator { storage: Intrinsic.Allocation }
+effect fn allocate(self: &mut OwnedAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   let mut inner = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(move layout) |> Effect.provideMut(&mut inner)
 }
@@ -101,7 +101,7 @@ import silk.effect { Effect }
 role SharedAudit
 role ExclusiveAudit
 struct AuditAllocator { tag: i32 }
-effect fn allocate(self: &mut AuditAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut AuditAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   fail OutOfMemoryError {}
 }
 impl Allocator for AuditAllocator { allocate: AuditAllocator.allocate }
@@ -128,7 +128,7 @@ service Counter {
   effect fn increment() -> i32 ? &mut Counter
 }
 struct Drops { value: i32 }
-struct Cell { value: i32 storage: Allocation drops: Shared<Drops> }
+struct Cell { value: i32 storage: Intrinsic.Allocation drops: Shared<Drops> }
 fn countDrop(drops: &mut Drops) -> i32 {
   drops.value = drops.value + 1
   return drops.value
@@ -188,7 +188,7 @@ struct Drops { value: i32 }
 service Value {
   effect fn read() -> i32 ! Problem ? &mut Value
 }
-struct Provider { code: i32 storage: Allocation drops: Shared<Drops> }
+struct Provider { code: i32 storage: Intrinsic.Allocation drops: Shared<Drops> }
 fn countDrop(drops: &mut Drops) -> i32 {
   drops.value = drops.value + 1
   return drops.value

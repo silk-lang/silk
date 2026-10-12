@@ -105,7 +105,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct Guard {
   tag: i32
-  storage: Allocation
+  storage: Intrinsic.Allocation
 }
 
 impl Drop for Guard {

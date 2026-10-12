@@ -19,11 +19,11 @@ temporary storage. [`fill`](#declaration-73696c6b2f7261775f6275666665723a3a52617
 
 ## Gotchas
 
-These wrappers do not verify allocation capacity or initialization. The caller must prove that
-an allocation fits the recorded element count, every selected range is in bounds, and every
-read or view covers initialized elements. Releasing a raw buffer releases its allocation but
-does not discover and drop values
-still stored in it; a container must clear initialized `Slot` values before release.
+[`from`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e66726f6d), [`read`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e72656164), [`copy`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f7079), [`view`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e76696577), and [`viewMut`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e766965774d7574) are `unsafe`: the caller must prove
+that an allocation fits the recorded element count, every selected range is in bounds, and
+every read or view covers initialized elements. [`slot`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e736c6f74) and [`fill`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e66696c6c) check the recorded count
+and trap outside it. Releasing a raw buffer releases its allocation but does not discover and
+drop values still stored in it; a container must clear initialized `Slot` values before release.
 
 ## Examples
 
@@ -90,7 +90,7 @@ one import that reaches `RawBuffer.from(...)` and the rest. It is unrelated to t
 ### Associated function `RawBuffer.from`
 
 ```silk
-pub fn from<T>(allocation: Allocation, count: usize) -> silk/core.RawBuffer<T>
+pub unsafe fn from<T>(allocation: Intrinsic.Allocation, count: usize) -> Intrinsic.RawBuffer<T>
 ```
 
 Adopts an allocation as typed raw storage with the specified element capacity.
@@ -104,23 +104,23 @@ The caller must prove that the allocation has the size and alignment for `count`
 ### Associated function `RawBuffer.slot`
 
 ```silk
-pub fn slot<'storage, T>(buffer: &'storage mut silk/core.RawBuffer<T>, index: usize) -> silk/core.Slot<'storage, T>
+pub fn slot<'storage, T>(buffer: &'storage mut Intrinsic.RawBuffer<T>, index: usize) -> Intrinsic.Slot<'storage, T>
 ```
 
 Selects one raw storage slot after checking the buffer's recorded element count.
 
 #### Gotchas
 
-An `index` outside [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74) traps. The caller must separately track whether the slot is
-initialized. The result retains exclusive access to the buffer until the slot is consumed.
-Lifetimes inside `T` remain separate from this storage access.
+An `index` outside [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74) traps. The slot operations that read or drop require the caller to
+track whether the slot is initialized. The result retains exclusive access to the buffer until
+the slot is consumed. Lifetimes inside `T` remain separate from this storage access.
 
 <a id="declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74"></a>
 
 ### Associated function `RawBuffer.count`
 
 ```silk
-pub fn count<T, 'life1>(buffer: &'life1 silk/core.RawBuffer<T>) -> usize
+pub fn count<T, 'life1>(buffer: &'life1 Intrinsic.RawBuffer<T>) -> usize
 ```
 
 Returns the element capacity recorded by a raw buffer.
@@ -130,22 +130,23 @@ Returns the element capacity recorded by a raw buffer.
 ### Associated function `RawBuffer.read`
 
 ```silk
-pub fn read<T, 'life1>(buffer: &'life1 silk/core.RawBuffer<T>, index: usize) -> T
+pub unsafe fn read<T, 'life1>(buffer: &'life1 Intrinsic.RawBuffer<T>, index: usize) -> T
 ```
 
 Copies one initialized element without changing its slot state.
 
 #### Gotchas
 
-`index` must be less than [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74), and the selected slot must contain an initialized `T`.
-A copied reference retains its original referent lifetime after the buffer is released.
+The caller must prove that `index` is less than [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74) and that the selected slot contains
+an initialized `T`. A copied reference retains its original referent lifetime after the buffer
+is released.
 
 <a id="declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f7079"></a>
 
 ### Associated function `RawBuffer.copy`
 
 ```silk
-pub fn copy<T, 'life1, 'life2>(destination: &'life1 mut silk/core.RawBuffer<T>, destinationOffset: usize, source: &'life2 [T], length: usize) -> ()
+pub unsafe fn copy<T, 'life1, 'life2>(destination: &'life1 mut Intrinsic.RawBuffer<T>, destinationOffset: usize, source: &'life2 [T], length: usize) -> ()
 ```
 
 Moves a caller-proven initialized range into selected storage in one bulk transfer.
@@ -165,39 +166,41 @@ initialized.
 ### Associated function `RawBuffer.fill`
 
 ```silk
-pub fn fill<'life0>(buffer: &'life0 mut silk/core.RawBuffer<u8>, offset: usize, length: usize, value: u8) -> ()
+pub fn fill<'life0>(buffer: &'life0 mut Intrinsic.RawBuffer<u8>, offset: usize, length: usize, value: u8) -> ()
 ```
 
 Initializes a selected byte range with one repeated byte value.
 
 #### Gotchas
 
-`offset + length` must not exceed [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74).
+A range beyond [`count`](#declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e636f756e74) traps.
 
 <a id="declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e76696577"></a>
 
 ### Associated function `RawBuffer.view`
 
 ```silk
-pub fn view<T, 'life1>(buffer: &'life1 silk/core.RawBuffer<T>, offset: usize, length: usize) -> &'life1 [T]
+pub unsafe fn view<T, 'life1>(buffer: &'life1 Intrinsic.RawBuffer<T>, offset: usize, length: usize) -> &'life1 [T]
 ```
 
 Borrows a shared view of an initialized element range.
 
 #### Gotchas
 
-The selected range must be in bounds, and each selected slot must be initialized.
+The caller must prove that the selected range is in bounds and that each selected slot is
+initialized.
 
 <a id="declaration-73696c6b2f7261775f6275666665723a3a5261774275666665722e766965774d7574"></a>
 
 ### Associated function `RawBuffer.viewMut`
 
 ```silk
-pub fn viewMut<T, 'life1>(buffer: &'life1 mut silk/core.RawBuffer<T>, offset: usize, length: usize) -> &'life1 mut [T]
+pub unsafe fn viewMut<T, 'life1>(buffer: &'life1 mut Intrinsic.RawBuffer<T>, offset: usize, length: usize) -> &'life1 mut [T]
 ```
 
 Borrows an exclusive view of an initialized element range.
 
 #### Gotchas
 
-The selected range must be in bounds, and each selected slot must be initialized.
+The caller must prove that the selected range is in bounds and that each selected slot is
+initialized.
