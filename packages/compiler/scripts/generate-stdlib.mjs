@@ -173,7 +173,7 @@ ${component.bindings
   },`,
   )
   .join('\n')
-// The sealed Intrinsic operator source (INTR-008) is not a manifest module: nothing can import it.
+// The sealed Intrinsic operator source (INTR-007) is not a manifest module: nothing can import it.
 const sealedModule = 'intrinsic/operators'
 const sealedPath = `${sealedModule}.silk`
 const sealedSource = await readFile(join(stdlibRoot, sealedPath), 'utf8')

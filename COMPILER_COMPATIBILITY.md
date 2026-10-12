@@ -45,7 +45,7 @@ re-normalization after substitution (`Fallible<IoError>` is `IoError`).
 
 ## Sealed operator interfaces
 
-INTR-008 and INTR-009 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
+INTR-007 and INTR-008 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
 conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable only as
 `Intrinsic.<Name>`.
 
