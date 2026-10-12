@@ -1,9 +1,10 @@
-//! Loan conflicts in one typed body, the first slice of native borrow checking.
+//! Loan conflicts and moved places in one typed body: native borrow checking for loans and moves.
 //!
 //! # When to use
-//! Call [`check`] on a successfully typed, non-generic, unselected body before it is published.
-//! A [`Outcome.Conflict`] rejects the body with `LoanConflict` (the bootstrap's `OWN0010`) or
-//! `AccessDuringLoan` (`OWN0011`) at the later access, relating the earlier loan.
+//! Call [`check`] on a successfully typed, unselected body before it is published. A
+//! [`Outcome.Conflict`] rejects the body with `LoanConflict` (the bootstrap's `OWN0010`),
+//! `AccessDuringLoan` (`OWN0011`), `UseAfterMove` (`OWN0001`), `OverlappingAssignment` (`OWN0004`)
+//! or `IncompatibleLoopHeader` (`OWN0005`), relating the earlier loan or move when there is one.
 //!
 //! # Details
 //! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
@@ -14,15 +15,16 @@
 //! is live, by backward liveness over the graph, so loans end at their last use. An access that
 //! overlaps a live loan conflicts as in the bootstrap: a shared borrow conflicts with an exclusive
 //! loan, an exclusive borrow with any loan, a read with an exclusive loan, and a write or move with
-//! any loan.
+//! any loan. Moves reach forward along the same graph until a binding or a covering replacement;
+//! each loop compares the moved places of its outer locals at entry and on every back edge.
 //!
 //! # Gotchas
-//! This slice proves only plain bodies. A body that matches, builds or calls a callable, runs an
-//! Effect, uses a storage primitive, reborrows through a reference, stores a loan anywhere but an
-//! immutable `let`, or lets a loan reach a call result, a return or a branch result answers
-//! [`Outcome.NotChecked`]: it is neither accepted nor rejected here. Two places whose overlap
-//! depends on an unknown index make the body `NotChecked` rather than a conflict, so the stage
-//! never rejects a body the bootstrap accepts.
+//! A body that matches, builds or calls a callable, runs an Effect, uses a storage primitive,
+//! reborrows through a reference, stores a loan anywhere but an immutable `let`, or lets a loan
+//! reach a call result, a return or a branch result answers [`Outcome.NotChecked`] with the
+//! [`BorrowStatus`] reason: it is neither accepted nor rejected here. An overlap that depends on an
+//! unknown index, or a partial replacement of a moved place, is `Imprecise` rather than a
+//! conflict, so the stage never rejects a body the bootstrap accepts.
 
 import hir.Hir {Access}
 import lexer.Span {Span}
@@ -32,6 +34,7 @@ import semantic.Rejection {RejectionCode}
 import semantic.Type {Type}
 import semantic.TypedBody {
   AggregateField,
+  BorrowStatus,
   ConsumedPlace,
   Expression,
   Local,
@@ -62,13 +65,15 @@ pub enum Outcome {
 /// `earlier` the borrow or move it conflicts with, if any; otherwise `code` and `access` are unused.
 pub struct Verdict {
   pub outcome: Outcome
+  /// For a clear body, `Regions`; for an unchecked one, the reason.
+  pub status: BorrowStatus
   pub code: RejectionCode
   pub access: Span
   pub earlier: Option<Span>
 }
 
-fn verdict(outcome: Outcome) -> Verdict {
-  return Verdict {outcome: outcome, code: RejectionCode.Unsupported, access: Span.make(usize.ZERO, usize.ZERO),
+fn verdict(outcome: Outcome, status: BorrowStatus) -> Verdict {
+  return Verdict {outcome: outcome, status: status, code: RejectionCode.Unsupported, access: Span.make(usize.ZERO, usize.ZERO),
     earlier: Option.none<Span>()}
 }
 
@@ -186,6 +191,8 @@ struct Walker {
   held: Vector<Vector<usize>>
   exit: usize
   outside: bool
+  // Why the walk left the checked slice, once `outside` is set.
+  reason: BorrowStatus
 }
 
 fn flowAt(at: usize) -> Flow {
@@ -422,6 +429,15 @@ effect fn useRoot(walker: &mut Walker, local: usize, span: Span, at: usize) -> F
   return Flow {at: point, carried: move used.carried}
 }
 
+// Leaves the checked slice; the first reason is the one reported.
+fn leave(walker: &mut Walker, reason: BorrowStatus) -> () {
+  if !walker.outside {
+    walker.outside = true
+    walker.reason = reason
+  }
+  return ()
+}
+
 fn holds(walker: &Walker, local: usize) -> bool {
   let held = Vector.asSlice<Vector<usize>>(&walker.held)
   return local < held.length && Vector.length<usize>(&held[local]) > usize.ZERO
@@ -448,7 +464,7 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
 ! OutOfMemoryError ? &mut Allocator {
   let path = run pathOf(nodes, place)
   if path.root == usize.MAX || path.through {
-    walker.outside = true
+    leave(&mut walker.*, BorrowStatus.StoredLoans)
     return flowAt(at)
   }
   let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
@@ -515,7 +531,7 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
     run consume(&mut walker.*, Vector.asSlice<Carry>(carried), point)
     let retained = run nodeRetains(nodes, result, owner)
     if retained {
-      walker.outside = true
+      leave(&mut walker.*, BorrowStatus.StoredLoans)
     }
   }
   return flowAt(point)
@@ -601,7 +617,7 @@ fn localType(locals: &[Local], local: usize) -> Shared<Type> {
 // The node shape `visit` dispatches on, read without holding a borrow of the node across calls.
 union Shape {
   Leaf,
-  Outside,
+  Outside {reason: BorrowStatus},
   ReadPlace,
   Borrow {access: Access, value: NodeId},
   Move {value: NodeId, consumed: bool},
@@ -712,7 +728,13 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
     Expression.Constant {..} => Shape.Leaf
     Expression.ForeignStatic {..} => Shape.Leaf
     Expression.ForeignAddress {..} => Shape.Leaf
-    _ => Shape.Outside
+    Expression.Callable {..} => Shape.Outside {reason: BorrowStatus.Captures}
+    Expression.StagedCallable {..} => Shape.Outside {reason: BorrowStatus.Captures}
+    Expression.CallableCall {..} => Shape.Outside {reason: BorrowStatus.Captures}
+    Expression.Run {..} => Shape.Outside {reason: BorrowStatus.Effects}
+    Expression.Match {..} => Shape.Outside {reason: BorrowStatus.Patterns}
+    Expression.PatternBinding {..} => Shape.Outside {reason: BorrowStatus.Patterns}
+    Expression.StorageCall {..} => Shape.Outside {reason: BorrowStatus.Storage}
   }
 }
 
@@ -729,8 +751,8 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
     Shape.Leaf => {
       return flowAt(at)
     }
-    Shape.Outside => {
-      walker.outside = true
+    Shape.Outside {reason} => {
+      leave(&mut walker.*, reason)
       return flowAt(at)
     }
     Shape.ReadPlace => {
@@ -745,7 +767,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
         if Vector.length<Carry>(&flow.carried) > usize.ZERO || (path.through && holds(&walker.*, path.root)) {
           let retained = run nodeRetains(nodes, id, owner)
           if retained {
-            walker.outside = true
+            leave(&mut walker.*, BorrowStatus.StoredLoans)
           }
         }
         let point = run newPoint(&mut walker.*, flow.at)
@@ -761,7 +783,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if consumed {
         let path = run pathOf(nodes, value)
         if path.root == usize.MAX || path.through {
-          walker.outside = true
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(at)
         }
         return run place(nodes, locals, owner, &mut walker.*, &path, Kind.Move, span, at)
@@ -788,7 +810,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
         let retained = run retains(&ty, owner)
         if retained {
           if mutable {
-            walker.outside = true
+            leave(&mut walker.*, BorrowStatus.StoredLoans)
             return flowAt(point)
           }
           run hold(&mut walker.*, local, Vector.asSlice<Carry>(&flow.carried), point)
@@ -803,7 +825,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
         let ty = localType(locals, local)
         let retained = run retains(&ty, owner)
         if retained {
-          walker.outside = true
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(flow.at)
         }
       }
@@ -816,7 +838,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
     Shape.PlaceAssignment {target, value} => {
       let path = run pathOf(nodes, target)
       if path.root == usize.MAX {
-        walker.outside = true
+        leave(&mut walker.*, BorrowStatus.StoredLoans)
         return flowAt(at)
       }
       let evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
@@ -825,7 +847,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if Vector.length<Carry>(&flow.carried) > usize.ZERO {
         let retained = run nodeRetains(nodes, target, owner)
         if retained {
-          walker.outside = true
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(flow.at)
         }
       }
@@ -846,7 +868,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if let Option<NodeId>.Some {value: operand} = &value {
         let flow = run visit(nodes, locals, owner, &mut walker.*, operand, at)
         if Vector.length<Carry>(&flow.carried) > usize.ZERO {
-          walker.outside = true
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(usize.MAX)
         }
         current = flow.at
@@ -859,7 +881,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if consumed {
         let path = run pathOf(nodes, value)
         if path.root == usize.MAX || path.through {
-          walker.outside = true
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(at)
         }
         let flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Drop, span, at)
@@ -882,7 +904,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
         other = run visit(nodes, locals, owner, &mut walker.*, alternative, split)
       }
       if Vector.length<Carry>(&taken.carried) > usize.ZERO || Vector.length<Carry>(&other.carried) > usize.ZERO {
-        walker.outside = true
+        leave(&mut walker.*, BorrowStatus.StoredLoans)
         return flowAt(usize.MAX)
       }
       let joined = run newPoint(&mut walker.*, taken.at)
@@ -906,14 +928,14 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       let enclosing = Vector.length<Frame>(&walker.frames) - usize.ONE
       Vector.truncate<Frame>(&mut walker.frames, enclosing)
       if Vector.length<Carry>(&repeated.carried) > usize.ZERO {
-        walker.outside = true
+        leave(&mut walker.*, BorrowStatus.StoredLoans)
       }
       return flowAt(exit)
     }
     Shape.Break => {
       let frames = Vector.asSlice<Frame>(&walker.frames)
       if frames.length == usize.ZERO {
-        walker.outside = true
+        leave(&mut walker.*, BorrowStatus.Awaiting)
         return flowAt(usize.MAX)
       }
       let frame = frames[frames.length - usize.ONE]
@@ -923,7 +945,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
     Shape.Continue => {
       let frames = Vector.asSlice<Frame>(&walker.frames)
       if frames.length == usize.ZERO {
-        walker.outside = true
+        leave(&mut walker.*, BorrowStatus.Awaiting)
         return flowAt(usize.MAX)
       }
       let frame = frames[frames.length - usize.ONE]
@@ -1260,15 +1282,16 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     held: Vector.make<Vector<usize>>(),
     exit: usize.ZERO,
     outside: false,
+    reason: BorrowStatus.Regions,
   }
   walker.exit = run newPoint(&mut walker, usize.MAX)
   let entry = run newPoint(&mut walker, usize.MAX)
   let flow = run visit(nodes, locals, owner, &mut walker, root, entry)
   if walker.outside {
-    return verdict(Outcome.NotChecked)
+    return verdict(Outcome.NotChecked, walker.reason)
   }
   if Vector.length<Carry>(&flow.carried) > usize.ZERO {
-    return verdict(Outcome.NotChecked)
+    return verdict(Outcome.NotChecked, BorrowStatus.StoredLoans)
   }
   let exit = walker.exit
   run edge(&mut walker, flow.at, exit)
@@ -1312,7 +1335,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     while checkedLoops < loops.length && (at == events.length || loops[checkedLoops].header < events[at].point) {
       if moveWidth > usize.ZERO && !compatibleHeader(&walker, events, moved, &reach, moveWidth, &loops[checkedLoops]) {
         let span = loops[checkedLoops].span
-        return Verdict {outcome: Outcome.Conflict, code: RejectionCode.IncompatibleLoopHeader, access: span, earlier: Option.none<Span>()}
+        return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.IncompatibleLoopHeader, access: span, earlier: Option.none<Span>()}
       }
       checkedLoops = checkedLoops + usize.ONE
     }
@@ -1321,7 +1344,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     }
     let event = &events[at]
     if event.consumesTarget == usize.ONE {
-      return Verdict {outcome: Outcome.Conflict, code: RejectionCode.OverlappingAssignment, access: event.span,
+      return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.OverlappingAssignment, access: event.span,
         earlier: Option.none<Span>()}
     }
     if event.consumesTarget != usize.ZERO {
@@ -1339,7 +1362,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
             && Vector.length<usize>(&event.place.steps) < Vector.length<usize>(&source.place.steps)
           if !ends && (event.kind != Kind.Write || !covers(&event.place, &source.place)) {
             if shared == usize.ONE && event.kind != Kind.Write {
-              return Verdict {outcome: Outcome.Conflict, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option.some<Span>(source.span)}
+              return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option.some<Span>(source.span)}
             }
             // A partial replacement of a moved place, or an overlap decided by an unknown index.
             unknown = true
@@ -1361,7 +1384,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
             }
             if live {
               if shared == usize.ONE {
-                return Verdict {outcome: Outcome.Conflict, code: value, access: event.span, earlier: Option.some<Span>(loans[index].origin)}
+                return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: value, access: event.span, earlier: Option.some<Span>(loans[index].origin)}
               }
               unknown = true
             }
@@ -1373,7 +1396,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     at = at + usize.ONE
   }
   if unknown {
-    return verdict(Outcome.NotChecked)
+    return verdict(Outcome.NotChecked, BorrowStatus.Imprecise)
   }
-  return verdict(Outcome.Clear)
+  return verdict(Outcome.Clear, BorrowStatus.Regions)
 }
