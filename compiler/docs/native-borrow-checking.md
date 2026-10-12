@@ -97,7 +97,8 @@ The bootstrap is the behavioral reference, not the architectural one.
   checker runs".
 - Some move-side rules already reject natively with bootstrap-equivalent codes:
   `ExtractionBoundary` (OWN0002), `ExplicitMoveRequired` (OWN0003), `MatchBorrowEscape`
-  (OWN0006), `GuardConsumesPattern` (OWN0008), `InvalidMatchScrutineePlace` (OWN0009),
+  (OWN0006), `ExclusiveMatchRequiresMutable` (OWN0007), `GuardConsumesPattern` (OWN0008),
+  `InvalidMatchScrutineePlace` (OWN0009),
   `BorrowedExtraction` (OWN0012), `ExclusiveBorrowRequiresMutable` (SEM0057) and
   `UnsatisfiedLifetimeBound` (SEM0212).
 - `UseAfterMove` (OWN0001), `OverlappingAssignment` (OWN0004) and `IncompatibleLoopHeader`
