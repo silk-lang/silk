@@ -309,6 +309,21 @@ cover first:
 A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
 the form.
 
+A call result keeps the loans its instantiated regions can hold, so the walk trusts each callee's
+signature, written or elided, exactly as typing does. A body is therefore checked modulo its
+callees' contracts: the program-level guarantee needs every body checked, which is what the gap
+count tracks, and a callee that still leaves with `regions` is where a contract violation could
+hide until the regions slice proves it.
+
+- When every result region is a lifetime parameter of the checked declaration, or the result is
+  one of its type parameters, a loan of a body local, or with a body region, is not retained: such
+  a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
+  caller's region or type, and safe code obtains a type parameter's value only as such a value.
+- When exactly one operand's loans name a result region, the result retains them exactly.
+- Otherwise each loan is carried approximately: every fresh borrow of one call shares the call's
+  region, so several operands may name it, and a callable retains its capture loans whatever its
+  type names.
+
 CI holds the count in two ways. Both read `compiler/borrow-check-gap.txt`, which has one line per
 corpus program with unchecked bodies, `<program> <reason>=<count> ...`, and one `retired` line.
 
