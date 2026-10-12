@@ -77,7 +77,7 @@ it.effect(
       const snapshot = yield* Analysis.ofSourceRealized(
         'architecture/artifacts',
         ascii(
-          'fn consume(value: Allocation) -> i32 { return 0 }\npub fn main() -> i32 { return 42 }',
+          'fn consume(value: Intrinsic.Allocation) -> i32 { return 0 }\npub fn main() -> i32 { return 42 }',
         ),
         'wasm32-unknown-unknown',
       )

@@ -157,7 +157,7 @@ struct RejectAllocator {
   calls: i32
   rejectAt: i32
 }
-effect fn allocate(self: &mut RejectAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut RejectAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   let ordinal = self.calls
   self.calls = self.calls + 1
   if ordinal == self.rejectAt { return run Allocator.outOfMemory() }

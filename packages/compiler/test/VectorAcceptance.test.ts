@@ -72,9 +72,9 @@ import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.vector { Vector }
-struct Guard { storage: Allocation }
+struct Guard { storage: Intrinsic.Allocation }
 struct Marker { value: i32 }
-fn guarded(storage: Allocation) -> Guard | Marker { return Guard { storage: move storage } }
+fn guarded(storage: Intrinsic.Allocation) -> Guard | Marker { return Guard { storage: move storage } }
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let layout = Layout.of<[i32; 1]>()
