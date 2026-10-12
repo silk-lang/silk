@@ -393,7 +393,7 @@ effect fn get<T>(self: &Fixed<T>) -> i32 { return 42 }
 effect fn read(self: &Fixed<i32>) -> i32 { return self.value }
 impl<T> Counter<i32> for Fixed<T> { get: Fixed.get }
 impl Meter for Fixed<i32> { read: Fixed.read }
-effect fn count<A>() -> A ? &Counter<A> { return run Counter.get<A>() }
+effect fn count<A>() -> A ? &Counter<A> { return run Counter<A>.get() }
 effect fn measure() -> i32 ? &Meter { return run Meter.read() }
 pub fn main() -> i32 {
   let fixed = Fixed<i32> { value: 42 }
@@ -463,7 +463,7 @@ impl<'a> Read<'a> for Holder<'a> {
 fn request<'a>(value: &'a i32) -> Request<'a> { return Request<'a> { value: value } }
 effect fn read<'a>(value: &'a i32) -> i32 ? &Read<'a> {
   let request = request(value)
-  return run Read.get<'a>(move request)
+  return run Read<'a>.get(move request)
 }
 pub fn main() -> i32 {
   let value = 42

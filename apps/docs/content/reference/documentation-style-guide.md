@@ -49,9 +49,9 @@ content, and each example heading. Declaration comments use this form:
 /// import silk.option { Option }
 ///
 /// pub fn main() -> i32 {
-///   let value = Option.some<i32>(2)
+///   let value = Option<i32>.some(2)
 ///   let result = move value
-///     |> Option.unwrapOr<i32>(0)
+///     |> Option<i32>.unwrapOr(0)
 ///   if result != 2 {
 ///     let mismatch = 1 / 0
 ///   }
@@ -380,8 +380,8 @@ import silk.usize
 import silk.vector { Vector }
 
 pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let count = Vector.length<i32>(&values)
+  let values = Vector<i32>.make()
+  let count = Vector<i32>.length(&values)
   return count
     |> usize.toI32
 }
@@ -400,7 +400,7 @@ documentation examples.
 Use `|>` when data flows through one or more operations. A pipe shows operation order and keeps the
 actor name visible.
 
-For example, write `move present |> Option.unwrapOr<i32>(0)` for an owned option. Use
+For example, write `move present |> Option<i32>.unwrapOr(0)` for an owned option. Use
 `|> Effect.provideMut(...)` to supply an Effect requirement.
 
 Do not use `|>` when the result is not valid Silk or when a direct call is clearer. A lexical borrow
@@ -489,12 +489,12 @@ This comment documents `Vector.length`. The signature gives the remaining inform
 /// import silk.option { Option }
 ///
 /// pub fn main() -> i32 {
-///   let present = Option.some<i32>(7)
-///   let absent = Option.none<i32>()
+///   let present = Option<i32>.some(7)
+///   let absent = Option<i32>.none()
 ///   let first = move present
-///     |> Option.unwrapOr<i32>(0)
+///     |> Option<i32>.unwrapOr(0)
 ///   let second = move absent
-///     |> Option.unwrapOr<i32>(5)
+///     |> Option<i32>.unwrapOr(5)
 ///   if first + second != 12 {
 ///     let mismatch = 1 / 0
 ///   }
@@ -540,12 +540,12 @@ an owned value pipeline.
 /// pub effect fn main() -> ()
 /// ! OutOfMemoryError {
 ///   let mut allocator = Allocator.systemAllocatorProvider()
-///   let mut values = Vector.make<i32>()
-///   let first = run Vector.append<i32>(&mut values, 10)
+///   let mut values = Vector<i32>.make()
+///   let first = run Vector<i32>.append(&mut values, 10)
 ///     |> Effect.provideMut<Allocator>(&mut allocator)
-///   let second = run Vector.append<i32>(&mut values, 20)
+///   let second = run Vector<i32>.append(&mut values, 20)
 ///     |> Effect.provideMut<Allocator>(&mut allocator)
-///   let value = Vector.get<i32>(&values, usize.ONE)
+///   let value = Vector<i32>.get(&values, usize.ONE)
 ///   if value != 20 {
 ///     let mismatch = 1 / 0
 ///   }

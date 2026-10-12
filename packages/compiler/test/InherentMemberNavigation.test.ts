@@ -21,7 +21,7 @@ impl<T> Option<T> {
   pub fn some(value: T) -> Self { return Option.Some { value: move value } }
   pub fn map<U>(self: Self, f: once fn(T) -> U) -> Option<U> {
     return match move self {
-      Option<T>.Some { value } => Option.some<U>(f(move value))
+      Option<T>.Some { value } => Option<U>.some(f(move value))
       Option<T>.None => Option<U>.None
     }
   }

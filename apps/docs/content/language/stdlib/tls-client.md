@@ -68,7 +68,7 @@ effect fn program<'name>(name: &'name [u8]) -> i32 ! OutOfMemoryError {
     Result<ReferenceIdentity<'name>, IdentityError>.Failure {error} => { return 0 }
   }
   let snapshot = TrustSnapshot.fromAnchors(
-    Vector.make<TrustAnchor>(),
+    Vector<TrustAnchor>.make(),
     SnapshotLimits {anchors: 0, encodedBytes: 0},
   )
   let trust = match move snapshot {
