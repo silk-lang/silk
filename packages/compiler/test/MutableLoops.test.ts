@@ -157,18 +157,18 @@ union Attempt<'a> { Retry, Ready { view: &'a i32 } }
 struct Profile<'a> { view: &'a i32 }
 impl<'a> Copy for Profile<'a> {}
 fn current<'a>(value: &'a i32, candidates: &'a [i32], path: &Vector<usize>) -> &'a i32 {
-  if Vector.length<usize>(path) == 0 { return value }
-  return &candidates[Vector.get<usize>(path, 0)]
+  if Vector<usize>.length(path) == 0 { return value }
+  return &candidates[Vector<usize>.get(path, 0)]
 }
 fn inspect<'a>(profile: Profile<'a>, candidates: &'a [i32], path: &Vector<usize>, retry: bool) -> Attempt<'a> {
-  if Vector.length<usize>(path) > 0 {
-    return Attempt<'a>.Ready {view: &candidates[Vector.get<usize>(path, 0)]}
+  if Vector<usize>.length(path) > 0 {
+    return Attempt<'a>.Ready {view: &candidates[Vector<usize>.get(path, 0)]}
   }
   if retry { return Attempt<'a>.Retry }
   return Attempt<'a>.Ready {view: profile.view}
 }
 effect fn search<'a>(value: &'a i32, candidates: &'a [i32]) -> i32 {
-  let mut path = Vector.make<usize>()
+  let mut path = Vector<usize>.make()
   let mut outer = 0
   while outer < 2 {
     outer = outer + 1
@@ -177,7 +177,7 @@ effect fn search<'a>(value: &'a i32, candidates: &'a [i32]) -> i32 {
     let attempt = inspect(profile, candidates, &path, outer == 1)
     let view = match move attempt {
       Attempt.Retry => {
-        let removed = Vector.pop<usize>(&mut path)
+        let removed = Vector<usize>.pop(&mut path)
         continue
       }
       Attempt.Ready {view} => view

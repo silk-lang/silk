@@ -278,13 +278,13 @@ effect fn verify(input: &[u8], expected: &[u8], expectedLength: usize, format: F
   let inputLimit = cap.maxInputBytes
   let outputLimit = cap.maxOutputBytes
   let mut decoder = run Decoder.make(format, move cap)
-  let mut chunk = Vector.make<u8>()
-  run Vector.reserve<u8>(&mut chunk, inputWidth)
-  let mut output = Vector.make<u8>()
-  run Vector.reserve<u8>(&mut output, outputWidth)
+  let mut chunk = Vector<u8>.make()
+  run Vector<u8>.reserve(&mut chunk, inputWidth)
+  let mut output = Vector<u8>.make()
+  run Vector<u8>.reserve(&mut output, outputWidth)
   let mut fill = usize.ZERO
   while fill < outputWidth {
-    run Vector.append<u8>(&mut output, 0)
+    run Vector<u8>.append(&mut output, 0)
     fill = fill + 1
   }
   let mut loaded = usize.ZERO
@@ -293,23 +293,23 @@ effect fn verify(input: &[u8], expected: &[u8], expectedLength: usize, format: F
   let mut calls = usize.ZERO
   while calls < input.length * 8 + expectedLength * 4 + 100 {
     calls = calls + 1
-    if Vector.length<u8>(&chunk) == 0 {
+    if Vector<u8>.length(&chunk) == 0 {
       let mut count = usize.ZERO
       while count < inputWidth && loaded < input.length {
-        run Vector.append<u8>(&mut chunk, input[loaded])
+        run Vector<u8>.append(&mut chunk, input[loaded])
         loaded = loaded + 1
         count = count + 1
       }
     }
-    let available = Vector.length<u8>(&chunk)
-    let outcome = advance(&mut decoder, Vector.asSlice<u8>(&chunk), Vector.asMutSlice<u8>(&mut output), loaded == input.length, calls == 1)
+    let available = Vector<u8>.length(&chunk)
+    let outcome = advance(&mut decoder, Vector<u8>.asSlice(&chunk), Vector<u8>.asMutSlice(&mut output), loaded == input.length, calls == 1)
     if outcome.consumed > available || outcome.written > outputWidth { return 1 }
     consumed = consumed + outcome.consumed
     let mut index = usize.ZERO
     while index < outcome.written {
       if !expectFailure {
         if written >= expectedLength || expected.length == 0 { return 2 }
-        if Vector.get<u8>(&output, index) != expected[usize.remainder(written, expected.length)] { return 3 }
+        if Vector<u8>.get(&output, index) != expected[usize.remainder(written, expected.length)] { return 3 }
       }
       written = written + 1
       index = index + 1
@@ -321,14 +321,14 @@ effect fn verify(input: &[u8], expected: &[u8], expectedLength: usize, format: F
       if expectedKind == ErrorKind.InputLimit && usize.toU64(consumed) != inputLimit { return 10 }
       if expectedKind == ErrorKind.OutputLimit && usize.toU64(written) != outputLimit { return 11 }
       let empty: [u8; 0] = []
-      let again = observation(Decoder.step(&mut decoder, &empty, Vector.asMutSlice<u8>(&mut output), true))
+      let again = observation(Decoder.step(&mut decoder, &empty, Vector<u8>.asMutSlice(&mut output), true))
       if !again.failed || again.kind != ErrorKind.InvalidUse || again.consumed != 0 || again.written != 0 { return 5 }
       return 0
     }
     if outcome.status == Status.Finished {
       if expectFailure || written != expectedLength || consumed != input.length { return 6 }
       let empty: [u8; 0] = []
-      let again = observation(Decoder.step(&mut decoder, &empty, Vector.asMutSlice<u8>(&mut output), true))
+      let again = observation(Decoder.step(&mut decoder, &empty, Vector<u8>.asMutSlice(&mut output), true))
       if again.failed || again.status != Status.Finished || again.consumed != 0 || again.written != 0 { return 7 }
       return 0
     }
@@ -336,11 +336,11 @@ effect fn verify(input: &[u8], expected: &[u8], expectedLength: usize, format: F
     let remaining = available - outcome.consumed
     index = usize.ZERO
     while index < remaining {
-      let byte = Vector.get<u8>(&chunk, index + outcome.consumed)
-      Vector.set<u8>(&mut chunk, index, byte)
+      let byte = Vector<u8>.get(&chunk, index + outcome.consumed)
+      Vector<u8>.set(&mut chunk, index, byte)
       index = index + 1
     }
-    Vector.truncate<u8>(&mut chunk, remaining)
+    Vector<u8>.truncate(&mut chunk, remaining)
   }
   return 9
 }
@@ -373,25 +373,25 @@ fn selectCase(index: usize) -> Case {
 effect fn suite() -> i32 ! OutOfMemoryError | DecodeError ? &mut Allocator {
   let bytes = ${byteLiteral(inputBytes)}
   let patterns = ${byteLiteral(expectedBytes)}
-  let mut input = Vector.make<u8>()
-  let mut expected = Vector.make<u8>()
+  let mut input = Vector<u8>.make()
+  let mut expected = Vector<u8>.make()
   let mut caseIndex: usize = 0
   while caseIndex < ${cases.length} {
     let selected = selectCase(caseIndex)
-    Vector.clear<u8>(&mut input)
-    Vector.clear<u8>(&mut expected)
+    Vector<u8>.clear(&mut input)
+    Vector<u8>.clear(&mut expected)
     let mut index: usize = 0
     while index < selected.inputLength {
-      run Vector.append<u8>(&mut input, bytes[selected.inputOffset + index])
+      run Vector<u8>.append(&mut input, bytes[selected.inputOffset + index])
       index = index + 1
     }
     index = 0
     while index < selected.patternLength {
-      run Vector.append<u8>(&mut expected, patterns[selected.expectedOffset + index])
+      run Vector<u8>.append(&mut expected, patterns[selected.expectedOffset + index])
       index = index + 1
     }
     let cap = Limits { maxInputBytes: selected.inputLimit, maxOutputBytes: selected.outputLimit, maxMembers: selected.memberLimit, maxHeaderBytes: selected.headerLimit, maxMemoryBytes: 65536 }
-    let result = run verify(Vector.asSlice<u8>(&input), Vector.asSlice<u8>(&expected), selected.outputLength, selected.format, selected.inputWidth, selected.outputWidth, move cap, selected.failure, selected.kind, selected.consumed, selected.written)
+    let result = run verify(Vector<u8>.asSlice(&input), Vector<u8>.asSlice(&expected), selected.outputLength, selected.format, selected.inputWidth, selected.outputWidth, move cap, selected.failure, selected.kind, selected.consumed, selected.written)
     if result != 0 { return usize.toI32(caseIndex) + 100 }
     caseIndex = caseIndex + 1
   }

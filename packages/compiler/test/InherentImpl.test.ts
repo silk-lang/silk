@@ -319,6 +319,39 @@ impl Holder { pub fn zero() -> i32 { return 0 } }`
   }),
 )
 
+it.effect('binds a written owner application to the impl binders the member names', () =>
+  Effect.gen(function* () {
+    const source = `struct Lent<'a, T> { value: &'a T }
+impl<'a, T> Lent<'a, T> {
+  fn read(lent: &Lent<'a, T>) -> &'a T { return lent.value }
+  fn pick<U>(lent: &Lent<'a, T>, other: U) -> &'a T { drop other return lent.value }
+}
+struct Pair<A, B> {
+  left: A
+  right: B
+}
+impl<A, B> Pair<A, B> {
+  fn second(value: B) -> B { return move value }
+  fn make(left: A, right: B) -> Pair<A, B> { return Pair { left: move left, right: move right } }
+}
+fn read<'r>(lent: &Lent<'r, i32>) -> &'r i32 { return Lent<i32>.read(lent) }
+fn pick<'r>(lent: &Lent<'r, i32>) -> &'r i32 { return Lent<i32>.pick<bool>(lent, true) }
+fn second() -> u8 { return Pair<i64, u8>.second(42) }
+fn made() -> Pair<i64, u8> { return Pair<i64, u8>.make(1, 2) }
+fn partial() -> i32 {
+  let pair = Pair<i64>.make(1, 2)
+  return 0
+}
+`
+    const snapshot = yield* Analysis.ofSource('root', ascii(source))
+    assert.deepEqual(codes(snapshot), ['SEM0051'])
+    assert.strictEqual(
+      Analysis.diagnostics(snapshot).at(0)?.span.start,
+      source.indexOf('Pair<i64>.make'),
+    )
+  }),
+)
+
 const analyzeConformance = (text: string) =>
   Analysis.make({ root: 'root' }).pipe(
     Effect.provide(

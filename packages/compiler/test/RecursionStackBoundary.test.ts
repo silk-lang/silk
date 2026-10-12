@@ -89,7 +89,7 @@ pub struct Drained {
 fn stepDepth(step: &Step) -> i32 {
   return match &step.kind {
     End nothing => 0
-    Link { next } => viewDepth(Box.get<Chain>(&next))
+    Link { next } => viewDepth(Box<Chain>.get(&next))
   }
 }
 
@@ -114,7 +114,7 @@ fn unlinkStep(step: Step) -> Drained {
 fn unlinkKind(kind: End | Link) -> Drained {
   return match move kind {
     End nothing => Drained { chain: Chain { step: Step { kind: End {} } }, more: false }
-    Link { next } => Drained { chain: Box.into<Chain>(move next), more: true }
+    Link { next } => Drained { chain: Box<Chain>.into(move next), more: true }
   }
 }
 
@@ -137,7 +137,7 @@ effect fn build(depth: i32) -> Chain ! OutOfMemoryError ? &mut Allocator {
   let mut remaining = depth
   while remaining > 0 {
     let taken = Intrinsic.replace(current, Chain { step: Step { kind: End {} } })
-    let boxed = run Box.make<Chain>(move taken)
+    let boxed = run Box<Chain>.make(move taken)
     current = Chain { step: Step { kind: Link { next: move boxed } } }
     remaining = remaining - 1
   }

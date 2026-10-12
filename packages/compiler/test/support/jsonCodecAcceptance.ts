@@ -114,8 +114,8 @@ impl Deserialize for Point {
       JsonToken.ObjectBegin => {}
       _ => { fail JsonError.at(JsonReason.TypeMismatch, JsonScanner.offset(&scanner.*)) }
     }
-    let mut x = Option.none<i32>()
-    let mut y = Option.none<i32>()
+    let mut x = Option<i32>.none()
+    let mut y = Option<i32>.none()
     let first = run peek(&mut scanner.*)
     match move first {
       JsonToken.ObjectEnd => {
@@ -131,13 +131,13 @@ impl Deserialize for Point {
           Option<i32>.Some { value: _ } => { fail JsonError.at(JsonReason.DuplicateKey, member.offset) }
           Option<i32>.None => {}
         }
-        x = Option.some<i32>(run JsonCodec.deserializeOne<i32>(&mut scanner.*))
+        x = Option<i32>.some(run JsonCodec.deserializeOne<i32>(&mut scanner.*))
       } else if String.view(&member.text) == "y" {
         match &y {
           Option<i32>.Some { value: _ } => { fail JsonError.at(JsonReason.DuplicateKey, member.offset) }
           Option<i32>.None => {}
         }
-        y = Option.some<i32>(run JsonCodec.deserializeOne<i32>(&mut scanner.*))
+        y = Option<i32>.some(run JsonCodec.deserializeOne<i32>(&mut scanner.*))
       } else {
         fail JsonError.at(JsonReason.UnknownField, member.offset)
       }
@@ -185,8 +185,8 @@ impl Deserialize for Segment {
       JsonToken.ObjectBegin => {}
       _ => { fail JsonError.at(JsonReason.TypeMismatch, JsonScanner.offset(&scanner.*)) }
     }
-    let mut start = Option.none<Point>()
-    let mut end = Option.none<Point>()
+    let mut start = Option<Point>.none()
+    let mut end = Option<Point>.none()
     let first = run peek(&mut scanner.*)
     match move first {
       JsonToken.ObjectEnd => {
@@ -202,13 +202,13 @@ impl Deserialize for Segment {
           Option<Point>.Some { value: _ } => { fail JsonError.at(JsonReason.DuplicateKey, member.offset) }
           Option<Point>.None => {}
         }
-        start = Option.some<Point>(run JsonCodec.deserializeOne<Point>(&mut scanner.*))
+        start = Option<Point>.some(run JsonCodec.deserializeOne<Point>(&mut scanner.*))
       } else if String.view(&member.text) == "end" {
         match &end {
           Option<Point>.Some { value: _ } => { fail JsonError.at(JsonReason.DuplicateKey, member.offset) }
           Option<Point>.None => {}
         }
-        end = Option.some<Point>(run JsonCodec.deserializeOne<Point>(&mut scanner.*))
+        end = Option<Point>.some(run JsonCodec.deserializeOne<Point>(&mut scanner.*))
       } else {
         fail JsonError.at(JsonReason.UnknownField, member.offset)
       }
@@ -307,11 +307,11 @@ effect fn check() -> i32 ! JsonError | OutOfMemoryError | WriterError {
   run writeArray(&values, &options) |> Effect.provideMut<Writer>(&mut sink)
   if !equals(&sink, b"[1]") { return 7 }
   sink.count = usize.ZERO
-  let absent = Option.none<i32>()
+  let absent = Option<i32>.none()
   run writeMaybe(&point.x, &absent, &options) |> Effect.provideMut<Writer>(&mut sink)
   if !equals(&sink, b"{\\"x\\":3}") { return 8 }
   sink.count = usize.ZERO
-  let included = Option.some<i32>(4)
+  let included = Option<i32>.some(4)
   run writeMaybe(&point.x, &included, &options) |> Effect.provideMut<Writer>(&mut sink)
   if !equals(&sink, b"{\\"x\\":3,\\"maybe\\":4}") { return 9 }
   sink.count = usize.ZERO
@@ -320,7 +320,7 @@ effect fn check() -> i32 ! JsonError | OutOfMemoryError | WriterError {
   if !(String.view(&text) == "ab") { return 1 }
   let numbers = run Json.deserialize<Vector<i32>>(b"[1,2]")
     |> Effect.provideMut<Allocator>(&mut allocator)
-  if !(Vector.length<i32>(&numbers) == 2) { return 2 }
+  if !(Vector<i32>.length(&numbers) == 2) { return 2 }
   run Json.serialize<Vector<i32>>(&numbers, &options) |> Effect.provideMut<Writer>(&mut sink)
   let tree = run Json.deserialize<Value>(b"{\\"a\\":1}")
     |> Effect.provideMut<Allocator>(&mut allocator)

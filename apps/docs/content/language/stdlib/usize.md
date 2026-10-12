@@ -39,7 +39,7 @@ import silk.usize
 pub fn main() -> i32 {
   let next = usize.checkedAdd(usize.MAX, usize.ONE)
   let recovered = move next
-    |> Option.unwrapOr<usize>(42)
+    |> Option<usize>.unwrapOr(42)
   return usize.toI32(recovered)
 }
 ```

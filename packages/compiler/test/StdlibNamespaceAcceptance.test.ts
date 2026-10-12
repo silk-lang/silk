@@ -12,9 +12,9 @@ const namespaceProgram = `import silk.option { Option }
 import silk.result { Result }
 import silk.vector { Vector }
 pub fn main() -> i32 {
-  let values = Vector.make<i32>()
-  let optional = Option.some<i32>(40)
-  let result = Result.succeed<i32, i32>(2)
+  let values = Vector<i32>.make()
+  let optional = Option<i32>.some(40)
+  let result = Result<i32, i32>.succeed(2)
   drop values
   drop optional
   drop result
@@ -35,7 +35,7 @@ effect fn next<'scratch>(
 ) -> JsonReadToken<'scratch>
 ! JsonError | BufferError
 ? &mut ByteDuplex | &mut MonotonicClock {
-  return run JsonReader.next(&mut reader.*, &mut input.*, move scratch, Option.none<Instant>())
+  return run JsonReader.next(&mut reader.*, &mut input.*, move scratch, Option<Instant>.none())
 }
 pub fn main() -> i32 { return 0 }`
 
@@ -288,9 +288,9 @@ it.effect('resolves Option, Result, and Vector operations through their namespac
     const snapshot = yield* AnalysisFixture.retainingMain(module, ascii(namespaceProgram))
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     for (const [spelling, expectedModule] of [
-      ['Vector.make', 'silk/vector'],
-      ['Option.some', 'silk/option'],
-      ['Result.succeed', 'silk/result'],
+      ['Vector<i32>.make', 'silk/vector'],
+      ['Option<i32>.some', 'silk/option'],
+      ['Result<i32, i32>.succeed', 'silk/result'],
     ] as const) {
       const offset = namespaceProgram.indexOf(spelling) + spelling.indexOf('.') + 1
       const occurrence = Analysis.semanticOccurrenceAt(snapshot, module, offset)
@@ -320,17 +320,17 @@ import silk.vector { Vector }
 service Audit { effect fn record() -> () ? &mut Audit }
 effect fn makeProvider() -> MemoryByteDuplex ! OutOfMemoryError ? &mut Allocator {
   let data = run Bytes.copy(&b"hello")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(1, 0),
     bytes: move data,
   })
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(1, 0),
     action: MemoryWriteAction.Accept {count: 2},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 16, 8, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 16, 8, Option<i32>.none())
 }
 effect fn authenticated<P>(
   connection: &mut OwnedConnection<P>
