@@ -555,7 +555,8 @@ An exclusive parent cannot be used through the parent parameter during a child r
 child call returns, the parent becomes available with its original access.
 
 **Boundary:** Reborrowing never strengthens access. `&mut values` is invalid when `values` is only
-`&[T]`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
+`&[T]`, and so is `&mut values[0]` or `&mut view.field` reached through a shared view, even when
+the binding holding the view is `mut`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
 exclusive reborrow. Forwarding an exclusive reference is written `&mut values`; passing the binding
 by value without `move` reports `OWN0003`. Method syntax is the one implicit reborrow:
 `counter.bump()` with `counter: &mut Counter` reborrows the referent for the receiver parameter
