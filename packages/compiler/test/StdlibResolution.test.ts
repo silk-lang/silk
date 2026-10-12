@@ -780,7 +780,7 @@ fn own(value: Result<i32, i32>) -> i32 {
 }
 
 pub fn main() -> i32 {
-  let outcome = StdResult.succeed<i32, i32>(7)
+  let outcome = StdResult<i32, i32>.succeed(7)
   drop outcome
   return helped()
 }`
