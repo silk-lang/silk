@@ -329,6 +329,51 @@ fn sharedSlice<T>(anchor: &[T]) -> &[T] { return anchor }`
   }),
 )
 
+it.effect('roots a borrowed match binding at the scrutinee payload it names', () =>
+  Effect.gen(function* () {
+    const source = `struct Narrow { first: i32 }
+union Choice { Left { value: Narrow }, Right { code: i32 } }
+fn increment(value: &mut Narrow) -> () { value.first = value.first + 1 }
+fn inspect(choice: &Choice) -> i32 { return 0 }
+fn heldLoan(choice: Choice) -> i32 {
+  let mut held = move choice
+  let mut seen = 0
+  match &mut held {
+    Choice.Left {value} => {
+      let other = &held
+      increment(&mut value)
+      seen = inspect(other)
+    }
+    Choice.Right {..} => {}
+  }
+  return seen
+}
+fn endedLoan(choice: Choice) -> i32 {
+  let mut held = move choice
+  let mut seen = 0
+  match &mut held {
+    Choice.Left {value} => {
+      let other = &held
+      seen = inspect(other)
+      increment(&mut value)
+    }
+    Choice.Right {..} => {}
+  }
+  return seen
+}`
+    const snapshot = yield* Analysis.ofSource('ownership/borrowed-match-binding', ascii(source))
+    // An exclusive binding is the selected payload of the scrutinee's place (MATCH-002), so
+    // borrowing it while a loan of the scrutinee is still used conflicts (BORROW-001).
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [{ code: 'OWN0010', start: source.indexOf('&mut value') }],
+    )
+  }),
+)
+
 it('restores sparse children while refusing projections through a consumed ancestor', () => {
   const outer = fieldPath(0)
   const left = fieldPath(0)
