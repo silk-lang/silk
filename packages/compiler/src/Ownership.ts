@@ -1489,7 +1489,9 @@ const checkExpressionOperation = (
             state,
             live,
             capture.value,
-            captureConsumes(capture, capture.value),
+            expression.lexical === true
+              ? capture.access === 'Take'
+              : captureConsumes(capture, capture.value),
             guard,
             escaping,
           )
