@@ -37,8 +37,8 @@ occur in the target, every argument written at the use, no inference, no bounds,
 re-normalization after substitution (`Fallible<IoError>` is `IoError`).
 
 - **Bootstrap:** implemented. Each distinct instantiation is expanded once per alias.
-- **Native:** not implemented yet. It still rejects alias parameters. The native half follows the
-  hash-consed type table, so expansion can be memoized on interned handles.
+- **Native:** not implemented yet. It still rejects alias parameters, and it accepts an omitted
+  lifetime in an alias target (`type Ref = &i32`) that the bootstrap rejects.
 - **Source migration:** none. No standard-library module or corpus program uses a generic alias
   until the native half lands.
 - Retire this entry when the native compiler accepts the same rules with the same conformance cases.
