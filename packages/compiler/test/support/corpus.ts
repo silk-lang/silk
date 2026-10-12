@@ -11348,7 +11348,7 @@ pub effect fn main() ! Primary {
   run primary()
 }`,
     nativeStderr:
-      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:6:3)\n  at memory/driver.main (memory/driver:24:3)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
+      'unhandled error: memory/driver.Primary\n  at memory/driver.primary (memory/driver:7:3)\n  at memory/driver.main (memory/driver:25:3)\n  at silk/effect.Effect.flatMap (silk/effect:303:19)\n',
     expected: { _tag: 'Trap' },
   },
   {
