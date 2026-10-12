@@ -507,8 +507,9 @@ v2 slice: the checker uses today's `Body` key and the v2 slices attach their edg
 Julia decided the open questions in the joint review with #1433 (2026-10-11):
 
 1. **Unit of checking IR.** The typed body, inside the `Body` unit (v2 option S1). No checking MIR.
-2. **Span parity.** Code plus primary-span parity on the differential corpus. Answers store spans
-   relative to their declaration, so parity compares rendered spans.
+2. **Span parity.** Code plus primary-span parity on the differential corpus. Accepted answers store
+   positions relative to their declaration; rejections and gaps keep absolute spans and record a
+   `DeclLocation` dependency (incremental v2 §3.5). Parity compares rendered spans.
 3. **Two-phase borrows.** None. BORROW-004 stays as written: `Vector.append(&mut v, f(&v))` is
    rejected.
 4. **One owner for move rules.** Move and initialization checks stay in typing; loan and region
