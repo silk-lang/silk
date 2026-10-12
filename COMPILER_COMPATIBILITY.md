@@ -2131,3 +2131,25 @@ inferred exclusive bindings for independent filesystem and allocator providers.
 - **Rule:** STATIC-012 reuses equal target, generic arguments, evidence and canonical static arguments. Distinct generic arguments retain distinct checked helper applications even when their current scalar results happen to agree.
 - **Coordinator fixture:** `selectedBodiesRouteStaticWorkAndEmbedValues` demands `scaled<i32>` and `scaled<bool>`, each calling `tagged<T>`. It checks one selected caller and one checked helper body for each distinct application, both exact embedded results of 42, and no new body demands when either equal application is repeated. Abstract-body rejection, other selected shapes, selected caller reuse and MIR's absence of runtime static-helper references remain checked.
 - **Evidence:** canonical selfhost 522d020d CI executed 69 of 70 static cases successfully; the single failure expected the bool application to reuse the i32 helper's checked body. An unchanged-actor C7 diagnostic reproduced that exact assertion failure with stable full source inputs. This fixture change preserves the compiler implementation and does not implement per-declaration invalidation in #1359.
+
+### Bootstrap Self inference on a forwarded exclusive binding
+
+- **Status:** Approved divergence on 2026-10-12 (orchestrator decision for the exclusive-view
+  OWN0003 follow-up).
+- **Rule:** forwarding an exclusive reference is written `&mut values`, and passing the binding
+  by value without `move` reports `OWN0003` (BORROW-005). This holds for interface operations too,
+  so `Stream.take(&mut lexer)` forwards `lexer: &mut Lexer`.
+- **Compilers:** native accepts `Stream.take(&mut lexer)` and reports `OWN0003` for
+  `Stream.take(lexer)`. For a concrete provider, the bootstrap infers `Self` from `&mut lexer` as a
+  borrow of the binding. It then reports `SEM0010` ("Stream has no operation take") and `SEM0057`
+  ("Exclusive borrowing requires mutable binding lexer"). It accepts the same call when the
+  provider is generic (`L: Stream`), and it accepts `Stream.take(&mut lexer.*)`.
+- **Source migration:** the compiler sources write the reference spelling `Stream.take(&mut lexer)`
+  (`compiler/src/semantic/SourceUnit.silk`, `compiler/src/main.silk`). The bootstrap does not need
+  to compile `compiler/src`.
+- **Diagnostics and limits:** only interface-operation calls on a concrete provider are affected.
+- **Evidence:** a bootstrap repro with a concrete `Lexer` and `interface Stream { fn take(self:
+  &mut Self) -> ... }` reports the two diagnostics above. The native self-build accepts both
+  compiler sites.
+- **Open questions:** none. Retire this entry when the bootstrap reads `&mut binding` of an
+  exclusive reference as a reborrow of its referent during `Self` inference.
