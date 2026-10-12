@@ -317,13 +317,16 @@ the form.
 CI holds the count in two ways. Both read `compiler/borrow-check-gap.txt`, which has one line per
 corpus program with unchecked bodies, `<program> <reason>=<count> ...`, and one `retired` line.
 
-- The selfhost corpus job compares each program's per-reason gap (the runner's
-  `SELFHOST_BORROW_GAP` receipts) with its line and fails on any difference, a fall as well as a
-  rise, so a line never goes stale and a later rise cannot hide under an old high count. A PR that
-  changes checking or the corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus
-log>`, the file's only writer, and `diff <old> <new>` prints the per-program transition table for
-  its description. Lines are independent and git merges the file with `merge=union`; two branches
-  that changed the same program leave two lines for it, which fail until `update` reruns.
+- The selfhost corpus job compares each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
+  receipts) with its line and fails on any difference, a fall as well as a rise, so a line never
+  goes stale and a later rise cannot hide under an old high count. A PR that changes checking or the
+  corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only
+  writer, and `diff <old> <new>` prints the per-program transition table for its description. The
+  corpus job builds its programs from main's verification harness, which can differ from a local run
+  on this branch's `corpus.ts`; the file must match CI, so when they disagree, run `update` on the
+  job's `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file
+  with `merge=union`; two branches that changed the same program leave two lines for it, which fail
+  until `update` reruns.
 - A reason that a slice retires is listed on the `retired` line and must be zero everywhere. The
   corpus job and the N2 self-build step both fail if a retired reason reappears. The self-build
   totals grow with the compiler, so they are printed as a receipt and never recorded.
