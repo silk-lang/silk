@@ -2787,6 +2787,38 @@ export const patternCoverage = (pattern: PatternFact): Match.CoverageIdentity | 
     : undefined
 }
 
+const isView = (type: Type.Type): type is Type.String | Type.Reference | Type.Slice =>
+  Type.isString(type) || Type.isReference(type) || Type.isSlice(type)
+
+/**
+ * Joins views that differ only in their outer region into one view of a fresh region that every
+ * arm's region outlives, so each arm's loan stays live while the result is used (MATCH-005). An
+ * arm view that already outlives the others is kept as the result instead.
+ */
+const joinViewRegions = (
+  joined: Match.Join,
+  reachable: ReadonlyArray<Type.Type>,
+  resolution: ResolutionContext,
+  anchor: AuthoredHir.Anchor,
+): Match.Join => {
+  if (joined._tag === 'Joined' && isView(joined.type)) return joined
+  const contributing = reachable.filter((type) => !Type.isNever(type))
+  const views = contributing.filter(isView)
+  const first = views.at(0)
+  if (
+    first === undefined ||
+    views.length !== contributing.length ||
+    resolution.bodyLifetimes === undefined
+  )
+    return joined
+  const region = BodyLifetime.region(resolution.bodyLifetimes, anchor, 'Join')
+  if (region === undefined) return joined
+  const type: Type.Type = { ...first, lifetime: region }
+  if (!views.every((view) => Type.equals({ ...view, lifetime: region }, type))) return joined
+  for (const view of views) BodyLifetime.constrain(resolution.bodyLifetimes, view.lifetime, region)
+  return { _tag: 'Joined', type }
+}
+
 export const analyzeMatch = (
   context: SemanticContext.SemanticContext,
   node: Extract<AuthoredHir.Expression, { readonly _tag: 'MatchExpression' }>,
@@ -3151,6 +3183,7 @@ export const analyzeMatch = (
       reachableTypes,
       BodyLifetime.environment(resolution?.bodyLifetimes, node.anchor, reachableTypes),
     )
+  joined = joinViewRegions(joined, reachableTypes, resolution, node.anchor)
   if (joined._tag === 'Incompatible') {
     let divergentRepresentations:
       | {
