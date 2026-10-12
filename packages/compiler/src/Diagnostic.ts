@@ -180,11 +180,9 @@ export const unknownOwnedCallableReturnCode = 'SEM0081' as const
 export const nonFiniteEffectJoinCode = 'SEM0132' as const
 /** Stable code for a refutable pattern in an unconditional local binding. */
 export const refutableLetPatternCode = 'SEM0133' as const
-/** Stable code for an operator marker that cannot describe its interface operation. */
-export const invalidOperatorContractCode = 'SEM0134' as const
-/** Stable code for operator syntax with no marked operation accepting its operands. */
+/** Stable code for operator syntax whose operator interface has no conformance accepting its operands. */
 export const operatorNotApplicableCode = 'SEM0135' as const
-/** Stable code for operator syntax matched by more than one marked operation. */
+/** Stable code for operator syntax matched by more than one conformance of its operator interface. */
 export const ambiguousOperatorCode = 'SEM0136' as const
 /** Stable code for an unsafe acknowledgement that does not complete an unsafe invocation. */
 export const misplacedUnsafeAcknowledgementCode = 'SEM0137' as const
@@ -441,6 +439,8 @@ export const unsatisfiedTypeOutlivesCode = 'SEM0213' as const
 export const invalidTestDeclarationCode = 'SEM0218' as const
 /** Emitted code references a function instance whose valid body native lowering does not support yet. */
 export const unsupportedLoweringCode = 'SEM0219' as const
+/** A sealed Drop or Copy head names `'static`, repeats one region, or bounds a region. */
+export const regionSelectiveConformanceCode = 'SEM0220' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -484,6 +484,7 @@ export type Code =
   | typeof unsatisfiedTypeOutlivesCode
   | typeof invalidTestDeclarationCode
   | typeof unsupportedLoweringCode
+  | typeof regionSelectiveConformanceCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -581,7 +582,6 @@ export type Code =
   | typeof unknownOwnedCallableReturnCode
   | typeof nonFiniteEffectJoinCode
   | typeof refutableLetPatternCode
-  | typeof invalidOperatorContractCode
   | typeof operatorNotApplicableCode
   | typeof ambiguousOperatorCode
   | typeof misplacedUnsafeAcknowledgementCode
@@ -896,7 +896,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
     }
   | { readonly _tag: 'InvalidExecutablePropertyConjunct'; readonly conjunct: string }
   | { readonly _tag: 'InvalidConformance'; readonly detail: string }
-  | { readonly _tag: 'InvalidOperatorContract'; readonly detail: string }
   | {
       readonly _tag: 'OperatorNotApplicable'
       readonly operator: string
@@ -975,6 +974,11 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly _tag: 'NonTerminatingConformance'
       readonly head: string
       readonly failures: ReadonlyArray<string>
+    }
+  | {
+      readonly _tag: 'RegionSelectiveConformance'
+      readonly head: string
+      readonly selection: string
     }
   | {
       readonly _tag: 'UnprovenConformance'
@@ -1910,17 +1914,6 @@ export const invalidConstant = <L>(detail: string, span: L): Diagnostic<L> => ({
   severity: 'error',
   message: `Invalid constant: ${detail}`,
   reason: { _tag: 'InvalidConstant' as const, detail },
-  span,
-})
-
-/** Creates the declaration diagnostic for an invalid interface operator marker. */
-export const invalidOperatorContract = <L>(detail: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'semantic',
-  code: invalidOperatorContractCode,
-  severity: 'error',
-  message: `Invalid operator contract: ${detail}`,
-  reason: { _tag: 'InvalidOperatorContract' as const, detail },
   span,
 })
 
@@ -4722,6 +4715,29 @@ export const nonTerminatingConformance = <L>(
   },
   span,
   notes: [...failures],
+})
+
+/**
+ * Creates the diagnostic for a sealed Drop or Copy head that would select by region.
+ *
+ * Lifetimes never decide which code runs: every region pattern of a type must run the same cleanup
+ * and copy, so a sealed head gives each region position its own unbounded binder.
+ */
+export const regionSelectiveConformance = <L>(
+  head: string,
+  selection: string,
+  span: L,
+): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: regionSelectiveConformanceCode,
+  severity: 'error',
+  message: `${head} selects by region: it ${selection}`,
+  reason: { _tag: 'RegionSelectiveConformance' as const, head, selection },
+  span,
+  notes: [
+    'A sealed Drop or Copy head gives every region position its own unbounded binder, because lifetimes never decide which code runs.',
+  ],
 })
 
 /**
