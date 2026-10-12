@@ -380,7 +380,7 @@ export const staticRetainedValueLimitCode = 'SEM0181' as const
 export const staticResidualGrowthLimitCode = 'SEM0182' as const
 /** Stable code for a type alias whose target resolves back through the alias itself. */
 export const cyclicTypeAliasCode = 'SEM0183' as const
-/** Stable code for a type alias that declares type parameters. */
+/** Stable code for a generic type alias parameter that is bounded, of an unsupported kind, or unused. */
 export const typeAliasParametersCode = 'SEM0184' as const
 /** Stable code for a foreign function whose ABI string is not "C". */
 export const unsupportedForeignAbiCode = 'SEM0185' as const
@@ -444,6 +444,8 @@ export const unsupportedLoweringCode = 'SEM0219' as const
 export const regionSelectiveConformanceCode = 'SEM0220' as const
 /** A member list follows an unwritten owner whose parameters the member uses (GEN-008). */
 export const ownerArgumentPlacementCode = 'SEM0221' as const
+/** Stable code for a namespace-qualified type named where a value is required (NAME-005). */
+export const namespaceQualifiedTypeCode = 'SEM0222' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -489,6 +491,7 @@ export type Code =
   | typeof unsupportedLoweringCode
   | typeof regionSelectiveConformanceCode
   | typeof ownerArgumentPlacementCode
+  | typeof namespaceQualifiedTypeCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -1175,7 +1178,12 @@ export type Reason<L = SourceSpan.SourceSpan> =
   | { readonly _tag: 'PrivateTypeExposure'; readonly type: string }
   | { readonly _tag: 'InlineRecursiveAggregate'; readonly members: ReadonlyArray<string> }
   | { readonly _tag: 'CyclicTypeAlias'; readonly aliases: ReadonlyArray<string> }
-  | { readonly _tag: 'TypeAliasParameters'; readonly alias: string }
+  | {
+      readonly _tag: 'TypeAliasParameters'
+      readonly alias: string
+      readonly parameter: string
+      readonly problem: TypeAliasParameterProblem
+    }
   | { readonly _tag: 'UnsupportedForeignAbi'; readonly abi: string }
   | { readonly _tag: 'GenericCLayoutRecord'; readonly record: string }
   | {
@@ -1437,6 +1445,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly member: string
       readonly owner: string
     }
+  | { readonly _tag: 'NamespaceQualifiedType'; readonly module: string; readonly member: string }
   | {
       readonly _tag: 'AssociatedFunctionOnValue'
       readonly owner: string
@@ -2470,13 +2479,37 @@ export const cyclicTypeAlias = <L>(
 })
 
 /** Rejects a type alias that declares type parameters. */
-export const typeAliasParameters = <L>(alias: string, span: L): Diagnostic<L> => ({
+/** Why a generic alias parameter is invalid (TYPE-004). */
+export type TypeAliasParameterProblem = 'Bounded' | 'Kind' | 'Unused'
+
+const typeAliasParameterMessage = (
+  alias: string,
+  parameter: string,
+  problem: TypeAliasParameterProblem,
+): string => {
+  switch (problem) {
+    case 'Bounded':
+      return `Type alias ${alias} parameter ${parameter} cannot declare bounds; the target's bounds apply at each use`
+    case 'Kind':
+      return `Type alias ${alias} parameter ${parameter} must be a type or lifetime parameter`
+    case 'Unused':
+      return `Type alias ${alias} parameter ${parameter} does not occur in its target`
+  }
+}
+
+/** Rejects a generic alias parameter that is bounded, of another kind, or unused (TYPE-004). */
+export const typeAliasParameters = <L>(
+  alias: string,
+  parameter: string,
+  problem: TypeAliasParameterProblem,
+  span: L,
+): Diagnostic<L> => ({
   _tag: 'Diagnostic',
   phase: 'semantic',
   code: typeAliasParametersCode,
   severity: 'error',
-  message: `Type alias ${alias} cannot declare type parameters; alias an applied type such as Point<i32> instead`,
-  reason: { _tag: 'TypeAliasParameters' as const, alias },
+  message: typeAliasParameterMessage(alias, parameter, problem),
+  reason: { _tag: 'TypeAliasParameters' as const, alias, parameter, problem },
   span,
 })
 
@@ -2767,6 +2800,25 @@ export const importedInherentMember = <L>(
   severity: 'error',
   message: `${module} has no root declaration ${member}; it is a member of ${owner}, so import ${owner} and write ${owner}.${member}`,
   reason: { _tag: 'ImportedInherentMember' as const, module, member, owner },
+  span,
+})
+
+/**
+ * Rejects a namespace-qualified type where a value is required, including as the qualifier of its
+ * own members: a namespace exposes root declarations, and a type's members are reached through the
+ * selected type (NAME-005).
+ */
+export const namespaceQualifiedType = <L>(
+  module: string,
+  member: string,
+  span: L,
+): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: namespaceQualifiedTypeCode,
+  severity: 'error',
+  message: `${member} in ${module} is a type, not a value; select it with an import and write ${member}.<member> for its members`,
+  reason: { _tag: 'NamespaceQualifiedType' as const, module, member },
   span,
 })
 

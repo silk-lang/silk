@@ -183,13 +183,110 @@ pub fn main() -> i32 { return 0 }`
   }),
 )
 
-it.effect('rejects a parameterized alias without reporting its parameters as unknown', () =>
+it.effect('substitutes the written arguments into a generic alias and renormalizes unions', () =>
   Effect.gen(function* () {
-    const self = yield* analyze(`struct Point<T> { x: T y: T }
-type Pair<T> = Point<T>
+    const self = yield* analyze(`struct Pair<A, B> { first: A second: B }
+struct IoError {}
+struct Left {}
+struct Right {}
+type IntPair<V> = Pair<i32, V>
+type Fallible<T> = T | IoError
+type Ref<'a, T> = &'a T
+fn pair(value: IntPair<bool>) -> i32 { return 0 }
+fn direct(value: Pair<i32, bool>) -> i32 { return 0 }
+fn collapsed(value: Fallible<IoError>) -> i32 { return 0 }
+fn widened(value: Fallible<Left | Right>) -> i32 { return 0 }
+fn nested(value: Fallible<Fallible<Left>>) -> i32 { return 0 }
+fn borrowed<'a>(value: Ref<'a, i32>) -> &'a i32 { return value }
 pub fn main() -> i32 { return 0 }`)
-    assert.deepEqual(codes(self), [Diagnostic.typeAliasParametersCode])
-    assert.strictEqual(memberType(self, 'root', 'Pair'), undefined)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+    assert.strictEqual(memberType(self, 'root', 'pair'), memberType(self, 'root', 'direct'))
+    assert.strictEqual(memberType(self, 'root', 'collapsed'), 'root.IoError')
+    assert.strictEqual(memberType(self, 'root', 'widened'), 'root.IoError | root.Left | root.Right')
+    assert.strictEqual(memberType(self, 'root', 'nested'), 'root.IoError | root.Left')
+  }),
+)
+
+it.effect('elides a lifetime an alias target omits at each use, as a struct header does', () =>
+  Effect.gen(function* () {
+    const source = `type Borrow = &i32
+type Bytes = &[u8]
+type Use = fn(i32) -> i32
+type Generic<T> = &T
+fn same(value: Borrow) -> Borrow { return value }
+fn first(bytes: Bytes) -> u8 { return bytes[0] }
+fn call(callback: Use) -> i32 { return callback(1) }
+fn generic(value: Generic<i32>) -> i32 { return value.* }
+fn two(left: Borrow, right: Borrow) -> Borrow { return left }
+fn twoWritten(left: &i32, right: &i32) -> &i32 { return left }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* analyze(source)
+    // Each use elides as the written-out target would. An ambiguous output is reported like one
+    // on a struct header: the elision failure, then the use's missing lifetime argument.
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32 { return left }')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
+it.effect('rejects bounded, row-kind and unused generic alias parameters at the parameter', () =>
+  Effect.gen(function* () {
+    const source = `interface Marker {}
+struct Point<T> { x: T y: T }
+type Bounded<T: Marker> = Point<T>
+type Rowed<?R> = Effect<i32 ? R>
+type Unused<T> = i32
+fn bounded(value: Bounded<i32>) -> i32 { return 0 }
+fn rowed(value: Rowed<?>) -> i32 { return 0 }
+fn unused(value: Unused<bool>) -> i32 { return 0 }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* analyze(source)
+    const rejected = Analysis.diagnostics(self).filter(
+      (diagnostic) => diagnostic.code === Diagnostic.typeAliasParametersCode,
+    )
+    assert.deepEqual(
+      rejected.map((diagnostic) => [
+        diagnostic.span.start,
+        diagnostic.reason._tag === 'TypeAliasParameters' ? diagnostic.reason.problem : undefined,
+      ]),
+      [
+        [source.indexOf('T: Marker'), 'Bounded'],
+        [source.indexOf('?R>'), 'Kind'],
+        [source.indexOf('T> = i32'), 'Unused'],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
+it.effect('requires every generic alias argument at the use and never infers one', () =>
+  Effect.gen(function* () {
+    const source = `struct IoError {}
+struct Left {}
+type Fallible<T> = T | IoError
+fn bare(value: Fallible) -> i32 { return 0 }
+fn extra(value: Fallible<Left, Left>) -> i32 { return 0 }
+fn take<T>(value: Fallible<T>) -> i32 { return 0 }
+pub fn main() -> i32 {
+  let inferred = take(Left {})
+  return take<Left>(Left {})
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Fallible) ->')],
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Fallible<Left, Left>')],
+        [Diagnostic.typeArgumentInferenceCode, source.indexOf('take(Left')],
+      ],
+      Json.stringify(messages(self)),
+    )
   }),
 )
 
@@ -282,6 +379,29 @@ pub fn main() -> i32 {
 }`)
     assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
   }),
+)
+
+it.effect(
+  'names a generic interface alias in bounds, impl heads and qualified operation calls',
+  () =>
+    Effect.gen(function* () {
+      const source = `interface Combine<Right, Output> {
+  fn combine(left: Self, right: Right) -> Output
+}
+type Same<T> = Combine<T, T>
+struct Tag { value: i32 }
+impl Tag { fn tagCombine(left: Tag, right: i32) -> i32 { return left.value + right } }
+impl Same<i32> for Tag { combine: Tag.tagCombine }
+fn bounded<T: Same<i32>>(value: T) -> i32 { return Same<i32>.combine(move value, 1) }
+fn bare(value: Tag) -> i32 { return Same.combine(move value, 1) }
+pub fn main() -> i32 { return bounded(Tag { value: 1 }) }`
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+        [[Diagnostic.typeArgumentArityCode, source.indexOf('Same.combine')]],
+        Json.stringify(messages(self)),
+      )
+    }),
 )
 
 it.effect('calls through an applied interface alias with the alias arguments', () =>
@@ -407,6 +527,55 @@ pub fn main() -> i32 {
         [Diagnostic.invalidConformanceCode, source.indexOf('qualified(Owned')],
         [Diagnostic.invalidConformanceCode, source.indexOf('imported(Owned')],
       ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
+it.effect('names enum members through an alias in values and patterns', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`import silk.order { Order, Ordering }
+enum Level { Low, High }
+type Tier = Level
+type Ord = Ordering
+fn pick(flag: bool) -> Tier {
+  if flag { return Tier.High }
+  return Tier.Low
+}
+fn rank(tier: Tier) -> i32 {
+  return match tier {
+    Tier.Low => 1
+    Tier.High => 2
+  }
+}
+fn compared(left: &i32, right: &i32) -> bool {
+  let ordering = Order.compare(left, right)
+  return ordering == Ord.Less || ordering == Ordering.Greater
+}
+pub fn main() -> i32 {
+  let low = 1
+  let high = 2
+  if compared(&low, &high) { return rank(pick(true)) + 40 }
+  return 0
+}`)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
+
+it.effect('rejects an enum member qualified through a namespace-qualified type', () =>
+  Effect.gen(function* () {
+    // A namespace exposes root declarations; a type's members go through the selected type.
+    const source = `import silk.order
+fn pick() -> i32 {
+  let ordering = order.Ordering.Greater
+  drop ordering
+  return 0
+}
+pub fn main() -> i32 { return pick() }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [[Diagnostic.namespaceQualifiedTypeCode, source.indexOf('Ordering.Greater')]],
       Json.stringify(messages(self)),
     )
   }),
