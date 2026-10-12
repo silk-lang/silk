@@ -295,9 +295,8 @@ cover first:
 
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
-- `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
-  exclusive views forwarded without `&mut` and region and contents obligations wait for later
-  slices.
+- `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
+  exclusive views included, are proved; region and contents obligations wait for later slices.
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
@@ -310,19 +309,40 @@ cover first:
 A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
 the form.
 
+A call result keeps the loans its instantiated regions can hold, so the walk trusts each callee's
+signature, written or elided, exactly as typing does. A body is therefore checked modulo its
+callees' contracts: the program-level guarantee needs every body checked, which is what the gap
+count tracks, and a callee that still leaves with `regions` is where a contract violation could
+hide until the regions slice proves it.
+
+- When every result region is a lifetime parameter of the checked declaration, or the result is
+  one of its type parameters, a loan of a body local, or with a body region, is not retained: such
+  a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
+  caller's region or type, and safe code obtains a type parameter's value only as such a value.
+- When exactly one operand's loans name a result region, the result retains them exactly.
+- Otherwise each loan is carried approximately: every fresh borrow of one call shares the call's
+  region, so several operands may name it, and a callable retains its capture loans whatever its
+  type names.
+
 CI holds the count in two ways. Both read `compiler/borrow-check-gap.txt`, which has one line per
-corpus program with unchecked bodies, `<program> <reason>=<count> ...`, and one `retired` line.
+corpus program, `<program> <reason>=<count> ...` (a bare name when nothing is unchecked), and one
+`retired` line.
 
 - The selfhost corpus job compares each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
   receipts) with its line and fails on any difference, a fall as well as a rise, so a line never
-  goes stale and a later rise cannot hide under an old high count. A PR that changes checking or the
-  corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only
-  writer, and `diff <old> <new>` prints the per-program transition table for its description. The
-  corpus job builds its programs from main's verification harness, which can differ from a local run
-  on this branch's `corpus.ts`; the file must match CI, so when they disagree, run `update` on the
-  job's `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file
-  with `merge=union`; two branches that changed the same program leave two lines for it, which fail
-  until `update` reruns.
+  goes stale and a later rise cannot hide under an old high count. A program that ran without a line
+  also fails. A line whose program did not run is only a notice: the job runs main's published
+  corpus, so a selfhost PR can declare a new program's line before main's bundle carries the
+  program. `update` writes a line for every program that ran and keeps, listing them as "not run",
+  the lines of programs that did not; `update --prune` drops those instead, for programs the corpus
+  no longer has. A PR that changes checking or the corpus reruns `node
+  .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
+  <new>` prints the per-program transition table for its description. The corpus job builds its
+  programs from main's verification harness, which can differ from a local run on this branch's
+  `corpus.ts`; the file must match CI, so when they disagree, run `update` on the job's
+  `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file with
+  `merge=union`; two branches that changed the same program leave two lines for it, which fail until
+  `update` reruns.
 - A reason that a slice retires is listed on the `retired` line and must be zero everywhere. The
   corpus job and the N2 self-build step both fail if a retired reason reappears. The self-build
   totals grow with the compiler, so they are printed as a receipt and never recorded.
