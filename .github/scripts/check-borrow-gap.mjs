@@ -4,7 +4,10 @@
 //     Compares each corpus program's SELFHOST_BORROW_GAP receipt with its baseline line. Any
 //     difference, a rise or a fall, fails until `update` records it.
 //   check-borrow-gap.mjs update <corpus log>
-//     Rewrites the baseline from a corpus log. It is the only writer of the file.
+//     Rewrites the baseline from a corpus log. It is the only writer of the file. CI's corpus job
+//     builds its corpus from main's verification harness, which can differ from a local run on this
+//     branch's corpus.ts; the baseline must match CI, so regenerate from the job's
+//     `selfhost-corpus-timings` artifact (or its log) whenever the two disagree.
 //   check-borrow-gap.mjs diff <old baseline> <new baseline>
 //     Prints the per-program transition table between two baselines, for a PR body.
 //   check-borrow-gap.mjs self-build <receipt directory>
@@ -60,8 +63,10 @@ const parseBaseline = (text, where) => {
 const parseReceipts = (log) => {
   const programs = new Map()
   for (const line of readFileSync(log, 'utf8').split('\n')) {
-    if (!line.startsWith(receiptPrefix)) continue
-    const receipt = JSON.parse(line.slice(receiptPrefix.length))
+    // A log copied from the job view prefixes each line with a timestamp.
+    const at = line.indexOf(receiptPrefix)
+    if (at < 0) continue
+    const receipt = JSON.parse(line.slice(at + receiptPrefix.length))
     const reasons = Object.fromEntries(
       Object.entries(receipt.reasons).filter(([, count]) => count > 0),
     )
