@@ -37,14 +37,14 @@ import silk.effect { Effect }
 effect fn build() -> i32
 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut creating = Box.make<i32>(42)
+  let mut creating = Box<i32>.make(42)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let boxed = run creating
-  let borrowed = Box.get<i32>(&boxed)
+  let borrowed = Box<i32>.get(&boxed)
   if borrowed[0] != 42 {
     return 1
   }
-  return Box.into<i32>(move boxed)
+  return Box<i32>.into(move boxed)
 }
 
 effect fn recover(error: OutOfMemoryError) -> i32 {

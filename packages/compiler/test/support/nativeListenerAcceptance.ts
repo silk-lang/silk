@@ -182,12 +182,12 @@ effect<'call> fn respondHttp<'call, 'request: 'call, 'connection: 'request, 'tra
     Result.Success {value} => value
   }
   let response = match move ResponseHead.make(
-    Version.Http11, status, Option.some<&'static [u8]>(b"No Content"), headers, httpValueLimits(),
+    Version.Http11, status, Option<&'static [u8]>.some(b"No Content"), headers, httpValueLimits(),
   ) {
     Result.Failure {error} => { fail ServerError.Value {error: move error} }
     Result.Success {value} => move value
   }
-  run reject(&mut request.*, &response, Option.none<Instant>())
+  run reject(&mut request.*, &response, Option<Instant>.none())
   return 42
 }
 
@@ -199,7 +199,7 @@ impl ConnectionHandler<Connection, i32, ServerError | OutOfMemoryError
   ) -> i32 ! ServerError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock
   where &'transport mut Connection provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
     drop handler
-    let handled = run withRequest(&mut connection.*, Option.none<Instant>(), respondHttp)
+    let handled = run withRequest(&mut connection.*, Option<Instant>.none(), respondHttp)
     return match move handled {
       Option.None => 251
       Option.Some {value} => value
@@ -219,7 +219,7 @@ effect fn serveHttp(listener: &mut Listener) -> i32
   let served = run Effect.result(serveNext<
     i32, ServerError | OutOfMemoryError,
   >(
-    &mut listener.*, httpLimits(), Option.none<Instant>(), NativeHttpHandler {},
+    &mut listener.*, httpLimits(), Option<Instant>.none(), NativeHttpHandler {},
   ))
   let client = unsafe silk_listener_finish_http()
   let code = match move served {
@@ -255,7 +255,7 @@ effect fn transferTcp<'call>(view: &'call mut AcceptedView<'call>) -> i32
     _ => { return 11 }
   }
   let mut input: [u8; 1] = [0]
-  let read = run ByteDuplex.readSome(&mut input, Option.none<Instant>())
+  let read = run ByteDuplex.readSome(&mut input, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*)
   match move read {
     ReadTransfer.Data {count} => {
@@ -263,7 +263,7 @@ effect fn transferTcp<'call>(view: &'call mut AcceptedView<'call>) -> i32
     }
     ReadTransfer.End => { return 13 }
   }
-  let written = run ByteDuplex.writeSome(b"y", Option.none<Instant>())
+  let written = run ByteDuplex.writeSome(b"y", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*)
   if written != usize.ONE { return 14 }
   return 42
@@ -280,7 +280,7 @@ effect fn transferUnix<'call>(view: &'call mut AcceptedView<'call>) -> i32
     _ => { return 21 }
   }
   let mut input: [u8; 1] = [0]
-  let read = run ByteDuplex.readSome(&mut input, Option.none<Instant>())
+  let read = run ByteDuplex.readSome(&mut input, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*)
   match move read {
     ReadTransfer.Data {count} => {
@@ -288,7 +288,7 @@ effect fn transferUnix<'call>(view: &'call mut AcceptedView<'call>) -> i32
     }
     ReadTransfer.End => { return 23 }
   }
-  let written = run ByteDuplex.writeSome(b"z", Option.none<Instant>())
+  let written = run ByteDuplex.writeSome(b"z", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*)
   if written != usize.ONE { return 24 }
   return 42
@@ -313,7 +313,7 @@ effect fn tcpCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | ByteI
   }
   if port <= 0 || unsafe silk_listener_connect_tcp(port) != 42 { return 32 }
   let admitted = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock.*)
   )
   let accepted = match move admitted {
@@ -344,7 +344,7 @@ effect fn unixCase(clock: &mut ImmediateClock) -> i32 ! NativeSocketError | Byte
   }
   if unsafe silk_listener_connect_unix(Pointer.fromSlice<u8>(path), path.length) != 42 { return 41 }
   let admitted = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock.*)
   )
   let accepted = match move admitted {
@@ -517,7 +517,7 @@ effect fn scriptedAcceptSuccess(
   unsafe { silk_listener_stub_reset(mode) }
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run openScriptListener(peerKind)
-  let accepted = run accept(&mut listener, Option.none<Instant>())
+  let accepted = run accept(&mut listener, Option<Instant>.none())
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   run Listener.close(&mut listener)
   if Listener.phase(&listener) != ListenerPhase.Closed { return 69 }
@@ -692,7 +692,7 @@ effect fn scriptedPreciseErrnos() -> i32 ! NativeSocketError {
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
   let attempted = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move attempted {
@@ -752,7 +752,7 @@ effect fn scriptedAddressFailures() -> i32 ! NativeSocketError {
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
   let short = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move short {
@@ -770,7 +770,7 @@ effect fn scriptedAddressFailures() -> i32 ! NativeSocketError {
   unsafe { silk_listener_stub_reset(107) }
   let mut unknownListener = run listen(loopback(), ListenOptions.defaults())
   let unknown = run Effect.result(
-    accept(&mut unknownListener, Option.none<Instant>())
+    accept(&mut unknownListener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move unknown {
@@ -787,7 +787,7 @@ effect fn scriptedAddressFailures() -> i32 ! NativeSocketError {
   unsafe { silk_listener_stub_reset(108) }
   let mut abstractListener = run listenUnix(b"/tmp/silk-jul-191-script.sock", ListenOptions.defaults())
   let abstract = run Effect.result(
-    accept(&mut abstractListener, Option.none<Instant>())
+    accept(&mut abstractListener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move abstract {
@@ -809,7 +809,7 @@ effect fn scriptedAcceptFailures() -> i32 ! NativeSocketError {
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
   let denied = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move denied {
@@ -825,7 +825,7 @@ effect fn scriptedAcceptFailures() -> i32 ! NativeSocketError {
   unsafe { silk_listener_stub_reset(117) }
   let mut configured = run listen(loopback(), ListenOptions.defaults())
   let setup = run Effect.result(
-    accept(&mut configured, Option.none<Instant>())
+    accept(&mut configured, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move setup {
@@ -847,7 +847,7 @@ effect fn scriptedDeadlineAndClose() -> i32 ! NativeSocketError {
   let mut clock = ImmediateClock {nowValue: SystemClock.make(5, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
   let timed = run Effect.result(
-    accept(&mut listener, Option.some<Instant>(SystemClock.make(5, 0)))
+    accept(&mut listener, Option<Instant>.some(SystemClock.make(5, 0)))
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move timed {
@@ -883,7 +883,7 @@ effect fn scriptedDeadlineAndClose() -> i32 ! NativeSocketError {
   }
   let mut overflowListener = run listen(loopback(), ListenOptions.defaults())
   let overflowed = run Effect.result(
-    accept(&mut overflowListener, Option.none<Instant>())
+    accept(&mut overflowListener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut overflowClock)
   )
   match move overflowed {
@@ -906,7 +906,7 @@ effect fn scriptedPollFailures() -> i32 ! NativeSocketError {
     let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
     let mut listener = run listen(loopback(), ListenOptions.defaults())
     let attempted = run Effect.result(
-      accept(&mut listener, Option.none<Instant>())
+      accept(&mut listener, Option<Instant>.none())
         |> Effect.provideMut<MonotonicClock>(&mut clock)
     )
     match move attempted {
@@ -962,7 +962,7 @@ effect fn scriptedScopedLifecycles() -> i32 ! NativeSocketError {
   unsafe { silk_listener_stub_reset(101) }
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
-  let accepted = run accept(&mut listener, Option.none<Instant>())
+  let accepted = run accept(&mut listener, Option<Instant>.none())
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   unsafe { silk_listener_stub_reset(124) }
   let protectedAccepted = run Effect.result(withAcceptedContext(
@@ -987,7 +987,7 @@ effect fn scriptedScopedLifecycles() -> i32 ! NativeSocketError {
 effect fn parkedListenerAccept(listener: &mut Listener) -> i32
 ! NativeSocketError
 ? &mut MonotonicClock {
-  let accepted = run accept(&mut listener.*, Option.none<Instant>())
+  let accepted = run accept(&mut listener.*, Option<Instant>.none())
   drop accepted
   unsafe { silk_listener_stub_mark_completion() }
   return 1
@@ -1052,7 +1052,7 @@ effect fn scriptedAcceptedContextCancellation() -> i32
   unsafe { silk_listener_stub_reset(101) }
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let mut listener = run listen(loopback(), ListenOptions.defaults())
-  let accepted = run accept(&mut listener, Option.none<Instant>())
+  let accepted = run accept(&mut listener, Option<Instant>.none())
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   run Listener.close(&mut listener)
 
@@ -1109,7 +1109,7 @@ effect fn scriptedDarwinCases() -> i32 ! NativeSocketError {
         if unsafe silk_listener_stub_setsockopts() != 1 { return 249 }
       }
       let attempted = run Effect.result(
-        accept(&mut listener, Option.none<Instant>())
+        accept(&mut listener, Option<Instant>.none())
           |> Effect.provideMut<MonotonicClock>(&mut clock)
       )
       match move attempted {
@@ -1169,7 +1169,7 @@ effect fn scriptedBoundaryDeadlines() -> i32 ! NativeSocketError {
     let mut listener = run openScriptListener(0)
     let mut clock = BoundaryClock {samples: 0, expireAt: expireAt}
     let result = run Effect.result(
-      accept(&mut listener, Option.some<Instant>(SystemClock.make(5, 0)))
+      accept(&mut listener, Option<Instant>.some(SystemClock.make(5, 0)))
         |> Effect.provideMut<MonotonicClock>(&mut clock)
     )
     match move result {
@@ -1191,7 +1191,7 @@ effect fn scriptedBoundaryDeadlines() -> i32 ! NativeSocketError {
   let mut listener = run openScriptListener(1)
   let mut clock = ImmediateClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
   let result = run Effect.result(
-    accept(&mut listener, Option.none<Instant>())
+    accept(&mut listener, Option<Instant>.none())
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   )
   match move result {
