@@ -894,7 +894,7 @@ impl MonotonicClock for StubClock {
 }
 
 struct RefusingAllocator {}
-effect fn allocate(self: &mut RefusingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut RefusingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   return run Allocator.outOfMemory()
 }
 impl Allocator for RefusingAllocator { allocate: RefusingAllocator.allocate }

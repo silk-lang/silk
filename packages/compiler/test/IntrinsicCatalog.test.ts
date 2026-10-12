@@ -2055,3 +2055,35 @@ it.effect('moves outcome metadata before invoking a replaced owner callback', ()
     }),
   ),
 )
+
+it.effect(
+  'spells the core storage types through Intrinsic and leaves the bare names ordinary',
+  () =>
+    Effect.gen(function* () {
+      const ordinary = `struct Slot { value: i32 }
+struct RawBuffer { count: i32 }
+struct Allocation { size: i32 }
+fn total(slot: Slot, buffer: RawBuffer, allocation: Allocation) -> i32 {
+  return slot.value + buffer.count + allocation.size
+}
+fn length(buffer: &Intrinsic.RawBuffer<i32>) -> usize { return Intrinsic.rawBufferCount<i32>(buffer) }
+pub fn main() -> i32 { return total(Slot {value: 40}, RawBuffer {count: 1}, Allocation {size: 1}) }`
+      const declared = yield* AnalysisFixture.frontend(
+        'intrinsic/ordinary-storage-names',
+        encoder.encode(ordinary),
+      )
+      assert.deepEqual(Analysis.diagnostics(declared), [])
+      const bare = `fn view<'s>(slot: Slot<'s, i32>) -> i32 { return 0 }
+pub fn main() -> i32 { return 0 }`
+      const unresolved = yield* AnalysisFixture.frontend(
+        'intrinsic/bare-storage-name',
+        encoder.encode(bare),
+      )
+      const diagnostics = Analysis.diagnostics(unresolved)
+      assert.deepEqual(
+        diagnostics.map((entry) => [entry.code, bare.slice(entry.span.start, entry.span.end)]),
+        [['SEM0001', 'Slot']],
+        'a bare storage spelling with no declaration in scope is an ordinary unknown name',
+      )
+    }),
+)

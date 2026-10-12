@@ -404,7 +404,7 @@ struct SuspendingAllocator {}
 effect fn allocate(
   self: &mut SuspendingAllocator,
   layout: Layout
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   return run Effect.suspend(effect {
     return run Intrinsic.systemAllocationAcquire(move layout)
   })

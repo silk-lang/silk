@@ -275,7 +275,7 @@ it.effect('transports exact local-shared allocation provenance through an ordina
   Effect.gen(function* () {
     const source = ascii(`import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
-fn forward(allocation: Allocation) -> Allocation { return move allocation }
+fn forward(allocation: Intrinsic.Allocation) -> Intrinsic.Allocation { return move allocation }
 effect fn construct() -> i32 ! OutOfMemoryError {
   let layout = Intrinsic.sharedLayout<i32>()
   let acquired = run Intrinsic.systemAllocationAcquire(move layout)
@@ -477,7 +477,7 @@ it.effect('invalidates inherited allocation provenance after a mutable parameter
   Effect.gen(function* () {
     const source = ascii(`import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
-fn replace(mut allocation: Allocation, replacement: Allocation) -> Allocation {
+fn replace(mut allocation: Intrinsic.Allocation, replacement: Intrinsic.Allocation) -> Intrinsic.Allocation {
   allocation = move replacement
   return move allocation
 }
@@ -519,7 +519,7 @@ it.effect('invalidates inherited allocation provenance after replacing a mutable
   Effect.gen(function* () {
     const source = ascii(`import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
-fn replace(mut allocation: Allocation, replacement: Allocation) -> Allocation {
+fn replace(mut allocation: Intrinsic.Allocation, replacement: Intrinsic.Allocation) -> Intrinsic.Allocation {
   let old = Intrinsic.replace(allocation, move replacement)
   drop old
   return move allocation
@@ -661,7 +661,7 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
           'local-shared-helper-provenance-mismatch',
           `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
-fn forward(allocation: Allocation) -> Allocation { return move allocation }
+fn forward(allocation: Intrinsic.Allocation) -> Intrinsic.Allocation { return move allocation }
 effect fn store() -> i32 ! OutOfMemoryError {
   let layout = Intrinsic.sharedLayout<u32>()
   let acquired = run Intrinsic.systemAllocationAcquire(move layout)
@@ -680,7 +680,7 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
           'local-shared-conditional-helper-provenance-mismatch',
           `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
-fn choose(flag: bool, wrong: Allocation, right: Allocation) -> Allocation {
+fn choose(flag: bool, wrong: Intrinsic.Allocation, right: Intrinsic.Allocation) -> Intrinsic.Allocation {
   if flag {
     drop right
     return move wrong
@@ -710,10 +710,10 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
 import silk.effect { Effect }
 import silk.layout { Layout }
 service Forge {
-  effect fn allocate(layout: Layout) -> Allocation ! OutOfMemoryError ? &mut Forge
+  effect fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? &mut Forge
 }
 struct BadForge {}
-effect fn allocate(self: &mut BadForge, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut BadForge, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   drop layout
   return run Intrinsic.systemAllocationAcquire(Layout.of<i32>())
 }
@@ -790,12 +790,12 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
           `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
 effect fn store() -> i32 ! OutOfMemoryError {
-  let blockLayout = Intrinsic.sharedLayout<Allocation>()
+  let blockLayout = Intrinsic.sharedLayout<Intrinsic.Allocation>()
   let block = run Intrinsic.systemAllocationAcquire(move blockLayout)
   let payloadLayout = Intrinsic.sharedLayout<i32>()
   let payload = run Intrinsic.systemAllocationAcquire(move payloadLayout)
   unsafe {
-    let core = Intrinsic.sharedFromAllocation<Allocation>(move block, move payload)
+    let core = Intrinsic.sharedFromAllocation<Intrinsic.Allocation>(move block, move payload)
     drop payload
     drop core
   }

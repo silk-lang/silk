@@ -13,7 +13,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 struct Guard<T> {
   value: T
-  storage: Allocation
+  storage: Intrinsic.Allocation
 }
 
 impl<T> Drop for Guard<T> {
