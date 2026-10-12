@@ -352,6 +352,45 @@ fn partial() -> i32 {
   }),
 )
 
+it.effect('reports a member list after an unwritten owner whose parameters the member uses', () =>
+  Effect.gen(function* () {
+    const source = `struct Lent<'a, T> { value: &'a T }
+impl<'a, T> Lent<'a, T> {
+  fn pick<U>(lent: &Lent<'a, T>, other: U) -> &'a T { drop other return lent.value }
+}
+struct Pair<A, B> {
+  left: A
+  right: B
+}
+impl<A, B> Pair<A, B> {
+  fn second(value: B) -> B { return move value }
+  fn keep<U>(value: U) -> U { return move value }
+}
+service Store<T> { effect<'env> fn put<'env>(value: T) -> i32 ? &mut Store<T> }
+fn prefixed(small: u8) -> u8 { return Pair.second<u8>(small) }
+fn picked<'r>(lent: &Lent<'r, i32>) -> &'r i32 { return Lent.pick<i32, bool>(lent, true) }
+fn own<'r>(lent: &Lent<'r, i32>) -> &'r i32 { return Lent.pick<bool>(lent, true) }
+fn independent() -> u8 { return Pair.keep<u8>(42) }
+fn inferred() -> u8 {
+  let small: u8 = 42
+  return Pair.second(small)
+}
+effect fn stored() -> i32 ? &mut Store<i32> { return run Store.put<i32>(5) }
+`
+    const snapshot = yield* Analysis.ofSource('root', ascii(source))
+    assert.deepEqual(codes(snapshot), ['SEM0221', 'SEM0221', 'SEM0221', 'SEM0221'])
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => diagnostic.span.start),
+      [
+        source.indexOf('<u8>(small)'),
+        source.indexOf('<i32, bool>'),
+        source.indexOf('<bool>(lent'),
+        source.indexOf('<i32>(5)'),
+      ],
+    )
+  }),
+)
+
 const analyzeConformance = (text: string) =>
   Analysis.make({ root: 'root' }).pipe(
     Effect.provide(
