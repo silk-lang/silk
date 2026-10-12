@@ -4081,15 +4081,14 @@ it('recovers a type alias without a target at the next declaration', () => {
 })
 
 it('rejects a bound list as a type alias target at the first plus', () => {
-  const source = 'type Both = A + B'
+  const source = 'type Both = A + B + C\npub fn after() -> i32 { return 1 }'
   const result = parseText('memory/bound-list-type-alias', source)
 
   assert.deepEqual(
-    diagnosticView(result)
-      .slice(0, 1)
-      .map((diagnostic) => [diagnostic.code, diagnostic.start]),
+    diagnosticView(result).map((diagnostic) => [diagnostic.code, diagnostic.start]),
     [['PAR0002', source.indexOf('+')]],
   )
+  assert.notStrictEqual(SyntaxTree.directNode(result.root, 'FunctionDeclaration'), undefined)
   assertOriginalTokenTraversal(result)
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })

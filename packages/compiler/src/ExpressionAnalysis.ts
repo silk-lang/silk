@@ -8547,8 +8547,14 @@ const aliasedInterfaceOperationTarget = (
     SemanticContext.nameText(context, qualifier) ?? '',
   )
   if (lookup._tag !== 'Resolved' || lookup.declaration._tag !== 'AliasDeclaration') return undefined
+  // An alias without arguments is its target's spelling, so the plain qualified path takes it.
   const target = lookup.declaration.target
-  if (target._tag !== 'Resolved') return undefined
+  if (
+    target._tag !== 'Resolved' ||
+    !Type.isNominal(target.type) ||
+    target.type.arguments.length === 0
+  )
+    return undefined
   return interfaceOperationTarget(
     context,
     {
@@ -11027,7 +11033,12 @@ function analyzeExpressionDecision(
     if (intrinsicOperationTarget(context, node)?.rule._tag === 'PlaceRule') {
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
-    const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+    const named = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+    // A transparent alias qualifier names its target declaration (TYPE-004).
+    const qualifierLookup =
+      named._tag === 'Resolved'
+        ? { ...named, declaration: NameResolution.erasedOwner(resolution.index, named.declaration) }
+        : named
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,
