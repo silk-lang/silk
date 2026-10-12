@@ -298,8 +298,10 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
   exclusive views forwarded without `&mut` and region and contents obligations wait for later
   slices.
-- `effects`, `storage`: the body uses that form, which the loan and move walk does not enter
-  yet.
+- `effects`: the body runs a stored Effect, or invokes an `effect fn` value. An immediate
+  `run f(..)` of an `effect fn` or interface operation call is checked as that one call
+  (EFF-003): the Effect it constructs is a temporary only the run consumes.
+- `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
@@ -442,6 +444,14 @@ rejects is never accepted.
    - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
+   - Scope-end storage ends as events: at a match arm's end, at a block's end and at body exit.
+     Until then a loan can outlive its root's scope unseen. For example, a consuming match arm can
+     yield `&value` of its arm-local binding. Every such body answers `regions` or `stored-loans`,
+     never `Checked`; this slice rejects that program with OWN0019.
+   - The failure edge from each `run` to body exit, beside the one `fail` already takes. Exit
+     carries no events before this slice, so the edge cannot change a verdict yet. Add it here with
+     a program whose failure path reaches a scope-end drop of a root whose loan is held across the
+     run.
 4. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
    through the per-declaration summaries of v2 P5(a); this slice adds the summary for whatever it
    needs if v2 has not landed it yet.
