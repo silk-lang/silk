@@ -7737,7 +7737,14 @@ const concreteContractOperationReference = (
         Location.at(memberToken.anchor),
       ),
     }
-  if (!Type.isNominal(receiverType)) return undefined
+  // A scalar or `string` provider conforms through a standard-library head (IMPL-004) like a
+  // nominal one, such as `impl Order for i32`.
+  if (
+    !Type.isNominal(receiverType) &&
+    typeof receiverType !== 'string' &&
+    !Type.isString(receiverType)
+  )
+    return undefined
   const canonical = contract.canonical.id
   const supplied = ConformanceProof.implementedContracts(
     resolution.index,
