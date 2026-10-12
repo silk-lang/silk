@@ -21,13 +21,13 @@ GEN-008 writes a generic owner's arguments on the owner and a member's own argum
 owner's lifetimes, which the call infers; it is otherwise a complete type.
 
 - **Bootstrap:** binds an owner application to the impl's or service's binders by position and
-  reports an incomplete one (SEM0051). It still accepts the member-prefix spelling.
+  reports an incomplete one (SEM0051). A member list after an unwritten owner whose parameters the
+  member names reports SEM0221.
 - **Native:** accepts complete owner applications on inherent members and services, and infers the
   lifetimes an inherent owner application omits. A service application cannot omit a lifetime yet.
   It still accepts the member-prefix spelling.
-- **Source migration:** `packages/compiler/scripts/migrate-type-argument-placement.mjs` rewrites the
-  member-prefix spelling and reports every site it cannot write without guessing. The stdlib, tests
-  and documentation are migrated on main; `compiler/src` migrates on `selfhost`.
+- **Source migration:** complete. The stdlib, tests, documentation and `compiler/` write owner
+  arguments on the owner, and the migration codemod is deleted.
 - Retire this entry when both compilers reject the member-prefix spelling with a diagnostic.
 
 ## Explicit synchronous source startup
