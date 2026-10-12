@@ -154,6 +154,8 @@ export interface LoanFact {
     | 'ReturnedCallableCapture'
     | 'InterfaceOperand'
     | 'ReturnedView'
+    /** A shared or exclusive callee whose environment the invocation's result retains. */
+    | 'RetainedCallee'
   readonly parent?: BindingSite
   readonly suspendsParent: boolean
   readonly startRegion: Tir.RegionId
@@ -3008,7 +3010,8 @@ const analyzeLoans = (
       const retainedExecutableCapture =
         loan.origin === 'CallableCapture' ||
         loan.origin === 'ReturnedCallableCapture' ||
-        loan.origin === 'EffectCapture'
+        loan.origin === 'EffectCapture' ||
+        loan.origin === 'RetainedCallee'
       const retainedThroughAuthoredUse =
         loan.startSpan.sourceId === span.sourceId &&
         loan.startSpan.end <= span.start &&
@@ -3026,18 +3029,19 @@ const analyzeLoans = (
     })
   }
 
-  const checkDirectAccess = (
+  // The loan an access to an authored place conflicts with, if any.
+  const directAccessConflict = (
     expression: LoanView.Expression,
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move',
-  ): void => {
+  ): LoanFact | undefined => {
     const direct = directSite(expression)
     const place = physicalPlace(expression)
-    if (direct === undefined || place === undefined) return
+    if (direct === undefined || place === undefined) return undefined
     loanAccessChecks += 1
     const places =
       borrowedRootType(expression) === undefined ? [place] : rootsOf(place.root, place.path)
-    const conflict = active.find(
+    return active.find(
       (loan) =>
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
         (loan.referents.some((referent) =>
@@ -3046,7 +3050,16 @@ const analyzeLoans = (
           (loan.suspendsParent && sameSite(loan.root, direct.site))) &&
         (access !== 'Read' || loan.access === 'Exclusive'),
     )
-    if (conflict !== undefined) {
+  }
+
+  const checkDirectAccess = (
+    expression: LoanView.Expression,
+    active: ReadonlyArray<LoanFact>,
+    access: 'Read' | 'Write' | 'Move',
+  ): void => {
+    const direct = directSite(expression)
+    const conflict = directAccessConflict(expression, active, access)
+    if (direct !== undefined && conflict !== undefined) {
       diagnostics.push(
         Diagnostic.ownerAccessDuringLoan(
           direct.spelling,
@@ -3419,10 +3432,65 @@ const analyzeLoans = (
         ]
         const returnedOrdinal = returnedArgumentOrdinals(expression)
         const inspectCallee = (): void => {
-          let access: 'Move' | 'Write' | 'Read' = 'Read'
-          if (expression.mode === 'Take') access = 'Move'
-          else if (expression.mode === 'Exclusive') access = 'Write'
+          const borrow = expression.mode
+          if (borrow === 'Take') {
+            inspect(expression.callee, region, active, 'Move', delayedEnd)
+            return
+          }
+          const access = borrow === 'Exclusive' ? 'Write' : 'Read'
+          // A result that retains the callee's environment, such as an Effect constructed from an
+          // `effect fn` value, holds a loan of the callee until its own last possible use or drop
+          // (EFFECT-OWN-001).
+          const place = physicalPlace(expression.callee)
+          const retained =
+            place !== undefined &&
+            expression.callee.type._tag === 'Available' &&
+            expression.type._tag === 'Available' &&
+            LoanView.retainsLifetimes(
+              expression.callee.type.type,
+              expression.type.type,
+              assumptions,
+            )
+          // An exclusive invocation, or one whose result retains its callee, borrows the callee; a
+          // shared invocation whose result does not is a read of it.
+          if (borrow === 'Shared' && !retained) {
+            inspect(expression.callee, region, active, access, delayedEnd)
+            return
+          }
+          const calleeSpan = context.spanOf(expression.callee.anchor)
+          const conflict = directAccessConflict(
+            expression.callee,
+            [...active, ...delayedLoansAt(calleeSpan, access === 'Write')],
+            access,
+          )
+          if (conflict !== undefined) {
+            diagnostics.push(
+              Diagnostic.conflictingViewLoan(
+                conflict.access,
+                borrow,
+                conflict.startSpan,
+                calleeSpan,
+              ),
+            )
+            return
+          }
           inspect(expression.callee, region, active, access, delayedEnd)
+          if (!retained || place === undefined) return
+          const end = delayedEnd ?? endpointAt(expression.anchor, region)
+          loans.push({
+            _tag: 'Loan',
+            id: { _tag: 'BorrowId', call: expression.callee.ref, ordinal: 0 },
+            root: place.root,
+            access: borrow,
+            origin: 'RetainedCallee',
+            suspendsParent: false,
+            startRegion: region,
+            endRegion: end.region,
+            startSpan: calleeSpan,
+            referents: [place],
+            endSpan: end.span,
+            cleanupOnly: end.cleanupOnly ?? false,
+          })
         }
         const inspectArguments = (): void => {
           for (const argument of expression.arguments) {

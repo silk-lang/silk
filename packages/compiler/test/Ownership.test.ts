@@ -1286,6 +1286,135 @@ pub fn main() -> i32 {
   assert.ok((loan?.endSpan.start ?? 0) > (loan?.startSpan.start ?? 0))
 })
 
+it('borrows a callable callee for the life of the Effect it constructs', () => {
+  const prelude = `struct Token { value: i32 }
+struct Narrow { first: i32 second: i32 }
+impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
+fn spend(token: Token) -> i32 { return token.value }
+`
+  const counting = `  let mut count = 0
+  let mut counting = effect fn(extra: i32) -> i32 {
+    count = count + extra
+    return count
+  }
+`
+  const cases: ReadonlyArray<{
+    readonly name: string
+    readonly body: string
+    readonly expected: ReadonlyArray<{
+      readonly code: string
+      readonly at: string
+      readonly offset?: number
+      readonly related?: string
+    }>
+  }> = [
+    {
+      name: 'held-exclusive',
+      body: `effect fn heldExclusive() -> i32 {
+${counting}  let mut pending = counting(1)
+  let direct = run counting(2)
+  return direct + run pending
+}`,
+      expected: [{ code: 'OWN0010', at: 'run counting(2)', offset: 4, related: 'counting(1)' }],
+    },
+    {
+      name: 'dropped-exclusive',
+      body: `effect fn droppedExclusive() -> i32 {
+${counting}  let pending = counting(1)
+  let direct = run counting(2)
+  drop pending
+  return direct
+}`,
+      expected: [{ code: 'OWN0010', at: 'run counting(2)', offset: 4, related: 'counting(1)' }],
+    },
+    {
+      name: 'ended-first',
+      body: `effect fn endedFirst() -> i32 {
+${counting}  let mut pending = counting(1)
+  let first = run pending
+  return first + run counting(2)
+}`,
+      expected: [],
+    },
+    {
+      name: 'dropped-first',
+      body: `effect fn droppedFirst() -> i32 {
+${counting}  let pending = counting(1)
+  drop pending
+  return run counting(2)
+}`,
+      expected: [],
+    },
+    {
+      name: 'dropped-callee',
+      body: `effect fn droppedCallee() -> i32 {
+${counting}  let pending = counting(1)
+  drop counting
+  drop pending
+  return 0
+}`,
+      expected: [{ code: 'OWN0011', at: 'drop counting', offset: 5, related: 'counting(1)' }],
+    },
+    {
+      name: 'held-shared',
+      body: `effect fn heldShared() -> i32 {
+  let mut held = Narrow {first: 1, second: 2}
+  let shared = effect fn(extra: i32) -> i32 { return held.first + extra }
+  let pending = shared(1)
+  held = Narrow {first: 3, second: 4}
+  drop pending
+  return held.second
+}`,
+      expected: [{ code: 'OWN0011', at: '\n  held = Narrow', offset: 3, related: 'held.first' }],
+    },
+    {
+      name: 'shared-twice',
+      body: `effect fn sharedTwice() -> i32 {
+  let held = Narrow {first: 1, second: 2}
+  let shared = effect fn(extra: i32) -> i32 { return held.first + extra }
+  let first = shared(1)
+  let second = shared(2)
+  let direct = run shared(3)
+  let left = run first
+  let right = run second
+  return left + right + direct
+}`,
+      expected: [],
+    },
+    {
+      name: 'owned-once',
+      body: `effect fn ownedOnce(token: Token) -> i32 {
+  let consumed = effect fn(extra: i32) -> i32 { return spend(move token) + extra }
+  let first = consumed(1)
+  let second = consumed(2)
+  drop first
+  drop second
+  return 0
+}`,
+      expected: [{ code: 'OWN0001', at: 'consumed(2)' }],
+    },
+  ]
+  for (const { name, body, expected } of cases) {
+    const source = `${prelude}${body}`
+    const facts = check(`ownership/effect-callee-${name}`, source)
+    assert.deepEqual(
+      facts.diagnostics.map((diagnostic): { readonly code: string; readonly start: number } => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+        ...(diagnostic.code === 'OWN0010' || diagnostic.code === 'OWN0011'
+          ? { related: diagnostic.relatedSpans?.at(0)?.span.start }
+          : {}),
+      })),
+      expected.map(({ code, at, offset, related }) => ({
+        code,
+        start: source.indexOf(at) + (offset ?? 0),
+        ...(related === undefined ? {} : { related: source.indexOf(related) }),
+      })),
+      name,
+    )
+  }
+})
+
 it('keeps an existing borrowed provider live until its last run', () => {
   const facts = check(
     'ownership/borrowed-provider',
