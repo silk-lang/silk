@@ -214,7 +214,7 @@ fn prepare<'policy>(value: Request<'policy>) -> Request<'policy> { return move v
 effect<'env> fn forward<'policy, A, E: 'env, ?R, 'env>(value: Request<'policy>, handler: Handler<'policy, E, R>) -> Response<'policy, A>
 ! E ? R | &mut Dispatch<'policy, Handler<'policy, E, R>, Response<'policy, A>, E, R> {
   let prepared = prepare(move value)
-  return run Dispatch.use<'policy, Handler<'policy, E, R>, Response<'policy, A>, E, R>(move prepared, move handler)
+  return run Dispatch<'policy, Handler<'policy, E, R>, Response<'policy, A>, E, R>.use(move prepared, move handler)
 }
 pub fn main() -> i32 { return 0 }`),
     )
@@ -2040,7 +2040,7 @@ service Clock {}
 service Logger {}
 service Dispatch<A, ?R> { effect fn read() -> A ? R | &mut Dispatch<A, R> }
 effect fn useDispatch<?R>() -> i32 ? R | &mut Clock | &mut Logger | &mut Dispatch<i32 ? R | &mut Clock | &mut Logger> {
-  return run Dispatch.read<i32, R | &mut Clock | &mut Logger>()
+  return run Dispatch<i32, R | &mut Clock | &mut Logger>.read()
 }
 effect fn risky() -> i32 ! First | Second { fail First {} }
 effect fn read() -> i32 ? &Clock { return 42 }

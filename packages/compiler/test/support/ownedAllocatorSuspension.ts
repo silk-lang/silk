@@ -136,7 +136,7 @@ fn countDrop(drops: &mut Drops) -> i32 {
 fn readDrops(drops: &Drops) -> i32 { return drops.value }
 impl Drop for Cell {
   fn drop(self: &mut Cell) -> () {
-    let changed = Shared.withMut<Drops, i32>(&self.drops, countDrop)
+    let changed = Shared<Drops>.withMut<i32>(&self.drops, countDrop)
     return ()
   }
 }
@@ -154,16 +154,16 @@ effect fn program(drops: &Shared<Drops>) -> i32 ! OutOfMemoryError ? &mut Alloca
   let cell = Cell {
     value: 41,
     storage: move storage,
-    drops: Shared.clone<Drops>(drops),
+    drops: Shared<Drops>.clone(drops),
   }
   let bound = Intrinsic.bindRequirementOwned<Counter>(read(), move cell)
   return run move bound
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return -1 }
 effect fn build() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let drops = run Shared.make<Drops>(Drops { value: 0 })
+  let drops = run Shared<Drops>.make(Drops { value: 0 })
   let result = run program(&drops)
-  let count = Shared.with<Drops, i32>(&drops, readDrops)
+  let count = Shared<Drops>.with<i32>(&drops, readDrops)
   drop drops
   if result != 42 || count != 1 { return 1 }
   return 42
@@ -196,7 +196,7 @@ fn countDrop(drops: &mut Drops) -> i32 {
 fn readDrops(drops: &Drops) -> i32 { return drops.value }
 impl Drop for Provider {
   fn drop(self: &mut Provider) -> () {
-    let changed = Shared.withMut<Drops, i32>(&self.drops, countDrop)
+    let changed = Shared<Drops>.withMut<i32>(&self.drops, countDrop)
     return ()
   }
 }
@@ -213,7 +213,7 @@ effect fn open(drops: &Shared<Drops>) -> Provider ! OutOfMemoryError {
   return Provider {
     code: 42,
     storage: move storage,
-    drops: Shared.clone<Drops>(drops),
+    drops: Shared<Drops>.clone(drops),
   }
 }
 effect fn use() -> i32 ! Problem ? &mut Value {
@@ -225,9 +225,9 @@ effect fn program(drops: &Shared<Drops>) -> i32 ! Problem | OutOfMemoryError ? &
 }
 effect fn recover(error: Problem | OutOfMemoryError) -> i32 { return 7 }
 effect fn build() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let drops = run Shared.make<Drops>(Drops { value: 0 })
+  let drops = run Shared<Drops>.make(Drops { value: 0 })
   let result = run Effect.catchAll(program(&drops), recover)
-  let count = Shared.with<Drops, i32>(&drops, readDrops)
+  let count = Shared<Drops>.with<i32>(&drops, readDrops)
   drop drops
   if result != 7 || count != 1 { return 1 }
   return 7

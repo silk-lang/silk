@@ -207,9 +207,11 @@ pub fn main() -> i32 {
   return 0
 }`,
     )
-    assert.include(
+    // GEN-008: an applied service is a service operation call, not an interface operation; the
+    // only remaining failure is the requirement `main` leaves unprovided.
+    assert.deepEqual(
       Analysis.diagnostics(appliedService).map((diagnostic) => diagnostic.code),
-      'SEM0010',
+      ['SEM0071'],
     )
 
     const resultDirected = yield* frontend(
