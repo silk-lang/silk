@@ -469,6 +469,32 @@ pub fn inspect(point: Point) -> i32 {
   assert.deepEqual(shared.diagnostics, [])
   assert.deepEqual(ownership(shared).diagnostics, [])
 
+  // Only bindings are pattern loans (PATT-009): a pattern that binds nothing holds no loan in
+  // its selected body.
+  const unbound = analyze(
+    'unbound-pattern-loan',
+    `pub union Slot<T> { Held { value: T }, Vacant }
+pub struct Token { kind: i32 }
+fn take(slot: Slot<Token>) -> i32 { return 0 }
+pub fn tested(input: Slot<Token>) -> i32 {
+  let direct = move input
+  if let Slot<Token>.Held { .. } = &direct { return take(move direct) }
+  return take(move direct)
+}
+pub fn refilled(input: Slot<Token>) -> i32 {
+  let mut slot = move input
+  if let Slot<Token>.Vacant = &slot { slot = Slot<Token>.Held { value: Token { kind: 1 } } }
+  return take(move slot)
+}
+pub fn destructured(token: Token) -> i32 {
+  let Token { .. } = &token
+  let consumed = move token
+  return consumed.kind
+}`,
+  )
+  assert.deepEqual(unbound.diagnostics, [])
+  assert.deepEqual(ownership(unbound).diagnostics, [])
+
   const exclusive = analyze(
     'exclusive-pattern-loan',
     `pub struct Point { x: i32 y: i32 }
