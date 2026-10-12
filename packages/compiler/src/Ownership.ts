@@ -3029,6 +3029,10 @@ const analyzeLoans = (
     })
   }
 
+  // Invocations a `run` executes in place: the Effect each constructs is consumed by that run, so
+  // nothing retains its callee beyond the call (EFF-003).
+  const ranInPlace = new Set<LoanView.Expression>()
+
   // The loan an access to an authored place conflicts with, if any.
   const directAccessConflict = (
     expression: LoanView.Expression,
@@ -3439,11 +3443,12 @@ const analyzeLoans = (
           }
           const access = borrow === 'Exclusive' ? 'Write' : 'Read'
           // A result that retains the callee's environment, such as an Effect constructed from an
-          // `effect fn` value, holds a loan of the callee until its own last possible use or drop
-          // (EFFECT-OWN-001).
+          // `effect fn` value and not run in place, holds a loan of the callee until its own last
+          // possible use or drop (EFFECT-OWN-001).
           const place = physicalPlace(expression.callee)
           const retained =
             place !== undefined &&
+            !ranInPlace.has(expression) &&
             expression.callee.type._tag === 'Available' &&
             expression.type._tag === 'Available' &&
             LoanView.retainsLifetimes(
@@ -3705,6 +3710,7 @@ const analyzeLoans = (
         return
       }
       case 'Run':
+        if (expression.subject._tag === 'CallableApply') ranInPlace.add(expression.subject)
         inspect(expression.subject, region, active, 'Read', endpointAt(expression.anchor, region))
         return
       case 'EffectBindRequirement': {

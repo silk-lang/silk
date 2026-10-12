@@ -1382,6 +1382,18 @@ ${counting}  let pending = counting(1)
       expected: [],
     },
     {
+      name: 'ran-in-place',
+      body: `effect fn ranInPlace() -> i32 {
+  let held = Narrow {first: 1, second: 2}
+  let mut shared = effect fn(extra: i32) -> i32 { return held.first + extra }
+  let view = &mut shared
+  let direct = run shared(1)
+  drop view
+  return direct
+}`,
+      expected: [{ code: 'OWN0011', at: 'run shared(1)', offset: 4, related: '&mut shared' }],
+    },
+    {
       name: 'owned-once',
       body: `effect fn ownedOnce(token: Token) -> i32 {
   let consumed = effect fn(extra: i32) -> i32 { return spend(move token) + extra }
