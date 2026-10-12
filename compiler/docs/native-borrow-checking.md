@@ -95,12 +95,15 @@ The bootstrap is the behavioral reference, not the architectural one.
 - `Lifetime` has `Static`, `Parameter`, `Local`, `Invocation`, `Meet` and `Supplied`. `Local` is
   documented as "a borrow region rooted at a source expression, retained until the abstract borrow
   checker runs".
-- Move-side rules already reject natively with bootstrap-equivalent codes: `UseAfterMove`
-  (OWN0001), `ExtractionBoundary` (OWN0002), `ExplicitMoveRequired` (OWN0003),
-  `OverlappingAssignment` (OWN0004), `IncompatibleLoopHeader` (OWN0005), `MatchBorrowEscape`
+- Some move-side rules already reject natively with bootstrap-equivalent codes:
+  `ExtractionBoundary` (OWN0002), `ExplicitMoveRequired` (OWN0003), `MatchBorrowEscape`
   (OWN0006), `GuardConsumesPattern` (OWN0008), `InvalidMatchScrutineePlace` (OWN0009),
   `BorrowedExtraction` (OWN0012), `ExclusiveBorrowRequiresMutable` (SEM0057) and
   `UnsatisfiedLifetimeBound` (SEM0212).
+- `UseAfterMove` (OWN0001), `OverlappingAssignment` (OWN0004) and `IncompatibleLoopHeader`
+  (OWN0005) come only from `CaptureAvailability`, so only a body with an anonymous-function
+  capture gets them. The native compiler accepts a second move of an ordinary local. The borrow
+  stage owns move flow for every body.
 - Region escapes are reported as `TypeMismatch` where the bootstrap reports OWN0019 (a #567 known
   gap). The borrow stage owns that fix.
 - `CaptureAvailability` already walks a typed body's control flow (blocks, branches, loops, `break`,
@@ -384,24 +387,30 @@ rejects is never accepted.
      captures, Effects or local sharing, plus the scalar fast path.
    - OWN0010 and OWN0011 (BORROW-001 to BORROW-005, BORROW-007, CALL-001), with structured cases
      asserting codes and spans. Every other body answers `NotChecked{reason}`.
-2. **Regions and OWN0019.**
+2. **Move flow** in every body the checker enters, abstract bodies included.
+   - Forward reaching moves over the same graph, with bindings and covering replacements as
+     reinitialization.
+   - OWN0001 at a use of a moved place, OWN0004 at a replacement whose right-hand side moves out of
+     its target, and OWN0005 at a loop that repeats with different moved places of its outer
+     locals than it entered with.
+3. **Regions and OWN0019.**
    - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
-3. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
+4. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
    through the per-declaration summaries of v2 P5(a); this slice adds the summary for whatever it
    needs if v2 has not landed it yet.
-4. **Selected static bodies**, per interned selection, including type-specific ones.
-5. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
+5. **Selected static bodies**, per interned selection, including type-specific ones.
+6. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
    EFFECT-OWN-002, provider loans).
-6. **Local sharing** (OWN0016). Suspension stays a named reason until suspension lowering lands.
-7. **Parity and closure.**
+7. **Local sharing** (OWN0016). Suspension stays a named reason until suspension lowering lands.
+8. **Parity and closure.**
    - Expected-diagnostic corpus mode (`main` first), the invalid-ownership set, zero unchecked on
      the self-build.
    - The gap becomes an error.
    - Retire `BorrowStatus.NotChecked` and the `borrow-check` gap code.
 
-Slices 3 to 6 are independent once slice 2 lands, and can run in parallel lanes. None depends on a
+Slices 4 to 7 are independent once slice 3 lands, and can run in parallel lanes. None depends on a
 v2 slice: the checker uses today's `Body` key and the v2 slices attach their edges to it later.
 
 ## 11. Decisions

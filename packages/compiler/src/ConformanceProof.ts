@@ -302,11 +302,17 @@ const provedContracts = (
   requireRuntimeConcrete: boolean,
   assumptions?: DeclarationFact,
 ): ReadonlyArray<Type.Nominal> => {
-  if (!Type.isNominal(provider) || (requireRuntimeConcrete && !Type.isRuntimeConcrete(provider)))
-    return []
-  const providerDeclaration = memberByNominal(self.modules, provider)
-  if (providerDeclaration === undefined || !endpointVisible(providerDeclaration, requestingModule))
-    return []
+  // A scalar or `string` provider has no declaration whose visibility could hide it.
+  if (typeof provider !== 'string' && !Type.isString(provider)) {
+    if (!Type.isNominal(provider) || (requireRuntimeConcrete && !Type.isRuntimeConcrete(provider)))
+      return []
+    const providerDeclaration = memberByNominal(self.modules, provider)
+    if (
+      providerDeclaration === undefined ||
+      !endpointVisible(providerDeclaration, requestingModule)
+    )
+      return []
+  }
 
   const implemented = new Map<string, Type.Nominal>()
   for (const headers of self.modules)
