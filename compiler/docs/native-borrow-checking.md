@@ -320,23 +320,31 @@ callees' contracts: the program-level guarantee needs every body checked, which 
 count tracks, and a callee that still leaves with `regions` is where a contract violation could
 hide until the regions slice proves it.
 
-- When every result region is a lifetime parameter of the checked declaration, a loan of a body
-  local is not retained: its region cannot outlive the caller's parameter, and typing already
-  rejects a body-local borrow given such a region.
+- When every result region is a lifetime parameter of the checked declaration, or the result is
+  one of its type parameters, a loan of a body local, or with a body region, is not retained: such
+  a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
+  caller's region or type, and safe code obtains a type parameter's value only as such a value.
 - When exactly one operand's loans name a result region, the result retains them exactly.
 - Otherwise each loan is carried approximately: every fresh borrow of one call shares the call's
   region, so several operands may name it, and a callable retains its capture loans whatever its
   type names.
 
-CI holds the count in two ways. Both read `compiler/borrow-check-gap.json`.
+CI holds the count in two ways. Both read `compiler/borrow-check-gap.txt`, which has one line per
+corpus program with unchecked bodies, `<program> <reason>=<count> ...`, and one `retired` line.
 
-- The selfhost corpus job sums each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
-  receipts) and fails when any reason rises above its baseline. The corpus is a fixed program set,
-  so its counts change only when checking changes or a program is added. A PR that adds a corpus
-  program, or a slice that checks more bodies, updates the baseline in the same diff.
-- A reason that a slice retires is listed under `retired` and must be zero everywhere. The corpus
-  job and the N2 self-build step both fail if a retired reason reappears. The self-build totals
-  grow with the compiler, so they are printed as a receipt and never compared.
+- The selfhost corpus job compares each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
+  receipts) with its line and fails on any difference, a fall as well as a rise, so a line never
+  goes stale and a later rise cannot hide under an old high count. A PR that changes checking or the
+  corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only
+  writer, and `diff <old> <new>` prints the per-program transition table for its description. The
+  corpus job builds its programs from main's verification harness, which can differ from a local run
+  on this branch's `corpus.ts`; the file must match CI, so when they disagree, run `update` on the
+  job's `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file
+  with `merge=union`; two branches that changed the same program leave two lines for it, which fail
+  until `update` reruns.
+- A reason that a slice retires is listed on the `retired` line and must be zero everywhere. The
+  corpus job and the N2 self-build step both fail if a retired reason reappears. The self-build
+  totals grow with the compiler, so they are printed as a receipt and never recorded.
 
 `captures` is retired. The walk checks callable construction, sections and invocation, and each
 anonymous body is checked where it is built: a borrowed capture's loan begins at construction and
