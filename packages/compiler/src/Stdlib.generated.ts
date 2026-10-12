@@ -3257,6 +3257,30 @@ export const modules = [
   },
 ] as const
 
+export const sealed = {
+  module: 'intrinsic/operators',
+  path: 'intrinsic/operators.silk',
+  members: [
+    'Add',
+    'BitAnd',
+    'BitNot',
+    'BitOr',
+    'BitXor',
+    'Divide',
+    'Equal',
+    'Multiply',
+    'Negate',
+    'Not',
+    'Order',
+    'Ordering',
+    'Remainder',
+    'Subtract',
+  ],
+  digest: 'f6d6b478755d180e1b60f6a1d5af7207d6841fb113564df5940a1d0da4ba93fd',
+  source:
+    '//! The sealed operator interfaces of the `Intrinsic` namespace (INTR-008, INTR-009).\n//!\n//! # Details\n//! The compiler embeds this file. It is not a module path: the compiler rejects an import of\n//! it, and its public declarations are named only as `Intrinsic.<Name>`. It holds only the operator\n//! interfaces, `Ordering`, and the sealed scalar conformances.\n\npub interface Add<Right, Output> {\n  fn add(left: Self, right: Right) -> Output\n}\n\npub interface Subtract<Right, Output> {\n  fn subtract(left: Self, right: Right) -> Output\n}\n\npub interface Multiply<Right, Output> {\n  fn multiply(left: Self, right: Right) -> Output\n}\n\npub interface Divide<Right, Output> {\n  fn divide(left: Self, right: Right) -> Output\n}\n\npub interface Remainder<Right, Output> {\n  fn remainder(left: Self, right: Right) -> Output\n}\n\npub interface Negate<Output> {\n  fn negate(value: Self) -> Output\n}\n\npub interface BitAnd<Right, Output> {\n  fn bitAnd(left: Self, right: Right) -> Output\n}\n\npub interface BitOr<Right, Output> {\n  fn bitOr(left: Self, right: Right) -> Output\n}\n\npub interface BitXor<Right, Output> {\n  fn bitXor(left: Self, right: Right) -> Output\n}\n\npub interface BitNot<Output> {\n  fn bitNot(value: Self) -> Output\n}\n\npub interface Not<Output> {\n  fn not(value: Self) -> Output\n}\n\npub interface Equal {\n  fn equals(left: &Self, right: &Self) -> bool\n}\n\npub enum Ordering {\n  Less,\n  Equal,\n  Greater,\n}\n\npub interface Order {\n  fn compare(left: &Self, right: &Self) -> Ordering\n}\n\nimpl Add<u8, u8> for u8 { add: Intrinsic.u8Add }\nimpl Add<u16, u16> for u16 { add: Intrinsic.u16Add }\nimpl Add<u32, u32> for u32 { add: Intrinsic.u32Add }\nimpl Add<u64, u64> for u64 { add: Intrinsic.u64Add }\nimpl Add<usize, usize> for usize { add: Intrinsic.usizeAdd }\nimpl Add<i8, i8> for i8 { add: Intrinsic.i8Add }\nimpl Add<i16, i16> for i16 { add: Intrinsic.i16Add }\nimpl Add<i32, i32> for i32 { add: Intrinsic.i32Add }\nimpl Add<i64, i64> for i64 { add: Intrinsic.i64Add }\nimpl Add<isize, isize> for isize { add: Intrinsic.isizeAdd }\n\nimpl Order for u8 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for u16 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for u32 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for u64 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for usize {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for i8 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for i16 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for i32 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for i64 {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n\nimpl Order for isize {\n  fn compare(left: &Self, right: &Self) -> Ordering {\n    if left.* < right.* { return Ordering.Less }\n    if right.* < left.* { return Ordering.Greater }\n    return Ordering.Equal\n  }\n}\n',
+} as const
+
 export const runtimeDefaults = [
   {
     targets: ['aarch64-apple-darwin'],

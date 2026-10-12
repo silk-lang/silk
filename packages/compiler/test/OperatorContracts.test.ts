@@ -194,6 +194,56 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('names the sealed operator interfaces and scalar conformances as Intrinsic members', () =>
+  Effect.gen(function* () {
+    // Library aliases name the sealed members the way `silk.ops` and `silk.order` will.
+    const self = yield* snapshot(`type Order = Intrinsic.Order
+struct Meters { value: i32 }
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
+}
+impl Intrinsic.Add<Meters, Meters> for Meters { add: Meters.plus }
+fn sum<T: Intrinsic.Add<T, T>>(left: T, right: T) -> T {
+  return Intrinsic.Add<T, T>.add(move left, move right)
+}
+fn rank<T: Order>(left: &T, right: &T) -> Intrinsic.Ordering { return Order.compare(left, right) }
+pub fn main() -> i32 {
+  let total = sum(Meters { value: 40 }, Meters { value: 2 })
+  let scalar = sum<i32>(40, 2)
+  let low: u8 = 1
+  let high: u8 = 2
+  let ordering: Intrinsic.Ordering = rank(&low, &high)
+  drop ordering
+  return total.value - scalar + 42
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
+it.effect(
+  'seals the operator source against imports, unknown members and scalar conformances',
+  () =>
+    Effect.gen(function* () {
+      const source = `import intrinsic.operators
+fn unknown<T: Intrinsic.Plus<T, T>>(value: T) -> T { return move value }
+fn same(left: i32, right: i32) -> i32 { return left }
+impl Intrinsic.Add<i32, i32> for i32 { add: same }
+pub fn main() -> i32 { return 0 }`
+      const self = yield* snapshot(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+        [
+          [Diagnostic.unknownModuleCode, source.indexOf('intrinsic.operators')],
+          [Diagnostic.invalidConformanceCode, source.indexOf('T: Intrinsic.Plus')],
+          // The sealed i32 conformance already exists, and IMPL-004 places no source conformance
+          // of a scalar provider outside the interface's module.
+          [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Add')],
+          [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Add')],
+        ],
+      )
+    }),
+)
+
 it('has no operator declaration syntax', () => {
   const source = 'interface M { operator * fn mul(left: Self, right: i32) -> Self }\n'
   const tree = parse('operator-contracts/marker', source)

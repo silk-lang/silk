@@ -30,6 +30,21 @@ owner's lifetimes, which the call infers; it is otherwise a complete type.
   arguments on the owner, and the migration codemod is deleted.
 - Retire this entry when both compilers reject the member-prefix spelling with a diagnostic.
 
+## Sealed operator interfaces
+
+INTR-008 and INTR-009 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
+conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable only as
+`Intrinsic.<Name>`.
+
+- **Bootstrap:** reads the file, rejects an import of it, and resolves its members. A closure holds
+  it only when one of its modules spells an `Intrinsic` member the file declares.
+- **Native:** does not load the file yet, and reports `Intrinsic.Add` and the other members as
+  unknown. Its pinned seed ignores the unimported file.
+- **Source migration:** none yet. `silk.ops`, `silk.equal` and `silk.order` still declare their own
+  interfaces and scalar conformances, and operator syntax binds to them (OP-009).
+- Retire this entry when the native compiler loads the same file and both compilers bind operators
+  to the sealed interfaces.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32

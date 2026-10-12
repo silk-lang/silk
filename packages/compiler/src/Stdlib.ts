@@ -1,5 +1,5 @@
 import * as Arr from 'effect/Array'
-import { modules, runtimeDefaults, runtimeComponents } from './Stdlib.generated.js'
+import { modules, runtimeDefaults, runtimeComponents, sealed } from './Stdlib.generated.js'
 
 /** Installed build defaults generated from distribution composition data. */
 export const compositions = {
@@ -69,3 +69,26 @@ export const findNamespace = (namespace: string): Module | undefined => byNamesp
 export const sources: ReadonlyMap<string, Uint8Array> = new Map(
   manifest.map((entry) => [entry.module, Uint8Array.from(entry.bytes)] as const),
 )
+
+/**
+ * The sealed `Intrinsic` operator source (INTR-008). It is compiler-owned rather than a manifest
+ * module: a closure loads it from these embedded bytes, no resolver is consulted for it, and no
+ * import may name it. Its public declarations are reachable only as `Intrinsic.<Name>`.
+ */
+export const sealedModule: {
+  readonly module: string
+  readonly path: string
+  /** The spellings of its public declarations, each reachable as `Intrinsic.<member>`. */
+  readonly members: ReadonlySet<string>
+  readonly digest: string
+  readonly bytes: Uint8Array
+} = {
+  module: sealed.module,
+  path: sealed.path,
+  members: new Set(sealed.members),
+  digest: sealed.digest,
+  bytes: encoder.encode(sealed.source),
+}
+
+/** Tests whether a module identity names the sealed `Intrinsic` operator source. */
+export const isSealed = (module: string): boolean => module === sealedModule.module

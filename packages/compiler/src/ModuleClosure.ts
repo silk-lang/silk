@@ -17,10 +17,12 @@ import * as Graph from './internal/Graph.js'
 import * as Hir from './Hir.js'
 import * as SemanticContext from './SemanticContext.js'
 import * as SourceFile from './SourceFile.js'
+import * as SourceOrigin from './SourceOrigin.js'
 import * as Source from './Source.js'
 import * as SourceResolver from './SourceResolver.js'
 import * as Stdlib from './Stdlib.js'
 import type * as SyntaxFile from './SyntaxFile.js'
+import type * as Token from './Token.js'
 import type * as TestDiscovery from './TestDiscovery.js'
 
 /** One compilation request: a canonical root identity plus optional target selection. */
@@ -158,10 +160,12 @@ export const validateRoots = Effect.fn('ModuleClosure.validateRoots')(function* 
   additionalRoots: ReadonlyArray<string> = [],
 ): Effect.fn.Return<Arr.NonEmptyReadonlyArray<string>, ModuleClosureError> {
   for (const module of [...new Set([...roots, ...additionalRoots])].sort())
-    if (!SourceResolver.isCanonicalModule(module))
+    if (!SourceResolver.isCanonicalModule(module) || Stdlib.isSealed(module))
       return yield* new ModuleClosureError({
         operation: 'ModuleClosure.loadProject',
-        message: `Root module identity ${module} is not canonical`,
+        message: Stdlib.isSealed(module)
+          ? `Root module identity ${module} names the sealed Intrinsic operator source`
+          : `Root module identity ${module} is not canonical`,
         reason: { _tag: 'InvalidRoot', module },
       })
   return Arr.sort(Arr.dedupe(roots), Order.String)
@@ -198,7 +202,7 @@ const parseModule = Effect.fnUntraced(function* (
   application?: string,
 ): Effect.fn.Return<ParsedModule> {
   const currentSource = SourceFile.make(name, source.bytes, source.origin)
-  const cacheable = Stdlib.find(name) !== undefined
+  const cacheable = Stdlib.find(name) !== undefined || Stdlib.isSealed(name)
   const cached = cacheable ? standardLibraryLowerings.get(name) : undefined
   let reused: Module | Hir.Lowered | undefined
   if (previous !== undefined && SourceFile.equals(previous.syntax.source, currentSource)) {
@@ -284,6 +288,25 @@ const analyzeModule = Effect.fnUntraced(function* (
     if (sourceSpelling === undefined)
       throw new RangeError('Available import path lost its source spelling')
     const span = context.spanOf(anchor)
+    // The sealed Intrinsic operator source is not a module path (INTR-008).
+    if (Stdlib.isSealed(module)) {
+      const diagnostic = Diagnostic.unknownModule(module, span)
+      diagnostics.push(diagnostic)
+      imports.push({
+        _tag: 'Import',
+        declaration,
+        header,
+        sourceSpelling,
+        canonicalTarget: module,
+        target: {
+          _tag: 'Unknown',
+          module,
+          anchor,
+          cause: Diagnostic.identity(diagnostic),
+        },
+      })
+      continue
+    }
     if (module === parsed.name) {
       const diagnostic = Diagnostic.selfImport(module, span)
       diagnostics.push(diagnostic)
@@ -352,6 +375,33 @@ const analyzeModule = Effect.fnUntraced(function* (
   }
 })
 
+const sealedReferences = new WeakMap<SyntaxFile.SyntaxFile, boolean>()
+const tokenDecoder = new TextDecoder()
+
+const tokenText = (syntax: SyntaxFile.SyntaxFile, token: Token.Token | undefined): string =>
+  token?.kind !== 'Identifier'
+    ? ''
+    : Option.match(SourceFile.slice(syntax.source, token.span), {
+        onNone: () => '',
+        onSome: (bytes) => tokenDecoder.decode(bytes),
+      })
+
+/** Whether a module spells `Intrinsic.<member>` for a member of the sealed operator source. */
+const namesSealedMember = (syntax: SyntaxFile.SyntaxFile): boolean => {
+  const cached = sealedReferences.get(syntax)
+  if (cached !== undefined) return cached
+  const tokens = syntax.tokens
+  const names = tokens.some(
+    (token, at) =>
+      tokens[at + 1]?.kind === 'Dot' &&
+      token.span.end - token.span.start === 'Intrinsic'.length &&
+      tokenText(syntax, token) === 'Intrinsic' &&
+      Stdlib.sealedModule.members.has(tokenText(syntax, tokens[at + 2])),
+  )
+  sealedReferences.set(syntax, names)
+  return names
+}
+
 const resolvedTargets = (module: Module): ReadonlyArray<string> =>
   [
     ...new Set(
@@ -397,6 +447,14 @@ export const loadProject = Effect.fn('ModuleClosure.loadProject')(function* (
   ): Effect.fn.Return<Resolution, never, SourceResolver.SourceResolver> {
     const cached = resolutions.get(module)
     if (cached !== undefined) return cached
+    if (Stdlib.isSealed(module)) {
+      const sealed: Resolution = {
+        _tag: 'Found',
+        source: SourceResolver.resolved(Stdlib.sealedModule.bytes, SourceOrigin.memory()),
+      }
+      resolutions.set(module, sealed)
+      return sealed
+    }
     // Standard-library identities resolve from the compiler-shipped sources exclusively; a
     // user resolver is never consulted inside the reserved namespace.
     const attempted = yield* Effect.result(
@@ -458,6 +516,24 @@ export const loadProject = Effect.fn('ModuleClosure.loadProject')(function* (
     diagnostics.push(analysis.diagnostics)
     for (const target of resolvedTargets(analysis.module)) {
       if (!loaded.has(target) && !pending.includes(target)) pending.push(target)
+    }
+  }
+
+  // No import reaches the sealed Intrinsic operator source. Only a module that spells one of its
+  // members can name a declaration of it, so the closure holds it exactly when one does.
+  if ([...loaded.values()].some((module) => namesSealedMember(module.syntax))) {
+    const sealed = yield* resolve(Stdlib.sealedModule.module)
+    if (sealed._tag === 'Found') {
+      const analysis = yield* analyzeModule(
+        yield* parseModule(
+          Stdlib.sealedModule.module,
+          sealed.source,
+          previousModules.get(Stdlib.sealedModule.module),
+        ),
+        resolve,
+      )
+      loaded.set(Stdlib.sealedModule.module, analysis.module)
+      diagnostics.push(analysis.diagnostics)
     }
   }
 
