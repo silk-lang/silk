@@ -298,9 +298,10 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
   exclusive views forwarded without `&mut` and region and contents obligations wait for later
   slices.
-- `effects`: the body runs a stored Effect, or invokes an `effect fn` value. An immediate
-  `run f(..)` of an `effect fn` or interface operation call is checked as that one call
-  (EFF-003): the Effect it constructs is a temporary only the run consumes.
+- `effects`: the body runs a stored Effect. An immediate `run f(..)` of an `effect fn` call, an
+  interface operation call or an `effect fn` value's invocation is checked as that one call
+  (EFF-003), and invoking an `effect fn` value without `run` is checked as the construction of an
+  Effect that borrows its callee (EFFECT-OWN-001).
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
@@ -367,8 +368,8 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.
 - **Where the reference and the bootstrap disagree**, the reference wins (it is prescriptive over
-  both compilers). The bootstrap gets a `main` fix in the same slice. A difference is never added to
-  `acceptedFailures`.
+  both compilers). The bootstrap gets a `main` fix in the same slice. The corpus job fails on any
+  `FAIL`, so a difference is never tolerated as a corpus failure.
 - **Positive parity:** the stdlib, the corpus and the compiler itself must pass the native checker
   with zero rejections, because they pass the bootstrap's.
 
