@@ -320,8 +320,10 @@ CI holds the count in two ways. Both read `compiler/borrow-check-gap.json`.
 anonymous body is checked where it is built: a borrowed capture's loan begins at construction and
 travels with the callable value, a moved capture leaves its place there, a shared invocation reads
 its callee, a `mut fn` invocation borrows it exclusively for the call, and a `once fn` invocation
-moves it (CAPTURE-001, CAPTURE-002, CALLABLE-002, CALLABLE-003). A callable that carries a loan
-anywhere but an immutable `let` answers `stored-loans`, as any loan-carrying value does.
+moves it (CAPTURE-001, CAPTURE-002, CALLABLE-002, CALLABLE-003). A callable value always carries
+its capture loans, whatever regions its type names, and a `let` or `let mut` binding of a callable
+holds them until its last use. A callable that carries a loan anywhere else answers `stored-loans`,
+as any loan-carrying value does.
 
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
