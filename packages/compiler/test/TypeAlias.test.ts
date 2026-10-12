@@ -533,3 +533,22 @@ pub fn main() -> i32 {
     assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
   }),
 )
+
+it.effect('rejects an enum member qualified through a namespace-qualified type', () =>
+  Effect.gen(function* () {
+    // A namespace exposes root declarations; a type's members go through the selected type.
+    const source = `import silk.order
+fn pick() -> i32 {
+  let ordering = order.Ordering.Greater
+  drop ordering
+  return 0
+}
+pub fn main() -> i32 { return pick() }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [[Diagnostic.namespaceQualifiedTypeCode, source.indexOf('Ordering.Greater')]],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
