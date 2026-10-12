@@ -9,9 +9,12 @@ import * as Schema from 'effect/Schema'
 import * as Verification from '../../../compiler/scripts/CorpusVerification.js'
 import type { CorpusProgram } from './support/corpus.js'
 
+// Each case's source names it, so the stub can attribute builds and runs of concurrent cases.
+const sourceOf = (name: string): string => `// ${name}\npub fn main() -> i32 { return 42 }`
+
 const literal: CorpusProgram = {
   name: 'literal',
-  source: 'pub fn main() -> i32 { return 42 }',
+  source: sourceOf('literal'),
   expected: { _tag: 'Completes', result: 42 },
   nativeStdout: 'witness\n',
   nativeStderr: 'stderr witness\n',
@@ -36,10 +39,12 @@ const fixture = Effect.fnUntraced(function* () {
   const compilerSource = `#!/bin/sh
 if [ "$6" != '${repository}/packages/compiler/stdlib' ]; then exit 3; fi
 if ! grep -q 'consumer stdlib witness' "$6/silk/i32.silk"; then exit 4; fi
-printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
+name="$(sed -n '1s|^// ||p' memory/driver.silk)"
+printf '%s %s:%s\\n' "$name" "$8" "\${10}" >> "$0.profiles"
+printf '%s\\n' "$name" > case
 cat > program <<'PROGRAM'
 #!/bin/sh
-printf '%s\\n' "$1" >> '${repository}/invocations'
+printf '%s %s\\n' "$(cat "$(dirname "$0")/case")" "$1" >> '${repository}/invocations'
 printf 'witness\\n'
 printf 'stderr witness\\n' >&2
 exit 42
@@ -58,6 +63,16 @@ chmod +x program
   }
 })
 
+/** Groups a stub log's `case value` lines by case, in the order each case wrote them. */
+const byCase = (log: string): Record<string, ReadonlyArray<string>> => {
+  const cases: Record<string, Array<string>> = {}
+  for (const line of log.split('\n').filter((entry) => entry !== '')) {
+    const space = line.indexOf(' ')
+    ;(cases[line.slice(0, space)] ??= []).push(line.slice(space + 1))
+  }
+  return cases
+}
+
 it.effect('verifies all live pins and declared profiles/runs without changing its inputs', () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
@@ -66,18 +81,16 @@ it.effect('verifies all live pins and declared profiles/runs without changing it
     // An unpinned failing case must not execute.
     yield* Verification.run(self, [
       literal,
-      { ...literal, name: 'unselected', nativeComponents: [] },
+      { ...literal, name: 'unselected', source: sourceOf('unselected'), nativeComponents: [] },
     ])
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
-    assert.strictEqual(
-      yield* fs.readFileString(`${self.compiler}.profiles`),
-      'none:true\nspeed:false\n',
-    )
-    assert.strictEqual(
-      yield* fs.readFileString(`${self.repository}/invocations`),
-      'one\ntwo\none\ntwo\n',
-    )
+    assert.deepEqual(byCase(yield* fs.readFileString(`${self.compiler}.profiles`)), {
+      literal: ['none:true', 'speed:false'],
+    })
+    assert.deepEqual(byCase(yield* fs.readFileString(`${self.repository}/invocations`)), {
+      literal: ['one', 'two', 'one', 'two'],
+    })
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
@@ -88,9 +101,20 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     yield* fs.writeFileString(self.pins, '["literal"]')
     const corpus: ReadonlyArray<CorpusProgram> = [
       literal,
-      { ...literal, name: 'observed-failure', nativeStdout: '', nativeStderr: '' },
-      { ...literal, name: 'observed-gap', nativeComponents: [] },
-      { ...literal, name: 'observed-trap', expected: { _tag: 'Trap' } },
+      {
+        ...literal,
+        name: 'observed-failure',
+        source: sourceOf('observed-failure'),
+        nativeStdout: '',
+        nativeStderr: '',
+      },
+      { ...literal, name: 'observed-gap', source: sourceOf('observed-gap'), nativeComponents: [] },
+      {
+        ...literal,
+        name: 'observed-trap',
+        source: sourceOf('observed-trap'),
+        expected: { _tag: 'Trap' },
+      },
     ]
     const messages: Array<string> = []
     const currentConsole = yield* Console.Console
@@ -131,14 +155,16 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
     // A failing unpinned case executes until its first mismatch; unsupported components do
     // not compile. The trap case still runs both profiles and both declared invocations.
-    assert.strictEqual(
-      yield* fs.readFileString(`${self.compiler}.profiles`),
-      'none:true\nspeed:false\nnone:true\nnone:true\nspeed:false\n',
-    )
-    assert.strictEqual(
-      yield* fs.readFileString(`${self.repository}/invocations`),
-      'one\ntwo\none\ntwo\none\none\ntwo\none\ntwo\n',
-    )
+    assert.deepEqual(byCase(yield* fs.readFileString(`${self.compiler}.profiles`)), {
+      literal: ['none:true', 'speed:false'],
+      'observed-failure': ['none:true'],
+      'observed-trap': ['none:true', 'speed:false'],
+    })
+    assert.deepEqual(byCase(yield* fs.readFileString(`${self.repository}/invocations`)), {
+      literal: ['one', 'two', 'one', 'two'],
+      'observed-failure': ['one'],
+      'observed-trap': ['one', 'two', 'one', 'two'],
+    })
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 

@@ -555,7 +555,7 @@ pub fn main() -> i32 {
 
 /** A qualified call without an import remains unresolved. */
 const called = `pub fn main() -> i32 {
-  let outcome = Result.succeed<i32, i32>(42)
+  let outcome = Result<i32, i32>.succeed(42)
   drop outcome
   return 0
 }`
@@ -763,7 +763,7 @@ pub fn main() -> i32 {
 const shadowedHelper = `import silk.result { Result }
 
 pub fn helped() -> i32 {
-  let outcome = Result.succeed<i32, i32>(42)
+  let outcome = Result<i32, i32>.succeed(42)
   drop outcome
   return 0
 }`
