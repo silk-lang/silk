@@ -6061,15 +6061,6 @@ struct DeclarationApplication {
   ownerPremises: Vector<Constraint>
 }
 
-fn declarationApplicationResult(result: Result<Shared<Type>, Shared<Rejection>>, premises: Vector<Constraint>) -> Result<DeclarationApplication, Shared<Rejection>> {
-  return match move result {
-    Result<Shared<Type>, Shared<Rejection>>.Success {value} => Result<DeclarationApplication, Shared<Rejection>>.succeed(
-      DeclarationApplication {ty: move value, ownerPremises: move premises},
-    )
-    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => Result<DeclarationApplication, Shared<Rejection>>.failResult(move error)
-  }
-}
-
 effect fn declarationApplication(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -6376,20 +6367,33 @@ effect fn declarationApplication(
           }
         }
       }
+      // An alias (TYPE-004) instantiates the target its query resolved over its own parameters;
+      // substitution renormalizes a union target. A lifetime the target omits is an implicit
+      // alias parameter that this use elides, as a struct header's is.
       if family == Family.Alias {
-        if let Node.AliasHeader {target, ..} = value.header {
-          // The alias query validates the declaration. A use expands under the caller's
-          // elision context, so an omitted alias lifetime remains fresh per use.
-          let expanded = run resolveType(
-            &mut resolver.*,
-            &mut owner.*,
-            &mut dependencies.*,
-            moduleOrdinal,
-            target,
-            Vector<Binder>.asSlice(&binders),
-            &mut callerElision.*,
+        let found = run declarationAt(&mut resolver.*, &module, declaration)
+        if let Option<DeclarationId>.Some {value: aliasId} = move found {
+          let mut types = Vector<usize>.make()
+          let mut lifetimes = Vector<usize>.make()
+          let mut rows = Vector<usize>.make()
+          run Type.collectOwned(&resolved, &aliasId, &mut types, &mut lifetimes, &mut rows)
+          let mut implicit = expected
+          while containsOrdinal(&lifetimes, implicit) {
+            let elided = run elidedLifetime(&mut resolver.*, anchor, span, &mut callerElision.*)
+            match move elided {
+              Result<Shared<Lifetime>, Shared<Rejection>>.Success {value: lifetime} => {
+                run Vector<Argument>.append(&mut arguments, Argument.Lifetime {value: move lifetime})
+              }
+              Result<Shared<Lifetime>, Shared<Rejection>>.Failure {error} => {
+                return Result<DeclarationApplication, Shared<Rejection>>.failResult(move error)
+              }
+            }
+            implicit = implicit + usize.ONE
+          }
+          let expanded = run Type.instantiate(&resolved, &aliasId, Vector<Argument>.asSlice(&arguments))
+          return Result<DeclarationApplication, Shared<Rejection>>.succeed(
+            DeclarationApplication {ty: move expanded, ownerPremises: move ownerPremises},
           )
-          return declarationApplicationResult(move expanded, move ownerPremises)
         }
       }
       if expected > usize.ZERO {
@@ -9465,19 +9469,11 @@ effect fn resolveAlias(
   let written = run header(&mut resolver.*, &module, declarationPosition(key))
   if let Option<HeaderSyntax>.Some {value} = move written {
     if let Node.AliasHeader {target, isPublic, generics, ..} = value.header {
-      // TYPE-004: an alias is not generic. It fixes every argument or names an unapplied
-      // declaration whose arguments each use supplies.
+      // TYPE-004: a generic alias resolves its target once over its own parameters; each use
+      // instantiates that type with its written arguments.
       if generics.length > usize.ZERO {
-        let mut span = value.span
-        if let Option<HirId>.Some {value: first} = move run typeChild(&mut resolver.*, &module, generics, usize.ZERO) {
-          if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, &module, first) {
-            span = parameter.span
-          }
-        }
-        return Answer {
-          outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, &module, RejectionCode.AliasParameters, span)},
-          dependencies: move dependencies,
-        }
+        return run resolveGenericAlias(&mut resolver.*, &mut owner.*, move dependencies, key, &module,
+          generics, target, isPublic)
       }
       let noTargetBinders = Vector<Binder>.make()
       let property = run sealedPropertyName(&mut resolver.*, &module, target, Vector<Binder>.asSlice(&noTargetBinders))
@@ -9578,6 +9574,108 @@ effect fn resolveAlias(
     outcome: Outcome.Rejected {diagnostic: move diagnostic},
     dependencies: move dependencies,
   }
+}
+
+// The span of the first generic alias parameter TYPE-004 refuses: one that is not an unbounded
+// type or lifetime parameter.
+effect fn refusedAliasParameter(resolver: &mut Resolver, module: &ModuleId, generics: Range) -> Option<Span>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    if let Option<HirId>.Some {value: parameterId} = move run typeChild(&mut resolver.*, module, generics, at) {
+      if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, module, parameterId) {
+        let accepted = match parameter.header {
+          Node.TypeParameter {bounds, ..} => bounds.length == usize.ZERO
+          Node.LifetimeParameter {bounds, ..} => bounds.length == usize.ZERO
+          _ => false
+        }
+        if !accepted { return Option<Span>.some(parameter.span) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+// The span of generic alias parameter `at`, or `fallback` when its syntax is unavailable.
+effect fn aliasParameterSpan(resolver: &mut Resolver, module: &ModuleId, generics: Range, at: usize, fallback: Span) -> Span
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  if let Option<HirId>.Some {value: parameterId} = move run typeChild(&mut resolver.*, module, generics, at) {
+    if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, module, parameterId) {
+      return parameter.span
+    }
+  }
+  return fallback
+}
+
+effect fn resolveGenericAlias(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: Vector<Dependency>,
+  key: Key,
+  module: &ModuleId,
+  generics: Range,
+  target: HirId,
+  isPublic: bool,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = move dependencies
+  if let Option<Span>.Some {value: span} = move run refusedAliasParameter(&mut resolver.*, module, generics) {
+    return Answer {
+      outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, module, RejectionCode.AliasParameters, span)},
+      dependencies: move dependencies,
+    }
+  }
+  let binders = match move run templateBinders(&mut resolver.*, module, declarationPosition(key)) {
+    Result<Vector<Binder>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+      return Answer {outcome: Outcome.Rejected {diagnostic: move error}, dependencies: move dependencies}
+    }
+  }
+  let identity = run declarationAt(&mut resolver.*, module, declarationPosition(key))
+  let mut elision = LifetimeElision {
+    owner: run declarationAt(&mut resolver.*, module, declarationPosition(key)),
+    nextOrdinal: Vector<Binder>.length(&binders),
+    output: false,
+    resultDefault: Option<Shared<Lifetime>>.none(),
+    generated: Vector<Shared<Lifetime>>.make(),
+    invocation: false,
+    nested: false,
+    renumber: Vector<usize>.make(),
+    staticEnvironment: false,
+    supplied: Option<Vector<Argument>>.none(),
+    assumptions: Option<Vector<Constraint>>.some(Vector<Constraint>.make()),
+    deferred: Option<Vector<DeferredBounds>>.none(),
+  }
+  let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies, key.module, target,
+    Vector<Binder>.asSlice(&binders), &mut elision)
+  let ty = match move resolved {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+      return Answer {outcome: Outcome.Rejected {diagnostic: move error}, dependencies: move dependencies}
+    }
+  }
+  if let Option<Shared<Rejection>>.Some {value: diagnostic} = move run exposedPrivate(&mut resolver.*, module, target, &ty, isPublic) {
+    return Answer {outcome: Outcome.Rejected {diagnostic: move diagnostic}, dependencies: move dependencies}
+  }
+  // Every parameter occurs in the target: an unused one would name distinct spellings of one type.
+  if let Option<DeclarationId>.Some {value: aliasId} = &identity {
+    let mut types = Vector<usize>.make()
+    let mut lifetimes = Vector<usize>.make()
+    let mut rows = Vector<usize>.make()
+    run Type.collectOwned(&ty, &aliasId, &mut types, &mut lifetimes, &mut rows)
+    let mut at = usize.ZERO
+    while at < Vector<Binder>.length(&binders) {
+      if !containsOrdinal(&types, at) && !containsOrdinal(&lifetimes, at) {
+        let span = run aliasParameterSpan(&mut resolver.*, module, generics, at, Span.make(usize.ZERO, usize.ZERO))
+        return Answer {
+          outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, module, RejectionCode.AliasParameters, span)},
+          dependencies: move dependencies,
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Answer {outcome: Outcome.Success {value: Value.Type {resolved: move ty}}, dependencies: move dependencies}
 }
 
 // The generic declaration an alias names without arguments (`type Pointed = Point`), so each use
