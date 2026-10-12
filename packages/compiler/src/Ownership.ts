@@ -1232,6 +1232,22 @@ const checkExpressionOperation = (
     }
     return true
   }
+  // An interface operation borrows an owned argument for a reference or slice operand. An
+  // argument that already is an exclusive reference or slice is forwarded by value instead, so it
+  // is consumed: forwarding is written `&mut values` (BORROW-005).
+  const operandConsumes = (
+    operand: DeclarationFacts.InterfaceOperationApplicationFact['operands'][number] | undefined,
+    argument: Tir.Expression,
+  ): boolean => {
+    if (
+      argument._tag !== 'Unavailable' &&
+      (Type.isReference(argument.type) || Type.isSlice(argument.type)) &&
+      argument.type.access === 'Exclusive'
+    )
+      return true
+    const type = operand?.type._tag === 'Resolved' ? operand.type.type : undefined
+    return type !== undefined && !Type.isReference(type) && !Type.isSlice(type)
+  }
   switch (expression._tag) {
     case 'ParameterReference':
     case 'BindingReference': {
@@ -1534,13 +1550,12 @@ const checkExpressionOperation = (
     case 'BuiltinCall': {
       for (const [ordinal, argument] of expression.arguments.entries()) {
         const operand = expression.interfaceOperation?.contract.operands.at(ordinal)
-        const type = operand?.type._tag === 'Resolved' ? operand.type.type : undefined
         if (
           !checkExpression(
             state,
             live,
             argument,
-            type !== undefined && !Type.isReference(type) && !Type.isSlice(type),
+            operandConsumes(operand, argument),
             guard,
             escaping,
           )
@@ -1552,13 +1567,12 @@ const checkExpressionOperation = (
     case 'InterfaceOperationCall': {
       for (const [ordinal, argument] of expression.arguments.entries()) {
         const operand = expression.contract.operands.at(ordinal)
-        const type = operand?.type._tag === 'Resolved' ? operand.type.type : undefined
         if (
           !checkExpression(
             state,
             live,
             argument,
-            type !== undefined && !Type.isReference(type) && !Type.isSlice(type),
+            operandConsumes(operand, argument),
             guard,
             escaping,
           )
