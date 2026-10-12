@@ -498,8 +498,9 @@ let text = unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
 ```
 
 The namespace is sealed. Source cannot declare, import as, alias as, shadow, reopen, extend, or
-implement `Intrinsic`. Its operations have canonical compiler identities independent of source
-paths or packages.
+implement `Intrinsic`. A `type` alias may name an individual member under TYPE-004; that names the
+member and does not alias the namespace. Its operations have canonical compiler identities
+independent of source paths or packages.
 
 An ordinary actor or function with a matching member spelling receives no privilege:
 
