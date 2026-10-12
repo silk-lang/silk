@@ -504,7 +504,7 @@ struct UriAllocationAudit {
  lastBytes: usize
  reject: bool
 }
-effect fn allocate(self: &mut UriAllocationAudit, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut UriAllocationAudit, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + 1
   self.lastBytes = layout.bytes
   if self.reject { return run Allocator.outOfMemory() }

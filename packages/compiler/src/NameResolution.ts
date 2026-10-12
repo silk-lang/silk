@@ -714,7 +714,10 @@ export const resolveType = (
   if (result._tag === 'Intrinsic') {
     if (
       result.actor === 'Intrinsic' &&
-      (second?.spelling === 'SharedCore' ||
+      (second?.spelling === 'Allocation' ||
+        second?.spelling === 'RawBuffer' ||
+        second?.spelling === 'Slot' ||
+        second?.spelling === 'SharedCore' ||
         second?.spelling === 'Execution' ||
         second?.spelling === 'ExecutionRef' ||
         second?.spelling === 'StorageFailure' ||

@@ -1072,7 +1072,7 @@ import silk.effect { Effect }
 import silk.layout { Layout }
 import silk.raw_buffer { RawBuffer }
 import silk.slot { Slot }
-struct Guard { storage: Allocation }
+struct Guard { storage: Intrinsic.Allocation }
 effect fn store() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let allocation = run Allocator.allocate(Layout.of<[Guard; 1]>())
